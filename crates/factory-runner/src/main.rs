@@ -1,7 +1,7 @@
 use std::{env, io::Read, path::PathBuf, process};
 
-use factory_core::{RunId, RunnerInstanceId};
-use factory_runner::{Config, Error, MAX_STARTUP_STDIN_BYTES};
+use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+use factory_runner::{Config, Error};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

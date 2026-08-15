@@ -14,6 +14,8 @@ pub const MAX_RUNNER_OUTPUT_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_RUNNER_ERROR_BYTES: usize = 16 * 1024;
 /// Maximum bytes in the complete durable event spool for one runner attempt.
 pub const MAX_RUNNER_SPOOL_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum task bytes transferred from the daemon to a new runner over stdin.
+pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
 
 /// One authenticated, newline-delimited request sent to a runner.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

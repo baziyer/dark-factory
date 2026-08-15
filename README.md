@@ -7,8 +7,10 @@ desktop agent simulation.
 The repository is being built in working vertical slices. Today it contains the
 shared protocol, the daemon's SQLite state/event store, a versioned local Unix
 socket, a small machine-readable CLI, and a stable provider-blind process
-runner. Provider adapters and the observer remain deliberately absent until
-their vertical slices are executable.
+runner. The daemon now has a default-deny launch boundary that keeps ambient
+credentials out of runners and transfers bounded task input only over stdin.
+Provider adapters and the observer remain deliberately absent until their
+vertical slices are executable.
 
 ## Non-goals
 
