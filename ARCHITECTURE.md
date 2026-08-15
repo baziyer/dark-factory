@@ -10,18 +10,20 @@ This file records constraints, not an aspirational component catalogue.
 2. SQLite is the durable source of truth. State changes and their append-only
    events commit in the same transaction. The store uses WAL with `FULL`
    synchronous writes so acknowledged commands survive more than a process
-   restart.
+   restart. One exclusive database lock prevents split-brain daemon writers.
 3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.
-   Runners identify themselves by run ID so a restarted daemon can verify and
-   adopt them instead of assuming a recorded PID is still the right process.
+   Runners prove both run ID and a random runner-instance ID over their control
+   socket so a restarted daemon never adopts or signals a process from PID
+   coincidence alone.
 5. Provider adapters translate structured provider output into the shared
    protocol. A PTY is an adapter-specific last resort, never the system's state
    model.
-6. The local control and event API uses a Unix socket by default. Inbound HTTP
-   webhooks are an explicit, authenticated listener; receiving a message is a
-   durable write before it wakes the orchestrator.
+6. The local control and event API uses a private Unix socket by default. A
+   subscription captures a durable replay head and marks when it has caught up.
+   Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
+   message is a durable write before it wakes the orchestrator.
 7. The UI repaints on input or factory events. Elapsed-time labels may request a
    coarse repaint while visible; no background animation or state polling is a
    source of truth.
