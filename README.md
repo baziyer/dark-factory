@@ -6,8 +6,9 @@ desktop agent simulation.
 
 The repository is being built in working vertical slices. Today it contains the
 shared protocol, the daemon's SQLite state/event store, a versioned local Unix
-socket, and a small machine-readable CLI. The runner and observer will arrive
-only when their slices are executable.
+socket, a small machine-readable CLI, and a stable provider-blind process
+runner. Provider adapters and the observer remain deliberately absent until
+their vertical slices are executable.
 
 ## Non-goals
 
