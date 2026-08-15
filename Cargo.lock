@@ -55,6 +55,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "factory-runner"
+version = "0.1.0"
+dependencies = [
+ "factory-core",
+ "rustix",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "factoryctl"
 version = "0.1.0"
 dependencies = [

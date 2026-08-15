@@ -14,9 +14,12 @@ This file records constraints, not an aspirational component catalogue.
 3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.
-   Runners prove both run ID and a random runner-instance ID over their control
-   socket so a restarted daemon never adopts or signals a process from PID
-   coincidence alone.
+   It creates a private socket and bounded event spool before directly spawning
+   one process group. Events are appended before publication. Runners prove both
+   run ID and a random runner-instance ID, retain terminal state until its exact
+   sequence is acknowledged, and never adopt or signal from PID coincidence
+   alone. A graceful runner signal stops the group but preserves an unacknowledged
+   spool for diagnosis and recovery.
 5. Provider adapters translate structured provider output into the shared
    protocol. A PTY is an adapter-specific last resort, never the system's state
    model.
