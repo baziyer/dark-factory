@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust 1.85
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
+      - name: Format
+        run: cargo +1.85.0 fmt --all -- --check
+      - name: Lint
+        run: cargo +1.85.0 clippy --locked --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo +1.85.0 test --locked --workspace
