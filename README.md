@@ -5,8 +5,8 @@ observer. The target is closer to systemd for Claude Code and Codex than a
 desktop agent simulation.
 
 The repository is being built in working vertical slices. Today it contains the
-shared domain and event protocol; daemon, runner, CLI, and observer crates will
-arrive only as each slice becomes executable.
+shared domain/event protocol and the daemon's SQLite state/event store. Runner,
+CLI, and observer crates will arrive only as each slice becomes executable.
 
 ## Non-goals
 

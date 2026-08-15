@@ -8,7 +8,9 @@ This file records constraints, not an aspirational component catalogue.
 1. `factoryd` is the sole owner of processes, scheduling, dependencies,
    concurrency, retries, budgets, durable state, and health.
 2. SQLite is the durable source of truth. State changes and their append-only
-   events commit in the same transaction.
+   events commit in the same transaction. The store uses WAL with `FULL`
+   synchronous writes so acknowledged commands survive more than a process
+   restart.
 3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.
