@@ -8,6 +8,8 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod local;
+
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_ID_LEN: usize = 128;
 
@@ -172,6 +174,13 @@ pub struct TaskSnapshot {
     pub priority: i32,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// A task snapshot together with the instructions supplied to its agent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskDetail {
+    pub snapshot: TaskSnapshot,
+    pub body: String,
 }
 
 /// A durable agent identity. Process-attempt state belongs to [`RunSnapshot`].

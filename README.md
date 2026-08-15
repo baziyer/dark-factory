@@ -5,8 +5,9 @@ observer. The target is closer to systemd for Claude Code and Codex than a
 desktop agent simulation.
 
 The repository is being built in working vertical slices. Today it contains the
-shared domain/event protocol and the daemon's SQLite state/event store. Runner,
-CLI, and observer crates will arrive only as each slice becomes executable.
+shared protocol, the daemon's SQLite state/event store, a versioned local Unix
+socket, and a small machine-readable CLI. The runner and observer will arrive
+only when their slices are executable.
 
 ## Non-goals
 
@@ -25,3 +26,27 @@ cargo test --locked --workspace
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
+
+## Local control plane
+
+Start the daemon and use `factoryctl` from another shell:
+
+```sh
+cargo run -p factoryd
+cargo run -p factoryctl -- health
+cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
+cargo run -p factoryctl -- project list
+cargo run -p factoryctl -- events --follow
+```
+
+Commands emit versioned JSON frames. Pass a returned project ID to
+`task add --project ID --title TITLE --body BODY`. Both programs use
+`$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
+`$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
+List commands expose `--after` and `--limit` cursors. Event subscriptions emit
+their durable replay boundary and a `caught_up` frame before live events.
+
+State is private by construction. Custom database and socket paths must each
+have an immediate parent directory owned by the current user with mode `0700`;
+files and sockets use mode `0600`. The default state directory is created with
+those permissions automatically.

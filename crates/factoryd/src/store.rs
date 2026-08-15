@@ -2,13 +2,14 @@ use std::{path::Path, time::Duration};
 
 use factory_core::{
     AgentId, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
-    TaskId, TaskSnapshot, TaskStatus,
+    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
 };
 use rusqlite::{Connection, Transaction, TransactionBehavior, params, types::Type};
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 1;
 const MAX_EVENT_PAGE: usize = 10_000;
+const MAX_STATE_PAGE: usize = 101;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewProject {
@@ -27,12 +28,6 @@ pub struct NewTask {
     pub priority: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskRecord {
-    pub snapshot: TaskSnapshot,
-    pub body: String,
-}
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("SQLite error: {0}")]
@@ -45,6 +40,8 @@ pub enum StoreError {
     InvalidSchemaVersion(i64),
     #[error("event page size must be between 1 and {MAX_EVENT_PAGE}")]
     InvalidEventLimit,
+    #[error("state page size must be between 1 and {MAX_STATE_PAGE}")]
+    InvalidStateLimit,
     #[error("corrupt event protocol version {0}")]
     CorruptProtocolVersion(i64),
     #[error("serialized factory event has no string type tag")]
@@ -125,8 +122,8 @@ impl Store {
         &mut self,
         input: NewTask,
         now_ms: i64,
-    ) -> Result<(TaskRecord, EventEnvelope)> {
-        let record = TaskRecord {
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let record = TaskDetail {
             snapshot: TaskSnapshot {
                 id: input.id,
                 project_id: input.project_id,
@@ -178,53 +175,81 @@ impl Store {
         ))
     }
 
-    pub fn list_projects(&self) -> Result<Vec<ProjectSnapshot>> {
+    pub fn list_projects(
+        &self,
+        after_id: Option<&ProjectId>,
+        limit: usize,
+    ) -> Result<Vec<ProjectSnapshot>> {
+        if !(1..=MAX_STATE_PAGE).contains(&limit) {
+            return Err(StoreError::InvalidStateLimit);
+        }
         let mut statement = self.connection.prepare(
             "SELECT id, name, root, created_at_ms, updated_at_ms
              FROM projects
-             ORDER BY created_at_ms, id",
+             WHERE (?1 IS NULL OR id > ?1)
+             ORDER BY id
+             LIMIT ?2",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok(ProjectSnapshot {
-                id: parse_id(row.get(0)?, 0)?,
-                name: row.get(1)?,
-                root: row.get(2)?,
-                created_at_ms: row.get(3)?,
-                updated_at_ms: row.get(4)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![after_id.map(ProjectId::as_str), limit as i64],
+            |row| {
+                Ok(ProjectSnapshot {
+                    id: parse_id(row.get(0)?, 0)?,
+                    name: row.get(1)?,
+                    root: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
+                })
+            },
+        )?;
 
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    pub fn list_tasks(&self, project_id: &ProjectId) -> Result<Vec<TaskRecord>> {
+    pub fn list_tasks(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&TaskId>,
+        limit: usize,
+    ) -> Result<Vec<TaskDetail>> {
+        if !(1..=MAX_STATE_PAGE).contains(&limit) {
+            return Err(StoreError::InvalidStateLimit);
+        }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body,
                     status, priority, created_at_ms, updated_at_ms
              FROM tasks
-             WHERE project_id = ?1
-             ORDER BY priority DESC, created_at_ms, id",
+             WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
+             ORDER BY id
+             LIMIT ?3",
         )?;
-        let rows = statement.query_map([project_id.as_str()], |row| {
-            let parent_id: Option<String> = row.get(2)?;
-            let assigned_id: Option<String> = row.get(3)?;
-            let status: String = row.get(6)?;
-            Ok(TaskRecord {
-                snapshot: TaskSnapshot {
-                    id: parse_id(row.get(0)?, 0)?,
-                    project_id: parse_id(row.get(1)?, 1)?,
-                    parent_task_id: parse_optional_id(parent_id, 2)?,
-                    depends_on: Vec::new(),
-                    assigned_agent_id: parse_optional_id(assigned_id, 3)?,
-                    title: row.get(4)?,
-                    status: parse_task_status(&status, 6)?,
-                    priority: row.get(7)?,
-                    created_at_ms: row.get(8)?,
-                    updated_at_ms: row.get(9)?,
-                },
-                body: row.get(5)?,
-            })
-        })?;
+        let rows = statement.query_map(
+            params![
+                project_id.as_str(),
+                after_id.map(TaskId::as_str),
+                limit as i64
+            ],
+            |row| {
+                let parent_id: Option<String> = row.get(2)?;
+                let assigned_id: Option<String> = row.get(3)?;
+                let status: String = row.get(6)?;
+                Ok(TaskDetail {
+                    snapshot: TaskSnapshot {
+                        id: parse_id(row.get(0)?, 0)?,
+                        project_id: parse_id(row.get(1)?, 1)?,
+                        parent_task_id: parse_optional_id(parent_id, 2)?,
+                        depends_on: Vec::new(),
+                        assigned_agent_id: parse_optional_id(assigned_id, 3)?,
+                        title: row.get(4)?,
+                        status: parse_task_status(&status, 6)?,
+                        priority: row.get(7)?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
+                    },
+                    body: row.get(5)?,
+                })
+            },
+        )?;
 
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
@@ -264,6 +289,14 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    pub fn latest_event_sequence(&self) -> Result<i64> {
+        Ok(self
+            .connection
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                row.get(0)
+            })?)
     }
 }
 

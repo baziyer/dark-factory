@@ -47,8 +47,10 @@ fn project_task_and_events_survive_reopen() {
     }
 
     let store = Store::open(&database).unwrap();
-    let projects = store.list_projects().unwrap();
-    let tasks = store.list_tasks(&project_id("dark-factory")).unwrap();
+    let projects = store.list_projects(None, 100).unwrap();
+    let tasks = store
+        .list_tasks(&project_id("dark-factory"), None, 100)
+        .unwrap();
     let events = store.events_after(0, 100).unwrap();
 
     assert_eq!(projects.len(), 1);
@@ -80,6 +82,7 @@ fn a_rejected_state_change_does_not_append_an_event() {
 #[test]
 fn event_replay_respects_cursor_and_limit() {
     let mut store = Store::open_in_memory().unwrap();
+    assert_eq!(store.latest_event_sequence().unwrap(), 0);
     for index in 1..=3 {
         store
             .create_project(
@@ -96,6 +99,7 @@ fn event_replay_respects_cursor_and_limit() {
     let events = store.events_after(1, 1).unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].sequence, 2);
+    assert_eq!(store.latest_event_sequence().unwrap(), 3);
 }
 
 #[test]
@@ -166,4 +170,62 @@ fn task_parents_must_be_distinct_and_in_the_same_project() {
     assert!(cross_project.is_err());
     assert!(self_parent.is_err());
     assert_eq!(store.events_after(0, 100).unwrap().len(), 4);
+}
+
+#[test]
+fn list_pages_use_a_stable_id_cursor() {
+    let mut store = Store::open_in_memory().unwrap();
+    for id in ["project-c", "project-a", "project-b"] {
+        store
+            .create_project(
+                NewProject {
+                    id: project_id(id),
+                    name: id.into(),
+                    root: format!("/work/{id}"),
+                },
+                1_000,
+            )
+            .unwrap();
+    }
+    for id in ["task-c", "task-a", "task-b"] {
+        store
+            .create_task(
+                NewTask {
+                    id: task_id(id),
+                    project_id: project_id("project-a"),
+                    parent_task_id: None,
+                    title: id.into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                2_000,
+            )
+            .unwrap();
+    }
+
+    let projects = store.list_projects(None, 2).unwrap();
+    assert_eq!(
+        projects
+            .iter()
+            .map(|project| project.id.as_str())
+            .collect::<Vec<_>>(),
+        ["project-a", "project-b"]
+    );
+    let projects = store
+        .list_projects(Some(&project_id("project-b")), 2)
+        .unwrap();
+    assert_eq!(projects[0].id, project_id("project-c"));
+
+    let tasks = store.list_tasks(&project_id("project-a"), None, 2).unwrap();
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.snapshot.id.as_str())
+            .collect::<Vec<_>>(),
+        ["task-a", "task-b"]
+    );
+    let tasks = store
+        .list_tasks(&project_id("project-a"), Some(&task_id("task-b")), 2)
+        .unwrap();
+    assert_eq!(tasks[0].snapshot.id, task_id("task-c"));
 }
