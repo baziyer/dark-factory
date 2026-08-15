@@ -2,8 +2,9 @@ use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES,
-        MAX_RUNNER_SPOOL_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope,
-        RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION,
+        RequestEnvelope, RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame,
+        RunnerRequest,
     },
 };
 
@@ -315,6 +316,11 @@ fn maximum_output_text_stays_within_the_bounded_frame_contract() {
     };
 
     assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_RUNNER_FRAME_BYTES);
+}
+
+#[test]
+fn startup_input_has_one_shared_hard_limit() {
+    assert_eq!(MAX_STARTUP_STDIN_BYTES, 1024 * 1024);
 }
 
 #[test]

@@ -19,8 +19,9 @@ use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES,
-        MAX_RUNNER_SPOOL_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope,
-        RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION,
+        RequestEnvelope, RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame,
+        RunnerRequest,
     },
 };
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
@@ -41,7 +42,6 @@ const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
-pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

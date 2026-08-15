@@ -14,6 +14,9 @@ This file records constraints, not an aspirational component catalogue.
 3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.
+   `factoryd` resolves a trusted absolute runner path before spawning it, clears
+   the daemon's ambient environment to a fixed non-secret allowlist, and sends
+   bounded task bytes only over runner stdin—not argv or environment variables.
    It creates a private socket and bounded event spool before directly spawning
    one process group. Events are appended before publication. Runners prove both
    run ID and a random runner-instance ID, retain terminal state until its exact
