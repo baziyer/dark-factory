@@ -1,6 +1,6 @@
 use std::{
     env, fs,
-    io::Write,
+    io::{Read, Write},
     process, thread,
     time::{Duration, Instant},
 };
@@ -24,6 +24,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout_bytes = 0;
     let mut invalid_stderr = false;
     let mut split_utf8 = false;
+    let mut stdin_to_stdout = false;
+    let mut touch_marker = None;
     let mut child_marker = None;
     let mut spawn_child_marker = None;
 
@@ -46,6 +48,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             "--stdout-bytes" => stdout_bytes = required(&mut args, "--stdout-bytes")?.parse()?,
             "--invalid-stderr" => invalid_stderr = true,
             "--split-utf8" => split_utf8 = true,
+            "--stdin-to-stdout" => stdin_to_stdout = true,
+            "--touch-marker" => touch_marker = Some(required(&mut args, "--touch-marker")?),
             "--child-marker" => child_marker = Some(required(&mut args, "--child-marker")?),
             "--spawn-child-marker" => {
                 spawn_child_marker = Some(required(&mut args, "--spawn-child-marker")?);
@@ -60,6 +64,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if let Some(marker) = touch_marker {
+        fs::write(marker, process::id().to_string())?;
+    }
+
     let mut spawned_child = if let Some(marker) = spawn_child_marker {
         Some(
             process::Command::new(env::current_exe()?)
@@ -69,6 +77,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    if stdin_to_stdout {
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input)?;
+        std::io::stdout().write_all(&input)?;
+        std::io::stdout().flush()?;
+    }
 
     if let Some(text) = stdout_text {
         std::io::stdout().write_all(text.as_bytes())?;

@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -23,6 +23,7 @@ const INSTANCE_ID: &str = "instance-1";
 
 struct RunningRunner {
     child: Option<Child>,
+    stderr: Option<std::process::ChildStderr>,
     runtime: PathBuf,
     _directory: tempfile::TempDir,
 }
@@ -32,20 +33,68 @@ impl RunningRunner {
         Self::spawn_program(Path::new(env!("CARGO_BIN_EXE_fake-agent")), agent_args)
     }
 
+    fn spawn_with_startup_input(agent_args: &[&str], input: &[u8]) -> Self {
+        Self::spawn_program_with_startup_input(
+            Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+            agent_args,
+            input,
+        )
+    }
+
     fn spawn_program(program: &Path, agent_args: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("run");
-        let child = runner_command(&runtime, directory.path(), program, agent_args)
+        let mut child = runner_command(&runtime, directory.path(), program, agent_args, None)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
+        let stderr = child.stderr.take();
         let mut runner = Self {
             child: Some(child),
+            stderr,
             runtime,
             _directory: directory,
         };
+        runner.wait_until_ready();
+        runner
+    }
+
+    fn spawn_program_with_startup_input(program: &Path, agent_args: &[&str], input: &[u8]) -> Self {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = directory.path().join("run");
+        let mut child = runner_command(
+            &runtime,
+            directory.path(),
+            program,
+            agent_args,
+            Some(input.len()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let stderr = child.stderr.take();
+        let mut stdin = child.stdin.take().unwrap();
+        let input = input.to_vec();
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = stdin.write_all(&input);
+            drop(stdin);
+            let _ = sent.send(result);
+        });
+        let mut runner = Self {
+            child: Some(child),
+            stderr,
+            runtime,
+            _directory: directory,
+        };
+        received
+            .recv_timeout(Duration::from_secs(2))
+            .expect("startup input producer remained blocked")
+            .unwrap();
         runner.wait_until_ready();
         runner
     }
@@ -65,7 +114,11 @@ impl RunningRunner {
                 return;
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                panic!("runner exited before ready: {status}");
+                let mut stderr = String::new();
+                if let Some(mut pipe) = self.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!("runner exited before ready: {status}; stderr: {stderr:?}");
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -117,7 +170,13 @@ impl RunningRunner {
     }
 }
 
-fn runner_command(runtime: &Path, cwd: &Path, program: &Path, agent_args: &[&str]) -> Command {
+fn runner_command(
+    runtime: &Path,
+    cwd: &Path,
+    program: &Path,
+    agent_args: &[&str],
+    stdin_bytes: Option<usize>,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_factory-runner"));
     command
         .arg("--run-id")
@@ -127,10 +186,11 @@ fn runner_command(runtime: &Path, cwd: &Path, program: &Path, agent_args: &[&str
         .arg("--runtime-dir")
         .arg(runtime)
         .arg("--cwd")
-        .arg(cwd)
-        .arg("--")
-        .arg(program)
-        .args(agent_args);
+        .arg(cwd);
+    if let Some(stdin_bytes) = stdin_bytes {
+        command.arg("--stdin-bytes").arg(stdin_bytes.to_string());
+    }
+    command.arg("--").arg(program).args(agent_args);
     command
 }
 
@@ -295,6 +355,227 @@ fn assert_command_ack(frame: RunnerFrame, command_id: &str) {
             command_id: command_id.into(),
         }
     );
+}
+
+fn stdout_text(frames: &[RunnerFrame]) -> String {
+    event_frames(frames)
+        .into_iter()
+        .filter_map(|(_, event)| match event {
+            RunnerEvent::Output {
+                stream: OutputStream::Stdout,
+                text,
+                ..
+            } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn assert_startup_input_rejected(declared_bytes: usize, input: &[u8]) {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("run");
+    let marker = directory.path().join("spawned");
+    let mut child = runner_command(
+        &runtime,
+        directory.path(),
+        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+        &["--touch-marker", marker.to_str().unwrap()],
+        Some(declared_bytes),
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(input);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if marker.exists() || runtime.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("invalid startup input reached runtime or child spawn");
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            assert!(!marker.exists());
+            assert!(!runtime.exists());
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("runner did not reject invalid startup input");
+}
+
+#[test]
+fn wrapped_agent_stdin_is_closed_by_default() {
+    let runner = RunningRunner::spawn(&["--stdin-to-stdout"]);
+    runner.wait_for_terminal_spool();
+
+    let frames = subscribe_through_terminal(&runner, 0);
+    assert_eq!(stdout_text(&frames), "");
+    assert!(matches!(
+        event_frames(&frames).last().unwrap().1,
+        RunnerEvent::Exited {
+            exit_code: Some(0),
+            signal: None,
+        }
+    ));
+
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "default-stdin-closed"),
+        "default-stdin-closed",
+    );
+    runner.wait_for_clean_exit();
+}
+
+#[test]
+fn framed_startup_input_is_exact_and_preserves_replay_and_ack() {
+    let input = b"first line\n{\"kind\":\"turn\",\"message\":\"hello factory\"}\nlast line\n";
+    let runner = RunningRunner::spawn_with_startup_input(&["--stdin-to-stdout"], input);
+    runner.wait_for_terminal_spool();
+
+    let frames = subscribe_through_terminal(&runner, 0);
+    assert_eq!(stdout_text(&frames).as_bytes(), input);
+    let events = event_frames(&frames);
+    assert!(matches!(
+        events.first().unwrap().1,
+        RunnerEvent::Started { .. }
+    ));
+    assert!(matches!(
+        events.last().unwrap().1,
+        RunnerEvent::Exited {
+            exit_code: Some(0),
+            signal: None,
+        }
+    ));
+
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "inherited-stdin-persisted"),
+        "inherited-stdin-persisted",
+    );
+    runner.wait_for_clean_exit();
+}
+
+#[test]
+fn startup_input_producer_finishes_when_the_child_exits_without_reading() {
+    let input = vec![b'x'; 64 * 1024];
+    let runner = RunningRunner::spawn_with_startup_input(&[], &input);
+    runner.wait_for_terminal_spool();
+
+    let frames = subscribe_through_terminal(&runner, 0);
+    let events = event_frames(&frames);
+    assert_eq!(events.len(), 2, "unexpected lifecycle: {events:?}");
+    assert!(matches!(events[0].1, RunnerEvent::Started { .. }));
+    assert!(matches!(
+        events[1].1,
+        RunnerEvent::Exited {
+            exit_code: Some(0),
+            signal: None,
+        }
+    ));
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "early-exit-input-terminal"),
+        "early-exit-input-terminal",
+    );
+    runner.wait_for_clean_exit();
+}
+
+#[test]
+fn stop_with_unread_startup_input_allows_term_cleanup_and_records_exit() {
+    let directory = tempfile::tempdir().unwrap();
+    let ready = directory.path().join("ready");
+    let cleanup = directory.path().join("cleanup");
+    let input = vec![b'x'; 1024 * 1024];
+    let runner = RunningRunner::spawn_program_with_startup_input(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "trap 'exec 0<&-; sleep 0.2; echo cleaned > \"$1\"; exit 0' TERM; echo ready > \"$2\"; while :; do sleep 1; done",
+            "sh",
+            cleanup.to_str().unwrap(),
+            ready.to_str().unwrap(),
+        ],
+        &input,
+    );
+    wait_for_path(&ready);
+
+    assert_command_ack(
+        request(
+            &runner,
+            INSTANCE_ID,
+            RunnerRequest::Stop {
+                command_id: "stop-pending-input".into(),
+                grace_ms: 1000,
+            },
+        ),
+        "stop-pending-input",
+    );
+    runner.wait_for_terminal_spool();
+    wait_for_path(&cleanup);
+
+    let frames = subscribe_through_terminal(&runner, 0);
+    assert!(matches!(
+        event_frames(&frames).last().unwrap().1,
+        RunnerEvent::Exited {
+            exit_code: Some(0),
+            signal: None,
+        }
+    ));
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "stopped-input-persisted"),
+        "stopped-input-persisted",
+    );
+    runner.wait_for_clean_exit();
+}
+
+#[test]
+fn invalid_startup_input_is_rejected_before_runtime_or_child_spawn() {
+    assert_startup_input_rejected(4, b"abc");
+    assert_startup_input_rejected(3, b"four");
+    assert_startup_input_rejected(1024 * 1024 + 1, b"");
+}
+
+#[test]
+fn invalid_cli_is_rejected_before_reading_declared_stdin() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = directory.path().join("run");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_factory-runner"))
+        .arg("--run-id")
+        .arg(RUN_ID)
+        .arg("--runner-instance-id")
+        .arg(INSTANCE_ID)
+        .arg("--runtime-dir")
+        .arg(&runtime)
+        .arg("--cwd")
+        .arg(directory.path())
+        .arg("--stdin-bytes")
+        .arg("1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let _open_stdin = child.stdin.take().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(!status.success());
+            assert!(!runtime.exists());
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("runner read framed stdin before rejecting its missing program");
 }
 
 #[test]
@@ -921,6 +1202,7 @@ fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
         directory.path(),
         program,
         &["--child-marker", marker_argument],
+        None,
     )
     .status()
     .unwrap();
@@ -937,6 +1219,7 @@ fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
         directory.path(),
         program,
         &["--child-marker", marker_argument],
+        None,
     )
     .status()
     .unwrap();

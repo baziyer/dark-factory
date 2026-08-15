@@ -41,6 +41,7 @@ const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
+pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -54,12 +55,12 @@ pub enum Error {
     Task(String),
 }
 
-#[derive(Clone, Debug)]
 pub struct Config {
     pub run_id: RunId,
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    pub startup_input: Option<Vec<u8>>,
     pub program: PathBuf,
     pub arguments: Vec<String>,
 }
@@ -458,6 +459,15 @@ fn validate_config(config: &Config) -> Result<(), Error> {
         return Err(Error::InvalidArguments(
             "agent program must not be empty".into(),
         ));
+    }
+    if config
+        .startup_input
+        .as_ref()
+        .is_some_and(|input| input.len() > MAX_STARTUP_STDIN_BYTES)
+    {
+        return Err(Error::InvalidArguments(format!(
+            "startup stdin exceeds the {MAX_STARTUP_STDIN_BYTES}-byte limit"
+        )));
     }
     let metadata = std::fs::metadata(&config.cwd)
         .map_err(|error| Error::InvalidArguments(format!("invalid cwd: {error}")))?;
@@ -910,11 +920,24 @@ async fn supervise(
     if *runner_shutdown.borrow() {
         return Ok(SupervisionOutcome::RunnerSignalled);
     }
+    let stdin = match prepare_startup_stdin(config.startup_input) {
+        Ok(stdin) => stdin,
+        Err(error) => {
+            log.append_lifecycle(
+                RunnerEvent::SpawnFailed {
+                    message: truncate_utf8(error.to_string(), MAX_RUNNER_ERROR_BYTES),
+                },
+                true,
+            )
+            .await?;
+            return Ok(SupervisionOutcome::AwaitAcknowledgement);
+        }
+    };
     let mut command = Command::new(&config.program);
     command
         .args(&config.arguments)
         .current_dir(&config.cwd)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.as_std_mut().process_group(0);
@@ -932,6 +955,7 @@ async fn supervise(
             return Ok(SupervisionOutcome::AwaitAcknowledgement);
         }
     };
+    drop(command);
     let child_pid = child
         .id()
         .ok_or_else(|| Error::Task("spawned child has no process ID".into()))?;
@@ -1058,6 +1082,17 @@ async fn supervise(
     } else {
         Ok(SupervisionOutcome::AwaitAcknowledgement)
     }
+}
+
+fn prepare_startup_stdin(input: Option<Vec<u8>>) -> Result<Stdio, Error> {
+    let Some(input) = input else {
+        return Ok(Stdio::null());
+    };
+    let mut file = tempfile::tempfile()?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    std::io::Write::write_all(&mut file, &input)?;
+    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0))?;
+    Ok(Stdio::from(file))
 }
 
 fn begin_group_termination(
@@ -1226,8 +1261,26 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DecodedChunk, decode_available};
-    use factory_core::runner::MAX_RUNNER_OUTPUT_TEXT_BYTES;
+    use super::{
+        Config, DecodedChunk, Error, MAX_STARTUP_STDIN_BYTES, decode_available, validate_config,
+    };
+    use factory_core::{RunId, RunnerInstanceId, runner::MAX_RUNNER_OUTPUT_TEXT_BYTES};
+
+    #[test]
+    fn config_rejects_startup_input_over_the_hard_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = validate_config(&Config {
+            run_id: RunId::try_from("run-1").unwrap(),
+            runner_instance_id: RunnerInstanceId::try_from("instance-1").unwrap(),
+            runtime_dir: directory.path().join("run"),
+            cwd: directory.path().to_owned(),
+            startup_input: Some(vec![0; MAX_STARTUP_STDIN_BYTES + 1]),
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(error, Error::InvalidArguments(message) if message.contains("stdin")));
+    }
 
     #[test]
     fn decoder_preserves_a_scalar_split_across_reads() {
