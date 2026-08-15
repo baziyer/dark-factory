@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod local;
+pub mod runner;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_ID_LEN: usize = 128;
@@ -97,6 +98,7 @@ id_type!(ProjectId);
 id_type!(TaskId);
 id_type!(AgentId);
 id_type!(RunId);
+id_type!(RunnerInstanceId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
