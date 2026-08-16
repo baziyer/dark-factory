@@ -17,7 +17,7 @@ This file records constraints, not an aspirational component catalogue.
    events; SQLite still owns the identities (projects, agents) those files are
    keyed by, and the daemon creates and bounds the files but never treats
    their content as part of the durable ledger.
-3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
+3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.
    `factoryd` resolves a trusted absolute runner path before spawning it, clears
@@ -85,16 +85,18 @@ This file records constraints, not an aspirational component catalogue.
    subscription captures a durable replay head and marks when it has caught up.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
    message is a durable write before it wakes the orchestrator.
-7. The UI repaints on input or factory events. Elapsed-time labels may request a
-   coarse repaint while visible; no background animation or state polling is a
-   source of truth.
+7. The board repaints on input or factory events; embedded agent terminals
+   repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
+   for elapsed-time labels and activity sparklines while visible; no
+   background animation or state polling is a source of truth.
 8. The orchestrator uses the same durable task and message interfaces as other
    clients. It may choose work, but it cannot bypass daemon-owned limits.
 
 ## First launch
 
 `factoryd` starts from an empty database. A human creates projects, agents, and
-tasks through `factoryctl` or its native UI and explicitly assigns each v1 run.
+tasks through `factoryctl` or the `factory-tui` board and explicitly assigns
+each v1 run.
 The daemon starts the worker through `factory-runner`, normalises structured
 provider events, and streams persisted state to disposable observers. A launch
 is proven only after a real provider command has run and an observer and daemon

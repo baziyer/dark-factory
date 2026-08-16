@@ -33,7 +33,7 @@ repeated as a backlog item.
 - Decide whether active-run messages should remain queued or be delivered as a
   provider-acknowledged next turn; never inject unacknowledged raw PTY input.
 - Decide and document the security policy for any future interactive terminal
-  embedded in the native UI.
+  embedded in the `factory-tui` board.
 - Add richer activity inspection and first-class blocked-question/document
   workflows.
 

@@ -4,8 +4,9 @@ set -eu
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repository_root=$(CDPATH= cd -- "$script_directory/.." && pwd)
 factoryctl="$repository_root/target/release/factoryctl"
+factory_tui="$repository_root/target/release/factory-tui"
 
-if [ ! -x "$factoryctl" ]; then
+if [ ! -x "$factoryctl" ] || [ ! -x "$factory_tui" ]; then
     echo "Dark Factory release binaries are missing." >&2
     echo "Run: cargo +1.85.0 build --locked --workspace --release" >&2
     exit 1
@@ -20,4 +21,4 @@ if ! "$factoryctl" health >/dev/null 2>&1; then
 fi
 
 echo "Dark Factory UI is running in the foreground. Close it with Ctrl-C; factoryd remains managed separately." >&2
-exec "$factoryctl" ui
+exec "$factory_tui"

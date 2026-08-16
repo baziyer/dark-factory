@@ -148,10 +148,9 @@ integer math (no float precision-loss lint dodging needed).
   `ActivitySeries`, `braille_sparkline`) and all key-handling. No sockets, no PTYs, no `Frame` —
   fully unit tested (`cargo test -p factory-tui`) without a terminal or a daemon.
 - `net.rs` — every socket touch: `resolve_socket_path`, project-list bootstrap, a project
-  session (consistent initial snapshot + `Subscribe` forever with reconnect/backoff, mirroring
-  `crates/factoryctl/src/ui.rs`'s egui-UI patterns), and one-shot request threads for operator
-  actions. Reports back to the render loop over an `mpsc::Sender<NetMsg>` — nothing here ever
-  touches the terminal.
+  session (consistent initial snapshot + `Subscribe` forever with reconnect/backoff), and one-shot
+  request threads for operator actions. Reports back to the render loop over an
+  `mpsc::Sender<NetMsg>` — nothing here ever touches the terminal.
 - `ui/` — pure rendering of `Board` (`floor.rs`, `log.rs`, `lists.rs`, `help.rs` for the
   status line and the prompt/picker/confirm overlays), dispatched from `ui/mod.rs::draw`.
 - `pane.rs`, `keys.rs`, `query.rs` — unchanged from the fidelity spike (a local-PTY child, the

@@ -205,8 +205,7 @@ fn load_event_sequence(client: &Client) -> Result<i64, String> {
 type ProjectSnapshotData = (Vec<AgentSnapshot>, Vec<TaskDetail>, Vec<RunSnapshot>, i64);
 
 /// Loads agents/tasks/runs for a project together with the event sequence they're consistent
-/// with, retrying (bounded) if the daemon's event head moved mid-load. Mirrors the technique
-/// `crates/factoryctl/src/ui.rs::load_consistent_snapshot` uses for the egui UI.
+/// with, retrying (bounded) if the daemon's event head moved mid-load.
 fn load_consistent_project_snapshot(
     client: &Client,
     project_id: &ProjectId,

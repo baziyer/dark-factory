@@ -6,7 +6,8 @@ desktop agent simulation.
 
 The first-launch system contains a SQLite-backed daemon, stable per-run process
 sidecars, concrete Claude Code and Codex adapters, a versioned private Unix
-socket, a machine-readable v1 CLI, and an event-driven native egui UI.
+socket, a machine-readable v1 CLI, and an event-driven ratatui operator board
+(`factory-tui`).
 Task reservation, provider-session ownership, runner replay, terminal outcome,
 and observer health are durable. Restarting the daemon, CLI, or UI does not stop
 an agent process.
@@ -73,7 +74,7 @@ cargo run -p factoryctl -- project delete --project PROJECT_ID
 cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID
 cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
-cargo run -p factoryctl -- ui
+cargo run -p factory-tui
 ```
 
 Every command, group, and subcommand accepts `--help`/`-h` and prints usage
@@ -81,10 +82,10 @@ text to stdout without contacting the daemon (for example `factoryctl task
 --help` or `factoryctl task cancel --help`).
 
 For the installed local release, use `./scripts/launch-ui.sh`. It checks the
-release binary and daemon first, then keeps the native UI attached to the
-current terminal. Leave that terminal open while using the UI; `Ctrl-C` closes
-the observer only. `factoryd` is a separate launchd service and survives UI or
-CLI shutdown.
+release binaries and daemon first, then keeps `factory-tui` attached to the
+current terminal. Leave that terminal open while using the board; `Ctrl-C`
+closes the observer only. `factoryd` is a separate launchd service and
+survives board or CLI shutdown.
 
 Commands emit versioned JSON frames. `task start` returns `run_accepted` once
 the task reservation is durable; runner readiness and completion arrive as
@@ -95,7 +96,7 @@ Agent profiles carry a provider-scoped `model` and `permission_mode` (Claude:
 `default`/`acceptEdits`/`plan`; Codex: `on-request`/`never`; `permission_mode`
 is stored and shown but not yet consumed by launch). Standing guidance and
 memory are file-backed, not database columns; see "Guidance files" below.
-`agent message` and the native inspector use one private durable
+`agent message` and `agent inbox` use one private durable
 inbox; messages are delivered with the next explicit task start and never enter
 public events. List commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
@@ -174,7 +175,8 @@ It puts the local terminal in raw mode, replays the retained log from
 `--since-offset` (default `0`, the full retained window) before switching to
 live bytes, forwards stdin as input, and forwards local window-size changes as
 resizes. Press `Ctrl-]` to detach; the terminal is restored on detach, EOF, or
-an unexpected exit. This is CLI-only — the egui UI does not expose it.
+an unexpected exit. This is CLI-only, separate from `factory-tui`'s own
+embedded agent panes.
 
 ## The Minerva webhook endpoint
 
@@ -210,10 +212,10 @@ external to the daemon.
 ## First-launch boundary and roadmap
 
 V1 is intentionally explicit: create projects, agents, and tasks, then choose
-the agent and worktree for each start. The native UI provides the same control
-surface as the JSON CLI plus project/task/agent/run inspection, bounded local
-runner output and stop control, assignment-derived queues, observer health,
-retry for terminal tasks, and recent durable events.
+the agent and worktree for each start. `factory-tui` provides the same control
+surface as the JSON CLI plus project/task/agent/run inspection, stop control,
+assignment-derived queues, observer health, retry for terminal tasks, and
+recent durable events.
 
 The unfinished product roadmap is kept in
 [ROADMAP.md](ROADMAP.md). It covers the God command center and agent operations,

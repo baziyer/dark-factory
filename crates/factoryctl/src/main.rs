@@ -9,17 +9,15 @@ use factoryctl::Client;
 use uuid::Uuid;
 
 mod attach;
-mod ui;
 mod usage;
 
 const USAGE: &str =
-    "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|attach|events> ...";
+    "usage: factoryctl [--socket PATH] <health|usage|project|task|agent|run|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
-Run the daemon separately (launchd keeps it alive), then run `factoryctl ui` in a persistent terminal.
+Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
 
 Commands:
-  ui                                          Open the native control plane
   health                                      Check the daemon
   usage                                       Probe Codex subscription usage on demand
   project add|list|delete|get|guidance        Manage projects and their guidance file
@@ -45,10 +43,6 @@ const USAGE_HELP: &str = "usage: factoryctl usage
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
 result. No daemon or socket is involved and nothing is persisted; Claude's
 usage is read by running `/usage` inside Claude's own interactive terminal.";
-const UI_HELP: &str = "usage: factoryctl ui
-
-Open the native (egui) control plane. It is being retired in favor of a
-ratatui terminal UI; prefer the other subcommands for scripting.";
 const EVENTS_HELP: &str = "usage: factoryctl events [--after N] [--limit N] [--follow]
 
 Read durable events from the daemon.
@@ -421,7 +415,6 @@ const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
     Help(&'static str),
-    Ui,
     Health,
     Usage,
     ProjectAdd {
@@ -585,10 +578,6 @@ fn run() -> Result<i32, String> {
         home.as_deref(),
     )?;
     let client = Client::new(socket);
-    if matches!(command, CliCommand::Ui) {
-        ui::run(client)?;
-        return Ok(0);
-    }
     if let CliCommand::Attach {
         project_id,
         run_id,
@@ -749,13 +738,6 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             }
             require_empty(&args)?;
             Ok((socket, CliCommand::Usage))
-        }
-        "ui" => {
-            if wants_help(&args) {
-                return Ok((socket, CliCommand::Help(UI_HELP)));
-            }
-            require_empty(&args)?;
-            Ok((socket, CliCommand::Ui))
         }
         "project" => parse_project(args).map(|command| (socket, command)),
         "task" => parse_task(args).map(|command| (socket, command)),
@@ -1173,7 +1155,6 @@ fn parse_events(mut args: Vec<String>) -> Result<CliCommand, String> {
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
-        CliCommand::Ui => Err("ui is handled before local requests".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Usage => Err("usage is handled before local requests".into()),
         CliCommand::ProjectAdd { id, name, root } => Ok(LocalRequest::CreateProject {
@@ -1573,10 +1554,6 @@ mod tests {
         assert_eq!(
             parse_args(args(&["-h"])).unwrap(),
             (None, CliCommand::Help(HELP))
-        );
-        assert_eq!(
-            parse_args(args(&["ui", "--help"])).unwrap(),
-            (None, CliCommand::Help(UI_HELP))
         );
     }
 

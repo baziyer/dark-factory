@@ -1,6 +1,7 @@
 //! `factoryctl attach`: raw terminal passthrough to one terminal-mode run's
 //! PTY. This is an operator escape hatch and a proof that the runner/daemon
-//! terminal wire works end to end; it is CLI-only and has no egui counterpart.
+//! terminal wire works end to end; it is CLI-only and separate from the
+//! `factory-tui` board's embedded panes.
 
 use std::{
     io::{Read, Write},
