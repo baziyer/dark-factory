@@ -164,7 +164,13 @@ impl FactoryApp {
                     }
                     self.connection = ConnectionState::Live;
                 }
-                UiMessage::Event(event) => self.apply_event(event),
+                UiMessage::Event(event) => {
+                    let refresh_details = event_requires_detail_refresh(&event);
+                    self.apply_event(event);
+                    if refresh_details {
+                        self.refresh(context);
+                    }
+                }
                 UiMessage::Operation(result) => match result {
                     Ok(message) => {
                         self.notice = Some(message);
@@ -741,6 +747,13 @@ fn task_result_text(task: &TaskDetail) -> Option<&str> {
     task.result.as_deref()
 }
 
+fn event_requires_detail_refresh(envelope: &EventEnvelope) -> bool {
+    matches!(
+        &envelope.event,
+        FactoryEvent::TaskChanged { task } if task.status.is_terminal()
+    )
+}
+
 fn short_id(prefix: &str) -> String {
     let uuid = Uuid::new_v4().simple().to_string();
     format!("{prefix}-{}", &uuid[..8])
@@ -985,11 +998,11 @@ fn operation_message(response: LocalResponse) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use factory_core::{
-        AgentId, AgentRole, AgentSnapshot, ObserverHealth, ProjectId, Provider, RunId, RunSnapshot,
-        RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
+        AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth, ProjectId,
+        Provider, RunId, RunSnapshot, RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
     };
 
-    use super::{TaskColumn, agent_card_text, task_result_text};
+    use super::{TaskColumn, agent_card_text, event_requires_detail_refresh, task_result_text};
 
     #[test]
     fn board_columns_are_a_total_task_status_projection() {
@@ -1063,5 +1076,30 @@ mod tests {
         };
 
         assert_eq!(task_result_text(&task), Some("The bounded provider answer"));
+    }
+
+    #[test]
+    fn terminal_task_events_request_a_detail_refresh() {
+        let event = EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 2,
+            event: FactoryEvent::TaskChanged {
+                task: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("task-1").unwrap(),
+                    project_id: ProjectId::try_from("factory").unwrap(),
+                    parent_task_id: None,
+                    depends_on: Vec::new(),
+                    assigned_agent_id: None,
+                    title: "Completed task".into(),
+                    status: TaskStatus::Succeeded,
+                    priority: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 2,
+                },
+            },
+        };
+
+        assert!(event_requires_detail_refresh(&event));
     }
 }
