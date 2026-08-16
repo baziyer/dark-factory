@@ -12,7 +12,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, ProjectId, Provider, RunFailureReason, RunId, RunnerInstanceId, TaskId,
+    AgentId, ObserverHealth, ProjectId, Provider, RunFailureReason, RunId, RunnerInstanceId,
+    TaskId,
     runner::{RunnerEvent, RunnerEventEnvelope},
 };
 use thiserror::Error;
@@ -442,6 +443,7 @@ async fn start_run_inner(
         runtime_dir,
         terminal_sequence: None,
         child: Some(child),
+        observer_health: ObserverHealth::Unknown,
         absence_authoritative: true,
         launch_pending: true,
         retry_delay: RECOVERY_RETRY_DELAY,
@@ -463,7 +465,8 @@ async fn recover_run(
             runtime_dir: run.runtime_dir,
             terminal_sequence: run.terminal_sequence,
             child: None,
-            absence_authoritative: true,
+            observer_health: run.observer_health,
+            absence_authoritative: run.observer_health == ObserverHealth::Healthy,
             launch_pending: false,
             retry_delay: RECOVERY_RETRY_DELAY,
         },
@@ -477,6 +480,7 @@ struct RecoveryWork {
     target: WatchTarget,
     runtime_dir: PathBuf,
     terminal_sequence: Option<i64>,
+    observer_health: ObserverHealth,
 }
 
 impl RecoveryWork {
@@ -490,6 +494,7 @@ impl RecoveryWork {
             },
             runtime_dir: PathBuf::from(run.runner_runtime),
             terminal_sequence: run.terminal_runner_sequence,
+            observer_health: run.observer_health,
         }
     }
 }
@@ -500,6 +505,7 @@ struct RunContext {
     runtime_dir: PathBuf,
     terminal_sequence: Option<i64>,
     child: Option<Child>,
+    observer_health: ObserverHealth,
     absence_authoritative: bool,
     launch_pending: bool,
     retry_delay: Duration,
@@ -548,6 +554,7 @@ async fn observe_run(
             Err(error) if manager_fatal(&error) => return Err(error),
             Err(error) => {
                 if distrusts_absence(&error) {
+                    set_observer_health(state, &mut context, ObserverHealth::Degraded).await?;
                     context.absence_authoritative = false;
                 }
                 tracing::warn!(
@@ -601,13 +608,13 @@ async fn supervise_run(
         .await?
         {
             Attach::Connected(subscription) => {
-                context.absence_authoritative = true;
                 context.launch_pending = false;
                 subscription
             }
             Attach::Shutdown => return Ok(()),
             Attach::Missing => {
                 if !context.absence_authoritative {
+                    set_observer_health(state, context, ObserverHealth::Degraded).await?;
                     return Err(Error::RunnerUnavailable);
                 }
                 if let Some(terminal) = context.terminal_sequence {
@@ -617,8 +624,12 @@ async fn supervise_run(
                     reconcile_terminal(state, context, terminal).await?;
                 } else {
                     match poll_child(&mut context.child)? {
-                        ChildState::Running => return Err(Error::RunnerUnavailable),
+                        ChildState::Running => {
+                            set_observer_health(state, context, ObserverHealth::Degraded).await?;
+                            return Err(Error::RunnerUnavailable);
+                        }
                         ChildState::ExitedBySignal => {
+                            set_observer_health(state, context, ObserverHealth::Degraded).await?;
                             context.absence_authoritative = false;
                             return Err(Error::RunnerUnavailable);
                         }
@@ -639,11 +650,13 @@ async fn supervise_run(
                 return Ok(());
             }
             Attach::Unreachable => {
-                if !context.absence_authoritative {
+                if !context.absence_authoritative && context.child.is_none() {
+                    set_observer_health(state, context, ObserverHealth::Degraded).await?;
                     return Err(Error::RunnerUnavailable);
                 }
                 match poll_child(&mut context.child)? {
                     ChildState::ExitedBySignal => {
+                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
                         context.absence_authoritative = false;
                     }
                     ChildState::ExitedNormally if context.launch_pending => {
@@ -655,7 +668,13 @@ async fn supervise_run(
                         .await?;
                         return Ok(());
                     }
-                    ChildState::Running | ChildState::ExitedNormally | ChildState::Absent => {}
+                    ChildState::Running | ChildState::ExitedNormally => {
+                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
+                    }
+                    ChildState::Absent => {
+                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
+                        context.absence_authoritative = false;
+                    }
                 }
                 return Err(Error::RunnerUnavailable);
             }
@@ -674,6 +693,8 @@ async fn supervise_run(
             Consume::Shutdown => return Ok(()),
             Consume::Reconnect { terminal_sequence } => {
                 context.terminal_sequence = terminal_sequence;
+                set_observer_health(state, context, ObserverHealth::Degraded).await?;
+                context.absence_authoritative = false;
                 let retry_delay = context.next_retry_delay();
                 tokio::select! {
                     _ = wait_for_shutdown(shutdown) => return Ok(()),
@@ -725,6 +746,8 @@ async fn consume_subscription(
             RunnerStreamItem::CaughtUp { .. } => {
                 flush_pending(state, context, &mut pending).await?;
                 deadline = None;
+                set_observer_health(state, context, ObserverHealth::Healthy).await?;
+                context.absence_authoritative = true;
                 caught_up = true;
                 if let Some(terminal) = terminal_sequence {
                     acknowledge_and_reconcile(client, state, context, terminal, shutdown).await?;
@@ -981,6 +1004,28 @@ async fn fail_unverifiable_identity(
             Ok((transition.disposition, transition.events))
         })
         .await?;
+    Ok(())
+}
+
+async fn set_observer_health(
+    state: &DaemonState,
+    context: &mut RunContext,
+    health: ObserverHealth,
+) -> Result<(), Error> {
+    if context.observer_health == health {
+        return Ok(());
+    }
+    let run_id = context.run_id.clone();
+    let runner_instance_id = context.target.runner_instance_id.clone();
+    let changed_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let transition =
+                store.set_observer_health(&run_id, &runner_instance_id, health, changed_at_ms)?;
+            Ok((transition.disposition, transition.events))
+        })
+        .await?;
+    context.observer_health = health;
     Ok(())
 }
 

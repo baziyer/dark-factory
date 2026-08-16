@@ -16,8 +16,9 @@ provider sessions, records run attempts, and supports exact runner replay and
 terminal reconciliation. A bounded Codex-only execution actor now launches and
 recovers stable runners without coupling their lifetime to the daemon. The
 local control plane can now create Codex agents and durably reserve queued tasks
-for them; native observation remains deliberately absent until its vertical
-slice is executable.
+for them. Exact runner observation health is durable, so a restart cannot
+mistake degraded supervision for proof that an agent stopped; native
+observation remains deliberately absent until its vertical slice is executable.
 
 ## Non-goals
 

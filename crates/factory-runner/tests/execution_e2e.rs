@@ -1,6 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
-use factory_core::{AgentId, AgentRole, FactoryEvent, ProjectId, Provider, RunStatus, TaskId};
+use factory_core::{
+    AgentId, AgentRole, FactoryEvent, ObserverHealth, ProjectId, Provider, RunStatus, TaskId,
+};
 use factoryd::{
     daemon_state::DaemonState,
     execution::{self, Config, StartCodex},
@@ -167,19 +169,22 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
         .await
         .unwrap();
     assert_eq!(target.provider_session_id.as_deref(), Some(THREAD_ID));
-    let statuses = events
+    let run_truth = events
         .iter()
         .filter_map(|event| match &event.event {
-            FactoryEvent::RunChanged { run } if run.id == started.run_id => Some(run.status),
+            FactoryEvent::RunChanged { run } if run.id == started.run_id => {
+                Some((run.status, run.observer_health))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
-        statuses,
+        run_truth,
         [
-            RunStatus::Starting,
-            RunStatus::Running,
-            RunStatus::Succeeded
+            (RunStatus::Starting, ObserverHealth::Unknown),
+            (RunStatus::Running, ObserverHealth::Unknown),
+            (RunStatus::Running, ObserverHealth::Healthy),
+            (RunStatus::Succeeded, ObserverHealth::Healthy),
         ]
     );
     let public_json = serde_json::to_string(&events).unwrap();

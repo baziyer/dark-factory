@@ -6,8 +6,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, ProjectId, Provider, RunId, RunStatus, RunnerInstanceId,
-    TaskId,
+    AgentId, AgentRole, FactoryEvent, ObserverHealth, ProjectId, Provider, RunId, RunStatus,
+    RunnerInstanceId, TaskId,
     runner::{
         OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerEvent, RunnerEventEnvelope,
         RunnerFrame, RunnerRequest,
@@ -360,6 +360,10 @@ impl RecoveryFixture {
                 )
                 .unwrap();
         }
+
+        store
+            .set_observer_health(&run_id, &runner_instance_id, ObserverHealth::Healthy, 8)
+            .unwrap();
 
         let baseline = store.latest_event_sequence().unwrap();
         Self {
@@ -772,7 +776,8 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
         [
             RunStatus::Starting,
             RunStatus::Running,
-            RunStatus::Succeeded
+            RunStatus::Succeeded,
+            RunStatus::Succeeded,
         ]
     );
     let public_json = serde_json::to_string(&events).unwrap();
@@ -975,30 +980,67 @@ async fn signalled_pre_hello_wrapper_does_not_release_potentially_live_provider_
         advance_and_settle(Duration::from_millis(100)).await;
     }
     let run_id = started.run_id.clone();
-    let (recoverable, events) = fixture
+    let (health, events) = fixture
         .state
         .with_store(move |store| {
+            let recovery = store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id);
             Ok((
-                store
-                    .recoverable_runs()?
-                    .into_iter()
-                    .any(|run| run.run.id == run_id),
+                recovery.map(|run| run.run.observer_health),
                 store.events_after(fixture.baseline, 100)?,
             ))
         })
         .await
         .unwrap();
-    assert!(recoverable);
-    let statuses = events
+    assert_eq!(health, Some(ObserverHealth::Degraded));
+    let health_changes = events
         .iter()
         .filter_map(|event| match &event.event {
-            FactoryEvent::RunChanged { run } if run.id == started.run_id => Some(run.status),
+            FactoryEvent::RunChanged { run } if run.id == started.run_id => {
+                Some(run.observer_health)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(statuses, [RunStatus::Starting]);
+    assert_eq!(
+        health_changes,
+        [ObserverHealth::Unknown, ObserverHealth::Degraded]
+    );
 
     stop(handle, join).await;
+
+    let runtime = fixture.runtime_root.join(started.run_id.as_str());
+    if runtime.exists() {
+        fs::remove_dir_all(runtime).unwrap();
+    }
+    let mut recovery_config = fixture.config();
+    recovery_config.runner_program = scripted.program.clone();
+    recovery_config.codex_program = scripted.provider.clone();
+    recovery_config.connect_grace = Duration::from_millis(50);
+    let (recovery_handle, recovery_join) =
+        execution::spawn(recovery_config, fixture.state.clone()).unwrap();
+    for _ in 0..10 {
+        advance_and_settle(Duration::from_millis(100)).await;
+    }
+    let run_id = started.run_id.clone();
+    let recovery = fixture
+        .state
+        .with_store(move |store| {
+            Ok(store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id)
+                .map(|run| (run.run.status, run.run.observer_health)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery,
+        Some((RunStatus::Starting, ObserverHealth::Degraded))
+    );
+    stop(recovery_handle, recovery_join).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -1047,28 +1089,38 @@ async fn signalled_authenticated_wrapper_keeps_the_run_assigned_and_recoverable(
         advance_and_settle(Duration::from_millis(100)).await;
     }
     let run_id = started.run_id.clone();
-    let (recoverable, events) = fixture
+    let (health, events) = fixture
         .state
         .with_store(move |store| {
+            let recovery = store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id);
             Ok((
-                store
-                    .recoverable_runs()?
-                    .into_iter()
-                    .any(|run| run.run.id == run_id),
+                recovery.map(|run| run.run.observer_health),
                 store.events_after(fixture.baseline, 100)?,
             ))
         })
         .await
         .unwrap();
-    assert!(recoverable);
-    let statuses = events
+    assert_eq!(health, Some(ObserverHealth::Degraded));
+    let health_changes = events
         .iter()
         .filter_map(|event| match &event.event {
-            FactoryEvent::RunChanged { run } if run.id == started.run_id => Some(run.status),
+            FactoryEvent::RunChanged { run } if run.id == started.run_id => {
+                Some(run.observer_health)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(statuses, [RunStatus::Starting]);
+    assert_eq!(
+        health_changes,
+        [
+            ObserverHealth::Unknown,
+            ObserverHealth::Healthy,
+            ObserverHealth::Degraded,
+        ]
+    );
 
     stop(handle, join).await;
 }
@@ -1115,28 +1167,42 @@ async fn authenticated_disconnect_cannot_fail_a_still_running_wrapper() {
 
     let run_id = started.run_id.clone();
     let baseline = fixture.baseline;
-    let (recoverable, events) = fixture
+    let (health, events) = fixture
         .state
         .with_store(move |store| {
+            let recovery = store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id);
             Ok((
-                store
-                    .recoverable_runs()?
-                    .into_iter()
-                    .any(|run| run.run.id == run_id),
+                recovery.map(|run| run.run.observer_health),
                 store.events_after(baseline, 100)?,
             ))
         })
         .await
         .unwrap();
-    assert!(recoverable, "the live wrapper was marked unverifiable");
-    let statuses = events
+    assert_eq!(
+        health,
+        Some(ObserverHealth::Degraded),
+        "the live wrapper was marked unverifiable"
+    );
+    let health_changes = events
         .iter()
         .filter_map(|event| match &event.event {
-            FactoryEvent::RunChanged { run } if run.id == started.run_id => Some(run.status),
+            FactoryEvent::RunChanged { run } if run.id == started.run_id => {
+                Some(run.observer_health)
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(statuses, [RunStatus::Starting]);
+    assert_eq!(
+        health_changes,
+        [
+            ObserverHealth::Unknown,
+            ObserverHealth::Healthy,
+            ObserverHealth::Degraded,
+        ]
+    );
 
     stop(handle, join).await;
     fs::write(&scripted.exit, b"").unwrap();
@@ -1240,6 +1306,66 @@ async fn post_commit_provider_launch_failure_keeps_run_id_and_fails_asynchronous
 }
 
 #[tokio::test(start_paused = true)]
+async fn unknown_missing_recovery_becomes_degraded_without_releasing_work() {
+    let fixture = RecoveryFixture::active(false);
+    let run_id = fixture.run_id.clone();
+    let runner_instance_id = fixture.runner_instance_id.clone();
+    fixture
+        .state
+        .commit_and_publish(move |store| {
+            let transition = store.set_observer_health(
+                &run_id,
+                &runner_instance_id,
+                ObserverHealth::Unknown,
+                9,
+            )?;
+            Ok(((), transition.events))
+        })
+        .await
+        .unwrap();
+    let baseline = fixture
+        .state
+        .with_store(|store| store.latest_event_sequence())
+        .await
+        .unwrap();
+    let (handle, join) = execution::spawn(
+        fixture.config(Duration::from_millis(50)),
+        fixture.state.clone(),
+    )
+    .unwrap();
+
+    settle().await;
+    advance_and_settle(Duration::from_millis(75)).await;
+
+    assert!(fixture.remains_recoverable().await);
+    let run_id = fixture.run_id.clone();
+    let (health, events) = fixture
+        .state
+        .with_store(move |store| {
+            let health = store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id)
+                .expect("unknown recovery disappeared")
+                .run
+                .observer_health;
+            Ok((health, store.events_after(baseline, 10)?))
+        })
+        .await
+        .unwrap();
+    assert_eq!(health, ObserverHealth::Degraded);
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0].event,
+        FactoryEvent::RunChanged { run }
+            if run.id == fixture.run_id
+                && run.status == RunStatus::Starting
+                && run.observer_health == ObserverHealth::Degraded
+    ));
+    stop(handle, join).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn missing_active_runner_becomes_unverifiable_after_grace() {
     let fixture = RecoveryFixture::active(false);
     let mut published = fixture.state.subscribe();
@@ -1302,7 +1428,7 @@ async fn missing_terminal_runner_reconciles_without_public_state_change() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hostile_runner_hello_identity_or_protocol_cannot_mutate_state() {
+async fn hostile_runner_hello_identity_or_protocol_cannot_mutate_execution_truth() {
     for wrong_protocol in [false, true] {
         let fixture = RecoveryFixture::active(true);
         let socket = fixture.runtime_dir.join("control.sock");
@@ -1362,23 +1488,26 @@ async fn hostile_runner_hello_identity_or_protocol_cannot_mutate_state() {
         settle().await;
 
         let remains_recoverable = fixture.remains_recoverable().await;
-        let head = fixture
-            .state
-            .with_store(|store| store.latest_event_sequence())
-            .await
-            .unwrap();
         let baseline = fixture.baseline;
-        let unexpected_events = fixture
+        let health_events = fixture
             .state
             .with_store(move |store| store.events_after(baseline, 10))
             .await
             .unwrap();
         assert!(
             remains_recoverable,
-            "hostile hello changed recovery membership: wrong_protocol={wrong_protocol}, baseline={}, head={head}, events={unexpected_events:?}",
+            "hostile hello changed recovery membership: wrong_protocol={wrong_protocol}, baseline={}, events={health_events:?}",
             fixture.baseline,
         );
-        assert_eq!(head, fixture.baseline);
+        assert_eq!(health_events.len(), 1);
+        assert!(matches!(
+            &health_events[0].event,
+            FactoryEvent::RunChanged { run }
+                if run.id == fixture.run_id
+                    && run.status == RunStatus::Starting
+                    && run.observer_health == ObserverHealth::Degraded
+        ));
+        assert_eq!(published.try_recv().unwrap(), health_events[0]);
         assert!(matches!(
             published.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -1472,12 +1601,25 @@ async fn hostile_hello_is_quarantined_then_recovery_retries_from_zero() {
     assert_eq!(first, expected);
     assert_eq!(second, expected);
     assert!(fixture.remains_recoverable().await);
-    let head = fixture
+    let baseline = fixture.baseline;
+    let health_events = fixture
         .state
-        .with_store(|store| store.latest_event_sequence())
+        .with_store(move |store| store.events_after(baseline, 10))
         .await
         .unwrap();
-    assert_eq!(head, fixture.baseline);
+    let health = health_events
+        .iter()
+        .filter_map(|event| match &event.event {
+            FactoryEvent::RunChanged { run } if run.id == fixture.run_id => {
+                Some(run.observer_health)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(health, [ObserverHealth::Degraded, ObserverHealth::Healthy]);
+    for event in &health_events {
+        assert_eq!(published.try_recv().unwrap(), *event);
+    }
     assert!(matches!(
         published.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -1488,11 +1630,12 @@ async fn hostile_hello_is_quarantined_then_recovery_retries_from_zero() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn repeated_observation_failures_back_off_instead_of_polling_forever() {
+async fn repeated_caught_up_disconnects_back_off_instead_of_polling_forever() {
     let fixture = RecoveryFixture::active(true);
     let socket = fixture.runtime_dir.join("control.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let expected_run = fixture.run_id.clone();
     let expected_instance = fixture.runner_instance_id.clone();
     let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::channel(3);
     let server = tokio::spawn(async move {
@@ -1506,20 +1649,29 @@ async fn repeated_observation_failures_back_off_instead_of_polling_forever() {
                 request.request,
                 RunnerRequest::Subscribe { after_sequence: 0 }
             );
-            let hostile = RunnerFrame::Hello {
+            let hello = RunnerFrame::Hello {
                 protocol_version: RUNNER_PROTOCOL_VERSION,
-                run_id: id("hostile-run"),
+                run_id: expected_run.clone(),
                 runner_instance_id: expected_instance.clone(),
                 runner_pid: 42,
                 replay_through: 0,
                 terminal_sequence: None,
             };
-            stream
-                .get_mut()
-                .write_all(&serde_json::to_vec(&hostile).unwrap())
-                .await
-                .unwrap();
-            stream.get_mut().write_all(b"\n").await.unwrap();
+            for frame in [
+                hello,
+                RunnerFrame::CaughtUp {
+                    protocol_version: RUNNER_PROTOCOL_VERSION,
+                    sequence: 0,
+                },
+            ] {
+                stream
+                    .get_mut()
+                    .write_all(&serde_json::to_vec(&frame).unwrap())
+                    .await
+                    .unwrap();
+                stream.get_mut().write_all(b"\n").await.unwrap();
+            }
+            drop(stream);
             attempt_tx.send(attempt).await.unwrap();
         }
     });
@@ -1531,10 +1683,41 @@ async fn repeated_observation_failures_back_off_instead_of_polling_forever() {
     .unwrap();
     assert_eq!(attempt_rx.recv().await, Some(1));
     settle().await;
+    let run_id = fixture.run_id.clone();
+    let health = fixture
+        .state
+        .with_store(move |store| {
+            Ok(store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id)
+                .expect("run stopped being recoverable")
+                .run
+                .observer_health)
+        })
+        .await
+        .unwrap();
+    assert_eq!(health, ObserverHealth::Degraded);
     advance_and_settle(Duration::from_millis(249)).await;
     assert!(attempt_rx.try_recv().is_err());
     advance_and_settle(Duration::from_millis(1)).await;
     assert_eq!(attempt_rx.try_recv(), Ok(2));
+    settle().await;
+    let run_id = fixture.run_id.clone();
+    let health = fixture
+        .state
+        .with_store(move |store| {
+            Ok(store
+                .recoverable_runs()?
+                .into_iter()
+                .find(|run| run.run.id == run_id)
+                .expect("run stopped being recoverable")
+                .run
+                .observer_health)
+        })
+        .await
+        .unwrap();
+    assert_eq!(health, ObserverHealth::Degraded);
     advance_and_settle(Duration::from_millis(499)).await;
     assert!(attempt_rx.try_recv().is_err());
     advance_and_settle(Duration::from_millis(1)).await;
@@ -1570,16 +1753,38 @@ async fn stale_private_socket_refusal_is_not_proof_that_a_runner_vanished() {
             fixture.remains_recoverable().await,
             "a present owner-only socket was treated as proof that the runner vanished"
         );
+        let baseline = fixture.baseline;
+        let health_events = fixture
+            .state
+            .with_store(move |store| store.events_after(baseline, 10))
+            .await
+            .unwrap();
+        assert_eq!(health_events.len(), 1);
+        assert!(matches!(
+            &health_events[0].event,
+            FactoryEvent::RunChanged { run }
+                if run.id == fixture.run_id
+                    && run.observer_health == ObserverHealth::Degraded
+                    && run.status == if terminal { RunStatus::Succeeded } else { RunStatus::Starting }
+        ));
+        assert_eq!(published.try_recv().unwrap(), health_events[0]);
+        assert!(matches!(
+            published.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        fs::remove_file(&socket).unwrap();
+        advance_and_settle(Duration::from_secs(2)).await;
+        assert!(
+            fixture.remains_recoverable().await,
+            "a degraded run used disappearance as proof of termination"
+        );
         let head = fixture
             .state
             .with_store(|store| store.latest_event_sequence())
             .await
             .unwrap();
-        assert_eq!(head, fixture.baseline);
-        assert!(matches!(
-            published.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
+        assert_eq!(head, fixture.baseline + 1);
         stop(handle, join).await;
     }
 }

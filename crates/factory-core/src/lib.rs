@@ -134,6 +134,16 @@ impl RunStatus {
     }
 }
 
+/// Whether the daemon can currently observe an exact runner instance.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverHealth {
+    #[default]
+    Unknown,
+    Healthy,
+    Degraded,
+}
+
 /// A durable, privacy-safe category for a failed run.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +241,10 @@ pub struct RunSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
     pub worktree: String,
+    #[serde(default)]
+    pub observer_health: ObserverHealth,
+    #[serde(default)]
+    pub observer_health_since_ms: i64,
     pub started_at_ms: i64,
     pub status_since_ms: i64,
     pub updated_at_ms: i64,

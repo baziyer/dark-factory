@@ -1,6 +1,6 @@
 use factory_core::{
-    AgentId, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId, RunFailureReason, RunId,
-    RunSnapshot, RunStatus, TaskId, TaskStatus,
+    AgentId, EventEnvelope, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
+    RunFailureReason, RunId, RunSnapshot, RunStatus, TaskId, TaskStatus,
 };
 
 fn id<T>(value: &str) -> T
@@ -50,6 +50,20 @@ fn all_run_failure_reasons_have_stable_wire_names() {
 }
 
 #[test]
+fn observer_health_has_stable_wire_names_and_an_unknown_default() {
+    let cases = [
+        (ObserverHealth::Unknown, "unknown"),
+        (ObserverHealth::Healthy, "healthy"),
+        (ObserverHealth::Degraded, "degraded"),
+    ];
+
+    assert_eq!(ObserverHealth::default(), ObserverHealth::Unknown);
+    for (health, expected) in cases {
+        assert_eq!(serde_json::to_value(health).unwrap(), expected);
+    }
+}
+
+#[test]
 fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
     let envelope = EventEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -66,6 +80,8 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
                 activity: Some("Waiting for review".into()),
                 wait_reason: None,
                 worktree: "/worktrees/task-3".into(),
+                observer_health: ObserverHealth::Healthy,
+                observer_health_since_ms: 1_723_000_008_000,
                 started_at_ms: 1_723_000_000_000,
                 status_since_ms: 1_723_000_009_000,
                 updated_at_ms: 1_723_000_010_000,
@@ -88,6 +104,11 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
     assert_eq!(value["event"]["data"]["run"]["parent_run_id"], "run-1");
     assert_eq!(value["event"]["data"]["run"]["project_id"], "project-1");
     assert_eq!(value["event"]["data"]["run"]["status"], "waiting");
+    assert_eq!(value["event"]["data"]["run"]["observer_health"], "healthy");
+    assert_eq!(
+        value["event"]["data"]["run"]["observer_health_since_ms"],
+        1_723_000_008_000_i64
+    );
     assert!(value["event"]["data"]["run"].get("ended_at_ms").is_none());
     assert!(value["event"]["data"]["run"].get("exit_code").is_none());
     assert!(value["event"]["data"]["run"].get("exit_signal").is_none());
@@ -96,6 +117,37 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
             .get("failure_reason")
             .is_none()
     );
+}
+
+#[test]
+fn old_run_events_default_missing_observer_health_fields() {
+    let json = r#"{
+        "protocol_version": 1,
+        "sequence": 7,
+        "occurred_at_ms": 40,
+        "event": {
+            "type": "run_changed",
+            "data": {
+                "run": {
+                    "id": "run-old",
+                    "project_id": "project-old",
+                    "agent_id": "agent-old",
+                    "status": "running",
+                    "worktree": "/work/old",
+                    "started_at_ms": 10,
+                    "status_since_ms": 20,
+                    "updated_at_ms": 30
+                }
+            }
+        }
+    }"#;
+
+    let decoded: EventEnvelope = serde_json::from_str(json).unwrap();
+    let FactoryEvent::RunChanged { run } = decoded.event else {
+        panic!("expected a run event");
+    };
+    assert_eq!(run.observer_health, ObserverHealth::Unknown);
+    assert_eq!(run.observer_health_since_ms, 0);
 }
 
 #[test]
