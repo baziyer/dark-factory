@@ -575,6 +575,7 @@ async fn get_run_terminal_is_not_found_when_the_spool_is_missing() {
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
@@ -646,6 +647,7 @@ async fn get_run_terminal_degrades_a_malformed_non_final_line_to_truncated() {
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
@@ -751,6 +753,7 @@ async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
