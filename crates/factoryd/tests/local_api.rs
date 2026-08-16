@@ -282,6 +282,70 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_task_detail_and_event_head_are_bounded_local_reads() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("detail-project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("detail-project"),
+                    name: "Detail Project".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("detail-task"),
+                    project_id: project_id("detail-project"),
+                    parent_task_id: None,
+                    title: "Hydrate me".into(),
+                    body: "bounded live body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::GetTask {
+                    project_id: project_id("detail-project"),
+                    task_id: task_id("detail-task"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Task { task },
+                ..
+            } if task.body == "bounded live body"
+        ));
+        assert!(matches!(
+            request(&socket, LocalRequest::LatestEventSequence).await,
+            ServerFrame::Response {
+                response: LocalResponse::EventHead { sequence: 2 },
+                ..
+            }
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_future_subscription_cursor_is_rejected_with_the_durable_head() {
     with_server(|socket| async move {
         let frame = request(&socket, LocalRequest::Subscribe { after_sequence: 99 }).await;

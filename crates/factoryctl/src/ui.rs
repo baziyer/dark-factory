@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -9,7 +10,7 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, TaskDetail, TaskId, TaskStatus,
     local::{
-        LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
+        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
         MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame, SubscriptionSeverity,
         SubscriptionUsageStatus,
     },
@@ -19,6 +20,7 @@ use uuid::Uuid;
 use factoryctl::Client;
 
 const RECENT_EVENT_LIMIT: usize = 100;
+const MAX_LEGACY_DETAIL_PAGES: usize = 16;
 
 pub fn run(client: Client) -> Result<(), String> {
     let options = eframe::NativeOptions {
@@ -37,8 +39,14 @@ pub fn run(client: Client) -> Result<(), String> {
 }
 
 enum UiMessage {
-    Snapshot(Snapshot),
+    Snapshot {
+        snapshot: Snapshot,
+        event_sequence: Option<i64>,
+        refresh_id: u64,
+    },
     Event(EventEnvelope),
+    TaskDetail(Result<TaskDetail, String>),
+    SubscriptionCaughtUp,
     Operation(Result<String, String>),
     StreamFailed(String),
 }
@@ -67,6 +75,9 @@ struct FactoryApp {
     selected_agent: Option<AgentId>,
     connection: ConnectionState,
     notice: Option<String>,
+    last_event_sequence: Option<i64>,
+    last_snapshot_refresh_id: u64,
+    next_refresh_id: u64,
     create_project: Option<ProjectForm>,
     create_agent: Option<AgentForm>,
     create_task: Option<TaskForm>,
@@ -110,7 +121,7 @@ impl FactoryApp {
     fn new(context: &eframe::CreationContext<'_>, client: Client) -> Self {
         context.egui_ctx.set_visuals(egui::Visuals::dark());
         let (sender, receiver) = mpsc::channel();
-        spawn_refresh(client.clone(), sender.clone(), context.egui_ctx.clone());
+        spawn_refresh(client.clone(), sender.clone(), context.egui_ctx.clone(), 1);
         spawn_subscription(client.clone(), sender.clone(), context.egui_ctx.clone());
         Self {
             client,
@@ -127,6 +138,9 @@ impl FactoryApp {
             selected_agent: None,
             connection: ConnectionState::Loading,
             notice: None,
+            last_event_sequence: None,
+            last_snapshot_refresh_id: 0,
+            next_refresh_id: 1,
             create_project: None,
             create_agent: None,
             create_task: None,
@@ -137,40 +151,70 @@ impl FactoryApp {
     fn receive(&mut self, context: &egui::Context) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                UiMessage::Snapshot(snapshot) => {
-                    self.projects = snapshot
-                        .projects
-                        .into_iter()
-                        .map(|project| (project.id.clone(), project))
-                        .collect();
-                    self.tasks = snapshot
-                        .tasks
-                        .into_iter()
-                        .map(|task| (task.snapshot.id.clone(), task))
-                        .collect();
-                    self.agents = snapshot
-                        .agents
-                        .into_iter()
-                        .map(|agent| (agent.id.clone(), agent))
-                        .collect();
-                    self.runs = snapshot
-                        .runs
-                        .into_iter()
-                        .map(|run| (run.id.clone(), run))
-                        .collect();
-                    self.usage = snapshot.usage;
+                UiMessage::Snapshot {
+                    snapshot,
+                    event_sequence,
+                    refresh_id,
+                } => {
+                    if !should_apply_snapshot(
+                        self.last_snapshot_refresh_id,
+                        self.last_event_sequence,
+                        refresh_id,
+                        event_sequence,
+                    ) {
+                        continue;
+                    }
+                    self.merge_snapshot(snapshot);
+                    self.last_event_sequence = match (self.last_event_sequence, event_sequence) {
+                        (Some(current), Some(incoming)) => Some(current.max(incoming)),
+                        (None, incoming) | (incoming, None) => incoming,
+                    };
+                    self.last_snapshot_refresh_id = refresh_id;
                     if self.selected_project.is_none() {
                         self.selected_project = self.projects.keys().next().cloned();
                     }
                     self.connection = ConnectionState::Live;
                 }
                 UiMessage::Event(event) => {
+                    if self
+                        .last_event_sequence
+                        .is_some_and(|sequence| event.sequence <= sequence)
+                    {
+                        continue;
+                    }
+                    let task_was_known = task_id_from_event(&event)
+                        .is_some_and(|task_id| self.tasks.contains_key(task_id));
+                    let needs_task_detail = task_event_needs_detail(task_was_known, &event);
+                    self.last_event_sequence = Some(event.sequence);
                     let refresh_details = event_requires_detail_refresh(&event);
                     self.apply_event(event);
+                    if needs_task_detail {
+                        if let Some((project_id, task_id)) = task_event_ids(self.recent.last()) {
+                            spawn_task_detail(
+                                self.client.clone(),
+                                self.sender.clone(),
+                                context.clone(),
+                                project_id,
+                                task_id,
+                            );
+                        }
+                    }
                     if refresh_details {
                         self.refresh(context);
                     }
                 }
+                UiMessage::TaskDetail(result) => match result {
+                    Ok(task) => {
+                        let task_id = task.snapshot.id.clone();
+                        if let Some(current) = self.tasks.get_mut(&task_id) {
+                            merge_task_detail(current, task);
+                        } else {
+                            self.tasks.insert(task_id, task);
+                        }
+                    }
+                    Err(message) => self.notice = Some(message),
+                },
+                UiMessage::SubscriptionCaughtUp => self.refresh(context),
                 UiMessage::Operation(result) => match result {
                     Ok(message) => {
                         self.notice = Some(message);
@@ -219,8 +263,52 @@ impl FactoryApp {
         self.connection = ConnectionState::Live;
     }
 
-    fn refresh(&self, context: &egui::Context) {
-        spawn_refresh(self.client.clone(), self.sender.clone(), context.clone());
+    fn merge_snapshot(&mut self, snapshot: Snapshot) {
+        for project in snapshot.projects {
+            let replace = self
+                .projects
+                .get(&project.id)
+                .is_none_or(|current| project.updated_at_ms > current.updated_at_ms);
+            if replace {
+                self.projects.insert(project.id.clone(), project);
+            }
+        }
+        for task in snapshot.tasks {
+            if let Some(current) = self.tasks.get_mut(&task.snapshot.id) {
+                merge_task_detail(current, task);
+            } else {
+                self.tasks.insert(task.snapshot.id.clone(), task);
+            }
+        }
+        for agent in snapshot.agents {
+            let replace = self
+                .agents
+                .get(&agent.id)
+                .is_none_or(|current| agent.updated_at_ms > current.updated_at_ms);
+            if replace {
+                self.agents.insert(agent.id.clone(), agent);
+            }
+        }
+        for run in snapshot.runs {
+            let replace = self
+                .runs
+                .get(&run.id)
+                .is_none_or(|current| run.updated_at_ms > current.updated_at_ms);
+            if replace {
+                self.runs.insert(run.id.clone(), run);
+            }
+        }
+        self.usage = snapshot.usage;
+    }
+
+    fn refresh(&mut self, context: &egui::Context) {
+        self.next_refresh_id = self.next_refresh_id.saturating_add(1);
+        spawn_refresh(
+            self.client.clone(),
+            self.sender.clone(),
+            context.clone(),
+            self.next_refresh_id,
+        );
     }
 
     fn submit(&self, request: LocalRequest, context: &egui::Context) {
@@ -754,6 +842,78 @@ fn event_requires_detail_refresh(envelope: &EventEnvelope) -> bool {
     )
 }
 
+fn task_event_needs_detail(task_was_known: bool, envelope: &EventEnvelope) -> bool {
+    !task_was_known && matches!(envelope.event, FactoryEvent::TaskChanged { .. })
+}
+
+fn task_id_from_event(envelope: &EventEnvelope) -> Option<&TaskId> {
+    match &envelope.event {
+        FactoryEvent::TaskChanged { task } => Some(&task.id),
+        _ => None,
+    }
+}
+
+fn task_event_ids(envelope: Option<&EventEnvelope>) -> Option<(ProjectId, TaskId)> {
+    match envelope.map(|envelope| &envelope.event) {
+        Some(FactoryEvent::TaskChanged { task }) => {
+            Some((task.project_id.clone(), task.id.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn should_apply_snapshot(
+    current_refresh_id: u64,
+    current_event_sequence: Option<i64>,
+    incoming_refresh_id: u64,
+    incoming_event_sequence: Option<i64>,
+) -> bool {
+    if incoming_refresh_id < current_refresh_id {
+        return false;
+    }
+    match (current_event_sequence, incoming_event_sequence) {
+        (Some(current), Some(incoming)) => incoming >= current,
+        _ => true,
+    }
+}
+
+fn merge_task_detail(current: &mut TaskDetail, incoming: TaskDetail) {
+    match incoming
+        .snapshot
+        .updated_at_ms
+        .cmp(&current.snapshot.updated_at_ms)
+    {
+        Ordering::Greater => *current = incoming,
+        Ordering::Equal => {
+            if current.body.is_empty() && !incoming.body.is_empty() {
+                current.body = incoming.body;
+            }
+            if current.result.is_none() && incoming.result.is_some() {
+                current.result = incoming.result;
+            }
+        }
+        Ordering::Less => {}
+    }
+}
+
+fn snapshot_heads_are_stable(before: Option<i64>, after: Option<i64>) -> bool {
+    before == after
+}
+
+fn is_unsupported_optional_request(response: &LocalResponse) -> bool {
+    matches!(
+        response,
+        LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            ..
+        }
+    )
+}
+
+fn legacy_detail_budget_exhausted(pages_read: usize) -> bool {
+    pages_read >= MAX_LEGACY_DETAIL_PAGES
+}
+
 fn short_id(prefix: &str) -> String {
     let uuid = Uuid::new_v4().simple().to_string();
     format!("{prefix}-{}", &uuid[..8])
@@ -797,13 +957,108 @@ fn event_summary(event: &EventEnvelope) -> String {
     format!("#{:06} {detail}", event.sequence)
 }
 
-fn spawn_refresh(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
+fn spawn_refresh(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    refresh_id: u64,
+) {
     thread::spawn(move || {
-        let result = load_snapshot(&client);
-        let message = result.map_or_else(UiMessage::StreamFailed, UiMessage::Snapshot);
+        let result = load_consistent_snapshot(&client);
+        let message = result.map_or_else(UiMessage::StreamFailed, |(snapshot, event_sequence)| {
+            UiMessage::Snapshot {
+                snapshot,
+                event_sequence,
+                refresh_id,
+            }
+        });
         let _ = sender.send(message);
         context.request_repaint();
     });
+}
+
+fn load_consistent_snapshot(client: &Client) -> Result<(Snapshot, Option<i64>), String> {
+    for _ in 0..3 {
+        let before = load_event_sequence(client)?;
+        let snapshot = load_snapshot(client)?;
+        let after = load_event_sequence(client)?;
+        if snapshot_heads_are_stable(before, after) {
+            return Ok((snapshot, after.or(before)));
+        }
+    }
+    Err("daemon state changed while loading the UI snapshot".into())
+}
+
+fn spawn_task_detail(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    project_id: ProjectId,
+    task_id: TaskId,
+) {
+    thread::spawn(move || {
+        let result = load_task_detail(&client, project_id, task_id);
+        let _ = sender.send(UiMessage::TaskDetail(result));
+        context.request_repaint();
+    });
+}
+
+fn load_task_detail(
+    client: &Client,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<TaskDetail, String> {
+    let response = request_response_raw(
+        client,
+        LocalRequest::GetTask {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+        },
+    )?;
+    if is_unsupported_optional_request(&response) {
+        return load_legacy_task_detail(client, project_id, task_id);
+    }
+    match response {
+        LocalResponse::Task { task } => Ok(task),
+        LocalResponse::Error { message, .. } => Err(message),
+        _ => Err("daemon returned an unexpected task detail response".into()),
+    }
+}
+
+fn load_legacy_task_detail(
+    client: &Client,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<TaskDetail, String> {
+    let mut after_id = None;
+    for pages_read in 0..MAX_LEGACY_DETAIL_PAGES {
+        let response = request_response(
+            client,
+            LocalRequest::ListTasks {
+                project_id: project_id.clone(),
+                after_id,
+                limit: MAX_TASK_PAGE_ITEMS,
+            },
+        )?;
+        let LocalResponse::Tasks {
+            tasks,
+            next_after_id,
+        } = response
+        else {
+            return Err("daemon returned an unexpected legacy task response".into());
+        };
+        if let Some(task) = tasks.into_iter().find(|task| task.snapshot.id == task_id) {
+            return Ok(task);
+        }
+        let Some(next) = next_after_id else {
+            return Err("task was not found while hydrating the UI".into());
+        };
+        if legacy_detail_budget_exhausted(pages_read + 1) {
+            return Err("legacy task hydration reached its bounded compatibility window".into());
+        }
+        after_id = Some(next);
+    }
+    Err("legacy task hydration reached its bounded compatibility window".into())
 }
 
 fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
@@ -823,6 +1078,14 @@ fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::
                                     return;
                                 }
                                 context.request_repaint();
+                            }
+                            Ok(ServerFrame::Response {
+                                response: LocalResponse::CaughtUp { .. },
+                                ..
+                            }) => {
+                                if sender.send(UiMessage::SubscriptionCaughtUp).is_err() {
+                                    return;
+                                }
                             }
                             Ok(ServerFrame::Response { .. }) => {}
                             Err(error) => {
@@ -867,6 +1130,15 @@ fn load_usage(client: &Client) -> Result<SubscriptionUsageStatus, String> {
     match request_response(client, LocalRequest::SubscriptionUsage)? {
         LocalResponse::SubscriptionUsage { usage } => Ok(usage),
         _ => Err("daemon returned an unexpected subscription usage response".into()),
+    }
+}
+
+fn load_event_sequence(client: &Client) -> Result<Option<i64>, String> {
+    let response = request_response_raw(client, LocalRequest::LatestEventSequence)?;
+    match optional_request_response(response)? {
+        LocalResponse::EventHead { sequence } => Ok(Some(sequence)),
+        LocalResponse::Error { .. } => Ok(None),
+        _ => Err("daemon returned an unexpected event-head response".into()),
     }
 }
 
@@ -974,12 +1246,26 @@ fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>
 }
 
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
+    match request_response_raw(client, request)? {
+        LocalResponse::Error { message, .. } => Err(message),
+        response => Ok(response),
+    }
+}
+
+fn request_response_raw(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
-        ServerFrame::Response { response, .. } => match response {
-            LocalResponse::Error { message, .. } => Err(message),
-            response => Ok(response),
-        },
+        ServerFrame::Response { response, .. } => Ok(response),
         ServerFrame::Event { .. } => Err("daemon returned an event instead of a response".into()),
+    }
+}
+
+fn optional_request_response(response: LocalResponse) -> Result<LocalResponse, String> {
+    if is_unsupported_optional_request(&response) {
+        return Ok(response);
+    }
+    match response {
+        LocalResponse::Error { message, .. } => Err(message),
+        response => Ok(response),
     }
 }
 
@@ -1003,6 +1289,108 @@ mod tests {
     };
 
     use super::{TaskColumn, agent_card_text, event_requires_detail_refresh, task_result_text};
+
+    #[test]
+    fn older_snapshot_generations_and_event_heads_are_rejected() {
+        assert!(!super::should_apply_snapshot(4, Some(10), 3, Some(11)));
+        assert!(!super::should_apply_snapshot(4, Some(10), 5, Some(9)));
+        assert!(super::should_apply_snapshot(4, Some(10), 5, Some(10)));
+        assert!(super::snapshot_heads_are_stable(Some(10), Some(10)));
+        assert!(!super::snapshot_heads_are_stable(Some(10), Some(11)));
+        assert!(super::snapshot_heads_are_stable(None, None));
+    }
+
+    #[test]
+    fn newer_task_detail_wins_when_a_snapshot_arrives_out_of_order() {
+        let mut current = TaskDetail {
+            snapshot: TaskSnapshot {
+                id: factory_core::TaskId::try_from("task-1").unwrap(),
+                project_id: ProjectId::try_from("factory").unwrap(),
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: None,
+                title: "Current".into(),
+                status: TaskStatus::Succeeded,
+                priority: 0,
+                created_at_ms: 1,
+                updated_at_ms: 20,
+            },
+            body: "new body".into(),
+            result: Some("new result".into()),
+        };
+        let older = TaskDetail {
+            snapshot: TaskSnapshot {
+                updated_at_ms: 10,
+                status: TaskStatus::Queued,
+                ..current.snapshot.clone()
+            },
+            body: "old body".into(),
+            result: None,
+        };
+
+        super::merge_task_detail(&mut current, older);
+        assert_eq!(current.snapshot.status, TaskStatus::Succeeded);
+        assert_eq!(current.result.as_deref(), Some("new result"));
+
+        let same_timestamp = TaskDetail {
+            snapshot: TaskSnapshot {
+                status: TaskStatus::Queued,
+                ..current.snapshot.clone()
+            },
+            body: "same-time stale body".into(),
+            result: None,
+        };
+        super::merge_task_detail(&mut current, same_timestamp);
+        assert_eq!(current.snapshot.status, TaskStatus::Succeeded);
+        assert_eq!(current.result.as_deref(), Some("new result"));
+    }
+
+    #[test]
+    fn previously_unseen_task_events_request_bounded_detail_hydration() {
+        let event = EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 2,
+            event: FactoryEvent::TaskChanged {
+                task: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("task-1").unwrap(),
+                    project_id: ProjectId::try_from("factory").unwrap(),
+                    parent_task_id: None,
+                    depends_on: Vec::new(),
+                    assigned_agent_id: None,
+                    title: "New task".into(),
+                    status: TaskStatus::Queued,
+                    priority: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+            },
+        };
+
+        assert!(super::task_event_needs_detail(false, &event));
+        assert!(!super::task_event_needs_detail(true, &event));
+    }
+
+    #[test]
+    fn invalid_request_event_head_errors_are_legacy_compatible() {
+        let response = factory_core::local::LocalResponse::Error {
+            code: factory_core::local::ErrorCode::InvalidRequest,
+            message: "unknown request".into(),
+        };
+        assert!(super::is_unsupported_optional_request(&response));
+        assert!(matches!(
+            super::optional_request_response(response),
+            Ok(factory_core::local::LocalResponse::Error {
+                code: factory_core::local::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        assert!(!super::is_unsupported_optional_request(
+            &factory_core::local::LocalResponse::Health
+        ));
+        assert!(!super::legacy_detail_budget_exhausted(0));
+        assert!(super::legacy_detail_budget_exhausted(16));
+    }
 
     #[test]
     fn board_columns_are_a_total_task_status_projection() {

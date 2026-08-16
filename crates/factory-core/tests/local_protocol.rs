@@ -46,6 +46,24 @@ fn request_envelope_has_a_stable_tagged_shape() {
 }
 
 #[test]
+fn live_detail_requests_and_event_head_have_stable_shapes() {
+    let request = LocalRequest::GetTask {
+        project_id: project_id("project-1"),
+        task_id: task_id("task-1"),
+    };
+    let head = LocalResponse::EventHead { sequence: 41 };
+
+    let request = serde_json::to_value(request).unwrap();
+    assert_eq!(request["type"], "get_task");
+    assert_eq!(request["data"]["project_id"], "project-1");
+    assert_eq!(request["data"]["task_id"], "task-1");
+    assert_eq!(
+        serde_json::to_value(head).unwrap(),
+        serde_json::json!({"type":"event_head","data":{"sequence":41}})
+    );
+}
+
+#[test]
 fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
     let detail = TaskDetail {
         snapshot: TaskSnapshot {
