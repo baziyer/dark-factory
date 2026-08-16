@@ -15,15 +15,18 @@ use tokio::{
     net::UnixStream,
     time::timeout,
 };
+use uuid::Uuid;
 
 const CONTROL_SOCKET_FILE: &str = "control.sock";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_STOP_GRACE_MS: u64 = 60_000;
 
 /// Authenticated address of exactly one stable runner.
 ///
 /// This type deliberately has no `Debug`: the random runner instance ID is a
 /// private control-plane credential.
+#[derive(Clone)]
 pub struct RunnerClient {
     socket: std::path::PathBuf,
     run_id: RunId,
@@ -106,6 +109,35 @@ impl RunnerClient {
             })
             .await?;
         let frame = read_control_frame(&mut reader, "terminal acknowledgement").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::CommandAck {
+                command_id: received,
+                ..
+            } if received == command_id => Ok(()),
+            RunnerFrame::CommandAck { .. } => Err(RunnerClientError::CommandMismatch),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
+        }
+    }
+
+    /// Requests a graceful stop from the exact authenticated runner.
+    ///
+    /// The command ID is intentionally fresh per user action. The runner
+    /// still deduplicates retries of the same wire command, while repeated UI
+    /// clicks remain explicit actions instead of sharing hidden daemon state.
+    pub async fn stop(&self, grace_ms: u64) -> Result<(), RunnerClientError> {
+        if grace_ms > MAX_STOP_GRACE_MS {
+            return Err(RunnerClientError::InvalidStopGrace { found: grace_ms });
+        }
+        let command_id = format!("stop-{}", Uuid::new_v4().simple());
+        let mut reader = self
+            .request(RunnerRequest::Stop {
+                command_id: command_id.clone(),
+                grace_ms,
+            })
+            .await?;
+        let frame = read_control_frame(&mut reader, "runner stop").await?;
         validate_protocol(frame.protocol_version())?;
         match frame {
             RunnerFrame::CommandAck {
@@ -432,6 +464,8 @@ pub enum RunnerClientError {
     InvalidTerminalSequence { found: i64 },
     #[error("runner acknowledged a different command")]
     CommandMismatch,
+    #[error("runner stop grace {found} ms exceeds the 60 second limit")]
+    InvalidStopGrace { found: u64 },
     #[error("timed out while waiting for {operation}")]
     TimedOut { operation: &'static str },
 }

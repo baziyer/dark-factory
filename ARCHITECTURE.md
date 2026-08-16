@@ -50,7 +50,10 @@ This file records constraints, not an aspirational component catalogue.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
-   command output, and patches remain transient runner data. A PTY is an
+   command output, and patches remain transient runner data. The native local
+   control API may expose a bounded, sanitized tail of the private runner spool
+   to the operator for inspection, but it never enters public events, webhook
+   snapshots, or tracing. A PTY is an
    adapter-specific last resort, never the system's state model. The first
    Claude adapter uses `--safe-mode`, deliberately
    disabling ambient settings, hooks, plugins, MCP servers, and project
@@ -84,3 +87,6 @@ have both restarted without stopping or misidentifying it.
   owner-configured endpoint profiles with distinct secrets and projects.
 - Repository visibility is private during early operation; making it public is
   a separate product decision.
+- Pause/retry and durable stop intent remain deferred; the current stop control
+  is an explicit direct request to the exact live runner from the local control
+  plane.

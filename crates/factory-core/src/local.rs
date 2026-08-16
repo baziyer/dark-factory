@@ -81,6 +81,15 @@ pub const MAX_AGENT_PAGE_ITEMS: u32 = 100;
 pub const MAX_RUN_PAGE_ITEMS: u32 = 100;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 100;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RunTerminal {
+    pub run_id: RunId,
+    pub head_sequence: i64,
+    pub output: String,
+    pub truncated: bool,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
@@ -153,6 +162,15 @@ pub enum LocalRequest {
         project_id: ProjectId,
         task_id: TaskId,
     },
+    GetRunTerminal {
+        project_id: ProjectId,
+        run_id: RunId,
+    },
+    StopRun {
+        project_id: ProjectId,
+        run_id: RunId,
+        grace_ms: u64,
+    },
     ListRuns {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -206,6 +224,9 @@ pub enum LocalResponse {
     Task {
         task: TaskDetail,
     },
+    RunTerminal {
+        terminal: RunTerminal,
+    },
     AgentCreated {
         agent: AgentSnapshot,
     },
@@ -215,6 +236,9 @@ pub enum LocalResponse {
         next_after_id: Option<AgentId>,
     },
     RunAccepted {
+        run_id: RunId,
+    },
+    RunStopped {
         run_id: RunId,
     },
     Tasks {

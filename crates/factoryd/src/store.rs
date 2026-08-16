@@ -313,6 +313,15 @@ pub struct ExecutionTarget {
     pub last_committed_runner_sequence: i64,
 }
 
+/// Private identity and runtime path needed for direct local runner control.
+///
+/// This deliberately omits task instructions and provider metadata. It is
+/// only used after the requested project/run scope has been checked.
+pub struct RunControlTarget {
+    pub runner_instance_id: RunnerInstanceId,
+    pub runner_runtime: String,
+}
+
 pub struct RecoverableRun {
     pub run: RunSnapshot,
     pub target: ExecutionTarget,
@@ -871,6 +880,23 @@ impl Store {
 
     pub fn execution_target(&self, run_id: &RunId) -> Result<ExecutionTarget> {
         load_execution_target(&self.connection, run_id)?.ok_or(StoreError::RunNotFound)
+    }
+
+    pub fn run_control_target(
+        &self,
+        project_id: &ProjectId,
+        run_id: &RunId,
+    ) -> Result<RunControlTarget> {
+        let run = load_run(&self.connection, run_id)?.ok_or(StoreError::RunNotFound)?;
+        if run.project_id != *project_id {
+            return Err(StoreError::RunNotFound);
+        }
+        let target =
+            load_execution_target(&self.connection, run_id)?.ok_or(StoreError::RunNotFound)?;
+        Ok(RunControlTarget {
+            runner_instance_id: target.runner_instance_id,
+            runner_runtime: target.runner_runtime,
+        })
     }
 
     pub fn ingest_runner_event(
