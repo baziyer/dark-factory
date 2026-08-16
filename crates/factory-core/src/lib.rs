@@ -181,6 +181,47 @@ pub enum ProviderHookEvent {
     SessionEnd,
 }
 
+impl ProviderHookEvent {
+    /// The exact event name Claude Code and Codex use in their own hook
+    /// wire protocols and configuration files (`SessionStart`,
+    /// `UserPromptSubmit`, ...) — independent of this enum's own
+    /// `snake_case` wire serialization used inside `LocalRequest::
+    /// ProviderHook`. This is what `factoryctl hook <Event>` accepts as its
+    /// positional argument and what generated provider hook commands are
+    /// invoked with.
+    #[must_use]
+    pub const fn provider_event_name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::Notification => "Notification",
+            Self::Stop => "Stop",
+            Self::SubagentStop => "SubagentStop",
+            Self::SessionEnd => "SessionEnd",
+        }
+    }
+
+    /// Parses the exact provider event name back into this enum. Inverse of
+    /// [`Self::provider_event_name`]. Returns `None` for anything else,
+    /// including this enum's own `snake_case` serialization.
+    #[must_use]
+    pub fn parse_provider_event_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "SessionStart" => Self::SessionStart,
+            "UserPromptSubmit" => Self::UserPromptSubmit,
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "Notification" => Self::Notification,
+            "Stop" => Self::Stop,
+            "SubagentStop" => Self::SubagentStop,
+            "SessionEnd" => Self::SessionEnd,
+            _ => return None,
+        })
+    }
+}
+
 /// Why a run (task-episode) was closed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -401,4 +442,48 @@ pub struct EventEnvelope {
     pub sequence: i64,
     pub occurred_at_ms: i64,
     pub event: FactoryEvent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderHookEvent;
+
+    #[test]
+    fn provider_event_name_round_trips_every_variant() {
+        let events = [
+            ProviderHookEvent::SessionStart,
+            ProviderHookEvent::UserPromptSubmit,
+            ProviderHookEvent::PreToolUse,
+            ProviderHookEvent::PostToolUse,
+            ProviderHookEvent::Notification,
+            ProviderHookEvent::Stop,
+            ProviderHookEvent::SubagentStop,
+            ProviderHookEvent::SessionEnd,
+        ];
+        for event in events {
+            let name = event.provider_event_name();
+            assert_eq!(
+                ProviderHookEvent::parse_provider_event_name(name),
+                Some(event)
+            );
+        }
+    }
+
+    #[test]
+    fn provider_event_name_is_exact_pascal_case_not_this_enums_own_snake_case_wire_form() {
+        assert_eq!(
+            ProviderHookEvent::SessionStart.provider_event_name(),
+            "SessionStart"
+        );
+        assert_eq!(
+            ProviderHookEvent::SubagentStop.provider_event_name(),
+            "SubagentStop"
+        );
+        assert_eq!(
+            ProviderHookEvent::parse_provider_event_name("session_start"),
+            None
+        );
+        assert_eq!(ProviderHookEvent::parse_provider_event_name("stop"), None);
+        assert_eq!(ProviderHookEvent::parse_provider_event_name(""), None);
+    }
 }
