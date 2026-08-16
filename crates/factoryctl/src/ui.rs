@@ -1003,19 +1003,21 @@ fn load_task_detail(
     project_id: ProjectId,
     task_id: TaskId,
 ) -> Result<TaskDetail, String> {
-    let response = request_response(
+    let response = request_response_raw(
         client,
         LocalRequest::GetTask {
             project_id: project_id.clone(),
             task_id: task_id.clone(),
         },
     )?;
-    match response {
-        LocalResponse::Task { task } => Ok(task),
-        response if is_unsupported_optional_request(&response) => load_tasks(client, &project_id)?
+    if is_unsupported_optional_request(&response) {
+        return load_tasks(client, &project_id)?
             .into_iter()
             .find(|task| task.snapshot.id == task_id)
-            .ok_or_else(|| "task was not found while hydrating the UI".into()),
+            .ok_or_else(|| "task was not found while hydrating the UI".into());
+    }
+    match response {
+        LocalResponse::Task { task } => Ok(task),
         LocalResponse::Error { message, .. } => Err(message),
         _ => Err("daemon returned an unexpected task detail response".into()),
     }
@@ -1094,9 +1096,10 @@ fn load_usage(client: &Client) -> Result<SubscriptionUsageStatus, String> {
 }
 
 fn load_event_sequence(client: &Client) -> Result<Option<i64>, String> {
-    match request_response(client, LocalRequest::LatestEventSequence)? {
+    let response = request_response_raw(client, LocalRequest::LatestEventSequence)?;
+    match optional_request_response(response)? {
         LocalResponse::EventHead { sequence } => Ok(Some(sequence)),
-        response if is_unsupported_optional_request(&response) => Ok(None),
+        LocalResponse::Error { .. } => Ok(None),
         _ => Err("daemon returned an unexpected event-head response".into()),
     }
 }
@@ -1205,12 +1208,26 @@ fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>
 }
 
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
+    match request_response_raw(client, request)? {
+        LocalResponse::Error { message, .. } => Err(message),
+        response => Ok(response),
+    }
+}
+
+fn request_response_raw(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
-        ServerFrame::Response { response, .. } => match response {
-            LocalResponse::Error { message, .. } => Err(message),
-            response => Ok(response),
-        },
+        ServerFrame::Response { response, .. } => Ok(response),
         ServerFrame::Event { .. } => Err("daemon returned an event instead of a response".into()),
+    }
+}
+
+fn optional_request_response(response: LocalResponse) -> Result<LocalResponse, String> {
+    if is_unsupported_optional_request(&response) {
+        return Ok(response);
+    }
+    match response {
+        LocalResponse::Error { message, .. } => Err(message),
+        response => Ok(response),
     }
 }
 
@@ -1323,6 +1340,13 @@ mod tests {
             message: "unknown request".into(),
         };
         assert!(super::is_unsupported_optional_request(&response));
+        assert!(matches!(
+            super::optional_request_response(response),
+            Ok(factory_core::local::LocalResponse::Error {
+                code: factory_core::local::ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
         assert!(!super::is_unsupported_optional_request(
             &factory_core::local::LocalResponse::Health
         ));
