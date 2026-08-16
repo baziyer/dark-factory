@@ -4,7 +4,7 @@ use std::{
     fs,
     future::Future,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +16,8 @@ use factory_core::{
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS,
-        MAX_TERMINAL_OUTPUT_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
+        MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail, RequestEnvelope,
+        RunTerminal, ServerFrame,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerEvent,
@@ -36,6 +37,7 @@ pub use crate::daemon_state::DaemonState as ApiState;
 use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
+    guidance::{self, GuidanceError},
     runner_client::{RunnerClient, RunnerClientError},
     store::{
         AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, RunControlTarget, StoreError,
@@ -91,6 +93,9 @@ impl ApiFailure {
                 ErrorCode::NotFound,
                 "agent was not found in the project".into(),
             ),
+            Self::Store(StoreError::ProjectNotFound) => {
+                (ErrorCode::NotFound, "project was not found".into())
+            }
             Self::Store(StoreError::TaskNotFound) => (
                 ErrorCode::NotFound,
                 "task was not found in the project".into(),
@@ -174,11 +179,13 @@ pub async fn serve<F>(
     listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: PathBuf,
     shutdown: F,
 ) -> io::Result<()>
 where
     F: Future<Output = ()>,
 {
+    let guidance_root = Arc::new(guidance_root);
     tokio::pin!(shutdown);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -200,11 +207,12 @@ where
                 };
                 let state = state.clone();
                 let execution = execution.clone();
+                let guidance_root = Arc::clone(&guidance_root);
                 let shutdown = stop_rx.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, state, execution, shutdown).await
+                        handle_connection(stream, state, execution, guidance_root, shutdown).await
                     {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
@@ -231,6 +239,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: Arc<PathBuf>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -303,7 +312,7 @@ async fn handle_connection(
         };
     }
 
-    let response = handle_request(&state, &execution, envelope.request)
+    let response = handle_request(&state, &execution, &guidance_root, envelope.request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
@@ -312,6 +321,7 @@ async fn handle_connection(
 async fn handle_request(
     state: &ApiState,
     execution: &execution::Handle,
+    guidance_root: &Path,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
@@ -319,6 +329,7 @@ async fn handle_request(
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
             let root = canonical_root(root).await?;
+            let project_id = id.clone();
             let project = state
                 .commit_and_publish(move |store| {
                     let (project, event) =
@@ -326,6 +337,7 @@ async fn handle_request(
                     Ok((project, vec![event]))
                 })
                 .await?;
+            ensure_project_guidance(guidance_root, &project_id).await?;
             Ok(LocalResponse::ProjectCreated { project })
         }
         LocalRequest::ListProjects { after_id, limit } => {
@@ -379,6 +391,8 @@ async fn handle_request(
             provider,
             model,
         } => {
+            let created_project_id = project_id.clone();
+            let created_agent_id = id.clone();
             let agent = state
                 .commit_and_publish(move |store| {
                     let (agent, event) = store.create_agent_with_model(
@@ -395,6 +409,7 @@ async fn handle_request(
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
             Ok(LocalResponse::AgentCreated { agent })
         }
         LocalRequest::ListAgents {
@@ -418,37 +433,79 @@ async fn handle_request(
             project_id,
             agent_id,
         } => {
+            let lookup_project_id = project_id.clone();
+            let lookup_agent_id = agent_id.clone();
             let agent = state
-                .with_store(move |store| store.get_agent_detail(&project_id, &agent_id))
+                .with_store(move |store| {
+                    store.get_agent_detail(&lookup_project_id, &lookup_agent_id)
+                })
                 .await?;
+            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
+            let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
+            let memory = read_guidance_file(agent_paths.memory.clone()).await?;
             Ok(LocalResponse::Agent {
-                agent: local_agent_detail(agent),
+                agent: local_agent_detail(agent, instructions, memory, agent_paths),
             })
         }
         LocalRequest::UpdateAgentProfile {
             project_id,
             agent_id,
             model,
+            permission_mode,
             instructions,
             memory,
         } => {
+            let store_project_id = project_id.clone();
+            let store_agent_id = agent_id.clone();
             let agent = state
                 .commit_and_publish(move |store| {
                     let (agent, event) = store.update_agent_profile(
-                        &project_id,
-                        &agent_id,
+                        &store_project_id,
+                        &store_agent_id,
                         UpdateAgentProfile {
                             model,
-                            instructions,
-                            memory,
+                            permission_mode,
                         },
                         now_ms()?,
                     )?;
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
+            write_guidance_file(agent_paths.instructions.clone(), instructions.clone()).await?;
+            write_guidance_file(agent_paths.memory.clone(), memory.clone()).await?;
             Ok(LocalResponse::AgentProfileUpdated {
-                agent: local_agent_detail(agent),
+                agent: local_agent_detail(agent, instructions, memory, agent_paths),
+            })
+        }
+        LocalRequest::GetProject { project_id } => {
+            let lookup_project_id = project_id.clone();
+            let project = state
+                .with_store(move |store| store.get_project(&lookup_project_id))
+                .await?;
+            let guidance_path =
+                factory_core::paths::project_guidance_path(guidance_root, &project_id);
+            let guidance = read_guidance_file(guidance_path.clone()).await?;
+            Ok(LocalResponse::Project {
+                project: local_project_detail(project, guidance, guidance_path),
+            })
+        }
+        LocalRequest::UpdateProjectGuidance { project_id, text } => {
+            if text.len() > guidance::MAX_GUIDANCE_FILE_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "project guidance must be at most {} bytes",
+                    guidance::MAX_GUIDANCE_FILE_BYTES
+                )));
+            }
+            let lookup_project_id = project_id.clone();
+            let project = state
+                .with_store(move |store| store.get_project(&lookup_project_id))
+                .await?;
+            let guidance_path =
+                factory_core::paths::project_guidance_path(guidance_root, &project_id);
+            write_guidance_file(guidance_path.clone(), text.clone()).await?;
+            Ok(LocalResponse::ProjectGuidanceUpdated {
+                project: local_project_detail(project, text, guidance_path),
             })
         }
         LocalRequest::SendAgentMessage {
@@ -745,15 +802,121 @@ async fn handle_request(
     }
 }
 
-fn local_agent_detail(agent: crate::store::AgentDetail) -> LocalAgentDetail {
+/// Absolute guidance-file paths for one agent, computed from the daemon's
+/// state root; never touches the filesystem itself.
+struct AgentGuidancePaths {
+    instructions: PathBuf,
+    memory: PathBuf,
+    project_guidance: PathBuf,
+}
+
+impl AgentGuidancePaths {
+    fn new(guidance_root: &Path, project_id: &ProjectId, agent_id: &AgentId) -> Self {
+        Self {
+            instructions: factory_core::paths::agent_instructions_path(
+                guidance_root,
+                project_id,
+                agent_id,
+            ),
+            memory: factory_core::paths::agent_memory_path(guidance_root, project_id, agent_id),
+            project_guidance: factory_core::paths::project_guidance_path(guidance_root, project_id),
+        }
+    }
+}
+
+fn local_agent_detail(
+    agent: crate::store::AgentDetail,
+    instructions: String,
+    memory: String,
+    paths: AgentGuidancePaths,
+) -> LocalAgentDetail {
     LocalAgentDetail {
         snapshot: agent.snapshot,
         profile: LocalAgentProfile {
             model: agent.profile.model,
-            instructions: agent.profile.instructions,
-            memory: agent.profile.memory,
+            permission_mode: agent.profile.permission_mode,
+            instructions,
+            memory,
             updated_at_ms: agent.profile.updated_at_ms,
         },
+        instructions_path: path_to_string(&paths.instructions),
+        memory_path: path_to_string(&paths.memory),
+        project_guidance_path: path_to_string(&paths.project_guidance),
+    }
+}
+
+fn local_project_detail(
+    project: ProjectSnapshot,
+    guidance: String,
+    guidance_path: PathBuf,
+) -> LocalProjectDetail {
+    LocalProjectDetail {
+        snapshot: project,
+        guidance,
+        guidance_path: path_to_string(&guidance_path),
+    }
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Reads a guidance file on the blocking pool, lazily creating it if absent.
+async fn read_guidance_file(path: PathBuf) -> Result<String, ApiFailure> {
+    tokio::task::spawn_blocking(move || guidance::read_or_create(&path))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Atomically overwrites a guidance file on the blocking pool.
+async fn write_guidance_file(path: PathBuf, text: String) -> Result<(), ApiFailure> {
+    tokio::task::spawn_blocking(move || guidance::write(&path, &text))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Idempotently creates a project's guidance directory and empty
+/// `PROJECT.md` on the blocking pool.
+async fn ensure_project_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+) -> Result<(), ApiFailure> {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    tokio::task::spawn_blocking(move || guidance::ensure_project(&home, &project_id))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Idempotently creates an agent's guidance directory, empty
+/// `instructions.md`, and empty `memory.md` on the blocking pool.
+async fn ensure_agent_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), ApiFailure> {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let agent_id = agent_id.clone();
+    tokio::task::spawn_blocking(move || guidance::ensure_agent(&home, &project_id, &agent_id))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+impl From<GuidanceError> for ApiFailure {
+    fn from(error: GuidanceError) -> Self {
+        match error {
+            GuidanceError::TooLarge { .. } | GuidanceError::InvalidText => {
+                Self::Invalid(error.to_string())
+            }
+            GuidanceError::NotUtf8 { .. }
+            | GuidanceError::Directory { .. }
+            | GuidanceError::File { .. } => Self::Internal(error.to_string()),
+        }
     }
 }
 

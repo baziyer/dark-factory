@@ -26,6 +26,9 @@ struct Config {
     codex: PathBuf,
     claude: PathBuf,
     runtime_root: PathBuf,
+    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
+    /// `factory_core::paths`).
+    guidance_root: PathBuf,
     max_active_runs: usize,
     webhook_config: Option<PathBuf>,
 }
@@ -62,6 +65,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let webhooks_enabled = webhooks.is_some();
     let webhooks_bind = webhooks.as_ref().map(WebhookServer::local_addr);
+    let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
             runner_program: config.runner,
@@ -70,6 +74,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             claude_max_turns: CLAUDE_MAX_TURNS,
             claude_max_budget_cents: CLAUDE_MAX_BUDGET_CENTS,
             runtime_root: config.runtime_root,
+            guidance_root: config.guidance_root,
             max_active_runs: config.max_active_runs,
             startup_timeout: STARTUP_TIMEOUT,
             connect_grace: CONNECT_GRACE,
@@ -93,7 +98,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let control_planes = serve_control_planes(listener, state, execution.clone(), webhooks);
+    let control_planes =
+        serve_control_planes(listener, state, execution.clone(), guidance_root, webhooks);
     tokio::pin!(control_planes);
     let result = tokio::select! {
         result = &mut control_planes => {
@@ -129,10 +135,17 @@ async fn serve_control_planes(
     listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: PathBuf,
     webhooks: Option<WebhookServer>,
 ) -> io::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let local = serve(listener, state, execution, wait_for_stop(stop_rx.clone()));
+    let local = serve(
+        listener,
+        state,
+        execution,
+        guidance_root,
+        wait_for_stop(stop_rx.clone()),
+    );
     let web = serve_optional_webhooks(webhooks, stop_rx);
     tokio::pin!(local);
     tokio::pin!(web);
@@ -228,6 +241,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         codex: PathBuf::from("codex"),
         claude: PathBuf::from("claude"),
         runtime_root: home.join("runs"),
+        guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
         webhook_config: None,
     };
@@ -315,11 +329,7 @@ fn next_path(
 }
 
 fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(path) = env::var_os("DARK_FACTORY_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = env::var_os("HOME").ok_or("HOME or DARK_FACTORY_HOME must be set")?;
-    Ok(PathBuf::from(home).join(".dark-factory"))
+    Ok(factory_core::paths::dark_factory_home()?)
 }
 
 #[cfg(test)]
@@ -336,6 +346,7 @@ mod tests {
             codex: PathBuf::from("codex"),
             claude: PathBuf::from("claude"),
             runtime_root: PathBuf::from("/state/runs"),
+            guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
             webhook_config: None,
         }

@@ -15,7 +15,7 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -58,11 +58,16 @@ pub struct NewAgent {
     pub provider: Provider,
 }
 
+/// Durable, provider-scoped model selection and permission mode. Standing
+/// instructions and memory used to live here as TEXT columns; they are now
+/// operator- and agent-editable files under the state directory (see
+/// `factoryd::guidance` and `factory_core::paths`), composed at launch by
+/// `execution::prepare_launch`. `permission_mode` is stored and shown but not
+/// yet consumed by launch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
-    pub instructions: String,
-    pub memory: String,
+    pub permission_mode: Option<String>,
     pub updated_at_ms: i64,
 }
 
@@ -73,8 +78,7 @@ pub struct AgentDetail {
 
 pub struct UpdateAgentProfile {
     pub model: Option<String>,
-    pub instructions: String,
-    pub memory: String,
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -100,7 +104,7 @@ pub struct AgentMessage {
 }
 
 const MAX_AGENT_MODEL_BYTES: usize = 256;
-const MAX_AGENT_PROFILE_TEXT_BYTES: usize = 16 * 1024;
+const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
 
 /// Provider-independent task vocabulary exposed by authenticated integrations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,7 +270,11 @@ pub struct ReservedRun {
 pub struct ExecutionTarget {
     pub provider: Provider,
     pub model: Option<String>,
-    pub agent_instructions: String,
+    /// Identity used to locate this agent's file-backed guidance and memory
+    /// under `factory_core::paths`; standing instructions and memory no
+    /// longer live in the database (see `AgentProfile`).
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
     pub project_root: String,
     pub task_body: String,
     pub agent_messages: Vec<AgentMessage>,
@@ -402,6 +410,8 @@ pub enum StoreError {
     CapacityReached { limit: usize },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
+    #[error("project was not found")]
+    ProjectNotFound,
     #[error("task was not found in the requested project")]
     TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]
@@ -490,6 +500,8 @@ pub enum StoreError {
     ProjectHasActiveRun,
     #[error("run is not in a stoppable state")]
     RunNotStoppable,
+    #[error("could not migrate stored agent instructions/memory to guidance files: {0}")]
+    AgentProfileMigration(String),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -1640,6 +1652,27 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    pub fn get_project(&self, project_id: &ProjectId) -> Result<ProjectSnapshot> {
+        self.connection
+            .query_row(
+                "SELECT id, name, root, created_at_ms, updated_at_ms
+                 FROM projects WHERE id = ?1",
+                params![project_id.as_str()],
+                |row| {
+                    Ok(ProjectSnapshot {
+                        id: parse_id(row.get(0)?, 0)?,
+                        name: row.get(1)?,
+                        root: row.get(2)?,
+                        created_at_ms: row.get(3)?,
+                        updated_at_ms: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)?
+            .ok_or(StoreError::ProjectNotFound)
+    }
+
     pub fn list_projects(
         &self,
         after_id: Option<&ProjectId>,
@@ -2309,8 +2342,7 @@ impl Store {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
-                instructions: String::new(),
-                memory: String::new(),
+                permission_mode: None,
                 updated_at_ms: 0,
             }),
         })
@@ -2331,19 +2363,17 @@ impl Store {
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, instructions, memory, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
-                instructions = excluded.instructions,
-                memory = excluded.memory,
+                permission_mode = excluded.permission_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
                 input.model,
-                input.instructions,
-                input.memory,
-                now_ms,
+                input.permission_mode,
+                now_ms
             ],
         )?;
         transaction.execute(
@@ -3424,12 +3454,7 @@ fn valid_terminal_result(result: Option<&str>) -> bool {
 
 fn validate_agent_profile(input: &UpdateAgentProfile) -> Result<()> {
     validate_agent_model(input.model.as_deref())?;
-    if !valid_bounded_profile_text(&input.instructions)
-        || !valid_bounded_profile_text(&input.memory)
-    {
-        return Err(StoreError::InvalidAgentProfile);
-    }
-    Ok(())
+    validate_agent_permission_mode(input.permission_mode.as_deref())
 }
 
 fn validate_agent_message(body: &str, created_at_ms: i64) -> Result<()> {
@@ -3457,11 +3482,18 @@ fn validate_agent_model(model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn valid_bounded_profile_text(value: &str) -> bool {
-    value.len() <= MAX_AGENT_PROFILE_TEXT_BYTES
-        && value
-            .chars()
-            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+/// Provider-scoped, free-form permission mode (e.g. Claude's `acceptEdits`
+/// or `plan`; Codex's `on-request` or `never`); `None` means the provider
+/// default. Validated the same way as `model`; not yet consumed by launch.
+fn validate_agent_permission_mode(permission_mode: Option<&str>) -> Result<()> {
+    if permission_mode.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_AGENT_PERMISSION_MODE_BYTES
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(StoreError::InvalidAgentProfile);
+    }
+    Ok(())
 }
 
 fn valid_failed_process_outcome(
@@ -3520,15 +3552,14 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, instructions, memory, updated_at_ms
+            "SELECT model, permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
                 Ok(AgentProfile {
                     model: row.get(0)?,
-                    instructions: row.get(1)?,
-                    memory: row.get(2)?,
-                    updated_at_ms: row.get(3)?,
+                    permission_mode: row.get(1)?,
+                    updated_at_ms: row.get(2)?,
                 })
             },
         )
@@ -3615,10 +3646,10 @@ fn load_execution_target(
 ) -> Result<Option<ExecutionTarget>> {
     connection
         .query_row(
-            "SELECT a.provider, ap.model, COALESCE(ap.instructions, ''), p.root, t.body, r.worktree, r.provider_session_id,
+            "SELECT a.provider, ap.model, p.root, t.body, r.worktree, r.provider_session_id,
                     a.codex_home, r.resumes_provider_session, r.runner_instance_id,
                     r.runner_protocol_version, r.runner_runtime,
-                    r.last_runner_sequence
+                    r.last_runner_sequence, r.project_id, r.agent_id
              FROM runs r
              JOIN agents a ON a.id = r.agent_id
              LEFT JOIN agent_profiles ap ON ap.agent_id = a.id
@@ -3628,24 +3659,25 @@ fn load_execution_target(
             params![run_id.as_str()],
             |row| {
                 let provider: String = row.get(0)?;
-                let protocol: i64 = row.get(10)?;
+                let protocol: i64 = row.get(9)?;
                 Ok(ExecutionTarget {
                     provider: parse_provider(&provider, 0)?,
                     model: row.get(1)?,
-                    agent_instructions: row.get(2)?,
-                    project_root: row.get(3)?,
-                    task_body: row.get(4)?,
+                    project_id: parse_id(row.get(12)?, 12)?,
+                    agent_id: parse_id(row.get(13)?, 13)?,
+                    project_root: row.get(2)?,
+                    task_body: row.get(3)?,
                     agent_messages: Vec::new(),
-                    worktree: row.get(5)?,
-                    provider_session_id: row.get(6)?,
-                    codex_home: row.get(7)?,
-                    resumes_provider_session: row.get(8)?,
-                    runner_instance_id: parse_id(row.get(9)?, 9)?,
+                    worktree: row.get(4)?,
+                    provider_session_id: row.get(5)?,
+                    codex_home: row.get(6)?,
+                    resumes_provider_session: row.get(7)?,
+                    runner_instance_id: parse_id(row.get(8)?, 8)?,
                     runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(10, Type::Integer, Box::new(error))
+                        rusqlite::Error::FromSqlConversionFailure(9, Type::Integer, Box::new(error))
                     })?,
-                    runner_runtime: row.get(11)?,
-                    last_committed_runner_sequence: row.get(12)?,
+                    runner_runtime: row.get(10)?,
+                    last_committed_runner_sequence: row.get(11)?,
                 })
             },
         )
@@ -3912,6 +3944,63 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         ))?;
         transaction.pragma_update(None, "user_version", 12)?;
         transaction.commit()?;
+        current = 12;
+    }
+    if current == 12 {
+        // Standing instructions and memory move from `agent_profiles` TEXT
+        // columns to files under `$DARK_FACTORY_HOME/projects`; write out any
+        // existing non-empty text before the columns are dropped below.
+        migrate_agent_profile_text_to_files(connection)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0013_agent_profile_files.sql"))?;
+        transaction.pragma_update(None, "user_version", 13)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// One-time data migration paired with `0013_agent_profile_files.sql`:
+/// writes any pre-existing `agent_profiles.instructions`/`.memory` text out
+/// to the new guidance files before those columns are dropped. A fresh
+/// database never has agent rows at migration time, so this is a no-op in
+/// practice; it exists for correctness on a real upgrade.
+fn migrate_agent_profile_text_to_files(connection: &Connection) -> Result<()> {
+    let mut statement = connection.prepare(
+        "SELECT ap.agent_id, a.project_id, ap.instructions, ap.memory
+         FROM agent_profiles ap
+         JOIN agents a ON a.id = ap.agent_id
+         WHERE ap.instructions <> '' OR ap.memory <> ''",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let home = factory_core::paths::dark_factory_home()
+        .map_err(|error| StoreError::AgentProfileMigration(error.to_string()))?;
+    for (agent_id, project_id, instructions, memory) in rows {
+        let project_id = ProjectId::try_from(project_id)
+            .map_err(|error| StoreError::AgentProfileMigration(error.to_string()))?;
+        let agent_id = AgentId::try_from(agent_id)
+            .map_err(|error| StoreError::AgentProfileMigration(error.to_string()))?;
+        if !instructions.is_empty() {
+            let path = factory_core::paths::agent_instructions_path(&home, &project_id, &agent_id);
+            crate::guidance::write(&path, &instructions)
+                .map_err(|error| StoreError::AgentProfileMigration(error.to_string()))?;
+        }
+        if !memory.is_empty() {
+            let path = factory_core::paths::agent_memory_path(&home, &project_id, &agent_id);
+            crate::guidance::write(&path, &memory)
+                .map_err(|error| StoreError::AgentProfileMigration(error.to_string()))?;
+        }
     }
     Ok(())
 }

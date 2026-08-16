@@ -276,10 +276,15 @@ fn agent_profile_is_available_only_through_private_local_detail() {
             snapshot: agent.clone(),
             profile: AgentProfile {
                 model: Some("gpt-5-codex".into()),
+                permission_mode: Some("on-request".into()),
                 instructions: "Orchestrate the factory.".into(),
                 memory: "Prefer narrow slices.".into(),
                 updated_at_ms: 3,
             },
+            instructions_path:
+                "/home/user/.dark-factory/projects/factory/agents/god/instructions.md".into(),
+            memory_path: "/home/user/.dark-factory/projects/factory/agents/god/memory.md".into(),
+            project_guidance_path: "/home/user/.dark-factory/projects/factory/PROJECT.md".into(),
         },
     };
     let value = serde_json::to_value(response).unwrap();

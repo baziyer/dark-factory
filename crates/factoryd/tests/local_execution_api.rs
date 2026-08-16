@@ -59,6 +59,7 @@ where
             claude_max_turns: NonZeroU32::new(20).unwrap(),
             claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: directory.path().join("runs"),
+            guidance_root: directory.path().to_path_buf(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
             connect_grace: Duration::from_secs(1),
@@ -68,9 +69,15 @@ where
     )
     .unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state.clone(), execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
 
     test(socket, state).await;
 
@@ -160,6 +167,7 @@ async fn local_agent_profile_round_trips_without_changing_public_agent_events() 
                 project_id: id::<ProjectId>("project-1"),
                 agent_id: id::<AgentId>("god"),
                 model: Some("gpt-5-codex".into()),
+                permission_mode: Some("on-request".into()),
                 instructions: "Coordinate the team.".into(),
                 memory: "Keep work bounded.".into(),
             },
@@ -171,7 +179,11 @@ async fn local_agent_profile_round_trips_without_changing_public_agent_events() 
                 ..
             } => {
                 assert_eq!(agent.profile.model.as_deref(), Some("gpt-5-codex"));
+                assert_eq!(agent.profile.permission_mode.as_deref(), Some("on-request"));
                 assert_eq!(agent.profile.instructions, "Coordinate the team.");
+                assert!(!agent.instructions_path.is_empty());
+                assert!(!agent.memory_path.is_empty());
+                assert!(!agent.project_guidance_path.is_empty());
             }
             other => panic!("unexpected profile response: {other:?}"),
         }
@@ -187,9 +199,86 @@ async fn local_agent_profile_round_trips_without_changing_public_agent_events() 
             ServerFrame::Response {
                 response: LocalResponse::Agent { agent },
                 ..
-            } => assert_eq!(agent.profile.memory, "Keep work bounded."),
+            } => {
+                assert_eq!(agent.profile.memory, "Keep work bounded.");
+                assert_eq!(agent.profile.permission_mode.as_deref(), Some("on-request"));
+            }
             other => panic!("unexpected agent response: {other:?}"),
         }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_project_guidance_round_trips_as_a_file_backed_sister_folder() {
+    with_server(|socket, _state| async move {
+        let root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: id::<ProjectId>("project-1"),
+                    name: "Dark Factory".into(),
+                    root: root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+
+        // A freshly created project already has an empty, readable PROJECT.md.
+        let created = request(
+            &socket,
+            LocalRequest::GetProject {
+                project_id: id::<ProjectId>("project-1"),
+            },
+        )
+        .await;
+        match created {
+            ServerFrame::Response {
+                response: LocalResponse::Project { project },
+                ..
+            } => {
+                assert_eq!(project.guidance, "");
+                assert!(project.guidance_path.ends_with("PROJECT.md"));
+            }
+            other => panic!("unexpected project response: {other:?}"),
+        }
+
+        let updated = request(
+            &socket,
+            LocalRequest::UpdateProjectGuidance {
+                project_id: id::<ProjectId>("project-1"),
+                text: "# Dark Factory\n\nBuild the thing.\n".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            updated,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectGuidanceUpdated { project },
+                ..
+            } if project.guidance == "# Dark Factory\n\nBuild the thing.\n"
+        ));
+
+        let reloaded = request(
+            &socket,
+            LocalRequest::GetProject {
+                project_id: id::<ProjectId>("project-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            reloaded,
+            ServerFrame::Response {
+                response: LocalResponse::Project { project },
+                ..
+            } if project.guidance == "# Dark Factory\n\nBuild the thing.\n"
+        ));
     })
     .await;
 }

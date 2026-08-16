@@ -465,6 +465,7 @@ impl RecoveryFixture {
             claude_max_turns: NonZeroU32::new(20).unwrap(),
             claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: self.runtime_root.clone(),
+            guidance_root: self._directory.path().to_path_buf(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
             connect_grace: grace,
@@ -759,6 +760,7 @@ impl QueuedFixture {
             claude_max_turns: NonZeroU32::new(20).unwrap(),
             claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: self.runtime_root.clone(),
+            guidance_root: self._directory.path().to_path_buf(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
             connect_grace: Duration::from_millis(100),
@@ -1011,9 +1013,17 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
             terminal_sequence: 3,
         }
     );
+    let memory_path = factory_core::paths::agent_memory_path(
+        fixture._directory.path(),
+        &fixture.project_id,
+        &fixture.agent_id,
+    );
     assert_eq!(
         fs::read_to_string(&scripted.input).unwrap(),
-        "private queued task body"
+        format!(
+            "Task instructions:\nprivate queued task body\n\nYour memory file is {}. Append durable lessons there; keep it under 16 KB.",
+            memory_path.display()
+        )
     );
     let arguments = fs::read_to_string(&scripted.arguments).unwrap();
     assert!(!arguments.contains("private queued task body"));
@@ -1048,6 +1058,59 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
     ] {
         assert!(!public_json.contains(private));
     }
+
+    stop(handle, join).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn launch_composes_project_and_agent_guidance_files_when_present() {
+    let fixture = QueuedFixture::new();
+    let home = fixture._directory.path();
+
+    // Pre-populate the sister-folder guidance files a real operator or agent
+    // would have written before this launch.
+    let project_guidance_path =
+        factory_core::paths::project_guidance_path(home, &fixture.project_id);
+    fs::create_dir_all(project_guidance_path.parent().unwrap()).unwrap();
+    fs::write(&project_guidance_path, "Ship the smallest correct slice.").unwrap();
+    let instructions_path =
+        factory_core::paths::agent_instructions_path(home, &fixture.project_id, &fixture.agent_id);
+    fs::create_dir_all(instructions_path.parent().unwrap()).unwrap();
+    fs::write(&instructions_path, "You are the queued worker.").unwrap();
+    let memory_path =
+        factory_core::paths::agent_memory_path(home, &fixture.project_id, &fixture.agent_id);
+    fs::write(&memory_path, "Prefer small, reversible slices.").unwrap();
+
+    let scripted = ScriptedRunner::compile(home);
+    let mut config = fixture.config();
+    config.runner_program = scripted.program.clone();
+    config.codex_program = scripted.codex_provider.clone();
+    config.connect_grace = Duration::from_secs(5);
+    let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
+
+    handle
+        .start_task(StartTask {
+            project_id: fixture.project_id.clone(),
+            task_id: fixture.task_id.clone(),
+            agent_id: fixture.agent_id.clone(),
+            parent_run_id: None,
+            worktree: fixture.project_root.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for_path(&scripted.launched).await;
+    fs::write(&scripted.release, b"").unwrap();
+    wait_for_path(&scripted.done).await;
+
+    let expected = format!(
+        "Project guidance:\nShip the smallest correct slice.\n\n\
+         Standing guidance:\nYou are the queued worker.\n\n\
+         Memory:\nPrefer small, reversible slices.\n\n\
+         Task instructions:\nprivate queued task body\n\n\
+         Your memory file is {}. Append durable lessons there; keep it under 16 KB.",
+        memory_path.display()
+    );
+    assert_eq!(fs::read_to_string(&scripted.input).unwrap(), expected);
 
     stop(handle, join).await;
 }
@@ -1136,11 +1199,20 @@ async fn fresh_and_adopted_claude_use_the_durable_provider_session_and_exact_cwd
         })
         .await
         .expect("Claude terminal acknowledgement was not durably reconciled");
-        let expected_input = if adopted {
+        let expected_task_body = if adopted {
             "private adopted Claude task body"
         } else {
             "private fresh Claude task body"
         };
+        let memory_path = factory_core::paths::agent_memory_path(
+            fixture._directory.path(),
+            &fixture.project_id,
+            &fixture.agent_id,
+        );
+        let expected_input = format!(
+            "Task instructions:\n{expected_task_body}\n\nYour memory file is {}. Append durable lessons there; keep it under 16 KB.",
+            memory_path.display()
+        );
         assert_eq!(fs::read_to_string(&scripted.input).unwrap(), expected_input);
         let task_id = fixture.task_id.clone();
         let result = fixture
@@ -1164,7 +1236,7 @@ async fn fresh_and_adopted_claude_use_the_durable_provider_session_and_exact_cwd
             .await
             .unwrap();
         assert!(!public.contains(launched_session));
-        assert!(!public.contains(expected_input));
+        assert!(!public.contains(expected_task_body));
 
         stop(handle, join).await;
     }
@@ -1172,7 +1244,12 @@ async fn fresh_and_adopted_claude_use_the_durable_provider_session_and_exact_cwd
 
 #[tokio::test(start_paused = true)]
 async fn startup_input_timeout_kills_the_unready_wrapper_and_allows_shutdown() {
-    let instructions = "x".repeat(factory_core::runner::MAX_STARTUP_STDIN_BYTES);
+    // The task body is composed with a "Task instructions:" header and a
+    // trailing memory-file paragraph (see `execution::compose_instructions`),
+    // so it must leave headroom under `MAX_STARTUP_STDIN_BYTES` rather than
+    // exactly filling it; this only needs to be large enough that the
+    // startup-input transfer is slow enough to observe in flight.
+    let instructions = "x".repeat(factory_core::runner::MAX_STARTUP_STDIN_BYTES - 4096);
     let fixture = QueuedFixture::with_body(instructions.clone());
     let scripted = ScriptedRunner::compile(fixture._directory.path());
     fs::write(&scripted.launch_shutdown_mode, b"").unwrap();

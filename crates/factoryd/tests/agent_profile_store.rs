@@ -29,14 +29,18 @@ fn fixture() -> Store {
 }
 
 #[test]
-fn agent_profile_is_durable_and_separate_from_public_agent_snapshot() {
+fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
+    // Standing instructions and memory used to live here too, as TEXT
+    // columns; they are now operator- and agent-editable files under the
+    // state directory (see `factoryd::guidance`), exercised end to end
+    // through the local API in `tests/local_execution_api.rs`.
     let mut store = fixture();
     let project = ProjectId::try_from("factory").unwrap();
     let agent = AgentId::try_from("god").unwrap();
 
     let initial = store.get_agent_detail(&project, &agent).unwrap();
     assert_eq!(initial.profile.model, None);
-    assert!(initial.profile.instructions.is_empty());
+    assert_eq!(initial.profile.permission_mode, None);
 
     store
         .update_agent_profile(
@@ -44,8 +48,7 @@ fn agent_profile_is_durable_and_separate_from_public_agent_snapshot() {
             &agent,
             UpdateAgentProfile {
                 model: Some("gpt-5-codex".into()),
-                instructions: "You are the factory orchestrator.".into(),
-                memory: "Prefer small, reversible slices.".into(),
+                permission_mode: Some("on-request".into()),
             },
             3,
         )
@@ -54,10 +57,9 @@ fn agent_profile_is_durable_and_separate_from_public_agent_snapshot() {
     let reloaded = store.get_agent_detail(&project, &agent).unwrap();
     assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5-codex"));
     assert_eq!(
-        reloaded.profile.instructions,
-        "You are the factory orchestrator."
+        reloaded.profile.permission_mode.as_deref(),
+        Some("on-request")
     );
-    assert_eq!(reloaded.profile.memory, "Prefer small, reversible slices.");
     assert_eq!(reloaded.snapshot.provider, Provider::Codex);
 }
 

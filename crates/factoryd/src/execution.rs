@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use crate::{
     daemon_state::{DaemonState, DaemonStateError},
+    guidance,
     providers::{
         claude::{
             self, ClaudeLaunch, Decoder as ClaudeDecoder, FailureReason as ClaudeFailureReason,
@@ -41,8 +42,9 @@ use crate::{
     runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
     runner_process,
     store::{
-        ExecutionTarget, MAX_RUNNER_BATCH_EVENTS, RecoverableExecution, RunReservation,
-        RunnerEventEffects, RunnerEventInput, StoreError, TerminalOutcome, WriteDisposition,
+        AgentMessage, ExecutionTarget, MAX_RUNNER_BATCH_EVENTS, RecoverableExecution,
+        RunReservation, RunnerEventEffects, RunnerEventInput, StoreError, TerminalOutcome,
+        WriteDisposition,
     },
 };
 
@@ -61,6 +63,9 @@ pub struct Config {
     pub claude_max_turns: NonZeroU32,
     pub claude_max_budget_cents: NonZeroU32,
     pub runtime_root: PathBuf,
+    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree read at
+    /// launch (see `factory_core::paths` and `guidance`).
+    pub guidance_root: PathBuf,
     pub max_active_runs: usize,
     pub startup_timeout: Duration,
     pub connect_grace: Duration,
@@ -148,6 +153,8 @@ pub enum Error {
     InvalidClock,
     #[error("durable execution metadata is inconsistent")]
     CorruptExecution,
+    #[error("launch guidance unavailable: {0}")]
+    Guidance(String),
 }
 
 struct SharedConfig {
@@ -157,6 +164,7 @@ struct SharedConfig {
     claude_max_turns: NonZeroU32,
     claude_max_budget_cents: NonZeroU32,
     runtime_root: PathBuf,
+    guidance_root: PathBuf,
     max_active_runs: usize,
     startup_timeout: Duration,
     connect_grace: Duration,
@@ -208,6 +216,7 @@ pub fn spawn(
         claude_max_turns: config.claude_max_turns,
         claude_max_budget_cents: config.claude_max_budget_cents,
         runtime_root,
+        guidance_root: config.guidance_root,
         max_active_runs: config.max_active_runs,
         startup_timeout: config.startup_timeout,
         connect_grace: config.connect_grace,
@@ -1161,7 +1170,8 @@ fn prepare_launch(
     let ExecutionTarget {
         provider,
         model,
-        agent_instructions,
+        project_id,
+        agent_id,
         task_body,
         agent_messages,
         provider_session_id,
@@ -1169,29 +1179,26 @@ fn prepare_launch(
         resumes_provider_session,
         ..
     } = target;
-    let has_standing_guidance = !agent_instructions.trim().is_empty();
-    let instructions = if !has_standing_guidance && agent_messages.is_empty() {
-        task_body
-    } else {
-        let mut instructions = String::new();
-        if has_standing_guidance {
-            instructions.push_str("Standing guidance:\n");
-            instructions.push_str(&agent_instructions);
-            instructions.push_str("\n\n");
-        }
-        if !agent_messages.is_empty() {
-            instructions.push_str("Operator messages for this launch:\n");
-            for message in agent_messages {
-                instructions.push_str("- ");
-                instructions.push_str(&message.body);
-                instructions.push('\n');
-            }
-            instructions.push('\n');
-        }
-        instructions.push_str("Task instructions:\n");
-        instructions.push_str(&task_body);
-        instructions
-    };
+    let memory_path =
+        factory_core::paths::agent_memory_path(&config.guidance_root, &project_id, &agent_id);
+    let instructions_path =
+        factory_core::paths::agent_instructions_path(&config.guidance_root, &project_id, &agent_id);
+    let project_guidance_path =
+        factory_core::paths::project_guidance_path(&config.guidance_root, &project_id);
+    let project_guidance = guidance::read_or_create(&project_guidance_path)
+        .map_err(|error| Error::Guidance(error.to_string()))?;
+    let standing_guidance = guidance::read_or_create(&instructions_path)
+        .map_err(|error| Error::Guidance(error.to_string()))?;
+    let memory = guidance::read_or_create(&memory_path)
+        .map_err(|error| Error::Guidance(error.to_string()))?;
+    let instructions = compose_instructions(
+        &project_guidance,
+        &standing_guidance,
+        &memory,
+        &agent_messages,
+        &task_body,
+        &memory_path,
+    );
     match provider {
         Provider::Codex => {
             let session = if resumes_provider_session {
@@ -1243,6 +1250,48 @@ fn prepare_launch(
             .map_err(|_| Error::InvalidSession)
         }
     }
+}
+
+/// Composes launch instructions from project guidance, standing guidance,
+/// memory, queued operator messages, and the task body, skipping any section
+/// that is empty. A final paragraph pointing at the agent's memory file is
+/// always appended so the agent can self-edit its own durable memory.
+fn compose_instructions(
+    project_guidance: &str,
+    standing_guidance: &str,
+    memory: &str,
+    agent_messages: &[AgentMessage],
+    task_body: &str,
+    memory_path: &Path,
+) -> String {
+    let mut sections = Vec::new();
+    if !project_guidance.trim().is_empty() {
+        sections.push(format!("Project guidance:\n{project_guidance}"));
+    }
+    if !standing_guidance.trim().is_empty() {
+        sections.push(format!("Standing guidance:\n{standing_guidance}"));
+    }
+    if !memory.trim().is_empty() {
+        sections.push(format!("Memory:\n{memory}"));
+    }
+    if !agent_messages.is_empty() {
+        let mut section = String::from("Operator messages for this launch:\n");
+        for message in agent_messages {
+            section.push_str("- ");
+            section.push_str(&message.body);
+            section.push('\n');
+        }
+        section.truncate(section.trim_end_matches('\n').len());
+        sections.push(section);
+    }
+    if !task_body.trim().is_empty() {
+        sections.push(format!("Task instructions:\n{task_body}"));
+    }
+    sections.push(format!(
+        "Your memory file is {}. Append durable lessons there; keep it under 16 KB.",
+        memory_path.display()
+    ));
+    sections.join("\n\n")
 }
 
 fn decoder_for(target: &WatchTarget) -> Result<ProviderDecoder, Error> {
@@ -1327,6 +1376,7 @@ fn error_category(error: &Error) -> &'static str {
         Error::WorkerStopped => "worker_stopped",
         Error::InvalidClock => "invalid_clock",
         Error::CorruptExecution => "corrupt_execution",
+        Error::Guidance(_) => "guidance",
     }
 }
 

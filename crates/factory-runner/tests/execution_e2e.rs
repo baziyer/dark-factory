@@ -111,6 +111,7 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
             claude_max_turns: NonZeroU32::new(20).unwrap(),
             claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: runtime_root.clone(),
+            guidance_root: directory.path().to_path_buf(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(5),
             connect_grace: Duration::from_secs(5),
@@ -119,6 +120,8 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
         state.clone(),
     )
     .unwrap();
+    let memory_path =
+        factory_core::paths::agent_memory_path(directory.path(), &project_id, &agent_id);
     let started = timeout(
         Duration::from_secs(10),
         handle.start_task(StartTask {
@@ -157,7 +160,10 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
 
     assert_eq!(
         fs::read_to_string(&provider_input).unwrap(),
-        "real runner private task"
+        format!(
+            "Task instructions:\nreal runner private task\n\nYour memory file is {}. Append durable lessons there; keep it under 16 KB.",
+            memory_path.display()
+        )
     );
     let arguments = fs::read_to_string(&provider_arguments).unwrap();
     assert_eq!(
@@ -350,6 +356,7 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
             claude_max_turns: NonZeroU32::new(20).unwrap(),
             claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: runtime_root.clone(),
+            guidance_root: directory.path().to_path_buf(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(5),
             connect_grace: Duration::from_secs(5),
@@ -358,6 +365,8 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
         state.clone(),
     )
     .unwrap();
+    let memory_path =
+        factory_core::paths::agent_memory_path(directory.path(), &project_id, &agent_id);
     let started = timeout(
         Duration::from_secs(10),
         handle.start_task(StartTask {
@@ -395,7 +404,11 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
     .expect("real runner terminal was not acknowledged and cleaned up");
 
     let private_task = "real runner private Claude task";
-    assert_eq!(fs::read_to_string(&provider_input).unwrap(), private_task);
+    let composed_input = format!(
+        "Task instructions:\n{private_task}\n\nYour memory file is {}. Append durable lessons there; keep it under 16 KB.",
+        memory_path.display()
+    );
+    assert_eq!(fs::read_to_string(&provider_input).unwrap(), composed_input);
     let arguments = fs::read_to_string(&provider_arguments).unwrap();
     assert_eq!(
         arguments.lines().collect::<Vec<_>>(),

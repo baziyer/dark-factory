@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod local;
+pub mod paths;
 pub mod runner;
 
 pub const PROTOCOL_VERSION: u16 = 1;

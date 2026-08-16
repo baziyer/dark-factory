@@ -8,11 +8,19 @@ use crate::{
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
-/// `AgentSnapshot` or `FactoryEvent`.
+/// `AgentSnapshot` or `FactoryEvent`. `instructions` and `memory` are read
+/// from (and written to) the agent's guidance files under
+/// `$DARK_FACTORY_HOME/projects`; see `AgentDetail::instructions_path` and
+/// `AgentDetail::memory_path`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Provider-scoped permission mode (Claude: `default`/`acceptEdits`/
+    /// `plan`; Codex: `on-request`/`never`); `None` is the provider default.
+    /// Stored and shown; not yet consumed by launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
     pub instructions: String,
     pub memory: String,
     pub updated_at_ms: i64,
@@ -22,6 +30,24 @@ pub struct AgentProfile {
 pub struct AgentDetail {
     pub snapshot: AgentSnapshot,
     pub profile: AgentProfile,
+    /// Absolute path to this agent's standing-guidance file, editable
+    /// directly with `$EDITOR`.
+    pub instructions_path: String,
+    /// Absolute path to this agent's memory file. The agent itself is
+    /// expected to append durable lessons here.
+    pub memory_path: String,
+    /// Absolute path to this agent's project's `PROJECT.md`.
+    pub project_guidance_path: String,
+}
+
+/// Project-level guidance, file-backed under `$DARK_FACTORY_HOME/projects`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectDetail {
+    pub snapshot: ProjectSnapshot,
+    pub guidance: String,
+    /// Absolute path to this project's `PROJECT.md`, editable directly with
+    /// `$EDITOR`.
+    pub guidance_path: String,
 }
 
 /// Private operator/agent message. Message bodies never enter public events.
@@ -92,6 +118,13 @@ pub enum LocalRequest {
         after_id: Option<ProjectId>,
         limit: u32,
     },
+    GetProject {
+        project_id: ProjectId,
+    },
+    UpdateProjectGuidance {
+        project_id: ProjectId,
+        text: String,
+    },
     CreateTask {
         id: TaskId,
         project_id: ProjectId,
@@ -120,6 +153,8 @@ pub enum LocalRequest {
         agent_id: AgentId,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
         instructions: String,
         memory: String,
     },
@@ -241,6 +276,12 @@ pub enum LocalResponse {
         projects: Vec<ProjectSnapshot>,
         #[serde(skip_serializing_if = "Option::is_none")]
         next_after_id: Option<ProjectId>,
+    },
+    Project {
+        project: ProjectDetail,
+    },
+    ProjectGuidanceUpdated {
+        project: ProjectDetail,
     },
     TaskCreated {
         task: TaskDetail,

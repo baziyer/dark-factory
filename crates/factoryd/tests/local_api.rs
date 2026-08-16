@@ -73,9 +73,15 @@ where
     let (execution, execution_join) =
         execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
 
     test(socket).await;
 
@@ -93,6 +99,7 @@ fn execution_config(directory: &Path) -> execution::Config {
         claude_max_turns: NonZeroU32::new(20).unwrap(),
         claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
         runtime_root: directory.join("runs"),
+        guidance_root: directory.to_path_buf(),
         max_active_runs: 1,
         startup_timeout: std::time::Duration::from_secs(1),
         connect_grace: std::time::Duration::from_secs(1),
@@ -407,9 +414,15 @@ async fn shutdown_closes_idle_connections_before_returning() {
     let (execution, execution_join) =
         execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
     let _idle = UnixStream::connect(&socket).await.unwrap();
 
     shutdown_tx.send(()).unwrap();
@@ -445,9 +458,15 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
     let (execution, execution_join) =
         execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
     let mut observer = UnixStream::connect(&socket).await.unwrap();
     write_request(&mut observer, LocalRequest::Subscribe { after_sequence: 0 }).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;

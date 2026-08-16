@@ -152,7 +152,7 @@ fn migrates_v3_health_as_unknown_with_a_nonnegative_since_and_reopens() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(stored, ("unknown".into(), 0));
 }
 
