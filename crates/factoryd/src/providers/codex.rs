@@ -107,6 +107,7 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
             runtime_dir: input.runtime_dir,
             cwd: input.cwd,
             startup_input: input.instructions.into_bytes(),
+            terminal: None,
         },
         decoder,
     })

@@ -562,6 +562,336 @@ async fn local_run_terminal_reads_private_spool_and_stop_controls_the_exact_runn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_run_terminal_is_not_found_when_the_spool_is_missing() {
+    with_server(|socket, state| async move {
+        let root = socket.parent().unwrap().join("missing-spool-project");
+        std::fs::create_dir(&root).unwrap();
+        create_project_and_task(&socket, &root, "missing spool task").await;
+        request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: id::<AgentId>("agent-1"),
+                project_id: id::<ProjectId>("project-1"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+        )
+        .await;
+
+        let run_id = id::<RunId>("run-missing-spool");
+        let runner_instance_id = id::<RunnerInstanceId>("instance-missing-spool");
+        // Deliberately do not create the runtime directory or its spool.
+        let runtime = root.join("run-missing-spool");
+        let root_string = root.to_string_lossy().into_owned();
+        let runtime_string = runtime.to_string_lossy().into_owned();
+        let reservation_run_id = run_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let reserved = store.reserve_task_run(
+                    RunReservation {
+                        project_id: id::<ProjectId>("project-1"),
+                        task_id: id::<TaskId>("task-1"),
+                        agent_id: id::<AgentId>("agent-1"),
+                        expected_provider: Provider::Codex,
+                        run_id: reservation_run_id,
+                        parent_run_id: None,
+                        worktree: root_string,
+                        fresh_provider_session_id: None,
+                        runner_instance_id,
+                        runner_runtime: runtime_string,
+                    },
+                    1,
+                    10,
+                )?;
+                Ok(((), reserved.events))
+            })
+            .await
+            .unwrap();
+
+        match request(
+            &socket,
+            LocalRequest::GetRunTerminal {
+                project_id: id::<ProjectId>("project-1"),
+                run_id,
+            },
+        )
+        .await
+        {
+            ServerFrame::Response {
+                response:
+                    LocalResponse::Error {
+                        code: ErrorCode::NotFound,
+                        ..
+                    },
+                ..
+            } => {}
+            other => panic!("expected a NotFound error, got {other:?}"),
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_run_terminal_degrades_a_malformed_non_final_line_to_truncated() {
+    with_server(|socket, state| async move {
+        let root = socket.parent().unwrap().join("malformed-spool-project");
+        std::fs::create_dir(&root).unwrap();
+        create_project_and_task(&socket, &root, "malformed spool task").await;
+        request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: id::<AgentId>("agent-1"),
+                project_id: id::<ProjectId>("project-1"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+        )
+        .await;
+
+        let run_id = id::<RunId>("run-malformed-spool");
+        let runner_instance_id = id::<RunnerInstanceId>("instance-malformed-spool");
+        let runtime = root.join("run-malformed-spool");
+        std::fs::create_dir(&runtime).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let runtime_string = runtime.to_string_lossy().into_owned();
+        let reservation_run_id = run_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let reserved = store.reserve_task_run(
+                    RunReservation {
+                        project_id: id::<ProjectId>("project-1"),
+                        task_id: id::<TaskId>("task-1"),
+                        agent_id: id::<AgentId>("agent-1"),
+                        expected_provider: Provider::Codex,
+                        run_id: reservation_run_id,
+                        parent_run_id: None,
+                        worktree: root_string,
+                        fresh_provider_session_id: None,
+                        runner_instance_id,
+                        runner_runtime: runtime_string,
+                    },
+                    1,
+                    10,
+                )?;
+                Ok(((), reserved.events))
+            })
+            .await
+            .unwrap();
+
+        // A valid record, then a torn/malformed record (as a concurrent
+        // writer might leave behind), then another valid record that must
+        // never surface: the spool is append-only, so a torn record in the
+        // middle can never become readable later.
+        let kept = RunnerEventEnvelope {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            sequence: 1,
+            occurred_at_ms: 11,
+            event: RunnerEvent::Output {
+                stream: OutputStream::Stdout,
+                text: "kept\n".into(),
+                lossy: false,
+            },
+        };
+        let dropped = RunnerEventEnvelope {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            sequence: 3,
+            occurred_at_ms: 13,
+            event: RunnerEvent::Output {
+                stream: OutputStream::Stdout,
+                text: "dropped\n".into(),
+                lossy: false,
+            },
+        };
+        let mut spool = Vec::new();
+        spool.extend(serde_json::to_vec(&kept).unwrap());
+        spool.push(b'\n');
+        spool.extend(b"{not valid json");
+        spool.push(b'\n');
+        spool.extend(serde_json::to_vec(&dropped).unwrap());
+        spool.push(b'\n');
+        std::fs::write(runtime.join("events.ndjson"), spool).unwrap();
+
+        match request(
+            &socket,
+            LocalRequest::GetRunTerminal {
+                project_id: id::<ProjectId>("project-1"),
+                run_id,
+            },
+        )
+        .await
+        {
+            ServerFrame::Response {
+                response: LocalResponse::RunTerminal { terminal },
+                ..
+            } => {
+                assert!(terminal.output.contains("kept"));
+                assert!(!terminal.output.contains("dropped"));
+                assert!(terminal.truncated);
+                assert_eq!(terminal.head_sequence, 1);
+            }
+            other => panic!("unexpected terminal response: {other:?}"),
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
+    with_server(|socket, state| async move {
+        let root = socket.parent().unwrap().join("attach-project");
+        std::fs::create_dir(&root).unwrap();
+        create_project_and_task(&socket, &root, "attach task").await;
+        request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: id::<AgentId>("agent-1"),
+                project_id: id::<ProjectId>("project-1"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+        )
+        .await;
+
+        let run_id = id::<RunId>("run-attach");
+        let runner_instance_id = id::<RunnerInstanceId>("instance-attach");
+        let runtime = root.join("run-attach");
+        std::fs::create_dir(&runtime).unwrap();
+        let root_string = root.to_string_lossy().into_owned();
+        let runtime_string = runtime.to_string_lossy().into_owned();
+        let reservation_run_id = run_id.clone();
+        let reservation_instance_id = runner_instance_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let reserved = store.reserve_task_run(
+                    RunReservation {
+                        project_id: id::<ProjectId>("project-1"),
+                        task_id: id::<TaskId>("task-1"),
+                        agent_id: id::<AgentId>("agent-1"),
+                        expected_provider: Provider::Codex,
+                        run_id: reservation_run_id,
+                        parent_run_id: None,
+                        worktree: root_string,
+                        fresh_provider_session_id: None,
+                        runner_instance_id: reservation_instance_id,
+                        runner_runtime: runtime_string,
+                    },
+                    1,
+                    10,
+                )?;
+                Ok(((), reserved.events))
+            })
+            .await
+            .unwrap();
+
+        let listener = tokio::net::UnixListener::bind(runtime.join("control.sock")).unwrap();
+        let expected_run_id = run_id.clone();
+        let expected_instance_id = runner_instance_id.clone();
+        let fake_runner = tokio::spawn(async move {
+            // First connection: AttachTerminal streams one output chunk.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: factory_core::runner::RequestEnvelope =
+                serde_json::from_str(&line).unwrap();
+            assert_eq!(envelope.run_id, expected_run_id);
+            assert_eq!(envelope.runner_instance_id, expected_instance_id);
+            assert!(matches!(
+                envelope.request,
+                factory_core::runner::RunnerRequest::AttachTerminal { since_offset: 0 }
+            ));
+            let mut stream = reader.into_inner();
+            let frame = factory_core::runner::RunnerFrame::TerminalOutput {
+                protocol_version: factory_core::runner::RUNNER_PROTOCOL_VERSION,
+                offset: 0,
+                bytes: factory_core::runner::encode_terminal_bytes(b"hello from pty"),
+            };
+            let mut payload = serde_json::to_vec(&frame).unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).await.unwrap();
+            drop(stream);
+
+            // Second connection: TerminalInput as a one-shot request.
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let envelope: factory_core::runner::RequestEnvelope =
+                serde_json::from_str(&line).unwrap();
+            match envelope.request {
+                factory_core::runner::RunnerRequest::TerminalInput { bytes } => {
+                    assert_eq!(
+                        factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
+                        b"marco".to_vec()
+                    );
+                }
+                other => panic!("unexpected runner request: {other:?}"),
+            }
+            let mut stream = reader.into_inner();
+            let frame = factory_core::runner::RunnerFrame::CommandAck {
+                protocol_version: factory_core::runner::RUNNER_PROTOCOL_VERSION,
+                command_id: "terminal-input".into(),
+            };
+            let mut payload = serde_json::to_vec(&frame).unwrap();
+            payload.push(b'\n');
+            stream.write_all(&payload).await.unwrap();
+        });
+
+        let mut stream = UnixStream::connect(&socket).await.unwrap();
+        let mut payload = serde_json::to_vec(&RequestEnvelope::new(LocalRequest::AttachTerminal {
+            project_id: id::<ProjectId>("project-1"),
+            run_id: run_id.clone(),
+            since_offset: 0,
+        }))
+        .unwrap();
+        payload.push(b'\n');
+        stream.write_all(&payload).await.unwrap();
+        let mut attach_reader = BufReader::new(stream);
+        let mut line = String::new();
+        attach_reader.read_line(&mut line).await.unwrap();
+        match serde_json::from_str::<ServerFrame>(&line).unwrap() {
+            ServerFrame::TerminalOutput {
+                run_id: got_run_id,
+                offset,
+                bytes,
+                ..
+            } => {
+                assert_eq!(got_run_id, run_id);
+                assert_eq!(offset, 0);
+                assert_eq!(
+                    factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
+                    b"hello from pty".to_vec()
+                );
+            }
+            other => panic!("unexpected server frame: {other:?}"),
+        }
+        drop(attach_reader);
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::TerminalInput {
+                    project_id: id::<ProjectId>("project-1"),
+                    run_id: run_id.clone(),
+                    bytes: factory_core::runner::encode_terminal_bytes(b"marco"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TerminalInputAccepted { run_id: accepted },
+                ..
+            } if accepted == run_id
+        ));
+
+        fake_runner.await.unwrap();
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
     with_server(|socket, state| async move {
         let root = socket.parent().unwrap().join("project");

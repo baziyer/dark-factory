@@ -20,14 +20,17 @@ use factory_core::{
         RunTerminal, ServerFrame,
     },
     runner::{
-        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerEvent,
+        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
         RunnerEventEnvelope,
     },
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
-    sync::{Semaphore, broadcast, watch},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take},
+    net::{
+        UnixListener, UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Semaphore, broadcast, mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -48,6 +51,9 @@ use crate::{
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_FRAME_CHANNEL_CAPACITY: usize = 64;
+
+type LimitedReader = Take<BufReader<OwnedReadHalf>>;
 
 #[derive(Debug)]
 enum ApiFailure {
@@ -264,34 +270,12 @@ async fn handle_connection(
     }
     payload.pop();
 
-    let envelope: RequestEnvelope = match serde_json::from_slice(&payload) {
-        Ok(envelope) => envelope,
-        Err(_) => {
-            return write_response(
-                &mut write,
-                LocalResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "request is not valid local protocol JSON".into(),
-                },
-            )
-            .await;
-        }
+    let request = match parse_envelope(&payload) {
+        Ok(request) => request,
+        Err(response) => return write_response(&mut write, *response).await,
     };
-    if envelope.protocol_version != PROTOCOL_VERSION {
-        return write_response(
-            &mut write,
-            LocalResponse::Error {
-                code: ErrorCode::UnsupportedProtocol,
-                message: format!(
-                    "protocol {} is unsupported; this daemon speaks {}",
-                    envelope.protocol_version, PROTOCOL_VERSION
-                ),
-            },
-        )
-        .await;
-    }
 
-    if let LocalRequest::Subscribe { after_sequence } = envelope.request {
+    if let LocalRequest::Subscribe { after_sequence } = request {
         if after_sequence < 0 {
             return write_response(
                 &mut write,
@@ -309,10 +293,211 @@ async fn handle_connection(
         };
     }
 
-    let response = handle_request(&state, &execution, &guidance_root, envelope.request)
+    if let LocalRequest::AttachTerminal {
+        project_id,
+        run_id,
+        since_offset,
+    } = request
+    {
+        let session_shutdown = shutdown.clone();
+        return tokio::select! {
+            biased;
+            _ = shutdown.changed() => Ok(()),
+            result = terminal_attach_session(
+                limited,
+                write,
+                state.clone(),
+                session_shutdown,
+                project_id,
+                run_id,
+                since_offset,
+            ) => result,
+        };
+    }
+
+    let response = handle_request(&state, &execution, &guidance_root, request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
+}
+
+fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
+    let envelope: RequestEnvelope = serde_json::from_slice(payload).map_err(|_| {
+        Box::new(LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            message: "request is not valid local protocol JSON".into(),
+        })
+    })?;
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err(Box::new(LocalResponse::Error {
+            code: ErrorCode::UnsupportedProtocol,
+            message: format!(
+                "protocol {} is unsupported; this daemon speaks {}",
+                envelope.protocol_version, PROTOCOL_VERSION
+            ),
+        }));
+    }
+    Ok(envelope.request)
+}
+
+/// Persistent multiplexed connection for one or more `AttachTerminal`
+/// sessions: `ServerFrame::TerminalOutput` for every attached run (tagged by
+/// `run_id`) is interleaved onto the same connection. Only further
+/// `AttachTerminal` requests are accepted on it; anything else gets an error
+/// response. Detaching happens implicitly on client disconnect, which drops
+/// this function's `JoinSet` and aborts every attached forwarding task.
+#[allow(clippy::too_many_arguments)]
+async fn terminal_attach_session(
+    mut reader: LimitedReader,
+    mut write: OwnedWriteHalf,
+    state: ApiState,
+    mut shutdown: watch::Receiver<bool>,
+    project_id: ProjectId,
+    run_id: RunId,
+    since_offset: u64,
+) -> io::Result<()> {
+    let (frame_tx, mut frame_rx) = mpsc::channel::<ServerFrame>(TERMINAL_FRAME_CHANNEL_CAPACITY);
+    let mut attaches = JoinSet::new();
+    spawn_terminal_attach(
+        &mut attaches,
+        state.clone(),
+        frame_tx.clone(),
+        project_id,
+        run_id,
+        since_offset,
+    );
+
+    let mut payload = Vec::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else { return Ok(()); };
+                write_frame(&mut write, &frame).await?;
+            }
+            Some(_) = attaches.join_next(), if !attaches.is_empty() => {}
+            result = read_next_line(&mut reader, &mut payload) => {
+                let Some(line) = result? else { return Ok(()); };
+                match parse_envelope(&line) {
+                    Ok(LocalRequest::AttachTerminal { project_id, run_id, since_offset }) => {
+                        spawn_terminal_attach(
+                            &mut attaches,
+                            state.clone(),
+                            frame_tx.clone(),
+                            project_id,
+                            run_id,
+                            since_offset,
+                        );
+                    }
+                    Ok(_) => {
+                        write_response(
+                            &mut write,
+                            LocalResponse::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: "only AttachTerminal is accepted on an attached \
+                                          terminal connection"
+                                    .into(),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(response) => write_response(&mut write, *response).await?,
+                }
+            }
+        }
+    }
+}
+
+fn spawn_terminal_attach(
+    attaches: &mut JoinSet<()>,
+    state: ApiState,
+    frame_tx: mpsc::Sender<ServerFrame>,
+    project_id: ProjectId,
+    run_id: RunId,
+    since_offset: u64,
+) {
+    attaches.spawn(async move {
+        let lookup_run_id = run_id.clone();
+        let target = match state
+            .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => {
+                let _ =
+                    send_terminal_error(&frame_tx, ApiFailure::from(error).into_response()).await;
+                return;
+            }
+        };
+        let client = RunnerClient::new(
+            &target.runner_runtime,
+            run_id.clone(),
+            target.runner_instance_id,
+        );
+        let mut subscription = match client.attach_terminal(since_offset).await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let response = runner_control_failure(error, "attach terminal").into_response();
+                let _ = send_terminal_error(&frame_tx, response).await;
+                return;
+            }
+        };
+        loop {
+            match subscription.next_chunk().await {
+                Ok((offset, bytes)) => {
+                    let frame = ServerFrame::TerminalOutput {
+                        protocol_version: PROTOCOL_VERSION,
+                        run_id: run_id.clone(),
+                        offset,
+                        bytes,
+                    };
+                    if frame_tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let response = runner_control_failure(error, "attach terminal").into_response();
+                    let _ = send_terminal_error(&frame_tx, response).await;
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn send_terminal_error(
+    frame_tx: &mpsc::Sender<ServerFrame>,
+    response: LocalResponse,
+) -> Result<(), mpsc::error::SendError<ServerFrame>> {
+    frame_tx
+        .send(ServerFrame::Response {
+            protocol_version: PROTOCOL_VERSION,
+            response,
+        })
+        .await
+}
+
+/// Reads one more newline-delimited frame from an already-open connection,
+/// resetting the per-frame size limit each time so a long-lived connection
+/// is not bounded by the *cumulative* bytes it has ever read.
+async fn read_next_line(
+    reader: &mut LimitedReader,
+    payload: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
+    payload.clear();
+    reader.set_limit((MAX_LOCAL_FRAME_BYTES + 2) as u64);
+    let read = reader.read_until(b'\n', payload).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if payload.last() != Some(&b'\n') || payload.len() - 1 > MAX_LOCAL_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request must be one newline-terminated JSON frame of at most 1 MiB",
+        ));
+    }
+    payload.pop();
+    Ok(Some(std::mem::take(payload)))
 }
 
 async fn handle_request(
@@ -752,7 +937,7 @@ async fn handle_request(
             )
             .stop(grace_ms)
             .await
-            .map_err(runner_control_failure)?;
+            .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_run_id = run_id.clone();
             state
@@ -763,6 +948,48 @@ async fn handle_request(
                 })
                 .await?;
             Ok(LocalResponse::RunStopped { run_id })
+        }
+        LocalRequest::AttachTerminal { .. } => {
+            unreachable!("AttachTerminal is handled per connection")
+        }
+        LocalRequest::TerminalInput {
+            project_id,
+            run_id,
+            bytes,
+        } => {
+            let lookup_run_id = run_id.clone();
+            let target = state
+                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .await?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                run_id.clone(),
+                target.runner_instance_id,
+            )
+            .terminal_input(bytes)
+            .await
+            .map_err(|error| runner_control_failure(error, "terminal input"))?;
+            Ok(LocalResponse::TerminalInputAccepted { run_id })
+        }
+        LocalRequest::ResizeTerminal {
+            project_id,
+            run_id,
+            cols,
+            rows,
+        } => {
+            let lookup_run_id = run_id.clone();
+            let target = state
+                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .await?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                run_id.clone(),
+                target.runner_instance_id,
+            )
+            .resize_terminal(cols, rows)
+            .await
+            .map_err(|error| runner_control_failure(error, "resize terminal"))?;
+            Ok(LocalResponse::TerminalResized { run_id })
         }
         LocalRequest::ListRuns {
             project_id,
@@ -972,15 +1199,18 @@ fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
     }
 }
 
-fn runner_control_failure(error: RunnerClientError) -> ApiFailure {
+fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {
     match error {
         RunnerClientError::RunnerRejected {
-            code: factory_core::runner::RunnerErrorCode::Conflict,
-        } => ApiFailure::Conflict("runner rejected the stop request".into()),
+            code: RunnerErrorCode::Conflict,
+        } => ApiFailure::Conflict(format!("runner rejected the {action} request")),
+        RunnerClientError::RunnerRejected {
+            code: RunnerErrorCode::InvalidRequest,
+        } => ApiFailure::Invalid(format!("runner rejected the {action} request")),
         RunnerClientError::InvalidStopGrace { found } => ApiFailure::Invalid(format!(
             "runner stop grace must be at most 60000 ms, got {found}"
         )),
-        _ => ApiFailure::Internal("runner control request failed".into()),
+        _ => ApiFailure::Internal(format!("runner {action} request failed")),
     }
 }
 
@@ -989,12 +1219,7 @@ fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerm
     let file = match fs::File::open(spool_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RunTerminal {
-                run_id,
-                head_sequence: 0,
-                output: String::new(),
-                truncated: false,
-            });
+            return Err(ApiFailure::Store(StoreError::RunNotFound));
         }
         Err(_) => {
             return Err(ApiFailure::Internal(
@@ -1030,10 +1255,14 @@ fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerm
         let event: RunnerEventEnvelope = match serde_json::from_slice(line) {
             Ok(event) => event,
             Err(_) if !terminated && index + 1 == line_count => break,
+            // A malformed non-final line means a concurrent writer left a
+            // torn record behind (the spool is append-only, so this cannot
+            // be later "fixed" by more appends); degrade to a truncated
+            // read of whatever was durably complete before it rather than
+            // failing the whole request.
             Err(_) => {
-                return Err(ApiFailure::Internal(
-                    "runner terminal spool is invalid".into(),
-                ));
+                truncated = true;
+                break;
             }
         };
         if event.protocol_version != factory_core::runner::RUNNER_PROTOCOL_VERSION {

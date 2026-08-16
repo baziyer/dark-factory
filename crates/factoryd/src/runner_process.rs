@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+use factory_core::{
+    RunId, RunnerInstanceId,
+    runner::{MAX_STARTUP_STDIN_BYTES, TerminalSize},
+};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
@@ -40,6 +43,10 @@ pub struct LaunchSpec {
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
     pub startup_input: Vec<u8>,
+    /// When `Some`, the runner spawns the provider under a PTY of this size
+    /// instead of piped stdout/stderr, and `startup_input` is not sent (it
+    /// must be empty; interactive programs take input from the operator).
+    pub terminal: Option<TerminalSize>,
 }
 
 /// The only provider-specific environment additions allowed across the
@@ -63,6 +70,8 @@ pub enum Error {
         actual_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error("terminal-mode launches must not carry startup input")]
+    TerminalModeWithStartupInput,
     #[error("runner executable path {program:?} must be absolute")]
     RunnerPathNotAbsolute { program: PathBuf },
     #[error("{role} executable {program:?} was not found")]
@@ -194,6 +203,9 @@ async fn spawn_runner_with_environment_and_timeout(
             maximum_bytes: MAX_STARTUP_STDIN_BYTES,
         });
     }
+    if spec.terminal.is_some() && !spec.startup_input.is_empty() {
+        return Err(Error::TerminalModeWithStartupInput);
+    }
 
     if !spec.runner_program.is_absolute() {
         return Err(Error::RunnerPathNotAbsolute {
@@ -203,7 +215,7 @@ async fn spawn_runner_with_environment_and_timeout(
     let runner = checked_executable(&spec.runner_program, "runner")?;
     let provider = resolve_executable(&spec.provider_program, &environment, "provider")?;
     let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
-    let input_length = spec.startup_input.len().to_string();
+    let terminal = spec.terminal;
     let mut command = Command::new(runner);
     command
         .arg("--run-id")
@@ -213,53 +225,81 @@ async fn spawn_runner_with_environment_and_timeout(
         .arg("--runtime-dir")
         .arg(spec.runtime_dir)
         .arg("--cwd")
-        .arg(spec.cwd)
-        .arg("--stdin-bytes")
-        .arg(input_length)
+        .arg(spec.cwd);
+    match terminal {
+        Some(size) => {
+            command
+                .arg("--terminal-cols")
+                .arg(size.cols.to_string())
+                .arg("--terminal-rows")
+                .arg(size.rows.to_string());
+        }
+        None => {
+            command
+                .arg("--stdin-bytes")
+                .arg(spec.startup_input.len().to_string());
+        }
+    }
+    command
         .arg("--")
         .arg(provider)
         .args(spec.provider_arguments)
-        .stdin(Stdio::piped());
-    apply_runner_environment(&mut command, &environment);
+        .stdin(if terminal.is_some() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        });
+    apply_runner_environment(&mut command, &environment, terminal.is_some());
     apply_provider_environment(&mut command, provider_environment.as_deref());
 
     let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
-    let mut stdin = child
-        .child_mut()
-        .stdin
-        .take()
-        .expect("factory-runner was configured with piped stdin");
-    let write_result = match startup_timeout {
-        Some(limit) => {
-            match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    drop(stdin);
-                    child.kill_and_reap().await;
-                    return Err(Error::StartupInputTimedOut);
+    if terminal.is_none() {
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .expect("factory-runner was configured with piped stdin");
+        let write_result = match startup_timeout {
+            Some(limit) => {
+                match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        drop(stdin);
+                        child.kill_and_reap().await;
+                        return Err(Error::StartupInputTimedOut);
+                    }
                 }
             }
+            None => stdin.write_all(&spec.startup_input).await,
+        };
+        if let Err(error) = write_result {
+            drop(stdin);
+            child.kill_and_reap().await;
+            return Err(Error::StartupInput(error));
         }
-        None => stdin.write_all(&spec.startup_input).await,
-    };
-    if let Err(error) = write_result {
         drop(stdin);
-        child.kill_and_reap().await;
-        return Err(Error::StartupInput(error));
     }
-    drop(stdin);
     Ok(child.into_child())
 }
 
-fn apply_runner_environment(command: &mut Command, environment: &CapturedEnvironment) {
+fn apply_runner_environment(
+    command: &mut Command,
+    environment: &CapturedEnvironment,
+    terminal: bool,
+) {
     command.env_clear();
     for (name, value) in &environment.values {
         command.env(name, value);
     }
-    command
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .env("GIT_TERMINAL_PROMPT", "0");
+    if terminal {
+        // Interactive programs need a real terminal type; forcing color off
+        // and TERM=dumb (the non-interactive default below) would break
+        // their rendering.
+        command.env("TERM", "xterm-256color");
+    } else {
+        command.env("NO_COLOR", "1").env("TERM", "dumb");
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
 }
 
 fn apply_provider_environment(command: &mut Command, codex_home: Option<&Path>) {
@@ -467,6 +507,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             runtime_dir: directory.join("runtime"),
             cwd: directory.to_owned(),
             startup_input: task,
+            terminal: None,
         }
     }
 
@@ -498,7 +539,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             .env("LD_PRELOAD", "/secret/library.so")
             .stdout(Stdio::piped());
 
-        apply_runner_environment(&mut command, &captured);
+        apply_runner_environment(&mut command, &captured, false);
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         let output = String::from_utf8(output.stdout).unwrap();

@@ -122,6 +122,7 @@ pub fn prepare(input: ClaudeLaunch) -> Result<PreparedClaude, PrepareError> {
             runtime_dir: input.runtime_dir,
             cwd: input.cwd,
             startup_input: input.instructions.into_bytes(),
+            terminal: None,
         },
         decoder,
     })
