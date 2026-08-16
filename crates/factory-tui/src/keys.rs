@@ -10,6 +10,25 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+/// The prefix key used to escape a zoomed terminal pane back to board control: the physical
+/// `Ctrl-]` (raw byte 0x1D, ASCII GS). Chosen because it's the classic telnet/rlogin escape
+/// character (existing operator muscle memory for "control the wrapper, not the thing inside
+/// it"), it's a single byte with no `Alt`/multi-key ambiguity, and in practice neither
+/// `claude`/`codex` nor common shells/editors bind it to anything reachable from normal
+/// (non-prefixed) input. Originally introduced (and load-bearing-tested) in the `factory-tui`
+/// fidelity spike — see `SPIKE.md` "Input routing" — and reused verbatim here for the board's
+/// zoomed-pane mode toggle.
+///
+/// The code below is `Char('5')`, not `Char(']')` - this is not a typo. Without Kitty keyboard
+/// protocol negotiation, crossterm's legacy Unix decoder maps the raw bytes 0x1C-0x1F to
+/// `Char('4'..'7') + CONTROL` rather than to the punctuation characters those bytes are
+/// conventionally named after (confirmed by reading
+/// `crossterm::event::sys::unix::parse::parse_event`; verified empirically too — see
+/// `SPIKE.md` "Input routing"). `ctrl_byte` below maps `'5'` back to the same 0x1D byte, so this
+/// still round-trips correctly for panes that want a literal `Ctrl-]`; only the *name* crossterm
+/// assigns it is surprising.
+pub const PREFIX_KEY: KeyEvent = KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL);
+
 /// Terminal modes that change how a key is encoded. These mirror `vt100::Screen`'s
 /// `application_cursor` / `application_keypad`, which the child controls via DECSET/DECRST
 /// (`CSI ?1h` / `CSI ?1l`, `CSI ?66h` / `CSI ?66l`) — i.e. this is state the *child* asked for,
@@ -116,7 +135,7 @@ fn encode_char(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
 /// Returns `None` when the combination has no defined control code (e.g. `Ctrl-1`); callers
 /// should fall back to sending the plain character in that case.
 ///
-/// The `'4'..='7'` arm exists because of a crossterm quirk (see `crate::app::PREFIX_KEY`):
+/// The `'4'..='7'` arm exists because of a crossterm quirk (see `PREFIX_KEY` above):
 /// without Kitty keyboard protocol negotiation, crossterm's legacy Unix parser decodes the raw
 /// control bytes 0x1C-0x1F as `Char('4'..'7') + CONTROL` rather than `Char('\\'/']'/'^'/'_') +
 /// CONTROL` - so *that* is what we actually receive for e.g. a physical `Ctrl-]` press, and it's
@@ -263,7 +282,7 @@ mod tests {
         // Reproduces crossterm's legacy Unix decoding of raw bytes 0x1C-0x1F: it reports them
         // as `Char('4'..'7') + CONTROL`, not `Char('\\'/']'/'^'/'_') + CONTROL`. This is exactly
         // what a physical `Ctrl-]` keypress (our prefix key) decodes to - see
-        // `crate::app::PREFIX_KEY`.
+        // `PREFIX_KEY` above.
         assert_eq!(enc(KeyCode::Char('4'), KeyModifiers::CONTROL), [0x1c]);
         assert_eq!(enc(KeyCode::Char('5'), KeyModifiers::CONTROL), [0x1d]);
         assert_eq!(enc(KeyCode::Char('6'), KeyModifiers::CONTROL), [0x1e]);

@@ -769,9 +769,13 @@ name = "factory-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "factory-core",
+ "factoryctl",
  "portable-pty",
  "ratatui",
+ "serde_json",
  "tui-term",
+ "uuid",
 ]
 
 [[package]]
