@@ -1,6 +1,9 @@
 use std::{env, io::Read, path::PathBuf, process};
 
-use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+use factory_core::{
+    RunId, RunnerInstanceId,
+    runner::{MAX_STARTUP_STDIN_BYTES, TerminalSize},
+};
 use factory_runner::{Config, Error};
 
 #[tokio::main(flavor = "current_thread")]
@@ -39,6 +42,8 @@ fn parse_arguments() -> Result<Config, Error> {
     let mut runtime_dir = None;
     let mut cwd = None;
     let mut stdin_bytes = None;
+    let mut terminal_cols = None;
+    let mut terminal_rows = None;
     let mut program = None;
     let mut agent_arguments = Vec::new();
 
@@ -56,6 +61,18 @@ fn parse_arguments() -> Result<Config, Error> {
                 let value = required(&mut arguments, "--stdin-bytes")?;
                 stdin_bytes = Some(value.parse::<usize>().map_err(|_| {
                     Error::InvalidArguments("--stdin-bytes must be a non-negative integer".into())
+                })?);
+            }
+            "--terminal-cols" => {
+                let value = required(&mut arguments, "--terminal-cols")?;
+                terminal_cols = Some(value.parse::<u16>().map_err(|_| {
+                    Error::InvalidArguments("--terminal-cols must be a 16-bit integer".into())
+                })?);
+            }
+            "--terminal-rows" => {
+                let value = required(&mut arguments, "--terminal-rows")?;
+                terminal_rows = Some(value.parse::<u16>().map_err(|_| {
+                    Error::InvalidArguments("--terminal-rows must be a 16-bit integer".into())
                 })?);
             }
             "--" => {
@@ -79,6 +96,15 @@ fn parse_arguments() -> Result<Config, Error> {
     let runtime_dir = required_value(runtime_dir, "--runtime-dir")?;
     let cwd = required_value(cwd, "--cwd")?;
     let program = required_value(program, "agent program after --")?;
+    let terminal = match (terminal_cols, terminal_rows) {
+        (Some(cols), Some(rows)) => Some(TerminalSize { cols, rows }),
+        (None, None) => None,
+        _ => {
+            return Err(Error::InvalidArguments(
+                "--terminal-cols and --terminal-rows must be given together".into(),
+            ));
+        }
+    };
     let startup_input = read_startup_input(stdin_bytes)?;
     Ok(Config {
         run_id,
@@ -88,6 +114,7 @@ fn parse_arguments() -> Result<Config, Error> {
         startup_input,
         program,
         arguments: agent_arguments,
+        terminal,
     })
 }
 

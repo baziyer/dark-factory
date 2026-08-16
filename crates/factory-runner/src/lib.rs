@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     future::pending,
     io,
+    io::{Read as _, Write as _},
     os::unix::{
         fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
@@ -19,15 +20,22 @@ use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES,
-        MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION,
-        RequestEnvelope, RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame,
-        RunnerRequest,
+        MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES, MAX_TERMINAL_INPUT_BYTES,
+        MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES, OutputStream,
+        RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
+        RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalSize, decode_terminal_bytes,
+        encode_terminal_bytes,
     },
 };
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use rustix::process::{
+    Pid, Signal, WaitOptions, kill_process_group, test_kill_process_group, waitpid,
+};
 use tokio::{
-    fs::File,
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    fs::{File, OpenOptions},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter,
+    },
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
@@ -42,6 +50,11 @@ const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
+const TERMINAL_LOG_FILE: &str = "terminal.log";
+const TERMINAL_LOG_ROTATED_FILE: &str = "terminal.log.1";
+const TERMINAL_BROADCAST_CAPACITY: usize = 64;
+const TERMINAL_COMMAND_CAPACITY: usize = 16;
+const TERMINAL_READ_CHUNK: usize = MAX_TERMINAL_OUTPUT_CHUNK_BYTES;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -63,13 +76,19 @@ pub struct Config {
     pub startup_input: Option<Vec<u8>>,
     pub program: PathBuf,
     pub arguments: Vec<String>,
+    /// When `Some`, the agent is spawned under a PTY of this size instead of
+    /// with piped stdout/stderr: `startup_input` is not sent (interactive
+    /// programs take input from the operator via `TerminalInput`), and
+    /// output is retained raw in `terminal.log` instead of decoded into
+    /// bounded `RunnerEvent::Output` text events.
+    pub terminal: Option<TerminalSize>,
 }
 
 struct PreparedRuntime {
     listener: UnixListener,
     log: Arc<EventLog>,
+    terminal_log: Option<Arc<TerminalLog>>,
     socket_path: PathBuf,
-    spool_path: PathBuf,
 }
 
 struct EventLog {
@@ -96,7 +115,9 @@ struct RuntimeState {
     run_id: RunId,
     runner_instance_id: RunnerInstanceId,
     log: Arc<EventLog>,
+    terminal_log: Option<Arc<TerminalLog>>,
     stop_tx: mpsc::Sender<StopCommand>,
+    terminal_tx: Option<mpsc::Sender<TerminalCommand>>,
     accepted_stops: Mutex<HashMap<String, u64>>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -104,6 +125,16 @@ struct RuntimeState {
 struct StopCommand {
     grace: Duration,
     response: oneshot::Sender<Result<(), ControlError>>,
+}
+
+struct TerminalCommand {
+    kind: TerminalCommandKind,
+    response: oneshot::Sender<Result<(), ControlError>>,
+}
+
+enum TerminalCommandKind {
+    Input(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +321,214 @@ impl EventLog {
     }
 }
 
+/// Retained, bounded, raw byte log for one terminal-mode run's PTY output.
+///
+/// Unlike [`EventLog`], this is not part of the durable command-acknowledgement
+/// path: bytes are appended best-effort (no `sync_data`) purely so an operator
+/// can inspect or re-attach to a run's terminal after the fact. Positions in
+/// the log are a single monotonic byte-stream offset, independent of which
+/// physical file currently holds a given byte.
+struct TerminalLog {
+    dir: PathBuf,
+    max_bytes: u64,
+    inner: Mutex<TerminalLogInner>,
+    chunks: broadcast::Sender<TerminalChunk>,
+}
+
+struct TerminalLogInner {
+    active_file: File,
+    active_start_offset: u64,
+    active_len: u64,
+    /// Start offset and length of `terminal.log.1`, the previous rotation,
+    /// when one exists.
+    previous: Option<(u64, u64)>,
+}
+
+impl TerminalLogInner {
+    const fn total_bytes(&self) -> u64 {
+        self.active_start_offset + self.active_len
+    }
+
+    const fn oldest_retained_offset(&self) -> u64 {
+        match self.previous {
+            Some((start, _)) => start,
+            None => self.active_start_offset,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TerminalChunk {
+    offset: u64,
+    bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSnapshot {
+    total_bytes: u64,
+    oldest_retained_offset: u64,
+    active_start_offset: u64,
+    previous: Option<(u64, u64)>,
+}
+
+impl TerminalLog {
+    fn new(dir: PathBuf, max_bytes: u64, active_file: File) -> Arc<Self> {
+        let (chunks, _) = broadcast::channel(TERMINAL_BROADCAST_CAPACITY);
+        Arc::new(Self {
+            dir,
+            max_bytes: max_bytes.max(1),
+            inner: Mutex::new(TerminalLogInner {
+                active_file,
+                active_start_offset: 0,
+                active_len: 0,
+                previous: None,
+            }),
+            chunks,
+        })
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<TerminalChunk> {
+        self.chunks.subscribe()
+    }
+
+    async fn snapshot(&self) -> TerminalSnapshot {
+        let inner = self.inner.lock().await;
+        TerminalSnapshot {
+            total_bytes: inner.total_bytes(),
+            oldest_retained_offset: inner.oldest_retained_offset(),
+            active_start_offset: inner.active_start_offset,
+            previous: inner.previous,
+        }
+    }
+
+    /// Appends raw bytes, rotating the active file when it is full, then
+    /// broadcasts the whole chunk (as one unit, regardless of whether it was
+    /// physically split across a rotation) to live subscribers.
+    async fn append(&self, bytes: Vec<u8>) -> Result<(), Error> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut inner = self.inner.lock().await;
+        let start_offset = inner.total_bytes();
+        let mut remaining: &[u8] = &bytes;
+        while !remaining.is_empty() {
+            let space = self.max_bytes.saturating_sub(inner.active_len);
+            if space == 0 {
+                self.rotate(&mut inner).await?;
+                continue;
+            }
+            let take = remaining
+                .len()
+                .min(usize::try_from(space).unwrap_or(usize::MAX));
+            inner.active_file.write_all(&remaining[..take]).await?;
+            inner.active_len += take as u64;
+            remaining = &remaining[take..];
+        }
+        inner.active_file.flush().await?;
+        drop(inner);
+        let _ = self.chunks.send(TerminalChunk {
+            offset: start_offset,
+            bytes: Arc::new(bytes),
+        });
+        Ok(())
+    }
+
+    async fn rotate(&self, inner: &mut TerminalLogInner) -> Result<(), Error> {
+        inner.active_file.flush().await?;
+        let active_path = self.dir.join(TERMINAL_LOG_FILE);
+        let rotated_path = self.dir.join(TERMINAL_LOG_ROTATED_FILE);
+        tokio::fs::rename(&active_path, &rotated_path).await?;
+        let fresh = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .mode(0o600)
+            .open(&active_path)
+            .await?;
+        inner.previous = Some((inner.active_start_offset, inner.active_len));
+        inner.active_start_offset += inner.active_len;
+        inner.active_len = 0;
+        inner.active_file = fresh;
+        Ok(())
+    }
+
+    /// Replays retained bytes `[from, through)` to `write` as `TerminalOutput`
+    /// frames, reading `terminal.log.1` (if it covers any of the range) then
+    /// `terminal.log`, using the file boundaries already fixed in `snapshot`.
+    ///
+    /// Files are opened fresh by path and are only ever appended to, never
+    /// rewritten in place, so a concurrent append cannot corrupt a read.
+    /// A pathologically fast *second* rotation while this replay is still in
+    /// flight (the active file filling up again before this function reaches
+    /// it) can shift what `terminal.log` refers to on disk; live streaming is
+    /// unaffected since it carries bytes directly rather than reading files.
+    async fn replay(
+        &self,
+        write: &mut OwnedWriteHalf,
+        snapshot: TerminalSnapshot,
+        from: u64,
+        through: u64,
+    ) -> Result<(), Error> {
+        let mut cursor = from;
+        if let Some((start, len)) = snapshot.previous {
+            cursor = self
+                .replay_file(
+                    write,
+                    &self.dir.join(TERMINAL_LOG_ROTATED_FILE),
+                    start,
+                    len,
+                    cursor,
+                    through,
+                )
+                .await?;
+        }
+        let active_len = snapshot.total_bytes - snapshot.active_start_offset;
+        self.replay_file(
+            write,
+            &self.dir.join(TERMINAL_LOG_FILE),
+            snapshot.active_start_offset,
+            active_len,
+            cursor,
+            through,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn replay_file(
+        &self,
+        write: &mut OwnedWriteHalf,
+        path: &Path,
+        file_start: u64,
+        file_len: u64,
+        cursor: u64,
+        through: u64,
+    ) -> Result<u64, Error> {
+        let file_end = file_start + file_len;
+        let read_from = cursor.max(file_start);
+        let read_through = through.min(file_end);
+        if read_from >= read_through {
+            return Ok(cursor);
+        }
+        let mut file = File::open(path).await?;
+        file.seek(io::SeekFrom::Start(read_from - file_start))
+            .await?;
+        let mut remaining = read_through - read_from;
+        let mut position = read_from;
+        let mut buffer = vec![0_u8; TERMINAL_READ_CHUNK];
+        while remaining > 0 {
+            let want = usize::try_from(remaining.min(TERMINAL_READ_CHUNK as u64))
+                .expect("chunk size fits usize");
+            file.read_exact(&mut buffer[..want]).await?;
+            send_terminal_output(write, position, &buffer[..want]).await?;
+            position += want as u64;
+            remaining -= want as u64;
+        }
+        Ok(position.max(cursor))
+    }
+}
+
 fn next_envelope(inner: &LogInner, event: RunnerEvent) -> RunnerEventEnvelope {
     RunnerEventEnvelope {
         protocol_version: RUNNER_PROTOCOL_VERSION,
@@ -334,18 +573,27 @@ pub async fn run_with_shutdown(
     mut runner_signal_rx: watch::Receiver<bool>,
 ) -> Result<(), Error> {
     validate_config(&config)?;
-    let runtime_dir = config.runtime_dir.clone();
-    let prepared = prepare_runtime(&config.runtime_dir).await?;
+    let terminal_mode = config.terminal.is_some();
+    let prepared = prepare_runtime(&config.runtime_dir, terminal_mode).await?;
     let (stop_tx, stop_rx) = mpsc::channel(16);
+    let (terminal_tx, terminal_rx) = if terminal_mode {
+        let (tx, rx) = mpsc::channel(TERMINAL_COMMAND_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let state = Arc::new(RuntimeState {
         run_id: config.run_id.clone(),
         runner_instance_id: config.runner_instance_id.clone(),
         log: Arc::clone(&prepared.log),
+        terminal_log: prepared.terminal_log.clone(),
         stop_tx,
+        terminal_tx,
         accepted_stops: Mutex::new(HashMap::new()),
         shutdown_tx,
     });
+    let terminal = prepared.terminal_log.clone().zip(terminal_rx);
 
     let mut server = tokio::spawn(serve(
         prepared.listener,
@@ -355,6 +603,7 @@ pub async fn run_with_shutdown(
     let mut supervisor = tokio::spawn(supervise(
         config,
         Arc::clone(&prepared.log),
+        terminal,
         stop_rx,
         runner_signal_rx.clone(),
     ));
@@ -367,7 +616,7 @@ pub async fn run_with_shutdown(
                 let supervisor_result = joined_task("process supervisor", supervisor.await);
                 server_result?;
                 supervisor_result?;
-                cleanup_runtime(&prepared.socket_path, &prepared.spool_path, &runtime_dir)?;
+                cleanup_runtime(&prepared.socket_path)?;
                 return Ok(());
             }
             supervisor.abort();
@@ -443,7 +692,7 @@ pub async fn run_with_shutdown(
     if preserve_runtime {
         return Ok(());
     }
-    cleanup_runtime(&prepared.socket_path, &prepared.spool_path, &runtime_dir)?;
+    cleanup_runtime(&prepared.socket_path)?;
     Ok(())
 }
 
@@ -469,6 +718,13 @@ fn validate_config(config: &Config) -> Result<(), Error> {
             "startup stdin exceeds the {MAX_STARTUP_STDIN_BYTES}-byte limit"
         )));
     }
+    if config.terminal.is_some() && config.startup_input.is_some() {
+        return Err(Error::InvalidArguments(
+            "terminal mode does not accept startup stdin; interactive programs take input from \
+             the operator via TerminalInput"
+                .into(),
+        ));
+    }
     let metadata = std::fs::metadata(&config.cwd)
         .map_err(|error| Error::InvalidArguments(format!("invalid cwd: {error}")))?;
     if !metadata.is_dir() {
@@ -477,10 +733,14 @@ fn validate_config(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
-async fn prepare_runtime(runtime_dir: &Path) -> Result<PreparedRuntime, Error> {
+async fn prepare_runtime(
+    runtime_dir: &Path,
+    terminal_mode: bool,
+) -> Result<PreparedRuntime, Error> {
     std::fs::DirBuilder::new().mode(0o700).create(runtime_dir)?;
     let spool_path = runtime_dir.join("events.ndjson");
     let socket_path = runtime_dir.join("control.sock");
+    let terminal_log_path = runtime_dir.join(TERMINAL_LOG_FILE);
     let setup = (|| -> io::Result<_> {
         let spool = std::fs::OpenOptions::new()
             .write(true)
@@ -488,39 +748,57 @@ async fn prepare_runtime(runtime_dir: &Path) -> Result<PreparedRuntime, Error> {
             .create_new(true)
             .mode(0o600)
             .open(&spool_path)?;
+        let terminal_log_file = terminal_mode
+            .then(|| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .read(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&terminal_log_path)
+            })
+            .transpose()?;
         let listener = UnixListener::bind(&socket_path)?;
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
-        Ok((spool, listener))
+        Ok((spool, terminal_log_file, listener))
     })();
-    let (spool, listener) = match setup {
+    let (spool, terminal_log_file, listener) = match setup {
         Ok(setup) => setup,
         Err(error) => {
             let _ = std::fs::remove_file(&socket_path);
             let _ = std::fs::remove_file(&spool_path);
+            let _ = std::fs::remove_file(&terminal_log_path);
             let _ = std::fs::remove_dir(runtime_dir);
             return Err(error.into());
         }
     };
+    let terminal_log = terminal_log_file.map(|file| {
+        TerminalLog::new(
+            runtime_dir.to_path_buf(),
+            MAX_TERMINAL_LOG_BYTES,
+            File::from_std(file),
+        )
+    });
     Ok(PreparedRuntime {
         listener,
         log: EventLog::new(spool_path.clone(), File::from_std(spool)),
+        terminal_log,
         socket_path,
-        spool_path,
     })
 }
 
-fn cleanup_runtime(socket: &Path, spool: &Path, runtime: &Path) -> Result<(), Error> {
+/// Removes the control socket only. `events.ndjson` and, in terminal mode,
+/// `terminal.log`/`terminal.log.1` are retained private per-run logs: they
+/// are never published as events, but the operator can inspect them (via
+/// `GetRunTerminal` or `AttachTerminal`) even after the run has been
+/// acknowledged and this process has exited. The runtime directory itself is
+/// therefore also retained; nothing above the runner ever deletes it.
+fn cleanup_runtime(socket: &Path) -> Result<(), Error> {
     match std::fs::remove_file(socket) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    match std::fs::remove_file(spool) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    std::fs::remove_dir(runtime)?;
     Ok(())
 }
 
@@ -720,6 +998,126 @@ async fn handle_connection(
             let _ = state.shutdown_tx.send(true);
             result
         }
+        RunnerRequest::AttachTerminal { since_offset } => {
+            let Some(terminal_log) = state.terminal_log.as_ref() else {
+                return send_control_error(
+                    &mut write_half,
+                    ControlError::new(
+                        RunnerErrorCode::InvalidRequest,
+                        "run was not launched in terminal mode",
+                    ),
+                )
+                .await;
+            };
+            attach_terminal_connection(&mut write_half, terminal_log, shutdown, since_offset).await
+        }
+        RunnerRequest::TerminalInput { bytes } => {
+            let Some(terminal_tx) = state.terminal_tx.clone() else {
+                return send_control_error(
+                    &mut write_half,
+                    ControlError::new(
+                        RunnerErrorCode::InvalidRequest,
+                        "run was not launched in terminal mode",
+                    ),
+                )
+                .await;
+            };
+            let decoded = match decode_terminal_bytes(&bytes) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    return send_control_error(
+                        &mut write_half,
+                        ControlError::new(
+                            RunnerErrorCode::InvalidRequest,
+                            "terminal input is not valid base64",
+                        ),
+                    )
+                    .await;
+                }
+            };
+            if decoded.len() > MAX_TERMINAL_INPUT_BYTES {
+                return send_control_error(
+                    &mut write_half,
+                    ControlError::new(
+                        RunnerErrorCode::InvalidRequest,
+                        format!("terminal input exceeds {MAX_TERMINAL_INPUT_BYTES} bytes"),
+                    ),
+                )
+                .await;
+            }
+            send_terminal_command(
+                &mut write_half,
+                &terminal_tx,
+                TerminalCommandKind::Input(decoded),
+                "terminal-input",
+            )
+            .await
+        }
+        RunnerRequest::ResizeTerminal { cols, rows } => {
+            let Some(terminal_tx) = state.terminal_tx.clone() else {
+                return send_control_error(
+                    &mut write_half,
+                    ControlError::new(
+                        RunnerErrorCode::InvalidRequest,
+                        "run was not launched in terminal mode",
+                    ),
+                )
+                .await;
+            };
+            send_terminal_command(
+                &mut write_half,
+                &terminal_tx,
+                TerminalCommandKind::Resize { cols, rows },
+                "resize-terminal",
+            )
+            .await
+        }
+    }
+}
+
+/// Forwards a `TerminalInput`/`ResizeTerminal` command to the supervisor and
+/// relays its outcome as a `CommandAck` (with a fixed, non-idempotency
+/// command ID: unlike `Stop`, these are not deduplicated retries) or error.
+async fn send_terminal_command(
+    write: &mut OwnedWriteHalf,
+    terminal_tx: &mpsc::Sender<TerminalCommand>,
+    kind: TerminalCommandKind,
+    command_id: &str,
+) -> Result<(), Error> {
+    let (response, received) = oneshot::channel();
+    if terminal_tx
+        .send(TerminalCommand { kind, response })
+        .await
+        .is_err()
+    {
+        return send_control_error(
+            write,
+            ControlError::new(
+                RunnerErrorCode::Conflict,
+                "agent process is already terminal",
+            ),
+        )
+        .await;
+    }
+    match received.await {
+        Ok(Ok(())) => {
+            send_frame(
+                write,
+                &RunnerFrame::CommandAck {
+                    protocol_version: RUNNER_PROTOCOL_VERSION,
+                    command_id: command_id.to_owned(),
+                },
+            )
+            .await
+        }
+        Ok(Err(error)) => send_control_error(write, error).await,
+        Err(_) => {
+            send_control_error(
+                write,
+                ControlError::new(RunnerErrorCode::Internal, "terminal supervisor disappeared"),
+            )
+            .await
+        }
     }
 }
 
@@ -833,6 +1231,85 @@ async fn subscribe_connection(
     }
 }
 
+/// Streams retained-then-live PTY output to one attached client.
+///
+/// Subscribes to the live broadcast before taking the retained-log snapshot,
+/// exactly like [`subscribe_connection`], so no byte can be missed between
+/// replay and the live feed. If the client falls behind (`Lagged`), it is
+/// dropped rather than resynchronized: it can reattach with a fresh
+/// `since_offset` covering whatever it still needs.
+async fn attach_terminal_connection(
+    write: &mut OwnedWriteHalf,
+    terminal_log: &TerminalLog,
+    mut shutdown: watch::Receiver<bool>,
+    since_offset: u64,
+) -> Result<(), Error> {
+    let mut chunks = terminal_log.subscribe();
+    let snapshot = terminal_log.snapshot().await;
+    if since_offset > snapshot.total_bytes {
+        return send_control_error(
+            write,
+            ControlError::new(
+                RunnerErrorCode::InvalidRequest,
+                "terminal offset is ahead of the live head",
+            ),
+        )
+        .await;
+    }
+    if since_offset < snapshot.oldest_retained_offset {
+        return send_control_error(
+            write,
+            ControlError::new(
+                RunnerErrorCode::InvalidRequest,
+                "terminal offset has been rotated out of the retained window",
+            ),
+        )
+        .await;
+    }
+    terminal_log
+        .replay(write, snapshot, since_offset, snapshot.total_bytes)
+        .await?;
+    let mut delivered = snapshot.total_bytes;
+
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            received = chunks.recv() => match received {
+                Ok(chunk) if chunk.offset + chunk.bytes.len() as u64 <= delivered => {}
+                Ok(chunk) if chunk.offset == delivered => {
+                    send_terminal_output(write, chunk.offset, &chunk.bytes).await?;
+                    delivered += chunk.bytes.len() as u64;
+                }
+                Ok(_) => {
+                    return send_control_error(
+                        write,
+                        ControlError::new(
+                            RunnerErrorCode::Internal,
+                            "terminal stream desynchronized; reattach from the last offset",
+                        ),
+                    )
+                    .await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    return send_control_error(
+                        write,
+                        ControlError::new(
+                            RunnerErrorCode::Conflict,
+                            "terminal subscriber fell behind; reattach from the last offset",
+                        ),
+                    )
+                    .await;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+}
+
 async fn replay_events(
     spool_path: &Path,
     write: &mut OwnedWriteHalf,
@@ -885,6 +1362,22 @@ async fn send_event(write: &mut OwnedWriteHalf, event: &RunnerEventEnvelope) -> 
     .await
 }
 
+async fn send_terminal_output(
+    write: &mut OwnedWriteHalf,
+    offset: u64,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    send_frame(
+        write,
+        &RunnerFrame::TerminalOutput {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            offset,
+            bytes: encode_terminal_bytes(bytes),
+        },
+    )
+    .await
+}
+
 async fn send_control_error(write: &mut OwnedWriteHalf, error: ControlError) -> Result<(), Error> {
     send_frame(
         write,
@@ -914,12 +1407,39 @@ async fn send_frame(write: &mut OwnedWriteHalf, frame: &RunnerFrame) -> Result<(
 async fn supervise(
     config: Config,
     log: Arc<EventLog>,
-    mut stops: mpsc::Receiver<StopCommand>,
-    mut runner_shutdown: watch::Receiver<bool>,
+    terminal: Option<(Arc<TerminalLog>, mpsc::Receiver<TerminalCommand>)>,
+    stops: mpsc::Receiver<StopCommand>,
+    runner_shutdown: watch::Receiver<bool>,
 ) -> Result<SupervisionOutcome, Error> {
     if *runner_shutdown.borrow() {
         return Ok(SupervisionOutcome::RunnerSignalled);
     }
+    match terminal {
+        Some((terminal_log, terminal_commands)) => {
+            let size = config
+                .terminal
+                .expect("a terminal log is only prepared for a terminal-mode config");
+            supervise_terminal(
+                config,
+                size,
+                log,
+                terminal_log,
+                stops,
+                terminal_commands,
+                runner_shutdown,
+            )
+            .await
+        }
+        None => supervise_piped(config, log, stops, runner_shutdown).await,
+    }
+}
+
+async fn supervise_piped(
+    config: Config,
+    log: Arc<EventLog>,
+    mut stops: mpsc::Receiver<StopCommand>,
+    mut runner_shutdown: watch::Receiver<bool>,
+) -> Result<SupervisionOutcome, Error> {
     let stdin = match prepare_startup_stdin(config.startup_input) {
         Ok(stdin) => stdin,
         Err(error) => {
@@ -1082,6 +1602,265 @@ async fn supervise(
     } else {
         Ok(SupervisionOutcome::AwaitAcknowledgement)
     }
+}
+
+/// Command sent to the dedicated PTY control thread, which is the sole owner
+/// of the PTY master handle and its writer for the run's whole lifetime.
+enum PtyControl {
+    Write(Vec<u8>),
+    Resize { cols: u16, rows: u16 },
+}
+
+/// Spawns the agent under a PTY and supervises it exactly like
+/// [`supervise_piped`] (same stop/kill/grace/runner-shutdown handling reused
+/// via the same helper functions), except output is raw retained bytes
+/// instead of decoded `RunnerEvent::Output` text, input flows from
+/// `TerminalInput` instead of `startup_input`, and resize commands reach the
+/// child's controlling terminal.
+///
+/// PTY I/O is fundamentally blocking (`portable_pty` exposes synchronous
+/// `Read`/`Write`), so it is bridged onto three dedicated OS threads: one
+/// blocked reading PTY output, one blocked owning the PTY master (writes and
+/// resizes), and one blocked in `waitpid` for the child's exit. Termination
+/// signals are still sent from this async task directly, by process group,
+/// reusing [`begin_group_termination`]/[`signal_process_group`] exactly as
+/// pipe mode does; the wait thread only observes the outcome.
+async fn supervise_terminal(
+    config: Config,
+    size: TerminalSize,
+    log: Arc<EventLog>,
+    terminal_log: Arc<TerminalLog>,
+    mut stops: mpsc::Receiver<StopCommand>,
+    mut terminal_commands: mpsc::Receiver<TerminalCommand>,
+    mut runner_shutdown: watch::Receiver<bool>,
+) -> Result<SupervisionOutcome, Error> {
+    let pty_system = native_pty_system();
+    let pair = match pty_system.openpty(PtySize {
+        rows: size.rows,
+        cols: size.cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(pair) => pair,
+        Err(error) => {
+            log.append_lifecycle(
+                RunnerEvent::SpawnFailed {
+                    message: truncate_utf8(
+                        format!("failed to open pty: {error}"),
+                        MAX_RUNNER_ERROR_BYTES,
+                    ),
+                },
+                true,
+            )
+            .await?;
+            return Ok(SupervisionOutcome::AwaitAcknowledgement);
+        }
+    };
+
+    let mut builder = CommandBuilder::new(&config.program);
+    builder.args(&config.arguments);
+    builder.cwd(&config.cwd);
+    let spawned = pair.slave.spawn_command(builder);
+    drop(pair.slave);
+    let child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            log.append_lifecycle(
+                RunnerEvent::SpawnFailed {
+                    message: truncate_utf8(error.to_string(), MAX_RUNNER_ERROR_BYTES),
+                },
+                true,
+            )
+            .await?;
+            return Ok(SupervisionOutcome::AwaitAcknowledgement);
+        }
+    };
+    let child_pid = child
+        .process_id()
+        .ok_or_else(|| Error::Task("spawned pty child has no process ID".into()))?;
+    drop(child);
+    let pid = Pid::from_raw(
+        i32::try_from(child_pid).map_err(|_| Error::Task("child PID overflow".into()))?,
+    )
+    .ok_or_else(|| Error::Task("child PID was zero".into()))?;
+    let mut process_group = ProcessGroupGuard::new(pid);
+    log.append_lifecycle(RunnerEvent::Started { child_pid }, false)
+        .await?;
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| Error::Task(format!("failed to clone pty reader: {error}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| Error::Task(format!("failed to take pty writer: {error}")))?;
+    let master = pair.master;
+
+    let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || pty_reader_loop(reader, output_tx));
+    let (control_tx, control_rx) = mpsc::channel::<PtyControl>(TERMINAL_COMMAND_CAPACITY);
+    std::thread::spawn(move || pty_control_loop(master, writer, control_rx));
+    let (exit_tx, mut exit_rx) = oneshot::channel();
+    std::thread::spawn(move || {
+        let result = waitpid(Some(pid), WaitOptions::empty()).map_err(io::Error::from);
+        let _ = exit_tx.send(result);
+    });
+
+    let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
+    let mut runner_signalled = false;
+    let mut reader_open = true;
+    let status = loop {
+        tokio::select! {
+            result = &mut exit_rx => {
+                let waited = result
+                    .map_err(|_| Error::Task("pty wait thread disappeared".into()))??;
+                let Some((_, status)) = waited else {
+                    return Err(Error::Task(
+                        "waitpid returned no status for a blocking wait".into(),
+                    ));
+                };
+                break status;
+            }
+            chunk = output_rx.recv(), if reader_open => match chunk {
+                Some(bytes) => terminal_log.append(bytes).await?,
+                None => reader_open = false,
+            },
+            command = stops.recv() => {
+                let Some(command) = command else {
+                    continue;
+                };
+                if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
+                    let _ = command.response.send(Err(ControlError::new(
+                        RunnerErrorCode::Internal,
+                        format!("failed to stop process group: {error}"),
+                    )));
+                    continue;
+                }
+                let _ = command.response.send(Ok(()));
+            }
+            changed = runner_shutdown.changed(), if !runner_signalled => {
+                changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
+                runner_signalled = true;
+                begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+            }
+            () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                signal_process_group(pid, Signal::KILL)?;
+                kill_deadline = None;
+            }
+            command = terminal_commands.recv() => {
+                let Some(command) = command else {
+                    continue;
+                };
+                let control = match command.kind {
+                    TerminalCommandKind::Input(bytes) => PtyControl::Write(bytes),
+                    TerminalCommandKind::Resize { cols, rows } => PtyControl::Resize { cols, rows },
+                };
+                let outcome = control_tx.send(control).await.map_err(|_| {
+                    ControlError::new(RunnerErrorCode::Internal, "pty control thread disappeared")
+                });
+                let _ = command.response.send(outcome);
+            }
+        }
+    };
+    let status = wait_status_to_exit(status);
+
+    if process_group_exists(pid)? {
+        begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+        loop {
+            tokio::select! {
+                () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                    signal_process_group(pid, Signal::KILL)?;
+                    break;
+                }
+                command = stops.recv() => {
+                    let Some(command) = command else {
+                        continue;
+                    };
+                    shorten_deadline(command.grace, &mut kill_deadline);
+                    let _ = command.response.send(Ok(()));
+                }
+                changed = runner_shutdown.changed(), if !runner_signalled => {
+                    changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
+                    runner_signalled = true;
+                }
+            }
+        }
+    }
+
+    if reader_open {
+        let drain_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
+            while let Some(bytes) = output_rx.recv().await {
+                terminal_log.append(bytes).await?;
+            }
+            Ok::<(), Error>(())
+        })
+        .await;
+        match drain_result {
+            Ok(result) => result?,
+            Err(_) => {
+                // The reader thread is still blocked (or its bytes are still
+                // being appended); we cannot forcibly cancel a blocking OS
+                // thread without unsafe, so we stop waiting for it here. It
+                // will finish and exit on its own once the pty fully closes.
+            }
+        }
+    }
+    log.append_lifecycle(
+        RunnerEvent::Exited {
+            exit_code: status.0,
+            signal: status.1,
+        },
+        true,
+    )
+    .await?;
+    process_group.disarm();
+    if runner_signalled {
+        Ok(SupervisionOutcome::RunnerSignalled)
+    } else {
+        Ok(SupervisionOutcome::AwaitAcknowledgement)
+    }
+}
+
+fn wait_status_to_exit(status: rustix::process::WaitStatus) -> (Option<i32>, Option<i32>) {
+    (status.exit_status(), status.terminating_signal())
+}
+
+fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, output_tx: mpsc::Sender<Vec<u8>>) {
+    let mut buffer = vec![0_u8; TERMINAL_READ_CHUNK];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        if output_tx.blocking_send(buffer[..read].to_vec()).is_err() {
+            break;
+        }
+    }
+}
+
+fn pty_control_loop(
+    master: Box<dyn MasterPty + Send>,
+    mut writer: Box<dyn std::io::Write + Send>,
+    mut control_rx: mpsc::Receiver<PtyControl>,
+) {
+    while let Some(command) = control_rx.blocking_recv() {
+        match command {
+            PtyControl::Write(bytes) => {
+                let _ = writer.write_all(&bytes);
+                let _ = writer.flush();
+            }
+            PtyControl::Resize { cols, rows } => {
+                let _ = master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                });
+            }
+        }
+    }
+    drop(master);
 }
 
 fn prepare_startup_stdin(input: Option<Vec<u8>>) -> Result<Stdio, Error> {
@@ -1262,9 +2041,19 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DecodedChunk, Error, MAX_STARTUP_STDIN_BYTES, decode_available, validate_config,
+        Config, DecodedChunk, Error, MAX_STARTUP_STDIN_BYTES, TERMINAL_LOG_FILE,
+        TERMINAL_LOG_ROTATED_FILE, TerminalLog, decode_available, validate_config,
     };
-    use factory_core::{RunId, RunnerInstanceId, runner::MAX_RUNNER_OUTPUT_TEXT_BYTES};
+    use factory_core::{
+        RunId, RunnerInstanceId,
+        runner::{MAX_RUNNER_OUTPUT_TEXT_BYTES, RunnerFrame, decode_terminal_bytes},
+    };
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use tokio::{
+        fs::File,
+        io::{AsyncBufReadExt, BufReader},
+        net::UnixStream,
+    };
 
     #[test]
     fn config_rejects_startup_input_over_the_hard_limit() {
@@ -1277,9 +2066,29 @@ mod tests {
             startup_input: Some(vec![0; MAX_STARTUP_STDIN_BYTES + 1]),
             program: "/bin/true".into(),
             arguments: Vec::new(),
+            terminal: None,
         })
         .unwrap_err();
         assert!(matches!(error, Error::InvalidArguments(message) if message.contains("stdin")));
+    }
+
+    #[test]
+    fn config_rejects_startup_input_combined_with_terminal_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = validate_config(&Config {
+            run_id: RunId::try_from("run-1").unwrap(),
+            runner_instance_id: RunnerInstanceId::try_from("instance-1").unwrap(),
+            runtime_dir: directory.path().join("run"),
+            cwd: directory.path().to_owned(),
+            startup_input: Some(b"hello".to_vec()),
+            program: "/bin/true".into(),
+            arguments: Vec::new(),
+            terminal: Some(factory_core::runner::TerminalSize { cols: 80, rows: 24 }),
+        })
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::InvalidArguments(message) if message.contains("terminal mode"))
+        );
     }
 
     #[test]
@@ -1315,5 +2124,73 @@ mod tests {
         assert_eq!(chunks[0].text.len(), MAX_RUNNER_OUTPUT_TEXT_BYTES - 1);
         assert_eq!(chunks[1].text, "🦀");
         assert!(chunks.iter().all(|chunk| !chunk.lossy));
+    }
+
+    fn open_terminal_log(dir: &std::path::Path, max_bytes: u64) -> std::sync::Arc<TerminalLog> {
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .read(true)
+            .mode(0o600)
+            .open(dir.join(TERMINAL_LOG_FILE))
+            .unwrap();
+        TerminalLog::new(dir.to_path_buf(), max_bytes, File::from_std(file))
+    }
+
+    #[tokio::test]
+    async fn terminal_log_rotates_exactly_once_dropping_the_oldest_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 4);
+
+        log.append(b"ABCD".to_vec()).await.unwrap(); // exactly fills the active file
+        log.append(b"EFGH".to_vec()).await.unwrap(); // forces the first rotation
+        log.append(b"IJKL".to_vec()).await.unwrap(); // forces a second rotation
+
+        let snapshot = log.snapshot().await;
+        assert_eq!(snapshot.total_bytes, 12);
+        assert_eq!(
+            snapshot.oldest_retained_offset, 4,
+            "the first generation was dropped"
+        );
+        assert_eq!(snapshot.active_start_offset, 8);
+        assert_eq!(snapshot.previous, Some((4, 4)));
+        assert_eq!(
+            std::fs::read(directory.path().join(TERMINAL_LOG_ROTATED_FILE)).unwrap(),
+            b"EFGH"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join(TERMINAL_LOG_FILE)).unwrap(),
+            b"IJKL"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_log_replay_stitches_the_rotated_and_active_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 4);
+        log.append(b"ABCD".to_vec()).await.unwrap();
+        log.append(b"EFGH".to_vec()).await.unwrap();
+        log.append(b"IJKL".to_vec()).await.unwrap();
+        let snapshot = log.snapshot().await;
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (_read, mut write) = server.into_split();
+        log.replay(&mut write, snapshot, 4, snapshot.total_bytes)
+            .await
+            .unwrap();
+        drop(write);
+
+        let mut reader = BufReader::new(&mut client);
+        let mut collected = Vec::new();
+        let mut line = String::new();
+        while reader.read_line(&mut line).await.unwrap() > 0 {
+            let frame: RunnerFrame = serde_json::from_str(line.trim_end()).unwrap();
+            let RunnerFrame::TerminalOutput { bytes, .. } = frame else {
+                panic!("expected terminal output, got {frame:?}");
+            };
+            collected.extend(decode_terminal_bytes(&bytes).unwrap());
+            line.clear();
+        }
+        assert_eq!(collected, b"EFGHIJKL");
     }
 }

@@ -21,6 +21,22 @@ where
     T::try_from(value.to_owned()).unwrap()
 }
 
+/// The runner no longer deletes its runtime directory on acknowledgement:
+/// `events.ndjson` is a retained private log, so exactly one runtime
+/// directory should remain under `runtime_root`, with its control socket
+/// gone (torn down) but its event spool retained (inspectable afterward).
+fn runtime_is_reconciled_and_retained(runtime_root: &std::path::Path) -> bool {
+    let entries: Vec<_> = fs::read_dir(runtime_root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect();
+    let [entry] = entries.as_slice() else {
+        return false;
+    };
+    let path = entry.path();
+    !path.join("control.sock").exists() && path.join("events.ndjson").is_file()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -148,7 +164,7 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
                 })
                 .await
                 .unwrap();
-            let runtime_clean = fs::read_dir(&runtime_root).unwrap().next().is_none();
+            let runtime_clean = runtime_is_reconciled_and_retained(&runtime_root);
             if reconciled && runtime_clean {
                 break;
             }
@@ -393,7 +409,7 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
                 })
                 .await
                 .unwrap();
-            let runtime_clean = fs::read_dir(&runtime_root).unwrap().next().is_none();
+            let runtime_clean = runtime_is_reconciled_and_retained(&runtime_root);
             if reconciled && runtime_clean {
                 break;
             }
