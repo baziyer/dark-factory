@@ -5,8 +5,9 @@ Status: 16 August 2026
 Dark Factory’s current baseline is the durable local supervisor and native
 control plane: explicit task starts, Claude and Codex runners, transactional
 results, queue assignment, retry/stop controls, on-demand Codex subscription
-usage via `factoryctl usage`, provider-scoped model selection, standing agent
-guidance, and a private durable message inbox delivered into the next launch.
+usage via `factoryctl usage`, provider-scoped model and permission-mode
+selection, file-backed project and agent guidance and memory composed at
+launch, and a private durable message inbox delivered into the next launch.
 
 This file lists unfinished product work only. Completed launch work is not
 repeated as a backlog item.
@@ -49,9 +50,18 @@ repeated as a backlog item.
 - Minerva's `legacy_v1` endpoint is the only wire profile the config accepts
   today; broadening beyond it is roadmap, not baseline.
 
+## Later: per-agent runtime isolation
+
+- Provision the reserved `worktrees/<agent_id>` git worktree, `codex-home/`
+  `CODEX_HOME`, and generated `claude-settings.json` hooks settings under each
+  agent's guidance directory (`factory_core::paths` already computes these
+  paths; nothing creates or consumes them yet).
+- Consume `permission_mode` at launch once the provider adapters accept it;
+  it is stored and shown today but not yet wired into `execution::prepare_launch`.
+
 ## Product boundaries
 
 - Usage is shown as normalized provider headroom, not historical costs.
 - Explicit task starts are v1; scheduling remains roadmap.
-- Public FactoryEvent snapshots stay bounded and free of profile memory,
-  instructions, message bodies, raw runner output, and tracing payloads.
+- Public FactoryEvent snapshots stay bounded and free of guidance-file
+  content, message bodies, raw runner output, and tracing payloads.

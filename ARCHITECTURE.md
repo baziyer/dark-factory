@@ -11,6 +11,12 @@ This file records constraints, not an aspirational component catalogue.
    events commit in the same transaction. The store uses WAL with `FULL`
    synchronous writes so acknowledged commands survive more than a process
    restart. One exclusive database lock prevents split-brain daemon writers.
+   Carve-out: project and agent guidance, memory, and standing instructions
+   are operator- and agent-editable files under `$DARK_FACTORY_HOME/projects`
+   (see `factory_core::paths` and `factoryd::guidance`), not SQLite columns or
+   events; SQLite still owns the identities (projects, agents) those files are
+   keyed by, and the daemon creates and bounds the files but never treats
+   their content as part of the durable ledger.
 3. `factory-ui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. Each run is launched through a small, stable `factory-runner` process.

@@ -56,8 +56,12 @@ cargo run -p factoryctl -- health
 cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
 cargo run -p factoryctl -- project list
 cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator --provider codex
+cargo run -p factoryctl -- agent get --project PROJECT_ID --agent AGENT_ID
+cargo run -p factoryctl -- agent profile set --project PROJECT_ID --agent AGENT_ID --model gpt-5-codex --instructions-file instructions.md
 cargo run -p factoryctl -- agent message --project PROJECT_ID --to AGENT_ID --body "Review the next task"
 cargo run -p factoryctl -- agent inbox --project PROJECT_ID --agent AGENT_ID
+cargo run -p factoryctl -- project get --project PROJECT_ID
+cargo run -p factoryctl -- project guidance set --project PROJECT_ID --file PROJECT.md
 cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
 cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
 cargo run -p factoryctl -- task cancel --project PROJECT_ID --task TASK_ID
@@ -86,8 +90,11 @@ the task reservation is durable; runner readiness and completion arrive as
 events. Both programs use
 `$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
 `$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
-Agent profiles use a provider-scoped model picker, persistent standing guidance,
-and memory. `agent message` and the native inspector use one private durable
+Agent profiles carry a provider-scoped `model` and `permission_mode` (Claude:
+`default`/`acceptEdits`/`plan`; Codex: `on-request`/`never`; `permission_mode`
+is stored and shown but not yet consumed by launch). Standing guidance and
+memory are file-backed, not database columns; see "Guidance files" below.
+`agent message` and the native inspector use one private durable
 inbox; messages are delivered with the next explicit task start and never enter
 public events. List commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
@@ -96,12 +103,51 @@ By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
 `claude` through the sanitized launch environment, stores runner state under
 `$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
 `--codex`, `--claude`, `--runtime-root`, and `--max-active-runs` to set those
-explicitly. Claude runs are bounded to 20 turns and USD 5.00 in v1.
+explicitly. Claude runs are bounded to 20 turns and USD 5.00 in v1. Current
+model ids: Claude `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
+`claude-haiku-4-5-20251001` (the installed `claude` CLI also accepts the
+short aliases `fable`/`opus`/`sonnet`/`haiku`); Codex model ids follow
+whatever the installed `codex` CLI supports. `agent add --model` and `agent
+profile set --model` forward any non-empty bounded string to the provider
+for either one; the daemon does not maintain its own model allowlist.
 
 State is private by construction. Custom database and socket paths must each
 have an immediate parent directory owned by the current user with mode `0700`;
 files and sockets use mode `0600`. The default state directory is created with
 those permissions automatically.
+
+## Guidance files
+
+Project and agent guidance, memory, and standing instructions live as plain
+Markdown files in a sister folder under `$DARK_FACTORY_HOME`, Munder-Difflin
+style, rather than as opaque database columns. SQLite remains the durable
+ledger for projects, agents, tasks, runs, events, and messages; these files
+are the operator- and agent-editable surface on top of it. `factoryd` creates
+the project directory and an empty `PROJECT.md` on `project add`, and the
+agent directory with empty `instructions.md`/`memory.md` on `agent add`
+(lazily again on first read, so rows created before this feature still work).
+Every file is capped at 16 KB.
+
+```text
+$DARK_FACTORY_HOME/projects/<project_id>/PROJECT.md
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/instructions.md
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/memory.md
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/       (reserved, not yet created)
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json  (reserved, not yet created)
+$DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/               (reserved, not yet created)
+```
+
+The last three paths are reserved for later tracks (a per-agent `CODEX_HOME`,
+generated Claude Code hooks settings, and a per-agent git worktree); today
+`factory_core::paths` only computes them.
+
+Task launch composes, in order, whichever of `PROJECT.md`, `instructions.md`,
+and `memory.md` are non-empty, then queued operator messages, then the task
+body, then an always-present final paragraph pointing the agent at its own
+`memory.md` path so it can append durable lessons there directly. Edit these
+files with any editor, or through the daemon: `agent get`/`project get` print
+their absolute paths, and `agent profile set`/`project guidance set` write
+them atomically (bounded, temp file plus rename).
 
 ## The Minerva webhook endpoint
 
