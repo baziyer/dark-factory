@@ -29,6 +29,7 @@ use tokio::{
 };
 
 const THREAD_ID: &str = "0195d40a-1111-7000-8000-000000000001";
+const MAX_TEST_VIRTUAL_DRIVE: Duration = Duration::from_secs(1);
 const SCRIPTED_RUNNER_SOURCE: &str = r####"
 use std::{
     env, fs,
@@ -433,6 +434,7 @@ impl RecoveryFixture {
 
     async fn drive_until_observer_health(&self, expected: ObserverHealth) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let virtual_deadline = tokio::time::Instant::now() + MAX_TEST_VIRTUAL_DRIVE;
         loop {
             if self.observer_health().await == Some(expected) {
                 return;
@@ -441,12 +443,17 @@ impl RecoveryFixture {
                 std::time::Instant::now() < deadline,
                 "timed out driving observer health to {expected:?}"
             );
+            assert!(
+                tokio::time::Instant::now() < virtual_deadline,
+                "observer health exceeded its virtual-time bound"
+            );
             advance_and_settle(Duration::from_millis(10)).await;
         }
     }
 
     async fn drive_until_recoverable(&self, expected: bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let virtual_deadline = tokio::time::Instant::now() + MAX_TEST_VIRTUAL_DRIVE;
         loop {
             if self.remains_recoverable().await == expected {
                 return;
@@ -454,6 +461,10 @@ impl RecoveryFixture {
             assert!(
                 std::time::Instant::now() < deadline,
                 "timed out waiting for recoverable={expected}"
+            );
+            assert!(
+                tokio::time::Instant::now() < virtual_deadline,
+                "recovery transition exceeded its virtual-time bound"
             );
             advance_and_settle(Duration::from_millis(10)).await;
         }
@@ -497,6 +508,7 @@ async fn receive_oneshot_while_advancing<T>(
     description: &str,
 ) -> T {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let virtual_deadline = tokio::time::Instant::now() + MAX_TEST_VIRTUAL_DRIVE;
     loop {
         match receiver.try_recv() {
             Ok(value) => return value,
@@ -509,6 +521,10 @@ async fn receive_oneshot_while_advancing<T>(
             std::time::Instant::now() < deadline,
             "timed out waiting for {description}"
         );
+        assert!(
+            tokio::time::Instant::now() < virtual_deadline,
+            "{description} exceeded its virtual-time bound"
+        );
         advance_and_settle(Duration::from_millis(10)).await;
     }
 }
@@ -516,8 +532,10 @@ async fn receive_oneshot_while_advancing<T>(
 async fn receive_mpsc_while_advancing<T>(
     receiver: &mut tokio::sync::mpsc::Receiver<T>,
     description: &str,
+    max_virtual_wait: Duration,
 ) -> T {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let virtual_deadline = tokio::time::Instant::now() + max_virtual_wait;
     loop {
         match receiver.try_recv() {
             Ok(value) => return value,
@@ -529,6 +547,10 @@ async fn receive_mpsc_while_advancing<T>(
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for {description}"
+        );
+        assert!(
+            tokio::time::Instant::now() < virtual_deadline,
+            "{description} exceeded its virtual-time bound"
         );
         advance_and_settle(Duration::from_millis(10)).await;
     }
@@ -1285,6 +1307,7 @@ async fn authenticated_disconnect_cannot_fail_a_still_running_wrapper() {
     advance_and_settle(Duration::from_millis(400)).await;
     let run_id = started.run_id.clone();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let virtual_deadline = tokio::time::Instant::now() + MAX_TEST_VIRTUAL_DRIVE;
     loop {
         let run_id = run_id.clone();
         let health = fixture
@@ -1304,6 +1327,10 @@ async fn authenticated_disconnect_cannot_fail_a_still_running_wrapper() {
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for the live wrapper to become degraded"
+        );
+        assert!(
+            tokio::time::Instant::now() < virtual_deadline,
+            "live-wrapper degradation exceeded its virtual-time bound"
         );
         advance_and_settle(Duration::from_millis(10)).await;
     }
@@ -1830,7 +1857,15 @@ async fn repeated_caught_up_disconnects_back_off_instead_of_polling_forever() {
         fixture.state.clone(),
     )
     .unwrap();
-    assert_eq!(attempt_rx.recv().await, Some(1));
+    assert_eq!(
+        receive_mpsc_while_advancing(
+            &mut attempt_rx,
+            "first caught-up attempt",
+            Duration::from_millis(100),
+        )
+        .await,
+        1
+    );
     fixture
         .wait_for_observer_health(ObserverHealth::Degraded)
         .await;
@@ -1838,10 +1873,16 @@ async fn repeated_caught_up_disconnects_back_off_instead_of_polling_forever() {
     advance_and_settle(Duration::from_millis(249)).await;
     assert!(attempt_rx.try_recv().is_err());
     assert_eq!(
-        receive_mpsc_while_advancing(&mut attempt_rx, "second caught-up attempt").await,
+        receive_mpsc_while_advancing(
+            &mut attempt_rx,
+            "second caught-up attempt",
+            Duration::from_millis(100),
+        )
+        .await,
         2
     );
     assert!(first_retry_started.elapsed() >= Duration::from_millis(250));
+    assert!(first_retry_started.elapsed() <= Duration::from_millis(350));
     fixture
         .wait_for_observer_health(ObserverHealth::Degraded)
         .await;
@@ -1849,10 +1890,16 @@ async fn repeated_caught_up_disconnects_back_off_instead_of_polling_forever() {
     advance_and_settle(Duration::from_millis(499)).await;
     assert!(attempt_rx.try_recv().is_err());
     assert_eq!(
-        receive_mpsc_while_advancing(&mut attempt_rx, "third caught-up attempt").await,
+        receive_mpsc_while_advancing(
+            &mut attempt_rx,
+            "third caught-up attempt",
+            Duration::from_millis(100),
+        )
+        .await,
         3
     );
     assert!(second_retry_started.elapsed() >= Duration::from_millis(500));
+    assert!(second_retry_started.elapsed() <= Duration::from_millis(600));
 
     stop(handle, join).await;
     server.await.unwrap();

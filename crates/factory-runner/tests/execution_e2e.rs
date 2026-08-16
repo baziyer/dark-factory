@@ -178,23 +178,39 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(
-        matches!(
-            run_truth.as_slice(),
-            [
-                (RunStatus::Starting, ObserverHealth::Unknown),
-                (RunStatus::Running, ObserverHealth::Unknown),
-                (RunStatus::Running, ObserverHealth::Healthy),
-                (RunStatus::Succeeded, ObserverHealth::Healthy),
-            ] | [
-                (RunStatus::Starting, ObserverHealth::Unknown),
-                (RunStatus::Running, ObserverHealth::Unknown),
-                (RunStatus::Succeeded, ObserverHealth::Unknown),
-                (RunStatus::Succeeded, ObserverHealth::Healthy),
-            ]
-        ),
-        "runner lifecycle and observer health were not monotonic: {run_truth:?}"
+    assert_eq!(run_truth.len(), 4);
+    assert_eq!(
+        run_truth.first(),
+        Some(&(RunStatus::Starting, ObserverHealth::Unknown))
     );
+    assert_eq!(
+        run_truth.last(),
+        Some(&(RunStatus::Succeeded, ObserverHealth::Healthy))
+    );
+    assert!(run_truth.windows(2).all(|window| {
+        let status_changed = window[0].0 != window[1].0;
+        let health_changed = window[0].1 != window[1].1;
+        status_changed ^ health_changed
+    }));
+    let mut lifecycle = run_truth
+        .iter()
+        .map(|(status, _)| *status)
+        .collect::<Vec<_>>();
+    lifecycle.dedup();
+    assert_eq!(
+        lifecycle,
+        [
+            RunStatus::Starting,
+            RunStatus::Running,
+            RunStatus::Succeeded
+        ]
+    );
+    let mut health = run_truth
+        .iter()
+        .map(|(_, health)| *health)
+        .collect::<Vec<_>>();
+    health.dedup();
+    assert_eq!(health, [ObserverHealth::Unknown, ObserverHealth::Healthy]);
     let public_json = serde_json::to_string(&events).unwrap();
     for private in [
         "real runner private task",
