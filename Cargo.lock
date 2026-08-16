@@ -59,6 +59,7 @@ name = "factory-runner"
 version = "0.1.0"
 dependencies = [
  "factory-core",
+ "factoryd",
  "rustix",
  "serde_json",
  "tempfile",

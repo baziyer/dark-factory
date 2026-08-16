@@ -13,8 +13,10 @@ Concrete Codex 0.147 and Claude Code 2.1.233 adapters build fresh and resumed
 stdin-only turns and normalise their JSONL into bounded, structurally filtered
 observations. A durable execution ledger now reserves tasks atomically, binds
 provider sessions, records run attempts, and supports exact runner replay and
-terminal reconciliation. Process scheduling and the observer remain
-deliberately absent until their vertical slices are executable.
+terminal reconciliation. A bounded Codex-only execution actor now launches and
+recovers stable runners without coupling their lifetime to the daemon. Local
+start commands and the native observer remain deliberately absent until their
+vertical slices are executable.
 
 ## Non-goals
 
