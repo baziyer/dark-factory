@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err("invalid webhook configuration state".into()),
     };
     let webhooks_enabled = webhooks.is_some();
+    let webhooks_bind = webhooks.as_ref().map(WebhookServer::local_addr);
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
             runner_program: config.runner,
@@ -80,8 +81,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         database = %instance.database_path().display(),
         socket = %instance.socket_path().display(),
         webhooks_enabled,
+        webhooks_bind = webhooks_bind.map(|bind| bind.to_string()),
         "factory daemon ready"
     );
+    if let Some(bind) = webhooks_bind {
+        tracing::info!(target: "factoryd.webhook", %bind, "webhooks enabled");
+    } else {
+        tracing::info!(
+            target: "factoryd.webhook",
+            "webhooks disabled: no --webhook-config and no $DARK_FACTORY_HOME/webhooks.json"
+        );
+    }
 
     let control_planes = serve_control_planes(listener, state, execution.clone(), webhooks);
     tokio::pin!(control_planes);
@@ -208,6 +218,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         .parent()
         .ok_or("factoryd executable has no parent directory")?
         .join("factory-runner");
+    let default_webhook_config = home.join("webhooks.json");
     let config = Config {
         database: home.join("factory.db"),
         socket: env::var_os("DARK_FACTORY_SOCKET")
@@ -220,7 +231,24 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
         webhook_config: None,
     };
-    parse_arguments(config, env::args_os().skip(1)).map_err(Into::into)
+    let mut config = parse_arguments(config, env::args_os().skip(1))?;
+    // Webhooks are on by default: if `$DARK_FACTORY_HOME/webhooks.json`
+    // exists, load it without requiring `--webhook-config`. An explicit
+    // `--webhook-config PATH` overrides this default.
+    config.webhook_config = resolve_webhook_config(
+        config.webhook_config,
+        default_webhook_config.clone(),
+        default_webhook_config.is_file(),
+    );
+    Ok(config)
+}
+
+fn resolve_webhook_config(
+    explicit: Option<PathBuf>,
+    default_path: PathBuf,
+    default_exists: bool,
+) -> Option<PathBuf> {
+    explicit.or_else(|| default_exists.then_some(default_path))
 }
 
 fn parse_arguments(
@@ -298,7 +326,7 @@ fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::{Config, parse_arguments};
+    use super::{Config, parse_arguments, resolve_webhook_config};
 
     fn config() -> Config {
         Config {
@@ -381,5 +409,26 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(duplicate, "--webhook-config may only be provided once");
+    }
+
+    #[test]
+    fn webhooks_default_on_when_the_home_config_file_exists_but_defer_to_an_explicit_path() {
+        let default_path = PathBuf::from("/state/webhooks.json");
+        assert_eq!(
+            resolve_webhook_config(None, default_path.clone(), true),
+            Some(default_path.clone())
+        );
+        assert_eq!(
+            resolve_webhook_config(None, default_path.clone(), false),
+            None
+        );
+        assert_eq!(
+            resolve_webhook_config(
+                Some(PathBuf::from("/explicit/webhooks.json")),
+                default_path,
+                true
+            ),
+            Some(PathBuf::from("/explicit/webhooks.json"))
+        );
     }
 }

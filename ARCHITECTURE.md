@@ -83,8 +83,9 @@ have both restarted without stopping or misidentifying it.
 - Zero-downtime handoff between two daemon binaries is deferred. Ordinary
   restart recovery reconnects to exact stable runners; unverifiable identities
   fail visibly rather than risk attaching to the wrong process.
-- Webhook exposure beyond loopback remains external. The daemon accepts only
-  owner-configured endpoint profiles with distinct secrets and projects.
+- Webhook exposure beyond loopback remains external. The daemon accepts
+  exactly one owner-configured endpoint, on by default when its config file
+  is present.
 - Repository visibility is private during early operation; making it public is
   a separate product decision.
 - Pause remains deferred, but stop intent is now durable: `StopRun` signals

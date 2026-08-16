@@ -18,8 +18,6 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 
 const LEGACY_SECRET: &str = "private-legacy-secret-sentinel";
-const LAB_SECRET: &str = "private-lab-secret-sentinel";
-const THIRD_SECRET: &str = "private-third-secret-sentinel";
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
@@ -34,7 +32,9 @@ fn private_write(path: &std::path::Path, contents: impl AsRef<[u8]>) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-fn config_json(bind: &str, legacy_secret: &std::path::Path, lab_secret: &std::path::Path) -> Value {
+/// The exact shape Minerva's live `webhooks.json` uses today: one endpoint,
+/// `legacy_v1`. This must keep loading unchanged.
+fn config_json(bind: &str, secret_file: &std::path::Path) -> Value {
     json!({
         "version": 1,
         "bind": bind,
@@ -42,87 +42,47 @@ fn config_json(bind: &str, legacy_secret: &std::path::Path, lab_secret: &std::pa
             {
                 "id": "minerva",
                 "wireProfile": "legacy_v1",
-                "secretFile": legacy_secret,
+                "secretFile": secret_file,
                 "projectId": "factory",
                 "orchestratorAgentId": "god"
-            },
-            {
-                "id": "lab",
-                "wireProfile": "factory_v1",
-                "secretFile": lab_secret,
-                "projectId": "lab-project",
-                "orchestratorAgentId": "foreman"
             }
         ]
     })
 }
 
-fn config_json_three(
-    bind: &str,
-    legacy_secret: &std::path::Path,
-    lab_secret: &std::path::Path,
-    third_secret: &std::path::Path,
-) -> Value {
-    let mut config = config_json(bind, legacy_secret, lab_secret);
-    config["endpoints"].as_array_mut().unwrap().push(json!({
-        "id": "third",
-        "wireProfile": "factory_v1",
-        "secretFile": third_secret,
-        "projectId": "third-project",
-        "orchestratorAgentId": "third-agent"
-    }));
-    config
-}
-
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, DaemonState) {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let legacy_secret = directory.path().join("legacy.secret");
-    let lab_secret = directory.path().join("lab.secret");
-    let third_secret = directory.path().join("third.secret");
-    private_write(&legacy_secret, LEGACY_SECRET);
-    private_write(&lab_secret, LAB_SECRET);
-    private_write(&third_secret, THIRD_SECRET);
+    let secret_file = directory.path().join("legacy.secret");
+    private_write(&secret_file, LEGACY_SECRET);
     let config_path = directory.path().join("webhooks.json");
     private_write(
         &config_path,
-        serde_json::to_vec_pretty(&config_json_three(
-            "127.0.0.1:0",
-            &legacy_secret,
-            &lab_secret,
-            &third_secret,
-        ))
-        .unwrap(),
+        serde_json::to_vec_pretty(&config_json("127.0.0.1:0", &secret_file)).unwrap(),
     );
 
     let mut store = Store::open_in_memory().unwrap();
-    for (project, name, root, orchestrator) in [
-        ("factory", "Factory", "/tmp/factory", "god"),
-        ("lab-project", "Lab", "/tmp/lab", "foreman"),
-        ("third-project", "Third", "/tmp/third", "third-agent"),
-    ] {
-        store
-            .create_project(
-                NewProject {
-                    id: project_id(project),
-                    name: name.into(),
-                    root: root.into(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                NewAgent {
-                    id: agent_id(orchestrator),
-                    project_id: project_id(project),
-                    parent_agent_id: None,
-                    role: AgentRole::Orchestrator,
-                    provider: Provider::Codex,
-                },
-                2,
-            )
-            .unwrap();
-    }
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/tmp/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("god"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
     (directory, config_path, DaemonState::new(store))
 }
 
@@ -131,14 +91,14 @@ async fn body_json(response: axum::response::Response) -> Value {
 }
 
 #[tokio::test]
-async fn one_owner_only_config_routes_two_isolated_endpoint_profiles() {
+async fn the_minerva_endpoint_authenticates_with_legacy_headers_and_serves_the_full_flow() {
     let (_directory, config_path, state) = fixture();
     let config = load_webhook_config(&config_path).unwrap();
     let router = webhook_router(state, config, Arc::new(WebhookHttpMetrics::default()))
         .await
         .unwrap();
 
-    let minerva = router
+    let created = router
         .clone()
         .oneshot(
             Request::post("/minerva")
@@ -149,72 +109,36 @@ async fn one_owner_only_config_routes_two_isolated_endpoint_profiles() {
         )
         .await
         .unwrap();
-    assert_eq!(minerva.status(), StatusCode::OK);
-    let minerva = body_json(minerva).await;
-    let minerva_token = minerva["token"].as_str().unwrap();
-
-    let lab = router
-        .clone()
-        .oneshot(
-            Request::post("/lab")
-                .header("content-type", "application/json")
-                .header("x-dark-factory-webhook-secret", LAB_SECRET)
-                .body(Body::from(r#"{"message":"generic factory"}"#))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(lab.status(), StatusCode::OK);
-    let lab = body_json(lab).await;
-    let lab_token = lab["token"].as_str().unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created = body_json(created).await;
+    let token = created["token"].as_str().unwrap();
 
     let wrong_secret = router
         .clone()
         .oneshot(
-            Request::post("/lab")
+            Request::post("/minerva")
                 .header("content-type", "application/json")
-                .header("x-dark-factory-webhook-secret", LEGACY_SECRET)
-                .body(Body::from(r#"{"message":"must not cross"}"#))
+                .header("x-md-webhook-secret", "not-the-real-secret")
+                .body(Body::from(r#"{"message":"must not authenticate"}"#))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(wrong_secret.status(), StatusCode::UNAUTHORIZED);
 
-    let cross_endpoint_token = router
+    let polled = router
         .clone()
         .oneshot(
-            Request::get("/lab")
-                .header("x-dark-factory-webhook-token", minerva_token)
+            Request::get("/minerva")
+                .header("x-md-webhook-token", token)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(cross_endpoint_token.status(), StatusCode::NOT_FOUND);
+    assert_eq!(polled.status(), StatusCode::OK);
 
-    let lab_poll = router
-        .oneshot(
-            Request::get("/lab")
-                .header("x-dark-factory-webhook-token", lab_token)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(lab_poll.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn wire_profile_controls_legacy_aliases_without_changing_subscription_usage() {
-    let (_directory, config_path, state) = fixture();
-    let config = load_webhook_config(&config_path).unwrap();
-    let router = webhook_router(state, config, Arc::new(WebhookHttpMetrics::default()))
-        .await
-        .unwrap();
-
-    let legacy = router
-        .clone()
+    let snapshot = router
         .oneshot(
             Request::get("/minerva/snapshot")
                 .header("x-md-webhook-secret", LEGACY_SECRET)
@@ -223,35 +147,17 @@ async fn wire_profile_controls_legacy_aliases_without_changing_subscription_usag
         )
         .await
         .unwrap();
-    assert_eq!(legacy.status(), StatusCode::OK);
-    let legacy = body_json(legacy).await;
-    let legacy_agent = &legacy["snapshot"]["agents"][0];
-    assert_eq!(legacy_agent["isGod"], true);
-    assert_eq!(legacy_agent["isOrchestrator"], true);
-    assert!(legacy_agent["role"].is_string());
-    assert!(legacy["snapshot"]["subscriptionUsage"].is_object());
-
-    let generic = router
-        .oneshot(
-            Request::get("/lab/snapshot")
-                .header("x-dark-factory-webhook-secret", LAB_SECRET)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(generic.status(), StatusCode::OK);
-    let generic = body_json(generic).await;
-    let generic_agent = &generic["snapshot"]["agents"][0];
-    assert_eq!(generic_agent["isOrchestrator"], true);
-    assert!(generic_agent.get("isGod").is_none());
-    assert!(generic_agent.get("tokens").is_none());
-    assert!(generic_agent.get("usd").is_none());
-    assert!(generic["snapshot"]["subscriptionUsage"].is_object());
+    assert_eq!(snapshot.status(), StatusCode::OK);
+    let snapshot = body_json(snapshot).await;
+    let agent = &snapshot["snapshot"]["agents"][0];
+    assert_eq!(agent["isGod"], true);
+    assert_eq!(agent["isOrchestrator"], true);
+    assert!(agent["role"].is_string());
+    assert!(snapshot["snapshot"].get("subscriptionUsage").is_none());
 }
 
 #[tokio::test]
-async fn one_endpoint_cannot_exhaust_another_endpoints_request_budget() {
+async fn a_second_configured_endpoint_can_never_exhaust_the_only_endpoints_request_budget() {
     let (_directory, config_path, state) = fixture();
     let config = load_webhook_config(&config_path).unwrap();
     let router = webhook_router(state, config, Arc::new(WebhookHttpMetrics::default()))
@@ -272,7 +178,6 @@ async fn one_endpoint_cannot_exhaust_another_endpoints_request_budget() {
         assert_eq!(response.status(), StatusCode::OK);
     }
     let exhausted = router
-        .clone()
         .oneshot(
             Request::get("/minerva/snapshot")
                 .header("x-md-webhook-secret", LEGACY_SECRET)
@@ -282,56 +187,6 @@ async fn one_endpoint_cannot_exhaust_another_endpoints_request_budget() {
         .await
         .unwrap();
     assert_eq!(exhausted.status(), StatusCode::TOO_MANY_REQUESTS);
-
-    let independent = router
-        .oneshot(
-            Request::get("/lab/snapshot")
-                .header("x-dark-factory-webhook-secret", LAB_SECRET)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(independent.status(), StatusCode::OK);
-}
-
-#[tokio::test]
-async fn three_configured_endpoints_keep_independent_request_budgets() {
-    let (_directory, config_path, state) = fixture();
-    let config = load_webhook_config(&config_path).unwrap();
-    let router = webhook_router(state, config, Arc::new(WebhookHttpMetrics::default()))
-        .await
-        .unwrap();
-
-    for (path, header, secret) in [
-        ("/minerva/snapshot", "x-md-webhook-secret", LEGACY_SECRET),
-        ("/lab/snapshot", "x-dark-factory-webhook-secret", LAB_SECRET),
-    ] {
-        for _ in 0..60 {
-            let response = router
-                .clone()
-                .oneshot(
-                    Request::get(path)
-                        .header(header, secret)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-    }
-
-    let third = router
-        .oneshot(
-            Request::get("/third/snapshot")
-                .header("x-dark-factory-webhook-secret", THIRD_SECRET)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(third.status(), StatusCode::OK);
 }
 
 #[test]
@@ -352,29 +207,46 @@ fn config_is_bounded_strict_private_and_non_symbolic() {
 }
 
 #[test]
-fn duplicate_ids_secrets_and_non_loopback_bind_fail_closed() {
+fn more_than_one_endpoint_or_a_missing_endpoint_fails_closed() {
     let (directory, config_path, _state) = fixture();
-    let legacy_secret = directory.path().join("legacy.secret");
-    let lab_secret = directory.path().join("lab.secret");
+    let secret_file = directory.path().join("legacy.secret");
+    let second_secret = directory.path().join("second.secret");
+    private_write(&second_secret, "another-private-secret");
 
-    let mut duplicate_id = config_json("127.0.0.1:0", &legacy_secret, &lab_secret);
-    duplicate_id["endpoints"][1]["id"] = json!("minerva");
-    private_write(&config_path, serde_json::to_vec(&duplicate_id).unwrap());
+    let mut two_endpoints = config_json("127.0.0.1:0", &secret_file);
+    two_endpoints["endpoints"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": "second",
+            "wireProfile": "legacy_v1",
+            "secretFile": second_secret,
+            "projectId": "second-project",
+            "orchestratorAgentId": "second-agent"
+        }));
+    private_write(&config_path, serde_json::to_vec(&two_endpoints).unwrap());
     assert!(load_webhook_config(&config_path).is_err());
 
-    let duplicate_secret = config_json("127.0.0.1:0", &legacy_secret, &legacy_secret);
-    private_write(&config_path, serde_json::to_vec(&duplicate_secret).unwrap());
+    let mut no_endpoints = config_json("127.0.0.1:0", &secret_file);
+    no_endpoints["endpoints"] = json!([]);
+    private_write(&config_path, serde_json::to_vec(&no_endpoints).unwrap());
     assert!(load_webhook_config(&config_path).is_err());
+}
 
-    let mut duplicate_project = config_json("127.0.0.1:0", &legacy_secret, &lab_secret);
-    duplicate_project["endpoints"][1]["projectId"] = json!("factory");
-    private_write(
-        &config_path,
-        serde_json::to_vec(&duplicate_project).unwrap(),
-    );
+#[test]
+fn only_the_legacy_v1_wire_profile_is_accepted() {
+    let (_directory, config_path, _state) = fixture();
+    let mut unsupported = fs::read_to_string(&config_path).unwrap();
+    unsupported = unsupported.replace("legacy_v1", "factory_v1");
+    private_write(&config_path, unsupported);
     assert!(load_webhook_config(&config_path).is_err());
+}
 
-    let non_loopback = config_json("0.0.0.0:3849", &legacy_secret, &lab_secret);
+#[test]
+fn non_loopback_bind_fails_closed() {
+    let (directory, config_path, _state) = fixture();
+    let secret_file = directory.path().join("legacy.secret");
+    let non_loopback = config_json("0.0.0.0:3849", &secret_file);
     private_write(&config_path, serde_json::to_vec(&non_loopback).unwrap());
     assert!(load_webhook_config(&config_path).is_err());
 }
@@ -387,8 +259,7 @@ fn endpoint_secret_itself_cannot_be_a_symbolic_link() {
     private_write(&real_secret, "another-private-secret");
     symlink(&real_secret, &linked_secret).unwrap();
 
-    let legacy_secret = directory.path().join("legacy.secret");
-    let config = config_json("127.0.0.1:0", &legacy_secret, &linked_secret);
+    let config = config_json("127.0.0.1:0", &linked_secret);
     private_write(&config_path, serde_json::to_vec(&config).unwrap());
     assert!(load_webhook_config(&config_path).is_err());
 }

@@ -16,10 +16,11 @@ default-deny environment; provider output is decoded into bounded structural
 state and is never copied wholesale into events, logs, or webhook responses.
 On success, only the provider's bounded final answer is stored as the task
 result for capability-scoped webhook polling and snapshots.
-An optional loopback HTTP listener hosts multiple configured webhook endpoints
-with distinct secrets and projects. Subscription headroom is collected without
-an agent/model turn, normalized into deterministic severity, and visible to the
-CLI, native UI, and webhooks.
+A loopback HTTP listener serves the single configured webhook endpoint
+(Minerva today) and is on by default whenever a config file is present.
+Subscription headroom is on-demand only: `factoryctl usage` runs a local Codex
+JSON-RPC probe and prints the result; nothing is persisted or collected in the
+background.
 
 ## Non-goals
 
@@ -102,11 +103,14 @@ have an immediate parent directory owned by the current user with mode `0700`;
 files and sockets use mode `0600`. The default state directory is created with
 those permissions automatically.
 
-## Generic webhook endpoints
+## The Minerva webhook endpoint
 
-Webhooks are optional and loopback-only. `factoryd --webhook-config PATH` loads
-one owner-only (`0600`) JSON file and all endpoint secrets before it advertises
-readiness. Endpoint IDs, secrets, and projects are unique.
+Webhooks are loopback-only and serve exactly one endpoint: Minerva, on the
+`legacy_v1` wire shape. The listener is **on by default** — if
+`$DARK_FACTORY_HOME/webhooks.json` exists, `factoryd` loads it and starts the
+listener automatically. `--webhook-config PATH` overrides the default location.
+Either way, the file must be owner-only (`0600`) JSON, and its endpoint secret
+must also be an owner-only (`0600`) regular file.
 
 ```json
 {
@@ -119,23 +123,16 @@ readiness. Endpoint IDs, secrets, and projects are unique.
       "secretFile": "/absolute/private/minerva.secret",
       "projectId": "factory",
       "orchestratorAgentId": "god"
-    },
-    {
-      "id": "another-client",
-      "wireProfile": "factory_v1",
-      "secretFile": "/absolute/private/another.secret",
-      "projectId": "another-project",
-      "orchestratorAgentId": "foreman"
     }
   ]
 }
 ```
 
-The endpoint ID is the route prefix. `legacy_v1` preserves the existing Minerva
-wire aliases and header names; `factory_v1` uses
-`x-dark-factory-webhook-secret` and `x-dark-factory-webhook-token` and omits
-legacy cost placeholders. Tunnel or device exposure remains external to the
-daemon.
+The endpoint ID is the route prefix. `legacy_v1` is the only accepted
+`wireProfile` value; the field is still required (an unrecognized value fails
+config loading) so this file keeps loading unchanged. A config listing more
+than one endpoint is rejected outright. Tunnel or device exposure remains
+external to the daemon.
 
 ## First-launch boundary and roadmap
 
@@ -143,7 +140,7 @@ V1 is intentionally explicit: create projects, agents, and tasks, then choose
 the agent and worktree for each start. The native UI provides the same control
 surface as the JSON CLI plus project/task/agent/run inspection, bounded local
 runner output and stop control, assignment-derived queues, observer health,
-subscription capacity, retry for terminal tasks, and recent durable events.
+retry for terminal tasks, and recent durable events.
 
 The unfinished product roadmap is kept in
 [ROADMAP.md](ROADMAP.md). It covers the God command center and agent operations,
@@ -153,8 +150,7 @@ profiles.
 
 ## Local service
 
-Templates in `launchd/` run the daemon and subscription monitor locally; they do
-not use GitHub Actions. Render placeholders to absolute canonical paths, keep
-state/config/log directories at `0700`, and install rendered plists at `0600`.
-The monitor stores only normalized allowance headroom and fixed failure
-categories—never raw provider terminal output or dollar estimates.
+The template in `launchd/` runs the daemon locally; it does not use GitHub
+Actions. Render placeholders to absolute canonical paths, keep state/config/log
+directories at `0700`, and install the rendered plist at `0600`. Subscription
+headroom has no background service: run `factoryctl usage` on demand instead.
