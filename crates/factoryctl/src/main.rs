@@ -17,17 +17,323 @@ const HELP: &str = "Dark Factory local control plane
 Run the daemon separately (launchd keeps it alive), then run `factoryctl ui` in a persistent terminal.
 
 Commands:
-  ui                                  Open the native control plane
-  health                              Check the daemon
-  project add|list                    Manage projects
-  task add|list|start|assign|retry    Manage and run tasks
-  agent add|list|message|inbox         Manage agents and their durable messages
-  run list                            List process attempts
-  events [--follow]                   Read durable events
+  ui                                          Open the native control plane
+  health                                      Check the daemon
+  usage                                       Read normalized subscription usage
+  project add|list|delete                     Manage projects
+  task add|list|get|start|retry|assign|cancel|update|delete
+                                               Manage and run tasks
+  agent add|list|delete|message|inbox         Manage agents and their durable messages
+  run list|stop                               List and stop process attempts
+  events [--follow]                           Read durable events
+
+Run `factoryctl <command> --help` or `factoryctl <command> <action> --help`
+for action-specific options.
 
 Options:
   --socket PATH                      Use an explicit local socket
   -h, --help                         Show this help";
+const HEALTH_HELP: &str = "usage: factoryctl health
+
+Check that the daemon is reachable and responding.";
+const USAGE_HELP: &str = "usage: factoryctl usage
+
+Read the normalized subscription usage snapshot (on-demand probe status).";
+const UI_HELP: &str = "usage: factoryctl ui
+
+Open the native (egui) control plane. It is being retired in favor of a
+ratatui terminal UI; prefer the other subcommands for scripting.";
+const EVENTS_HELP: &str = "usage: factoryctl events [--after N] [--limit N] [--follow]
+
+Read durable events from the daemon.
+
+Options:
+  --after N                Read events after this sequence (default 0)
+  --limit N                 Page size (default and max: 100; not with --follow)
+  --follow                   Stream events as they occur
+  -h, --help                  Show this help";
+
+const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete> [options]
+
+Manage projects.
+
+Actions:
+  add       Create a new project
+  list      List projects
+  delete    Delete a project that has no non-terminal run
+
+Run `factoryctl project <action> --help` for action-specific options.";
+const PROJECT_ADD_HELP: &str = "usage: factoryctl project add --name TEXT --root PATH [options]
+
+Create a new project.
+
+Required:
+  --name TEXT             Project name (1-160 bytes)
+  --root PATH             Existing readable directory
+
+Options:
+  --id ID                  Explicit project ID (default: generated UUID)
+  -h, --help                Show this help";
+const PROJECT_LIST_HELP: &str = "usage: factoryctl project list [options]
+
+List projects, ordered by ID.
+
+Options:
+  --after ID               Resume after this project ID
+  --limit N                  Page size (default and max: 100)
+  -h, --help                  Show this help";
+const PROJECT_DELETE_HELP: &str = "usage: factoryctl project delete --project ID
+
+Delete a project that has no non-terminal run. Cascades to delete every
+task, agent, and run in the project.
+
+Required:
+  --project ID           Project to delete
+
+Options:
+  -h, --help              Show this help";
+
+const TASK_HELP: &str =
+    "usage: factoryctl task <add|list|get|start|retry|assign|cancel|update|delete> [options]
+
+Manage tasks within a project.
+
+Actions:
+  add       Create a new task
+  list      List tasks in a project
+  get       Fetch one task
+  start     Start a queued task on an agent
+  retry     Requeue a failed or cancelled task
+  assign    Set or clear a task's queue owner without starting it
+  cancel    Cancel a queued or blocked task
+  update    Edit a queued task's title or body
+  delete    Delete a task that has no active run
+
+Run `factoryctl task <action> --help` for action-specific options.";
+const TASK_ADD_HELP: &str =
+    "usage: factoryctl task add --project ID --title TEXT --body TEXT [options]
+
+Create a new task.
+
+Required:
+  --project ID          Project the task belongs to
+  --title TEXT          Task title (1-240 bytes)
+  --body TEXT           Task body
+
+Options:
+  --id ID                 Explicit task ID (default: generated UUID)
+  --parent PARENT_ID      Parent task ID
+  --priority N              Priority (default: 0)
+  -h, --help                 Show this help";
+const TASK_LIST_HELP: &str = "usage: factoryctl task list --project ID [options]
+
+List tasks in a project, ordered by ID.
+
+Required:
+  --project ID           Project to list tasks from
+
+Options:
+  --after ID               Resume after this task ID
+  --limit N                  Page size (default and max: 10)
+  -h, --help                   Show this help";
+const TASK_GET_HELP: &str = "usage: factoryctl task get --project ID --task ID
+
+Fetch one task by ID.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to fetch
+
+Options:
+  -h, --help              Show this help";
+const TASK_START_HELP: &str =
+    "usage: factoryctl task start --project ID --task ID --agent ID --worktree PATH [options]
+
+Start a queued task on an idle agent.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to start
+  --agent ID             Agent to run it
+  --worktree PATH        Working directory for the run
+
+Options:
+  --parent-run ID          Parent run ID (for orchestrator-spawned runs)
+  -h, --help                 Show this help";
+const TASK_RETRY_HELP: &str = "usage: factoryctl task retry --project ID --task ID
+
+Requeue a failed or cancelled task.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to retry
+
+Options:
+  -h, --help              Show this help";
+const TASK_ASSIGN_HELP: &str = "usage: factoryctl task assign --project ID --task ID [--agent ID]
+
+Set or clear a queued task's queue owner without starting it. Omit --agent
+to clear the assignment back to the operator.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to assign
+
+Options:
+  --agent ID               Agent to assign as queue owner
+  -h, --help                 Show this help";
+const TASK_CANCEL_HELP: &str = "usage: factoryctl task cancel --project ID --task ID
+
+Cancel a queued or blocked task. The task keeps its current assignment and
+can be retried later.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to cancel
+
+Options:
+  -h, --help              Show this help";
+const TASK_UPDATE_HELP: &str =
+    "usage: factoryctl task update --project ID --task ID [--title TEXT] [--body TEXT]
+
+Edit a queued task's title and/or body. At least one of --title or --body
+is required.
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to update
+
+Options:
+  --title TEXT              New title (1-240 bytes)
+  --body TEXT                 New body
+  -h, --help                    Show this help";
+const TASK_DELETE_HELP: &str = "usage: factoryctl task delete --project ID --task ID
+
+Delete a task that has no non-terminal run, no subtasks, and no run that is
+a parent of another run. Also deletes its terminal runs and any rows that
+reference it (questions, dependencies, webhook capabilities).
+
+Required:
+  --project ID           Project the task belongs to
+  --task ID              Task to delete
+
+Options:
+  -h, --help              Show this help";
+
+const AGENT_HELP: &str = "usage: factoryctl agent <add|list|delete|message|inbox> [options]
+
+Manage agents within a project and their durable messages.
+
+Actions:
+  add       Create a new agent
+  list      List agents in a project
+  delete    Delete an agent that has no open run
+  message   Send a durable message from one agent to another
+  inbox     List an agent's durable messages
+
+Run `factoryctl agent <action> --help` for action-specific options.";
+const AGENT_ADD_HELP: &str =
+    "usage: factoryctl agent add --project ID --role <orchestrator|worker> --provider <claude|codex> [options]
+
+Create a new agent.
+
+Required:
+  --project ID           Project the agent belongs to
+  --role ROLE              orchestrator or worker
+  --provider PROVIDER      claude (or claude-code) or codex
+
+Options:
+  --id ID                    Explicit agent ID (default: generated UUID)
+  --parent PARENT_ID         Parent agent ID
+  --model MODEL               Provider model identifier for this agent
+  -h, --help                   Show this help";
+const AGENT_LIST_HELP: &str = "usage: factoryctl agent list --project ID [options]
+
+List agents in a project, ordered by ID.
+
+Required:
+  --project ID           Project to list agents from
+
+Options:
+  --after ID               Resume after this agent ID
+  --limit N                  Page size (default and max: 100)
+  -h, --help                   Show this help";
+const AGENT_DELETE_HELP: &str = "usage: factoryctl agent delete --project ID --agent ID
+
+Delete an agent that has no open run and no child agents, and whose runs are
+not the parent of another run. Its terminal runs are deleted too, and any
+tasks still assigned to it become unassigned. Its agent profile row is
+deleted, messages addressed to it are deleted, and messages it sent survive
+with the sender cleared.
+
+Required:
+  --project ID           Project the agent belongs to
+  --agent ID             Agent to delete
+
+Options:
+  -h, --help              Show this help";
+const AGENT_MESSAGE_HELP: &str =
+    "usage: factoryctl agent message --project ID --to AGENT_ID --body TEXT [options]
+
+Send a durable message from one agent to another. Messages are delivered
+into the recipient's inbox on their next run launch.
+
+Required:
+  --project ID           Project the agents belong to
+  --to AGENT_ID          Recipient agent ID
+  --body TEXT            Message body
+
+Options:
+  --id ID                    Explicit message ID (default: generated UUID)
+  --from AGENT_ID             Sender agent ID (default: none/system)
+  -h, --help                   Show this help";
+const AGENT_INBOX_HELP: &str = "usage: factoryctl agent inbox --project ID --agent ID [options]
+
+List an agent's durable messages, ordered by ID.
+
+Required:
+  --project ID           Project the agent belongs to
+  --agent ID             Agent whose inbox to list
+
+Options:
+  --after ID               Resume after this message ID
+  --limit N                  Page size (default and max: 100)
+  -h, --help                   Show this help";
+
+const RUN_HELP: &str = "usage: factoryctl run <list|stop> [options]
+
+Inspect and control process attempts (runs).
+
+Actions:
+  list      List runs in a project
+  stop      Request a graceful stop of a run
+
+Run `factoryctl run <action> --help` for action-specific options.";
+const RUN_LIST_HELP: &str = "usage: factoryctl run list --project ID [options]
+
+List runs in a project, ordered by ID.
+
+Required:
+  --project ID           Project to list runs from
+
+Options:
+  --after ID               Resume after this run ID
+  --limit N                  Page size (default and max: 100)
+  -h, --help                   Show this help";
+const RUN_STOP_HELP: &str = "usage: factoryctl run stop --project ID --run ID [--grace-ms N]
+
+Request a graceful stop of a run. The daemon signals the runner and marks
+stop intent on the run, so its next terminal event is recorded as stopped
+rather than failed, and its task becomes cancelled instead of failed.
+
+Required:
+  --project ID           Project the run belongs to
+  --run ID                Run to stop
+
+Options:
+  --grace-ms N              Grace period before a harder stop (default 0, max 60000)
+  -h, --help                  Show this help";
+
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
@@ -36,7 +342,7 @@ const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
-    Help,
+    Help(&'static str),
     Ui,
     Health,
     Usage,
@@ -48,6 +354,9 @@ enum CliCommand {
     ProjectList {
         after_id: Option<String>,
         limit: u32,
+    },
+    ProjectDelete {
+        project_id: String,
     },
     TaskAdd {
         id: Option<String>,
@@ -78,6 +387,24 @@ enum CliCommand {
         task_id: String,
         agent_id: Option<String>,
     },
+    TaskGet {
+        project_id: String,
+        task_id: String,
+    },
+    TaskCancel {
+        project_id: String,
+        task_id: String,
+    },
+    TaskUpdate {
+        project_id: String,
+        task_id: String,
+        title: Option<String>,
+        body: Option<String>,
+    },
+    TaskDelete {
+        project_id: String,
+        task_id: String,
+    },
     AgentAdd {
         id: Option<String>,
         project_id: String,
@@ -104,10 +431,19 @@ enum CliCommand {
         after_id: Option<String>,
         limit: u32,
     },
+    AgentDelete {
+        project_id: String,
+        agent_id: String,
+    },
     RunList {
         project_id: String,
         after_id: Option<String>,
         limit: u32,
+    },
+    RunStop {
+        project_id: String,
+        run_id: String,
+        grace_ms: u64,
     },
     Events {
         after_sequence: i64,
@@ -130,8 +466,8 @@ fn main() {
 
 fn run() -> Result<i32, String> {
     let (explicit_socket, command) = parse_args(env::args().skip(1).collect())?;
-    if matches!(command, CliCommand::Help) {
-        println!("{HELP}");
+    if let CliCommand::Help(text) = command {
+        println!("{text}");
         return Ok(0);
     }
     let environment_socket = env::var("DARK_FACTORY_SOCKET").ok();
@@ -193,6 +529,14 @@ fn is_error(frame: &ServerFrame) -> bool {
     )
 }
 
+fn is_help_flag(value: &str) -> bool {
+    value == "--help" || value == "-h"
+}
+
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|argument| is_help_flag(argument))
+}
+
 fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), String> {
     let socket = take_option(&mut args, "--socket")?;
     if args.is_empty() {
@@ -200,19 +544,27 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
     }
 
     let command = args.remove(0);
+    if command == "help" || is_help_flag(&command) {
+        return Ok((socket, CliCommand::Help(HELP)));
+    }
     match command.as_str() {
-        "help" | "-h" | "--help" if args.is_empty() => Ok((socket, CliCommand::Help)),
         "health" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(HEALTH_HELP)));
+            }
             require_empty(&args)?;
             Ok((socket, CliCommand::Health))
         }
         "usage" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(USAGE_HELP)));
+            }
             require_empty(&args)?;
             Ok((socket, CliCommand::Usage))
         }
         "ui" => {
-            if args == ["--help"] || args == ["-h"] {
-                return Ok((socket, CliCommand::Help));
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(UI_HELP)));
             }
             require_empty(&args)?;
             Ok((socket, CliCommand::Ui))
@@ -221,13 +573,29 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         "task" => parse_task(args).map(|command| (socket, command)),
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
-        "events" => parse_events(args).map(|command| (socket, command)),
+        "events" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(EVENTS_HELP)));
+            }
+            parse_events(args).map(|command| (socket, command))
+        }
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
     }
 }
 
 fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(PROJECT_HELP));
+    }
     let action = take_action(&mut args, "project")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "add" => PROJECT_ADD_HELP,
+            "list" => PROJECT_LIST_HELP,
+            "delete" => PROJECT_DELETE_HELP,
+            _ => PROJECT_HELP,
+        }));
+    }
     match action.as_str() {
         "add" => {
             let id = take_option(&mut args, "--id")?;
@@ -242,12 +610,34 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             require_empty(&args)?;
             Ok(CliCommand::ProjectList { after_id, limit })
         }
+        "delete" => {
+            let project_id = required_option(&mut args, "--project")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ProjectDelete { project_id })
+        }
         _ => Err(format!("unknown project action {action:?}")),
     }
 }
 
 fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(TASK_HELP));
+    }
     let action = take_action(&mut args, "task")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "add" => TASK_ADD_HELP,
+            "list" => TASK_LIST_HELP,
+            "get" => TASK_GET_HELP,
+            "start" => TASK_START_HELP,
+            "retry" => TASK_RETRY_HELP,
+            "assign" => TASK_ASSIGN_HELP,
+            "cancel" => TASK_CANCEL_HELP,
+            "update" => TASK_UPDATE_HELP,
+            "delete" => TASK_DELETE_HELP,
+            _ => TASK_HELP,
+        }));
+    }
     match action.as_str() {
         "add" => {
             let id = take_option(&mut args, "--id")?;
@@ -315,12 +705,68 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 agent_id,
             })
         }
+        "get" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskGet {
+                project_id,
+                task_id,
+            })
+        }
+        "cancel" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskCancel {
+                project_id,
+                task_id,
+            })
+        }
+        "update" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            let title = take_option(&mut args, "--title")?;
+            let body = take_option(&mut args, "--body")?;
+            require_empty(&args)?;
+            if title.is_none() && body.is_none() {
+                return Err("task update requires --title or --body".into());
+            }
+            Ok(CliCommand::TaskUpdate {
+                project_id,
+                task_id,
+                title,
+                body,
+            })
+        }
+        "delete" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskDelete {
+                project_id,
+                task_id,
+            })
+        }
         _ => Err(format!("unknown task action {action:?}")),
     }
 }
 
 fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(AGENT_HELP));
+    }
     let action = take_action(&mut args, "agent")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "add" => AGENT_ADD_HELP,
+            "list" => AGENT_LIST_HELP,
+            "delete" => AGENT_DELETE_HELP,
+            "message" => AGENT_MESSAGE_HELP,
+            "inbox" => AGENT_INBOX_HELP,
+            _ => AGENT_HELP,
+        }));
+    }
     match action.as_str() {
         "add" => {
             let id = take_option(&mut args, "--id")?;
@@ -386,12 +832,31 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 limit,
             })
         }
+        "delete" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentDelete {
+                project_id,
+                agent_id,
+            })
+        }
         _ => Err(format!("unknown agent action {action:?}")),
     }
 }
 
 fn parse_run(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(RUN_HELP));
+    }
     let action = take_action(&mut args, "run")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(match action.as_str() {
+            "list" => RUN_LIST_HELP,
+            "stop" => RUN_STOP_HELP,
+            _ => RUN_HELP,
+        }));
+    }
     match action.as_str() {
         "list" => {
             let project_id = required_option(&mut args, "--project")?;
@@ -402,6 +867,20 @@ fn parse_run(mut args: Vec<String>) -> Result<CliCommand, String> {
                 project_id,
                 after_id,
                 limit,
+            })
+        }
+        "stop" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let run_id = required_option(&mut args, "--run")?;
+            let grace_ms = take_option(&mut args, "--grace-ms")?
+                .map(|value| parse_number(&value, "--grace-ms"))
+                .transpose()?
+                .unwrap_or(0u64);
+            require_empty(&args)?;
+            Ok(CliCommand::RunStop {
+                project_id,
+                run_id,
+                grace_ms,
             })
         }
         _ => Err(format!("unknown run action {action:?}")),
@@ -431,7 +910,7 @@ fn parse_events(mut args: Vec<String>) -> Result<CliCommand, String> {
 
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
-        CliCommand::Help => Err("help is not a daemon request".into()),
+        CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Ui => Err("ui is handled before local requests".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Usage => Ok(LocalRequest::SubscriptionUsage),
@@ -448,6 +927,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .map(|id| parse_id(id, "project cursor"))
                 .transpose()?,
             limit,
+        }),
+        CliCommand::ProjectDelete { project_id } => Ok(LocalRequest::DeleteProject {
+            project_id: parse_id(project_id, "project")?,
         }),
         CliCommand::TaskAdd {
             id,
@@ -508,6 +990,38 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
             agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
+        }),
+        CliCommand::TaskGet {
+            project_id,
+            task_id,
+        } => Ok(LocalRequest::GetTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+        }),
+        CliCommand::TaskCancel {
+            project_id,
+            task_id,
+        } => Ok(LocalRequest::CancelTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+        }),
+        CliCommand::TaskUpdate {
+            project_id,
+            task_id,
+            title,
+            body,
+        } => Ok(LocalRequest::UpdateTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+            title,
+            body,
+        }),
+        CliCommand::TaskDelete {
+            project_id,
+            task_id,
+        } => Ok(LocalRequest::DeleteTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
         }),
         CliCommand::AgentAdd {
             id,
@@ -571,6 +1085,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?,
             limit,
         }),
+        CliCommand::AgentDelete {
+            project_id,
+            agent_id,
+        } => Ok(LocalRequest::DeleteAgent {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+        }),
         CliCommand::RunList {
             project_id,
             after_id,
@@ -579,6 +1100,15 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "run cursor")).transpose()?,
             limit,
+        }),
+        CliCommand::RunStop {
+            project_id,
+            run_id,
+            grace_ms,
+        } => Ok(LocalRequest::StopRun {
+            project_id: parse_id(project_id, "project")?,
+            run_id: parse_id(run_id, "run")?,
+            grace_ms,
         }),
         CliCommand::Events {
             after_sequence,
@@ -709,7 +1239,7 @@ mod tests {
     use factory_core::{AgentRole, Provider, local::LocalRequest};
     use uuid::Uuid;
 
-    use super::{CliCommand, parse_args, request_for, resolve_socket_path};
+    use super::*;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
@@ -752,16 +1282,120 @@ mod tests {
     fn help_is_available_without_a_daemon_connection() {
         assert_eq!(
             parse_args(args(&["--help"])).unwrap(),
-            (None, CliCommand::Help)
+            (None, CliCommand::Help(HELP))
         );
         assert_eq!(
             parse_args(args(&["help"])).unwrap(),
-            (None, CliCommand::Help)
+            (None, CliCommand::Help(HELP))
+        );
+        assert_eq!(
+            parse_args(args(&["-h"])).unwrap(),
+            (None, CliCommand::Help(HELP))
         );
         assert_eq!(
             parse_args(args(&["ui", "--help"])).unwrap(),
-            (None, CliCommand::Help)
+            (None, CliCommand::Help(UI_HELP))
         );
+    }
+
+    #[test]
+    fn every_group_and_subcommand_has_its_own_help_text() {
+        assert_eq!(
+            parse_args(args(&["health", "--help"])).unwrap().1,
+            CliCommand::Help(HEALTH_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["usage", "--help"])).unwrap().1,
+            CliCommand::Help(USAGE_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["events", "--help"])).unwrap().1,
+            CliCommand::Help(EVENTS_HELP)
+        );
+
+        assert_eq!(
+            parse_args(args(&["project"])).unwrap().1,
+            CliCommand::Help(PROJECT_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "--help"])).unwrap().1,
+            CliCommand::Help(PROJECT_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "add", "--help"])).unwrap().1,
+            CliCommand::Help(PROJECT_ADD_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "list", "-h"])).unwrap().1,
+            CliCommand::Help(PROJECT_LIST_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "delete", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_DELETE_HELP)
+        );
+
+        assert_eq!(
+            parse_args(args(&["task"])).unwrap().1,
+            CliCommand::Help(TASK_HELP)
+        );
+        for (action, expected) in [
+            ("add", TASK_ADD_HELP),
+            ("list", TASK_LIST_HELP),
+            ("get", TASK_GET_HELP),
+            ("start", TASK_START_HELP),
+            ("retry", TASK_RETRY_HELP),
+            ("assign", TASK_ASSIGN_HELP),
+            ("cancel", TASK_CANCEL_HELP),
+            ("update", TASK_UPDATE_HELP),
+            ("delete", TASK_DELETE_HELP),
+        ] {
+            assert_eq!(
+                parse_args(args(&["task", action, "--help"])).unwrap().1,
+                CliCommand::Help(expected),
+                "task {action} --help"
+            );
+        }
+
+        assert_eq!(
+            parse_args(args(&["agent"])).unwrap().1,
+            CliCommand::Help(AGENT_HELP)
+        );
+        for (action, expected) in [
+            ("add", AGENT_ADD_HELP),
+            ("list", AGENT_LIST_HELP),
+            ("delete", AGENT_DELETE_HELP),
+            ("message", AGENT_MESSAGE_HELP),
+            ("inbox", AGENT_INBOX_HELP),
+        ] {
+            assert_eq!(
+                parse_args(args(&["agent", action, "--help"])).unwrap().1,
+                CliCommand::Help(expected),
+                "agent {action} --help"
+            );
+        }
+
+        assert_eq!(
+            parse_args(args(&["run"])).unwrap().1,
+            CliCommand::Help(RUN_HELP)
+        );
+        for (action, expected) in [("list", RUN_LIST_HELP), ("stop", RUN_STOP_HELP)] {
+            assert_eq!(
+                parse_args(args(&["run", action, "--help"])).unwrap().1,
+                CliCommand::Help(expected),
+                "run {action} --help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_does_not_require_otherwise_required_options() {
+        // --help must short-circuit before required-option validation.
+        let (_, command) = parse_args(args(&["task", "add", "--help"])).unwrap();
+        assert_eq!(command, CliCommand::Help(TASK_ADD_HELP));
+        let (_, command) = parse_args(args(&["run", "stop", "--help"])).unwrap();
+        assert_eq!(command, CliCommand::Help(RUN_STOP_HELP));
     }
 
     #[test]
@@ -1116,5 +1750,161 @@ mod tests {
             panic!("expected create project request");
         };
         assert!(Uuid::parse_str(id.as_str()).is_ok());
+    }
+
+    #[test]
+    fn task_control_commands_parse_and_map_to_new_requests() {
+        let (_, command) = parse_args(args(&[
+            "task",
+            "cancel",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::CancelTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+            }
+        );
+
+        let (_, command) = parse_args(args(&[
+            "task",
+            "get",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::GetTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+            }
+        );
+
+        let (_, command) = parse_args(args(&[
+            "task",
+            "delete",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::DeleteTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+            }
+        );
+
+        let (_, command) = parse_args(args(&[
+            "task",
+            "update",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+            "--title",
+            "New",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::UpdateTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+                title: Some("New".into()),
+                body: None,
+            }
+        );
+
+        let error = parse_args(args(&[
+            "task",
+            "update",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "task update requires --title or --body");
+    }
+
+    #[test]
+    fn agent_and_project_delete_commands_parse_and_map_to_new_requests() {
+        let (_, command) = parse_args(args(&[
+            "agent",
+            "delete",
+            "--project",
+            "project-1",
+            "--agent",
+            "agent-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::DeleteAgent {
+                project_id: "project-1".try_into().unwrap(),
+                agent_id: "agent-1".try_into().unwrap(),
+            }
+        );
+
+        let (_, command) =
+            parse_args(args(&["project", "delete", "--project", "project-1"])).unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::DeleteProject {
+                project_id: "project-1".try_into().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn run_stop_command_parses_grace_and_defaults_to_zero() {
+        let (_, command) = parse_args(args(&[
+            "run",
+            "stop",
+            "--project",
+            "project-1",
+            "--run",
+            "run-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::StopRun {
+                project_id: "project-1".try_into().unwrap(),
+                run_id: "run-1".try_into().unwrap(),
+                grace_ms: 0,
+            }
+        );
+
+        let (_, command) = parse_args(args(&[
+            "run",
+            "stop",
+            "--project",
+            "project-1",
+            "--run",
+            "run-1",
+            "--grace-ms",
+            "2500",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::StopRun {
+                project_id: "project-1".try_into().unwrap(),
+                run_id: "run-1".try_into().unwrap(),
+                grace_ms: 2500,
+            }
+        );
     }
 }
