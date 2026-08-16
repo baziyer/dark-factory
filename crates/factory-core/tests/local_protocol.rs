@@ -1,5 +1,6 @@
 use factory_core::{
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider,
+    RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
         RequestEnvelope, ServerFrame,
@@ -12,6 +13,14 @@ fn project_id(value: &str) -> ProjectId {
 
 fn task_id(value: &str) -> TaskId {
     TaskId::try_from(value).unwrap()
+}
+
+fn agent_id(value: &str) -> AgentId {
+    AgentId::try_from(value).unwrap()
+}
+
+fn run_id(value: &str) -> RunId {
+    RunId::try_from(value).unwrap()
 }
 
 #[test]
@@ -66,6 +75,59 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
     assert_eq!(
         serde_json::from_value::<LocalResponse>(value).unwrap(),
         response
+    );
+}
+
+#[test]
+fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
+    let create = LocalRequest::CreateAgent {
+        id: agent_id("agent-1"),
+        project_id: project_id("project-1"),
+        parent_agent_id: Some(agent_id("agent-parent")),
+        role: AgentRole::Worker,
+    };
+    let start = LocalRequest::StartTask {
+        project_id: project_id("project-1"),
+        task_id: task_id("task-1"),
+        agent_id: agent_id("agent-1"),
+        parent_run_id: Some(run_id("run-parent")),
+        worktree: "/work/dark-factory-agent-1".into(),
+    };
+    let created = LocalResponse::AgentCreated {
+        agent: AgentSnapshot {
+            id: agent_id("agent-1"),
+            project_id: project_id("project-1"),
+            parent_agent_id: Some(agent_id("agent-parent")),
+            role: AgentRole::Worker,
+            provider: Provider::Codex,
+            current_run_id: None,
+            created_at_ms: 10,
+            updated_at_ms: 10,
+        },
+    };
+    let accepted = LocalResponse::RunAccepted {
+        run_id: run_id("run-1"),
+    };
+
+    let create = serde_json::to_value(create).unwrap();
+    assert_eq!(create["type"], "create_agent");
+    assert_eq!(create["data"]["role"], "worker");
+    assert!(create["data"].get("provider").is_none());
+
+    let start = serde_json::to_value(start).unwrap();
+    assert_eq!(start["type"], "start_task");
+    assert_eq!(start["data"]["task_id"], "task-1");
+    assert_eq!(start["data"]["worktree"], "/work/dark-factory-agent-1");
+    assert!(start["data"].get("body").is_none());
+    assert!(start["data"].get("provider_session_id").is_none());
+
+    assert_eq!(
+        serde_json::to_value(created).unwrap()["type"],
+        "agent_created"
+    );
+    assert_eq!(
+        serde_json::to_value(accepted).unwrap(),
+        serde_json::json!({"type":"run_accepted","data":{"run_id":"run-1"}})
     );
 }
 

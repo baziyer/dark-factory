@@ -1,4 +1,4 @@
-use std::{future::Future, path::Path};
+use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
     FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
@@ -8,6 +8,7 @@ use factory_core::{
     },
 };
 use factoryd::{
+    execution,
     local_api::{ApiState, serve},
     store::Store,
 };
@@ -61,11 +62,14 @@ where
     Fut: Future<Output = ()>,
 {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, async {
+    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
         let _ = shutdown_rx.await;
     }));
 
@@ -73,6 +77,20 @@ where
 
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+fn execution_config(directory: &Path) -> execution::Config {
+    execution::Config {
+        runner_program: directory.join("missing-factory-runner"),
+        codex_program: directory.join("missing-codex"),
+        runtime_root: directory.join("runs"),
+        max_active_runs: 1,
+        startup_timeout: std::time::Duration::from_secs(1),
+        connect_grace: std::time::Duration::from_secs(1),
+        batch_delay: std::time::Duration::from_millis(25),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -311,11 +329,14 @@ async fn the_frame_limit_counts_json_but_not_the_newline_delimiter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_closes_idle_connections_before_returning() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, async {
+    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
         let _ = shutdown_rx.await;
     }));
     let _idle = UnixStream::connect(&socket).await.unwrap();
@@ -326,11 +347,14 @@ async fn shutdown_closes_idle_connections_before_returning() {
         .expect("server should cancel and drain idle handlers")
         .unwrap()
         .unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_a_blocked_historical_replay() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -347,8 +371,10 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
             .unwrap();
     }
     let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, async {
+    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
         let _ = shutdown_rx.await;
     }));
     let mut observer = UnixStream::connect(&socket).await.unwrap();
@@ -361,6 +387,8 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
         .expect("shutdown must cancel a blocked observer replay")
         .unwrap()
         .unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

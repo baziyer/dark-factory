@@ -9,7 +9,7 @@ use std::{
 };
 
 use factory_core::{
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, TaskDetail, TaskId,
+    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, TaskDetail, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_PROJECT_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, RequestEnvelope,
@@ -28,7 +28,8 @@ pub use crate::daemon_state::DaemonState as ApiState;
 
 use crate::{
     daemon_state::DaemonStateError,
-    store::{NewProject, NewTask, StoreError},
+    execution::{self, StartCodex},
+    store::{NewAgent, NewProject, NewTask, StoreError},
 };
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
@@ -38,6 +39,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug)]
 enum ApiFailure {
     Invalid(String),
+    Conflict(String),
     Store(StoreError),
     Internal(String),
 }
@@ -57,6 +59,7 @@ impl ApiFailure {
     fn into_response(self) -> LocalResponse {
         let (code, message) = match self {
             Self::Invalid(message) => (ErrorCode::InvalidRequest, message),
+            Self::Conflict(message) => (ErrorCode::Conflict, message),
             Self::Store(StoreError::InvalidEventLimit) => (
                 ErrorCode::InvalidRequest,
                 "event limit is outside the supported range".into(),
@@ -64,6 +67,30 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidStateLimit) => (
                 ErrorCode::InvalidRequest,
                 "state page limit is outside the supported range".into(),
+            ),
+            Self::Store(StoreError::AgentNotFound) => (
+                ErrorCode::NotFound,
+                "agent was not found in the project".into(),
+            ),
+            Self::Store(StoreError::TaskNotQueued) => (
+                ErrorCode::Conflict,
+                "task is not queued in the project".into(),
+            ),
+            Self::Store(StoreError::AgentProviderMismatch) => (
+                ErrorCode::Conflict,
+                "agent is not available for Codex execution".into(),
+            ),
+            Self::Store(StoreError::AgentUnavailable) => (
+                ErrorCode::Conflict,
+                "agent already has an active run".into(),
+            ),
+            Self::Store(StoreError::ParentRunLineageMismatch) => (
+                ErrorCode::Conflict,
+                "parent run does not match the agent hierarchy".into(),
+            ),
+            Self::Store(StoreError::CapacityReached { .. }) => (
+                ErrorCode::Conflict,
+                "active execution capacity has been reached".into(),
             ),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -75,7 +102,34 @@ impl ApiFailure {
     }
 }
 
-pub async fn serve<F>(listener: UnixListener, state: ApiState, shutdown: F) -> io::Result<()>
+impl From<execution::Error> for ApiFailure {
+    fn from(error: execution::Error) -> Self {
+        match error {
+            execution::Error::InvalidWorktree | execution::Error::NonUtf8Path => {
+                Self::Invalid("task worktree must be an existing UTF-8 directory".into())
+            }
+            execution::Error::StartBackpressure => {
+                Self::Conflict("too many execution starts are in progress".into())
+            }
+            execution::Error::State(DaemonStateError::Store(
+                error @ (StoreError::AgentNotFound
+                | StoreError::AgentProviderMismatch
+                | StoreError::TaskNotQueued
+                | StoreError::AgentUnavailable
+                | StoreError::ParentRunLineageMismatch
+                | StoreError::CapacityReached { .. }),
+            )) => Self::Store(error),
+            _ => Self::Internal("execution manager could not accept the task".into()),
+        }
+    }
+}
+
+pub async fn serve<F>(
+    listener: UnixListener,
+    state: ApiState,
+    execution: execution::Handle,
+    shutdown: F,
+) -> io::Result<()>
 where
     F: Future<Output = ()>,
 {
@@ -99,10 +153,13 @@ where
                     }
                 };
                 let state = state.clone();
+                let execution = execution.clone();
                 let shutdown = stop_rx.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_connection(stream, state, shutdown).await {
+                    if let Err(error) =
+                        handle_connection(stream, state, execution, shutdown).await
+                    {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
                 });
@@ -127,6 +184,7 @@ where
 async fn handle_connection(
     stream: UnixStream,
     state: ApiState,
+    execution: execution::Handle,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -199,7 +257,7 @@ async fn handle_connection(
         };
     }
 
-    let response = handle_request(&state, envelope.request)
+    let response = handle_request(&state, &execution, envelope.request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
@@ -207,6 +265,7 @@ async fn handle_connection(
 
 async fn handle_request(
     state: &ApiState,
+    execution: &execution::Handle,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
@@ -265,6 +324,49 @@ async fn handle_request(
                 })
                 .await?;
             Ok(LocalResponse::TaskCreated { task })
+        }
+        LocalRequest::CreateAgent {
+            id,
+            project_id,
+            parent_agent_id,
+            role,
+        } => {
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.create_agent(
+                        NewAgent {
+                            id,
+                            project_id,
+                            parent_agent_id,
+                            role,
+                            provider: Provider::Codex,
+                        },
+                        now_ms()?,
+                    )?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentCreated { agent })
+        }
+        LocalRequest::StartTask {
+            project_id,
+            task_id,
+            agent_id,
+            parent_run_id,
+            worktree,
+        } => {
+            let started = execution
+                .start_codex(StartCodex {
+                    project_id,
+                    task_id,
+                    agent_id,
+                    parent_run_id,
+                    worktree: PathBuf::from(worktree),
+                })
+                .await?;
+            Ok(LocalResponse::RunAccepted {
+                run_id: started.run_id,
+            })
         }
         LocalRequest::ListTasks {
             project_id,
@@ -530,7 +632,9 @@ fn is_constraint_error(error: &StoreError) -> bool {
 
 fn api_failure_to_io(error: ApiFailure) -> io::Error {
     io::Error::other(match error {
-        ApiFailure::Invalid(message) | ApiFailure::Internal(message) => message,
+        ApiFailure::Invalid(message)
+        | ApiFailure::Conflict(message)
+        | ApiFailure::Internal(message) => message,
         ApiFailure::Store(error) => error.to_string(),
     })
 }
