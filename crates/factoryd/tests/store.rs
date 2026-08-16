@@ -1,5 +1,7 @@
-use factory_core::{ProjectId, TaskId};
-use factoryd::store::{NewProject, NewTask, Store};
+use factory_core::{
+    AgentId, AgentRole, ProjectId, Provider, RunId, RunnerInstanceId, TaskId, TaskStatus,
+};
+use factoryd::store::{NewAgent, NewProject, NewTask, RunReservation, Store};
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
@@ -228,4 +230,105 @@ fn list_pages_use_a_stable_id_cursor() {
         .list_tasks(&project_id("project-a"), Some(&task_id("task-b")), 2)
         .unwrap();
     assert_eq!(tasks[0].snapshot.id, task_id("task-c"));
+}
+
+#[test]
+fn failed_tasks_can_be_requeued_without_losing_assignment_or_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let mut store = Store::open(&database).unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Retry me".into(),
+                body: "Try again".into(),
+                priority: 0,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: AgentId::try_from("god").unwrap(),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Codex,
+            },
+            3,
+        )
+        .unwrap();
+    let reservation = RunReservation {
+        project_id: project_id("factory"),
+        task_id: task_id("task-1"),
+        agent_id: AgentId::try_from("god").unwrap(),
+        expected_provider: Provider::Codex,
+        run_id: RunId::try_from("run-1").unwrap(),
+        parent_run_id: None,
+        worktree: "/work/factory".into(),
+        fresh_provider_session_id: None,
+        runner_instance_id: RunnerInstanceId::try_from("instance-1").unwrap(),
+        runner_runtime: "/private/runners/run-1".into(),
+    };
+    store.reserve_task_run(reservation, 1, 4).unwrap();
+    store
+        .fail_run_launch(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-1").unwrap(),
+            5,
+        )
+        .unwrap();
+
+    let (task, event) = store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 6)
+        .unwrap();
+    assert_eq!(task.snapshot.status, TaskStatus::Queued);
+    assert_eq!(
+        task.snapshot.assigned_agent_id,
+        Some(AgentId::try_from("god").unwrap())
+    );
+    assert_eq!(task.result, None);
+    assert!(matches!(
+        event.event,
+        factory_core::FactoryEvent::TaskChanged { .. }
+    ));
+    let snapshot = store
+        .webhook_snapshot(
+            &project_id("factory"),
+            &AgentId::try_from("god").unwrap(),
+            7,
+        )
+        .unwrap();
+    assert_eq!(snapshot.tasks[0].started_at_ms, None);
+    assert_eq!(snapshot.tasks[0].completed_at_ms, None);
+    assert_eq!(store.events_after(0, 100).unwrap().len(), 10);
+    drop(store);
+
+    let reopened = Store::open(&database).unwrap();
+    let snapshot = reopened
+        .webhook_snapshot(
+            &project_id("factory"),
+            &AgentId::try_from("god").unwrap(),
+            8,
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot.tasks[0].status,
+        factoryd::store::OperationalTaskStatus::Todo
+    );
+    assert_eq!(snapshot.tasks[0].started_at_ms, None);
 }

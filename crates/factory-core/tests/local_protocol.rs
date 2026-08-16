@@ -329,6 +329,44 @@ fn collection_requests_and_responses_have_stable_cursors() {
 }
 
 #[test]
+fn retry_task_has_a_small_versioned_local_shape() {
+    let request = LocalRequest::RetryTask {
+        project_id: project_id("factory"),
+        task_id: task_id("task-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        serde_json::json!({
+            "type": "retry_task",
+            "data": {"project_id": "factory", "task_id": "task-1"}
+        })
+    );
+
+    let response = LocalResponse::TaskRetried {
+        task: TaskDetail {
+            snapshot: TaskSnapshot {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: None,
+                title: "Retry".into(),
+                status: TaskStatus::Queued,
+                priority: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            body: "body".into(),
+            result: None,
+        },
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "task_retried");
+    let decoded = serde_json::from_value::<LocalResponse>(value).unwrap();
+    assert_eq!(decoded, response);
+}
+
+#[test]
 fn the_largest_valid_task_page_fits_one_local_frame() {
     let tasks = (0..10)
         .map(|index| TaskDetail {

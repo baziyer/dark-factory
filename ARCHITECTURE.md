@@ -87,6 +87,6 @@ have both restarted without stopping or misidentifying it.
   owner-configured endpoint profiles with distinct secrets and projects.
 - Repository visibility is private during early operation; making it public is
   a separate product decision.
-- Pause/retry and durable stop intent remain deferred; the current stop control
-  is an explicit direct request to the exact live runner from the local control
-  plane.
+- Pause and durable stop intent remain deferred; retry is an explicit requeue of
+  a terminal task, while the current stop control is a direct request to the
+  exact live runner from the local control plane.

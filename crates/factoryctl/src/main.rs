@@ -12,6 +12,22 @@ mod ui;
 
 const USAGE: &str =
     "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|events> ...";
+const HELP: &str = "Dark Factory local control plane
+
+Run the daemon separately (launchd keeps it alive), then run `factoryctl ui` in a persistent terminal.
+
+Commands:
+  ui                                  Open the native control plane
+  health                              Check the daemon
+  project add|list                    Manage projects
+  task add|list|start|retry           Manage and run tasks
+  agent add|list                      Manage agents
+  run list                            List process attempts
+  events [--follow]                   Read durable events
+
+Options:
+  --socket PATH                      Use an explicit local socket
+  -h, --help                         Show this help";
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
@@ -20,6 +36,7 @@ const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
+    Help,
     Ui,
     Health,
     Usage,
@@ -51,6 +68,10 @@ enum CliCommand {
         agent_id: String,
         parent_run_id: Option<String>,
         worktree: String,
+    },
+    TaskRetry {
+        project_id: String,
+        task_id: String,
     },
     AgentAdd {
         id: Option<String>,
@@ -90,6 +111,10 @@ fn main() {
 
 fn run() -> Result<i32, String> {
     let (explicit_socket, command) = parse_args(env::args().skip(1).collect())?;
+    if matches!(command, CliCommand::Help) {
+        println!("{HELP}");
+        return Ok(0);
+    }
     let environment_socket = env::var("DARK_FACTORY_SOCKET").ok();
     let factory_home = env::var("DARK_FACTORY_HOME").ok();
     let home = env::var("HOME").ok();
@@ -157,6 +182,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
 
     let command = args.remove(0);
     match command.as_str() {
+        "help" | "-h" | "--help" if args.is_empty() => Ok((socket, CliCommand::Help)),
         "health" => {
             require_empty(&args)?;
             Ok((socket, CliCommand::Health))
@@ -166,6 +192,9 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             Ok((socket, CliCommand::Usage))
         }
         "ui" => {
+            if args == ["--help"] || args == ["-h"] {
+                return Ok((socket, CliCommand::Help));
+            }
             require_empty(&args)?;
             Ok((socket, CliCommand::Ui))
         }
@@ -245,6 +274,15 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 agent_id,
                 parent_run_id,
                 worktree,
+            })
+        }
+        "retry" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskRetry {
+                project_id,
+                task_id,
             })
         }
         _ => Err(format!("unknown task action {action:?}")),
@@ -333,6 +371,7 @@ fn parse_events(mut args: Vec<String>) -> Result<CliCommand, String> {
 
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
+        CliCommand::Help => Err("help is not a daemon request".into()),
         CliCommand::Ui => Err("ui is handled before local requests".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Usage => Ok(LocalRequest::SubscriptionUsage),
@@ -393,6 +432,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .map(|id| parse_id(id, "parent run"))
                 .transpose()?,
             worktree,
+        }),
+        CliCommand::TaskRetry {
+            project_id,
+            task_id,
+        } => Ok(LocalRequest::RetryTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
         }),
         CliCommand::AgentAdd {
             id,
@@ -598,6 +644,22 @@ mod tests {
             PathBuf::from("/home/.dark-factory/f.sock")
         );
         assert!(resolve_socket_path(None, None, None, None).is_err());
+    }
+
+    #[test]
+    fn help_is_available_without_a_daemon_connection() {
+        assert_eq!(
+            parse_args(args(&["--help"])).unwrap(),
+            (None, CliCommand::Help)
+        );
+        assert_eq!(
+            parse_args(args(&["help"])).unwrap(),
+            (None, CliCommand::Help)
+        );
+        assert_eq!(
+            parse_args(args(&["ui", "--help"])).unwrap(),
+            (None, CliCommand::Help)
+        );
     }
 
     #[test]
