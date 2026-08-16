@@ -1,6 +1,6 @@
 use factory_core::{
-    AgentId, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId, RunId, RunSnapshot,
-    RunStatus, TaskId, TaskStatus,
+    AgentId, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId, RunFailureReason, RunId,
+    RunSnapshot, RunStatus, TaskId, TaskStatus,
 };
 
 fn id<T>(value: &str) -> T
@@ -30,6 +30,26 @@ fn all_run_status_values_have_stable_wire_names() {
 }
 
 #[test]
+fn all_run_failure_reasons_have_stable_wire_names() {
+    assert_eq!(PROTOCOL_VERSION, 1);
+
+    let cases = [
+        (RunFailureReason::Protocol, "protocol"),
+        (RunFailureReason::Provider, "provider"),
+        (RunFailureReason::Permission, "permission"),
+        (RunFailureReason::Limit, "limit"),
+        (RunFailureReason::Process, "process"),
+        (RunFailureReason::Spawn, "spawn"),
+        (RunFailureReason::Incomplete, "incomplete"),
+        (RunFailureReason::Unverifiable, "unverifiable"),
+    ];
+
+    for (reason, expected) in cases {
+        assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+    }
+}
+
+#[test]
 fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
     let envelope = EventEnvelope {
         protocol_version: PROTOCOL_VERSION,
@@ -38,6 +58,7 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
         event: FactoryEvent::RunChanged {
             run: RunSnapshot {
                 id: id::<RunId>("run-7"),
+                project_id: id::<ProjectId>("project-1"),
                 agent_id: id::<AgentId>("worker-2"),
                 parent_run_id: Some(id::<RunId>("run-1")),
                 task_id: Some(id::<TaskId>("task-3")),
@@ -50,6 +71,8 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
                 updated_at_ms: 1_723_000_010_000,
                 ended_at_ms: None,
                 exit_code: None,
+                exit_signal: None,
+                failure_reason: None,
             },
         },
     };
@@ -63,9 +86,16 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
     assert_eq!(value["sequence"], 42);
     assert_eq!(value["event"]["type"], "run_changed");
     assert_eq!(value["event"]["data"]["run"]["parent_run_id"], "run-1");
+    assert_eq!(value["event"]["data"]["run"]["project_id"], "project-1");
     assert_eq!(value["event"]["data"]["run"]["status"], "waiting");
     assert!(value["event"]["data"]["run"].get("ended_at_ms").is_none());
     assert!(value["event"]["data"]["run"].get("exit_code").is_none());
+    assert!(value["event"]["data"]["run"].get("exit_signal").is_none());
+    assert!(
+        value["event"]["data"]["run"]
+            .get("failure_reason")
+            .is_none()
+    );
 }
 
 #[test]

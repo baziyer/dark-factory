@@ -22,7 +22,9 @@ This file records constraints, not an aspirational component catalogue.
    run ID and a random runner-instance ID, retain terminal state until its exact
    sequence is acknowledged, and never adopt or signal from PID coincidence
    alone. A graceful runner signal stops the group but preserves an unacknowledged
-   spool for diagnosis and recovery.
+   spool for diagnosis and recovery. After a daemon restart, adapter state is
+   rebuilt by replaying that spool from sequence zero; SQLite's committed runner
+   sequence is only the deduplication boundary for durable state and events.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,

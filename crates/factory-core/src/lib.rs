@@ -134,6 +134,20 @@ impl RunStatus {
     }
 }
 
+/// A durable, privacy-safe category for a failed run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailureReason {
+    Protocol,
+    Provider,
+    Permission,
+    Limit,
+    Process,
+    Spawn,
+    Incomplete,
+    Unverifiable,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -205,6 +219,7 @@ pub struct AgentSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunSnapshot {
     pub id: RunId,
+    pub project_id: ProjectId,
     pub agent_id: AgentId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<RunId>,
@@ -223,6 +238,10 @@ pub struct RunSnapshot {
     pub ended_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<RunFailureReason>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
