@@ -166,6 +166,12 @@ pub enum LocalRequest {
         project_id: ProjectId,
         task_id: TaskId,
     },
+    AssignTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
+    },
     GetRunTerminal {
         project_id: ProjectId,
         run_id: RunId,
@@ -229,6 +235,9 @@ pub enum LocalResponse {
         task: TaskDetail,
     },
     TaskRetried {
+        task: TaskDetail,
+    },
+    TaskAssigned {
         task: TaskDetail,
     },
     RunTerminal {

@@ -2048,6 +2048,57 @@ impl Store {
         ))
     }
 
+    pub fn assign_task(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: Option<&AgentId>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_task(&transaction, task_id)?
+            .filter(|task| task.snapshot.project_id == *project_id)
+            .ok_or(StoreError::TaskNotFound)?;
+        if task.snapshot.status != TaskStatus::Queued {
+            return Err(StoreError::TaskNotQueued);
+        }
+        if let Some(agent_id) = agent_id {
+            let exists = load_agent(&transaction, agent_id)?
+                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
+            if !exists {
+                return Err(StoreError::AgentNotFound);
+            }
+        }
+        transaction.execute(
+            "UPDATE tasks
+             SET assigned_agent_id = ?1, updated_at_ms = ?2
+             WHERE id = ?3 AND project_id = ?4 AND status = 'queued'",
+            params![
+                agent_id.map(AgentId::as_str),
+                now_ms,
+                task_id.as_str(),
+                project_id.as_str(),
+            ],
+        )?;
+        let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
+        let event = FactoryEvent::TaskChanged {
+            task: task.snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
     pub fn list_agents(
         &self,
         project_id: &ProjectId,
