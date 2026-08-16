@@ -1,0 +1,18 @@
+{"type":"thread.started","thread_id":"0195d40a-1111-7000-8000-000000000001","future":"ignored"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_reasoning","type":"reasoning","text":"PRIVATE_REASONING"}}
+{"type":"item.completed","item":{"id":"item_reasoning","type":"reasoning","text":"PRIVATE_REASONING"}}
+{"type":"item.started","item":{"id":"item_command","type":"command_execution","command":"printf COMMAND_SECRET","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.updated","item":{"id":"item_command","type":"command_execution","command":"printf COMMAND_SECRET","aggregated_output":"OUTPUT_SECRET","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_command","type":"command_execution","command":"printf COMMAND_SECRET","aggregated_output":"OUTPUT_SECRET","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_file","type":"file_change","changes":[{"path":"/private/FILE_SECRET","kind":"update"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_mcp","type":"mcp_tool_call","server":"private-server","tool":"private-tool","arguments":{"token":"MCP_SECRET"},"result":{"content":"MCP_RESULT_SECRET"},"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_search","type":"web_search","query":"SEARCH_SECRET","status":"completed"}}
+{"type":"item.completed","item":{"id":"item_todo","type":"todo_list","items":[{"text":"TODO_SECRET","completed":false}]}}
+{"type":"item.started","item":{"id":"item_collab","type":"collab_tool_call","tool":"wait","sender_thread_id":"0195d40a-2222-7000-8000-000000000002","receiver_thread_ids":[],"prompt":"COLLAB_SECRET","agents_states":{},"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_collab","type":"collab_tool_call","tool":"wait","sender_thread_id":"0195d40a-2222-7000-8000-000000000002","receiver_thread_ids":[],"prompt":"COLLAB_SECRET","agents_states":{},"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_error","type":"error","message":"ITEM_ERROR_SECRET","status":"failed"}}
+{"type":"item.completed","item":{"id":"item_future","type":"future_item","private":"UNKNOWN_ITEM_SECRET"}}
+{"type":"item.completed","item":{"id":"item_message","type":"agent_message","text":"Adapter ready 🏭"}}
+{"type":"future.event","private":"UNKNOWN_SECRET"}
+{"type":"turn.completed","usage":{"input_tokens":101,"cached_input_tokens":23,"cache_write_input_tokens":7,"output_tokens":11,"reasoning_output_tokens":5},"future":"ignored"}

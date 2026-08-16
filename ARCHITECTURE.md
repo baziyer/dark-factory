@@ -24,8 +24,10 @@ This file records constraints, not an aspirational component catalogue.
    alone. A graceful runner signal stops the group but preserves an unacknowledged
    spool for diagnosis and recovery.
 5. Provider adapters translate structured provider output into the shared
-   protocol. A PTY is an adapter-specific last resort, never the system's state
-   model.
+   protocol. Persisted observations contain only bounded, privacy-safe summaries;
+   raw reasoning, tool inputs, command output, and patches remain transient
+   runner data. A PTY is an adapter-specific last resort, never the system's
+   state model.
 6. The local control and event API uses a private Unix socket by default. A
    subscription captures a durable replay head and marks when it has caught up.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
