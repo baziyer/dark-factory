@@ -692,16 +692,29 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         scripts(directory.path());
         executable(
             &directory.path().join("provider-probe"),
-            "#!/bin/sh\nsleep 0.2\nprintf survived > \"$TMPDIR/survived\"\ncat >/dev/null\n",
+            "#!/bin/sh\nprintf ready > \"$TMPDIR/ready\"\nwhile [ ! -e \"$TMPDIR/release\" ]; do sleep 0.01; done\nprintf survived > \"$TMPDIR/survived\"\n",
         );
         let captured = probe_environment(directory.path(), directory.path());
-        let child = spawn_runner_with_environment(spec(directory.path(), Vec::new()), captured)
+        let mut child = spawn_runner_with_environment(spec(directory.path(), Vec::new()), captured)
             .await
             .unwrap();
+
+        let ready = directory.path().join("ready");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if !ready.exists() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            panic!("provider did not reach the pre-drop barrier");
+        }
         drop(child);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        fs::write(directory.path().join("release"), b"").unwrap();
 
         let marker = directory.path().join("survived");
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while !marker.exists() && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

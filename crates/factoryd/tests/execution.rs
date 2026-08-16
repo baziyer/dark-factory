@@ -829,23 +829,29 @@ async fn startup_input_timeout_kills_the_unready_wrapper_and_allows_shutdown() {
             break;
         }
     }
-    assert!(
-        shutdown.is_finished(),
-        "a wedged startup-input transfer blocked daemon shutdown"
-    );
-    shutdown.await.unwrap().unwrap();
+    tokio::time::resume();
+    timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("a wedged startup-input transfer blocked daemon shutdown")
+        .unwrap()
+        .unwrap();
     join.await.unwrap().unwrap();
     let raw_pid = fs::read_to_string(&scripted.runner_pid)
         .unwrap()
         .parse::<i32>()
         .unwrap();
     let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
-    if rustix::process::test_kill_process(pid).is_ok() {
+    let was_alive_after_shutdown = rustix::process::test_kill_process(pid).is_ok();
+    if was_alive_after_shutdown {
         fs::write(&scripted.release, b"").unwrap();
         wait_for_path(&scripted.input_received).await;
         fs::write(&scripted.exit, b"").unwrap();
         wait_for_path(&scripted.done).await;
     }
+    assert!(
+        !was_alive_after_shutdown,
+        "startup timeout did not kill and reap the unready wrapper"
+    );
     assert!(rustix::process::test_kill_process(pid).is_err());
     let events = fixture
         .state
@@ -1690,7 +1696,12 @@ async fn invalid_endpoint_after_terminal_ack_failure_is_not_absence_proof() {
         reader.get_mut().write_all(b"\n").await.unwrap();
         let _ = invalid_tx.send(());
         let mut eof = String::new();
-        reader.read_line(&mut eof).await.unwrap();
+        match reader.read_line(&mut eof).await {
+            Ok(0) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(bytes) => panic!("subscription peer sent {bytes} unexpected bytes"),
+            Err(error) => panic!("subscription close failed: {error}"),
+        }
     });
 
     let (handle, join) = execution::spawn(
@@ -2057,7 +2068,7 @@ async fn fixed_start_attempt_bound_returns_backpressure_without_waiting_for_stor
     stop(handle, join).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn reconnect_replays_duplicate_prefix_into_fresh_decoder_then_acks_exact_terminal() {
     let fixture = RecoveryFixture::active(true);
     let socket = fixture.runtime_dir.join("control.sock");
@@ -2206,27 +2217,35 @@ async fn reconnect_replays_duplicate_prefix_into_fresh_decoder_then_acks_exact_t
         fixture.state.clone(),
     )
     .unwrap();
-    first_replay_rx.await.unwrap();
+    timeout(Duration::from_secs(5), first_replay_rx)
+        .await
+        .expect("initial replay subscription timed out")
+        .unwrap();
     let run_id = fixture.run_id.clone();
-    loop {
-        let run_id = run_id.clone();
-        let committed = fixture
-            .state
-            .with_store(move |store| {
-                Ok(store
-                    .execution_target(&run_id)?
-                    .last_committed_runner_sequence)
-            })
-            .await
-            .unwrap();
-        if committed == 2 {
-            break;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let run_id = run_id.clone();
+            let committed = fixture
+                .state
+                .with_store(move |store| {
+                    Ok(store
+                        .execution_target(&run_id)?
+                        .last_committed_runner_sequence)
+                })
+                .await
+                .unwrap();
+            if committed == 2 {
+                break;
+            }
+            yield_now().await;
         }
-        yield_now().await;
-    }
-    settle().await;
-    advance_and_settle(Duration::from_millis(250)).await;
-    let requests = server.await.unwrap();
+    })
+    .await
+    .expect("initial replay prefix did not commit");
+    let requests = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("reconnect and exact terminal acknowledgement timed out")
+        .unwrap();
     settle().await;
 
     assert_eq!(
