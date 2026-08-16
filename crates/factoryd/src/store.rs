@@ -1,4 +1,7 @@
-use std::{path::Path, time::Duration};
+use std::{
+    path::{Component, Path},
+    time::Duration,
+};
 
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth,
@@ -10,8 +13,9 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -42,6 +46,32 @@ pub struct NewAgent {
     pub parent_agent_id: Option<AgentId>,
     pub role: AgentRole,
     pub provider: Provider,
+}
+
+/// Exact private provider context imported with an existing agent.
+///
+/// This deliberately has no `Debug` or `Clone` implementation because all
+/// fields are private execution metadata.
+pub enum AdoptedProviderSession {
+    ClaudeCode {
+        session_id: String,
+        cwd: String,
+    },
+    Codex {
+        thread_id: String,
+        cwd: String,
+        codex_home: Option<String>,
+    },
+}
+
+/// The minimal private pre-reservation identity required by execution.
+///
+/// The actual provider session identity remains inside the store until an
+/// execution target has been atomically reserved. This type deliberately has
+/// no `Debug` implementation.
+pub struct AgentExecutionIdentity {
+    pub provider: Provider,
+    pub has_provider_session: bool,
 }
 
 /// Private launch metadata for reserving one explicit queued task.
@@ -76,6 +106,7 @@ pub struct ExecutionTarget {
     pub task_body: String,
     pub worktree: String,
     pub provider_session_id: Option<String>,
+    pub codex_home: Option<String>,
     pub resumes_provider_session: bool,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_protocol_version: u16,
@@ -226,6 +257,10 @@ pub enum StoreError {
     InvalidSessionConfirmation,
     #[error("provider session identity conflicts with durable ownership")]
     ProviderSessionConflict,
+    #[error("adopted provider session does not match the agent provider")]
+    InvalidProviderSessionAdoption,
+    #[error("reserved worktree does not match the adopted provider session")]
+    ProviderSessionCwdMismatch,
     #[error("terminal runner events require a normalized outcome")]
     TerminalOutcomeRequired,
     #[error("non-terminal runner events cannot carry a terminal outcome")]
@@ -372,6 +407,31 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        self.insert_agent(input, None, now_ms)
+    }
+
+    /// Atomically creates an agent already bound to one exact provider
+    /// session. Private provider metadata is stored only on the agent row and
+    /// is intentionally absent from the returned public snapshot and event.
+    pub fn adopt_agent(
+        &mut self,
+        input: NewAgent,
+        session: AdoptedProviderSession,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        let session = adopted_session_context(session)?;
+        if input.provider != session.provider {
+            return Err(StoreError::InvalidProviderSessionAdoption);
+        }
+        self.insert_agent(input, Some(session), now_ms)
+    }
+
+    fn insert_agent(
+        &mut self,
+        input: NewAgent,
+        session: Option<AgentSessionContext>,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
         let agent = AgentSnapshot {
             id: input.id,
             project_id: input.project_id,
@@ -388,17 +448,36 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(session) = session.as_ref() {
+            let already_owned: bool = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM agents
+                    WHERE provider = ?1 AND provider_session_id = ?2
+                 )",
+                params![provider_value(session.provider), session.session_id],
+                |row| row.get(0),
+            )?;
+            if already_owned {
+                return Err(StoreError::ProviderSessionConflict);
+            }
+        }
         transaction.execute(
             "INSERT INTO agents (
                 id, project_id, parent_agent_id, role, provider,
-                provider_session_id, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7)",
+                provider_session_id, provider_session_cwd, codex_home,
+                created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent.id.as_str(),
                 agent.project_id.as_str(),
                 agent.parent_agent_id.as_ref().map(AgentId::as_str),
                 agent_role_value(agent.role),
                 provider_value(agent.provider),
+                session.as_ref().map(|session| session.session_id.as_str()),
+                session.as_ref().map(|session| session.cwd.as_str()),
+                session
+                    .as_ref()
+                    .and_then(|session| session.codex_home.as_deref()),
                 agent.created_at_ms,
                 agent.updated_at_ms,
             ],
@@ -414,6 +493,20 @@ impl Store {
                 event,
             },
         ))
+    }
+
+    pub fn agent_execution_identity(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<AgentExecutionIdentity> {
+        let agent = load_agent(&self.connection, agent_id)?
+            .filter(|agent| &agent.snapshot.project_id == project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        Ok(AgentExecutionIdentity {
+            provider: agent.snapshot.provider,
+            has_provider_session: agent.provider_session_id.is_some(),
+        })
     }
 
     /// Atomically assigns one explicit queued task to one idle agent.
@@ -473,9 +566,22 @@ impl Store {
                 if input.fresh_provider_session_id.is_some() {
                     return Err(StoreError::ProviderSessionConflict);
                 }
+                let established_cwd = agent_record
+                    .provider_session_cwd
+                    .as_deref()
+                    .ok_or(StoreError::InvalidExecutionMetadata)?;
+                if established_cwd != input.worktree {
+                    return Err(StoreError::ProviderSessionCwdMismatch);
+                }
                 (Some(established), true)
             }
-            None => (input.fresh_provider_session_id, false),
+            None => {
+                if agent_record.provider_session_cwd.is_some() || agent_record.codex_home.is_some()
+                {
+                    return Err(StoreError::InvalidExecutionMetadata);
+                }
+                (input.fresh_provider_session_id, false)
+            }
         };
         transaction.execute(
             "INSERT INTO runs (
@@ -1252,9 +1358,45 @@ fn ingest_runner_event_in_transaction(
     })
 }
 
+struct AgentSessionContext {
+    provider: Provider,
+    session_id: String,
+    cwd: String,
+    codex_home: Option<String>,
+}
+
+fn adopted_session_context(session: AdoptedProviderSession) -> Result<AgentSessionContext> {
+    let context = match session {
+        AdoptedProviderSession::ClaudeCode { session_id, cwd } => AgentSessionContext {
+            provider: Provider::ClaudeCode,
+            session_id,
+            cwd,
+            codex_home: None,
+        },
+        AdoptedProviderSession::Codex {
+            thread_id,
+            cwd,
+            codex_home,
+        } => AgentSessionContext {
+            provider: Provider::Codex,
+            session_id: thread_id,
+            cwd,
+            codex_home,
+        },
+    };
+    validate_canonical_provider_session(&context.session_id)?;
+    validate_canonical_absolute_path(&context.cwd)?;
+    if let Some(codex_home) = context.codex_home.as_deref() {
+        validate_canonical_absolute_path(codex_home)?;
+    }
+    Ok(context)
+}
+
 struct AgentRecord {
     snapshot: AgentSnapshot,
     provider_session_id: Option<String>,
+    provider_session_cwd: Option<String>,
+    codex_home: Option<String>,
 }
 
 struct RunLedger {
@@ -1404,9 +1546,14 @@ fn confirm_provider_session(
     )?;
     transaction.execute(
         "UPDATE agents
-         SET provider_session_id = COALESCE(provider_session_id, ?1)
-         WHERE id = ?2",
-        params![session_id, ledger.snapshot.agent_id.as_str()],
+         SET provider_session_id = COALESCE(provider_session_id, ?1),
+             provider_session_cwd = COALESCE(provider_session_cwd, ?2)
+         WHERE id = ?3",
+        params![
+            session_id,
+            ledger.snapshot.worktree,
+            ledger.snapshot.agent_id.as_str()
+        ],
     )?;
     Ok(())
 }
@@ -1527,7 +1674,8 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
     connection
         .query_row(
             "SELECT a.id, a.project_id, a.parent_agent_id, a.role, a.provider,
-                    a.provider_session_id, a.created_at_ms, a.updated_at_ms,
+                    a.provider_session_id, a.provider_session_cwd, a.codex_home,
+                    a.created_at_ms, a.updated_at_ms,
                     (SELECT r.id FROM runs r
                      WHERE r.agent_id = a.id
                        AND r.ended_at_ms IS NULL
@@ -1539,7 +1687,7 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
                 let parent_agent_id: Option<String> = row.get(2)?;
                 let role: String = row.get(3)?;
                 let provider: String = row.get(4)?;
-                let current_run_id: Option<String> = row.get(8)?;
+                let current_run_id: Option<String> = row.get(10)?;
                 Ok(AgentRecord {
                     snapshot: AgentSnapshot {
                         id: parse_id(row.get(0)?, 0)?,
@@ -1547,11 +1695,13 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
                         parent_agent_id: parse_optional_id(parent_agent_id, 2)?,
                         role: parse_agent_role(&role, 3)?,
                         provider: parse_provider(&provider, 4)?,
-                        current_run_id: parse_optional_id(current_run_id, 8)?,
-                        created_at_ms: row.get(6)?,
-                        updated_at_ms: row.get(7)?,
+                        current_run_id: parse_optional_id(current_run_id, 10)?,
+                        created_at_ms: row.get(8)?,
+                        updated_at_ms: row.get(9)?,
                     },
                     provider_session_id: row.get(5)?,
+                    provider_session_cwd: row.get(6)?,
+                    codex_home: row.get(7)?,
                 })
             },
         )
@@ -1639,7 +1789,7 @@ fn load_execution_target(
     connection
         .query_row(
             "SELECT a.provider, p.root, t.body, r.worktree, r.provider_session_id,
-                    r.resumes_provider_session, r.runner_instance_id,
+                    a.codex_home, r.resumes_provider_session, r.runner_instance_id,
                     r.runner_protocol_version, r.runner_runtime,
                     r.last_runner_sequence
              FROM runs r
@@ -1650,20 +1800,21 @@ fn load_execution_target(
             params![run_id.as_str()],
             |row| {
                 let provider: String = row.get(0)?;
-                let protocol: i64 = row.get(7)?;
+                let protocol: i64 = row.get(8)?;
                 Ok(ExecutionTarget {
                     provider: parse_provider(&provider, 0)?,
                     project_root: row.get(1)?,
                     task_body: row.get(2)?,
                     worktree: row.get(3)?,
                     provider_session_id: row.get(4)?,
-                    resumes_provider_session: row.get(5)?,
-                    runner_instance_id: parse_id(row.get(6)?, 6)?,
+                    codex_home: row.get(5)?,
+                    resumes_provider_session: row.get(6)?,
+                    runner_instance_id: parse_id(row.get(7)?, 7)?,
                     runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+                        rusqlite::Error::FromSqlConversionFailure(8, Type::Integer, Box::new(error))
                     })?,
-                    runner_runtime: row.get(8)?,
-                    last_committed_runner_sequence: row.get(9)?,
+                    runner_runtime: row.get(9)?,
+                    last_committed_runner_sequence: row.get(10)?,
                 })
             },
         )
@@ -1743,6 +1894,15 @@ fn validate_provider_session(value: Option<&str>) -> Result<()> {
     }
 }
 
+fn validate_canonical_provider_session(value: &str) -> Result<()> {
+    validate_provider_session(Some(value))?;
+    let parsed = Uuid::parse_str(value).map_err(|_| StoreError::InvalidExecutionMetadata)?;
+    if parsed.hyphenated().to_string() != value {
+        return Err(StoreError::InvalidExecutionMetadata);
+    }
+    Ok(())
+}
+
 fn validate_absolute_path(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > MAX_PATH_BYTES
@@ -1753,6 +1913,22 @@ fn validate_absolute_path(value: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn validate_canonical_absolute_path(value: &str) -> Result<()> {
+    validate_absolute_path(value)?;
+    let mut components = Path::new(value).components();
+    if !matches!(components.next(), Some(Component::RootDir))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+        || value.chars().any(char::is_control)
+        || value
+            .split('/')
+            .skip(1)
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        return Err(StoreError::InvalidExecutionMetadata);
+    }
+    Ok(())
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -1791,6 +1967,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0004_observer_health.sql"))?;
         transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
+        current = 4;
+    }
+    if current == 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0005_provider_session_context.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 5)?;
         transaction.commit()?;
     }
     Ok(())

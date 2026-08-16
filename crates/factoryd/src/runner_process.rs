@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -32,11 +32,28 @@ pub struct LaunchSpec {
     /// Non-secret provider flags. These are observable in process metadata and
     /// must never contain task content, credentials, or tokens.
     pub provider_arguments: Vec<OsString>,
+    /// Closed provider-specific environment additions. Ambient values are
+    /// never forwarded implicitly.
+    pub provider_environment: ProviderEnvironment,
     pub run_id: RunId,
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
     pub startup_input: Vec<u8>,
+}
+
+/// The only provider-specific environment additions allowed across the
+/// daemon-to-runner boundary.
+///
+/// This deliberately has no `Debug` or `Clone` implementation because an
+/// explicit provider home is private process metadata.
+pub enum ProviderEnvironment {
+    /// Use only the daemon's small, fixed environment allowlist.
+    Inherited,
+    /// Use one explicitly selected Codex home for authentication and session
+    /// storage. The path must already identify a canonical directory owned by
+    /// the effective user and not writable by group or other users.
+    CodexHome(PathBuf),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +81,8 @@ pub enum Error {
     StartupInput(std::io::Error),
     #[error("factory-runner did not consume startup input before the deadline")]
     StartupInputTimedOut,
+    #[error("provider environment is invalid")]
+    InvalidProviderEnvironment,
 }
 
 struct StartupChild {
@@ -126,12 +145,13 @@ impl CapturedEnvironment {
 /// Starts one stable runner after checking its trusted absolute path and
 /// resolving the provider to a canonical executable file.
 ///
-/// Only `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, `TMPDIR`, `LANG`, `LC_ALL`,
-/// and `LC_CTYPE` cross the daemon boundary when present. The child also gets
-/// fixed non-interactive values for `NO_COLOR`, `TERM`, and
-/// `GIT_TERMINAL_PROMPT`. Task bytes are bounded by
-/// [`MAX_STARTUP_STDIN_BYTES`], written only to the runner's piped stdin, and
-/// the pipe is closed before this function returns.
+/// Ambient environment is restricted to `HOME`, `USER`, `LOGNAME`, `SHELL`,
+/// `PATH`, `TMPDIR`, `LANG`, `LC_ALL`, and `LC_CTYPE` when present. A validated
+/// explicit `CODEX_HOME` is the only provider-specific addition. The child
+/// also gets fixed non-interactive values for `NO_COLOR`, `TERM`, and
+/// `GIT_TERMINAL_PROMPT`. Task bytes are bounded by [`MAX_STARTUP_STDIN_BYTES`],
+/// written only to the runner's piped stdin, and the pipe is closed before this
+/// function returns.
 ///
 /// The returned child retains Tokio's default no-kill-on-drop behavior. Its
 /// caller owns subsequent observation and reaping; dropping it must not stop an
@@ -139,12 +159,13 @@ impl CapturedEnvironment {
 ///
 /// # Errors
 ///
-/// Returns an error before spawning when task bytes are oversized or either
-/// executable is missing or unusable. A spawn or startup-input write failure is
-/// also returned; a spawned child is explicitly killed and reaped after a write
-/// failure or timeout. Cancellation synchronously kills a child that has not
-/// yet received its complete input; the stable runner cannot have launched the
-/// provider at that point.
+/// Returns an error before spawning when task bytes are oversized, either
+/// executable is missing or unusable, or the explicit provider environment is
+/// invalid. A spawn or startup-input write failure is also returned; a spawned
+/// child is explicitly killed and reaped after a write failure or timeout.
+/// Cancellation synchronously kills a child that has not yet received its
+/// complete input; the stable runner cannot have launched the provider at that
+/// point.
 pub async fn spawn_runner(spec: LaunchSpec, startup_timeout: Duration) -> Result<Child, Error> {
     spawn_runner_with_environment_and_timeout(
         spec,
@@ -181,6 +202,7 @@ async fn spawn_runner_with_environment_and_timeout(
     }
     let runner = checked_executable(&spec.runner_program, "runner")?;
     let provider = resolve_executable(&spec.provider_program, &environment, "provider")?;
+    let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
     let input_length = spec.startup_input.len().to_string();
     let mut command = Command::new(runner);
     command
@@ -199,6 +221,7 @@ async fn spawn_runner_with_environment_and_timeout(
         .args(spec.provider_arguments)
         .stdin(Stdio::piped());
     apply_runner_environment(&mut command, &environment);
+    apply_provider_environment(&mut command, provider_environment.as_deref());
 
     let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
     let mut stdin = child
@@ -237,6 +260,39 @@ fn apply_runner_environment(command: &mut Command, environment: &CapturedEnviron
         .env("NO_COLOR", "1")
         .env("TERM", "dumb")
         .env("GIT_TERMINAL_PROMPT", "0");
+}
+
+fn apply_provider_environment(command: &mut Command, codex_home: Option<&Path>) {
+    if let Some(codex_home) = codex_home {
+        command.env("CODEX_HOME", codex_home);
+    }
+}
+
+fn resolve_provider_environment(
+    environment: &ProviderEnvironment,
+) -> Result<Option<PathBuf>, Error> {
+    match environment {
+        ProviderEnvironment::Inherited => Ok(None),
+        ProviderEnvironment::CodexHome(home) => {
+            let metadata =
+                fs::symlink_metadata(home).map_err(|_| Error::InvalidProviderEnvironment)?;
+            let canonical =
+                fs::canonicalize(home).map_err(|_| Error::InvalidProviderEnvironment)?;
+            if canonical != *home
+                || metadata.file_type().is_symlink()
+                || !is_owned_directory(&metadata, rustix::process::geteuid().as_raw())
+            {
+                return Err(Error::InvalidProviderEnvironment);
+            }
+            Ok(Some(canonical))
+        }
+    }
+}
+
+fn is_owned_directory(metadata: &fs::Metadata, expected_uid: u32) -> bool {
+    metadata.is_dir()
+        && metadata.uid() == expected_uid
+        && metadata.permissions().mode() & 0o022 == 0
 }
 
 fn resolve_executable(
@@ -320,9 +376,9 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        CapturedEnvironment, LaunchSpec, SAFE_ENVIRONMENT_NAMES, apply_runner_environment,
-        resolve_executable, spawn_runner_with_environment,
-        spawn_runner_with_environment_and_timeout,
+        CapturedEnvironment, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
+        apply_runner_environment, is_owned_directory, resolve_executable,
+        spawn_runner_with_environment, spawn_runner_with_environment_and_timeout,
     };
 
     fn id<T>(value: &str) -> T
@@ -346,6 +402,7 @@ mod tests {
             "OPENAI_API_KEY" => Some(OsString::from("openai-secret-sentinel")),
             "ANTHROPIC_API_KEY" => Some(OsString::from("anthropic-secret-sentinel")),
             "CODEX_ACCESS_TOKEN" => Some(OsString::from("codex-secret-sentinel")),
+            "CODEX_HOME" => Some(OsString::from("/ambient/codex-home-secret")),
             "CLAUDE_CODE_OAUTH_TOKEN" => Some(OsString::from("claude-secret-sentinel")),
             "GOOGLE_API_KEY" => Some(OsString::from("google-secret-sentinel")),
             "VERCEL_TOKEN" => Some(OsString::from("vercel-secret-sentinel")),
@@ -404,6 +461,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             runner_program: directory.join("runner-probe"),
             provider_program: PathBuf::from("provider-probe"),
             provider_arguments: vec![OsString::from("--safe-provider-flag")],
+            provider_environment: ProviderEnvironment::Inherited,
             run_id: id::<RunId>("run-safe-launch"),
             runner_instance_id: id::<RunnerInstanceId>("runner-safe-launch"),
             runtime_dir: directory.join("runtime"),
@@ -428,6 +486,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             .env("OPENAI_API_KEY", "openai-secret-sentinel")
             .env("ANTHROPIC_API_KEY", "anthropic-secret-sentinel")
             .env("CODEX_ACCESS_TOKEN", "codex-secret-sentinel")
+            .env("CODEX_HOME", "/ambient/codex-home-secret")
             .env("CLAUDE_CODE_OAUTH_TOKEN", "claude-secret-sentinel")
             .env("GOOGLE_API_KEY", "google-secret-sentinel")
             .env("VERCEL_TOKEN", "vercel-secret-sentinel")
@@ -463,6 +522,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(!output.contains("OPENAI_API_KEY"));
         assert!(!output.contains("ANTHROPIC_API_KEY"));
         assert!(!output.contains("CODEX_ACCESS_TOKEN"));
+        assert!(!output.contains("CODEX_HOME"));
         assert!(!output.contains("CLAUDE_CODE_OAUTH_TOKEN"));
         assert!(!output.contains("openai-secret-sentinel"));
         assert!(!output.contains("anthropic-secret-sentinel"));
@@ -480,6 +540,74 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             !output.contains("LOGNAME="),
             "missing safe names stay absent"
         );
+    }
+
+    #[tokio::test]
+    async fn explicit_codex_home_is_canonical_owned_and_replaces_ambient_value() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let home = directory.path().join("codex-home");
+        fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o755)).unwrap();
+        let home = fs::canonicalize(home).unwrap();
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.provider_environment = ProviderEnvironment::CodexHome(home.clone());
+
+        let mut child = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let provider_env = fs::read_to_string(directory.path().join("provider-env")).unwrap();
+        let expected = format!("CODEX_HOME={}", home.display());
+        assert!(provider_env.lines().any(|line| line == expected));
+        assert!(!provider_env.contains("/ambient/codex-home-secret"));
+    }
+
+    #[tokio::test]
+    async fn invalid_codex_home_fails_closed_before_spawn_and_is_redacted() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let missing = directory.path().join("PRIVATE_MISSING_HOME_SECRET");
+        let home = directory.path().join("PRIVATE_REAL_HOME_SECRET");
+        fs::create_dir(&home).unwrap();
+        let alias = directory.path().join("PRIVATE_SYMLINK_HOME_SECRET");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let noncanonical = home.join("..").join("PRIVATE_REAL_HOME_SECRET");
+        let writable = directory.path().join("PRIVATE_WRITABLE_HOME_SECRET");
+        fs::create_dir(&writable).unwrap();
+        fs::set_permissions(&writable, fs::Permissions::from_mode(0o777)).unwrap();
+        let not_directory = directory.path().join("PRIVATE_FILE_HOME_SECRET");
+        fs::write(&not_directory, b"not a home").unwrap();
+
+        for rejected in [missing, alias, noncanonical, writable, not_directory] {
+            let captured = probe_environment(directory.path(), directory.path());
+            let mut launch = spec(directory.path(), b"PRIVATE_TASK_SECRET".to_vec());
+            launch.provider_environment = ProviderEnvironment::CodexHome(rejected.clone());
+            let error = spawn_runner_with_environment(launch, captured)
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("provider environment"));
+            assert!(!message.contains(rejected.to_string_lossy().as_ref()));
+            assert!(!message.contains("PRIVATE_"));
+            assert!(!directory.path().join("runner-argv").exists());
+        }
+    }
+
+    #[test]
+    fn codex_home_must_be_owned_by_the_effective_user() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let metadata = fs::metadata(directory.path()).unwrap();
+        let effective_uid = rustix::process::geteuid().as_raw();
+
+        assert!(is_owned_directory(&metadata, effective_uid));
+        assert!(!is_owned_directory(
+            &metadata,
+            effective_uid.wrapping_add(1)
+        ));
     }
 
     #[tokio::test]
@@ -505,6 +633,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         for observed in [&runner_argv, &provider_argv, &provider_env] {
             assert!(!observed.windows(12).any(|bytes| bytes == b"private task"));
         }
+        assert!(!provider_env.windows(10).any(|bytes| bytes == b"CODEX_HOME"));
         let runner_argv = String::from_utf8(runner_argv).unwrap();
         assert!(runner_argv.contains("--stdin-bytes\n39\n"));
         assert!(runner_argv.contains("--run-id\nrun-safe-launch\n"));

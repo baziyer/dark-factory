@@ -39,6 +39,13 @@ This file records constraints, not an aspirational component catalogue.
    advertised head, and `degraded` means supervision was lost without proof
    that the runner stopped. Only healthy observation makes a missing endpoint
    authoritative after restart; degraded work remains assigned and recoverable.
+   An adopted provider session is inseparable from its exact canonical
+   worktree. Codex may additionally bind an explicit, canonical, same-owner
+   `CODEX_HOME`; it is injected through a closed provider-environment type after
+   the ambient environment is cleared. Resume never falls back to a fresh
+   session or a different worktree/home. Claude identities are captured by the
+   same private store contract; executable Claude continuation lands before the
+   one-time Munder cutover.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,

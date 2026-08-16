@@ -9,7 +9,7 @@ use factory_core::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::runner_process::LaunchSpec;
+use crate::runner_process::{LaunchSpec, ProviderEnvironment};
 
 pub const MAX_CODEX_JSON_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_CODEX_PREVIEW_BYTES: usize = 4 * 1024;
@@ -25,6 +25,9 @@ pub struct CodexLaunch {
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    /// An exact imported Codex home, or `None` for the existing sanitized
+    /// `HOME` default used by newly allocated agents.
+    pub codex_home: Option<PathBuf>,
     pub instructions: String,
     pub session: Session,
 }
@@ -51,6 +54,8 @@ pub struct PreparedCodex {
 ///
 /// Instructions are returned only as bounded runner stdin. Provider arguments
 /// are fixed, non-secret process metadata; the caller cannot inject flags.
+/// User configuration is disabled while authentication and session state may
+/// still use an explicit Codex home.
 ///
 /// # Errors
 ///
@@ -66,6 +71,7 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
         "workspace-write",
         "-c",
         "approval_policy=\"never\"",
+        "--ignore-user-config",
     ]
     .map(OsString::from)
     .to_vec();
@@ -86,6 +92,10 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
             runner_program: input.runner_program,
             provider_program: input.codex_program,
             provider_arguments: arguments,
+            provider_environment: input.codex_home.map_or(
+                ProviderEnvironment::Inherited,
+                ProviderEnvironment::CodexHome,
+            ),
             run_id: input.run_id,
             runner_instance_id: input.runner_instance_id,
             runtime_dir: input.runtime_dir,

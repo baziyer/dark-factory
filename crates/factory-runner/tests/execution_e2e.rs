@@ -6,7 +6,7 @@ use factory_core::{
 use factoryd::{
     daemon_state::DaemonState,
     execution::{self, Config, StartCodex},
-    store::{NewAgent, NewProject, NewTask, Store},
+    store::{AdoptedProviderSession, NewAgent, NewProject, NewTask, Store},
 };
 use tokio::{task::yield_now, time::timeout};
 
@@ -21,23 +21,30 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
+async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("factory.db");
     let project_root = directory.path().join("project");
     fs::create_dir(&project_root).unwrap();
     fs::set_permissions(&project_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let project_root = fs::canonicalize(project_root).unwrap();
     let runtime_root = directory.path().join("runs");
     fs::create_dir(&runtime_root).unwrap();
     fs::set_permissions(&runtime_root, fs::Permissions::from_mode(0o700)).unwrap();
     let provider_input = directory.path().join("provider-input.txt");
     let provider_arguments = directory.path().join("provider-arguments.txt");
+    let provider_home = directory.path().join("provider-home.txt");
+    let codex_home = directory.path().join("codex-home");
+    fs::create_dir(&codex_home).unwrap();
+    fs::set_permissions(&codex_home, fs::Permissions::from_mode(0o755)).unwrap();
+    let codex_home = fs::canonicalize(codex_home).unwrap();
     let provider = directory.path().join("fake-codex");
     let thread_started = format!("{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD_ID}\"}}");
     let provider_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}' '{}'\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$CODEX_HOME\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}' '{}'\n",
         provider_arguments.display(),
+        provider_home.display(),
         provider_input.display(),
         thread_started,
         "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}",
@@ -73,13 +80,18 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
         )
         .unwrap();
     store
-        .create_agent(
+        .adopt_agent(
             NewAgent {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+            },
+            AdoptedProviderSession::Codex {
+                thread_id: THREAD_ID.into(),
+                cwd: project_root.to_str().unwrap().into(),
+                codex_home: Some(codex_home.to_str().unwrap().into()),
             },
             3,
         )
@@ -153,10 +165,17 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
             "workspace-write",
             "-c",
             "approval_policy=\"never\"",
+            "--ignore-user-config",
+            "resume",
+            THREAD_ID,
             "-",
         ]
     );
     assert!(!arguments.contains("real runner private task"));
+    assert_eq!(
+        fs::read_to_string(&provider_home).unwrap(),
+        codex_home.to_str().unwrap()
+    );
 
     let run_id = started.run_id.clone();
     let (events, target) = state
@@ -215,6 +234,7 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
     for private in [
         "real runner private task",
         THREAD_ID,
+        codex_home.to_str().unwrap(),
         target.runner_instance_id.as_str(),
         target.runner_runtime.as_str(),
     ] {

@@ -168,7 +168,7 @@ fn no_effects() -> RunnerEventEffects {
 }
 
 #[test]
-fn migrates_v1_to_v4_without_losing_state_or_event_head() {
+fn migrates_v1_to_v5_without_losing_state_or_event_head() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("factory.db");
     {
@@ -231,7 +231,7 @@ fn migrates_v1_to_v4_without_losing_state_or_event_head() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     connection
         .execute_batch("PRAGMA foreign_keys = ON")
         .unwrap();
