@@ -162,6 +162,10 @@ pub enum LocalRequest {
         project_id: ProjectId,
         task_id: TaskId,
     },
+    RetryTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
     GetRunTerminal {
         project_id: ProjectId,
         run_id: RunId,
@@ -222,6 +226,9 @@ pub enum LocalResponse {
         task: TaskDetail,
     },
     Task {
+        task: TaskDetail,
+    },
+    TaskRetried {
         task: TaskDetail,
     },
     RunTerminal {

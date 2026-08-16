@@ -435,6 +435,8 @@ pub enum StoreError {
     AgentProviderMismatch,
     #[error("task is not queued in the requested project")]
     TaskNotQueued,
+    #[error("task is not retryable in the requested project")]
+    TaskNotRetryable,
     #[error("only an idle same-project agent can reserve a task")]
     AgentUnavailable,
     #[error("parent run does not match the agent parent and project")]
@@ -1998,6 +2000,52 @@ impl Store {
             return Err(StoreError::TaskNotFound);
         }
         Ok(task)
+    }
+
+    pub fn retry_task(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_task(&transaction, task_id)?
+            .filter(|task| task.snapshot.project_id == *project_id)
+            .ok_or(StoreError::TaskNotFound)?;
+        if !matches!(
+            task.snapshot.status,
+            TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            return Err(StoreError::TaskNotRetryable);
+        }
+        let changed = transaction.execute(
+            "UPDATE tasks
+             SET status = 'queued', result = NULL, started_at_ms = NULL,
+                 completed_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND project_id = ?3
+               AND status IN ('failed', 'cancelled')",
+            params![now_ms, task_id.as_str(), project_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::TaskNotRetryable);
+        }
+        let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
+        let event = FactoryEvent::TaskChanged {
+            task: task.snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
     }
 
     pub fn list_agents(

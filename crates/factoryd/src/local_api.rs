@@ -104,6 +104,10 @@ impl ApiFailure {
                 ErrorCode::Conflict,
                 "task is not queued in the project".into(),
             ),
+            Self::Store(StoreError::TaskNotRetryable) => (
+                ErrorCode::Conflict,
+                "task is not retryable in the project".into(),
+            ),
             Self::Store(StoreError::AgentProviderMismatch) => (
                 ErrorCode::Conflict,
                 "agent provider does not match the requested execution".into(),
@@ -439,6 +443,18 @@ async fn handle_request(
                 .with_store(move |store| store.get_task(&project_id, &task_id))
                 .await?;
             Ok(LocalResponse::Task { task })
+        }
+        LocalRequest::RetryTask {
+            project_id,
+            task_id,
+        } => {
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) = store.retry_task(&project_id, &task_id, now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskRetried { task })
         }
         LocalRequest::GetRunTerminal { project_id, run_id } => {
             let lookup_run_id = run_id.clone();

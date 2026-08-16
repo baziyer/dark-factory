@@ -62,6 +62,12 @@ cargo run -p factoryctl -- events --follow
 cargo run -p factoryctl -- ui
 ```
 
+For the installed local release, use `./scripts/launch-ui.sh`. It checks the
+release binary and daemon first, then keeps the native UI attached to the
+current terminal. Leave that terminal open while using the UI; `Ctrl-C` closes
+the observer only. `factoryd` is a separate launchd service and survives UI or
+CLI shutdown.
+
 Commands emit versioned JSON frames. `task start` returns `run_accepted` once
 the task reservation is durable; runner readiness and completion arrive as
 events. Both programs use
@@ -122,12 +128,12 @@ V1 is intentionally explicit: create projects, agents, and tasks, then choose
 the agent and worktree for each start. The native UI provides the same control
 surface as the JSON CLI plus project/task/agent/run inspection, bounded local
 runner output and stop control, assignment-derived queues, observer health,
-subscription capacity, and recent durable events.
+subscription capacity, retry for terminal tasks, and recent durable events.
 
 Deferred work is narrow and evidence-led:
 
 - scheduling and dependency-driven allocation;
-- pause/retry controls and durable stop intent;
+- pause controls and durable stop intent;
 - a separate agent function axis (`design`, `execution`, `operations`) shown as
   Studio, Workshop, and Control Room, without changing the authority roles
   `orchestrator` and `worker`;

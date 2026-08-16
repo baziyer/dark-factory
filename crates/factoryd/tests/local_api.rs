@@ -622,3 +622,64 @@ async fn an_unsupported_protocol_cannot_mutate_state() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retry_is_a_local_control_operation_and_does_not_change_queued_tasks() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Queued".into(),
+                    body: "Still queued".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+
+        let retry = request(
+            &socket,
+            LocalRequest::RetryTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            retry,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+    })
+    .await;
+}

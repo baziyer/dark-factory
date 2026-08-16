@@ -10,7 +10,7 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, TaskDetail, TaskId, TaskStatus,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
+        LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
         MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RunTerminal, ServerFrame, SubscriptionSeverity,
         SubscriptionUsageStatus,
     },
@@ -20,7 +20,6 @@ use uuid::Uuid;
 use factoryctl::Client;
 
 const RECENT_EVENT_LIMIT: usize = 100;
-const MAX_LEGACY_DETAIL_PAGES: usize = 16;
 
 pub fn run(client: Client) -> Result<(), String> {
     let options = eframe::NativeOptions {
@@ -46,7 +45,10 @@ enum UiMessage {
     },
     Event(EventEnvelope),
     TaskDetail(Result<TaskDetail, String>),
-    RunTerminal(Result<RunTerminal, String>),
+    RunTerminal {
+        request_id: u64,
+        result: Result<RunTerminal, String>,
+    },
     SubscriptionCaughtUp,
     Operation(Result<String, String>),
     StreamFailed(String),
@@ -76,6 +78,7 @@ struct FactoryApp {
     selected_agent: Option<AgentId>,
     terminal_run_id: Option<RunId>,
     terminal: Option<RunTerminal>,
+    terminal_request_id: u64,
     connection: ConnectionState,
     notice: Option<String>,
     last_event_sequence: Option<i64>,
@@ -141,6 +144,7 @@ impl FactoryApp {
             selected_agent: None,
             terminal_run_id: None,
             terminal: None,
+            terminal_request_id: 0,
             connection: ConnectionState::Loading,
             notice: None,
             last_event_sequence: None,
@@ -219,8 +223,15 @@ impl FactoryApp {
                     }
                     Err(message) => self.notice = Some(message),
                 },
-                UiMessage::RunTerminal(result) => match result {
-                    Ok(terminal) if self.terminal_run_id.as_ref() == Some(&terminal.run_id) => {
+                UiMessage::RunTerminal { request_id, result } => match result {
+                    Ok(terminal)
+                        if should_apply_terminal(
+                            request_id,
+                            self.terminal_request_id,
+                            self.terminal_run_id.as_ref(),
+                            &terminal,
+                        ) =>
+                    {
                         self.terminal = Some(terminal);
                     }
                     Ok(_) => {}
@@ -405,41 +416,58 @@ impl FactoryApp {
                         SubscriptionSeverity::Warning => ("capacity warning", Color32::YELLOW),
                         SubscriptionSeverity::Critical => ("capacity critical", Color32::LIGHT_RED),
                     };
-                    ui.label(RichText::new(label).color(color));
-                    for provider in &usage.providers {
-                        let percent = provider
-                            .used_percent
-                            .map_or_else(|| "unknown".to_owned(), |value| format!("{value}%"));
-                        ui.label(format!("{:?} {percent}", provider.provider));
-                    }
+                    ui.label(RichText::new(label).color(color))
+                        .on_hover_ui(|ui| {
+                            for provider in &usage.providers {
+                                let percent = provider.used_percent.map_or_else(
+                                    || "unknown".to_owned(),
+                                    |value| format!("{value}%"),
+                                );
+                                ui.label(format!("{:?} {percent}", provider.provider));
+                            }
+                        });
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
                         self.refresh(context);
                     }
-                    if ui.button("New task").clicked() && self.selected_project.is_some() {
-                        self.create_task = Some(TaskForm {
-                            id: short_id("task"),
-                            title: String::new(),
-                            body: String::new(),
-                            priority: 0,
-                        });
-                    }
-                    if ui.button("New agent").clicked() && self.selected_project.is_some() {
-                        self.create_agent = Some(AgentForm {
-                            id: short_id("worker"),
-                            parent: String::new(),
-                            role: AgentRole::Worker,
-                            provider: Provider::Codex,
-                        });
-                    }
-                    if ui.button("New project").clicked() {
-                        self.create_project = Some(ProjectForm {
-                            id: short_id("project"),
-                            name: String::new(),
-                            root: String::new(),
-                        });
-                    }
+                    ui.menu_button("New", |ui| {
+                        if ui
+                            .add_enabled(self.selected_project.is_some(), egui::Button::new("Task"))
+                            .clicked()
+                        {
+                            self.create_task = Some(TaskForm {
+                                id: short_id("task"),
+                                title: String::new(),
+                                body: String::new(),
+                                priority: 0,
+                            });
+                            ui.close();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.selected_project.is_some(),
+                                egui::Button::new("Agent"),
+                            )
+                            .clicked()
+                        {
+                            self.create_agent = Some(AgentForm {
+                                id: short_id("worker"),
+                                parent: String::new(),
+                                role: AgentRole::Worker,
+                                provider: Provider::Codex,
+                            });
+                            ui.close();
+                        }
+                        if ui.button("Project").clicked() {
+                            self.create_project = Some(ProjectForm {
+                                id: short_id("project"),
+                                name: String::new(),
+                                root: String::new(),
+                            });
+                            ui.close();
+                        }
+                    });
                 });
             });
             if let Some(notice) = &self.notice {
@@ -458,7 +486,8 @@ impl FactoryApp {
                 for project in self.projects.values() {
                     let selected = self.selected_project.as_ref() == Some(&project.id);
                     if ui
-                        .selectable_label(selected, format!("{}\n{}", project.name, project.id))
+                        .selectable_label(selected, project.name.clone())
+                        .on_hover_text(format!("{}\n{}", project.id, project.root))
                         .clicked()
                     {
                         self.selected_project = Some(project.id.clone());
@@ -511,36 +540,50 @@ impl FactoryApp {
         ui.label(format!("{} · {:?}", task.snapshot.id, task.snapshot.status));
         ui.label(task_assignee_text(task));
         ui.separator();
-        ui.label(RichText::new("Instructions").strong());
-        if task.body.is_empty() {
-            ui.label(RichText::new("Refresh to load private instructions.").italics());
-        } else {
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    ui.label(&task.body);
-                });
-        }
+        ui.collapsing("Instructions", |ui| {
+            if task.body.is_empty() {
+                ui.label(RichText::new("No instructions loaded.").italics());
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.label(&task.body);
+                    });
+            }
+        });
         if let Some(result) = task_result_text(task) {
-            ui.separator();
-            ui.label(RichText::new("Result").strong());
-            egui::ScrollArea::vertical()
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    ui.label(result);
-                });
+            ui.collapsing("Result", |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        ui.label(result);
+                    });
+            });
         }
         if !task.snapshot.depends_on.is_empty() {
-            ui.separator();
-            ui.label(format!(
-                "Depends on: {}",
-                task.snapshot
-                    .depends_on
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            ui.collapsing("Dependencies", |ui| {
+                ui.label(
+                    task.snapshot
+                        .depends_on
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            });
+        }
+        if matches!(
+            task.snapshot.status,
+            TaskStatus::Failed | TaskStatus::Cancelled
+        ) && ui.button("Retry task").clicked()
+        {
+            self.submit(
+                LocalRequest::RetryTask {
+                    project_id: task.snapshot.project_id.clone(),
+                    task_id: task.snapshot.id.clone(),
+                },
+                context,
+            );
         }
         if task.snapshot.status == TaskStatus::Queued {
             ui.separator();
@@ -652,12 +695,14 @@ impl FactoryApp {
         };
         self.terminal_run_id = Some(run_id.clone());
         self.terminal = None;
+        self.terminal_request_id = self.terminal_request_id.saturating_add(1);
         spawn_run_terminal(
             self.client.clone(),
             self.sender.clone(),
             context.clone(),
             project_id,
             run_id,
+            self.terminal_request_id,
         );
     }
 
@@ -712,40 +757,44 @@ impl FactoryApp {
                 });
             ui.separator();
             ui.label(RichText::new("Allocation").strong());
-            ui.label(
-                RichText::new("Explicit starts allocate v1 work; the scheduler remains roadmap.")
+            let unassigned = allocation_counts(&tasks, None);
+            ui.collapsing(format!("Allocation · {} unassigned", unassigned.0), |ui| {
+                ui.label(
+                    RichText::new(
+                        "Operator starts v1 work explicitly; scheduling remains roadmap.",
+                    )
                     .small()
                     .weak(),
-            );
-            for agent in self
-                .project_agents()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-            {
-                let counts = allocation_counts(&tasks, Some(&agent.id));
-                ui.collapsing(
-                    format!("{} · queued {} · active {}", agent.id, counts.0, counts.1),
-                    |ui| {
-                        for task in tasks.iter().filter(|task| {
-                            task.snapshot.assigned_agent_id.as_ref() == Some(&agent.id)
-                                && task.snapshot.status == TaskStatus::Queued
-                        }) {
-                            ui.label(format!("{} · {}", task.snapshot.id, task.snapshot.title));
-                        }
-                        if counts.0 == 0 && counts.1 == 0 {
-                            ui.label(RichText::new("No queued or active work.").italics());
-                        }
-                    },
                 );
-            }
-            let unassigned = allocation_counts(&tasks, None);
-            ui.label(format!(
-                "Operator queue · {} queued · {} active",
-                unassigned.0, unassigned.1
-            ));
+                for agent in self
+                    .project_agents()
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                {
+                    let counts = allocation_counts(&tasks, Some(&agent.id));
+                    ui.collapsing(
+                        format!("{} · queued {} · active {}", agent.id, counts.0, counts.1),
+                        |ui| {
+                            for task in tasks.iter().filter(|task| {
+                                task.snapshot.assigned_agent_id.as_ref() == Some(&agent.id)
+                                    && task.snapshot.status == TaskStatus::Queued
+                            }) {
+                                ui.label(task.snapshot.title.clone());
+                            }
+                            if counts.0 == 0 && counts.1 == 0 {
+                                ui.label(RichText::new("No queued or active work.").italics());
+                            }
+                        },
+                    );
+                }
+                ui.label(format!(
+                    "Operator queue · {} queued · {} active",
+                    unassigned.0, unassigned.1
+                ));
+            });
             ui.separator();
-            ui.label(RichText::new("Tasks").strong());
+            ui.label(RichText::new(format!("Tasks · {}", tasks.len())).strong());
             ui.columns(4, |columns| {
                 for (index, (title, status)) in [
                     ("QUEUED", TaskColumn::Queued),
@@ -795,13 +844,15 @@ impl FactoryApp {
             .default_height(120.0)
             .show(context, |ui| {
                 ui.label(RichText::new("Recent events").strong());
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for event in self.recent.iter().rev().take(20).rev() {
-                            ui.label(RichText::new(event_summary(event)).monospace().small());
-                        }
-                    });
+                ui.collapsing(format!("Activity · {} events", self.recent.len()), |ui| {
+                    egui::ScrollArea::vertical()
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for event in self.recent.iter().rev().take(20).rev() {
+                                ui.label(RichText::new(event_summary(event)).monospace().small());
+                            }
+                        });
+                });
             });
     }
 
@@ -989,13 +1040,7 @@ fn task_assignee_text(task: &TaskDetail) -> String {
 }
 
 fn task_card_text(task: &TaskDetail) -> String {
-    format!(
-        "{}\n{} · p{}\n{}",
-        task.snapshot.title,
-        task.snapshot.id,
-        task.snapshot.priority,
-        task_assignee_text(task)
-    )
+    format!("{}\n{}", task.snapshot.title, task_assignee_text(task))
 }
 
 fn latest_run_for_task<'a>(
@@ -1091,22 +1136,17 @@ fn merge_task_detail(current: &mut TaskDetail, incoming: TaskDetail) {
     }
 }
 
+fn should_apply_terminal(
+    request_id: u64,
+    latest_request_id: u64,
+    selected_run_id: Option<&RunId>,
+    incoming: &RunTerminal,
+) -> bool {
+    request_id == latest_request_id && selected_run_id == Some(&incoming.run_id)
+}
+
 fn snapshot_heads_are_stable(before: Option<i64>, after: Option<i64>) -> bool {
     before == after
-}
-
-fn is_unsupported_optional_request(response: &LocalResponse) -> bool {
-    matches!(
-        response,
-        LocalResponse::Error {
-            code: ErrorCode::InvalidRequest,
-            ..
-        }
-    )
-}
-
-fn legacy_detail_budget_exhausted(pages_read: usize) -> bool {
-    pages_read >= MAX_LEGACY_DETAIL_PAGES
 }
 
 fn short_id(prefix: &str) -> String {
@@ -1204,10 +1244,11 @@ fn spawn_run_terminal(
     context: egui::Context,
     project_id: ProjectId,
     run_id: RunId,
+    request_id: u64,
 ) {
     thread::spawn(move || {
         let result = load_run_terminal(&client, project_id, run_id);
-        let _ = sender.send(UiMessage::RunTerminal(result));
+        let _ = sender.send(UiMessage::RunTerminal { request_id, result });
         context.request_repaint();
     });
 }
@@ -1229,57 +1270,17 @@ fn load_task_detail(
     project_id: ProjectId,
     task_id: TaskId,
 ) -> Result<TaskDetail, String> {
-    let response = request_response_raw(
+    let response = request_response(
         client,
         LocalRequest::GetTask {
             project_id: project_id.clone(),
             task_id: task_id.clone(),
         },
     )?;
-    if is_unsupported_optional_request(&response) {
-        return load_legacy_task_detail(client, project_id, task_id);
-    }
     match response {
         LocalResponse::Task { task } => Ok(task),
-        LocalResponse::Error { message, .. } => Err(message),
         _ => Err("daemon returned an unexpected task detail response".into()),
     }
-}
-
-fn load_legacy_task_detail(
-    client: &Client,
-    project_id: ProjectId,
-    task_id: TaskId,
-) -> Result<TaskDetail, String> {
-    let mut after_id = None;
-    for pages_read in 0..MAX_LEGACY_DETAIL_PAGES {
-        let response = request_response(
-            client,
-            LocalRequest::ListTasks {
-                project_id: project_id.clone(),
-                after_id,
-                limit: MAX_TASK_PAGE_ITEMS,
-            },
-        )?;
-        let LocalResponse::Tasks {
-            tasks,
-            next_after_id,
-        } = response
-        else {
-            return Err("daemon returned an unexpected legacy task response".into());
-        };
-        if let Some(task) = tasks.into_iter().find(|task| task.snapshot.id == task_id) {
-            return Ok(task);
-        }
-        let Some(next) = next_after_id else {
-            return Err("task was not found while hydrating the UI".into());
-        };
-        if legacy_detail_budget_exhausted(pages_read + 1) {
-            return Err("legacy task hydration reached its bounded compatibility window".into());
-        }
-        after_id = Some(next);
-    }
-    Err("legacy task hydration reached its bounded compatibility window".into())
 }
 
 fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
@@ -1355,10 +1356,9 @@ fn load_usage(client: &Client) -> Result<SubscriptionUsageStatus, String> {
 }
 
 fn load_event_sequence(client: &Client) -> Result<Option<i64>, String> {
-    let response = request_response_raw(client, LocalRequest::LatestEventSequence)?;
-    match optional_request_response(response)? {
+    let response = request_response(client, LocalRequest::LatestEventSequence)?;
+    match response {
         LocalResponse::EventHead { sequence } => Ok(Some(sequence)),
-        LocalResponse::Error { .. } => Ok(None),
         _ => Err("daemon returned an unexpected event-head response".into()),
     }
 }
@@ -1480,21 +1480,12 @@ fn request_response_raw(client: &Client, request: LocalRequest) -> Result<LocalR
     }
 }
 
-fn optional_request_response(response: LocalResponse) -> Result<LocalResponse, String> {
-    if is_unsupported_optional_request(&response) {
-        return Ok(response);
-    }
-    match response {
-        LocalResponse::Error { message, .. } => Err(message),
-        response => Ok(response),
-    }
-}
-
 fn operation_message(response: LocalResponse) -> Result<String, String> {
     let message = match response {
         LocalResponse::Health => "Daemon is healthy".to_owned(),
         LocalResponse::ProjectCreated { project } => format!("Created project {}", project.id),
         LocalResponse::TaskCreated { task } => format!("Created task {}", task.snapshot.id),
+        LocalResponse::TaskRetried { task } => format!("Requeued task {}", task.snapshot.id),
         LocalResponse::AgentCreated { agent } => format!("Created agent {}", agent.id),
         LocalResponse::RunAccepted { run_id } => format!("Accepted run {run_id}"),
         LocalResponse::RunStopped { run_id } => format!("Stop requested for run {run_id}"),
@@ -1508,6 +1499,7 @@ mod tests {
     use factory_core::{
         AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth, ProjectId,
         Provider, RunId, RunSnapshot, RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
+        local::RunTerminal,
     };
 
     use super::{
@@ -1594,27 +1586,6 @@ mod tests {
 
         assert!(super::task_event_needs_detail(false, &event));
         assert!(!super::task_event_needs_detail(true, &event));
-    }
-
-    #[test]
-    fn invalid_request_event_head_errors_are_legacy_compatible() {
-        let response = factory_core::local::LocalResponse::Error {
-            code: factory_core::local::ErrorCode::InvalidRequest,
-            message: "unknown request".into(),
-        };
-        assert!(super::is_unsupported_optional_request(&response));
-        assert!(matches!(
-            super::optional_request_response(response),
-            Ok(factory_core::local::LocalResponse::Error {
-                code: factory_core::local::ErrorCode::InvalidRequest,
-                ..
-            })
-        ));
-        assert!(!super::is_unsupported_optional_request(
-            &factory_core::local::LocalResponse::Health
-        ));
-        assert!(!super::legacy_detail_budget_exhausted(0));
-        assert!(super::legacy_detail_budget_exhausted(16));
     }
 
     #[test]
@@ -1785,6 +1756,55 @@ mod tests {
             super::latest_run_for_task([&newer, &older].into_iter(), &project_id, &task_id)
                 .unwrap();
         assert_eq!(selected.id, newer.id);
+    }
+
+    #[test]
+    fn stale_terminal_refreshes_cannot_replace_the_latest_request() {
+        let selected = RunId::try_from("run-1").unwrap();
+        let stale = RunTerminal {
+            run_id: selected.clone(),
+            head_sequence: 7,
+            output: "older".into(),
+            truncated: false,
+        };
+        let other_run = RunTerminal {
+            run_id: RunId::try_from("run-2").unwrap(),
+            ..stale.clone()
+        };
+
+        assert!(!super::should_apply_terminal(1, 2, Some(&selected), &stale));
+        assert!(!super::should_apply_terminal(2, 2, None, &stale));
+        assert!(!super::should_apply_terminal(
+            2,
+            2,
+            Some(&selected),
+            &other_run
+        ));
+        assert!(super::should_apply_terminal(2, 2, Some(&selected), &stale));
+    }
+
+    #[test]
+    fn task_cards_are_compact_and_leave_identifiers_to_the_inspector() {
+        let task = TaskDetail {
+            snapshot: TaskSnapshot {
+                id: factory_core::TaskId::try_from("task-1").unwrap(),
+                project_id: ProjectId::try_from("factory").unwrap(),
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
+                title: "Ship the operator view".into(),
+                status: TaskStatus::Queued,
+                priority: 9,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            body: String::new(),
+            result: None,
+        };
+        let card = super::task_card_text(&task);
+        assert!(card.contains("Ship the operator view"));
+        assert!(card.contains("curie"));
+        assert!(!card.contains("task-1"));
     }
 
     fn test_run(
