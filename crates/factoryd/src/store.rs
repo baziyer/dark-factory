@@ -16,6 +16,7 @@ const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
+pub const MAX_RUNNER_BATCH_EVENTS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewProject {
@@ -104,6 +105,15 @@ pub struct RunnerEventEffects {
     pub terminal_outcome: Option<TerminalOutcome>,
 }
 
+/// One durable runner event and its already-normalized private effects.
+///
+/// This deliberately has no `Debug` or `Clone` implementation because output
+/// events and provider session identities must not enter logs accidentally.
+pub struct RunnerEventInput {
+    pub event: RunnerEventEnvelope,
+    pub effects: RunnerEventEffects,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalOutcome {
     Succeeded,
@@ -177,6 +187,8 @@ pub enum StoreError {
     RunnerProtocolMismatch { expected: u16, found: u16 },
     #[error("runner sequence {0} must be positive")]
     InvalidRunnerSequence(i64),
+    #[error("runner event batch must contain 1-{MAX_RUNNER_BATCH_EVENTS} events")]
+    InvalidRunnerBatchSize,
     #[error("durable runner sequence {0} cannot advance")]
     CorruptRunnerSequence(i64),
     #[error("runner event gap: expected sequence {expected}, found {found}")]
@@ -521,159 +533,67 @@ impl Store {
         effects: RunnerEventEffects,
         now_ms: i64,
     ) -> Result<IngestResult> {
-        if event.sequence <= 0 {
-            return Err(StoreError::InvalidRunnerSequence(event.sequence));
+        self.ingest_runner_events(
+            run_id,
+            runner_instance_id,
+            vec![RunnerEventInput {
+                event: event.clone(),
+                effects,
+            }],
+            now_ms,
+        )
+    }
+
+    /// Commits a bounded contiguous runner replay in one synchronous write.
+    pub fn ingest_runner_events(
+        &mut self,
+        run_id: &RunId,
+        runner_instance_id: &RunnerInstanceId,
+        items: Vec<RunnerEventInput>,
+        now_ms: i64,
+    ) -> Result<IngestResult> {
+        if !(1..=MAX_RUNNER_BATCH_EVENTS).contains(&items.len()) {
+            return Err(StoreError::InvalidRunnerBatchSize);
         }
-        validate_provider_session(effects.confirmed_provider_session_id.as_deref())?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ledger = load_run_ledger(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
-        validate_runner_identity(&ledger, runner_instance_id, event.protocol_version)?;
-
-        if event.sequence <= ledger.last_runner_sequence {
-            validate_duplicate(&ledger, event, &effects)?;
-            return Ok(IngestResult {
-                disposition: IngestDisposition::Duplicate,
-                events: Vec::new(),
-            });
-        }
-        if ledger.terminal_runner_sequence.is_some() || ledger.snapshot.status.is_terminal() {
-            return Err(StoreError::RunnerAlreadyTerminal);
-        }
-        let expected =
-            ledger
-                .last_runner_sequence
-                .checked_add(1)
-                .ok_or(StoreError::CorruptRunnerSequence(
-                    ledger.last_runner_sequence,
-                ))?;
-        if event.sequence != expected {
-            return Err(StoreError::RunnerSequenceGap {
-                expected,
-                found: event.sequence,
-            });
-        }
-
-        let is_provider_stdout = matches!(
-            event.event,
-            RunnerEvent::Output {
-                stream: factory_core::runner::OutputStream::Stdout,
-                ..
+        let mut any_recorded = false;
+        let mut events = Vec::new();
+        let mut previous_sequence: Option<i64> = None;
+        for input in items {
+            if let Some(previous) = previous_sequence {
+                let expected = previous
+                    .checked_add(1)
+                    .ok_or(StoreError::InvalidRunnerSequence(input.event.sequence))?;
+                if input.event.sequence != expected {
+                    return Err(StoreError::RunnerSequenceGap {
+                        expected,
+                        found: input.event.sequence,
+                    });
+                }
             }
-        );
-        if effects.confirmed_provider_session_id.is_some() && !is_provider_stdout {
-            return Err(StoreError::InvalidSessionConfirmation);
-        }
-        let terminal_kind = terminal_kind(&event.event);
-        match (terminal_kind, effects.terminal_outcome) {
-            (Some(_), None) => return Err(StoreError::TerminalOutcomeRequired),
-            (None, Some(_)) => return Err(StoreError::UnexpectedTerminalOutcome),
-            _ => {}
-        }
-        validate_runner_lifecycle(&ledger, &event.event)?;
-        if let Some(session_id) = effects.confirmed_provider_session_id.as_deref() {
-            confirm_provider_session(&transaction, &ledger, session_id, now_ms)?;
-        }
-
-        let Some(kind) = terminal_kind else {
-            let mut events = Vec::new();
-            if matches!(event.event, RunnerEvent::Started { .. }) {
-                transaction.execute(
-                    "UPDATE runs
-                     SET status = 'running', last_runner_sequence = ?1,
-                         status_since_ms = ?2, updated_at_ms = ?3
-                     WHERE id = ?4",
-                    params![event.sequence, now_ms, now_ms, run_id.as_str()],
-                )?;
-                let run = load_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
-                let changed = FactoryEvent::RunChanged { run };
-                let sequence = append_event(&transaction, now_ms, &changed)?;
-                events.push(EventEnvelope {
-                    protocol_version: PROTOCOL_VERSION,
-                    sequence,
-                    occurred_at_ms: now_ms,
-                    event: changed,
-                });
-            } else {
-                transaction.execute(
-                    "UPDATE runs SET last_runner_sequence = ?1 WHERE id = ?2",
-                    params![event.sequence, run_id.as_str()],
-                )?;
+            previous_sequence = Some(input.event.sequence);
+            let result = ingest_runner_event_in_transaction(
+                &transaction,
+                run_id,
+                runner_instance_id,
+                &input.event,
+                &input.effects,
+                now_ms,
+            )?;
+            if result.disposition == IngestDisposition::Recorded {
+                any_recorded = true;
             }
-            transaction.commit()?;
-            return Ok(IngestResult {
-                disposition: IngestDisposition::Recorded,
-                events,
-            });
-        };
-
-        let outcome = effects
-            .terminal_outcome
-            .ok_or(StoreError::TerminalOutcomeRequired)?;
-        let confirmed_session = transaction
-            .query_row(
-                "SELECT provider_session_confirmed_at_ms FROM runs WHERE id = ?1",
-                params![run_id.as_str()],
-                |row| row.get::<_, Option<i64>>(0),
-            )?
-            .is_some();
-        let terminal = validate_terminal_outcome(&event.event, outcome, confirmed_session)?;
-        transaction.execute(
-            "UPDATE runs
-             SET status = ?1, last_runner_sequence = ?2,
-                 terminal_runner_sequence = ?2, runner_terminal_kind = ?3,
-                 status_since_ms = ?4, updated_at_ms = ?4, ended_at_ms = ?4,
-                 exit_code = ?5, exit_signal = ?6, failure_reason = ?7,
-                 activity = NULL, wait_reason = NULL
-             WHERE id = ?8",
-            params![
-                run_status_value(terminal.run_status),
-                event.sequence,
-                kind,
-                now_ms,
-                terminal.exit_code,
-                terminal.exit_signal,
-                terminal.failure_reason.map(failure_reason_value),
-                run_id.as_str(),
-            ],
-        )?;
-        let task_id = ledger
-            .snapshot
-            .task_id
-            .as_ref()
-            .ok_or(StoreError::InvalidRunState)?;
-        let changed = transaction.execute(
-            "UPDATE tasks
-             SET status = ?1, updated_at_ms = ?2
-             WHERE id = ?3 AND project_id = ?4 AND assigned_agent_id = ?5
-               AND status = 'running'",
-            params![
-                task_status_value(terminal.task_status),
-                now_ms,
-                task_id.as_str(),
-                ledger.snapshot.project_id.as_str(),
-                ledger.snapshot.agent_id.as_str(),
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidRunState);
+            events.extend(result.events);
         }
-        transaction.execute(
-            "UPDATE agents SET updated_at_ms = ?1 WHERE id = ?2",
-            params![now_ms, ledger.snapshot.agent_id.as_str()],
-        )?;
-        let task = load_task(&transaction, task_id)?
-            .ok_or(StoreError::InvalidRunState)?
-            .snapshot;
-        let agent = load_agent(&transaction, &ledger.snapshot.agent_id)?
-            .ok_or(StoreError::AgentNotFound)?
-            .snapshot;
-        let run = load_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
-        let events = append_execution_events(&transaction, now_ms, &task, &agent, &run)?;
         transaction.commit()?;
         Ok(IngestResult {
-            disposition: IngestDisposition::Recorded,
+            disposition: if any_recorded {
+                IngestDisposition::Recorded
+            } else {
+                IngestDisposition::Duplicate
+            },
             events,
         })
     }
@@ -977,6 +897,166 @@ impl Store {
                 row.get(0)
             })?)
     }
+}
+
+fn ingest_runner_event_in_transaction(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    runner_instance_id: &RunnerInstanceId,
+    event: &RunnerEventEnvelope,
+    effects: &RunnerEventEffects,
+    now_ms: i64,
+) -> Result<IngestResult> {
+    if event.sequence <= 0 {
+        return Err(StoreError::InvalidRunnerSequence(event.sequence));
+    }
+    validate_provider_session(effects.confirmed_provider_session_id.as_deref())?;
+    let ledger = load_run_ledger(transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+    validate_runner_identity(&ledger, runner_instance_id, event.protocol_version)?;
+
+    if event.sequence <= ledger.last_runner_sequence {
+        validate_duplicate(&ledger, event, effects)?;
+        return Ok(IngestResult {
+            disposition: IngestDisposition::Duplicate,
+            events: Vec::new(),
+        });
+    }
+    if ledger.terminal_runner_sequence.is_some() || ledger.snapshot.status.is_terminal() {
+        return Err(StoreError::RunnerAlreadyTerminal);
+    }
+    let expected =
+        ledger
+            .last_runner_sequence
+            .checked_add(1)
+            .ok_or(StoreError::CorruptRunnerSequence(
+                ledger.last_runner_sequence,
+            ))?;
+    if event.sequence != expected {
+        return Err(StoreError::RunnerSequenceGap {
+            expected,
+            found: event.sequence,
+        });
+    }
+
+    let is_provider_stdout = matches!(
+        event.event,
+        RunnerEvent::Output {
+            stream: factory_core::runner::OutputStream::Stdout,
+            ..
+        }
+    );
+    if effects.confirmed_provider_session_id.is_some() && !is_provider_stdout {
+        return Err(StoreError::InvalidSessionConfirmation);
+    }
+    let terminal_kind = terminal_kind(&event.event);
+    match (terminal_kind, effects.terminal_outcome) {
+        (Some(_), None) => return Err(StoreError::TerminalOutcomeRequired),
+        (None, Some(_)) => return Err(StoreError::UnexpectedTerminalOutcome),
+        _ => {}
+    }
+    validate_runner_lifecycle(&ledger, &event.event)?;
+    if let Some(session_id) = effects.confirmed_provider_session_id.as_deref() {
+        confirm_provider_session(transaction, &ledger, session_id, now_ms)?;
+    }
+
+    let Some(kind) = terminal_kind else {
+        let mut events = Vec::new();
+        if matches!(event.event, RunnerEvent::Started { .. }) {
+            transaction.execute(
+                "UPDATE runs
+                 SET status = 'running', last_runner_sequence = ?1,
+                     status_since_ms = ?2, updated_at_ms = ?3
+                 WHERE id = ?4",
+                params![event.sequence, now_ms, now_ms, run_id.as_str()],
+            )?;
+            let run = load_run(transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+            let changed = FactoryEvent::RunChanged { run };
+            let sequence = append_event(transaction, now_ms, &changed)?;
+            events.push(EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: changed,
+            });
+        } else {
+            transaction.execute(
+                "UPDATE runs SET last_runner_sequence = ?1 WHERE id = ?2",
+                params![event.sequence, run_id.as_str()],
+            )?;
+        }
+        return Ok(IngestResult {
+            disposition: IngestDisposition::Recorded,
+            events,
+        });
+    };
+
+    let outcome = effects
+        .terminal_outcome
+        .ok_or(StoreError::TerminalOutcomeRequired)?;
+    let confirmed_session = transaction
+        .query_row(
+            "SELECT provider_session_confirmed_at_ms FROM runs WHERE id = ?1",
+            params![run_id.as_str()],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .is_some();
+    let terminal = validate_terminal_outcome(&event.event, outcome, confirmed_session)?;
+    transaction.execute(
+        "UPDATE runs
+         SET status = ?1, last_runner_sequence = ?2,
+             terminal_runner_sequence = ?2, runner_terminal_kind = ?3,
+             status_since_ms = ?4, updated_at_ms = ?4, ended_at_ms = ?4,
+             exit_code = ?5, exit_signal = ?6, failure_reason = ?7,
+             activity = NULL, wait_reason = NULL
+         WHERE id = ?8",
+        params![
+            run_status_value(terminal.run_status),
+            event.sequence,
+            kind,
+            now_ms,
+            terminal.exit_code,
+            terminal.exit_signal,
+            terminal.failure_reason.map(failure_reason_value),
+            run_id.as_str(),
+        ],
+    )?;
+    let task_id = ledger
+        .snapshot
+        .task_id
+        .as_ref()
+        .ok_or(StoreError::InvalidRunState)?;
+    let changed = transaction.execute(
+        "UPDATE tasks
+         SET status = ?1, updated_at_ms = ?2
+         WHERE id = ?3 AND project_id = ?4 AND assigned_agent_id = ?5
+           AND status = 'running'",
+        params![
+            task_status_value(terminal.task_status),
+            now_ms,
+            task_id.as_str(),
+            ledger.snapshot.project_id.as_str(),
+            ledger.snapshot.agent_id.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidRunState);
+    }
+    transaction.execute(
+        "UPDATE agents SET updated_at_ms = ?1 WHERE id = ?2",
+        params![now_ms, ledger.snapshot.agent_id.as_str()],
+    )?;
+    let task = load_task(transaction, task_id)?
+        .ok_or(StoreError::InvalidRunState)?
+        .snapshot;
+    let agent = load_agent(transaction, &ledger.snapshot.agent_id)?
+        .ok_or(StoreError::AgentNotFound)?
+        .snapshot;
+    let run = load_run(transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+    let events = append_execution_events(transaction, now_ms, &task, &agent, &run)?;
+    Ok(IngestResult {
+        disposition: IngestDisposition::Recorded,
+        events,
+    })
 }
 
 struct AgentRecord {
