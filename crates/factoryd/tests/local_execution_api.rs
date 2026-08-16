@@ -117,6 +117,84 @@ async fn create_project_and_task(socket: &Path, root: &Path, task_body: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_profile_round_trips_without_changing_public_agent_events() {
+    with_server(|socket, _state| async move {
+        let root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: id::<ProjectId>("project-1"),
+                    name: "Dark Factory".into(),
+                    root: root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: id::<AgentId>("god"),
+                    project_id: id::<ProjectId>("project-1"),
+                    parent_agent_id: None,
+                    role: AgentRole::Orchestrator,
+                    provider: Provider::Codex,
+                    model: Some("gpt-5-codex".into()),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        let updated = request(
+            &socket,
+            LocalRequest::UpdateAgentProfile {
+                project_id: id::<ProjectId>("project-1"),
+                agent_id: id::<AgentId>("god"),
+                model: Some("gpt-5-codex".into()),
+                instructions: "Coordinate the team.".into(),
+                memory: "Keep work bounded.".into(),
+            },
+        )
+        .await;
+        match updated {
+            ServerFrame::Response {
+                response: LocalResponse::AgentProfileUpdated { agent },
+                ..
+            } => {
+                assert_eq!(agent.profile.model.as_deref(), Some("gpt-5-codex"));
+                assert_eq!(agent.profile.instructions, "Coordinate the team.");
+            }
+            other => panic!("unexpected profile response: {other:?}"),
+        }
+        let loaded = request(
+            &socket,
+            LocalRequest::GetAgent {
+                project_id: id::<ProjectId>("project-1"),
+                agent_id: id::<AgentId>("god"),
+            },
+        )
+        .await;
+        match loaded {
+            ServerFrame::Response {
+                response: LocalResponse::Agent { agent },
+                ..
+            } => assert_eq!(agent.profile.memory, "Keep work bounded."),
+            other => panic!("unexpected agent response: {other:?}"),
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_task_list_exposes_a_real_persisted_result() {
     with_server(|socket, state| async move {
         let root = socket.parent().unwrap().join("project");
@@ -130,6 +208,7 @@ async fn local_task_list_exposes_a_real_persisted_result() {
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
@@ -252,6 +331,7 @@ async fn local_run_terminal_reads_private_spool_and_stop_controls_the_exact_runn
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
@@ -408,6 +488,7 @@ async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;
@@ -479,6 +560,7 @@ async fn an_invalid_worktree_is_rejected_without_reserving_the_task_or_echoing_t
                 parent_agent_id: None,
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
+                model: None,
             },
         )
         .await;

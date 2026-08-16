@@ -65,6 +65,9 @@ async fn codex_protocol_uses_only_initialize_initialized_and_rate_limit_read() {
     );
     assert_eq!(usage.resets_at_ms, Some(789_000));
     assert!(!usage.exhausted);
+    assert_eq!(usage.windows.len(), 2);
+    assert_eq!(usage.windows[0].used_percent, 98);
+    assert_eq!(usage.windows[1].used_percent, 96);
 }
 
 #[tokio::test]
@@ -94,6 +97,9 @@ fn claude_screen_reader_parser_normalizes_the_highest_limit() {
     assert_eq!(usage.provider, Provider::ClaudeCode);
     assert_eq!(usage.used_percent, 87);
     assert!(!usage.exhausted);
+    assert_eq!(usage.windows.len(), 2);
+    assert_eq!(usage.windows[0].used_percent, 42);
+    assert_eq!(usage.windows[1].used_percent, 87);
 
     let exhausted = parse_claude_usage(
         b"Current session\n100% used\nResets in 2h\nCurrent week (all models)\n20% used\nResets Aug 18\nlimit reached\n",

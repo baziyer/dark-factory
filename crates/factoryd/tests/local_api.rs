@@ -717,6 +717,7 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     parent_agent_id: None,
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
+                    model: None,
                 },
             )
             .await,
@@ -777,6 +778,93 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                 ..
             } if task.snapshot.assigned_agent_id.is_none()
         ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_messages_round_trip_without_public_events() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("god"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Orchestrator,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+
+        let sent = request(
+            &socket,
+            LocalRequest::SendAgentMessage {
+                id: factory_core::MessageId::try_from("message-1").unwrap(),
+                project_id: project_id("factory"),
+                sender_agent_id: None,
+                recipient_agent_id: agent_id("god"),
+                body: "Please review the queue.".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            sent,
+            ServerFrame::Response {
+                response: LocalResponse::AgentMessageSent { ref message },
+                ..
+            } if message.delivered_at_ms.is_none()
+        ));
+
+        let listed = request(
+            &socket,
+            LocalRequest::ListAgentMessages {
+                project_id: project_id("factory"),
+                agent_id: agent_id("god"),
+                after_id: None,
+                limit: 10,
+            },
+        )
+        .await;
+        assert!(matches!(
+            listed,
+            ServerFrame::Response {
+                response: LocalResponse::AgentMessages { ref messages, .. },
+                ..
+            } if messages.len() == 1 && messages[0].body == "Please review the queue."
+        ));
+
+        assert_eq!(
+            request(&socket, LocalRequest::LatestEventSequence,).await,
+            ServerFrame::Response {
+                protocol_version: PROTOCOL_VERSION,
+                response: LocalResponse::EventHead { sequence: 2 },
+            }
+        );
     })
     .await;
 }

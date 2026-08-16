@@ -55,6 +55,8 @@ cargo run -p factoryctl -- health
 cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
 cargo run -p factoryctl -- project list
 cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator --provider codex
+cargo run -p factoryctl -- agent message --project PROJECT_ID --to AGENT_ID --body "Review the next task"
+cargo run -p factoryctl -- agent inbox --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
 cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
 cargo run -p factoryctl -- usage
@@ -73,7 +75,10 @@ the task reservation is durable; runner readiness and completion arrive as
 events. Both programs use
 `$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
 `$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
-List commands expose `--after` and `--limit` cursors. Event subscriptions emit
+Agent profiles use a provider-scoped model picker, persistent standing guidance,
+and memory. `agent message` and the native inspector use one private durable
+inbox; messages are delivered with the next explicit task start and never enter
+public events. List commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
 
 By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
@@ -130,18 +135,11 @@ surface as the JSON CLI plus project/task/agent/run inspection, bounded local
 runner output and stop control, assignment-derived queues, observer health,
 subscription capacity, retry for terminal tasks, and recent durable events.
 
-Deferred work is narrow and evidence-led:
-
-- scheduling and dependency-driven allocation;
-- pause controls and durable stop intent;
-- a separate agent function axis (`design`, `execution`, `operations`) shown as
-  Studio, Workshop, and Control Room, without changing the authority roles
-  `orchestrator` and `worker`;
-- optional memorable display names drawn from scientists, philosophers,
-  engineers, and artists, never used as IDs or policy;
-- richer event/activity inspection and a first-class blocked-question/document
-  workflow for generic remote clients;
-- public-network webhook deployment and additional wire profiles.
+The unfinished product roadmap is kept in
+[ROADMAP.md](ROADMAP.md). It covers the God command center and agent operations,
+provider-thread/intervention controls, scheduling, richer
+blocked-question/document workflows, function axes, and further external wire
+profiles.
 
 ## Local service
 

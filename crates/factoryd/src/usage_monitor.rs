@@ -28,12 +28,21 @@ const CLEAN_TERM: &str = "xterm-256color";
 const CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NormalizedUsageWindow {
+    pub window: SubscriptionLimitWindow,
+    pub used_percent: u8,
+    pub resets_at_ms: Option<i64>,
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NormalizedUsage {
     pub provider: Provider,
     pub used_percent: u8,
     pub limit_window: SubscriptionLimitWindow,
     pub resets_at_ms: Option<i64>,
     pub exhausted: bool,
+    pub windows: Vec<NormalizedUsageWindow>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -230,12 +239,13 @@ async fn wait_for_response<R: AsyncRead + Unpin>(
 
 fn parse_codex_rate_limits(result: &Value) -> Result<NormalizedUsage, CollectorError> {
     let mut selected: Option<(u8, SubscriptionLimitWindow, Option<i64>)> = None;
+    let mut windows = Vec::new();
     let mut exhausted = false;
     let historical = result
         .get("rateLimits")
         .and_then(Value::as_object)
         .ok_or(CollectorError::Protocol)?;
-    inspect_codex_snapshot(historical, &mut selected, &mut exhausted)?;
+    inspect_codex_snapshot(historical, &mut selected, &mut windows, &mut exhausted)?;
     if let Some(buckets) = result.get("rateLimitsByLimitId") {
         if !buckets.is_null() {
             let buckets = buckets.as_object().ok_or(CollectorError::Protocol)?;
@@ -243,6 +253,7 @@ fn parse_codex_rate_limits(result: &Value) -> Result<NormalizedUsage, CollectorE
                 inspect_codex_snapshot(
                     snapshot.as_object().ok_or(CollectorError::Protocol)?,
                     &mut selected,
+                    &mut windows,
                     &mut exhausted,
                 )?;
             }
@@ -255,17 +266,20 @@ fn parse_codex_rate_limits(result: &Value) -> Result<NormalizedUsage, CollectorE
         limit_window,
         resets_at_ms,
         exhausted,
+        windows: coalesce_usage_windows(windows),
     })
 }
 
 fn inspect_codex_snapshot(
     snapshot: &serde_json::Map<String, Value>,
     selected: &mut Option<(u8, SubscriptionLimitWindow, Option<i64>)>,
+    windows: &mut Vec<NormalizedUsageWindow>,
     exhausted: &mut bool,
 ) -> Result<(), CollectorError> {
-    *exhausted |= snapshot
+    let snapshot_exhausted = snapshot
         .get("rateLimitReachedType")
         .is_some_and(|value| !value.is_null());
+    *exhausted |= snapshot_exhausted;
     for (name, window) in [
         ("primary", SubscriptionLimitWindow::Primary),
         ("secondary", SubscriptionLimitWindow::Secondary),
@@ -294,6 +308,12 @@ fn inspect_codex_snapshot(
                     .ok_or(CollectorError::Protocol)
             })
             .transpose()?;
+        windows.push(NormalizedUsageWindow {
+            window,
+            used_percent: percent,
+            resets_at_ms: reset,
+            exhausted: snapshot_exhausted,
+        });
         if selected
             .as_ref()
             .is_none_or(|(current, _, _)| percent > *current)
@@ -535,8 +555,20 @@ pub fn parse_claude_usage(raw: &[u8]) -> Result<NormalizedUsage, CollectorError>
     }
 
     let mut selected = (session_percent, SubscriptionLimitWindow::CurrentSession);
+    let mut windows = vec![NormalizedUsageWindow {
+        window: SubscriptionLimitWindow::CurrentSession,
+        used_percent: session_percent,
+        resets_at_ms: None,
+        exhausted: session_percent == 100,
+    }];
     for heading in week_headings {
         let percent = parse_claude_usage_block(&lines, heading)?;
+        windows.push(NormalizedUsageWindow {
+            window: SubscriptionLimitWindow::CurrentWeek,
+            used_percent: percent,
+            resets_at_ms: None,
+            exhausted: percent == 100,
+        });
         if percent > selected.0 {
             selected = (percent, SubscriptionLimitWindow::CurrentWeek);
         }
@@ -548,7 +580,27 @@ pub fn parse_claude_usage(raw: &[u8]) -> Result<NormalizedUsage, CollectorError>
         limit_window: selected.1,
         resets_at_ms: None,
         exhausted,
+        windows: coalesce_usage_windows(windows),
     })
+}
+
+fn coalesce_usage_windows(windows: Vec<NormalizedUsageWindow>) -> Vec<NormalizedUsageWindow> {
+    let mut result: Vec<NormalizedUsageWindow> = Vec::with_capacity(windows.len());
+    for window in windows {
+        if let Some(existing) = result
+            .iter_mut()
+            .find(|current| current.window == window.window)
+        {
+            if window.used_percent > existing.used_percent {
+                existing.used_percent = window.used_percent;
+                existing.resets_at_ms = window.resets_at_ms;
+            }
+            existing.exhausted |= window.exhausted;
+        } else {
+            result.push(window);
+        }
+    }
+    result
 }
 
 fn parse_claude_usage_block(lines: &[&str], heading: usize) -> Result<u8, CollectorError> {

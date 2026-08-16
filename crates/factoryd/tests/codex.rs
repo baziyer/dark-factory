@@ -30,6 +30,7 @@ fn launch(session: Session, instructions: &str) -> CodexLaunch {
         runner_instance_id: id::<RunnerInstanceId>("runner-codex-adapter"),
         runtime_dir: PathBuf::from("/private/runtime"),
         cwd: PathBuf::from("/workspace/project"),
+        model: None,
         codex_home: Some(PathBuf::from("/private/codex-home")),
         instructions: instructions.to_owned(),
         session,
@@ -201,6 +202,18 @@ fn launch_arguments_are_fixed_and_instructions_exist_only_on_stdin() {
         }
         assert!(!message.contains("DO_NOT_ECHO_THIS_TASK"));
     }
+}
+
+#[test]
+fn configured_model_is_passed_as_one_provider_argument() {
+    let mut input = launch(Session::New, "task");
+    input.model = Some("gpt-5-codex".into());
+    let args = prepare(input).unwrap().launch_spec.provider_arguments;
+    let model_index = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(
+        args.get(model_index + 1),
+        Some(&OsString::from("gpt-5-codex"))
+    );
 }
 
 #[test]

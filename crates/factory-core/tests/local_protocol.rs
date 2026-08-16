@@ -2,9 +2,10 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
     Provider, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
-        RequestEnvelope, RunTerminal, ServerFrame, SubscriptionLimitWindow,
-        SubscriptionProviderStatus, SubscriptionSeverity, SubscriptionUsageStatus,
+        AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
+        SubscriptionLimitWindow, SubscriptionProviderStatus, SubscriptionSeverity,
+        SubscriptionUsageStatus,
     },
 };
 
@@ -170,6 +171,7 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         parent_agent_id: Some(agent_id("agent-parent")),
         role: AgentRole::Worker,
         provider: Provider::Codex,
+        model: None,
     };
     let start = LocalRequest::StartTask {
         project_id: project_id("project-1"),
@@ -217,6 +219,50 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
 }
 
 #[test]
+fn agent_creation_can_carry_an_optional_model_without_exposing_an_id_field_contract() {
+    let request = LocalRequest::CreateAgent {
+        id: agent_id("agent-1"),
+        project_id: project_id("project-1"),
+        parent_agent_id: Some(agent_id("god")),
+        role: AgentRole::Worker,
+        provider: Provider::Codex,
+        model: Some("gpt-5-codex".into()),
+    };
+    let value = serde_json::to_value(request).unwrap();
+    assert_eq!(value["data"]["model"], "gpt-5-codex");
+}
+
+#[test]
+fn operator_messages_have_a_private_durable_wire_shape() {
+    let message = AgentMessage {
+        id: factory_core::MessageId::try_from("message-1").unwrap(),
+        project_id: project_id("project-1"),
+        sender_agent_id: None,
+        recipient_agent_id: agent_id("god"),
+        body: "Please inspect the failing launch before the next task.".into(),
+        created_at_ms: 10,
+        delivered_at_ms: None,
+    };
+    let request = LocalRequest::SendAgentMessage {
+        id: factory_core::MessageId::try_from("message-1").unwrap(),
+        project_id: project_id("project-1"),
+        sender_agent_id: None,
+        recipient_agent_id: agent_id("god"),
+        body: message.body.clone(),
+    };
+    let response = LocalResponse::AgentMessageSent { message };
+
+    assert_eq!(
+        serde_json::to_value(request).unwrap()["type"],
+        "send_agent_message"
+    );
+    assert_eq!(
+        serde_json::to_value(response).unwrap()["type"],
+        "agent_message_sent"
+    );
+}
+
+#[test]
 fn subscription_headroom_has_a_small_normalized_local_shape() {
     let request = LocalRequest::SubscriptionUsage;
     let response = LocalResponse::SubscriptionUsage {
@@ -232,6 +278,7 @@ fn subscription_headroom_has_a_small_normalized_local_shape() {
                 exhausted: Some(false),
                 severity: SubscriptionSeverity::Warning,
                 consecutive_failures: 0,
+                windows: Vec::new(),
             }],
         },
     };
@@ -244,6 +291,39 @@ fn subscription_headroom_has_a_small_normalized_local_shape() {
     assert_eq!(value["type"], "subscription_usage");
     assert_eq!(value["data"]["usage"]["providers"][0]["used_percent"], 82);
     assert!(serde_json::from_value::<LocalResponse>(value).is_ok());
+}
+
+#[test]
+fn agent_profile_is_available_only_through_private_local_detail() {
+    let agent = AgentSnapshot {
+        id: agent_id("god"),
+        project_id: project_id("factory"),
+        parent_agent_id: None,
+        role: AgentRole::Orchestrator,
+        provider: Provider::Codex,
+        current_run_id: None,
+        created_at_ms: 1,
+        updated_at_ms: 2,
+    };
+    let response = LocalResponse::Agent {
+        agent: AgentDetail {
+            snapshot: agent.clone(),
+            profile: AgentProfile {
+                model: Some("gpt-5-codex".into()),
+                instructions: "Orchestrate the factory.".into(),
+                memory: "Prefer narrow slices.".into(),
+                updated_at_ms: 3,
+            },
+        },
+    };
+    let value = serde_json::to_value(response).unwrap();
+    assert_eq!(value["data"]["agent"]["profile"]["model"], "gpt-5-codex");
+    assert!(
+        serde_json::to_value(FactoryEvent::AgentChanged { agent })
+            .unwrap()
+            .get("profile")
+            .is_none()
+    );
 }
 
 #[test]

@@ -25,6 +25,8 @@ pub struct CodexLaunch {
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    /// An explicit provider model, or `None` for the Codex CLI default.
+    pub model: Option<String>,
     /// An exact imported Codex home, or `None` for the existing sanitized
     /// `HOME` default used by newly allocated agents.
     pub codex_home: Option<PathBuf>,
@@ -75,6 +77,10 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
     ]
     .map(OsString::from)
     .to_vec();
+    if let Some(model) = input.model.as_deref() {
+        arguments.push(OsString::from("--model"));
+        arguments.push(OsString::from(model));
+    }
 
     let decoder = match input.session {
         Session::New => Decoder::fresh(),

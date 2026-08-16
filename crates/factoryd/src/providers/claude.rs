@@ -32,6 +32,8 @@ pub struct ClaudeLaunch {
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    /// An explicit provider model, or `None` for the Claude CLI default.
+    pub model: Option<String>,
     pub instructions: String,
     pub session: Session,
     pub max_turns: NonZeroU32,
@@ -93,6 +95,10 @@ pub fn prepare(input: ClaudeLaunch) -> Result<PreparedClaude, PrepareError> {
     ]
     .map(OsString::from)
     .to_vec();
+    if let Some(model) = input.model.as_deref() {
+        arguments.push(OsString::from("--model"));
+        arguments.push(OsString::from(model));
+    }
     arguments.push(OsString::from(input.max_turns.get().to_string()));
     arguments.push(OsString::from("--max-budget-usd"));
     arguments.push(OsString::from(format_budget(input.max_budget_cents)));

@@ -21,7 +21,7 @@ Commands:
   health                              Check the daemon
   project add|list                    Manage projects
   task add|list|start|assign|retry    Manage and run tasks
-  agent add|list                      Manage agents
+  agent add|list|message|inbox         Manage agents and their durable messages
   run list                            List process attempts
   events [--follow]                   Read durable events
 
@@ -84,9 +84,23 @@ enum CliCommand {
         parent_agent_id: Option<String>,
         role: AgentRole,
         provider: Provider,
+        model: Option<String>,
     },
     AgentList {
         project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    AgentMessage {
+        id: Option<String>,
+        project_id: String,
+        sender_agent_id: Option<String>,
+        recipient_agent_id: String,
+        body: String,
+    },
+    AgentInbox {
+        project_id: String,
+        agent_id: String,
         after_id: Option<String>,
         limit: u32,
     },
@@ -322,6 +336,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 "codex" => Provider::Codex,
                 _ => return Err("--provider must be claude or codex".into()),
             };
+            let model = take_option(&mut args, "--model")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentAdd {
                 id,
@@ -329,6 +344,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 parent_agent_id,
                 role,
                 provider,
+                model,
             })
         }
         "list" => {
@@ -338,6 +354,34 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             require_empty(&args)?;
             Ok(CliCommand::AgentList {
                 project_id,
+                after_id,
+                limit,
+            })
+        }
+        "message" => {
+            let id = take_option(&mut args, "--id")?;
+            let project_id = required_option(&mut args, "--project")?;
+            let sender_agent_id = take_option(&mut args, "--from")?;
+            let recipient_agent_id = required_option(&mut args, "--to")?;
+            let body = required_option(&mut args, "--body")?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentMessage {
+                id,
+                project_id,
+                sender_agent_id,
+                recipient_agent_id,
+                body,
+            })
+        }
+        "inbox" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(&mut args, AGENT_LIST_LIMIT, MAX_AGENT_PAGE_ITEMS)?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentInbox {
+                project_id,
+                agent_id,
                 after_id,
                 limit,
             })
@@ -471,6 +515,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             parent_agent_id,
             role,
             provider,
+            model,
         } => Ok(LocalRequest::CreateAgent {
             id: id
                 .map(|id| parse_id(id, "agent"))
@@ -482,6 +527,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?,
             role,
             provider,
+            model,
         }),
         CliCommand::AgentList {
             project_id,
@@ -491,6 +537,37 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id
                 .map(|id| parse_id(id, "agent cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::AgentMessage {
+            id,
+            project_id,
+            sender_agent_id,
+            recipient_agent_id,
+            body,
+        } => Ok(LocalRequest::SendAgentMessage {
+            id: id
+                .map(|id| parse_id(id, "message"))
+                .transpose()?
+                .unwrap_or(generated_id()?),
+            project_id: parse_id(project_id, "project")?,
+            sender_agent_id: sender_agent_id
+                .map(|id| parse_id(id, "sender agent"))
+                .transpose()?,
+            recipient_agent_id: parse_id(recipient_agent_id, "recipient agent")?,
+            body,
+        }),
+        CliCommand::AgentInbox {
+            project_id,
+            agent_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListAgentMessages {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "message cursor"))
                 .transpose()?,
             limit,
         }),
@@ -773,6 +850,8 @@ mod tests {
                 "worker",
                 "--provider",
                 "codex",
+                "--model",
+                "gpt-5-codex",
             ]))
             .unwrap(),
             (
@@ -783,6 +862,7 @@ mod tests {
                     parent_agent_id: Some("agent-parent".into()),
                     role: AgentRole::Worker,
                     provider: Provider::Codex,
+                    model: Some("gpt-5-codex".into()),
                 }
             )
         );
@@ -829,6 +909,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_message_and_inbox_commands_use_the_shared_local_channel() {
+        let (_, message) = parse_args(args(&[
+            "agent",
+            "message",
+            "--project",
+            "factory",
+            "--from",
+            "god",
+            "--to",
+            "worker",
+            "--body",
+            "Please report your result.",
+        ]))
+        .unwrap();
+        let request = request_for(message).unwrap();
+        assert!(matches!(
+            request,
+            LocalRequest::SendAgentMessage {
+                sender_agent_id: Some(sender),
+                recipient_agent_id,
+                body,
+                ..
+            } if sender == "god".try_into().unwrap()
+                && recipient_agent_id == "worker".try_into().unwrap()
+                && body == "Please report your result."
+        ));
+
+        let (_, inbox) = parse_args(args(&[
+            "agent",
+            "inbox",
+            "--project",
+            "factory",
+            "--agent",
+            "worker",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            request_for(inbox).unwrap(),
+            LocalRequest::ListAgentMessages { .. }
+        ));
+    }
+
+    #[test]
     fn agent_ids_are_client_generated_but_run_ids_are_daemon_generated() {
         let request = request_for(CliCommand::AgentAdd {
             id: None,
@@ -836,6 +959,7 @@ mod tests {
             parent_agent_id: None,
             role: AgentRole::Orchestrator,
             provider: Provider::Codex,
+            model: None,
         })
         .unwrap();
         let LocalRequest::CreateAgent { id, role, .. } = request else {

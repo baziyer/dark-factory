@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
-    Provider, RunId, RunSnapshot, TaskDetail, TaskId,
+    AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, Provider, RunId, RunSnapshot, TaskDetail, TaskId,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -26,7 +26,7 @@ pub enum SubscriptionFailureCategory {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum SubscriptionProbeOutcome {
     Observed {
@@ -35,6 +35,8 @@ pub enum SubscriptionProbeOutcome {
         #[serde(skip_serializing_if = "Option::is_none")]
         resets_at_ms: Option<i64>,
         exhausted: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        windows: Vec<SubscriptionUsageWindow>,
     },
     Failed {
         category: SubscriptionFailureCategory,
@@ -47,6 +49,15 @@ pub enum SubscriptionSeverity {
     Ok,
     Warning,
     Critical,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionUsageWindow {
+    pub window: SubscriptionLimitWindow,
+    pub used_percent: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<i64>,
+    pub exhausted: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -65,12 +76,45 @@ pub struct SubscriptionProviderStatus {
     pub exhausted: Option<bool>,
     pub severity: SubscriptionSeverity,
     pub consecutive_failures: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<SubscriptionUsageWindow>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SubscriptionUsageStatus {
     pub overall_severity: SubscriptionSeverity,
     pub providers: Vec<SubscriptionProviderStatus>,
+}
+
+/// Private operator-facing configuration. It is deliberately not part of an
+/// `AgentSnapshot` or `FactoryEvent`.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentProfile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub instructions: String,
+    pub memory: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentDetail {
+    pub snapshot: AgentSnapshot,
+    pub profile: AgentProfile,
+}
+
+/// Private operator/agent message. Message bodies never enter public events.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentMessage {
+    pub id: MessageId,
+    pub project_id: ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender_agent_id: Option<AgentId>,
+    pub recipient_agent_id: AgentId,
+    pub body: String,
+    pub created_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_at_ms: Option<i64>,
 }
 
 /// Maximum JSON payload size. The newline delimiter is not part of this limit.
@@ -82,6 +126,7 @@ pub const MAX_RUN_PAGE_ITEMS: u32 = 100;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 100;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunTerminal {
@@ -137,6 +182,35 @@ pub enum LocalRequest {
         parent_agent_id: Option<AgentId>,
         role: AgentRole,
         provider: Provider,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+    },
+    GetAgent {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    UpdateAgentProfile {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        instructions: String,
+        memory: String,
+    },
+    SendAgentMessage {
+        id: MessageId,
+        project_id: ProjectId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sender_agent_id: Option<AgentId>,
+        recipient_agent_id: AgentId,
+        body: String,
+    },
+    ListAgentMessages {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<MessageId>,
+        limit: u32,
     },
     ListAgents {
         project_id: ProjectId,
@@ -245,6 +319,20 @@ pub enum LocalResponse {
     },
     AgentCreated {
         agent: AgentSnapshot,
+    },
+    Agent {
+        agent: AgentDetail,
+    },
+    AgentProfileUpdated {
+        agent: AgentDetail,
+    },
+    AgentMessageSent {
+        message: AgentMessage,
+    },
+    AgentMessages {
+        messages: Vec<AgentMessage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<MessageId>,
     },
     Agents {
         agents: Vec<AgentSnapshot>,

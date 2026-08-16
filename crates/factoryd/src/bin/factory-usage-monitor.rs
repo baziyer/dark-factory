@@ -5,7 +5,7 @@ use factory_core::{
     local::{
         LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, RequestEnvelope, ServerFrame,
         SubscriptionFailureCategory, SubscriptionLimitWindow, SubscriptionProbeOutcome,
-        SubscriptionSeverity,
+        SubscriptionSeverity, SubscriptionUsageWindow,
     },
 };
 use factoryd::usage_monitor::{
@@ -207,7 +207,7 @@ async fn record_probe(
     .map_err(|_| "usage state commit timed out")?
 }
 
-const fn observed_outcome(usage: NormalizedUsage) -> SubscriptionProbeOutcome {
+fn observed_outcome(usage: NormalizedUsage) -> SubscriptionProbeOutcome {
     SubscriptionProbeOutcome::Observed {
         used_percent: usage.used_percent,
         limit_window: match usage.limit_window {
@@ -224,6 +224,29 @@ const fn observed_outcome(usage: NormalizedUsage) -> SubscriptionProbeOutcome {
         },
         resets_at_ms: usage.resets_at_ms,
         exhausted: usage.exhausted,
+        windows: usage
+            .windows
+            .into_iter()
+            .map(|window| SubscriptionUsageWindow {
+                window: match window.window {
+                    factoryd::store::SubscriptionLimitWindow::Primary => {
+                        SubscriptionLimitWindow::Primary
+                    }
+                    factoryd::store::SubscriptionLimitWindow::Secondary => {
+                        SubscriptionLimitWindow::Secondary
+                    }
+                    factoryd::store::SubscriptionLimitWindow::CurrentSession => {
+                        SubscriptionLimitWindow::CurrentSession
+                    }
+                    factoryd::store::SubscriptionLimitWindow::CurrentWeek => {
+                        SubscriptionLimitWindow::CurrentWeek
+                    }
+                },
+                used_percent: window.used_percent,
+                resets_at_ms: window.resets_at_ms,
+                exhausted: window.exhausted,
+            })
+            .collect(),
     }
 }
 

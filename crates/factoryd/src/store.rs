@@ -4,7 +4,7 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth,
+    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId, ObserverHealth,
     PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, RunFailureReason, RunId, RunSnapshot,
     RunStatus, RunnerInstanceId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     runner::{RUNNER_PROTOCOL_VERSION, RunnerEvent, RunnerEventEnvelope},
@@ -12,10 +12,11 @@ use factory_core::{
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -29,6 +30,7 @@ const MAX_BODY_BYTES: usize = 100_000;
 const MAX_WEBHOOK_TITLE_BYTES: usize = 240;
 const MAX_WEBHOOK_TEXT_BYTES: usize = 4_000;
 const MAX_TERMINAL_RESULT_BYTES: usize = 4 * 1024;
+const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_RUNNER_BATCH_EVENTS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,6 +58,50 @@ pub struct NewAgent {
     pub role: AgentRole,
     pub provider: Provider,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentProfile {
+    pub model: Option<String>,
+    pub instructions: String,
+    pub memory: String,
+    pub updated_at_ms: i64,
+}
+
+pub struct AgentDetail {
+    pub snapshot: AgentSnapshot,
+    pub profile: AgentProfile,
+}
+
+pub struct UpdateAgentProfile {
+    pub model: Option<String>,
+    pub instructions: String,
+    pub memory: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewAgentMessage {
+    pub id: MessageId,
+    pub project_id: ProjectId,
+    pub sender_agent_id: Option<AgentId>,
+    pub recipient_agent_id: AgentId,
+    pub body: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentMessage {
+    pub id: MessageId,
+    pub project_id: ProjectId,
+    pub sender_agent_id: Option<AgentId>,
+    pub recipient_agent_id: AgentId,
+    pub body: String,
+    pub created_at_ms: i64,
+    pub delivered_at_ms: Option<i64>,
+    pub delivered_run_id: Option<RunId>,
+}
+
+const MAX_AGENT_MODEL_BYTES: usize = 256;
+const MAX_AGENT_PROFILE_TEXT_BYTES: usize = 16 * 1024;
 
 /// Provider-independent task vocabulary exposed by authenticated integrations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +167,7 @@ pub enum SubscriptionFailureCategory {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum SubscriptionLimitWindow {
     Primary,
     Secondary,
@@ -129,13 +175,22 @@ pub enum SubscriptionLimitWindow {
     CurrentWeek,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SubscriptionUsageWindow {
+    pub window: SubscriptionLimitWindow,
+    pub used_percent: u8,
+    pub resets_at_ms: Option<i64>,
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionProbeOutcome {
     Observed {
         used_percent: u8,
         limit_window: SubscriptionLimitWindow,
         resets_at_ms: Option<i64>,
         exhausted: bool,
+        windows: Vec<SubscriptionUsageWindow>,
     },
     Failed {
         category: SubscriptionFailureCategory,
@@ -162,6 +217,7 @@ pub struct SubscriptionProviderState {
     pub exhausted: Option<bool>,
     pub severity: SubscriptionSeverity,
     pub consecutive_failures: u32,
+    pub windows: Vec<SubscriptionUsageWindow>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,8 +351,11 @@ pub struct ReservedRun {
 /// Privacy-sensitive inputs and durable replay position needed to supervise a run.
 pub struct ExecutionTarget {
     pub provider: Provider,
+    pub model: Option<String>,
+    pub agent_instructions: String,
     pub project_root: String,
     pub task_body: String,
+    pub agent_messages: Vec<AgentMessage>,
     pub worktree: String,
     pub provider_session_id: Option<String>,
     pub codex_home: Option<String>,
@@ -433,6 +492,10 @@ pub enum StoreError {
     TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
+    #[error("agent profile is invalid or exceeds its bound")]
+    InvalidAgentProfile,
+    #[error("agent message is invalid or exceeds its bound")]
+    InvalidAgentMessage,
     #[error("task is not queued in the requested project")]
     TaskNotQueued,
     #[error("task is not retryable in the requested project")]
@@ -628,7 +691,17 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.insert_agent(input, None, now_ms)
+        self.insert_agent(input, None, None, now_ms)
+    }
+
+    pub fn create_agent_with_model(
+        &mut self,
+        input: NewAgent,
+        model: Option<String>,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        validate_agent_model(model.as_deref())?;
+        self.insert_agent(input, model, None, now_ms)
     }
 
     /// Atomically creates an agent already bound to one exact provider
@@ -644,12 +717,13 @@ impl Store {
         if input.provider != session.provider {
             return Err(StoreError::InvalidProviderSessionAdoption);
         }
-        self.insert_agent(input, Some(session), now_ms)
+        self.insert_agent(input, None, Some(session), now_ms)
     }
 
     fn insert_agent(
         &mut self,
         input: NewAgent,
+        model: Option<String>,
         session: Option<AgentSessionContext>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
@@ -702,6 +776,11 @@ impl Store {
                 agent.created_at_ms,
                 agent.updated_at_ms,
             ],
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_profiles (agent_id, model, updated_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![agent.id.as_str(), model, agent.updated_at_ms],
         )?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
@@ -867,6 +946,13 @@ impl Store {
             .snapshot;
         let run = load_run(&transaction, &input.run_id)?.ok_or(StoreError::RunNotFound)?;
         let events = append_execution_events(&transaction, now_ms, &task.snapshot, &agent, &run)?;
+        let agent_messages = Self::deliver_agent_messages_in_transaction(
+            &transaction,
+            &input.project_id,
+            &input.agent_id,
+            Some(&input.run_id),
+            now_ms,
+        )?;
         let target =
             load_execution_target(&transaction, &input.run_id)?.ok_or(StoreError::RunNotFound)?;
         transaction.commit()?;
@@ -875,7 +961,10 @@ impl Store {
             task: task.snapshot,
             agent,
             run,
-            target,
+            target: ExecutionTarget {
+                agent_messages,
+                ..target
+            },
             events,
         })
     }
@@ -1333,7 +1422,7 @@ impl Store {
         let replayed = transaction
             .query_row(
                 "SELECT outcome, used_percent, limit_window, resets_at_ms, exhausted,
-                    failure_category
+                    failure_category, windows_json
              FROM subscription_usage_probes
              WHERE provider = ?1 AND attempted_at_ms = ?2",
                 params![provider, input.attempted_at_ms],
@@ -1345,6 +1434,7 @@ impl Store {
                         resets_at_ms: row.get(3)?,
                         exhausted: row.get(4)?,
                         failure_category: row.get(5)?,
+                        windows_json: row.get(6)?,
                     })
                 },
             )
@@ -1386,6 +1476,10 @@ impl Store {
         let prior_limit = prior.as_ref().and_then(|state| state.public.limit_window);
         let prior_reset = prior.as_ref().and_then(|state| state.public.resets_at_ms);
         let prior_exhausted = prior.as_ref().and_then(|state| state.public.exhausted);
+        let prior_windows = prior
+            .as_ref()
+            .map(|state| state.public.windows.clone())
+            .unwrap_or_default();
 
         let (
             outcome_name,
@@ -1398,16 +1492,25 @@ impl Store {
             failures,
             failure_category,
             last_success_at_ms,
+            windows,
         ) = match input.outcome {
             SubscriptionProbeOutcome::Observed {
                 used_percent,
                 limit_window,
                 resets_at_ms,
                 exhausted,
+                windows,
             } => {
                 if resets_at_ms.is_some_and(|reset| reset < 0) {
                     return Err(StoreError::InvalidSubscriptionProbe);
                 }
+                let windows = canonical_subscription_windows(
+                    used_percent,
+                    limit_window,
+                    resets_at_ms,
+                    exhausted,
+                    windows,
+                )?;
                 let capacity = subscription_capacity_severity(used_percent, exhausted);
                 (
                     "observed",
@@ -1420,6 +1523,7 @@ impl Store {
                     0,
                     None,
                     Some(input.attempted_at_ms),
+                    windows,
                 )
             }
             SubscriptionProbeOutcome::Failed { category } => {
@@ -1440,16 +1544,23 @@ impl Store {
                     failures,
                     Some(subscription_failure_value(category)),
                     prior_success,
+                    prior_windows,
                 )
             }
         };
         let upward_transition = severity > previous_severity;
+        let windows_json = if outcome_name == "observed" {
+            Some(serde_json::to_string(&windows)?)
+        } else {
+            None
+        };
 
         transaction.execute(
             "INSERT INTO subscription_usage_probes (
                 provider, attempted_at_ms, outcome, used_percent, limit_window,
-                resets_at_ms, exhausted, severity, failure_category, notification_task_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                resets_at_ms, exhausted, severity, failure_category, notification_task_id,
+                windows_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
             params![
                 provider,
                 input.attempted_at_ms,
@@ -1476,14 +1587,15 @@ impl Store {
                 },
                 subscription_severity_value(severity),
                 failure_category,
+                windows_json,
             ],
         )?;
         transaction.execute(
             "INSERT INTO subscription_usage_state (
                 provider, last_attempt_at_ms, last_success_at_ms, used_percent, limit_window,
-                resets_at_ms, exhausted, capacity_severity, severity,
+                resets_at_ms, exhausted, windows_json, capacity_severity, severity,
                 consecutive_failures
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(provider) DO UPDATE SET
                 last_attempt_at_ms = excluded.last_attempt_at_ms,
                 last_success_at_ms = excluded.last_success_at_ms,
@@ -1491,6 +1603,7 @@ impl Store {
                 limit_window = excluded.limit_window,
                 resets_at_ms = excluded.resets_at_ms,
                 exhausted = excluded.exhausted,
+                windows_json = excluded.windows_json,
                 capacity_severity = excluded.capacity_severity,
                 severity = excluded.severity,
                 consecutive_failures = excluded.consecutive_failures",
@@ -1502,6 +1615,7 @@ impl Store {
                 limit_window.map(subscription_limit_window_value),
                 resets_at_ms,
                 exhausted.map(i64::from),
+                windows_json,
                 subscription_severity_value(capacity_severity),
                 subscription_severity_value(severity),
                 i64::from(failures),
@@ -1523,7 +1637,7 @@ impl Store {
                 subscription_severity_value(severity),
                 subscription_provider_title(input.provider)
             );
-            let body = subscription_notification_advice(input.outcome, severity);
+            let body = subscription_notification_advice(outcome_name == "observed", severity);
             transaction.execute(
                 "INSERT INTO tasks (
                     id, project_id, parent_task_id, assigned_agent_id, title, body,
@@ -1583,7 +1697,8 @@ impl Store {
     pub fn subscription_usage_snapshot(&self) -> Result<SubscriptionUsageSnapshot> {
         let mut statement = self.connection.prepare(
             "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
-                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window
+                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
+                    windows_json
              FROM subscription_usage_state ORDER BY provider",
         )?;
         let providers = statement
@@ -2135,6 +2250,209 @@ impl Store {
             .collect()
     }
 
+    pub fn get_agent_detail(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<AgentDetail> {
+        let agent = load_agent(&self.connection, agent_id)?
+            .filter(|agent| agent.snapshot.project_id == *project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        Ok(AgentDetail {
+            snapshot: agent.snapshot,
+            profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
+                model: None,
+                instructions: String::new(),
+                memory: String::new(),
+                updated_at_ms: 0,
+            }),
+        })
+    }
+
+    pub fn update_agent_profile(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        input: UpdateAgentProfile,
+        now_ms: i64,
+    ) -> Result<(AgentDetail, EventEnvelope)> {
+        validate_agent_profile(&input)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_agent(&transaction, agent_id)?
+            .filter(|agent| agent.snapshot.project_id == *project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        transaction.execute(
+            "INSERT INTO agent_profiles (agent_id, model, instructions, memory, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                model = excluded.model,
+                instructions = excluded.instructions,
+                memory = excluded.memory,
+                updated_at_ms = excluded.updated_at_ms",
+            params![
+                agent_id.as_str(),
+                input.model,
+                input.instructions,
+                input.memory,
+                now_ms,
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE agents SET updated_at_ms = ?1 WHERE id = ?2",
+            params![now_ms, agent_id.as_str()],
+        )?;
+        let snapshot = load_agent(&transaction, agent_id)?
+            .ok_or(StoreError::AgentNotFound)?
+            .snapshot;
+        let event = FactoryEvent::AgentChanged {
+            agent: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        let profile =
+            load_agent_profile(&transaction, agent_id)?.ok_or(StoreError::AgentNotFound)?;
+        transaction.commit()?;
+        Ok((
+            AgentDetail { snapshot, profile },
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    /// Stores a private message without appending a public factory event.
+    pub fn send_agent_message(&mut self, input: NewAgentMessage) -> Result<AgentMessage> {
+        validate_agent_message(&input.body, input.created_at_ms)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        load_agent(&transaction, &input.recipient_agent_id)?
+            .filter(|agent| agent.snapshot.project_id == input.project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        if let Some(sender_agent_id) = &input.sender_agent_id {
+            load_agent(&transaction, sender_agent_id)?
+                .filter(|agent| agent.snapshot.project_id == input.project_id)
+                .ok_or(StoreError::AgentNotFound)?;
+        }
+        transaction.execute(
+            "INSERT INTO agent_messages (
+                id, project_id, sender_agent_id, recipient_agent_id,
+                body, created_at_ms, delivered_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+            params![
+                input.id.as_str(),
+                input.project_id.as_str(),
+                input.sender_agent_id.as_ref().map(AgentId::as_str),
+                input.recipient_agent_id.as_str(),
+                input.body,
+                input.created_at_ms,
+            ],
+        )?;
+        let message =
+            load_agent_message(&transaction, &input.id)?.ok_or(StoreError::InvalidAgentMessage)?;
+        transaction.commit()?;
+        Ok(message)
+    }
+
+    pub fn list_agent_messages(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        after_id: Option<&MessageId>,
+        limit: usize,
+    ) -> Result<Vec<AgentMessage>> {
+        if !(1..=MAX_STATE_PAGE).contains(&limit) {
+            return Err(StoreError::InvalidStateLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_id, sender_agent_id, recipient_agent_id,
+                    body, created_at_ms, delivered_at_ms, delivered_run_id
+             FROM agent_messages
+             WHERE project_id = ?1 AND recipient_agent_id = ?2
+               AND (?3 IS NULL OR id > ?3)
+             ORDER BY id
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![
+                project_id.as_str(),
+                agent_id.as_str(),
+                after_id.map(MessageId::as_str),
+                limit as i64,
+            ],
+            agent_message_from_row,
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(Ok)
+            .collect()
+    }
+
+    fn deliver_agent_messages_in_transaction(
+        transaction: &Transaction<'_>,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        run_id: Option<&RunId>,
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let mut statement = transaction.prepare(
+            "SELECT id
+             FROM agent_messages
+             WHERE project_id = ?1 AND recipient_agent_id = ?2
+               AND delivered_at_ms IS NULL
+             ORDER BY created_at_ms, id",
+        )?;
+        let ids = statement
+            .query_map(params![project_id.as_str(), agent_id.as_str()], |row| {
+                parse_id::<MessageId>(row.get(0)?, 0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for id in &ids {
+            transaction.execute(
+                "UPDATE agent_messages
+                 SET delivered_at_ms = ?1, delivered_run_id = ?2
+                 WHERE id = ?3 AND project_id = ?4 AND delivered_at_ms IS NULL",
+                params![
+                    delivered_at_ms,
+                    run_id.map(RunId::as_str),
+                    id.as_str(),
+                    project_id.as_str()
+                ],
+            )?;
+        }
+        ids.into_iter()
+            .map(|id| load_agent_message(transaction, &id)?.ok_or(StoreError::InvalidAgentMessage))
+            .collect()
+    }
+
+    pub fn deliver_agent_messages(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        if delivered_at_ms < 0 {
+            return Err(StoreError::InvalidAgentMessage);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let messages = Self::deliver_agent_messages_in_transaction(
+            &transaction,
+            project_id,
+            agent_id,
+            None,
+            delivered_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(messages)
+    }
+
     pub fn list_runs(
         &self,
         project_id: &ProjectId,
@@ -2241,6 +2559,7 @@ struct StoredSubscriptionProbe {
     resets_at_ms: Option<i64>,
     exhausted: Option<i64>,
     failure_category: Option<String>,
+    windows_json: Option<String>,
 }
 
 fn stored_subscription_probe_matches(
@@ -2253,6 +2572,7 @@ fn stored_subscription_probe_matches(
             limit_window,
             resets_at_ms,
             exhausted,
+            windows,
         } => {
             stored.outcome == "observed"
                 && stored.used_percent == Some(i64::from(used_percent))
@@ -2261,6 +2581,7 @@ fn stored_subscription_probe_matches(
                 && stored.resets_at_ms == resets_at_ms
                 && stored.exhausted == Some(if exhausted { 1 } else { 0 })
                 && stored.failure_category.is_none()
+                && stored_windows_match(stored.windows_json.as_deref(), &windows)
         }
         SubscriptionProbeOutcome::Failed { category } => {
             stored.outcome == "failed"
@@ -2273,6 +2594,15 @@ fn stored_subscription_probe_matches(
     }
 }
 
+fn stored_windows_match(stored: Option<&str>, requested: &[SubscriptionUsageWindow]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    stored
+        .and_then(|value| serde_json::from_str::<Vec<SubscriptionUsageWindow>>(value).ok())
+        .is_some_and(|value| value == requested)
+}
+
 fn load_subscription_state_row(
     connection: &Connection,
     provider: Provider,
@@ -2281,13 +2611,13 @@ fn load_subscription_state_row(
         .query_row(
             "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
                     resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
-                    capacity_severity
+                    windows_json, capacity_severity
              FROM subscription_usage_state WHERE provider = ?1",
             params![provider_value(provider)],
             |row| {
                 Ok(SubscriptionStateRow {
                     public: parse_subscription_provider_state(row)?,
-                    capacity_severity: parse_subscription_severity(&row.get::<_, String>(9)?, 9)?,
+                    capacity_severity: parse_subscription_severity(&row.get::<_, String>(10)?, 10)?,
                 })
             },
         )
@@ -2302,7 +2632,8 @@ fn load_subscription_provider_state(
     connection
         .query_row(
             "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
-                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window
+                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
+                    windows_json
              FROM subscription_usage_state WHERE provider = ?1",
             params![provider_value(provider)],
             parse_subscription_provider_state,
@@ -2334,20 +2665,76 @@ fn parse_subscription_provider_state(
     let consecutive_failures = u32::try_from(row.get::<_, i64>(7)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
     })?;
+    let limit_window = row
+        .get::<_, Option<String>>(8)?
+        .map(|value| parse_subscription_limit_window(&value, 8))
+        .transpose()?;
+    let resets_at_ms: Option<i64> = row.get(4)?;
+    let windows_json: Option<String> = row.get(9)?;
+    let windows = windows_json
+        .as_deref()
+        .map(|value| {
+            serde_json::from_str(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| {
+            used_percent
+                .zip(limit_window)
+                .map(|(used_percent, window)| SubscriptionUsageWindow {
+                    window,
+                    used_percent,
+                    resets_at_ms,
+                    exhausted: exhausted.unwrap_or(false),
+                })
+                .into_iter()
+                .collect()
+        });
     Ok(SubscriptionProviderState {
         provider,
         last_attempt_at_ms: row.get(1)?,
         last_success_at_ms: row.get(2)?,
         used_percent,
-        limit_window: row
-            .get::<_, Option<String>>(8)?
-            .map(|value| parse_subscription_limit_window(&value, 8))
-            .transpose()?,
-        resets_at_ms: row.get(4)?,
+        limit_window,
+        resets_at_ms,
         exhausted,
         severity: parse_subscription_severity(&row.get::<_, String>(6)?, 6)?,
         consecutive_failures,
+        windows,
     })
+}
+
+fn canonical_subscription_windows(
+    used_percent: u8,
+    limit_window: SubscriptionLimitWindow,
+    resets_at_ms: Option<i64>,
+    exhausted: bool,
+    windows: Vec<SubscriptionUsageWindow>,
+) -> Result<Vec<SubscriptionUsageWindow>> {
+    let windows = if windows.is_empty() {
+        vec![SubscriptionUsageWindow {
+            window: limit_window,
+            used_percent,
+            resets_at_ms,
+            exhausted,
+        }]
+    } else {
+        windows
+    };
+    if windows.len() > 4
+        || windows.iter().any(|window| {
+            window.used_percent > 100 || window.resets_at_ms.is_some_and(|reset| reset < 0)
+        })
+        || windows.iter().enumerate().any(|(index, window)| {
+            windows[..index]
+                .iter()
+                .any(|prior| prior.window == window.window)
+        })
+    {
+        return Err(StoreError::InvalidSubscriptionProbe);
+    }
+    Ok(windows)
 }
 
 const fn subscription_capacity_severity(used_percent: u8, exhausted: bool) -> SubscriptionSeverity {
@@ -2434,21 +2821,20 @@ const fn subscription_provider_title(provider: Provider) -> &'static str {
 }
 
 const fn subscription_notification_advice(
-    outcome: SubscriptionProbeOutcome,
+    observed: bool,
     severity: SubscriptionSeverity,
 ) -> &'static str {
-    match outcome {
-        SubscriptionProbeOutcome::Failed { .. } => {
-            "The local subscription allowance collector has failed repeatedly. Verify the collector and account status. No work was automatically changed."
-        }
-        SubscriptionProbeOutcome::Observed { .. } => match severity {
+    if !observed {
+        "The local subscription allowance collector has failed repeatedly. Verify the collector and account status. No work was automatically changed."
+    } else {
+        match severity {
             SubscriptionSeverity::Critical => {
                 "Subscription headroom is critical. Review provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
             }
             SubscriptionSeverity::Warning | SubscriptionSeverity::Ok => {
                 "Subscription headroom needs review. Check provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
             }
-        },
+        }
     }
 }
 
@@ -3256,6 +3642,48 @@ fn valid_terminal_result(result: Option<&str>) -> bool {
     })
 }
 
+fn validate_agent_profile(input: &UpdateAgentProfile) -> Result<()> {
+    validate_agent_model(input.model.as_deref())?;
+    if !valid_bounded_profile_text(&input.instructions)
+        || !valid_bounded_profile_text(&input.memory)
+    {
+        return Err(StoreError::InvalidAgentProfile);
+    }
+    Ok(())
+}
+
+fn validate_agent_message(body: &str, created_at_ms: i64) -> Result<()> {
+    if created_at_ms < 0
+        || body.is_empty()
+        || body.len() > MAX_AGENT_MESSAGE_BYTES
+        || body.contains('\0')
+        || body
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'))
+    {
+        return Err(StoreError::InvalidAgentMessage);
+    }
+    Ok(())
+}
+
+fn validate_agent_model(model: Option<&str>) -> Result<()> {
+    if model.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_AGENT_MODEL_BYTES
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(StoreError::InvalidAgentProfile);
+    }
+    Ok(())
+}
+
+fn valid_bounded_profile_text(value: &str) -> bool {
+    value.len() <= MAX_AGENT_PROFILE_TEXT_BYTES
+        && value
+            .chars()
+            .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+}
+
 fn valid_failed_process_outcome(
     exit_code: Option<i32>,
     signal: Option<i32>,
@@ -3302,6 +3730,25 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
                     provider_session_id: row.get(5)?,
                     provider_session_cwd: row.get(6)?,
                     codex_home: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
+    connection
+        .query_row(
+            "SELECT model, instructions, memory, updated_at_ms
+             FROM agent_profiles WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+            |row| {
+                Ok(AgentProfile {
+                    model: row.get(0)?,
+                    instructions: row.get(1)?,
+                    memory: row.get(2)?,
+                    updated_at_ms: row.get(3)?,
                 })
             },
         )
@@ -3403,37 +3850,94 @@ fn load_execution_target(
 ) -> Result<Option<ExecutionTarget>> {
     connection
         .query_row(
-            "SELECT a.provider, p.root, t.body, r.worktree, r.provider_session_id,
+            "SELECT a.provider, ap.model, COALESCE(ap.instructions, ''), p.root, t.body, r.worktree, r.provider_session_id,
                     a.codex_home, r.resumes_provider_session, r.runner_instance_id,
                     r.runner_protocol_version, r.runner_runtime,
                     r.last_runner_sequence
              FROM runs r
              JOIN agents a ON a.id = r.agent_id
+             LEFT JOIN agent_profiles ap ON ap.agent_id = a.id
              JOIN projects p ON p.id = r.project_id
              JOIN tasks t ON t.id = r.task_id
              WHERE r.id = ?1",
             params![run_id.as_str()],
             |row| {
                 let provider: String = row.get(0)?;
-                let protocol: i64 = row.get(8)?;
+                let protocol: i64 = row.get(10)?;
                 Ok(ExecutionTarget {
                     provider: parse_provider(&provider, 0)?,
-                    project_root: row.get(1)?,
-                    task_body: row.get(2)?,
-                    worktree: row.get(3)?,
-                    provider_session_id: row.get(4)?,
-                    codex_home: row.get(5)?,
-                    resumes_provider_session: row.get(6)?,
-                    runner_instance_id: parse_id(row.get(7)?, 7)?,
+                    model: row.get(1)?,
+                    agent_instructions: row.get(2)?,
+                    project_root: row.get(3)?,
+                    task_body: row.get(4)?,
+                    agent_messages: Vec::new(),
+                    worktree: row.get(5)?,
+                    provider_session_id: row.get(6)?,
+                    codex_home: row.get(7)?,
+                    resumes_provider_session: row.get(8)?,
+                    runner_instance_id: parse_id(row.get(9)?, 9)?,
                     runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(8, Type::Integer, Box::new(error))
+                        rusqlite::Error::FromSqlConversionFailure(10, Type::Integer, Box::new(error))
                     })?,
-                    runner_runtime: row.get(9)?,
-                    last_committed_runner_sequence: row.get(10)?,
+                    runner_runtime: row.get(11)?,
+                    last_committed_runner_sequence: row.get(12)?,
                 })
             },
         )
         .optional()
+        .map_err(StoreError::from)
+        .and_then(|target| match target {
+            Some(mut target) => {
+                target.agent_messages = load_agent_messages_for_run(connection, run_id)?;
+                Ok(Some(target))
+            }
+            None => Ok(None),
+        })
+}
+
+fn load_agent_message(
+    connection: &Connection,
+    message_id: &MessageId,
+) -> Result<Option<AgentMessage>> {
+    connection
+        .query_row(
+            "SELECT id, project_id, sender_agent_id, recipient_agent_id,
+                    body, created_at_ms, delivered_at_ms, delivered_run_id
+             FROM agent_messages WHERE id = ?1",
+            params![message_id.as_str()],
+            agent_message_from_row,
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn agent_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMessage> {
+    let sender_agent_id: Option<String> = row.get(2)?;
+    Ok(AgentMessage {
+        id: parse_id(row.get(0)?, 0)?,
+        project_id: parse_id(row.get(1)?, 1)?,
+        sender_agent_id: parse_optional_id(sender_agent_id, 2)?,
+        recipient_agent_id: parse_id(row.get(3)?, 3)?,
+        body: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        delivered_at_ms: row.get(6)?,
+        delivered_run_id: parse_optional_id(row.get(7)?, 7)?,
+    })
+}
+
+fn load_agent_messages_for_run(
+    connection: &Connection,
+    run_id: &RunId,
+) -> Result<Vec<AgentMessage>> {
+    let mut statement = connection.prepare(
+        "SELECT id, project_id, sender_agent_id, recipient_agent_id,
+                body, created_at_ms, delivered_at_ms, delivered_run_id
+         FROM agent_messages
+         WHERE delivered_run_id = ?1
+         ORDER BY created_at_ms, id",
+    )?;
+    let rows = statement.query_map(params![run_id.as_str()], agent_message_from_row)?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StoreError::from)
 }
 
@@ -3605,6 +4109,27 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0007_subscription_usage.sql"))?;
         transaction.pragma_update(None, "user_version", 7)?;
+        transaction.commit()?;
+        current = 7;
+    }
+    if current == 7 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0008_subscription_windows.sql"))?;
+        transaction.pragma_update(None, "user_version", 8)?;
+        transaction.commit()?;
+        current = 8;
+    }
+    if current == 8 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0009_agent_profiles.sql"))?;
+        transaction.pragma_update(None, "user_version", 9)?;
+        transaction.commit()?;
+        current = 9;
+    }
+    if current == 9 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0010_agent_messages.sql"))?;
+        transaction.pragma_update(None, "user_version", 10)?;
         transaction.commit()?;
     }
     Ok(())

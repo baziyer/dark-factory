@@ -1160,12 +1160,38 @@ fn prepare_launch(
 ) -> Result<runner_process::LaunchSpec, Error> {
     let ExecutionTarget {
         provider,
+        model,
+        agent_instructions,
         task_body,
+        agent_messages,
         provider_session_id,
         codex_home,
         resumes_provider_session,
         ..
     } = target;
+    let has_standing_guidance = !agent_instructions.trim().is_empty();
+    let instructions = if !has_standing_guidance && agent_messages.is_empty() {
+        task_body
+    } else {
+        let mut instructions = String::new();
+        if has_standing_guidance {
+            instructions.push_str("Standing guidance:\n");
+            instructions.push_str(&agent_instructions);
+            instructions.push_str("\n\n");
+        }
+        if !agent_messages.is_empty() {
+            instructions.push_str("Operator messages for this launch:\n");
+            for message in agent_messages {
+                instructions.push_str("- ");
+                instructions.push_str(&message.body);
+                instructions.push('\n');
+            }
+            instructions.push('\n');
+        }
+        instructions.push_str("Task instructions:\n");
+        instructions.push_str(&task_body);
+        instructions
+    };
     match provider {
         Provider::Codex => {
             let session = if resumes_provider_session {
@@ -1183,7 +1209,8 @@ fn prepare_launch(
                 runtime_dir,
                 cwd: worktree,
                 codex_home: codex_home.map(PathBuf::from),
-                instructions: task_body,
+                model,
+                instructions,
                 session,
             })
             .map(|prepared| prepared.launch_spec)
@@ -1206,7 +1233,8 @@ fn prepare_launch(
                 runner_instance_id,
                 runtime_dir,
                 cwd: worktree,
-                instructions: task_body,
+                model,
+                instructions,
                 session,
                 max_turns: config.claude_max_turns,
                 max_budget_cents: config.claude_max_budget_cents,

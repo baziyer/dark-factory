@@ -203,6 +203,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             parent_agent_id,
             role,
             provider,
+            model,
         } = request.request
         else {
             panic!("expected create-agent request");
@@ -212,6 +213,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         assert_eq!(parent_agent_id, None);
         assert_eq!(role, AgentRole::Worker);
         assert_eq!(provider, Provider::Codex);
+        assert_eq!(model, None);
         write_response(
             &mut agent_stream,
             LocalResponse::AgentCreated {

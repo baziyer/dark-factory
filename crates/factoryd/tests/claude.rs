@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, path::PathBuf};
+use std::{ffi::OsString, num::NonZeroU32, path::PathBuf};
 
 use factory_core::{
     RunId, RunnerInstanceId,
@@ -32,6 +32,7 @@ fn launch(session: Session, instructions: &str) -> ClaudeLaunch {
         runner_instance_id: id::<RunnerInstanceId>("runner-claude"),
         runtime_dir: PathBuf::from("/runtime/run-claude"),
         cwd: PathBuf::from("/worktree"),
+        model: None,
         instructions: instructions.to_owned(),
         session,
         max_turns: NonZeroU32::new(20).unwrap(),
@@ -183,6 +184,23 @@ fn fresh_launch_uses_preallocated_identity_with_exact_safe_args_and_raw_stdin() 
     }
 
     assert_eq!(prepared.launch_spec.startup_input, task.as_bytes());
+}
+
+#[test]
+fn configured_model_is_passed_as_one_provider_argument() {
+    let mut input = launch(
+        Session::New {
+            session_id: SESSION_ID.to_owned(),
+        },
+        "task",
+    );
+    input.model = Some("claude-sonnet-4-6".into());
+    let args = prepare(input).unwrap().launch_spec.provider_arguments;
+    let model_index = args.iter().position(|arg| arg == "--model").unwrap();
+    assert_eq!(
+        args.get(model_index + 1),
+        Some(&OsString::from("claude-sonnet-4-6"))
+    );
 }
 
 #[test]

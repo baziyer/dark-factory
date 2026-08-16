@@ -10,18 +10,21 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
-    TaskDetail, TaskId,
+    AgentId, AgentSnapshot, MessageId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
+    RunSnapshot, TaskDetail, TaskId,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
-        MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
+        AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
+        AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS,
+        MAX_TERMINAL_OUTPUT_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
         SubscriptionFailureCategory as LocalSubscriptionFailureCategory,
         SubscriptionLimitWindow as LocalSubscriptionLimitWindow,
         SubscriptionProbeOutcome as LocalSubscriptionProbeOutcome,
         SubscriptionProviderStatus as LocalSubscriptionProviderStatus,
         SubscriptionSeverity as LocalSubscriptionSeverity,
         SubscriptionUsageStatus as LocalSubscriptionUsageStatus,
+        SubscriptionUsageWindow as LocalSubscriptionUsageWindow,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerEvent,
@@ -43,8 +46,10 @@ use crate::{
     execution::{self, StartTask},
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        NewAgent, NewProject, NewTask, RunControlTarget, StoreError, SubscriptionFailureCategory,
-        SubscriptionLimitWindow, SubscriptionProbe, SubscriptionProbeOutcome, SubscriptionSeverity,
+        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, RunControlTarget, StoreError,
+        SubscriptionFailureCategory, SubscriptionLimitWindow, SubscriptionProbe,
+        SubscriptionProbeOutcome, SubscriptionSeverity, SubscriptionUsageWindow,
+        UpdateAgentProfile,
     },
 };
 
@@ -87,6 +92,14 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidSubscriptionProbe) => (
                 ErrorCode::InvalidRequest,
                 "subscription probe is invalid".into(),
+            ),
+            Self::Store(StoreError::InvalidAgentProfile) => (
+                ErrorCode::InvalidRequest,
+                "agent profile is invalid or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidAgentMessage) => (
+                ErrorCode::InvalidRequest,
+                "agent message is invalid or exceeds its bound".into(),
             ),
             Self::Store(StoreError::AgentNotFound) => (
                 ErrorCode::NotFound,
@@ -363,10 +376,11 @@ async fn handle_request(
             parent_agent_id,
             role,
             provider,
+            model,
         } => {
             let agent = state
                 .commit_and_publish(move |store| {
-                    let (agent, event) = store.create_agent(
+                    let (agent, event) = store.create_agent_with_model(
                         NewAgent {
                             id,
                             project_id,
@@ -374,6 +388,7 @@ async fn handle_request(
                             role,
                             provider,
                         },
+                        model,
                         now_ms()?,
                     )?;
                     Ok((agent, vec![event]))
@@ -395,6 +410,94 @@ async fn handle_request(
             let next_after_id = next_agent_cursor(&mut agents, limit);
             Ok(LocalResponse::Agents {
                 agents,
+                next_after_id,
+            })
+        }
+        LocalRequest::GetAgent {
+            project_id,
+            agent_id,
+        } => {
+            let agent = state
+                .with_store(move |store| store.get_agent_detail(&project_id, &agent_id))
+                .await?;
+            Ok(LocalResponse::Agent {
+                agent: local_agent_detail(agent),
+            })
+        }
+        LocalRequest::UpdateAgentProfile {
+            project_id,
+            agent_id,
+            model,
+            instructions,
+            memory,
+        } => {
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.update_agent_profile(
+                        &project_id,
+                        &agent_id,
+                        UpdateAgentProfile {
+                            model,
+                            instructions,
+                            memory,
+                        },
+                        now_ms()?,
+                    )?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentProfileUpdated {
+                agent: local_agent_detail(agent),
+            })
+        }
+        LocalRequest::SendAgentMessage {
+            id,
+            project_id,
+            sender_agent_id,
+            recipient_agent_id,
+            body,
+        } => {
+            if body.len() > MAX_AGENT_MESSAGE_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "agent message must be at most {MAX_AGENT_MESSAGE_BYTES} bytes"
+                )));
+            }
+            let message = state
+                .commit_and_publish(move |store| {
+                    let message = store.send_agent_message(NewAgentMessage {
+                        id,
+                        project_id,
+                        sender_agent_id,
+                        recipient_agent_id,
+                        body,
+                        created_at_ms: now_ms()?,
+                    })?;
+                    Ok((message, Vec::new()))
+                })
+                .await?;
+            Ok(LocalResponse::AgentMessageSent {
+                message: local_agent_message(message),
+            })
+        }
+        LocalRequest::ListAgentMessages {
+            project_id,
+            agent_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("agent message", limit, MAX_AGENT_PAGE_ITEMS)?;
+            let messages = state
+                .with_store(move |store| {
+                    store.list_agent_messages(&project_id, &agent_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let mut messages = messages
+                .into_iter()
+                .map(local_agent_message)
+                .collect::<Vec<_>>();
+            let next_after_id = next_message_cursor(&mut messages, limit);
+            Ok(LocalResponse::AgentMessages {
+                messages,
                 next_after_id,
             })
         }
@@ -557,6 +660,16 @@ async fn handle_request(
                             exhausted: provider.exhausted,
                             severity: local_subscription_severity(provider.severity),
                             consecutive_failures: provider.consecutive_failures,
+                            windows: provider
+                                .windows
+                                .into_iter()
+                                .map(|window| LocalSubscriptionUsageWindow {
+                                    window: local_subscription_window(window.window),
+                                    used_percent: window.used_percent,
+                                    resets_at_ms: window.resets_at_ms,
+                                    exhausted: window.exhausted,
+                                })
+                                .collect(),
                         })
                         .collect(),
                 },
@@ -601,15 +714,14 @@ async fn handle_request(
     }
 }
 
-const fn store_subscription_outcome(
-    outcome: LocalSubscriptionProbeOutcome,
-) -> SubscriptionProbeOutcome {
+fn store_subscription_outcome(outcome: LocalSubscriptionProbeOutcome) -> SubscriptionProbeOutcome {
     match outcome {
         LocalSubscriptionProbeOutcome::Observed {
             used_percent,
             limit_window,
             resets_at_ms,
             exhausted,
+            windows,
         } => SubscriptionProbeOutcome::Observed {
             used_percent,
             limit_window: match limit_window {
@@ -622,6 +734,26 @@ const fn store_subscription_outcome(
             },
             resets_at_ms,
             exhausted,
+            windows: windows
+                .into_iter()
+                .map(|window| SubscriptionUsageWindow {
+                    window: match window.window {
+                        LocalSubscriptionLimitWindow::Primary => SubscriptionLimitWindow::Primary,
+                        LocalSubscriptionLimitWindow::Secondary => {
+                            SubscriptionLimitWindow::Secondary
+                        }
+                        LocalSubscriptionLimitWindow::CurrentSession => {
+                            SubscriptionLimitWindow::CurrentSession
+                        }
+                        LocalSubscriptionLimitWindow::CurrentWeek => {
+                            SubscriptionLimitWindow::CurrentWeek
+                        }
+                    },
+                    used_percent: window.used_percent,
+                    resets_at_ms: window.resets_at_ms,
+                    exhausted: window.exhausted,
+                })
+                .collect(),
         },
         LocalSubscriptionProbeOutcome::Failed { category } => SubscriptionProbeOutcome::Failed {
             category: match category {
@@ -655,6 +787,30 @@ const fn local_subscription_window(
         SubscriptionLimitWindow::Secondary => LocalSubscriptionLimitWindow::Secondary,
         SubscriptionLimitWindow::CurrentSession => LocalSubscriptionLimitWindow::CurrentSession,
         SubscriptionLimitWindow::CurrentWeek => LocalSubscriptionLimitWindow::CurrentWeek,
+    }
+}
+
+fn local_agent_detail(agent: crate::store::AgentDetail) -> LocalAgentDetail {
+    LocalAgentDetail {
+        snapshot: agent.snapshot,
+        profile: LocalAgentProfile {
+            model: agent.profile.model,
+            instructions: agent.profile.instructions,
+            memory: agent.profile.memory,
+            updated_at_ms: agent.profile.updated_at_ms,
+        },
+    }
+}
+
+fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
+    LocalAgentMessage {
+        id: message.id,
+        project_id: message.project_id,
+        sender_agent_id: message.sender_agent_id,
+        recipient_agent_id: message.recipient_agent_id,
+        body: message.body,
+        created_at_ms: message.created_at_ms,
+        delivered_at_ms: message.delivered_at_ms,
     }
 }
 
@@ -996,6 +1152,14 @@ fn next_run_cursor(runs: &mut Vec<RunSnapshot>, limit: usize) -> Option<RunId> {
     }
     runs.pop();
     runs.last().map(|run| run.id.clone())
+}
+
+fn next_message_cursor(messages: &mut Vec<LocalAgentMessage>, limit: usize) -> Option<MessageId> {
+    if messages.len() <= limit {
+        return None;
+    }
+    messages.pop();
+    messages.last().map(|message| message.id.clone())
 }
 
 fn now_ms() -> Result<i64, StoreError> {

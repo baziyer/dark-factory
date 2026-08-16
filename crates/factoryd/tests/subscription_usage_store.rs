@@ -60,6 +60,7 @@ fn observed(
             limit_window: SubscriptionLimitWindow::Primary,
             resets_at_ms: Some(at + 10_000),
             exhausted,
+            windows: Vec::new(),
         },
         notification_task_id: task_id(notification),
     }

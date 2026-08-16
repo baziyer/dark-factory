@@ -3,6 +3,7 @@ use std::{
     collections::BTreeMap,
     sync::mpsc::{self, Receiver, Sender},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui::{self, Color32, RichText};
@@ -10,8 +11,9 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, TaskDetail, TaskId, TaskStatus,
     local::{
-        LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
-        MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RunTerminal, ServerFrame, SubscriptionSeverity,
+        AgentDetail, AgentMessage, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS,
+        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RunTerminal, ServerFrame,
+        SubscriptionLimitWindow, SubscriptionProviderStatus, SubscriptionSeverity,
         SubscriptionUsageStatus,
     },
 };
@@ -45,6 +47,22 @@ enum UiMessage {
     },
     Event(EventEnvelope),
     TaskDetail(Result<TaskDetail, String>),
+    AgentDetail {
+        agent_id: AgentId,
+        result: Result<AgentDetail, String>,
+    },
+    AgentProfile {
+        agent_id: AgentId,
+        result: Result<AgentDetail, String>,
+    },
+    AgentMessages {
+        agent_id: AgentId,
+        result: Result<Vec<AgentMessage>, String>,
+    },
+    AgentMessageSent {
+        agent_id: AgentId,
+        result: Result<AgentMessage, String>,
+    },
     RunTerminal {
         request_id: u64,
         result: Result<RunTerminal, String>,
@@ -73,11 +91,14 @@ struct FactoryApp {
     projects: BTreeMap<ProjectId, ProjectSnapshot>,
     tasks: BTreeMap<TaskId, TaskDetail>,
     agents: BTreeMap<AgentId, AgentSnapshot>,
+    agent_details: BTreeMap<AgentId, AgentDetail>,
+    agent_messages: BTreeMap<AgentId, Vec<AgentMessage>>,
     runs: BTreeMap<RunId, RunSnapshot>,
     usage: Option<SubscriptionUsageStatus>,
     recent: Vec<EventEnvelope>,
     selected_project: Option<ProjectId>,
     show_all_queue: bool,
+    show_history: bool,
     selected_task: Option<TaskId>,
     selected_agent: Option<AgentId>,
     terminal_run_id: Option<RunId>,
@@ -93,6 +114,17 @@ struct FactoryApp {
     create_task: Option<TaskForm>,
     start: StartForm,
     queue_owner_editor: Option<QueueOwnerEditor>,
+    agent_profile_draft: Option<AgentProfileDraft>,
+    agent_profile_pending: Option<AgentId>,
+    agent_profile_error: Option<String>,
+    agent_message_draft: String,
+    agent_message_pending: bool,
+}
+
+struct AgentProfileDraft {
+    model: String,
+    instructions: String,
+    memory: String,
 }
 
 #[derive(Clone, Copy)]
@@ -109,10 +141,16 @@ struct ProjectForm {
 }
 
 struct AgentForm {
-    id: String,
-    parent: String,
+    parent: Option<AgentId>,
     role: AgentRole,
     provider: Provider,
+    model: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ModelOption {
+    label: &'static str,
+    value: Option<&'static str>,
 }
 
 struct TaskForm {
@@ -202,11 +240,14 @@ impl FactoryApp {
             projects: BTreeMap::new(),
             tasks: BTreeMap::new(),
             agents: BTreeMap::new(),
+            agent_details: BTreeMap::new(),
+            agent_messages: BTreeMap::new(),
             runs: BTreeMap::new(),
             usage: None,
             recent: Vec::new(),
             selected_project: None,
             show_all_queue: false,
+            show_history: false,
             selected_task: None,
             selected_agent: None,
             terminal_run_id: None,
@@ -222,6 +263,11 @@ impl FactoryApp {
             create_task: None,
             start: StartForm::default(),
             queue_owner_editor: None,
+            agent_profile_draft: None,
+            agent_profile_pending: None,
+            agent_profile_error: None,
+            agent_message_draft: String::new(),
+            agent_message_pending: false,
         }
     }
 
@@ -290,6 +336,58 @@ impl FactoryApp {
                         }
                     }
                     Err(message) => self.notice = Some(message),
+                },
+                UiMessage::AgentDetail { agent_id, result } => match result {
+                    Ok(detail) => {
+                        self.agent_details.insert(agent_id.clone(), detail.clone());
+                        if self.selected_agent.as_ref() == Some(&agent_id) {
+                            self.agent_profile_draft = Some(agent_profile_draft(&detail));
+                            self.agent_profile_error = None;
+                        }
+                    }
+                    Err(message) => {
+                        if self.selected_agent.as_ref() == Some(&agent_id) {
+                            self.agent_profile_draft = None;
+                            self.agent_profile_error = Some(message.clone());
+                            self.notice = Some(message);
+                        }
+                    }
+                },
+                UiMessage::AgentProfile { agent_id, result } => match result {
+                    Ok(detail) => {
+                        self.agent_details.insert(agent_id.clone(), detail.clone());
+                        if self.selected_agent.as_ref() == Some(&agent_id)
+                            && self.agent_profile_pending.as_ref() == Some(&agent_id)
+                        {
+                            self.agent_profile_draft = Some(agent_profile_draft(&detail));
+                            self.agent_profile_pending = None;
+                            self.notice = Some(format!("Updated profile for agent {agent_id}"));
+                        }
+                    }
+                    Err(message) => {
+                        if self.agent_profile_pending.as_ref() == Some(&agent_id) {
+                            self.agent_profile_pending = None;
+                            self.notice = Some(message);
+                        }
+                    }
+                },
+                UiMessage::AgentMessages { agent_id, result } => match result {
+                    Ok(messages) => {
+                        self.agent_messages.insert(agent_id, messages);
+                    }
+                    Err(message) => self.notice = Some(message),
+                },
+                UiMessage::AgentMessageSent { agent_id, result } => match result {
+                    Ok(_) => {
+                        self.agent_message_pending = false;
+                        self.agent_message_draft.clear();
+                        self.load_agent_messages(context, agent_id);
+                        self.notice = Some("Message queued for the agent's next task".into());
+                    }
+                    Err(message) => {
+                        self.agent_message_pending = false;
+                        self.notice = Some(message);
+                    }
                 },
                 UiMessage::RunTerminal { request_id, result } => match result {
                     Ok(terminal)
@@ -472,6 +570,67 @@ impl FactoryApp {
             .collect()
     }
 
+    fn select_agent(&mut self, context: &egui::Context, agent_id: AgentId) {
+        self.selected_agent = Some(agent_id.clone());
+        self.selected_task = None;
+        self.agent_profile_draft = None;
+        self.agent_profile_pending = None;
+        self.agent_profile_error = None;
+        self.agent_message_draft.clear();
+        self.agent_message_pending = false;
+        if let Some(detail) = self.agent_details.get(&agent_id) {
+            self.agent_profile_draft = Some(agent_profile_draft(detail));
+        } else {
+            self.load_agent_detail(context, agent_id.clone());
+        }
+        self.load_agent_messages(context, agent_id.clone());
+        if let Some(run_id) = self
+            .agents
+            .get(&agent_id)
+            .and_then(|agent| self.run_for_agent(agent))
+            .map(|run| run.id.clone())
+        {
+            self.load_terminal(context, run_id);
+        } else {
+            self.terminal_run_id = None;
+            self.terminal = None;
+        }
+    }
+
+    fn load_agent_detail(&mut self, context: &egui::Context, agent_id: AgentId) {
+        let Some(project_id) = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| agent.project_id.clone())
+        else {
+            return;
+        };
+        spawn_agent_detail(
+            self.client.clone(),
+            self.sender.clone(),
+            context.clone(),
+            project_id,
+            agent_id,
+        );
+    }
+
+    fn load_agent_messages(&self, context: &egui::Context, agent_id: AgentId) {
+        let Some(project_id) = self
+            .agents
+            .get(&agent_id)
+            .map(|agent| agent.project_id.clone())
+        else {
+            return;
+        };
+        spawn_agent_messages(
+            self.client.clone(),
+            self.sender.clone(),
+            context.clone(),
+            project_id,
+            agent_id,
+        );
+    }
+
     fn sync_queue_owner_editor(&mut self, task: &TaskDetail) {
         let value = task
             .snapshot
@@ -533,21 +692,15 @@ impl FactoryApp {
                 ui.label(format!("{running} active · {blocked} blocked"));
                 if let Some(usage) = &self.usage {
                     ui.separator();
-                    let (label, color) = match usage.overall_severity {
-                        SubscriptionSeverity::Ok => ("capacity ok", Color32::LIGHT_GREEN),
-                        SubscriptionSeverity::Warning => ("capacity warning", Color32::YELLOW),
-                        SubscriptionSeverity::Critical => ("capacity critical", Color32::LIGHT_RED),
-                    };
-                    ui.label(RichText::new(label).color(color))
-                        .on_hover_ui(|ui| {
-                            for provider in &usage.providers {
-                                let percent = provider.used_percent.map_or_else(
-                                    || "unknown".to_owned(),
-                                    |value| format!("{value}%"),
-                                );
-                                ui.label(format!("{:?} {percent}", provider.provider));
-                            }
-                        });
+                    for provider in &usage.providers {
+                        let color = match provider.severity {
+                            SubscriptionSeverity::Ok => Color32::LIGHT_GREEN,
+                            SubscriptionSeverity::Warning => Color32::YELLOW,
+                            SubscriptionSeverity::Critical => Color32::LIGHT_RED,
+                        };
+                        ui.label(RichText::new(provider_usage_line(provider)).color(color))
+                            .on_hover_ui(|ui| provider_usage_details(ui, provider));
+                    }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
@@ -574,10 +727,10 @@ impl FactoryApp {
                             .clicked()
                         {
                             self.create_agent = Some(AgentForm {
-                                id: short_id("worker"),
-                                parent: String::new(),
+                                parent: None,
                                 role: AgentRole::Worker,
                                 provider: Provider::Codex,
+                                model: String::new(),
                             });
                             ui.close();
                         }
@@ -660,7 +813,7 @@ impl FactoryApp {
                 if let Some(agent_id) = self.selected_agent.clone() {
                     if let Some(agent) = self.agents.get(&agent_id).cloned() {
                         let run = self.run_for_agent(&agent).cloned();
-                        agent_inspector(ui, &agent, run.as_ref());
+                        self.agent_inspector(ui, context, &agent, run.as_ref());
                         if let Some(run) = run {
                             self.terminal_panel(ui, context, &run);
                         }
@@ -851,6 +1004,179 @@ impl FactoryApp {
         }
     }
 
+    fn agent_inspector(
+        &mut self,
+        ui: &mut egui::Ui,
+        context: &egui::Context,
+        agent: &AgentSnapshot,
+        run: Option<&RunSnapshot>,
+    ) {
+        agent_inspector_summary(ui, agent, run);
+        ui.separator();
+        let children = self
+            .agents
+            .values()
+            .filter(|candidate| {
+                candidate.project_id == agent.project_id
+                    && candidate.parent_agent_id.as_ref() == Some(&agent.id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        ui.collapsing(format!("Team · {} child agents", children.len()), |ui| {
+            if children.is_empty() {
+                ui.label(RichText::new("No child agents configured.").italics());
+            }
+            for child in children {
+                if ui
+                    .selectable_label(false, format!("{} · {:?}", child.id, child.provider))
+                    .clicked()
+                {
+                    self.select_agent(context, child.id);
+                }
+            }
+        });
+        ui.separator();
+        let messages = self
+            .agent_messages
+            .get(&agent.id)
+            .cloned()
+            .unwrap_or_default();
+        let pending_messages = messages
+            .iter()
+            .filter(|message| message.delivered_at_ms.is_none())
+            .count();
+        ui.collapsing(
+            format!("Messages · {pending_messages} queued for next task"),
+            |ui| {
+                if messages.is_empty() {
+                    ui.label(RichText::new("No messages yet.").italics());
+                } else {
+                    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        for message in &messages {
+                            let status = if message.delivered_at_ms.is_some() {
+                                "delivered"
+                            } else {
+                                "queued"
+                            };
+                            ui.label(format!("{status}: {}", message.body));
+                        }
+                    });
+                }
+                ui.label(
+                    RichText::new(
+                        "Queued messages are added to the next explicit provider launch; they do not interrupt an active run.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_enabled_ui(!self.agent_message_pending, |ui| {
+                    ui.label("Message to agent");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.agent_message_draft)
+                            .desired_rows(3)
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            },
+        );
+        let mut send_message = false;
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.agent_message_pending && !self.agent_message_draft.trim().is_empty(),
+                    egui::Button::new("Queue message"),
+                )
+                .clicked()
+            {
+                send_message = true;
+            }
+        });
+        if send_message {
+            self.agent_message_pending = true;
+            spawn_agent_message_send(
+                self.client.clone(),
+                self.sender.clone(),
+                context.clone(),
+                agent.project_id.clone(),
+                agent.id.clone(),
+                self.agent_message_draft.trim().to_owned(),
+            );
+        }
+        ui.separator();
+        ui.label(RichText::new("Agent profile").strong());
+        let Some(draft) = self.agent_profile_draft.as_mut() else {
+            ui.label(
+                RichText::new(agent_profile_load_message(
+                    self.agent_profile_error.as_deref(),
+                ))
+                .italics(),
+            );
+            return;
+        };
+        let pending = self.agent_profile_pending.is_some();
+        ui.add_enabled_ui(!pending, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Model");
+                let options = provider_model_options(agent.provider);
+                let selected = options
+                    .iter()
+                    .find(|option| option.value == (!draft.model.is_empty()).then_some(draft.model.as_str()))
+                    .map_or("Choose a model", |option| option.label);
+                egui::ComboBox::from_id_salt(("agent-profile-model", agent.id.clone()))
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for option in options {
+                            ui.selectable_value(
+                                &mut draft.model,
+                                option.value.unwrap_or_default().to_owned(),
+                                option.label,
+                            );
+                        }
+                    });
+            });
+            ui.label(
+                RichText::new("Models are scoped to the installed provider CLI; Provider default uses its configured default.")
+                    .small()
+                    .weak(),
+            );
+            ui.label("Standing guidance");
+            ui.label(RichText::new(agent_profile_guidance_help()).small().weak());
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.instructions)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+            ui.label("Memory");
+            ui.add(
+                egui::TextEdit::multiline(&mut draft.memory)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        if pending {
+            ui.label(RichText::new("Saving profile…").small().weak());
+        }
+        if ui
+            .add_enabled(!pending, egui::Button::new("Save profile"))
+            .clicked()
+        {
+            let model = (!draft.model.trim().is_empty()).then(|| draft.model.trim().to_owned());
+            self.agent_profile_pending = Some(agent.id.clone());
+            spawn_agent_profile_update(
+                self.client.clone(),
+                self.sender.clone(),
+                context.clone(),
+                LocalRequest::UpdateAgentProfile {
+                    project_id: agent.project_id.clone(),
+                    agent_id: agent.id.clone(),
+                    model,
+                    instructions: draft.instructions.clone(),
+                    memory: draft.memory.clone(),
+                },
+            );
+        }
+    }
+
     fn terminal_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context, run: &RunSnapshot) {
         ui.separator();
         ui.label(RichText::new("Terminal · local runner").strong());
@@ -996,8 +1322,23 @@ impl FactoryApp {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
+            let completed_count = tasks
+                .iter()
+                .filter(|task| !task_is_visible(task.snapshot.status, false))
+                .count();
+            let active_count = tasks.len().saturating_sub(completed_count);
             ui.separator();
-            ui.label(RichText::new("Agents").strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Agents").strong());
+                if ui.button("New agent").clicked() {
+                    self.create_agent = Some(AgentForm {
+                        parent: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                        model: String::new(),
+                    });
+                }
+            });
             egui::ScrollArea::horizontal()
                 .id_salt("agent-strip")
                 .show(ui, |ui| {
@@ -1017,15 +1358,7 @@ impl FactoryApp {
                                 )
                                 .clicked()
                             {
-                                let run_id = run.map(|run| run.id.clone());
-                                self.selected_agent = Some(agent.id);
-                                self.selected_task = None;
-                                if let Some(run_id) = run_id {
-                                    self.load_terminal(context, run_id);
-                                } else {
-                                    self.terminal_run_id = None;
-                                    self.terminal = None;
-                                }
+                                self.select_agent(context, agent.id);
                             }
                         }
                     });
@@ -1069,27 +1402,46 @@ impl FactoryApp {
                 ));
             });
             ui.separator();
-            ui.label(RichText::new(format!("Tasks · {}", tasks.len())).strong());
-            ui.columns(4, |columns| {
-                for (index, (title, status)) in [
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Active tasks · {active_count}")).strong());
+                if ui
+                    .button(if self.show_history {
+                        format!("Hide history · {completed_count}")
+                    } else {
+                        format!("History · {completed_count}")
+                    })
+                    .clicked()
+                {
+                    self.show_history = !self.show_history;
+                }
+            });
+            let columns = if self.show_history {
+                vec![
                     ("QUEUED", TaskColumn::Queued),
                     ("RUNNING", TaskColumn::Running),
                     ("BLOCKED", TaskColumn::Blocked),
                     ("DONE", TaskColumn::Done),
                 ]
-                .into_iter()
-                .enumerate()
-                {
-                    columns[index].label(RichText::new(title).strong());
-                    columns[index].separator();
+            } else {
+                vec![
+                    ("QUEUED", TaskColumn::Queued),
+                    ("RUNNING", TaskColumn::Running),
+                    ("BLOCKED", TaskColumn::Blocked),
+                ]
+            };
+            let show_history = self.show_history;
+            ui.columns(columns.len(), |columns_ui| {
+                for (index, (title, status)) in columns.into_iter().enumerate() {
+                    columns_ui[index].label(RichText::new(title).strong());
+                    columns_ui[index].separator();
                     egui::ScrollArea::vertical()
                         .id_salt(("task-column", index))
                         .auto_shrink([false, false])
-                        .show(&mut columns[index], |ui| {
-                            for task in tasks
-                                .iter()
-                                .filter(|task| status.matches(task.snapshot.status))
-                            {
+                        .show(&mut columns_ui[index], |ui| {
+                            for task in tasks.iter().filter(|task| {
+                                task_is_visible(task.snapshot.status, show_history)
+                                    && status.matches(task.snapshot.status)
+                            }) {
                                 let selected =
                                     self.selected_task.as_ref() == Some(&task.snapshot.id);
                                 if ui
@@ -1181,13 +1533,41 @@ impl FactoryApp {
         let Some(project_id) = self.selected_project.clone() else {
             return;
         };
+        let agents = self
+            .project_agents()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let parent_options = parent_agent_options(&agents);
         let mut open = true;
         let mut submit = false;
         egui::Window::new("New agent")
             .open(&mut open)
             .show(context, |ui| {
-                field(ui, "ID", &mut form.id);
-                field(ui, "Parent (optional)", &mut form.parent);
+                ui.label(
+                    RichText::new("The agent ID is generated automatically.")
+                        .small()
+                        .weak(),
+                );
+                ui.horizontal(|ui| {
+                    ui.label("Parent");
+                    egui::ComboBox::from_id_salt("new-agent-parent")
+                        .selected_text(
+                            form.parent
+                                .as_ref()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| "None".into()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for option in &parent_options {
+                                let label = option
+                                    .as_ref()
+                                    .map(ToString::to_string)
+                                    .unwrap_or_else(|| "None".into());
+                                ui.selectable_value(&mut form.parent, option.clone(), label);
+                            }
+                        });
+                });
                 ui.horizontal(|ui| {
                     ui.label("Role");
                     ui.selectable_value(&mut form.role, AgentRole::Worker, "worker");
@@ -1198,30 +1578,51 @@ impl FactoryApp {
                     ui.selectable_value(&mut form.provider, Provider::Codex, "Codex");
                     ui.selectable_value(&mut form.provider, Provider::ClaudeCode, "Claude");
                 });
+                let options = provider_model_options(form.provider);
+                if !options.iter().any(|option| {
+                    option.value == (!form.model.is_empty()).then_some(form.model.as_str())
+                }) {
+                    form.model.clear();
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Model");
+                    let selected = options
+                        .iter()
+                        .find(|option| {
+                            option.value == (!form.model.is_empty()).then_some(form.model.as_str())
+                        })
+                        .map_or("Choose a model", |option| option.label);
+                    egui::ComboBox::from_id_salt("new-agent-model")
+                        .selected_text(selected)
+                        .show_ui(ui, |ui| {
+                            for option in options {
+                                ui.selectable_value(
+                                    &mut form.model,
+                                    option.value.unwrap_or_default().to_owned(),
+                                    option.label,
+                                );
+                            }
+                        });
+                });
+                ui.label(
+                    RichText::new("Provider default uses the CLI's configured model.")
+                        .small()
+                        .weak(),
+                );
                 submit = ui.button("Create agent").clicked();
             });
         if submit {
-            let parsed = AgentId::try_from(form.id.clone()).and_then(|id| {
-                let parent_agent_id = if form.parent.trim().is_empty() {
-                    None
-                } else {
-                    Some(AgentId::try_from(form.parent.clone())?)
-                };
-                Ok((id, parent_agent_id))
-            });
-            match parsed {
-                Ok((id, parent_agent_id)) => self.submit(
-                    LocalRequest::CreateAgent {
-                        id,
-                        project_id,
-                        parent_agent_id,
-                        role: form.role,
-                        provider: form.provider,
-                    },
-                    context,
-                ),
-                Err(error) => self.notice = Some(error.to_string()),
-            }
+            self.submit(
+                LocalRequest::CreateAgent {
+                    id: AgentId::try_from(short_id("agent")).expect("generated agent ID is valid"),
+                    project_id,
+                    parent_agent_id: form.parent,
+                    role: form.role,
+                    provider: form.provider,
+                    model: (!form.model.trim().is_empty()).then(|| form.model.trim().to_owned()),
+                },
+                context,
+            );
         } else if open {
             self.create_agent = Some(form);
         }
@@ -1286,6 +1687,115 @@ enum TaskColumn {
     Running,
     Blocked,
     Done,
+}
+
+fn task_is_visible(status: TaskStatus, show_history: bool) -> bool {
+    show_history
+        || !matches!(
+            status,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+}
+
+fn provider_usage_line(provider: &SubscriptionProviderStatus) -> String {
+    let provider_name = match provider.provider {
+        Provider::Codex => "Codex",
+        Provider::ClaudeCode => "Claude",
+    };
+    let buckets = [
+        SubscriptionLimitWindow::Primary,
+        SubscriptionLimitWindow::Secondary,
+        SubscriptionLimitWindow::CurrentSession,
+        SubscriptionLimitWindow::CurrentWeek,
+    ]
+    .into_iter()
+    .filter_map(|window| {
+        provider
+            .windows
+            .iter()
+            .find(|usage| usage.window == window)
+            .map(|usage| {
+                format!(
+                    "{} {}%",
+                    usage_window_label(provider.provider, window),
+                    usage.used_percent
+                )
+            })
+    })
+    .collect::<Vec<_>>();
+    if buckets.is_empty() {
+        provider.used_percent.map_or_else(
+            || format!("{provider_name} · usage unavailable"),
+            |percent| format!("{provider_name} · {percent}%"),
+        )
+    } else {
+        format!("{provider_name} · {}", buckets.join(" · "))
+    }
+}
+
+fn provider_usage_details(ui: &mut egui::Ui, provider: &SubscriptionProviderStatus) {
+    ui.label(RichText::new(provider_usage_line(provider)).strong());
+    if provider.windows.is_empty() {
+        ui.label("No separate 5h/7d buckets were returned by the provider.");
+    } else {
+        for usage in &provider.windows {
+            let reset = usage
+                .resets_at_ms
+                .map_or_else(|| "reset time unavailable".to_owned(), format_reset);
+            ui.label(format!(
+                "{}: {}% used · {}{}",
+                usage_window_label(provider.provider, usage.window),
+                usage.used_percent,
+                reset,
+                if usage.exhausted { " · exhausted" } else { "" },
+            ));
+        }
+    }
+    if provider.consecutive_failures > 0 {
+        ui.label(format!(
+            "{} consecutive usage probe failures",
+            provider.consecutive_failures
+        ));
+    }
+}
+
+fn usage_window_label(provider: Provider, window: SubscriptionLimitWindow) -> &'static str {
+    match (provider, window) {
+        (Provider::Codex, SubscriptionLimitWindow::Primary)
+        | (Provider::ClaudeCode, SubscriptionLimitWindow::CurrentSession) => "5h",
+        (Provider::Codex, SubscriptionLimitWindow::Secondary)
+        | (Provider::ClaudeCode, SubscriptionLimitWindow::CurrentWeek) => "7d",
+        (_, SubscriptionLimitWindow::Primary) => "primary",
+        (_, SubscriptionLimitWindow::Secondary) => "secondary",
+        (_, SubscriptionLimitWindow::CurrentSession) => "session",
+        (_, SubscriptionLimitWindow::CurrentWeek) => "week",
+    }
+}
+
+fn format_reset(reset_at_ms: i64) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(reset_at_ms);
+    let remaining_ms = reset_at_ms.saturating_sub(now_ms);
+    match remaining_ms.cmp(&0) {
+        Ordering::Equal => "reset now".to_owned(),
+        Ordering::Less => "reset overdue".to_owned(),
+        Ordering::Greater => {
+            let minutes = remaining_ms / 60_000;
+            let days = minutes / (24 * 60);
+            let hours = (minutes % (24 * 60)) / 60;
+            let minutes = minutes % 60;
+            if days > 0 {
+                format!("resets in {days}d {hours}h")
+            } else if hours > 0 {
+                format!("resets in {hours}h {minutes}m")
+            } else {
+                format!("resets in {minutes}m")
+            }
+        }
+    }
 }
 
 impl TaskColumn {
@@ -1463,7 +1973,7 @@ fn agent_card_text(agent: &AgentSnapshot, run: Option<&RunSnapshot>) -> String {
     format!("{}\n{:?} · {state}", agent.id, agent.provider)
 }
 
-fn agent_inspector(ui: &mut egui::Ui, agent: &AgentSnapshot, run: Option<&RunSnapshot>) {
+fn agent_inspector_summary(ui: &mut egui::Ui, agent: &AgentSnapshot, run: Option<&RunSnapshot>) {
     ui.heading(agent.id.to_string());
     ui.label(format!("{:?} · {:?}", agent.role, agent.provider));
     ui.separator();
@@ -1582,6 +2092,184 @@ fn load_task_detail(
         LocalResponse::Task { task } => Ok(task),
         _ => Err("daemon returned an unexpected task detail response".into()),
     }
+}
+
+fn agent_profile_draft(detail: &AgentDetail) -> AgentProfileDraft {
+    AgentProfileDraft {
+        model: detail.profile.model.clone().unwrap_or_default(),
+        instructions: detail.profile.instructions.clone(),
+        memory: detail.profile.memory.clone(),
+    }
+}
+
+fn provider_model_options(provider: Provider) -> &'static [ModelOption] {
+    const CODEX: &[ModelOption] = &[
+        ModelOption {
+            label: "Provider default",
+            value: None,
+        },
+        ModelOption {
+            label: "GPT-5.6 Luna",
+            value: Some("gpt-5.6-luna"),
+        },
+        ModelOption {
+            label: "GPT-5 Codex",
+            value: Some("gpt-5-codex"),
+        },
+    ];
+    const CLAUDE: &[ModelOption] = &[
+        ModelOption {
+            label: "Provider default",
+            value: None,
+        },
+        ModelOption {
+            label: "Sonnet",
+            value: Some("sonnet"),
+        },
+        ModelOption {
+            label: "Opus",
+            value: Some("opus"),
+        },
+        ModelOption {
+            label: "Fable",
+            value: Some("fable"),
+        },
+    ];
+    match provider {
+        Provider::Codex => CODEX,
+        Provider::ClaudeCode => CLAUDE,
+    }
+}
+
+const fn agent_profile_guidance_help() -> &'static str {
+    "Persistent guidance included with every new task. Use Message for the next task."
+}
+
+fn parent_agent_options(agents: &[AgentSnapshot]) -> Vec<Option<AgentId>> {
+    let mut options = vec![None];
+    options.extend(agents.iter().map(|agent| Some(agent.id.clone())));
+    options
+}
+
+fn agent_profile_load_message(error: Option<&str>) -> String {
+    error.map_or_else(
+        || "Loading profile…".to_owned(),
+        |error| format!("Profile unavailable: {error}"),
+    )
+}
+
+fn spawn_agent_detail(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) {
+    thread::spawn(move || {
+        let response_agent_id = agent_id.clone();
+        let result = request_response(
+            &client,
+            LocalRequest::GetAgent {
+                project_id,
+                agent_id,
+            },
+        )
+        .and_then(|response| match response {
+            LocalResponse::Agent { agent } => Ok(agent),
+            _ => Err("daemon returned an unexpected agent detail response".into()),
+        });
+        let _ = sender.send(UiMessage::AgentDetail {
+            agent_id: response_agent_id,
+            result,
+        });
+        context.request_repaint();
+    });
+}
+
+fn spawn_agent_profile_update(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    request: LocalRequest,
+) {
+    thread::spawn(move || {
+        let response_agent_id = match &request {
+            LocalRequest::UpdateAgentProfile { agent_id, .. } => agent_id.clone(),
+            _ => unreachable!("profile update helper receives one request shape"),
+        };
+        let result = request_response(&client, request).and_then(|response| match response {
+            LocalResponse::AgentProfileUpdated { agent } => Ok(agent),
+            _ => Err("daemon returned an unexpected agent profile response".into()),
+        });
+        let _ = sender.send(UiMessage::AgentProfile {
+            agent_id: response_agent_id,
+            result,
+        });
+        context.request_repaint();
+    });
+}
+
+fn spawn_agent_messages(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) {
+    thread::spawn(move || {
+        let response_agent_id = agent_id.clone();
+        let result = request_response(
+            &client,
+            LocalRequest::ListAgentMessages {
+                project_id,
+                agent_id,
+                after_id: None,
+                limit: MAX_AGENT_PAGE_ITEMS,
+            },
+        )
+        .and_then(|response| match response {
+            LocalResponse::AgentMessages { messages, .. } => Ok(messages),
+            _ => Err("daemon returned an unexpected agent messages response".into()),
+        });
+        let _ = sender.send(UiMessage::AgentMessages {
+            agent_id: response_agent_id,
+            result,
+        });
+        context.request_repaint();
+    });
+}
+
+fn spawn_agent_message_send(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    project_id: ProjectId,
+    agent_id: AgentId,
+    body: String,
+) {
+    thread::spawn(move || {
+        let response_agent_id = agent_id.clone();
+        let result = request_response(
+            &client,
+            LocalRequest::SendAgentMessage {
+                id: factory_core::MessageId::try_from(short_id("message"))
+                    .expect("generated message ID is valid"),
+                project_id,
+                sender_agent_id: None,
+                recipient_agent_id: agent_id,
+                body,
+            },
+        )
+        .and_then(|response| match response {
+            LocalResponse::AgentMessageSent { message } => Ok(message),
+            _ => Err("daemon returned an unexpected agent message response".into()),
+        });
+        let _ = sender.send(UiMessage::AgentMessageSent {
+            agent_id: response_agent_id,
+            result,
+        });
+        context.request_repaint();
+    });
 }
 
 fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
@@ -1803,13 +2491,85 @@ mod tests {
     use factory_core::{
         AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth, ProjectId,
         Provider, RunId, RunSnapshot, RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
-        local::RunTerminal,
+        local::{RunTerminal, SubscriptionSeverity},
     };
 
     use super::{
-        TaskColumn, agent_card_text, allocation_counts, event_requires_detail_refresh,
-        task_assignee_text, task_result_text,
+        TaskColumn, agent_card_text, agent_profile_guidance_help, agent_profile_load_message,
+        allocation_counts, event_requires_detail_refresh, parent_agent_options,
+        provider_model_options, provider_usage_line, task_assignee_text, task_is_visible,
+        task_result_text,
     };
+
+    #[test]
+    fn agent_creation_uses_existing_agents_as_parent_choices() {
+        let agents = vec![
+            AgentSnapshot {
+                id: AgentId::try_from("god").unwrap(),
+                project_id: ProjectId::try_from("factory").unwrap(),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Codex,
+                current_run_id: None,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            AgentSnapshot {
+                id: AgentId::try_from("worker").unwrap(),
+                project_id: ProjectId::try_from("factory").unwrap(),
+                parent_agent_id: Some(AgentId::try_from("god").unwrap()),
+                role: AgentRole::Worker,
+                provider: Provider::ClaudeCode,
+                current_run_id: None,
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            },
+        ];
+        let options = parent_agent_options(&agents);
+        assert_eq!(
+            options,
+            vec![
+                None,
+                Some(AgentId::try_from("god").unwrap()),
+                Some(AgentId::try_from("worker").unwrap())
+            ]
+        );
+    }
+
+    #[test]
+    fn profile_load_errors_replace_the_indefinite_loading_state() {
+        assert_eq!(agent_profile_load_message(None), "Loading profile…");
+        assert_eq!(
+            agent_profile_load_message(Some("request is not valid local protocol JSON")),
+            "Profile unavailable: request is not valid local protocol JSON"
+        );
+    }
+
+    #[test]
+    fn model_picker_is_scoped_to_the_selected_provider() {
+        let codex = provider_model_options(Provider::Codex);
+        let claude = provider_model_options(Provider::ClaudeCode);
+        assert_eq!(codex.first().unwrap().value, None);
+        assert_eq!(claude.first().unwrap().value, None);
+        assert!(
+            codex
+                .iter()
+                .any(|option| option.value == Some("gpt-5.6-luna"))
+        );
+        assert!(claude.iter().any(|option| option.value == Some("sonnet")));
+        assert!(!codex.iter().any(|option| option.value == Some("sonnet")));
+        assert!(
+            !claude
+                .iter()
+                .any(|option| option.value == Some("gpt-5.6-luna"))
+        );
+    }
+
+    #[test]
+    fn profile_guidance_is_explicitly_persistent_not_the_next_message() {
+        assert!(agent_profile_guidance_help().contains("every new task"));
+        assert!(agent_profile_guidance_help().contains("Message"));
+    }
 
     #[test]
     fn older_snapshot_generations_and_event_heads_are_rejected() {
@@ -1904,6 +2664,44 @@ mod tests {
         ] {
             assert!(TaskColumn::Done.matches(status));
         }
+    }
+
+    #[test]
+    fn provider_usage_line_names_both_five_hour_and_seven_day_buckets() {
+        let provider = factory_core::local::SubscriptionProviderStatus {
+            provider: Provider::Codex,
+            last_attempt_at_ms: 1,
+            last_success_at_ms: Some(1),
+            used_percent: Some(98),
+            limit_window: Some(factory_core::local::SubscriptionLimitWindow::Primary),
+            resets_at_ms: Some(2),
+            exhausted: Some(false),
+            severity: SubscriptionSeverity::Critical,
+            consecutive_failures: 0,
+            windows: vec![
+                factory_core::local::SubscriptionUsageWindow {
+                    window: factory_core::local::SubscriptionLimitWindow::Primary,
+                    used_percent: 98,
+                    resets_at_ms: Some(2),
+                    exhausted: false,
+                },
+                factory_core::local::SubscriptionUsageWindow {
+                    window: factory_core::local::SubscriptionLimitWindow::Secondary,
+                    used_percent: 61,
+                    resets_at_ms: Some(3),
+                    exhausted: false,
+                },
+            ],
+        };
+        assert_eq!(provider_usage_line(&provider), "Codex · 5h 98% · 7d 61%");
+    }
+
+    #[test]
+    fn completed_tasks_are_hidden_from_the_default_active_board() {
+        assert!(task_is_visible(TaskStatus::Queued, false));
+        assert!(task_is_visible(TaskStatus::Blocked, false));
+        assert!(!task_is_visible(TaskStatus::Succeeded, false));
+        assert!(task_is_visible(TaskStatus::Succeeded, true));
     }
 
     #[test]

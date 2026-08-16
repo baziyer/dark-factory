@@ -97,6 +97,7 @@ macro_rules! id_type {
 id_type!(ProjectId);
 id_type!(TaskId);
 id_type!(AgentId);
+id_type!(MessageId);
 id_type!(RunId);
 id_type!(RunnerInstanceId);
 
