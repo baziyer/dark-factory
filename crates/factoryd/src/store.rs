@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -556,6 +556,28 @@ pub enum StoreError {
     WebhookSnapshotTooLarge,
     #[error("subscription usage input is invalid")]
     InvalidSubscriptionProbe,
+    #[error("project was not found")]
+    ProjectNotFound,
+    #[error("task is not cancellable in the requested project")]
+    TaskNotCancellable,
+    #[error("task is not editable in the requested project")]
+    TaskNotEditable,
+    #[error("task has a non-terminal run and cannot be deleted")]
+    TaskHasActiveRun,
+    #[error("task has subtasks and cannot be deleted")]
+    TaskHasSubtasks,
+    #[error("a run of this task is the parent of another run and cannot be deleted")]
+    TaskRunHasDependents,
+    #[error("agent has an open run and cannot be deleted")]
+    AgentHasActiveRun,
+    #[error("agent has child agents and cannot be deleted")]
+    AgentHasChildren,
+    #[error("a run of this agent is the parent of another run and cannot be deleted")]
+    AgentRunHasDependents,
+    #[error("project has a non-terminal run and cannot be deleted")]
+    ProjectHasActiveRun,
+    #[error("run is not in a stoppable state")]
+    RunNotStoppable,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -2214,6 +2236,425 @@ impl Store {
         ))
     }
 
+    /// Cancels a queued or blocked task. The task keeps its current
+    /// assignment so an operator can see who last owned it; `retry_task` can
+    /// requeue it later.
+    pub fn cancel_task(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _task = load_task(&transaction, task_id)?
+            .filter(|task| task.snapshot.project_id == *project_id)
+            .ok_or(StoreError::TaskNotFound)?;
+        let changed = transaction.execute(
+            "UPDATE tasks
+             SET status = 'cancelled', updated_at_ms = ?1, completed_at_ms = ?1
+             WHERE id = ?2 AND project_id = ?3 AND status IN ('queued', 'blocked')",
+            params![now_ms, task_id.as_str(), project_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::TaskNotCancellable);
+        }
+        let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
+        let event = FactoryEvent::TaskChanged {
+            task: task.snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    /// Edits a queued task's title and/or body. Bounds are enforced by the
+    /// local API layer, mirroring `CreateTask`.
+    pub fn update_task(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        title: Option<String>,
+        body: Option<String>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _task = load_task(&transaction, task_id)?
+            .filter(|task| task.snapshot.project_id == *project_id)
+            .ok_or(StoreError::TaskNotFound)?;
+        let changed = transaction.execute(
+            "UPDATE tasks
+             SET title = COALESCE(?1, title), body = COALESCE(?2, body),
+                 updated_at_ms = ?3
+             WHERE id = ?4 AND project_id = ?5 AND status = 'queued'",
+            params![title, body, now_ms, task_id.as_str(), project_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::TaskNotEditable);
+        }
+        let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
+        let event = FactoryEvent::TaskChanged {
+            task: task.snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    /// Deletes a task that has no non-terminal run, no subtasks, and no run
+    /// that is itself the parent of another run. Terminal runs and every row
+    /// that references the task (questions, dependencies, webhook
+    /// capabilities, subscription notifications) are removed in the same
+    /// transaction.
+    pub fn delete_task(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        now_ms: i64,
+    ) -> Result<EventEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _task = load_task(&transaction, task_id)?
+            .filter(|task| task.snapshot.project_id == *project_id)
+            .ok_or(StoreError::TaskNotFound)?;
+        let has_active_run: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runs
+                WHERE task_id = ?1 AND status NOT IN ('succeeded', 'failed', 'stopped')
+             )",
+            params![task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_active_run {
+            return Err(StoreError::TaskHasActiveRun);
+        }
+        let has_subtasks: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM tasks WHERE parent_task_id = ?1 AND project_id = ?2
+             )",
+            params![task_id.as_str(), project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_subtasks {
+            return Err(StoreError::TaskHasSubtasks);
+        }
+        let has_dependent_runs: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runs child
+                JOIN runs parent ON parent.id = child.parent_run_id
+                WHERE parent.task_id = ?1
+             )",
+            params![task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_dependent_runs {
+            return Err(StoreError::TaskRunHasDependents);
+        }
+
+        transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        transaction.execute(
+            "DELETE FROM task_question_documents
+             WHERE project_id = ?1
+               AND question_id IN (
+                   SELECT id FROM task_questions WHERE task_id = ?2 AND project_id = ?1
+               )",
+            params![project_id.as_str(), task_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM task_questions WHERE task_id = ?1 AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM task_dependencies
+             WHERE (task_id = ?1 OR depends_on_task_id = ?1) AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM webhook_task_capabilities WHERE task_id = ?1 AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE subscription_usage_probes SET notification_task_id = NULL
+             WHERE notification_task_id = ?1",
+            params![task_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM runs WHERE task_id = ?1 AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM tasks WHERE id = ?1 AND project_id = ?2",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::TaskNotFound);
+        }
+        let event = FactoryEvent::TaskDeleted {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        })
+    }
+
+    /// Deletes an agent that has no open run, no child agents, and no run
+    /// that is itself the parent of another run. Its terminal runs are
+    /// deleted too; tasks still assigned to it become unassigned (queue
+    /// owner reverts to the operator).
+    pub fn delete_agent(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<Vec<EventEnvelope>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = load_agent(&transaction, agent_id)?
+            .filter(|agent| agent.snapshot.project_id == *project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        if agent.snapshot.current_run_id.is_some() {
+            return Err(StoreError::AgentHasActiveRun);
+        }
+        let has_children: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM agents WHERE parent_agent_id = ?1 AND project_id = ?2
+             )",
+            params![agent_id.as_str(), project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_children {
+            return Err(StoreError::AgentHasChildren);
+        }
+        let has_dependent_runs: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runs child
+                JOIN runs parent ON parent.id = child.parent_run_id
+                WHERE parent.agent_id = ?1
+             )",
+            params![agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_dependent_runs {
+            return Err(StoreError::AgentRunHasDependents);
+        }
+
+        transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        let mut events = Vec::new();
+        let unassigned_task_ids: Vec<TaskId> = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM tasks WHERE assigned_agent_id = ?1 AND project_id = ?2")?;
+            let rows = statement
+                .query_map(params![agent_id.as_str(), project_id.as_str()], |row| {
+                    parse_id::<TaskId>(row.get(0)?, 0)
+                })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if !unassigned_task_ids.is_empty() {
+            transaction.execute(
+                "UPDATE tasks SET assigned_agent_id = NULL, updated_at_ms = ?1
+                 WHERE assigned_agent_id = ?2 AND project_id = ?3",
+                params![now_ms, agent_id.as_str(), project_id.as_str()],
+            )?;
+            for unassigned_task_id in &unassigned_task_ids {
+                let task =
+                    load_task(&transaction, unassigned_task_id)?.ok_or(StoreError::TaskNotFound)?;
+                let event = FactoryEvent::TaskChanged {
+                    task: task.snapshot,
+                };
+                let sequence = append_event(&transaction, now_ms, &event)?;
+                events.push(EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence,
+                    occurred_at_ms: now_ms,
+                    event,
+                });
+            }
+        }
+
+        transaction.execute(
+            "DELETE FROM runs WHERE agent_id = ?1 AND project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM agents WHERE id = ?1 AND project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::AgentNotFound);
+        }
+        let event = FactoryEvent::AgentDeleted {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        events.push(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        });
+        transaction.commit()?;
+        Ok(events)
+    }
+
+    /// Deletes a project and cascades to every task, agent, and run scoped
+    /// to it in one transaction. Refused while any non-terminal run remains.
+    pub fn delete_project(&mut self, project_id: &ProjectId, now_ms: i64) -> Result<EventEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+            params![project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::ProjectNotFound);
+        }
+        let has_active_run: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runs
+                WHERE project_id = ?1 AND status NOT IN ('succeeded', 'failed', 'stopped')
+             )",
+            params![project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_active_run {
+            return Err(StoreError::ProjectHasActiveRun);
+        }
+
+        transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        transaction.execute(
+            "DELETE FROM task_question_documents WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM task_questions WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM task_dependencies WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM webhook_task_capabilities WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE subscription_usage_probes SET notification_task_id = NULL
+             WHERE notification_task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM runs WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM tasks WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM agents WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        // Immutable by design (see task_documents_immutable_delete); no code
+        // path inserts rows here today, so this is normally a no-op. If rows
+        // exist, the trigger aborts the delete and the whole transaction
+        // rolls back, surfacing as a Conflict.
+        transaction.execute(
+            "DELETE FROM task_documents WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM projects WHERE id = ?1",
+            params![project_id.as_str()],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::ProjectNotFound);
+        }
+        let event = FactoryEvent::ProjectDeleted {
+            project_id: project_id.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        })
+    }
+
+    /// Persists stop intent on a non-terminal run and bumps its
+    /// `updated_at_ms` so subscribers see the request land. The local API
+    /// layer calls this only after the runner has accepted the stop signal.
+    /// When the run's terminal event is later ingested, stop intent turns a
+    /// `failed`-shaped process exit into `stopped`, and moves the task to
+    /// `cancelled` instead of `failed`.
+    pub fn request_run_stop(
+        &mut self,
+        project_id: &ProjectId,
+        run_id: &RunId,
+        now_ms: i64,
+    ) -> Result<(RunSnapshot, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run = load_run(&transaction, run_id)?
+            .filter(|run| run.project_id == *project_id)
+            .ok_or(StoreError::RunNotFound)?;
+        if run.status.is_terminal() {
+            return Err(StoreError::RunNotStoppable);
+        }
+        transaction.execute(
+            "UPDATE runs
+             SET stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?1),
+                 updated_at_ms = ?1
+             WHERE id = ?2",
+            params![now_ms, run_id.as_str()],
+        )?;
+        let run = load_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+        let event = FactoryEvent::RunChanged { run: run.clone() };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            run,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
     pub fn list_agents(
         &self,
         project_id: &ProjectId,
@@ -3265,6 +3706,7 @@ fn ingest_runner_event_in_transaction(
         )?
         .is_some();
     let terminal = validate_terminal_outcome(&event.event, outcome, confirmed_session)?;
+    let terminal = apply_stop_intent(terminal, kind, ledger.stop_requested_at_ms.is_some());
     transaction.execute(
         "UPDATE runs
          SET status = ?1, last_runner_sequence = ?2,
@@ -3376,6 +3818,7 @@ struct RunLedger {
     runner_reconciled_at_ms: Option<i64>,
     runner_terminal_kind: Option<String>,
     task_result: Option<String>,
+    stop_requested_at_ms: Option<i64>,
 }
 
 fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<RunLedger>> {
@@ -3388,7 +3831,8 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
                     runner_instance_id, runner_protocol_version,
                     last_runner_sequence, terminal_runner_sequence,
                     runner_reconciled_at_ms, runner_terminal_kind,
-                    (SELECT result FROM tasks WHERE id = runs.task_id)
+                    (SELECT result FROM tasks WHERE id = runs.task_id),
+                    stop_requested_at_ms
              FROM runs WHERE id = ?1",
             params![run_id.as_str()],
             |row| {
@@ -3406,6 +3850,7 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
                     runner_reconciled_at_ms: row.get(6)?,
                     runner_terminal_kind: row.get(7)?,
                     task_result: row.get(8)?,
+                    stop_requested_at_ms: row.get(9)?,
                 })
             },
         )
@@ -3562,6 +4007,7 @@ fn validate_duplicate(
             outcome,
             ledger.provider_session_confirmed_at_ms.is_some(),
         )?;
+        let terminal = apply_stop_intent(terminal, kind, ledger.stop_requested_at_ms.is_some());
         if ledger.snapshot.status != terminal.run_status
             || ledger.snapshot.failure_reason != terminal.failure_reason
             || ledger.snapshot.exit_code != terminal.exit_code
@@ -3583,6 +4029,26 @@ struct TerminalState {
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
     result: Option<String>,
+}
+
+/// Turns a `failed`-shaped process exit into `stopped`/`cancelled` when the
+/// operator had requested a stop before the runner reported its terminal
+/// event. Spawn failures are left alone: a process that never started was
+/// never something a signal could have stopped, and the schema requires
+/// `spawn_failed` runs to stay `failed` with `failure_reason = 'spawn'`.
+fn apply_stop_intent(terminal: TerminalState, kind: &str, stop_requested: bool) -> TerminalState {
+    if stop_requested && kind == "exited" && terminal.run_status == RunStatus::Failed {
+        TerminalState {
+            run_status: RunStatus::Stopped,
+            task_status: TaskStatus::Cancelled,
+            failure_reason: None,
+            exit_code: terminal.exit_code,
+            exit_signal: terminal.exit_signal,
+            result: None,
+        }
+    } else {
+        terminal
+    }
 }
 
 fn validate_terminal_outcome(
@@ -4131,6 +4597,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0010_agent_messages.sql"))?;
         transaction.pragma_update(None, "user_version", 10)?;
         transaction.commit()?;
+        current = 10;
+    }
+    if current == 10 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0011_run_stop_intent.sql"))?;
+        transaction.pragma_update(None, "user_version", 11)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -4198,6 +4671,30 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             task_id: run.task_id.as_ref(),
             agent_id: Some(&run.agent_id),
             run_id: Some(&run.id),
+        },
+        FactoryEvent::TaskDeleted {
+            project_id,
+            task_id,
+        } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: Some(task_id),
+            agent_id: None,
+            run_id: None,
+        },
+        FactoryEvent::AgentDeleted {
+            project_id,
+            agent_id,
+        } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: Some(agent_id),
+            run_id: None,
+        },
+        FactoryEvent::ProjectDeleted { project_id } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: None,
+            run_id: None,
         },
     }
 }

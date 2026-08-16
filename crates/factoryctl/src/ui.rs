@@ -461,6 +461,15 @@ impl FactoryApp {
             FactoryEvent::RunChanged { run } => {
                 self.runs.insert(run.id.clone(), run.clone());
             }
+            FactoryEvent::TaskDeleted { task_id, .. } => {
+                self.tasks.remove(task_id);
+            }
+            FactoryEvent::AgentDeleted { agent_id, .. } => {
+                self.agents.remove(agent_id);
+            }
+            FactoryEvent::ProjectDeleted { project_id } => {
+                self.projects.remove(project_id);
+            }
         }
         self.recent.push(envelope);
         if self.recent.len() > RECENT_EVENT_LIMIT {
@@ -1999,6 +2008,9 @@ fn event_summary(event: &EventEnvelope) -> String {
         FactoryEvent::TaskChanged { task } => format!("task {} → {:?}", task.id, task.status),
         FactoryEvent::AgentChanged { agent } => format!("agent {}", agent.id),
         FactoryEvent::RunChanged { run } => format!("run {} → {:?}", run.id, run.status),
+        FactoryEvent::TaskDeleted { task_id, .. } => format!("task {task_id} deleted"),
+        FactoryEvent::AgentDeleted { agent_id, .. } => format!("agent {agent_id} deleted"),
+        FactoryEvent::ProjectDeleted { project_id } => format!("project {project_id} deleted"),
     };
     format!("#{:06} {detail}", event.sequence)
 }

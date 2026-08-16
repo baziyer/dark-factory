@@ -137,6 +137,21 @@ impl ApiFailure {
                 ErrorCode::Conflict,
                 "active execution capacity has been reached".into(),
             ),
+            Self::Store(StoreError::ProjectNotFound) => {
+                (ErrorCode::NotFound, "project was not found".into())
+            }
+            Self::Store(
+                error @ (StoreError::TaskNotCancellable
+                | StoreError::TaskNotEditable
+                | StoreError::TaskHasActiveRun
+                | StoreError::TaskHasSubtasks
+                | StoreError::TaskRunHasDependents
+                | StoreError::AgentHasActiveRun
+                | StoreError::AgentHasChildren
+                | StoreError::AgentRunHasDependents
+                | StoreError::ProjectHasActiveRun
+                | StoreError::RunNotStoppable),
+            ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
             }
@@ -559,6 +574,94 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::TaskRetried { task })
         }
+        LocalRequest::CancelTask {
+            project_id,
+            task_id,
+        } => {
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) = store.cancel_task(&project_id, &task_id, now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskCancelled { task })
+        }
+        LocalRequest::UpdateTask {
+            project_id,
+            task_id,
+            title,
+            body,
+        } => {
+            if title.is_none() && body.is_none() {
+                return Err(ApiFailure::Invalid(
+                    "task update must include title or body".into(),
+                ));
+            }
+            let title = title
+                .map(|title| required_text("task title", title, 240))
+                .transpose()?;
+            if let Some(body) = body.as_ref() {
+                if body.len() > MAX_TASK_BODY_BYTES {
+                    return Err(ApiFailure::Invalid(format!(
+                        "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
+                    )));
+                }
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) =
+                        store.update_task(&project_id, &task_id, title, body, now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskUpdated { task })
+        }
+        LocalRequest::DeleteTask {
+            project_id,
+            task_id,
+        } => {
+            let response_project_id = project_id.clone();
+            let response_task_id = task_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let event = store.delete_task(&project_id, &task_id, now_ms()?)?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskDeleted {
+                project_id: response_project_id,
+                task_id: response_task_id,
+            })
+        }
+        LocalRequest::DeleteAgent {
+            project_id,
+            agent_id,
+        } => {
+            let response_project_id = project_id.clone();
+            let response_agent_id = agent_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let events = store.delete_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok(((), events))
+                })
+                .await?;
+            Ok(LocalResponse::AgentDeleted {
+                project_id: response_project_id,
+                agent_id: response_agent_id,
+            })
+        }
+        LocalRequest::DeleteProject { project_id } => {
+            let response_project_id = project_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let event = store.delete_project(&project_id, now_ms()?)?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::ProjectDeleted {
+                project_id: response_project_id,
+            })
+        }
         LocalRequest::AssignTask {
             project_id,
             task_id,
@@ -593,9 +696,12 @@ async fn handle_request(
                     "runner stop grace must be at most 60000 ms".into(),
                 ));
             }
+            let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
             let target = state
-                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .with_store(move |store| {
+                    store.run_control_target(&lookup_project_id, &lookup_run_id)
+                })
                 .await?;
             RunnerClient::new(
                 &target.runner_runtime,
@@ -605,6 +711,15 @@ async fn handle_request(
             .stop(grace_ms)
             .await
             .map_err(runner_control_failure)?;
+            let stop_project_id = project_id.clone();
+            let stop_run_id = run_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (run, event) =
+                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
+                    Ok((run, vec![event]))
+                })
+                .await?;
             Ok(LocalResponse::RunStopped { run_id })
         }
         LocalRequest::ListRuns {

@@ -264,10 +264,33 @@ pub struct RunSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum FactoryEvent {
-    ProjectChanged { project: ProjectSnapshot },
-    TaskChanged { task: TaskSnapshot },
-    AgentChanged { agent: AgentSnapshot },
-    RunChanged { run: RunSnapshot },
+    ProjectChanged {
+        project: ProjectSnapshot,
+    },
+    TaskChanged {
+        task: TaskSnapshot,
+    },
+    AgentChanged {
+        agent: AgentSnapshot,
+    },
+    RunChanged {
+        run: RunSnapshot,
+    },
+    /// A task was permanently removed. Unlike `TaskChanged`, there is no
+    /// surviving snapshot to publish.
+    TaskDeleted {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+    /// An agent was permanently removed.
+    AgentDeleted {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    /// A project and everything scoped to it was permanently removed.
+    ProjectDeleted {
+        project_id: ProjectId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

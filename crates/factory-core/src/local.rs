@@ -240,6 +240,29 @@ pub enum LocalRequest {
         project_id: ProjectId,
         task_id: TaskId,
     },
+    CancelTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+    UpdateTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+    },
+    DeleteTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+    DeleteAgent {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    DeleteProject {
+        project_id: ProjectId,
+    },
     AssignTask {
         project_id: ProjectId,
         task_id: TaskId,
@@ -310,6 +333,23 @@ pub enum LocalResponse {
     },
     TaskRetried {
         task: TaskDetail,
+    },
+    TaskCancelled {
+        task: TaskDetail,
+    },
+    TaskUpdated {
+        task: TaskDetail,
+    },
+    TaskDeleted {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+    AgentDeleted {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    ProjectDeleted {
+        project_id: ProjectId,
     },
     TaskAssigned {
         task: TaskDetail,
