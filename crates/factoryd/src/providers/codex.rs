@@ -70,13 +70,13 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
     .map(OsString::from)
     .to_vec();
 
-    let expected_thread_id = match input.session {
-        Session::New => None,
+    let decoder = match input.session {
+        Session::New => Decoder::fresh(),
         Session::Resume { thread_id } => {
-            validate_thread_id(&thread_id)?;
+            let decoder = Decoder::resume(thread_id.clone())?;
             arguments.push(OsString::from("resume"));
             arguments.push(OsString::from(&thread_id));
-            Some(thread_id)
+            decoder
         }
     };
     arguments.push(OsString::from("-"));
@@ -92,7 +92,7 @@ pub fn prepare(input: CodexLaunch) -> Result<PreparedCodex, InvalidThreadId> {
             cwd: input.cwd,
             startup_input: input.instructions.into_bytes(),
         },
-        decoder: Decoder::new(expected_thread_id),
+        decoder,
     })
 }
 
@@ -280,6 +280,27 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Creates a decoder for a fresh Codex thread.
+    ///
+    /// Recovery uses this constructor even after the fresh attempt has
+    /// confirmed a thread ID: replay from runner sequence zero rebuilds and
+    /// revalidates that identity from the retained provider stream and the
+    /// store's durable session ownership.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self::new(None)
+    }
+
+    /// Creates a decoder bound to one previously confirmed Codex thread.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidThreadId`] unless `thread_id` is a canonical UUID.
+    pub fn resume(thread_id: String) -> Result<Self, InvalidThreadId> {
+        validate_thread_id(&thread_id)?;
+        Ok(Self::new(Some(thread_id)))
+    }
+
     fn new(expected_thread_id: Option<String>) -> Self {
         Self {
             buffer: Vec::new(),

@@ -4,12 +4,12 @@ use std::{
     future::Future,
     io,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use factory_core::{
-    EventEnvelope, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, TaskDetail, TaskId,
+    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, TaskDetail, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_PROJECT_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, RequestEnvelope,
@@ -24,54 +24,33 @@ use tokio::{
     time::timeout,
 };
 
-use crate::store::{NewProject, NewTask, Store, StoreError};
+pub use crate::daemon_state::DaemonState as ApiState;
+
+use crate::{
+    daemon_state::DaemonStateError,
+    store::{NewProject, NewTask, StoreError},
+};
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
-
-#[derive(Clone)]
-pub struct ApiState {
-    store: Arc<Mutex<Store>>,
-    events: broadcast::Sender<EventEnvelope>,
-}
-
-impl ApiState {
-    #[must_use]
-    pub fn new(store: Store) -> Self {
-        let (events, _) = broadcast::channel(256);
-        Self {
-            store: Arc::new(Mutex::new(store)),
-            events,
-        }
-    }
-
-    async fn with_store<T, F>(&self, operation: F) -> Result<T, ApiFailure>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
-    {
-        let store = Arc::clone(&self.store);
-        tokio::task::spawn_blocking(move || {
-            let mut store = store
-                .lock()
-                .map_err(|_| ApiFailure::Internal("store lock was poisoned".into()))?;
-            operation(&mut store).map_err(ApiFailure::Store)
-        })
-        .await
-        .map_err(|error| ApiFailure::Internal(format!("store worker failed: {error}")))?
-    }
-
-    fn publish(&self, event: EventEnvelope) {
-        let _ = self.events.send(event);
-    }
-}
 
 #[derive(Debug)]
 enum ApiFailure {
     Invalid(String),
     Store(StoreError),
     Internal(String),
+}
+
+impl From<DaemonStateError> for ApiFailure {
+    fn from(error: DaemonStateError) -> Self {
+        match error {
+            DaemonStateError::Store(error) => Self::Store(error),
+            DaemonStateError::StoreLockPoisoned | DaemonStateError::StoreWorkerFailed => {
+                Self::Internal(error.to_string())
+            }
+        }
+    }
 }
 
 impl ApiFailure {
@@ -235,12 +214,13 @@ async fn handle_request(
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
             let root = canonical_root(root).await?;
-            let (project, event) = state
-                .with_store(move |store| {
-                    store.create_project(NewProject { id, name, root }, now_ms()?)
+            let project = state
+                .commit_and_publish(move |store| {
+                    let (project, event) =
+                        store.create_project(NewProject { id, name, root }, now_ms()?)?;
+                    Ok((project, vec![event]))
                 })
                 .await?;
-            state.publish(event);
             Ok(LocalResponse::ProjectCreated { project })
         }
         LocalRequest::ListProjects { after_id, limit } => {
@@ -268,9 +248,9 @@ async fn handle_request(
                     "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
                 )));
             }
-            let (task, event) = state
-                .with_store(move |store| {
-                    store.create_task(
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) = store.create_task(
                         NewTask {
                             id,
                             project_id,
@@ -280,10 +260,10 @@ async fn handle_request(
                             priority,
                         },
                         now_ms()?,
-                    )
+                    )?;
+                    Ok((task, vec![event]))
                 })
                 .await?;
-            state.publish(event);
             Ok(LocalResponse::TaskCreated { task })
         }
         LocalRequest::ListTasks {
@@ -323,7 +303,7 @@ async fn stream_events<W>(mut write: W, state: &ApiState, after_sequence: i64) -
 where
     W: AsyncWrite + Unpin,
 {
-    let mut receiver = state.events.subscribe();
+    let mut receiver = state.subscribe();
     let replay_through = latest_event_sequence(state)
         .await
         .map_err(api_failure_to_io)?;
@@ -392,6 +372,7 @@ where
         let events = state
             .with_store(move |store| store.events_after(cursor, remaining))
             .await
+            .map_err(ApiFailure::from)
             .map_err(api_failure_to_io)?;
         if events.is_empty() {
             return Err(io::Error::new(
@@ -433,6 +414,7 @@ async fn latest_event_sequence(state: &ApiState) -> Result<i64, ApiFailure> {
     state
         .with_store(|store| store.latest_event_sequence())
         .await
+        .map_err(ApiFailure::from)
 }
 
 async fn write_response<W>(write: &mut W, response: LocalResponse) -> io::Result<()>

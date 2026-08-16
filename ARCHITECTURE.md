@@ -24,7 +24,11 @@ This file records constraints, not an aspirational component catalogue.
    alone. A graceful runner signal stops the group but preserves an unacknowledged
    spool for diagnosis and recovery. After a daemon restart, adapter state is
    rebuilt by replaying that spool from sequence zero; SQLite's committed runner
-   sequence is only the deduplication boundary for durable state and events.
+   sequence is only the deduplication boundary for durable state and events. A
+   terminal runner is marked reconciled only after its exact acknowledgement
+   reply, or after its terminal outcome is durable and its runtime endpoint is
+   proven absent; reconciliation itself is private cleanup, not a public state
+   transition.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,

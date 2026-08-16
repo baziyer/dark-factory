@@ -100,7 +100,7 @@ fn no_effects() -> RunnerEventEffects {
 }
 
 #[test]
-fn migrates_v1_to_v2_without_losing_state_or_event_head() {
+fn migrates_v1_to_v3_without_losing_state_or_event_head() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("factory.db");
     {
@@ -163,7 +163,7 @@ fn migrates_v1_to_v2_without_losing_state_or_event_head() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     connection
         .execute_batch("PRAGMA foreign_keys = ON")
         .unwrap();
@@ -524,9 +524,9 @@ fn terminal_frame_outcome_and_public_transitions_commit_atomically() {
     assert_eq!(recoverable.len(), 1);
     assert_eq!(recoverable[0].target.last_committed_runner_sequence, 3);
     assert_eq!(recoverable[0].terminal_runner_sequence, Some(3));
-    assert_eq!(recoverable[0].runner_acknowledged_at_ms, None);
+    assert_eq!(recoverable[0].runner_reconciled_at_ms, None);
 
-    let wrong_ack = store.mark_runner_acknowledged(&id("run"), &instance, 1, 9);
+    let wrong_ack = store.mark_runner_terminal_reconciled(&id("run"), &instance, 1, 9);
     assert!(matches!(
         wrong_ack,
         Err(StoreError::TerminalSequenceMismatch {
@@ -536,13 +536,13 @@ fn terminal_frame_outcome_and_public_transitions_commit_atomically() {
     ));
     assert_eq!(
         store
-            .mark_runner_acknowledged(&id("run"), &instance, 3, 10)
+            .mark_runner_terminal_reconciled(&id("run"), &instance, 3, 10)
             .unwrap(),
         WriteDisposition::Applied
     );
     assert_eq!(
         store
-            .mark_runner_acknowledged(&id("run"), &instance, 3, 99)
+            .mark_runner_terminal_reconciled(&id("run"), &instance, 3, 99)
             .unwrap(),
         WriteDisposition::Duplicate
     );
@@ -847,7 +847,7 @@ fn recovery_survives_reopen_with_only_private_bounded_metadata() {
         )
         .unwrap();
     store
-        .mark_runner_acknowledged(&id("run"), &instance, 3, 8)
+        .mark_runner_terminal_reconciled(&id("run"), &instance, 3, 8)
         .unwrap();
     store
         .create_task(

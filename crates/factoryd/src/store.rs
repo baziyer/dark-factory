@@ -11,7 +11,7 @@ use rusqlite::{
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -93,7 +93,7 @@ pub struct RecoverableRun {
     pub target: ExecutionTarget,
     pub provider_session_confirmed_at_ms: Option<i64>,
     pub terminal_runner_sequence: Option<i64>,
-    pub runner_acknowledged_at_ms: Option<i64>,
+    pub runner_reconciled_at_ms: Option<i64>,
 }
 
 /// Effects already normalized from exactly one runner event.
@@ -456,7 +456,7 @@ impl Store {
                 resumes_provider_session, provider_session_confirmed_at_ms,
                 runner_instance_id, runner_protocol_version, runner_runtime,
                 last_runner_sequence, terminal_runner_sequence,
-                runner_acknowledged_at_ms, runner_terminal_kind,
+                runner_reconciled_at_ms, runner_terminal_kind,
                 started_at_ms, status_since_ms, updated_at_ms, ended_at_ms,
                 exit_code, exit_signal, failure_reason
              ) VALUES (
@@ -615,26 +615,7 @@ impl Store {
             && ledger.snapshot.failure_reason == Some(RunFailureReason::Spawn)
             && ledger.terminal_runner_sequence.is_none()
         {
-            let task = load_task(
-                &transaction,
-                ledger
-                    .snapshot
-                    .task_id
-                    .as_ref()
-                    .ok_or(StoreError::InvalidRunState)?,
-            )?
-            .ok_or(StoreError::InvalidRunState)?
-            .snapshot;
-            let agent = load_agent(&transaction, &ledger.snapshot.agent_id)?
-                .ok_or(StoreError::AgentNotFound)?
-                .snapshot;
-            return Ok(ExecutionTransition {
-                disposition: WriteDisposition::Duplicate,
-                task,
-                agent,
-                run: ledger.snapshot,
-                events: Vec::new(),
-            });
+            return duplicate_failure_transition(&transaction, &ledger);
         }
         if ledger.snapshot.status != RunStatus::Starting
             || ledger.last_runner_sequence != 0
@@ -642,49 +623,49 @@ impl Store {
         {
             return Err(StoreError::InvalidRunState);
         }
-        transaction.execute(
-            "UPDATE runs
-             SET status = 'failed', status_since_ms = ?1, updated_at_ms = ?1,
-                 ended_at_ms = ?1, failure_reason = 'spawn'
-             WHERE id = ?2",
-            params![now_ms, run_id.as_str()],
-        )?;
-        let task_id = ledger
-            .snapshot
-            .task_id
-            .as_ref()
-            .ok_or(StoreError::InvalidRunState)?;
-        let changed = transaction.execute(
-            "UPDATE tasks SET status = 'failed', updated_at_ms = ?1
-             WHERE id = ?2 AND assigned_agent_id = ?3 AND status = 'running'",
-            params![now_ms, task_id.as_str(), ledger.snapshot.agent_id.as_str()],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidRunState);
-        }
-        transaction.execute(
-            "UPDATE agents SET updated_at_ms = ?1 WHERE id = ?2",
-            params![now_ms, ledger.snapshot.agent_id.as_str()],
-        )?;
-        let task = load_task(&transaction, task_id)?
-            .ok_or(StoreError::InvalidRunState)?
-            .snapshot;
-        let agent = load_agent(&transaction, &ledger.snapshot.agent_id)?
-            .ok_or(StoreError::AgentNotFound)?
-            .snapshot;
-        let run = load_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
-        let events = append_execution_events(&transaction, now_ms, &task, &agent, &run)?;
+        let transition =
+            fail_run_in_transaction(&transaction, &ledger, RunFailureReason::Spawn, now_ms)?;
         transaction.commit()?;
-        Ok(ExecutionTransition {
-            disposition: WriteDisposition::Applied,
-            task,
-            agent,
-            run,
-            events,
-        })
+        Ok(transition)
     }
 
-    pub fn mark_runner_acknowledged(
+    pub fn fail_run_unverifiable(
+        &mut self,
+        run_id: &RunId,
+        runner_instance_id: &RunnerInstanceId,
+        now_ms: i64,
+    ) -> Result<ExecutionTransition> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ledger = load_run_ledger(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+        if &ledger.runner_instance_id != runner_instance_id {
+            return Err(StoreError::RunnerIdentityMismatch);
+        }
+        if ledger.snapshot.status == RunStatus::Failed
+            && ledger.snapshot.failure_reason == Some(RunFailureReason::Unverifiable)
+            && ledger.terminal_runner_sequence.is_none()
+        {
+            return duplicate_failure_transition(&transaction, &ledger);
+        }
+        if ledger.snapshot.status.is_terminal() || ledger.terminal_runner_sequence.is_some() {
+            return Err(StoreError::InvalidRunState);
+        }
+        let transition = fail_run_in_transaction(
+            &transaction,
+            &ledger,
+            RunFailureReason::Unverifiable,
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(transition)
+    }
+
+    /// Records that terminal runner cleanup is reconciled.
+    ///
+    /// Callers may use this after the exact acknowledgement was received or
+    /// after the exact runner endpoint was proven absent.
+    pub fn mark_runner_terminal_reconciled(
         &mut self,
         run_id: &RunId,
         runner_instance_id: &RunnerInstanceId,
@@ -707,11 +688,11 @@ impl Store {
                 found: terminal_sequence,
             });
         }
-        if ledger.runner_acknowledged_at_ms.is_some() {
+        if ledger.runner_reconciled_at_ms.is_some() {
             return Ok(WriteDisposition::Duplicate);
         }
         transaction.execute(
-            "UPDATE runs SET runner_acknowledged_at_ms = ?1 WHERE id = ?2",
+            "UPDATE runs SET runner_reconciled_at_ms = ?1 WHERE id = ?2",
             params![now_ms, run_id.as_str()],
         )?;
         transaction.commit()?;
@@ -721,10 +702,10 @@ impl Store {
     pub fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider_session_confirmed_at_ms,
-                    terminal_runner_sequence, runner_acknowledged_at_ms
+                    terminal_runner_sequence, runner_reconciled_at_ms
              FROM runs
              WHERE ended_at_ms IS NULL
-                OR (terminal_runner_sequence IS NOT NULL AND runner_acknowledged_at_ms IS NULL)
+                OR (terminal_runner_sequence IS NOT NULL AND runner_reconciled_at_ms IS NULL)
              ORDER BY project_id, started_at_ms, id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -738,7 +719,7 @@ impl Store {
         let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         rows.into_iter()
-            .map(|(run_id, confirmed, terminal, acknowledged)| {
+            .map(|(run_id, confirmed, terminal, reconciled)| {
                 let run_id: RunId = RunId::try_from(run_id).map_err(|error| {
                     StoreError::Sqlite(rusqlite::Error::FromSqlConversionFailure(
                         0,
@@ -752,7 +733,7 @@ impl Store {
                         .ok_or(StoreError::RunNotFound)?,
                     provider_session_confirmed_at_ms: confirmed,
                     terminal_runner_sequence: terminal,
-                    runner_acknowledged_at_ms: acknowledged,
+                    runner_reconciled_at_ms: reconciled,
                 })
             })
             .collect()
@@ -897,6 +878,100 @@ impl Store {
                 row.get(0)
             })?)
     }
+}
+
+fn duplicate_failure_transition(
+    transaction: &Transaction<'_>,
+    ledger: &RunLedger,
+) -> Result<ExecutionTransition> {
+    let task = load_task(
+        transaction,
+        ledger
+            .snapshot
+            .task_id
+            .as_ref()
+            .ok_or(StoreError::InvalidRunState)?,
+    )?
+    .ok_or(StoreError::InvalidRunState)?
+    .snapshot;
+    let agent = load_agent(transaction, &ledger.snapshot.agent_id)?
+        .ok_or(StoreError::AgentNotFound)?
+        .snapshot;
+    Ok(ExecutionTransition {
+        disposition: WriteDisposition::Duplicate,
+        task,
+        agent,
+        run: ledger.snapshot.clone(),
+        events: Vec::new(),
+    })
+}
+
+fn fail_run_in_transaction(
+    transaction: &Transaction<'_>,
+    ledger: &RunLedger,
+    reason: RunFailureReason,
+    now_ms: i64,
+) -> Result<ExecutionTransition> {
+    let may_fail_blocked_task = reason == RunFailureReason::Unverifiable;
+    let changed = transaction.execute(
+        "UPDATE runs
+         SET status = 'failed', status_since_ms = ?1, updated_at_ms = ?1,
+             ended_at_ms = ?1, exit_code = NULL, exit_signal = NULL,
+             failure_reason = ?2, activity = NULL, wait_reason = NULL
+         WHERE id = ?3 AND ended_at_ms IS NULL",
+        params![
+            now_ms,
+            failure_reason_value(reason),
+            ledger.snapshot.id.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidRunState);
+    }
+    let task_id = ledger
+        .snapshot
+        .task_id
+        .as_ref()
+        .ok_or(StoreError::InvalidRunState)?;
+    let changed = transaction.execute(
+        "UPDATE tasks SET status = 'failed', updated_at_ms = ?1
+         WHERE id = ?2 AND project_id = ?3 AND assigned_agent_id = ?4
+           AND (status = 'running' OR (?5 AND status = 'blocked'))",
+        params![
+            now_ms,
+            task_id.as_str(),
+            ledger.snapshot.project_id.as_str(),
+            ledger.snapshot.agent_id.as_str(),
+            may_fail_blocked_task,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::InvalidRunState);
+    }
+    transaction.execute(
+        "UPDATE agents SET updated_at_ms = ?1
+         WHERE id = ?2 AND project_id = ?3",
+        params![
+            now_ms,
+            ledger.snapshot.agent_id.as_str(),
+            ledger.snapshot.project_id.as_str(),
+        ],
+    )?;
+    let task = load_task(transaction, task_id)?
+        .ok_or(StoreError::InvalidRunState)?
+        .snapshot;
+    let agent = load_agent(transaction, &ledger.snapshot.agent_id)?
+        .ok_or(StoreError::AgentNotFound)?
+        .snapshot;
+    let run = load_run(transaction, &ledger.snapshot.id)?.ok_or(StoreError::RunNotFound)?;
+    let events = append_execution_events(transaction, now_ms, &task, &agent, &run)?;
+    Ok(ExecutionTransition {
+        disposition: WriteDisposition::Applied,
+        task,
+        agent,
+        run,
+        events,
+    })
 }
 
 fn ingest_runner_event_in_transaction(
@@ -1072,7 +1147,7 @@ struct RunLedger {
     runner_protocol_version: u16,
     last_runner_sequence: i64,
     terminal_runner_sequence: Option<i64>,
-    runner_acknowledged_at_ms: Option<i64>,
+    runner_reconciled_at_ms: Option<i64>,
     runner_terminal_kind: Option<String>,
 }
 
@@ -1085,7 +1160,7 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
             "SELECT provider_session_id, provider_session_confirmed_at_ms,
                     runner_instance_id, runner_protocol_version,
                     last_runner_sequence, terminal_runner_sequence,
-                    runner_acknowledged_at_ms, runner_terminal_kind
+                    runner_reconciled_at_ms, runner_terminal_kind
              FROM runs WHERE id = ?1",
             params![run_id.as_str()],
             |row| {
@@ -1100,7 +1175,7 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
                     })?,
                     last_runner_sequence: row.get(4)?,
                     terminal_runner_sequence: row.get(5)?,
-                    runner_acknowledged_at_ms: row.get(6)?,
+                    runner_reconciled_at_ms: row.get(6)?,
                     runner_terminal_kind: row.get(7)?,
                 })
             },
@@ -1580,6 +1655,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0002_execution_ledger.sql"))?;
         transaction.pragma_update(None, "user_version", 2)?;
+        transaction.commit()?;
+        current = 2;
+    }
+    if current == 2 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0003_runner_reconciliation.sql"))?;
+        transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
     }
     Ok(())
