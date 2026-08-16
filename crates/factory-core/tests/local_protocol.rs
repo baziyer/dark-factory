@@ -138,6 +138,7 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
         },
         body: "Use the local socket protocol.".into(),
         result: Some("The local socket protocol is ready.".into()),
+        blocked_reason: None,
     };
     let response = LocalResponse::TaskCreated {
         task: detail.clone(),
@@ -421,6 +422,7 @@ fn retry_task_has_a_small_versioned_local_shape() {
             },
             body: "body".into(),
             result: None,
+            blocked_reason: None,
         },
     };
     let value = serde_json::to_value(&response).unwrap();
@@ -476,6 +478,7 @@ fn assign_task_has_a_small_versioned_local_shape() {
             },
             body: "body".into(),
             result: None,
+            blocked_reason: None,
         },
     };
     let value = serde_json::to_value(&response).unwrap();
@@ -503,6 +506,7 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
             },
             body: "x".repeat(MAX_TASK_BODY_BYTES),
             result: None,
+            blocked_reason: None,
         })
         .collect();
     let frame = ServerFrame::Response {
@@ -569,6 +573,8 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         worktree: "/work/agent-1".into(),
         provider_session_id: None,
         current_run_id: None,
+        activity: None,
+        activity_inferred: false,
         last_hook_event: None,
         last_hook_at_ms: None,
         wait_reason: None,
@@ -591,6 +597,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
             "state": "idle",
             "state_since_ms": 10,
             "worktree": "/work/agent-1",
+            "activity_inferred": false,
             "observer_health": "unknown",
             "observer_health_since_ms": 0,
             "started_at_ms": 5,
@@ -626,6 +633,8 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
         worktree: "/work/agent-1".into(),
         provider_session_id: Some("thread-1".into()),
         current_run_id: Some(run_id("run-1")),
+        activity: Some("tool: Read".into()),
+        activity_inferred: true,
         last_hook_event: Some(ProviderHookEvent::Notification),
         last_hook_at_ms: Some(19),
         wait_reason: Some("permission prompt".into()),
@@ -640,6 +649,8 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
     let value = serde_json::to_value(&session).unwrap();
     assert_eq!(value["provider_session_id"], "thread-1");
     assert_eq!(value["current_run_id"], "run-1");
+    assert_eq!(value["activity"], "tool: Read");
+    assert_eq!(value["activity_inferred"], true);
     assert_eq!(value["last_hook_event"], "notification");
     assert_eq!(value["wait_reason"], "permission prompt");
     assert_eq!(

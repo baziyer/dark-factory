@@ -1024,6 +1024,7 @@ mod tests {
             },
             body: String::new(),
             result: None,
+            blocked_reason: None,
         }
     }
 

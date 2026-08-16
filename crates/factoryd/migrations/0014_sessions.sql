@@ -9,6 +9,12 @@
 -- observer health, exit code/signal) moves to `sessions`. `agents` drops the
 -- provider-session pin (it now lives on `sessions`) and gains a durable
 -- pause flag and a per-agent worktree.
+--
+-- 5C amendment (in place, not a new migration): both `provider` CHECK
+-- constraints below were widened to also allow 'shell' (the minimal example
+-- provider, `crates/factoryd/src/providers/shell.rs`). Safe to amend in
+-- place rather than add a 0015: this migration has not landed anywhere
+-- outside this integration branch.
 
 -- Runs still open from the dead ephemeral-runner model cannot be adopted by
 -- a resident session; force-close them before the rebuild below copies
@@ -29,7 +35,7 @@ CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL REFERENCES projects(id),
     agent_id TEXT NOT NULL,
-    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex')),
+    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex', 'shell')),
     provider_session_id TEXT CHECK (
         provider_session_id IS NULL OR length(provider_session_id) BETWEEN 1 AND 256
     ),
@@ -99,7 +105,7 @@ CREATE TABLE agents_new (
     project_id TEXT NOT NULL REFERENCES projects(id),
     parent_agent_id TEXT,
     role TEXT NOT NULL CHECK (role IN ('orchestrator', 'worker')),
-    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex')),
+    provider TEXT NOT NULL CHECK (provider IN ('claude_code', 'codex', 'shell')),
     paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
     worktree TEXT CHECK (
         worktree IS NULL OR

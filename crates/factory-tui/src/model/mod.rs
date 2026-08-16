@@ -607,12 +607,14 @@ impl Board {
                 let existing = self.tasks.get(&task.id);
                 let body = existing.map_or_else(String::new, |detail| detail.body.clone());
                 let result = existing.and_then(|detail| detail.result.clone());
+                let blocked_reason = existing.and_then(|detail| detail.blocked_reason.clone());
                 self.tasks.insert(
                     task.id.clone(),
                     TaskDetail {
                         snapshot: task,
                         body,
                         result,
+                        blocked_reason,
                     },
                 );
             }
@@ -779,6 +781,7 @@ pub const fn provider_letter(provider: Provider) -> char {
     match provider {
         Provider::ClaudeCode => 'C',
         Provider::Codex => 'X',
+        Provider::Shell => 'S',
     }
 }
 

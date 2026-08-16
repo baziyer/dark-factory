@@ -19,6 +19,8 @@ pub struct Theme {
     pub claude_worker: char,
     /// `X` — a Codex worker's station glyph.
     pub codex_worker: char,
+    /// `S` — a shell-provider worker's station glyph (the minimal example provider).
+    pub shell_worker: char,
     /// `c` — a sub-agent's station glyph (any agent with `parent_agent_id` set).
     pub subagent: char,
     /// `▒` — one cell of an in-tray's queued work, capped and shown as `+N` past the cap.
@@ -47,6 +49,7 @@ pub const FORTRESS: Theme = Theme {
     orchestrator: '◆',
     claude_worker: 'C',
     codex_worker: 'X',
+    shell_worker: 'S',
     subagent: 'c',
     queued: '▒',
     capacity: '░',
@@ -66,6 +69,7 @@ pub const PLAIN: Theme = Theme {
     orchestrator: '@',
     claude_worker: 'C',
     codex_worker: 'X',
+    shell_worker: 'S',
     subagent: 'c',
     queued: '#',
     capacity: '.',
@@ -103,6 +107,7 @@ mod tests {
             PLAIN.orchestrator,
             PLAIN.claude_worker,
             PLAIN.codex_worker,
+            PLAIN.shell_worker,
             PLAIN.subagent,
             PLAIN.queued,
             PLAIN.capacity,
@@ -130,6 +135,7 @@ mod tests {
                 theme.orchestrator,
                 theme.claude_worker,
                 theme.codex_worker,
+                theme.shell_worker,
                 theme.subagent,
                 theme.queued,
                 theme.capacity,

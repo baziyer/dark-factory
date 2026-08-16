@@ -108,6 +108,13 @@ id_type!(SessionId);
 pub enum Provider {
     ClaudeCode,
     Codex,
+    /// A plain POSIX shell, driven entirely by `factoryctl hook`/`task
+    /// done`/`task blocked` calls the launched command makes itself. The
+    /// minimal example provider (`crates/factoryd/src/providers/shell.rs`,
+    /// `crates/factoryd/tests/fixtures/shell-agent.sh`): no native hooks or
+    /// permission prompts to speak of, useful for deterministic lifecycle
+    /// tests and as a template for a new provider.
+    Shell,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -296,6 +303,10 @@ pub struct TaskDetail {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Why `factoryctl task blocked` was called, when `snapshot.status` is
+    /// [`TaskStatus::Blocked`]; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 /// A durable agent identity. Process-attempt state belongs to [`RunSnapshot`].
@@ -378,6 +389,14 @@ pub struct SessionSnapshot {
     pub provider_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<RunId>,
+    /// Bounded free-text activity label (e.g. `"tool: Read"`), or `None`
+    /// while idle/starting/stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// Whether `activity` was inferred from a generic hook (`true`, shown
+    /// with a `~` by the TUI) rather than naming an exact tool (`false`).
+    #[serde(default)]
+    pub activity_inferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_hook_event: Option<ProviderHookEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]

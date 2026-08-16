@@ -23,6 +23,25 @@ const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
     "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
 ];
 
+/// The only names a session's `session_environment` may set. Fixed for every
+/// provider (`DARK_FACTORY_AGENT`/`DARK_FACTORY_PROJECT`/`DARK_FACTORY_SOCKET`/
+/// `DARK_FACTORY_SESSION_TOKEN_FILE`, so an agent's own `factoryctl`
+/// invocations — `task done`, `agent message`, ... — pick up a sender
+/// identity, per TRACK5-WIRE.md) plus one provider-specific addition: the
+/// shell provider's hook subprocess has no generated config file to embed a
+/// trusted `factoryctl` path in (unlike Claude's `--settings` file or
+/// Codex's seeded `config.toml`), so it needs `DARK_FACTORY_FACTORYCTL` in
+/// its environment instead (`providers::shell::ShellProvider`). This is a
+/// closed list, not a passthrough: a provider constructing `LaunchSpec`
+/// cannot smuggle in an arbitrary environment variable.
+const SESSION_ENVIRONMENT_NAMES: [&str; 5] = [
+    "DARK_FACTORY_AGENT",
+    "DARK_FACTORY_PROJECT",
+    "DARK_FACTORY_SOCKET",
+    "DARK_FACTORY_SESSION_TOKEN_FILE",
+    "DARK_FACTORY_FACTORYCTL",
+];
+
 /// Everything needed to launch one provider command under `factory-runner`.
 ///
 /// This deliberately has no `Debug` or `Clone` implementation because it owns
@@ -38,6 +57,11 @@ pub struct LaunchSpec {
     /// Closed provider-specific environment additions. Ambient values are
     /// never forwarded implicitly.
     pub provider_environment: ProviderEnvironment,
+    /// Fixed-name daemon-set additions on top of [`SAFE_ENVIRONMENT_NAMES`]
+    /// and `provider_environment`; every name must appear in
+    /// [`SESSION_ENVIRONMENT_NAMES`] or [`spawn_runner`] rejects the launch
+    /// before spawning anything.
+    pub session_environment: Vec<(String, String)>,
     pub run_id: RunId,
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
@@ -92,6 +116,8 @@ pub enum Error {
     StartupInputTimedOut,
     #[error("provider environment is invalid")]
     InvalidProviderEnvironment,
+    #[error("session environment variable {name:?} is not in the allowed set")]
+    InvalidSessionEnvironment { name: String },
 }
 
 struct StartupChild {
@@ -206,6 +232,11 @@ async fn spawn_runner_with_environment_and_timeout(
     if spec.terminal.is_some() && !spec.startup_input.is_empty() {
         return Err(Error::TerminalModeWithStartupInput);
     }
+    for (name, _) in &spec.session_environment {
+        if !SESSION_ENVIRONMENT_NAMES.contains(&name.as_str()) {
+            return Err(Error::InvalidSessionEnvironment { name: name.clone() });
+        }
+    }
 
     if !spec.runner_program.is_absolute() {
         return Err(Error::RunnerPathNotAbsolute {
@@ -251,6 +282,9 @@ async fn spawn_runner_with_environment_and_timeout(
         });
     apply_runner_environment(&mut command, &environment, terminal.is_some());
     apply_provider_environment(&mut command, provider_environment.as_deref());
+    for (name, value) in &spec.session_environment {
+        command.env(name, value);
+    }
 
     let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
     if terminal.is_none() {
@@ -502,6 +536,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             provider_program: PathBuf::from("provider-probe"),
             provider_arguments: vec![OsString::from("--safe-provider-flag")],
             provider_environment: ProviderEnvironment::Inherited,
+            session_environment: Vec::new(),
             run_id: id::<RunId>("run-safe-launch"),
             runner_instance_id: id::<RunnerInstanceId>("runner-safe-launch"),
             runtime_dir: directory.join("runtime"),

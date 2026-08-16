@@ -55,6 +55,7 @@ fn task(
         },
         body: String::new(),
         result: None,
+        blocked_reason: None,
     }
 }
 
@@ -94,6 +95,8 @@ fn session(id: &str, agent_id: &str, project: &str, state: SessionState) -> Sess
         worktree: "/work".into(),
         provider_session_id: None,
         current_run_id: None,
+        activity: None,
+        activity_inferred: false,
         last_hook_event: None,
         last_hook_at_ms: None,
         wait_reason: None,

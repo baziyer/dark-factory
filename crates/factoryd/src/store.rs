@@ -283,6 +283,8 @@ impl SessionRow {
             worktree: self.worktree.clone(),
             provider_session_id: self.provider_session_id.clone(),
             current_run_id: self.current_run_id.clone(),
+            activity: self.activity.clone(),
+            activity_inferred: self.activity_inferred,
             last_hook_event: self.last_hook_event,
             last_hook_at_ms: self.last_hook_at_ms,
             wait_reason: self.wait_reason.clone(),
@@ -540,6 +542,7 @@ impl Store {
             },
             body: input.body,
             result: None,
+            blocked_reason: None,
         };
         let event = FactoryEvent::TaskChanged {
             task: record.snapshot.clone(),
@@ -2054,7 +2057,7 @@ impl Store {
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
-                    status, priority, created_at_ms, updated_at_ms
+                    status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
              WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
              ORDER BY id
@@ -2084,6 +2087,7 @@ impl Store {
                     },
                     body: row.get(5)?,
                     result: row.get(6)?,
+                    blocked_reason: row.get(11)?,
                 })
             },
         )?;
@@ -3313,7 +3317,7 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
     connection
         .query_row(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
-                    status, priority, created_at_ms, updated_at_ms
+                    status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks WHERE id = ?1",
             params![task_id.as_str()],
             |row| {
@@ -3334,6 +3338,7 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
                     },
                     body: row.get(5)?,
                     result: row.get(6)?,
+                    blocked_reason: row.get(11)?,
                 })
             },
         )
@@ -3937,6 +3942,7 @@ const fn provider_value(value: Provider) -> &'static str {
     match value {
         Provider::ClaudeCode => "claude_code",
         Provider::Codex => "codex",
+        Provider::Shell => "shell",
     }
 }
 

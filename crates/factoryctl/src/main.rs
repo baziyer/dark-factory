@@ -303,19 +303,24 @@ Actions:
 
 Run `factoryctl agent <action> --help` for action-specific options.";
 const AGENT_ADD_HELP: &str =
-    "usage: factoryctl agent add --project ID --role <orchestrator|worker> --provider <claude|codex> [options]
+    "usage: factoryctl agent add --project ID --role <orchestrator|worker> --provider <claude|codex|shell> [options]
 
 Create a new agent.
 
 Required:
   --project ID           Project the agent belongs to
   --role ROLE              orchestrator or worker
-  --provider PROVIDER      claude (or claude-code) or codex
+  --provider PROVIDER      claude (or claude-code), codex, or shell (minimal example provider)
 
 Options:
   --id ID                    Explicit agent ID (default: generated UUID)
   --parent PARENT_ID         Parent agent ID
   --model MODEL               Provider model identifier for this agent
+                               (shell provider: a command to run under
+                               `sh -lc`, e.g. an absolute path to a script;
+                               omitted means a plain interactive shell)
+  --worktree PATH              Absolute path to an existing git worktree,
+                               overriding the daemon-managed default
   -h, --help                   Show this help";
 const AGENT_LIST_HELP: &str = "usage: factoryctl agent list --project ID [options]
 
@@ -645,6 +650,7 @@ enum CliCommand {
         role: AgentRole,
         provider: Provider,
         model: Option<String>,
+        worktree: Option<String>,
     },
     AgentList {
         project_id: String,
@@ -1334,9 +1340,11 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             let provider = match required_option(&mut args, "--provider")?.as_str() {
                 "claude" | "claude-code" => Provider::ClaudeCode,
                 "codex" => Provider::Codex,
-                _ => return Err("--provider must be claude or codex".into()),
+                "shell" => Provider::Shell,
+                _ => return Err("--provider must be claude, codex, or shell".into()),
             };
             let model = take_option(&mut args, "--model")?;
+            let worktree = take_option(&mut args, "--worktree")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentAdd {
                 id,
@@ -1345,6 +1353,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 role,
                 provider,
                 model,
+                worktree,
             })
         }
         "list" => {
@@ -1661,6 +1670,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             role,
             provider,
             model,
+            worktree,
         } => Ok(LocalRequest::CreateAgent {
             id: id
                 .map(|id| parse_id(id, "agent"))
@@ -1673,7 +1683,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             role,
             provider,
             model,
-            worktree: None,
+            worktree,
         }),
         CliCommand::AgentList {
             project_id,
@@ -2257,8 +2267,34 @@ mod tests {
                     role: AgentRole::Worker,
                     provider: Provider::Codex,
                     model: Some("gpt-5-codex".into()),
+                    worktree: None,
                 }
             )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "add",
+                "--project",
+                "project-1",
+                "--role",
+                "worker",
+                "--provider",
+                "shell",
+                "--worktree",
+                "/abs/worktree",
+            ]))
+            .unwrap()
+            .1,
+            CliCommand::AgentAdd {
+                id: None,
+                project_id: "project-1".into(),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+                model: None,
+                worktree: Some("/abs/worktree".into()),
+            }
         );
         assert_eq!(
             parse_args(args(&[
@@ -2602,6 +2638,7 @@ mod tests {
             role: AgentRole::Orchestrator,
             provider: Provider::Codex,
             model: None,
+            worktree: None,
         })
         .unwrap();
         let LocalRequest::CreateAgent { id, role, .. } = request else {

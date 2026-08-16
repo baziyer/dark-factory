@@ -19,6 +19,7 @@
 pub mod claude;
 pub mod codex;
 pub mod hooks;
+pub mod shell;
 
 use std::path::PathBuf;
 

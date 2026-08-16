@@ -186,6 +186,7 @@ fn glyph_for(theme: &Theme, station: &StationSlot) -> char {
         match station.provider {
             Provider::ClaudeCode => theme.claude_worker,
             Provider::Codex => theme.codex_worker,
+            Provider::Shell => theme.shell_worker,
         }
     }
 }
