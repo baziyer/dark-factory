@@ -948,8 +948,7 @@ fn delete_agent_deletes_its_profile_and_inbox_but_keeps_sent_messages_with_sende
             &agent_id("curie"),
             UpdateAgentProfile {
                 model: Some("claude-test".into()),
-                instructions: "Be terse.".into(),
-                memory: "Nothing yet.".into(),
+                permission_mode: None,
             },
             4,
         )
@@ -1041,8 +1040,7 @@ fn delete_project_cascades_agent_profiles_and_messages() {
             &agent_id("curie"),
             UpdateAgentProfile {
                 model: Some("claude-test".into()),
-                instructions: "Be terse.".into(),
-                memory: "Nothing yet.".into(),
+                permission_mode: None,
             },
             4,
         )

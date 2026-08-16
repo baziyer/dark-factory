@@ -1101,6 +1101,17 @@ async fn cancel_update_and_delete_are_local_control_operations() {
             }
         ));
 
+        let guidance_root = socket.parent().unwrap();
+        let agent_guidance_dir = factory_core::paths::agent_dir(
+            guidance_root,
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        assert!(
+            agent_guidance_dir.is_dir(),
+            "agent guidance directory should exist before delete"
+        );
+
         let agent_deleted = request(
             &socket,
             LocalRequest::DeleteAgent {
@@ -1116,6 +1127,17 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 ..
             }
         ));
+        assert!(
+            !agent_guidance_dir.exists(),
+            "agent guidance directory should be removed after delete"
+        );
+
+        let project_guidance_dir =
+            factory_core::paths::project_dir(guidance_root, &project_id("factory"));
+        assert!(
+            project_guidance_dir.is_dir(),
+            "project guidance directory should exist before delete"
+        );
 
         let project_deleted = request(
             &socket,
@@ -1131,6 +1153,10 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 ..
             }
         ));
+        assert!(
+            !project_guidance_dir.exists(),
+            "project guidance directory should be removed after delete"
+        );
     })
     .await;
 }

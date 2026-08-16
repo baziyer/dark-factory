@@ -410,8 +410,6 @@ pub enum StoreError {
     CapacityReached { limit: usize },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
-    #[error("project was not found")]
-    ProjectNotFound,
     #[error("task was not found in the requested project")]
     TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]

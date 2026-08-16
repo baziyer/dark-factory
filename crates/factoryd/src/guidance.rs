@@ -59,6 +59,38 @@ pub fn ensure_agent(
     ensure_file(&paths::agent_memory_path(home, project_id, agent_id))
 }
 
+/// Recursively removes one agent's guidance directory (`instructions.md`,
+/// `memory.md`, and the reserved worktree/codex-home/claude-settings paths
+/// under it), if present. A missing directory is not an error: callers use
+/// this best-effort after the owning `DeleteAgent` transaction has already
+/// committed, so the ledger row is gone either way.
+pub fn remove_agent(
+    home: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), GuidanceError> {
+    remove_dir(&paths::agent_dir(home, project_id, agent_id))
+}
+
+/// Recursively removes one project's guidance directory (`PROJECT.md` and
+/// every agent directory under it), if present. Best-effort, for the same
+/// reason as [`remove_agent`]: called after `DeleteProject` has already
+/// committed.
+pub fn remove_project(home: &Path, project_id: &ProjectId) -> Result<(), GuidanceError> {
+    remove_dir(&paths::project_dir(home, project_id))
+}
+
+fn remove_dir(path: &Path) -> Result<(), GuidanceError> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(GuidanceError::Directory {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Reads a guidance file, lazily creating an empty private file (and its
 /// parent directories) if it does not exist yet. Bounded to
 /// [`MAX_GUIDANCE_FILE_BYTES`].
@@ -328,6 +360,35 @@ mod tests {
             read_or_create(&path),
             Err(GuidanceError::TooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn remove_agent_deletes_the_agent_directory_and_is_idempotent() {
+        let home = tempfile::tempdir().unwrap();
+        let (project, agent) = ids();
+        ensure_agent(home.path(), &project, &agent).unwrap();
+        let agent_dir = paths::agent_dir(home.path(), &project, &agent);
+        assert!(agent_dir.is_dir());
+
+        remove_agent(home.path(), &project, &agent).unwrap();
+        assert!(!agent_dir.exists());
+        // Missing directory is not an error (best-effort cleanup).
+        remove_agent(home.path(), &project, &agent).unwrap();
+    }
+
+    #[test]
+    fn remove_project_deletes_the_project_directory_including_agents() {
+        let home = tempfile::tempdir().unwrap();
+        let (project, agent) = ids();
+        ensure_project(home.path(), &project).unwrap();
+        ensure_agent(home.path(), &project, &agent).unwrap();
+        let project_dir = paths::project_dir(home.path(), &project);
+        assert!(project_dir.is_dir());
+
+        remove_project(home.path(), &project).unwrap();
+        assert!(!project_dir.exists());
+        // Missing directory is not an error (best-effort cleanup).
+        remove_project(home.path(), &project).unwrap();
     }
 
     #[test]

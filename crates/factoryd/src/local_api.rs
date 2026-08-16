@@ -10,7 +10,7 @@ use std::{
 };
 
 use factory_core::{
-    PROTOCOL_VERSION, RunId,
+    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
@@ -128,9 +128,6 @@ impl ApiFailure {
                 ErrorCode::Conflict,
                 "active execution capacity has been reached".into(),
             ),
-            Self::Store(StoreError::ProjectNotFound) => {
-                (ErrorCode::NotFound, "project was not found".into())
-            }
             Self::Store(
                 error @ (StoreError::TaskNotCancellable
                 | StoreError::TaskNotEditable
@@ -688,6 +685,7 @@ async fn handle_request(
                     Ok(((), events))
                 })
                 .await?;
+            remove_agent_guidance(guidance_root, &response_project_id, &response_agent_id).await;
             Ok(LocalResponse::AgentDeleted {
                 project_id: response_project_id,
                 agent_id: response_agent_id,
@@ -701,6 +699,7 @@ async fn handle_request(
                     Ok(((), vec![event]))
                 })
                 .await?;
+            remove_project_guidance(guidance_root, &response_project_id).await;
             Ok(LocalResponse::ProjectDeleted {
                 project_id: response_project_id,
             })
@@ -905,6 +904,47 @@ async fn ensure_agent_guidance(
         .await
         .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
         .map_err(ApiFailure::from)
+}
+
+/// Best-effort recursive removal of one agent's guidance directory, run
+/// after `DeleteAgent`'s transaction has already committed. The ledger row
+/// is gone either way, so a filesystem failure here is logged and otherwise
+/// ignored rather than surfaced to the caller.
+async fn remove_agent_guidance(guidance_root: &Path, project_id: &ProjectId, agent_id: &AgentId) {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let agent_id = agent_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || guidance::remove_agent(&home, &project_id, &agent_id))
+            .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to remove agent guidance directory after delete");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "guidance worker panicked while removing agent guidance directory");
+        }
+    }
+}
+
+/// Best-effort recursive removal of one project's guidance directory, run
+/// after `DeleteProject`'s transaction has already committed. See
+/// [`remove_agent_guidance`] for why failures are only logged.
+async fn remove_project_guidance(guidance_root: &Path, project_id: &ProjectId) {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || guidance::remove_project(&home, &project_id)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to remove project guidance directory after delete");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "guidance worker panicked while removing project guidance directory");
+        }
+    }
 }
 
 impl From<GuidanceError> for ApiFailure {

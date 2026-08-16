@@ -57,8 +57,7 @@ Options:
   --follow                   Stream events as they occur
   -h, --help                  Show this help";
 
-const PROJECT_HELP: &str =
-    "usage: factoryctl project <add|list|delete|get|guidance> [options]
+const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete|get|guidance> [options]
 
 Manage projects.
 
