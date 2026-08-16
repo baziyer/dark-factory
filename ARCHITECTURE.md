@@ -24,11 +24,21 @@ This file records constraints, not an aspirational component catalogue.
    the daemon's ambient environment to a fixed non-secret allowlist, and sends
    bounded task bytes only over runner stdin—not argv or environment variables.
    It creates a private socket and bounded event spool before directly spawning
-   one process group. Events are appended before publication. Runners prove both
+   one process group. Events are appended before publication. A launch spec may
+   instead select terminal mode: the runner spawns the provider under a PTY of
+   the given size, does not send startup input (an interactive program takes
+   input from the operator), and appends raw output to a second bounded,
+   retained log (`terminal.log`, rotated once to `terminal.log.1` on overflow)
+   instead of decoding stdout into structural output events; `Started`,
+   `Exited`, and `SpawnFailed` lifecycle events are still recorded exactly as
+   in piped mode. Runners prove both
    run ID and a random runner-instance ID, retain terminal state until its exact
    sequence is acknowledged, and never adopt or signal from PID coincidence
    alone. A graceful runner signal stops the group but preserves an unacknowledged
-   spool for diagnosis and recovery. After a daemon restart, adapter state is
+   spool for diagnosis and recovery; acknowledgement itself removes only the
+   control socket, since the durable event spool and, in terminal mode, the
+   retained terminal log are private per-run files kept for operator
+   inspection, not deleted. After a daemon restart, adapter state is
    rebuilt by replaying that spool from sequence zero; SQLite's committed runner
    sequence is only the deduplication boundary for durable state and events. A
    terminal runner is marked reconciled only after its exact acknowledgement
@@ -57,10 +67,16 @@ This file records constraints, not an aspirational component catalogue.
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
    command output, and patches remain transient runner data. The native local
-   control API may expose a bounded, sanitized tail of the private runner spool
-   to the operator for inspection, but it never enters public events, webhook
-   snapshots, or tracing. A PTY is an
-   adapter-specific last resort, never the system's state model. The first
+   control API may expose a bounded, sanitized tail of the private runner spool,
+   or—for a terminal-mode run—attach live to its retained PTY output and accept
+   operator input and resize requests, for inspection; none of this ever enters
+   public events, webhook snapshots, or tracing, and the daemon proxy treats
+   attached bytes as opaque (never logged, never decoded). The runner supports a
+   first-class PTY mode with its own bounded, retained log and control-socket
+   wire protocol, but it is not the system's state model: durable state and
+   structural events are always driven by the provider decoder's normalized
+   output, never by raw terminal bytes, and the concrete Claude Code and Codex
+   adapters do not yet launch their provider interactively under it. The first
    Claude adapter uses `--safe-mode`, deliberately
    disabling ambient settings, hooks, plugins, MCP servers, and project
    instructions; enabling project Claude configuration requires a later explicit

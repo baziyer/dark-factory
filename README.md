@@ -70,6 +70,7 @@ cargo run -p factoryctl -- task delete --project PROJECT_ID --task TASK_ID
 cargo run -p factoryctl -- run stop --project PROJECT_ID --run RUN_ID
 cargo run -p factoryctl -- agent delete --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- project delete --project PROJECT_ID
+cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID
 cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
 cargo run -p factoryctl -- ui
@@ -148,6 +149,32 @@ body, then an always-present final paragraph pointing the agent at its own
 files with any editor, or through the daemon: `agent get`/`project get` print
 their absolute paths, and `agent profile set`/`project guidance set` write
 them atomically (bounded, temp file plus rename).
+
+## Terminal-mode runs and `attach`
+
+A run launched under a PTY (`factory-runner`'s terminal mode; not yet how the
+`claude`/`codex` adapters launch by default) retains its raw PTY output in
+`terminal.log` under the run's runtime directory, bounded at 64 MiB and
+rotated once to `terminal.log.1` on overflow — the tail is always kept, never
+the whole history. Unlike the public event log, `terminal.log` (and the
+runner's private `events.ndjson`) is never deleted when a run is acknowledged;
+only the runner's control socket is removed. These are private, bounded,
+per-run logs for operator inspection — they never enter public events, webhook
+snapshots, or tracing.
+
+`factoryctl attach` is the CLI operator escape hatch onto a terminal-mode
+run's PTY:
+
+```sh
+cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID
+cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID --since-offset 0
+```
+
+It puts the local terminal in raw mode, replays the retained log from
+`--since-offset` (default `0`, the full retained window) before switching to
+live bytes, forwards stdin as input, and forwards local window-size changes as
+resizes. Press `Ctrl-]` to detach; the terminal is restored on detach, EOF, or
+an unexpected exit. This is CLI-only — the egui UI does not expose it.
 
 ## The Minerva webhook endpoint
 
