@@ -187,7 +187,7 @@ impl fmt::Debug for WebhookSecret {
 
 impl WebhookSecret {
     fn matches(&self, provided: &[u8]) -> bool {
-        constant_time_eq(&self.0, provided)
+        crate::store::constant_time_eq(&self.0, provided)
     }
 }
 
@@ -573,17 +573,6 @@ pub async fn bind_webhooks(
         local_addr: local,
         metrics,
     })
-}
-
-fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
-    if expected.len() != provided.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (&left, &right) in expected.iter().zip(provided) {
-        difference |= left ^ right;
-    }
-    std::hint::black_box(difference) == 0
 }
 
 fn rate_limited(state: &HttpState, route: Route) -> Option<Response> {

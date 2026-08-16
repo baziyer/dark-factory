@@ -1,6 +1,4 @@
-use std::{
-    env, error::Error, ffi::OsString, io, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration,
-};
+use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
@@ -12,11 +10,6 @@ use factoryd::{
 use tokio::{net::UnixListener, sync::watch, task::JoinHandle};
 
 const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
-const CLAUDE_MAX_TURNS: NonZeroU32 = NonZeroU32::new(20).unwrap();
-const CLAUDE_MAX_BUDGET_CENTS: NonZeroU32 = NonZeroU32::new(500).unwrap();
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CONNECT_GRACE: Duration = Duration::from_secs(5);
-const BATCH_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Eq, PartialEq)]
 struct Config {
@@ -68,17 +61,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
-            runner_program: config.runner,
-            codex_program: config.codex,
-            claude_program: config.claude,
-            claude_max_turns: CLAUDE_MAX_TURNS,
-            claude_max_budget_cents: CLAUDE_MAX_BUDGET_CENTS,
             runtime_root: config.runtime_root,
             guidance_root: config.guidance_root,
             max_active_runs: config.max_active_runs,
-            startup_timeout: STARTUP_TIMEOUT,
-            connect_grace: CONNECT_GRACE,
-            batch_delay: BATCH_DELAY,
         },
         state.clone(),
     )?;

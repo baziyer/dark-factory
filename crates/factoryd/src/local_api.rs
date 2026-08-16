@@ -10,14 +10,15 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId, SessionId,
+    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId, SessionId,
+    SessionSnapshot,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
-        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS,
-        MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail, RequestEnvelope,
-        RunTerminal, ServerFrame,
+        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
+        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail,
+        RequestEnvelope, RunTerminal, ServerFrame,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
@@ -43,8 +44,8 @@ use crate::{
     guidance::{self, GuidanceError},
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, RunControlTarget, StoreError,
-        UpdateAgentProfile,
+        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, SessionControlTarget,
+        StoreError, UpdateAgentProfile,
     },
 };
 
@@ -52,6 +53,12 @@ const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
 const TERMINAL_FRAME_CHANNEL_CAPACITY: usize = 64;
+/// Mirrors the `tasks.result` CHECK bound (migration 0006).
+const MAX_TASK_RESULT_BYTES: usize = 131_072;
+/// Mirrors the `tasks.blocked_reason` CHECK bound (migration 0014).
+const MAX_BLOCKED_REASON_BYTES: usize = 4096;
+/// Mirrors the `sessions.activity`/`wait_reason` CHECK bound (migration 0014).
+const MAX_HOOK_FIELD_BYTES: usize = 512;
 
 type LimitedReader = Take<BufReader<OwnedReadHalf>>;
 
@@ -95,6 +102,18 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "agent message is invalid or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidTaskResult) => (
+                ErrorCode::InvalidRequest,
+                "task result exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidBlockedReason) => (
+                ErrorCode::InvalidRequest,
+                "task blocked reason is empty or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidHookToken) => (
+                ErrorCode::InvalidRequest,
+                "hook token is not recognized".into(),
+            ),
             Self::Store(StoreError::AgentNotFound) => (
                 ErrorCode::NotFound,
                 "agent was not found in the project".into(),
@@ -110,9 +129,21 @@ impl ApiFailure {
                 ErrorCode::NotFound,
                 "run was not found in the project".into(),
             ),
+            Self::Store(StoreError::SessionNotFound) => (
+                ErrorCode::NotFound,
+                "session was not found in the project".into(),
+            ),
             Self::Store(StoreError::TaskNotQueued) => (
                 ErrorCode::Conflict,
                 "task is not queued in the project".into(),
+            ),
+            Self::Store(StoreError::TaskNotRunning) => (
+                ErrorCode::Conflict,
+                "task is not running in the project".into(),
+            ),
+            Self::Store(StoreError::TaskAssignmentMismatch) => (
+                ErrorCode::Conflict,
+                "task is not assigned to the requesting agent".into(),
             ),
             Self::Store(StoreError::TaskNotRetryable) => (
                 ErrorCode::Conflict,
@@ -124,16 +155,15 @@ impl ApiFailure {
             ),
             Self::Store(StoreError::AgentUnavailable) => (
                 ErrorCode::Conflict,
-                "agent already has an active run".into(),
+                "agent already has an open run or live session".into(),
             ),
-            Self::Store(StoreError::ParentRunLineageMismatch) => (
+            Self::Store(StoreError::SessionAlreadyLive) => (
                 ErrorCode::Conflict,
-                "parent run does not match the agent hierarchy".into(),
+                "agent already has a live session".into(),
             ),
-            Self::Store(StoreError::CapacityReached { .. }) => (
-                ErrorCode::Conflict,
-                "active execution capacity has been reached".into(),
-            ),
+            Self::Store(StoreError::SessionNotLive) => {
+                (ErrorCode::Conflict, "session is not live".into())
+            }
             Self::Store(
                 error @ (StoreError::TaskNotCancellable
                 | StoreError::TaskNotEditable
@@ -141,6 +171,7 @@ impl ApiFailure {
                 | StoreError::TaskHasSubtasks
                 | StoreError::TaskRunHasDependents
                 | StoreError::AgentHasActiveRun
+                | StoreError::AgentHasLiveSession
                 | StoreError::AgentHasChildren
                 | StoreError::AgentRunHasDependents
                 | StoreError::ProjectHasActiveRun
@@ -159,19 +190,16 @@ impl ApiFailure {
 impl From<execution::Error> for ApiFailure {
     fn from(error: execution::Error) -> Self {
         match error {
-            execution::Error::InvalidWorktree | execution::Error::NonUtf8Path => {
-                Self::Invalid("task worktree must be an existing UTF-8 directory".into())
-            }
-            execution::Error::StartBackpressure => {
-                Self::Conflict("too many execution starts are in progress".into())
-            }
+            execution::Error::NoLiveSession => Self::Conflict(
+                "agent has no live session yet; session spawning lands in a later track".into(),
+            ),
             execution::Error::State(DaemonStateError::Store(
                 error @ (StoreError::AgentNotFound
-                | StoreError::AgentProviderMismatch
                 | StoreError::TaskNotQueued
+                | StoreError::TaskAssignmentMismatch
                 | StoreError::AgentUnavailable
-                | StoreError::ParentRunLineageMismatch
-                | StoreError::CapacityReached { .. }),
+                | StoreError::SessionNotFound
+                | StoreError::SessionNotLive),
             )) => Self::Store(error),
             _ => Self::Internal("execution manager could not accept the task".into()),
         }
@@ -418,18 +446,12 @@ fn spawn_terminal_attach(
     since_offset: u64,
 ) {
     attaches.spawn(async move {
-        // TRANSITION: sessions land in 5A/5C; until then the session id is
-        // the run id.
-        let run_id = match resolve_transitional_run_id(&session_id) {
-            Ok(run_id) => run_id,
-            Err(failure) => {
-                let _ = send_terminal_error(&frame_tx, failure.into_response()).await;
-                return;
-            }
-        };
-        let lookup_run_id = run_id.clone();
+        let lookup_project_id = project_id.clone();
+        let lookup_session_id = session_id.clone();
         let target = match state
-            .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+            .with_store(move |store| {
+                store.session_control_target(&lookup_project_id, &lookup_session_id)
+            })
             .await
         {
             Ok(target) => target,
@@ -439,7 +461,18 @@ fn spawn_terminal_attach(
                 return;
             }
         };
-        let client = RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id);
+        let control_run_id = match session_control_run_id(&session_id) {
+            Ok(run_id) => run_id,
+            Err(failure) => {
+                let _ = send_terminal_error(&frame_tx, failure.into_response()).await;
+                return;
+            }
+        };
+        let client = RunnerClient::new(
+            &target.runner_runtime,
+            control_run_id,
+            target.runner_instance_id,
+        );
         let mut subscription = match client.attach_terminal(since_offset).await {
             Ok(subscription) => subscription,
             Err(error) => {
@@ -580,14 +613,10 @@ async fn handle_request(
             model,
             worktree,
         } => {
-            if worktree.is_some() {
-                // TRANSITION: per-agent worktrees land in 5C (D3); accept
-                // nothing silently rather than dropping an operator's
-                // explicit override.
-                return Err(ApiFailure::Invalid(
-                    "per-agent worktrees are not implemented yet".into(),
-                ));
-            }
+            let worktree = match worktree {
+                Some(worktree) => Some(validate_agent_worktree(worktree).await?),
+                None => None,
+            };
             let created_project_id = project_id.clone();
             let created_agent_id = id.clone();
             let agent = state
@@ -606,6 +635,23 @@ async fn handle_request(
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            let agent = if let Some(worktree) = worktree {
+                let worktree_project_id = created_project_id.clone();
+                let worktree_agent_id = created_agent_id.clone();
+                state
+                    .commit_and_publish(move |store| {
+                        let (agent, event) = store.set_agent_worktree(
+                            &worktree_project_id,
+                            &worktree_agent_id,
+                            worktree,
+                            now_ms()?,
+                        )?;
+                        Ok((agent, vec![event]))
+                    })
+                    .await?
+            } else {
+                agent
+            };
             ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
             Ok(LocalResponse::AgentCreated { agent })
         }
@@ -763,12 +809,22 @@ async fn handle_request(
             parent_run_id,
             worktree,
         } => {
-            // TRANSITION: per-agent worktrees (the `None` default) land in
-            // 5C (D3); until then the caller must supply one explicitly.
-            let Some(worktree) = worktree else {
-                return Err(ApiFailure::Invalid(
-                    "worktree is required until per-agent worktrees exist".into(),
-                ));
+            let worktree = match worktree {
+                Some(worktree) => worktree,
+                None => {
+                    let lookup_project_id = project_id.clone();
+                    let lookup_agent_id = agent_id.clone();
+                    let agent = state
+                        .with_store(move |store| {
+                            store.get_agent_detail(&lookup_project_id, &lookup_agent_id)
+                        })
+                        .await?;
+                    agent.snapshot.worktree.ok_or_else(|| {
+                        ApiFailure::Invalid(
+                            "agent has no worktree; pass one explicitly or set one first".into(),
+                        )
+                    })?
+                }
             };
             let started = execution
                 .start_task(StartTask {
@@ -952,9 +1008,10 @@ async fn handle_request(
                     store.run_control_target(&lookup_project_id, &lookup_run_id)
                 })
                 .await?;
+            let control_run_id = run_id.clone();
             RunnerClient::new(
                 &target.runner_runtime,
-                run_id.clone(),
+                control_run_id,
                 target.runner_instance_id,
             )
             .stop(grace_ms)
@@ -971,19 +1028,176 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::RunStopped { run_id })
         }
-        // TRANSITION: sessions land in 5A (state + handlers) and 5C
-        // (delivery/spawn); every session-shaped request is rejected here
-        // rather than left silently unhandled.
-        LocalRequest::CancelRun { .. }
-        | LocalRequest::CompleteTask { .. }
-        | LocalRequest::BlockTask { .. }
-        | LocalRequest::PauseAgent { .. }
-        | LocalRequest::ResumeAgent { .. }
-        | LocalRequest::ListSessions { .. }
-        | LocalRequest::StopSession { .. }
-        | LocalRequest::ProviderHook { .. } => Err(ApiFailure::Invalid(
-            "sessions are not implemented yet".into(),
-        )),
+        LocalRequest::CancelRun { project_id, run_id } => {
+            let response_run_id = run_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let closed = store.cancel_run(&project_id, &run_id, now_ms()?)?;
+                    Ok(((), closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::RunCancelled {
+                run_id: response_run_id,
+            })
+        }
+        LocalRequest::CompleteTask {
+            project_id,
+            task_id,
+            result,
+        } => {
+            if result.len() > MAX_TASK_RESULT_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
+                )));
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
+                    Ok((closed.task, closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::TaskCompleted { task })
+        }
+        LocalRequest::BlockTask {
+            project_id,
+            task_id,
+            reason,
+        } => {
+            if reason.is_empty() || reason.len() > MAX_BLOCKED_REASON_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
+                )));
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
+                    Ok((closed.task, closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::TaskBlocked { task })
+        }
+        LocalRequest::PauseAgent {
+            project_id,
+            agent_id,
+        } => {
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.pause_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentPaused { agent })
+        }
+        LocalRequest::ResumeAgent {
+            project_id,
+            agent_id,
+        } => {
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.resume_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentResumed { agent })
+        }
+        LocalRequest::ListSessions {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = session_page_limit(limit)?;
+            let mut sessions = state
+                .with_store(move |store| {
+                    store.list_sessions(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id = next_cursor(&mut sessions, limit, |session| session.id.clone());
+            Ok(LocalResponse::Sessions {
+                sessions,
+                next_after_id,
+            })
+        }
+        LocalRequest::StopSession {
+            project_id,
+            session_id,
+            grace_ms,
+        } => {
+            if grace_ms > 60_000 {
+                return Err(ApiFailure::Invalid(
+                    "runner stop grace must be at most 60000 ms".into(),
+                ));
+            }
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
+            let target = state
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
+            let stop_project_id = project_id.clone();
+            let stop_session_id = session_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (session, event) = store.request_session_stop(
+                        &stop_project_id,
+                        &stop_session_id,
+                        now_ms()?,
+                    )?;
+                    Ok((session, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::SessionStopped { session_id })
+        }
+        LocalRequest::ProviderHook {
+            token,
+            event,
+            payload,
+        } => {
+            if token.is_empty() || token.len() > 4096 {
+                return Err(ApiFailure::Invalid("hook token is invalid".into()));
+            }
+            let lookup_token = token.clone();
+            let session = state
+                .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
+                .await?
+                .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
+            let session_id = session.id;
+            let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
+            let record_session_id = session_id.clone();
+            let updated_session = state
+                .commit_and_publish(move |store| {
+                    let (session, event_envelope) = store.record_hook_event(
+                        &record_session_id,
+                        event,
+                        activity,
+                        inferred,
+                        wait_reason,
+                        now_ms()?,
+                    )?;
+                    Ok((session, vec![event_envelope]))
+                })
+                .await?;
+            let reply = if matches!(
+                event,
+                ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
+            ) {
+                state
+                    .with_store(move |store| Ok(stop_hook_reply(store, &updated_session)))
+                    .await?
+            } else {
+                serde_json::json!({})
+            };
+            Ok(LocalResponse::ProviderHookReply { reply })
+        }
         LocalRequest::AttachTerminal { .. } => {
             unreachable!("AttachTerminal is handled per connection")
         }
@@ -992,17 +1206,22 @@ async fn handle_request(
             session_id,
             bytes,
         } => {
-            // TRANSITION: sessions land in 5A/5C; until then the session id
-            // is the run id.
-            let run_id = resolve_transitional_run_id(&session_id)?;
-            let lookup_run_id = run_id.clone();
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
             let target = state
-                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
                 .await?;
-            RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id)
-                .terminal_input(bytes)
-                .await
-                .map_err(|error| runner_control_failure(error, "terminal input"))?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .terminal_input(bytes)
+            .await
+            .map_err(|error| runner_control_failure(error, "terminal input"))?;
             Ok(LocalResponse::TerminalInputAccepted { session_id })
         }
         LocalRequest::ResizeTerminal {
@@ -1011,17 +1230,22 @@ async fn handle_request(
             cols,
             rows,
         } => {
-            // TRANSITION: sessions land in 5A/5C; until then the session id
-            // is the run id.
-            let run_id = resolve_transitional_run_id(&session_id)?;
-            let lookup_run_id = run_id.clone();
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
             let target = state
-                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
                 .await?;
-            RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id)
-                .resize_terminal(cols, rows)
-                .await
-                .map_err(|error| runner_control_failure(error, "resize terminal"))?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .resize_terminal(cols, rows)
+            .await
+            .map_err(|error| runner_control_failure(error, "resize terminal"))?;
             Ok(LocalResponse::TerminalResized { session_id })
         }
         LocalRequest::ListRuns {
@@ -1232,13 +1456,94 @@ fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
     }
 }
 
-/// TRANSITION: sessions land in 5A/5C; until then the session id is the run
-/// id, so every session-shaped terminal request is resolved as a lookup by
-/// run id. `SessionId` and `RunId` share the same charset/length validation,
-/// so this only fails if the daemon and client versions disagree.
-fn resolve_transitional_run_id(session_id: &SessionId) -> Result<RunId, ApiFailure> {
-    RunId::try_from(session_id.as_str())
-        .map_err(|_| ApiFailure::Invalid("session id is not a valid run id".into()))
+/// Validates an operator-supplied agent worktree override (D3): must be an
+/// absolute, existing directory. Creating the git worktree itself is
+/// execution's job; this only records the path.
+async fn validate_agent_worktree(worktree: String) -> Result<String, ApiFailure> {
+    if !Path::new(&worktree).is_absolute() {
+        return Err(ApiFailure::Invalid(
+            "agent worktree must be an absolute path".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        if !Path::new(&worktree).is_dir() {
+            return Err(ApiFailure::Invalid(
+                "agent worktree must be an existing directory".into(),
+            ));
+        }
+        Ok(worktree)
+    })
+    .await
+    .map_err(|error| ApiFailure::Internal(format!("worktree check worker failed: {error}")))?
+}
+
+fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {
+    // The store's generic state-page cap (`MAX_STATE_PAGE`, currently 101)
+    // is smaller than the wire's advertised `MAX_SESSION_PAGE_ITEMS`; a
+    // caller that omits `limit` gets a page that is guaranteed to fit
+    // rather than the wire maximum.
+    const DEFAULT_SESSION_PAGE: usize = 100;
+    let limit = limit.unwrap_or(DEFAULT_SESSION_PAGE);
+    if !(1..=MAX_SESSION_PAGE_ITEMS as usize).contains(&limit) {
+        return Err(ApiFailure::Invalid(format!(
+            "session page limit must be between 1 and {MAX_SESSION_PAGE_ITEMS}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// Computes the `record_hook_event` inputs for one hook event from its
+/// opaque JSON payload: `tool_name` for `PreToolUse`, `message` for
+/// `Notification`; every other event carries no payload-derived field.
+fn compute_hook_fields(
+    event: ProviderHookEvent,
+    payload: &serde_json::Value,
+) -> (Option<String>, bool, Option<String>) {
+    match event {
+        ProviderHookEvent::SessionStart | ProviderHookEvent::Stop => (None, false, None),
+        ProviderHookEvent::UserPromptSubmit | ProviderHookEvent::PostToolUse => {
+            (Some("thinking".into()), true, None)
+        }
+        ProviderHookEvent::PreToolUse => {
+            let tool_name = payload
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (
+                Some(bounded_hook_field(&format!("tool: {tool_name}"))),
+                false,
+                None,
+            )
+        }
+        ProviderHookEvent::Notification => {
+            let message = payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("waiting for input");
+            (None, false, Some(bounded_hook_field(message)))
+        }
+        ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => (None, false, None),
+    }
+}
+
+fn bounded_hook_field(value: &str) -> String {
+    if value.len() <= MAX_HOOK_FIELD_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_HOOK_FIELD_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+/// 5C: deliver next work here. Once a session's `Stop`/`SubagentStop` hook
+/// reports durable state (an open run not yet delivered, or undelivered
+/// `agent_messages`), reply `{"decision":"block","reason":"<composed
+/// text>"}` to keep the CLI turning instead of going idle (TRACK5-DESIGN.md
+/// section 3). For now every reply is `{}`.
+fn stop_hook_reply(_store: &crate::store::Store, _session: &SessionSnapshot) -> serde_json::Value {
+    serde_json::json!({})
 }
 
 fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {
@@ -1256,7 +1561,10 @@ fn runner_control_failure(error: RunnerClientError, action: &'static str) -> Api
     }
 }
 
-fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerminal, ApiFailure> {
+fn read_run_terminal(
+    target: &SessionControlTarget,
+    run_id: RunId,
+) -> Result<RunTerminal, ApiFailure> {
     let spool_path = PathBuf::from(&target.runner_runtime).join("events.ndjson");
     let file = match fs::File::open(spool_path) {
         Ok(file) => file,
@@ -1559,6 +1867,16 @@ fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> I
     }
     items.pop();
     items.last().map(id)
+}
+
+/// The runner protocol still keys control requests by `RunId` (see
+/// `factory_core::runner`); `SessionId` and `RunId` share the same
+/// charset/length validation, so a session's own id doubles as its
+/// runner-facing identity until that protocol grows a session concept of
+/// its own.
+fn session_control_run_id(session_id: &SessionId) -> Result<RunId, ApiFailure> {
+    RunId::try_from(session_id.as_str())
+        .map_err(|_| ApiFailure::Internal("session id is not runner-addressable".into()))
 }
 
 fn now_ms() -> Result<i64, StoreError> {

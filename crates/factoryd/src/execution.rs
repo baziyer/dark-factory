@@ -1,78 +1,49 @@
-//! Durable Claude Code and Codex execution ownership.
+//! Task-episode delivery into resident agent sessions.
+//!
+//! TRANSITION (5A -> 5C): the per-run ephemeral-runner supervision loop that
+//! used to live here (spawn a fresh `factory-runner` per task, decode its
+//! stream-JSON, recover it after a restart) is gone. Migration 0014 moved
+//! everything it depended on (runner identity, provider session, observer
+//! health) off `runs` and onto `sessions`, and the target model spawns one
+//! resident PTY-backed session per agent instead of one process per task
+//! (see TRACK5-DESIGN.md section 1 and TRACK5-WIRE.md). Real session
+//! spawning, PTY-typed delivery, and restart recovery are 5C's track
+//! (`Store::recoverable_sessions`, `Store::create_session`, and the seam at
+//! `local_api::stop_hook_reply` are already in place for it).
+//!
+//! What remains meaningful without that: `StartTask` (the operator's
+//! explicit "deliver now") opens a task-episode (`Store::open_run_episode`)
+//! inside an agent's *already-live* session. Against an agent with no live
+//! session yet, it fails with `Error::NoLiveSession` until 5C wires up
+//! spawning.
 
 use std::{
     fs, io,
-    num::NonZeroU32,
-    os::unix::{
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-        process::ExitStatusExt,
-    },
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    os::unix::fs::{DirBuilderExt, MetadataExt},
+    path::PathBuf,
 };
 
-use factory_core::{
-    AgentId, ObserverHealth, ProjectId, Provider, RunFailureReason, RunId, RunnerInstanceId,
-    TaskId,
-    runner::{RunnerEvent, RunnerEventEnvelope},
-};
+use factory_core::{AgentId, ProjectId, RunId, TaskId};
 use thiserror::Error;
-use tokio::{
-    process::Child,
-    sync::{mpsc, oneshot, watch},
-    task::{JoinHandle, JoinSet},
-    time::{Instant, sleep_until, timeout_at},
-};
-use uuid::Uuid;
+use tokio::{sync::watch, task::JoinHandle};
 
-use crate::{
-    daemon_state::{DaemonState, DaemonStateError},
-    guidance,
-    providers::{
-        claude::{
-            self, ClaudeLaunch, Decoder as ClaudeDecoder, FailureReason as ClaudeFailureReason,
-            Observation as ClaudeObservation, Outcome as ClaudeOutcome, Session as ClaudeSession,
-        },
-        codex::{
-            self, CodexLaunch, Decoder as CodexDecoder, FailureReason as CodexFailureReason,
-            Observation as CodexObservation, Outcome as CodexOutcome, Session as CodexSession,
-        },
-    },
-    runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
-    runner_process,
-    store::{
-        AgentMessage, ExecutionTarget, MAX_RUNNER_BATCH_EVENTS, RecoverableExecution,
-        RunReservation, RunnerEventEffects, RunnerEventInput, StoreError, TerminalOutcome,
-        WriteDisposition,
-    },
-};
+use crate::daemon_state::{DaemonState, DaemonStateError};
 
-const COMMAND_CAPACITY: usize = 32;
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
-const RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
-const MAX_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-const CONTROL_SOCKET_FILE: &str = "control.sock";
 
-/// Fixed process and durability bounds for the execution actor.
+/// Bounds still meaningful without per-task runner spawning.
 pub struct Config {
-    pub runner_program: PathBuf,
-    pub codex_program: PathBuf,
-    pub claude_program: PathBuf,
-    pub claude_max_turns: NonZeroU32,
-    pub claude_max_budget_cents: NonZeroU32,
+    /// Root directory future sessions' runner runtime directories live
+    /// under. Validated (existing, private, owner-only) at `spawn()` time
+    /// so 5C's session spawn has a ready-made private root.
     pub runtime_root: PathBuf,
-    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree read at
-    /// launch (see `factory_core::paths` and `guidance`).
+    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
+    /// `factory_core::paths` and `guidance`).
     pub guidance_root: PathBuf,
     pub max_active_runs: usize,
-    pub startup_timeout: Duration,
-    pub connect_grace: Duration,
-    pub batch_delay: Duration,
 }
 
-/// One explicit queued task assigned to one existing provider-bound agent.
+/// One explicit queued task to deliver now into its agent's live session.
 pub struct StartTask {
     pub project_id: ProjectId,
     pub task_id: TaskId,
@@ -86,114 +57,70 @@ pub struct StartedRun {
     pub run_id: RunId,
 }
 
-/// Bounded command handle for the execution actor.
-#[derive(Clone)]
-pub struct Handle {
-    tx: mpsc::Sender<Command>,
-}
-
-impl Handle {
-    /// Durably reserves one queued task for its agent's stored provider.
-    ///
-    /// Success means the reservation and its public events are committed. The
-    /// runner may still be starting; readiness and completion are observable
-    /// through the durable run state.
-    pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Start {
-                input,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| Error::ManagerStopped)?;
-        reply_rx.await.map_err(|_| Error::ManagerStopped)?
-    }
-
-    /// Stops daemon-side observation without stopping or acknowledging runners.
-    pub async fn shutdown(&self) -> Result<(), Error> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.tx
-            .send(Command::Shutdown { reply: reply_tx })
-            .await
-            .map_err(|_| Error::ManagerStopped)?;
-        reply_rx.await.map_err(|_| Error::ManagerStopped)
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("execution concurrency must be greater than zero")]
     InvalidConcurrency,
-    #[error("execution timing bounds must be greater than zero")]
-    InvalidTiming,
     #[error("runner runtime root is not a private owner-only directory")]
     InvalidRuntimeRoot,
-    #[error("task worktree is not an existing directory")]
-    InvalidWorktree,
-    #[error("execution path is not valid UTF-8")]
-    NonUtf8Path,
     #[error("daemon state failed: {0}")]
     State(#[from] DaemonStateError),
-    #[error("provider session binding is invalid")]
-    InvalidSession,
-    #[error("runner launch failed: {0}")]
-    Launch(#[from] runner_process::Error),
-    #[error("runner control failed: {0}")]
-    Runner(#[from] RunnerClientError),
-    #[error("runner did not become reachable within its launch grace")]
-    RunnerUnavailable,
-    #[error("too many execution starts are in progress")]
-    StartBackpressure,
     #[error("execution manager has stopped")]
     ManagerStopped,
-    #[error("execution worker stopped unexpectedly")]
-    WorkerStopped,
+    #[error("agent has no live session yet; session spawning lands in a later track")]
+    NoLiveSession,
     #[error("system clock is before the Unix epoch")]
     InvalidClock,
-    #[error("durable execution metadata is inconsistent")]
-    CorruptExecution,
-    #[error("launch guidance unavailable: {0}")]
-    Guidance(String),
 }
 
-struct SharedConfig {
-    runner_program: PathBuf,
-    codex_program: PathBuf,
-    claude_program: PathBuf,
-    claude_max_turns: NonZeroU32,
-    claude_max_budget_cents: NonZeroU32,
-    runtime_root: PathBuf,
-    guidance_root: PathBuf,
-    max_active_runs: usize,
-    startup_timeout: Duration,
-    connect_grace: Duration,
-    batch_delay: Duration,
+/// Bounded handle for task-episode delivery.
+#[derive(Clone)]
+pub struct Handle {
+    state: DaemonState,
+    shutdown: watch::Sender<bool>,
 }
 
-enum Command {
-    Start {
-        input: StartTask,
-        reply: oneshot::Sender<Result<StartedRun, Error>>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
+impl Handle {
+    /// Opens a task-episode inside the agent's live session. Durable once
+    /// this returns `Ok`.
+    pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
+        let StartTask {
+            project_id,
+            agent_id,
+            task_id,
+            ..
+        } = input;
+        let lookup_project_id = project_id.clone();
+        let lookup_agent_id = agent_id.clone();
+        let session = self
+            .state
+            .with_store(move |store| {
+                store.live_session_for_agent(&lookup_project_id, &lookup_agent_id)
+            })
+            .await?
+            .ok_or(Error::NoLiveSession)?;
+        let opened_at_ms = now_ms()?;
+        let run_id = self
+            .state
+            .commit_and_publish(move |store| {
+                let opened = store.open_run_episode(&session.id, &task_id, opened_at_ms)?;
+                let run_id = opened.run.id.clone();
+                Ok((run_id, opened.events))
+            })
+            .await?;
+        Ok(StartedRun { run_id })
+    }
+
+    /// Stops accepting new work. There is no background supervision loop to
+    /// tear down in this reduced module; kept so `main.rs`'s shutdown
+    /// sequencing does not need to know that.
+    pub async fn shutdown(&self) -> Result<(), Error> {
+        let _ = self.shutdown.send(true);
+        Ok(())
+    }
 }
 
-struct StartWork {
-    input: StartTask,
-    reply: oneshot::Sender<Result<StartedRun, Error>>,
-}
-
-struct WorkerCompletion {
-    start: bool,
-    result: Result<Option<RunContext>, Error>,
-}
-
-/// Starts the bounded execution actor on the current Tokio runtime.
-///
-/// The actor recovers durable runner identities before accepting new work.
+/// Starts the (currently trivial) execution manager.
 pub fn spawn(
     config: Config,
     state: DaemonState,
@@ -201,1306 +128,31 @@ pub fn spawn(
     if config.max_active_runs == 0 {
         return Err(Error::InvalidConcurrency);
     }
-    if config.startup_timeout.is_zero()
-        || config.connect_grace.is_zero()
-        || config.batch_delay.is_zero()
-    {
-        return Err(Error::InvalidTiming);
-    }
-    let runtime_root = prepare_runtime_root(&config.runtime_root)?;
+    prepare_runtime_root(&config.runtime_root)?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::ManagerStopped)?;
-    let config = Arc::new(SharedConfig {
-        runner_program: config.runner_program,
-        codex_program: config.codex_program,
-        claude_program: config.claude_program,
-        claude_max_turns: config.claude_max_turns,
-        claude_max_budget_cents: config.claude_max_budget_cents,
-        runtime_root,
-        guidance_root: config.guidance_root,
-        max_active_runs: config.max_active_runs,
-        startup_timeout: config.startup_timeout,
-        connect_grace: config.connect_grace,
-        batch_delay: config.batch_delay,
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let join = runtime.spawn(async move {
+        let _ = shutdown_rx.changed().await;
+        Ok(())
     });
-    let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
-    let join = runtime.spawn(run_actor(config, state, rx));
-    Ok((Handle { tx }, join))
-}
-
-async fn run_actor(
-    config: Arc<SharedConfig>,
-    state: DaemonState,
-    mut commands: mpsc::Receiver<Command>,
-) -> Result<(), Error> {
-    let recoverable = state
-        .with_store(|store| store.recoverable_executions())
-        .await?;
-    let recovery = recoverable
-        .into_iter()
-        .map(RecoveryWork::from_recoverable)
-        .collect::<Vec<_>>();
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut tasks = JoinSet::new();
-    for run in recovery {
-        let task_config = Arc::clone(&config);
-        let task_state = state.clone();
-        let task_shutdown = shutdown_rx.clone();
-        tasks.spawn(async move {
-            WorkerCompletion {
-                start: false,
-                result: recover_run(task_config, task_state, run, task_shutdown)
-                    .await
-                    .map(|()| None),
-            }
-        });
-    }
-    let mut start_workers = 0usize;
-
-    loop {
-        tokio::select! {
-            command = commands.recv() => match command {
-                Some(Command::Start { input, reply }) if start_workers < COMMAND_CAPACITY => {
-                    let task_config = Arc::clone(&config);
-                    let task_state = state.clone();
-                    let task_shutdown = shutdown_rx.clone();
-                    tasks.spawn(async move {
-                        WorkerCompletion {
-                            start: true,
-                            result: start_run(
-                                task_config,
-                                task_state,
-                                StartWork { input, reply },
-                                task_shutdown,
-                            )
-                            .await,
-                        }
-                    });
-                    start_workers += 1;
-                }
-                Some(Command::Start { reply, .. }) => {
-                    let _ = reply.send(Err(Error::StartBackpressure));
-                }
-                Some(Command::Shutdown { reply }) => {
-                    let _ = shutdown_tx.send(true);
-                    commands.close();
-                    while let Some(command) = commands.recv().await {
-                        if let Command::Start { reply, .. } = command {
-                            let _ = reply.send(Err(Error::ManagerStopped));
-                        }
-                    }
-                    while let Some(result) = tasks.join_next().await {
-                        drop(result.map_err(|_| Error::WorkerStopped)?);
-                    }
-                    let _ = reply.send(());
-                    return Ok(());
-                }
-                None => {
-                    let _ = shutdown_tx.send(true);
-                    while let Some(result) = tasks.join_next().await {
-                        drop(result.map_err(|_| Error::WorkerStopped)?);
-                    }
-                    return Ok(());
-                }
-            },
-            joined = tasks.join_next(), if !tasks.is_empty() => {
-                let completion = joined.expect("non-empty JoinSet returned no task")
-                    .map_err(|_| Error::WorkerStopped)?;
-                if completion.start {
-                    start_workers = start_workers.checked_sub(1).ok_or(Error::WorkerStopped)?;
-                }
-                match completion.result {
-                    Ok(Some(context)) => {
-                        let task_config = Arc::clone(&config);
-                        let task_state = state.clone();
-                        let mut task_shutdown = shutdown_rx.clone();
-                        tasks.spawn(async move {
-                            WorkerCompletion {
-                                start: false,
-                                result: observe_run(
-                                    &task_config,
-                                    &task_state,
-                                    context,
-                                    &mut task_shutdown,
-                                )
-                                .await
-                                .map(|()| None),
-                            }
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) if manager_fatal(&error) => {
-                        let _ = shutdown_tx.send(true);
-                        tasks.abort_all();
-                        while tasks.join_next().await.is_some() {}
-                        return Err(error);
-                    }
-                    Err(error) => tracing::warn!(
-                            failure = error_category(&error),
-                            "execution worker stopped without affecting peers"
-                        ),
-                }
-            }
-        }
-    }
-}
-
-async fn start_run(
-    config: Arc<SharedConfig>,
-    state: DaemonState,
-    work: StartWork,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<Option<RunContext>, Error> {
-    let mut reply = Some(work.reply);
-    let result = start_run_inner(&config, &state, work.input, &mut reply, &mut shutdown).await;
-    match result {
-        Ok(context) => Ok(context),
-        Err(error) => {
-            if let Some(reply) = reply.take() {
-                let fatal = manager_fatal(&error);
-                let _ = reply.send(Err(error));
-                if fatal {
-                    Err(Error::WorkerStopped)
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Err(error)
-            }
-        }
-    }
-}
-
-async fn start_run_inner(
-    config: &SharedConfig,
-    state: &DaemonState,
-    input: StartTask,
-    reply: &mut Option<oneshot::Sender<Result<StartedRun, Error>>>,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<Option<RunContext>, Error> {
-    let worktree = canonical_worktree(&input.worktree)?;
-    let run_id = new_id::<RunId>()?;
-    let runner_instance_id = new_id::<RunnerInstanceId>()?;
-    let runtime_dir = config.runtime_root.join(run_id.as_str());
-    let worktree_text = path_text(&worktree)?;
-    let runtime_text = path_text(&runtime_dir)?;
-    let identity_project = input.project_id.clone();
-    let identity_agent = input.agent_id.clone();
-    let identity = state
-        .with_store(move |store| store.agent_execution_identity(&identity_project, &identity_agent))
-        .await?;
-    let provider = identity.provider;
-    let fresh_provider_session_id =
-        if identity.provider == Provider::ClaudeCode && !identity.has_provider_session {
-            Some(Uuid::new_v4().hyphenated().to_string())
-        } else {
-            None
-        };
-    let reservation = RunReservation {
-        project_id: input.project_id,
-        task_id: input.task_id,
-        agent_id: input.agent_id,
-        expected_provider: identity.provider,
-        run_id: run_id.clone(),
-        parent_run_id: input.parent_run_id,
-        worktree: worktree_text,
-        fresh_provider_session_id,
-        runner_instance_id: runner_instance_id.clone(),
-        runner_runtime: runtime_text,
-    };
-    let max_active_runs = config.max_active_runs;
-    let reserved_at_ms = now_ms()?;
-    let reserved = state
-        .commit_and_publish(move |store| {
-            let reserved = store.reserve_task_run(reservation, max_active_runs, reserved_at_ms)?;
-            let crate::store::ReservedRun { target, events, .. } = reserved;
-            Ok((target, events))
-        })
-        .await?;
-    tracing::info!(
-        target: "factoryd.execution",
-        event = "run_reserved",
-        run_id = %run_id,
-        provider = provider_category(provider)
-    );
-    if let Some(reply) = reply.take() {
-        let _ = reply.send(Ok(StartedRun {
-            run_id: run_id.clone(),
-        }));
-    }
-
-    if shutdown_requested(shutdown) {
-        fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
-        return Ok(None);
-    }
-
-    let watch_target = WatchTarget::from_execution_target(&reserved);
-    let launch_spec = match prepare_launch(
-        config,
-        reserved,
-        run_id.clone(),
-        runner_instance_id.clone(),
-        runtime_dir.clone(),
-        worktree,
-    ) {
-        Ok(launch_spec) => launch_spec,
-        Err(_) => {
-            fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
-            return Ok(None);
-        }
-    };
-
-    let child = match runner_process::spawn_runner(launch_spec, config.startup_timeout).await {
-        Ok(child) => child,
-        Err(_) => {
-            fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
-            return Ok(None);
-        }
-    };
-    Ok(Some(RunContext {
-        run_id,
-        target: watch_target,
-        runtime_dir,
-        terminal_sequence: None,
-        child: Some(child),
-        observer_health: ObserverHealth::Unknown,
-        absence_authoritative: true,
-        launch_pending: true,
-        retry_delay: RECOVERY_RETRY_DELAY,
-    }))
-}
-
-async fn recover_run(
-    config: Arc<SharedConfig>,
-    state: DaemonState,
-    run: RecoveryWork,
-    mut shutdown: watch::Receiver<bool>,
-) -> Result<(), Error> {
-    observe_run(
-        &config,
-        &state,
-        RunContext {
-            run_id: run.run_id,
-            target: run.target,
-            runtime_dir: run.runtime_dir,
-            terminal_sequence: run.terminal_sequence,
-            child: None,
-            observer_health: run.observer_health,
-            absence_authoritative: run.observer_health == ObserverHealth::Healthy,
-            launch_pending: false,
-            retry_delay: RECOVERY_RETRY_DELAY,
-        },
-        &mut shutdown,
-    )
-    .await
-}
-
-struct RecoveryWork {
-    run_id: RunId,
-    target: WatchTarget,
-    runtime_dir: PathBuf,
-    terminal_sequence: Option<i64>,
-    observer_health: ObserverHealth,
-}
-
-impl RecoveryWork {
-    fn from_recoverable(run: RecoverableExecution) -> Self {
-        Self {
-            run_id: run.run_id,
-            target: WatchTarget {
-                provider: run.provider,
-                provider_session_id: run.provider_session_id,
-                resumes_provider_session: run.resumes_provider_session,
-                runner_instance_id: run.runner_instance_id,
-            },
-            runtime_dir: PathBuf::from(run.runner_runtime),
-            terminal_sequence: run.terminal_runner_sequence,
-            observer_health: run.observer_health,
-        }
-    }
-}
-
-struct RunContext {
-    run_id: RunId,
-    target: WatchTarget,
-    runtime_dir: PathBuf,
-    terminal_sequence: Option<i64>,
-    child: Option<Child>,
-    observer_health: ObserverHealth,
-    absence_authoritative: bool,
-    launch_pending: bool,
-    retry_delay: Duration,
-}
-
-impl RunContext {
-    fn next_retry_delay(&mut self) -> Duration {
-        let delay = self.retry_delay;
-        self.retry_delay = delay
-            .checked_mul(2)
-            .unwrap_or(MAX_RECOVERY_RETRY_DELAY)
-            .min(MAX_RECOVERY_RETRY_DELAY);
-        delay
-    }
-
-    fn reset_retry_delay(&mut self) {
-        self.retry_delay = RECOVERY_RETRY_DELAY;
-    }
-}
-
-struct WatchTarget {
-    provider: Provider,
-    provider_session_id: Option<String>,
-    resumes_provider_session: bool,
-    runner_instance_id: RunnerInstanceId,
-}
-
-impl WatchTarget {
-    fn from_execution_target(target: &ExecutionTarget) -> Self {
-        Self {
-            provider: target.provider,
-            provider_session_id: target.provider_session_id.clone(),
-            resumes_provider_session: target.resumes_provider_session,
-            runner_instance_id: target.runner_instance_id.clone(),
-        }
-    }
-}
-
-async fn observe_run(
-    config: &SharedConfig,
-    state: &DaemonState,
-    mut context: RunContext,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), Error> {
-    loop {
-        match supervise_run(config, state, &mut context, shutdown).await {
-            Ok(()) => return Ok(()),
-            Err(error) if manager_fatal(&error) => return Err(error),
-            Err(error) => {
-                if distrusts_absence(&error) {
-                    set_observer_health(state, &mut context, ObserverHealth::Degraded).await?;
-                    context.absence_authoritative = false;
-                }
-                tracing::warn!(
-                    run_id = %context.run_id,
-                    failure = error_category(&error),
-                    "provider run observation will retry"
-                );
-                let retry_delay = context.next_retry_delay();
-                tokio::select! {
-                    _ = wait_for_shutdown(shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(retry_delay) => {}
-                }
-            }
-        }
-    }
-}
-
-async fn supervise_run(
-    config: &SharedConfig,
-    state: &DaemonState,
-    context: &mut RunContext,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), Error> {
-    let client = RunnerClient::new(
-        &context.runtime_dir,
-        context.run_id.clone(),
-        context.target.runner_instance_id.clone(),
-    );
-    loop {
-        if shutdown_requested(shutdown) {
-            return Ok(());
-        }
-        if let Some(terminal_sequence) = context.terminal_sequence {
-            if endpoint_absent(&context.runtime_dir)? {
-                if !context.absence_authoritative {
-                    return Err(Error::RunnerUnavailable);
-                }
-                if child_is_running(&mut context.child)? {
-                    return Err(Error::RunnerUnavailable);
-                }
-                reconcile_terminal(state, context, terminal_sequence).await?;
-                return Ok(());
-            }
-        }
-        let active_subscription = match attach_with_grace(
-            &client,
-            &context.runtime_dir,
-            config.connect_grace,
-            shutdown,
-        )
-        .await?
-        {
-            Attach::Connected(subscription) => {
-                context.launch_pending = false;
-                subscription
-            }
-            Attach::Shutdown => return Ok(()),
-            Attach::Missing => {
-                if !context.absence_authoritative {
-                    set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                    return Err(Error::RunnerUnavailable);
-                }
-                if let Some(terminal) = context.terminal_sequence {
-                    if child_is_running(&mut context.child)? {
-                        return Err(Error::RunnerUnavailable);
-                    }
-                    reconcile_terminal(state, context, terminal).await?;
-                } else {
-                    match poll_child(&mut context.child)? {
-                        ChildState::Running => {
-                            set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                            return Err(Error::RunnerUnavailable);
-                        }
-                        ChildState::ExitedBySignal => {
-                            set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                            context.absence_authoritative = false;
-                            return Err(Error::RunnerUnavailable);
-                        }
-                        ChildState::ExitedNormally | ChildState::Absent => {
-                            if context.launch_pending {
-                                fail_launch(
-                                    state,
-                                    context.run_id.clone(),
-                                    context.target.runner_instance_id.clone(),
-                                )
-                                .await?;
-                            } else {
-                                fail_unverifiable(state, context).await?;
-                            }
-                        }
-                    }
-                }
-                return Ok(());
-            }
-            Attach::Unreachable => {
-                if !context.absence_authoritative && context.child.is_none() {
-                    set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                    return Err(Error::RunnerUnavailable);
-                }
-                match poll_child(&mut context.child)? {
-                    ChildState::ExitedBySignal => {
-                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                        context.absence_authoritative = false;
-                    }
-                    ChildState::ExitedNormally if context.launch_pending => {
-                        fail_launch(
-                            state,
-                            context.run_id.clone(),
-                            context.target.runner_instance_id.clone(),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                    ChildState::Running | ChildState::ExitedNormally => {
-                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                    }
-                    ChildState::Absent => {
-                        set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                        context.absence_authoritative = false;
-                    }
-                }
-                return Err(Error::RunnerUnavailable);
-            }
-        };
-        match consume_subscription(
-            config,
+    Ok((
+        Handle {
             state,
-            &client,
-            context,
-            active_subscription,
-            shutdown,
-        )
-        .await?
-        {
-            Consume::Finished => return Ok(()),
-            Consume::Shutdown => return Ok(()),
-            Consume::Reconnect { terminal_sequence } => {
-                context.terminal_sequence = terminal_sequence;
-                set_observer_health(state, context, ObserverHealth::Degraded).await?;
-                context.absence_authoritative = false;
-                let retry_delay = context.next_retry_delay();
-                tokio::select! {
-                    _ = wait_for_shutdown(shutdown) => return Ok(()),
-                    _ = tokio::time::sleep(retry_delay) => {}
-                }
-            }
-        }
-    }
-}
-
-enum Consume {
-    Finished,
-    Shutdown,
-    Reconnect { terminal_sequence: Option<i64> },
-}
-
-async fn consume_subscription(
-    config: &SharedConfig,
-    state: &DaemonState,
-    client: &RunnerClient,
-    context: &mut RunContext,
-    mut subscription: RunnerSubscription,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<Consume, Error> {
-    let mut decoder = Some(decoder_for(&context.target)?);
-    let mut pending = Vec::new();
-    let mut deadline = None;
-    let mut caught_up = false;
-    let mut terminal_sequence = context.terminal_sequence;
-    let mut session_seen = false;
-
-    loop {
-        let read = next_stream_item(&mut subscription, shutdown, deadline).await;
-        let item = match read {
-            StreamRead::Shutdown => return Ok(Consume::Shutdown),
-            StreamRead::Flush => {
-                flush_pending(state, context, &mut pending).await?;
-                deadline = None;
-                continue;
-            }
-            StreamRead::Item(Ok(item)) => item,
-            StreamRead::Item(Err(error)) if reconnectable(&error) => {
-                return Ok(Consume::Reconnect { terminal_sequence });
-            }
-            StreamRead::Item(Err(error)) => return Err(Error::Runner(error)),
-        };
-
-        match item {
-            RunnerStreamItem::CaughtUp { .. } => {
-                flush_pending(state, context, &mut pending).await?;
-                deadline = None;
-                set_observer_health(state, context, ObserverHealth::Healthy).await?;
-                context.absence_authoritative = true;
-                caught_up = true;
-                if let Some(terminal) = terminal_sequence {
-                    acknowledge_and_reconcile(client, state, context, terminal, shutdown).await?;
-                    context.child = None;
-                    return Ok(Consume::Finished);
-                }
-            }
-            RunnerStreamItem::Event(event) => {
-                if caught_up {
-                    context.reset_retry_delay();
-                }
-                if deadline.is_none() {
-                    deadline = Some(Instant::now() + config.batch_delay);
-                }
-                let is_terminal = terminal_event(&event.event);
-                let effects = normalize_effects(
-                    decoder.as_mut().ok_or(Error::CorruptExecution)?,
-                    &event,
-                    &mut session_seen,
-                );
-                if is_terminal {
-                    let outcome = finish_outcome(
-                        decoder.take().ok_or(Error::CorruptExecution)?,
-                        session_seen,
-                    );
-                    pending.push(RunnerEventInput {
-                        event: event.clone(),
-                        effects: RunnerEventEffects {
-                            confirmed_provider_session_id: effects.confirmed_provider_session_id,
-                            terminal_outcome: Some(outcome),
-                        },
-                    });
-                    terminal_sequence = Some(event.sequence);
-                    context.terminal_sequence = Some(event.sequence);
-                    flush_pending(state, context, &mut pending).await?;
-                    deadline = None;
-                    if caught_up {
-                        acknowledge_and_reconcile(client, state, context, event.sequence, shutdown)
-                            .await?;
-                        context.child = None;
-                        return Ok(Consume::Finished);
-                    }
-                } else {
-                    pending.push(RunnerEventInput { event, effects });
-                    if pending.len() == MAX_RUNNER_BATCH_EVENTS {
-                        flush_pending(state, context, &mut pending).await?;
-                        deadline = None;
-                    }
-                }
-            }
-        }
-    }
-}
-
-enum ProviderDecoder {
-    Codex(CodexDecoder),
-    Claude {
-        decoder: ClaudeDecoder,
-        expected_session_id: String,
-    },
-}
-
-fn normalize_effects(
-    decoder: &mut ProviderDecoder,
-    event: &RunnerEventEnvelope,
-    session_seen: &mut bool,
-) -> RunnerEventEffects {
-    let confirmed = match decoder {
-        ProviderDecoder::Codex(decoder) => {
-            decoder
-                .push(&event.event)
-                .into_iter()
-                .find_map(|observation| match observation {
-                    CodexObservation::ThreadStarted { thread_id } => Some(thread_id),
-                    _ => None,
-                })
-        }
-        ProviderDecoder::Claude {
-            decoder,
-            expected_session_id,
-        } => decoder
-            .push(&event.event)
-            .into_iter()
-            .any(|observation| matches!(observation, ClaudeObservation::Initialized { .. }))
-            .then(|| expected_session_id.clone()),
-    };
-    if confirmed.is_some() {
-        *session_seen = true;
-    }
-    RunnerEventEffects {
-        confirmed_provider_session_id: confirmed,
-        terminal_outcome: None,
-    }
-}
-
-fn finish_outcome(decoder: ProviderDecoder, session_seen: bool) -> TerminalOutcome {
-    match decoder {
-        ProviderDecoder::Codex(decoder) => {
-            let finished = decoder.finish();
-            match finished.outcome {
-                CodexOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded {
-                    result: finished.final_preview.map(|preview| preview.text),
-                },
-                CodexOutcome::Succeeded { .. } => {
-                    TerminalOutcome::Failed(RunFailureReason::Protocol)
-                }
-                CodexOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
-                    CodexFailureReason::Protocol => RunFailureReason::Protocol,
-                    CodexFailureReason::Provider => RunFailureReason::Provider,
-                    CodexFailureReason::Process => RunFailureReason::Process,
-                    CodexFailureReason::Spawn => RunFailureReason::Spawn,
-                    CodexFailureReason::Incomplete => RunFailureReason::Incomplete,
-                }),
-            }
-        }
-        ProviderDecoder::Claude { decoder, .. } => {
-            let finished = decoder.finish();
-            match finished.outcome {
-                ClaudeOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded {
-                    result: finished.final_preview.map(|preview| preview.text),
-                },
-                ClaudeOutcome::Succeeded { .. } => {
-                    TerminalOutcome::Failed(RunFailureReason::Protocol)
-                }
-                ClaudeOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
-                    ClaudeFailureReason::Protocol => RunFailureReason::Protocol,
-                    ClaudeFailureReason::Provider => RunFailureReason::Provider,
-                    ClaudeFailureReason::Permission => RunFailureReason::Permission,
-                    ClaudeFailureReason::Limit => RunFailureReason::Limit,
-                    ClaudeFailureReason::Process => RunFailureReason::Process,
-                    ClaudeFailureReason::Spawn => RunFailureReason::Spawn,
-                    ClaudeFailureReason::Incomplete => RunFailureReason::Incomplete,
-                }),
-            }
-        }
-    }
-}
-
-async fn flush_pending(
-    state: &DaemonState,
-    context: &RunContext,
-    pending: &mut Vec<RunnerEventInput>,
-) -> Result<(), Error> {
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let items = std::mem::take(pending);
-    let run_id = context.run_id.clone();
-    let runner_instance_id = context.target.runner_instance_id.clone();
-    let committed_at_ms = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            let result =
-                store.ingest_runner_events(&run_id, &runner_instance_id, items, committed_at_ms)?;
-            Ok(((), result.events))
-        })
-        .await?;
-    Ok(())
-}
-
-enum StreamRead {
-    Item(Result<RunnerStreamItem, RunnerClientError>),
-    Flush,
-    Shutdown,
-}
-
-async fn next_stream_item(
-    subscription: &mut RunnerSubscription,
-    shutdown: &mut watch::Receiver<bool>,
-    deadline: Option<Instant>,
-) -> StreamRead {
-    if shutdown_requested(shutdown) {
-        return StreamRead::Shutdown;
-    }
-    match deadline {
-        Some(deadline) => tokio::select! {
-            _ = wait_for_shutdown(shutdown) => StreamRead::Shutdown,
-            result = timeout_at(deadline, subscription.next_item()) => match result {
-                Ok(item) => StreamRead::Item(item),
-                Err(_) => StreamRead::Flush,
-            },
+            shutdown: shutdown_tx,
         },
-        None => tokio::select! {
-            _ = wait_for_shutdown(shutdown) => StreamRead::Shutdown,
-            item = subscription.next_item() => StreamRead::Item(item),
-        },
-    }
-}
-
-enum Attach {
-    Connected(RunnerSubscription),
-    Missing,
-    Unreachable,
-    Shutdown,
-}
-
-async fn attach_with_grace(
-    client: &RunnerClient,
-    runtime_dir: &Path,
-    grace: Duration,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<Attach, Error> {
-    let deadline = Instant::now() + grace;
-    loop {
-        if shutdown_requested(shutdown) {
-            return Ok(Attach::Shutdown);
-        }
-        let attempted = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(Attach::Shutdown),
-            result = timeout_at(deadline, client.subscribe()) => result,
-        };
-        match attempted {
-            Ok(Ok(subscription)) => return Ok(Attach::Connected(subscription)),
-            Ok(Err(error)) if unavailable(&error) => {}
-            Ok(Err(error)) => return Err(Error::Runner(error)),
-            Err(_) => return Ok(Attach::Unreachable),
-        }
-        if Instant::now() >= deadline {
-            return classify_unavailable(runtime_dir);
-        }
-        let wake = (Instant::now() + CONNECT_RETRY_DELAY).min(deadline);
-        tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(Attach::Shutdown),
-            _ = sleep_until(wake) => {}
-        }
-    }
-}
-
-async fn acknowledge_and_reconcile(
-    client: &RunnerClient,
-    state: &DaemonState,
-    context: &mut RunContext,
-    terminal_sequence: i64,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<(), Error> {
-    loop {
-        let acknowledgement = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            result = client.acknowledge_exit(terminal_sequence) => result,
-        };
-        match acknowledgement {
-            Ok(()) => {
-                reconcile_terminal(state, context, terminal_sequence).await?;
-                return Ok(());
-            }
-            Err(error) if reconnectable(&error) => {
-                if context.absence_authoritative && endpoint_absent(&context.runtime_dir)? {
-                    reconcile_terminal(state, context, terminal_sequence).await?;
-                    return Ok(());
-                }
-            }
-            Err(error) => return Err(Error::Runner(error)),
-        }
-        let retry_delay = context.next_retry_delay();
-        tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(()),
-            _ = tokio::time::sleep(retry_delay) => {}
-        }
-    }
-}
-
-async fn reconcile_terminal(
-    state: &DaemonState,
-    context: &RunContext,
-    terminal_sequence: i64,
-) -> Result<(), Error> {
-    let run_id = context.run_id.clone();
-    let runner_instance_id = context.target.runner_instance_id.clone();
-    let reconciled_at_ms = now_ms()?;
-    let disposition = state
-        .commit_and_publish(move |store| {
-            let disposition = store.mark_runner_terminal_reconciled(
-                &run_id,
-                &runner_instance_id,
-                terminal_sequence,
-                reconciled_at_ms,
-            )?;
-            Ok((disposition, Vec::new()))
-        })
-        .await?;
-    if disposition == WriteDisposition::Applied {
-        tracing::info!(
-            target: "factoryd.execution",
-            event = "runner_terminal_reconciled",
-            run_id = %context.run_id,
-            terminal_sequence
-        );
-    }
-    Ok(())
-}
-
-async fn fail_unverifiable(state: &DaemonState, context: &RunContext) -> Result<(), Error> {
-    fail_unverifiable_identity(
-        state,
-        context.run_id.clone(),
-        context.target.runner_instance_id.clone(),
-    )
-    .await
-}
-
-async fn fail_unverifiable_identity(
-    state: &DaemonState,
-    run_id: RunId,
-    runner_instance_id: RunnerInstanceId,
-) -> Result<(), Error> {
-    let failed_at_ms = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            let transition =
-                store.fail_run_unverifiable(&run_id, &runner_instance_id, failed_at_ms)?;
-            Ok((transition.disposition, transition.events))
-        })
-        .await?;
-    Ok(())
-}
-
-async fn set_observer_health(
-    state: &DaemonState,
-    context: &mut RunContext,
-    health: ObserverHealth,
-) -> Result<(), Error> {
-    if context.observer_health == health {
-        return Ok(());
-    }
-    let run_id = context.run_id.clone();
-    let runner_instance_id = context.target.runner_instance_id.clone();
-    let changed_at_ms = now_ms()?;
-    let disposition = state
-        .commit_and_publish(move |store| {
-            let transition =
-                store.set_observer_health(&run_id, &runner_instance_id, health, changed_at_ms)?;
-            Ok((transition.disposition, transition.events))
-        })
-        .await?;
-    if disposition == WriteDisposition::Applied {
-        tracing::info!(
-            target: "factoryd.execution",
-            event = "observer_health_changed",
-            run_id = %context.run_id,
-            observer_health = observer_health_category(health)
-        );
-    }
-    context.observer_health = health;
-    Ok(())
-}
-
-async fn fail_launch(
-    state: &DaemonState,
-    run_id: RunId,
-    runner_instance_id: RunnerInstanceId,
-) -> Result<WriteDisposition, Error> {
-    let failed_at_ms = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            let transition = store.fail_run_launch(&run_id, &runner_instance_id, failed_at_ms)?;
-            Ok((transition.disposition, transition.events))
-        })
-        .await
-        .map_err(Error::State)
-}
-
-fn child_is_running(child: &mut Option<Child>) -> Result<bool, Error> {
-    Ok(matches!(poll_child(child)?, ChildState::Running))
-}
-
-enum ChildState {
-    Absent,
-    Running,
-    ExitedNormally,
-    ExitedBySignal,
-}
-
-fn poll_child(child: &mut Option<Child>) -> Result<ChildState, Error> {
-    let Some(process) = child.as_mut() else {
-        return Ok(ChildState::Absent);
-    };
-    let status = process.try_wait().map_err(|_| Error::RunnerUnavailable)?;
-    let Some(status) = status else {
-        return Ok(ChildState::Running);
-    };
-    *child = None;
-    if status.signal().is_some() {
-        Ok(ChildState::ExitedBySignal)
-    } else {
-        Ok(ChildState::ExitedNormally)
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_launch(
-    config: &SharedConfig,
-    target: ExecutionTarget,
-    run_id: RunId,
-    runner_instance_id: RunnerInstanceId,
-    runtime_dir: PathBuf,
-    worktree: PathBuf,
-) -> Result<runner_process::LaunchSpec, Error> {
-    let ExecutionTarget {
-        provider,
-        model,
-        project_id,
-        agent_id,
-        task_body,
-        agent_messages,
-        provider_session_id,
-        codex_home,
-        resumes_provider_session,
-        ..
-    } = target;
-    let memory_path =
-        factory_core::paths::agent_memory_path(&config.guidance_root, &project_id, &agent_id);
-    let instructions_path =
-        factory_core::paths::agent_instructions_path(&config.guidance_root, &project_id, &agent_id);
-    let project_guidance_path =
-        factory_core::paths::project_guidance_path(&config.guidance_root, &project_id);
-    let project_guidance = guidance::read_or_create(&project_guidance_path)
-        .map_err(|error| Error::Guidance(error.to_string()))?;
-    let standing_guidance = guidance::read_or_create(&instructions_path)
-        .map_err(|error| Error::Guidance(error.to_string()))?;
-    let memory = guidance::read_or_create(&memory_path)
-        .map_err(|error| Error::Guidance(error.to_string()))?;
-    let instructions = compose_instructions(
-        &project_guidance,
-        &standing_guidance,
-        &memory,
-        &agent_messages,
-        &task_body,
-        &memory_path,
-    );
-    match provider {
-        Provider::Codex => {
-            let session = if resumes_provider_session {
-                CodexSession::Resume {
-                    thread_id: provider_session_id.ok_or(Error::CorruptExecution)?,
-                }
-            } else {
-                CodexSession::New
-            };
-            codex::prepare(CodexLaunch {
-                runner_program: config.runner_program.clone(),
-                codex_program: config.codex_program.clone(),
-                run_id,
-                runner_instance_id,
-                runtime_dir,
-                cwd: worktree,
-                codex_home: codex_home.map(PathBuf::from),
-                model,
-                instructions,
-                session,
-            })
-            .map(|prepared| prepared.launch_spec)
-            .map_err(|_| Error::InvalidSession)
-        }
-        Provider::ClaudeCode => {
-            if codex_home.is_some() {
-                return Err(Error::CorruptExecution);
-            }
-            let session_id = provider_session_id.ok_or(Error::CorruptExecution)?;
-            let session = if resumes_provider_session {
-                ClaudeSession::Resume { session_id }
-            } else {
-                ClaudeSession::New { session_id }
-            };
-            claude::prepare(ClaudeLaunch {
-                runner_program: config.runner_program.clone(),
-                claude_program: config.claude_program.clone(),
-                run_id,
-                runner_instance_id,
-                runtime_dir,
-                cwd: worktree,
-                model,
-                instructions,
-                session,
-                max_turns: config.claude_max_turns,
-                max_budget_cents: config.claude_max_budget_cents,
-            })
-            .map(|prepared| prepared.launch_spec)
-            .map_err(|_| Error::InvalidSession)
-        }
-    }
-}
-
-/// Composes launch instructions from project guidance, standing guidance,
-/// memory, queued operator messages, and the task body, skipping any section
-/// that is empty. A final paragraph pointing at the agent's memory file is
-/// always appended so the agent can self-edit its own durable memory.
-fn compose_instructions(
-    project_guidance: &str,
-    standing_guidance: &str,
-    memory: &str,
-    agent_messages: &[AgentMessage],
-    task_body: &str,
-    memory_path: &Path,
-) -> String {
-    let mut sections = Vec::new();
-    if !project_guidance.trim().is_empty() {
-        sections.push(format!("Project guidance:\n{project_guidance}"));
-    }
-    if !standing_guidance.trim().is_empty() {
-        sections.push(format!("Standing guidance:\n{standing_guidance}"));
-    }
-    if !memory.trim().is_empty() {
-        sections.push(format!("Memory:\n{memory}"));
-    }
-    if !agent_messages.is_empty() {
-        let mut section = String::from("Operator messages for this launch:\n");
-        for message in agent_messages {
-            section.push_str("- ");
-            section.push_str(&message.body);
-            section.push('\n');
-        }
-        section.truncate(section.trim_end_matches('\n').len());
-        sections.push(section);
-    }
-    if !task_body.trim().is_empty() {
-        sections.push(format!("Task instructions:\n{task_body}"));
-    }
-    sections.push(format!(
-        "Your memory file is {}. Append durable lessons there; keep it under 16 KB.",
-        memory_path.display()
-    ));
-    sections.join("\n\n")
-}
-
-fn decoder_for(target: &WatchTarget) -> Result<ProviderDecoder, Error> {
-    match target.provider {
-        Provider::Codex => {
-            if target.resumes_provider_session {
-                let session = target
-                    .provider_session_id
-                    .clone()
-                    .ok_or(Error::CorruptExecution)?;
-                CodexDecoder::resume(session)
-                    .map(ProviderDecoder::Codex)
-                    .map_err(|_| Error::InvalidSession)
-            } else {
-                Ok(ProviderDecoder::Codex(CodexDecoder::fresh()))
-            }
-        }
-        Provider::ClaudeCode => {
-            let expected_session_id = target
-                .provider_session_id
-                .clone()
-                .ok_or(Error::CorruptExecution)?;
-            let decoder = if target.resumes_provider_session {
-                ClaudeDecoder::resume(expected_session_id.clone())
-            } else {
-                ClaudeDecoder::fresh(expected_session_id.clone())
-            }
-            .map_err(|_| Error::InvalidSession)?;
-            Ok(ProviderDecoder::Claude {
-                decoder,
-                expected_session_id,
-            })
-        }
-    }
-}
-
-fn terminal_event(event: &RunnerEvent) -> bool {
-    matches!(
-        event,
-        RunnerEvent::SpawnFailed { .. } | RunnerEvent::Exited { .. }
-    )
-}
-
-fn manager_fatal(error: &Error) -> bool {
-    match error {
-        Error::State(DaemonStateError::Store(error)) => matches!(
-            error,
-            StoreError::Sqlite(_)
-                | StoreError::Json(_)
-                | StoreError::UnsupportedSchema { .. }
-                | StoreError::InvalidSchemaVersion(_)
-                | StoreError::CorruptProtocolVersion(_)
-                | StoreError::MissingEventKind
-                | StoreError::EventSequenceGap { .. }
-                | StoreError::CorruptRunnerSequence(_)
-        ),
-        Error::State(DaemonStateError::StoreLockPoisoned | DaemonStateError::StoreWorkerFailed)
-        | Error::WorkerStopped
-        | Error::InvalidClock => true,
-        _ => false,
-    }
-}
-
-fn distrusts_absence(error: &Error) -> bool {
-    matches!(error, Error::Runner(_) | Error::CorruptExecution)
-}
-
-fn error_category(error: &Error) -> &'static str {
-    match error {
-        Error::InvalidConcurrency => "invalid_concurrency",
-        Error::InvalidTiming => "invalid_timing",
-        Error::InvalidRuntimeRoot => "invalid_runtime_root",
-        Error::InvalidWorktree => "invalid_worktree",
-        Error::NonUtf8Path => "non_utf8_path",
-        Error::State(_) => "state",
-        Error::InvalidSession => "invalid_session",
-        Error::Launch(_) => "launch",
-        Error::Runner(_) => "runner_protocol",
-        Error::RunnerUnavailable => "runner_unavailable",
-        Error::StartBackpressure => "start_backpressure",
-        Error::ManagerStopped => "manager_stopped",
-        Error::WorkerStopped => "worker_stopped",
-        Error::InvalidClock => "invalid_clock",
-        Error::CorruptExecution => "corrupt_execution",
-        Error::Guidance(_) => "guidance",
-    }
-}
-
-const fn provider_category(provider: Provider) -> &'static str {
-    match provider {
-        Provider::ClaudeCode => "claude_code",
-        Provider::Codex => "codex",
-    }
-}
-
-const fn observer_health_category(health: ObserverHealth) -> &'static str {
-    match health {
-        ObserverHealth::Unknown => "unknown",
-        ObserverHealth::Healthy => "healthy",
-        ObserverHealth::Degraded => "degraded",
-    }
-}
-
-fn reconnectable(error: &RunnerClientError) -> bool {
-    matches!(
-        error,
-        RunnerClientError::Io(source) if retryable_io_kind(source.kind())
-    ) || matches!(
-        error,
-        RunnerClientError::UnexpectedEof
-            | RunnerClientError::UnterminatedFrame
-            | RunnerClientError::TimedOut { .. }
-    )
-}
-
-fn retryable_io_kind(kind: io::ErrorKind) -> bool {
-    matches!(
-        kind,
-        io::ErrorKind::NotFound
-            | io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::ConnectionReset
-            | io::ErrorKind::ConnectionAborted
-            | io::ErrorKind::BrokenPipe
-            | io::ErrorKind::NotConnected
-            | io::ErrorKind::UnexpectedEof
-            | io::ErrorKind::TimedOut
-    )
-}
-
-fn unavailable(error: &RunnerClientError) -> bool {
-    matches!(
-        error,
-        RunnerClientError::Io(source)
-            if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
-    )
-}
-
-fn classify_unavailable(runtime_dir: &Path) -> Result<Attach, Error> {
-    if endpoint_absent(runtime_dir)? {
-        Ok(Attach::Missing)
-    } else {
-        Ok(Attach::Unreachable)
-    }
-}
-
-fn endpoint_absent(runtime_dir: &Path) -> Result<bool, Error> {
-    let runtime = match fs::symlink_metadata(runtime_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(_) => return Err(Error::CorruptExecution),
-    };
-    if runtime.file_type().is_symlink()
-        || !runtime.is_dir()
-        || runtime.uid() != rustix::process::geteuid().as_raw()
-        || runtime.mode() & 0o777 != PRIVATE_DIRECTORY_MODE
-    {
-        return Err(Error::CorruptExecution);
-    }
-    let socket = match fs::symlink_metadata(runtime_dir.join(CONTROL_SOCKET_FILE)) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(_) => return Err(Error::CorruptExecution),
-    };
-    if !socket.file_type().is_socket()
-        || socket.uid() != rustix::process::geteuid().as_raw()
-        || socket.mode() & 0o777 != 0o600
-    {
-        return Err(Error::CorruptExecution);
-    }
-    Ok(false)
-}
-
-fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
-    *shutdown.borrow()
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    let _ = shutdown.wait_for(|requested| *requested).await;
-}
-
-fn new_id<T>() -> Result<T, Error>
-where
-    T: TryFrom<String>,
-{
-    T::try_from(Uuid::new_v4().hyphenated().to_string()).map_err(|_| Error::CorruptExecution)
+        join,
+    ))
 }
 
 fn now_ms() -> Result<i64, Error> {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map_err(|_| Error::InvalidClock)?
         .as_millis();
     i64::try_from(millis).map_err(|_| Error::InvalidClock)
 }
 
-fn canonical_worktree(path: &Path) -> Result<PathBuf, Error> {
-    let canonical = fs::canonicalize(path).map_err(|_| Error::InvalidWorktree)?;
-    let metadata = fs::metadata(&canonical).map_err(|_| Error::InvalidWorktree)?;
-    if metadata.is_dir() {
-        Ok(canonical)
-    } else {
-        Err(Error::InvalidWorktree)
-    }
-}
-
-fn prepare_runtime_root(path: &Path) -> Result<PathBuf, Error> {
+fn prepare_runtime_root(path: &std::path::Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidRuntimeRoot);
     }
@@ -1513,7 +165,8 @@ fn prepare_runtime_root(path: &Path) -> Result<PathBuf, Error> {
                 .mode(PRIVATE_DIRECTORY_MODE)
                 .create(parent)
                 .map_err(|_| Error::InvalidRuntimeRoot)?;
-            verify_private_directory(parent)?;
+            let metadata = fs::symlink_metadata(parent).map_err(|_| Error::InvalidRuntimeRoot)?;
+            verify_private_directory_metadata(&metadata)?;
         }
         Err(_) => return Err(Error::InvalidRuntimeRoot),
     }
@@ -1529,12 +182,7 @@ fn prepare_runtime_root(path: &Path) -> Result<PathBuf, Error> {
         }
         Err(_) => return Err(Error::InvalidRuntimeRoot),
     }
-    fs::canonicalize(path).map_err(|_| Error::InvalidRuntimeRoot)
-}
-
-fn verify_private_directory(path: &Path) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| Error::InvalidRuntimeRoot)?;
-    verify_private_directory_metadata(&metadata)
+    Ok(())
 }
 
 fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Error> {
@@ -1548,6 +196,52 @@ fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Erro
     Ok(())
 }
 
-fn path_text(path: &Path) -> Result<String, Error> {
-    path.to_str().map(str::to_owned).ok_or(Error::NonUtf8Path)
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+    use crate::store::Store;
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    fn config(directory: &std::path::Path) -> Config {
+        Config {
+            runtime_root: directory.join("runs"),
+            guidance_root: directory.to_path_buf(),
+            max_active_runs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_zero_concurrency() {
+        let directory = private_tempdir();
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let mut cfg = config(directory.path());
+        cfg.max_active_runs = 0;
+        assert!(matches!(spawn(cfg, state), Err(Error::InvalidConcurrency)));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_task_without_a_live_session_fails_clearly() {
+        let directory = private_tempdir();
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let (handle, join) = spawn(config(directory.path()), state).unwrap();
+        let result = handle
+            .start_task(StartTask {
+                project_id: ProjectId::try_from("factory").unwrap(),
+                task_id: TaskId::try_from("task-1").unwrap(),
+                agent_id: AgentId::try_from("agent-1").unwrap(),
+                parent_run_id: None,
+                worktree: directory.path().to_path_buf(),
+            })
+            .await;
+        assert!(matches!(result, Err(Error::NoLiveSession)));
+        handle.shutdown().await.unwrap();
+        join.await.unwrap().unwrap();
+    }
 }
