@@ -30,6 +30,7 @@ fn launch(session: Session, instructions: &str) -> CodexLaunch {
         runner_instance_id: id::<RunnerInstanceId>("runner-codex-adapter"),
         runtime_dir: PathBuf::from("/private/runtime"),
         cwd: PathBuf::from("/workspace/project"),
+        codex_home: Some(PathBuf::from("/private/codex-home")),
         instructions: instructions.to_owned(),
         session,
     }
@@ -124,6 +125,7 @@ fn launch_arguments_are_fixed_and_instructions_exist_only_on_stdin() {
             "workspace-write",
             "-c",
             "approval_policy=\"never\"",
+            "--ignore-user-config",
             "-",
         ]
         .map(OsString::from)
@@ -135,6 +137,11 @@ fn launch_arguments_are_fixed_and_instructions_exist_only_on_stdin() {
             .iter()
             .all(|arg| arg != instructions)
     );
+    assert!(matches!(
+        &fresh.provider_environment,
+        factoryd::runner_process::ProviderEnvironment::CodexHome(path)
+            if path == &PathBuf::from("/private/codex-home")
+    ));
 
     let resumed = prepare(launch(
         Session::Resume {
@@ -155,6 +162,7 @@ fn launch_arguments_are_fixed_and_instructions_exist_only_on_stdin() {
             "workspace-write",
             "-c",
             "approval_policy=\"never\"",
+            "--ignore-user-config",
             "resume",
             THREAD_ID,
             "-",
@@ -162,6 +170,19 @@ fn launch_arguments_are_fixed_and_instructions_exist_only_on_stdin() {
         .map(OsString::from)
     );
     assert_eq!(resumed.startup_input, instructions.as_bytes());
+    assert!(matches!(
+        &resumed.provider_environment,
+        factoryd::runner_process::ProviderEnvironment::CodexHome(path)
+            if path == &PathBuf::from("/private/codex-home")
+    ));
+
+    let mut inherited = launch(Session::New, instructions);
+    inherited.codex_home = None;
+    let inherited = prepare(inherited).unwrap().launch_spec;
+    assert!(matches!(
+        inherited.provider_environment,
+        factoryd::runner_process::ProviderEnvironment::Inherited
+    ));
 
     for invalid in ["", "--last", "not-a-uuid", "0195d40a\nsecret"] {
         let error = match prepare(launch(

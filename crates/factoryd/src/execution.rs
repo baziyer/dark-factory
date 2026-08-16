@@ -417,6 +417,7 @@ async fn start_run_inner(
         runner_instance_id: runner_instance_id.clone(),
         runtime_dir: runtime_dir.clone(),
         cwd: worktree,
+        codex_home: reserved.codex_home.as_ref().map(PathBuf::from),
         instructions,
         session,
     })

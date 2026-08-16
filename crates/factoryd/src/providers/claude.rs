@@ -14,7 +14,7 @@ use factory_core::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::runner_process::LaunchSpec;
+use crate::runner_process::{LaunchSpec, ProviderEnvironment};
 
 pub const MAX_CLAUDE_JSON_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_CLAUDE_PREVIEW_BYTES: usize = 4 * 1024;
@@ -108,6 +108,7 @@ pub fn prepare(input: ClaudeLaunch) -> Result<PreparedClaude, PrepareError> {
             runner_program: input.runner_program,
             provider_program: input.claude_program,
             provider_arguments: arguments,
+            provider_environment: ProviderEnvironment::Inherited,
             run_id: input.run_id,
             runner_instance_id: input.runner_instance_id,
             runtime_dir: input.runtime_dir,
