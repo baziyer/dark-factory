@@ -5,9 +5,9 @@ use factory_core::{
     runner::{MAX_RUNNER_OUTPUT_TEXT_BYTES, OutputStream, RunnerEvent},
 };
 use factoryd::providers::claude::{
-    ClaudeLaunch, FailureReason, MAX_CLAUDE_JSON_LINE_BYTES, MAX_CLAUDE_PREVIEW_BYTES,
-    MainLoopUsage, Observation, Outcome, ProtocolViolation, RunUsage, Session, ToolKind, ToolPhase,
-    ToolResult, prepare,
+    ClaudeLaunch, Decoder, FailureReason, MAX_CLAUDE_JSON_LINE_BYTES, MAX_CLAUDE_PREVIEW_BYTES,
+    MainLoopUsage, Observation, Outcome, PrepareError, ProtocolViolation, RunUsage, Session,
+    ToolKind, ToolPhase, ToolResult, prepare,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -130,9 +130,15 @@ fn decode(text: &str, terminal: RunnerEvent) -> (Vec<Observation>, Outcome) {
 }
 
 #[test]
-fn fresh_launch_has_exact_safe_args_and_raw_stdin() {
+fn fresh_launch_uses_preallocated_identity_with_exact_safe_args_and_raw_stdin() {
     let task = "PRIVATE_TASK\nwith 🏭 and spaces";
-    let prepared = prepare(launch(Session::New, task)).unwrap();
+    let prepared = prepare(launch(
+        Session::New {
+            session_id: SESSION_ID.to_owned(),
+        },
+        task,
+    ))
+    .unwrap();
     let args: Vec<_> = prepared
         .launch_spec
         .provider_arguments
@@ -160,11 +166,12 @@ fn fresh_launch_has_exact_safe_args_and_raw_stdin() {
             "--no-chrome",
             "--safe-mode",
             "--session-id",
-            args[17].as_ref(),
+            SESSION_ID,
         ]
     );
     let session_id = args[17].as_ref();
     assert_eq!(Uuid::parse_str(session_id).unwrap().to_string(), session_id);
+    assert_eq!(session_id, SESSION_ID);
     assert_eq!(prepared.session_id(), session_id);
     assert!(!args.iter().any(|arg| arg.contains("PRIVATE_TASK")));
     for forbidden in [
@@ -208,8 +215,60 @@ fn resume_is_canonical_exact_and_bound_to_its_decoder_without_echoing_invalid_id
         Ok(_) => panic!("invalid session was accepted"),
         Err(error) => error,
     };
+    assert!(matches!(&error, PrepareError::InvalidSessionId));
     assert!(!error.to_string().contains(secret_invalid));
     assert!(!format!("{error:?}").contains(secret_invalid));
+    assert!(!format!("{error:?}").contains("PRIVATE_TASK"));
+
+    let error = match prepare(launch(
+        Session::New {
+            session_id: secret_invalid.to_owned(),
+        },
+        "PRIVATE_TASK",
+    )) {
+        Ok(_) => panic!("invalid fresh session was accepted"),
+        Err(error) => error,
+    };
+    assert!(matches!(&error, PrepareError::InvalidSessionId));
+    assert!(!error.to_string().contains(secret_invalid));
+    assert!(!format!("{error:?}").contains(secret_invalid));
+    assert!(!format!("{error:?}").contains("PRIVATE_TASK"));
+}
+
+#[test]
+fn launch_independent_decoders_bind_fresh_and_resume_to_one_exact_identity() {
+    for mut decoder in [
+        Decoder::fresh(SESSION_ID.to_owned()).unwrap(),
+        Decoder::resume(SESSION_ID.to_owned()).unwrap(),
+    ] {
+        let observations = decoder.push(&stdout(minimal_success(SESSION_ID)));
+        let _ = decoder.push(&exited(Some(0), None));
+        let finished = decoder.finish();
+        assert!(matches!(
+            finished.outcome,
+            Outcome::Succeeded { ref session_id, .. } if session_id == SESSION_ID
+        ));
+        assert!(
+            observations
+                .iter()
+                .any(|observation| matches!(observation, Observation::Initialized { .. }))
+        );
+        assert!(!format!("{observations:?}").contains(SESSION_ID));
+    }
+
+    for build in [
+        Decoder::fresh as fn(String) -> Result<Decoder, PrepareError>,
+        Decoder::resume,
+    ] {
+        let secret_invalid = "not-a-uuid-PRIVATE_DECODER_SECRET";
+        let error = match build(secret_invalid.to_owned()) {
+            Ok(_) => panic!("invalid recovery identity was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(&error, PrepareError::InvalidSessionId));
+        assert!(!error.to_string().contains(secret_invalid));
+        assert!(!format!("{error:?}").contains(secret_invalid));
+    }
 }
 
 #[test]
@@ -393,7 +452,14 @@ fn terminal_reconciliation_is_fail_closed() {
     ));
     assert!(!format!("{observations:?}").contains("PROVIDER_ERROR_SECRET"));
 
-    let mut decoder = prepare(launch(Session::New, "")).unwrap().decoder;
+    let mut decoder = prepare(launch(
+        Session::New {
+            session_id: SESSION_ID.to_owned(),
+        },
+        "",
+    ))
+    .unwrap()
+    .decoder;
     let _ = decoder.push(&RunnerEvent::SpawnFailed {
         message: "SPAWN_SECRET".to_owned(),
     });
@@ -401,7 +467,14 @@ fn terminal_reconciliation_is_fail_closed() {
     assert_eq!(outcome.failure_reason(), Some(FailureReason::Spawn));
     assert!(!format!("{outcome:?}").contains("SPAWN_SECRET"));
 
-    let mut decoder = prepare(launch(Session::New, "")).unwrap().decoder;
+    let mut decoder = prepare(launch(
+        Session::New {
+            session_id: SESSION_ID.to_owned(),
+        },
+        "",
+    ))
+    .unwrap()
+    .decoder;
     let _ = decoder.push(&stdout("{not-json}\n"));
     assert_eq!(
         decoder.finish().outcome.failure_reason(),
@@ -412,14 +485,7 @@ fn terminal_reconciliation_is_fail_closed() {
 
 #[test]
 fn identity_integrity_and_final_unterminated_line_are_enforced() {
-    let mut decoder = prepare(launch(
-        Session::Resume {
-            session_id: SESSION_ID.to_owned(),
-        },
-        "",
-    ))
-    .unwrap()
-    .decoder;
+    let mut decoder = Decoder::resume(SESSION_ID.to_owned()).unwrap();
     let wrong = minimal_success(OTHER_SESSION_ID);
     let observations = decoder.push(&stdout(&wrong));
     let _ = decoder.push(&exited(Some(0), None));
@@ -430,14 +496,7 @@ fn identity_integrity_and_final_unterminated_line_are_enforced() {
     );
     assert!(!format!("{observations:?}{:?}", finished.outcome).contains(OTHER_SESSION_ID));
 
-    let mut decoder = prepare(launch(
-        Session::Resume {
-            session_id: SESSION_ID.to_owned(),
-        },
-        "",
-    ))
-    .unwrap()
-    .decoder;
+    let mut decoder = Decoder::resume(SESSION_ID.to_owned()).unwrap();
     let _ = decoder.push(&stdout(minimal_success(SESSION_ID)));
     let _ = decoder.push(&exited(Some(0), None));
     assert!(matches!(
@@ -474,7 +533,14 @@ fn malformed_lossy_truncated_and_stderr_never_leak_or_succeed() {
         );
     }
 
-    let mut decoder = prepare(launch(Session::New, "")).unwrap().decoder;
+    let mut decoder = prepare(launch(
+        Session::New {
+            session_id: SESSION_ID.to_owned(),
+        },
+        "",
+    ))
+    .unwrap()
+    .decoder;
     let diagnostic = decoder.push(&RunnerEvent::Output {
         stream: OutputStream::Stderr,
         text: "STDERR_PATH_SECRET /private/file TOKEN_SECRET".to_owned(),

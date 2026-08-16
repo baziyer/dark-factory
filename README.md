@@ -13,11 +13,12 @@ Concrete Codex 0.147 and Claude Code 2.1.233 adapters build fresh and resumed
 stdin-only turns and normalise their JSONL into bounded, structurally filtered
 observations. A durable execution ledger now reserves tasks atomically, binds
 provider sessions, records run attempts, and supports exact runner replay and
-terminal reconciliation. A bounded Codex-only execution actor now launches and
-recovers stable runners without coupling their lifetime to the daemon. The
-local control plane can now create Codex agents and durably reserve queued tasks
-for them. Existing Claude and Codex identities can be captured with their exact
-session worktree; adopted Codex sessions may also bind one explicit private
+terminal reconciliation. A bounded concrete execution actor now launches and
+recovers Claude Code and Codex runners without coupling their lifetime to the
+daemon. The local control plane can create Codex agents and durably start tasks
+for provider-bound Codex or adopted Claude agents. Existing Claude and Codex
+identities can be captured with their exact session worktree; adopted Codex
+sessions may also bind one explicit private
 `CODEX_HOME` without re-enabling ambient environment inheritance. Exact runner
 observation health is durable, so a restart cannot mistake degraded supervision
 for proof that an agent stopped; native
@@ -64,10 +65,12 @@ events. Both programs use
 List commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
 
-By default `factoryd` starts the sibling `factory-runner`, resolves `codex`
-through the sanitized launch environment, stores runner state under
+By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
+`claude` through the sanitized launch environment, stores runner state under
 `$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
-`--codex`, `--runtime-root`, and `--max-active-runs` to set those explicitly.
+`--codex`, `--claude`, `--runtime-root`, and `--max-active-runs` to set those
+explicitly. Claude runs are bounded to 20 turns and USD 5.00 in this first
+local cutover policy.
 
 State is private by construction. Custom database and socket paths must each
 have an immediate parent directory owned by the current user with mode `0700`;

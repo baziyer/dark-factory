@@ -1,4 +1,6 @@
-use std::{future::Future, os::unix::fs::PermissionsExt, path::Path, time::Duration};
+use std::{
+    future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::Path, time::Duration,
+};
 
 use factory_core::{
     AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunStatus, TaskId,
@@ -49,6 +51,9 @@ where
         execution::Config {
             runner_program: directory.path().join("missing-factory-runner"),
             codex_program: directory.path().join("missing-codex"),
+            claude_program: directory.path().join("missing-claude"),
+            claude_max_turns: NonZeroU32::new(20).unwrap(),
+            claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: directory.path().join("runs"),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
@@ -239,7 +244,7 @@ async fn an_invalid_worktree_is_rejected_without_reserving_the_task_or_echoing_t
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_imported_non_codex_agent_is_a_sanitized_conflict_without_partial_writes() {
+async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
     with_server(|socket, state| async move {
         let root = socket.parent().unwrap().join("project");
         std::fs::create_dir(&root).unwrap();
@@ -260,12 +265,7 @@ async fn an_imported_non_codex_agent_is_a_sanitized_conflict_without_partial_wri
             })
             .await
             .unwrap();
-        let baseline = state
-            .with_store(|store| store.latest_event_sequence())
-            .await
-            .unwrap();
-
-        let rejected = request(
+        let accepted = request(
             &socket,
             LocalRequest::StartTask {
                 project_id: id::<ProjectId>("project-1"),
@@ -276,26 +276,25 @@ async fn an_imported_non_codex_agent_is_a_sanitized_conflict_without_partial_wri
             },
         )
         .await;
-        assert!(matches!(
-            &rejected,
+        let run_id = match &accepted {
             ServerFrame::Response {
-                response: LocalResponse::Error {
-                    code: ErrorCode::Conflict,
-                    message,
-                },
-                ..
-            } if message == "agent is not available for Codex execution"
-        ));
-        let rejected = serde_json::to_string(&rejected).unwrap();
-        assert!(!rejected.contains("private migration task"));
-        assert!(!rejected.contains("claude_code"));
-        assert_eq!(
-            state
-                .with_store(|store| store.latest_event_sequence())
-                .await
-                .unwrap(),
-            baseline
-        );
+                protocol_version: PROTOCOL_VERSION,
+                response: LocalResponse::RunAccepted { run_id },
+            } => run_id.clone(),
+            other => panic!("unexpected Claude start response: {other:?}"),
+        };
+        let target = state
+            .with_store(move |store| store.execution_target(&run_id))
+            .await
+            .unwrap();
+        assert_eq!(target.provider, Provider::ClaudeCode);
+        assert!(!target.resumes_provider_session);
+        assert!(target.provider_session_id.is_some());
+
+        let response = serde_json::to_string(&accepted).unwrap();
+        assert!(!response.contains("private migration task"));
+        assert!(!response.contains("claude_code"));
+        assert!(!response.contains("session"));
     })
     .await;
 }

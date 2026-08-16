@@ -28,7 +28,7 @@ pub use crate::daemon_state::DaemonState as ApiState;
 
 use crate::{
     daemon_state::DaemonStateError,
-    execution::{self, StartCodex},
+    execution::{self, StartTask},
     store::{NewAgent, NewProject, NewTask, StoreError},
 };
 
@@ -78,7 +78,7 @@ impl ApiFailure {
             ),
             Self::Store(StoreError::AgentProviderMismatch) => (
                 ErrorCode::Conflict,
-                "agent is not available for Codex execution".into(),
+                "agent provider does not match the requested execution".into(),
             ),
             Self::Store(StoreError::AgentUnavailable) => (
                 ErrorCode::Conflict,
@@ -356,7 +356,7 @@ async fn handle_request(
             worktree,
         } => {
             let started = execution
-                .start_codex(StartCodex {
+                .start_task(StartTask {
                     project_id,
                     task_id,
                     agent_id,

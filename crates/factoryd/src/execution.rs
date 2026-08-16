@@ -1,7 +1,8 @@
-//! Codex-only execution ownership for the first vertical slice.
+//! Durable Claude Code and Codex execution ownership.
 
 use std::{
     fs, io,
+    num::NonZeroU32,
     os::unix::{
         fs::{DirBuilderExt, FileTypeExt, MetadataExt},
         process::ExitStatusExt,
@@ -27,9 +28,15 @@ use uuid::Uuid;
 
 use crate::{
     daemon_state::{DaemonState, DaemonStateError},
-    providers::codex::{
-        self, CodexLaunch, Decoder, FailureReason as CodexFailureReason, Observation,
-        Outcome as CodexOutcome, Session,
+    providers::{
+        claude::{
+            self, ClaudeLaunch, Decoder as ClaudeDecoder, FailureReason as ClaudeFailureReason,
+            Observation as ClaudeObservation, Outcome as ClaudeOutcome, Session as ClaudeSession,
+        },
+        codex::{
+            self, CodexLaunch, Decoder as CodexDecoder, FailureReason as CodexFailureReason,
+            Observation as CodexObservation, Outcome as CodexOutcome, Session as CodexSession,
+        },
     },
     runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
     runner_process,
@@ -46,10 +53,13 @@ const MAX_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const CONTROL_SOCKET_FILE: &str = "control.sock";
 
-/// Fixed process and durability bounds for the Codex execution actor.
+/// Fixed process and durability bounds for the execution actor.
 pub struct Config {
     pub runner_program: PathBuf,
     pub codex_program: PathBuf,
+    pub claude_program: PathBuf,
+    pub claude_max_turns: NonZeroU32,
+    pub claude_max_budget_cents: NonZeroU32,
     pub runtime_root: PathBuf,
     pub max_active_runs: usize,
     pub startup_timeout: Duration,
@@ -57,8 +67,8 @@ pub struct Config {
     pub batch_delay: Duration,
 }
 
-/// One explicit queued task assigned to one existing Codex agent.
-pub struct StartCodex {
+/// One explicit queued task assigned to one existing provider-bound agent.
+pub struct StartTask {
     pub project_id: ProjectId,
     pub task_id: TaskId,
     pub agent_id: AgentId,
@@ -71,19 +81,19 @@ pub struct StartedRun {
     pub run_id: RunId,
 }
 
-/// Bounded command handle for the Codex execution actor.
+/// Bounded command handle for the execution actor.
 #[derive(Clone)]
 pub struct Handle {
     tx: mpsc::Sender<Command>,
 }
 
 impl Handle {
-    /// Durably reserves one queued task for Codex execution.
+    /// Durably reserves one queued task for its agent's stored provider.
     ///
     /// Success means the reservation and its public events are committed. The
     /// runner may still be starting; readiness and completion are observable
     /// through the durable run state.
-    pub async fn start_codex(&self, input: StartCodex) -> Result<StartedRun, Error> {
+    pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(Command::Start {
@@ -120,7 +130,7 @@ pub enum Error {
     NonUtf8Path,
     #[error("daemon state failed: {0}")]
     State(#[from] DaemonStateError),
-    #[error("Codex session binding is invalid")]
+    #[error("provider session binding is invalid")]
     InvalidSession,
     #[error("runner launch failed: {0}")]
     Launch(#[from] runner_process::Error),
@@ -143,6 +153,9 @@ pub enum Error {
 struct SharedConfig {
     runner_program: PathBuf,
     codex_program: PathBuf,
+    claude_program: PathBuf,
+    claude_max_turns: NonZeroU32,
+    claude_max_budget_cents: NonZeroU32,
     runtime_root: PathBuf,
     max_active_runs: usize,
     startup_timeout: Duration,
@@ -152,7 +165,7 @@ struct SharedConfig {
 
 enum Command {
     Start {
-        input: StartCodex,
+        input: StartTask,
         reply: oneshot::Sender<Result<StartedRun, Error>>,
     },
     Shutdown {
@@ -161,7 +174,7 @@ enum Command {
 }
 
 struct StartWork {
-    input: StartCodex,
+    input: StartTask,
     reply: oneshot::Sender<Result<StartedRun, Error>>,
 }
 
@@ -170,7 +183,7 @@ struct WorkerCompletion {
     result: Result<Option<RunContext>, Error>,
 }
 
-/// Starts the bounded Codex execution actor on the current Tokio runtime.
+/// Starts the bounded execution actor on the current Tokio runtime.
 ///
 /// The actor recovers durable runner identities before accepting new work.
 pub fn spawn(
@@ -191,6 +204,9 @@ pub fn spawn(
     let config = Arc::new(SharedConfig {
         runner_program: config.runner_program,
         codex_program: config.codex_program,
+        claude_program: config.claude_program,
+        claude_max_turns: config.claude_max_turns,
+        claude_max_budget_cents: config.claude_max_budget_cents,
         runtime_root,
         max_active_runs: config.max_active_runs,
         startup_timeout: config.startup_timeout,
@@ -210,19 +226,8 @@ async fn run_actor(
     let recoverable = state
         .with_store(|store| store.recoverable_executions())
         .await?;
-    let deferred_provider_runs = recoverable
-        .iter()
-        .filter(|run| run.provider != Provider::Codex)
-        .count();
-    if deferred_provider_runs > 0 {
-        tracing::warn!(
-            count = deferred_provider_runs,
-            "recoverable non-Codex runs remain untouched"
-        );
-    }
     let recovery = recoverable
         .into_iter()
-        .filter(|run| run.provider == Provider::Codex)
         .map(RecoveryWork::from_recoverable)
         .collect::<Vec<_>>();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -322,7 +327,7 @@ async fn run_actor(
                     }
                     Err(error) => tracing::warn!(
                             failure = error_category(&error),
-                            "Codex execution worker stopped without affecting peers"
+                            "execution worker stopped without affecting peers"
                         ),
                 }
             }
@@ -359,7 +364,7 @@ async fn start_run(
 async fn start_run_inner(
     config: &SharedConfig,
     state: &DaemonState,
-    input: StartCodex,
+    input: StartTask,
     reply: &mut Option<oneshot::Sender<Result<StartedRun, Error>>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Option<RunContext>, Error> {
@@ -369,15 +374,26 @@ async fn start_run_inner(
     let runtime_dir = config.runtime_root.join(run_id.as_str());
     let worktree_text = path_text(&worktree)?;
     let runtime_text = path_text(&runtime_dir)?;
+    let identity_project = input.project_id.clone();
+    let identity_agent = input.agent_id.clone();
+    let identity = state
+        .with_store(move |store| store.agent_execution_identity(&identity_project, &identity_agent))
+        .await?;
+    let fresh_provider_session_id =
+        if identity.provider == Provider::ClaudeCode && !identity.has_provider_session {
+            Some(Uuid::new_v4().hyphenated().to_string())
+        } else {
+            None
+        };
     let reservation = RunReservation {
         project_id: input.project_id,
         task_id: input.task_id,
         agent_id: input.agent_id,
-        expected_provider: Provider::Codex,
+        expected_provider: identity.provider,
         run_id: run_id.clone(),
         parent_run_id: input.parent_run_id,
         worktree: worktree_text,
-        fresh_provider_session_id: None,
+        fresh_provider_session_id,
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_text,
     };
@@ -401,43 +417,29 @@ async fn start_run_inner(
         return Ok(None);
     }
 
-    let session = match launch_session(&reserved) {
-        Ok(session) => session,
-        Err(_) => {
-            fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
-            return Ok(None);
-        }
-    };
     let watch_target = WatchTarget::from_execution_target(&reserved);
-    let instructions = reserved.task_body;
-    let prepared = codex::prepare(CodexLaunch {
-        runner_program: config.runner_program.clone(),
-        codex_program: config.codex_program.clone(),
-        run_id: run_id.clone(),
-        runner_instance_id: runner_instance_id.clone(),
-        runtime_dir: runtime_dir.clone(),
-        cwd: worktree,
-        codex_home: reserved.codex_home.as_ref().map(PathBuf::from),
-        instructions,
-        session,
-    })
-    .map_err(|_| Error::InvalidSession);
-    let prepared = match prepared {
-        Ok(prepared) => prepared,
+    let launch_spec = match prepare_launch(
+        config,
+        reserved,
+        run_id.clone(),
+        runner_instance_id.clone(),
+        runtime_dir.clone(),
+        worktree,
+    ) {
+        Ok(launch_spec) => launch_spec,
         Err(_) => {
             fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
             return Ok(None);
         }
     };
 
-    let child =
-        match runner_process::spawn_runner(prepared.launch_spec, config.startup_timeout).await {
-            Ok(child) => child,
-            Err(_) => {
-                fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
-                return Ok(None);
-            }
-        };
+    let child = match runner_process::spawn_runner(launch_spec, config.startup_timeout).await {
+        Ok(child) => child,
+        Err(_) => {
+            fail_launch(state, run_id.clone(), runner_instance_id.clone()).await?;
+            return Ok(None);
+        }
+    };
     Ok(Some(RunContext {
         run_id,
         target: watch_target,
@@ -489,6 +491,7 @@ impl RecoveryWork {
         Self {
             run_id: run.run_id,
             target: WatchTarget {
+                provider: run.provider,
                 provider_session_id: run.provider_session_id,
                 resumes_provider_session: run.resumes_provider_session,
                 runner_instance_id: run.runner_instance_id,
@@ -528,6 +531,7 @@ impl RunContext {
 }
 
 struct WatchTarget {
+    provider: Provider,
     provider_session_id: Option<String>,
     resumes_provider_session: bool,
     runner_instance_id: RunnerInstanceId,
@@ -536,6 +540,7 @@ struct WatchTarget {
 impl WatchTarget {
     fn from_execution_target(target: &ExecutionTarget) -> Self {
         Self {
+            provider: target.provider,
             provider_session_id: target.provider_session_id.clone(),
             resumes_provider_session: target.resumes_provider_session,
             runner_instance_id: target.runner_instance_id.clone(),
@@ -561,7 +566,7 @@ async fn observe_run(
                 tracing::warn!(
                     run_id = %context.run_id,
                     failure = error_category(&error),
-                    "Codex run observation will retry"
+                    "provider run observation will retry"
                 );
                 let retry_delay = context.next_retry_delay();
                 tokio::select! {
@@ -803,18 +808,38 @@ async fn consume_subscription(
     }
 }
 
+enum ProviderDecoder {
+    Codex(CodexDecoder),
+    Claude {
+        decoder: ClaudeDecoder,
+        expected_session_id: String,
+    },
+}
+
 fn normalize_effects(
-    decoder: &mut Decoder,
+    decoder: &mut ProviderDecoder,
     event: &RunnerEventEnvelope,
     session_seen: &mut bool,
 ) -> RunnerEventEffects {
-    let observations = decoder.push(&event.event);
-    let confirmed = observations
-        .into_iter()
-        .find_map(|observation| match observation {
-            Observation::ThreadStarted { thread_id } => Some(thread_id),
-            _ => None,
-        });
+    let confirmed = match decoder {
+        ProviderDecoder::Codex(decoder) => {
+            decoder
+                .push(&event.event)
+                .into_iter()
+                .find_map(|observation| match observation {
+                    CodexObservation::ThreadStarted { thread_id } => Some(thread_id),
+                    _ => None,
+                })
+        }
+        ProviderDecoder::Claude {
+            decoder,
+            expected_session_id,
+        } => decoder
+            .push(&event.event)
+            .into_iter()
+            .any(|observation| matches!(observation, ClaudeObservation::Initialized { .. }))
+            .then(|| expected_session_id.clone()),
+    };
     if confirmed.is_some() {
         *session_seen = true;
     }
@@ -824,17 +849,32 @@ fn normalize_effects(
     }
 }
 
-fn finish_outcome(decoder: Decoder, session_seen: bool) -> TerminalOutcome {
-    match decoder.finish().outcome {
-        CodexOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded,
-        CodexOutcome::Succeeded { .. } => TerminalOutcome::Failed(RunFailureReason::Protocol),
-        CodexOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
-            CodexFailureReason::Protocol => RunFailureReason::Protocol,
-            CodexFailureReason::Provider => RunFailureReason::Provider,
-            CodexFailureReason::Process => RunFailureReason::Process,
-            CodexFailureReason::Spawn => RunFailureReason::Spawn,
-            CodexFailureReason::Incomplete => RunFailureReason::Incomplete,
-        }),
+fn finish_outcome(decoder: ProviderDecoder, session_seen: bool) -> TerminalOutcome {
+    match decoder {
+        ProviderDecoder::Codex(decoder) => match decoder.finish().outcome {
+            CodexOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded,
+            CodexOutcome::Succeeded { .. } => TerminalOutcome::Failed(RunFailureReason::Protocol),
+            CodexOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
+                CodexFailureReason::Protocol => RunFailureReason::Protocol,
+                CodexFailureReason::Provider => RunFailureReason::Provider,
+                CodexFailureReason::Process => RunFailureReason::Process,
+                CodexFailureReason::Spawn => RunFailureReason::Spawn,
+                CodexFailureReason::Incomplete => RunFailureReason::Incomplete,
+            }),
+        },
+        ProviderDecoder::Claude { decoder, .. } => match decoder.finish().outcome {
+            ClaudeOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded,
+            ClaudeOutcome::Succeeded { .. } => TerminalOutcome::Failed(RunFailureReason::Protocol),
+            ClaudeOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
+                ClaudeFailureReason::Protocol => RunFailureReason::Protocol,
+                ClaudeFailureReason::Provider => RunFailureReason::Provider,
+                ClaudeFailureReason::Permission => RunFailureReason::Permission,
+                ClaudeFailureReason::Limit => RunFailureReason::Limit,
+                ClaudeFailureReason::Process => RunFailureReason::Process,
+                ClaudeFailureReason::Spawn => RunFailureReason::Spawn,
+                ClaudeFailureReason::Incomplete => RunFailureReason::Incomplete,
+            }),
+        },
     }
 }
 
@@ -1072,28 +1112,105 @@ fn poll_child(child: &mut Option<Child>) -> Result<ChildState, Error> {
     }
 }
 
-fn decoder_for(target: &WatchTarget) -> Result<Decoder, Error> {
-    if target.resumes_provider_session {
-        let session = target
-            .provider_session_id
-            .clone()
-            .ok_or(Error::CorruptExecution)?;
-        Decoder::resume(session).map_err(|_| Error::InvalidSession)
-    } else {
-        Ok(Decoder::fresh())
+#[allow(clippy::too_many_arguments)]
+fn prepare_launch(
+    config: &SharedConfig,
+    target: ExecutionTarget,
+    run_id: RunId,
+    runner_instance_id: RunnerInstanceId,
+    runtime_dir: PathBuf,
+    worktree: PathBuf,
+) -> Result<runner_process::LaunchSpec, Error> {
+    let ExecutionTarget {
+        provider,
+        task_body,
+        provider_session_id,
+        codex_home,
+        resumes_provider_session,
+        ..
+    } = target;
+    match provider {
+        Provider::Codex => {
+            let session = if resumes_provider_session {
+                CodexSession::Resume {
+                    thread_id: provider_session_id.ok_or(Error::CorruptExecution)?,
+                }
+            } else {
+                CodexSession::New
+            };
+            codex::prepare(CodexLaunch {
+                runner_program: config.runner_program.clone(),
+                codex_program: config.codex_program.clone(),
+                run_id,
+                runner_instance_id,
+                runtime_dir,
+                cwd: worktree,
+                codex_home: codex_home.map(PathBuf::from),
+                instructions: task_body,
+                session,
+            })
+            .map(|prepared| prepared.launch_spec)
+            .map_err(|_| Error::InvalidSession)
+        }
+        Provider::ClaudeCode => {
+            if codex_home.is_some() {
+                return Err(Error::CorruptExecution);
+            }
+            let session_id = provider_session_id.ok_or(Error::CorruptExecution)?;
+            let session = if resumes_provider_session {
+                ClaudeSession::Resume { session_id }
+            } else {
+                ClaudeSession::New { session_id }
+            };
+            claude::prepare(ClaudeLaunch {
+                runner_program: config.runner_program.clone(),
+                claude_program: config.claude_program.clone(),
+                run_id,
+                runner_instance_id,
+                runtime_dir,
+                cwd: worktree,
+                instructions: task_body,
+                session,
+                max_turns: config.claude_max_turns,
+                max_budget_cents: config.claude_max_budget_cents,
+            })
+            .map(|prepared| prepared.launch_spec)
+            .map_err(|_| Error::InvalidSession)
+        }
     }
 }
 
-fn launch_session(target: &ExecutionTarget) -> Result<Session, Error> {
-    if target.resumes_provider_session {
-        Ok(Session::Resume {
-            thread_id: target
+fn decoder_for(target: &WatchTarget) -> Result<ProviderDecoder, Error> {
+    match target.provider {
+        Provider::Codex => {
+            if target.resumes_provider_session {
+                let session = target
+                    .provider_session_id
+                    .clone()
+                    .ok_or(Error::CorruptExecution)?;
+                CodexDecoder::resume(session)
+                    .map(ProviderDecoder::Codex)
+                    .map_err(|_| Error::InvalidSession)
+            } else {
+                Ok(ProviderDecoder::Codex(CodexDecoder::fresh()))
+            }
+        }
+        Provider::ClaudeCode => {
+            let expected_session_id = target
                 .provider_session_id
                 .clone()
-                .ok_or(Error::CorruptExecution)?,
-        })
-    } else {
-        Ok(Session::New)
+                .ok_or(Error::CorruptExecution)?;
+            let decoder = if target.resumes_provider_session {
+                ClaudeDecoder::resume(expected_session_id.clone())
+            } else {
+                ClaudeDecoder::fresh(expected_session_id.clone())
+            }
+            .map_err(|_| Error::InvalidSession)?;
+            Ok(ProviderDecoder::Claude {
+                decoder,
+                expected_session_id,
+            })
+        }
     }
 }
 
