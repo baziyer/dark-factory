@@ -1,4 +1,4 @@
-use std::{env, error::Error, ffi::OsString, io, path::PathBuf, time::Duration};
+use std::{env, error::Error, ffi::OsString, io, num::NonZeroU32, path::PathBuf, time::Duration};
 
 use factoryd::{
     execution,
@@ -9,6 +9,8 @@ use factoryd::{
 use tokio::{net::UnixListener, task::JoinHandle};
 
 const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
+const CLAUDE_MAX_TURNS: NonZeroU32 = NonZeroU32::new(20).unwrap();
+const CLAUDE_MAX_BUDGET_CENTS: NonZeroU32 = NonZeroU32::new(500).unwrap();
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_GRACE: Duration = Duration::from_secs(5);
 const BATCH_DELAY: Duration = Duration::from_millis(25);
@@ -19,6 +21,7 @@ struct Config {
     socket: PathBuf,
     runner: PathBuf,
     codex: PathBuf,
+    claude: PathBuf,
     runtime_root: PathBuf,
     max_active_runs: usize,
 }
@@ -37,6 +40,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         execution::Config {
             runner_program: config.runner,
             codex_program: config.codex,
+            claude_program: config.claude,
+            claude_max_turns: CLAUDE_MAX_TURNS,
+            claude_max_budget_cents: CLAUDE_MAX_BUDGET_CENTS,
             runtime_root: config.runtime_root,
             max_active_runs: config.max_active_runs,
             startup_timeout: STARTUP_TIMEOUT,
@@ -107,6 +113,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
             .unwrap_or_else(|| home.join("f.sock")),
         runner,
         codex: PathBuf::from("codex"),
+        claude: PathBuf::from("claude"),
         runtime_root: home.join("runs"),
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
     };
@@ -131,6 +138,9 @@ fn parse_arguments(
             Some("--codex") => {
                 config.codex = next_path(&mut arguments, "--codex")?;
             }
+            Some("--claude") => {
+                config.claude = next_path(&mut arguments, "--claude")?;
+            }
             Some("--runtime-root") => {
                 config.runtime_root = next_path(&mut arguments, "--runtime-root")?;
             }
@@ -146,7 +156,7 @@ fn parse_arguments(
             }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--codex PATH] [--runtime-root PATH] [--max-active-runs N]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--codex PATH] [--claude PATH] [--runtime-root PATH] [--max-active-runs N]"
                 );
                 std::process::exit(0);
             }
@@ -187,6 +197,7 @@ mod tests {
             socket: PathBuf::from("/state/f.sock"),
             runner: PathBuf::from("/bin/factory-runner"),
             codex: PathBuf::from("codex"),
+            claude: PathBuf::from("claude"),
             runtime_root: PathBuf::from("/state/runs"),
             max_active_runs: 4,
         }
@@ -209,6 +220,8 @@ mod tests {
                 "/opt/dark-factory/factory-runner",
                 "--codex",
                 "/opt/codex",
+                "--claude",
+                "/opt/claude",
                 "--runtime-root",
                 "/private/runs",
                 "--max-active-runs",
@@ -221,6 +234,7 @@ mod tests {
             PathBuf::from("/opt/dark-factory/factory-runner")
         );
         assert_eq!(parsed.codex, PathBuf::from("/opt/codex"));
+        assert_eq!(parsed.claude, PathBuf::from("/opt/claude"));
         assert_eq!(parsed.runtime_root, PathBuf::from("/private/runs"));
         assert_eq!(parsed.max_active_runs, 2);
 

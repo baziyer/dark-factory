@@ -1,5 +1,6 @@
 use std::{
     fs,
+    num::NonZeroU32,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
@@ -15,10 +16,10 @@ use factory_core::{
 };
 use factoryd::{
     daemon_state::{DaemonState, DaemonStateError},
-    execution::{self, Config, StartCodex},
+    execution::{self, Config, StartTask},
     store::{
-        NewAgent, NewProject, NewTask, RunReservation, RunnerEventEffects, Store, StoreError,
-        TerminalOutcome,
+        AdoptedProviderSession, NewAgent, NewProject, NewTask, RunReservation, RunnerEventEffects,
+        Store, StoreError, TerminalOutcome,
     },
 };
 use tokio::{
@@ -27,6 +28,7 @@ use tokio::{
     task::yield_now,
     time::{advance, timeout},
 };
+use uuid::Uuid;
 
 const THREAD_ID: &str = "0195d40a-1111-7000-8000-000000000001";
 const MAX_TEST_VIRTUAL_DRIVE: Duration = Duration::from_secs(1);
@@ -160,8 +162,23 @@ fn main() {
         r#"{"type":"event","data":{"protocol_version":1,"event":{"protocol_version":1,"sequence":1,"occurred_at_ms":1001,"event":{"type":"started","data":{"child_pid":42}}}}}"#,
     )
     .expect("started");
+    let claude_session_id = arguments.windows(2).find_map(|pair| {
+        matches!(pair[0].as_str(), "--session-id" | "--resume")
+            .then_some(pair[1].as_str())
+    });
+    let provider_output = if let Some(session_id) = claude_session_id {
+        format!(
+            "{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"{session_id}\",\"model\":\"claude-sonnet-4-6\",\"permissionMode\":\"acceptEdits\",\"claude_code_version\":\"2.1.233\"}}\n\
+             {{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"{session_id}\",\"result\":\"done\",\"terminal_reason\":\"completed\",\"stop_reason\":\"end_turn\",\"permission_denials\":[],\"total_cost_usd\":0.25,\"usage\":{{\"input_tokens\":1,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3,\"output_tokens\":4}}}}\n"
+        )
+    } else {
+        format!(
+            "{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD_ID}\"}}\n\
+             {{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}}}\n"
+        )
+    };
     let output = format!(
-        r#"{{"type":"event","data":{{"protocol_version":1,"event":{{"protocol_version":1,"sequence":2,"occurred_at_ms":1002,"event":{{"type":"output","data":{{"stream":"stdout","text":"{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD_ID}\"}}\n{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}}}\n","lossy":false}}}}}}}}}}"#
+        r#"{{"type":"event","data":{{"protocol_version":1,"event":{{"protocol_version":1,"sequence":2,"occurred_at_ms":1002,"event":{{"type":"output","data":{{"stream":"stdout","text":{provider_output:?},"lossy":false}}}}}}}}}}"#
     );
     write_frame(&mut subscription, &output).expect("output");
     write_frame(
@@ -212,6 +229,57 @@ fn runner_event(sequence: i64, event: RunnerEvent) -> RunnerEventEnvelope {
     }
 }
 
+fn claude_init_event(sequence: i64) -> RunnerEventEnvelope {
+    runner_event(
+        sequence,
+        RunnerEvent::Output {
+            stream: OutputStream::Stdout,
+            text: format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": THREAD_ID,
+                    "model": "claude-sonnet-4-6",
+                    "permissionMode": "acceptEdits",
+                    "claude_code_version": "2.1.233",
+                })
+            ),
+            lossy: false,
+        },
+    )
+}
+
+fn claude_result_event(sequence: i64) -> RunnerEventEnvelope {
+    runner_event(
+        sequence,
+        RunnerEvent::Output {
+            stream: OutputStream::Stdout,
+            text: format!(
+                "{}\n",
+                serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "session_id": THREAD_ID,
+                    "result": "done",
+                    "terminal_reason": "completed",
+                    "stop_reason": "end_turn",
+                    "permission_denials": [],
+                    "total_cost_usd": 0.25,
+                    "usage": {
+                        "input_tokens": 1,
+                        "cache_creation_input_tokens": 2,
+                        "cache_read_input_tokens": 3,
+                        "output_tokens": 4,
+                    },
+                })
+            ),
+            lossy: false,
+        },
+    )
+}
+
 struct RecoveryFixture {
     _directory: tempfile::TempDir,
     database: PathBuf,
@@ -232,7 +300,15 @@ impl RecoveryFixture {
         Self::new(runtime_exists, false)
     }
 
+    fn active_claude(runtime_exists: bool) -> Self {
+        Self::new_for_provider(runtime_exists, false, Provider::ClaudeCode)
+    }
+
     fn new(runtime_exists: bool, terminal: bool) -> Self {
+        Self::new_for_provider(runtime_exists, terminal, Provider::Codex)
+    }
+
+    fn new_for_provider(runtime_exists: bool, terminal: bool, provider: Provider) -> Self {
         // macOS Unix-domain socket paths are short; keep the fixture root well
         // below that limit so a bind failure cannot masquerade as recovery.
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -240,6 +316,7 @@ impl RecoveryFixture {
         let database = directory.path().join("factory.db");
         let project_root = directory.path().join("project");
         private_directory(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
         let runtime_root = directory.path().join("new-runs");
         private_directory(&runtime_root);
         let runtime_dir = directory.path().join("recovered-run");
@@ -283,7 +360,7 @@ impl RecoveryFixture {
                     project_id: project_id.clone(),
                     parent_agent_id: None,
                     role: AgentRole::Worker,
-                    provider: Provider::Codex,
+                    provider,
                 },
                 3,
             )
@@ -294,11 +371,12 @@ impl RecoveryFixture {
                     project_id,
                     task_id,
                     agent_id,
-                    expected_provider: Provider::Codex,
+                    expected_provider: provider,
                     run_id: run_id.clone(),
                     parent_run_id: None,
                     worktree: project_root.to_str().unwrap().into(),
-                    fresh_provider_session_id: None,
+                    fresh_provider_session_id: (provider == Provider::ClaudeCode)
+                        .then(|| THREAD_ID.into()),
                     runner_instance_id: runner_instance_id.clone(),
                     runner_runtime: runtime_dir.to_str().unwrap().into(),
                 },
@@ -383,6 +461,9 @@ impl RecoveryFixture {
         Config {
             runner_program: PathBuf::from("/unused/factory-runner"),
             codex_program: PathBuf::from("/unused/codex"),
+            claude_program: PathBuf::from("/unused/claude"),
+            claude_max_turns: NonZeroU32::new(20).unwrap(),
+            claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: self.runtime_root.clone(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
@@ -581,11 +662,32 @@ impl QueuedFixture {
     }
 
     fn with_body(body: String) -> Self {
+        Self::with_provider(body, Provider::Codex, false)
+    }
+
+    fn fresh_claude() -> Self {
+        Self::with_provider(
+            "private fresh Claude task body".into(),
+            Provider::ClaudeCode,
+            false,
+        )
+    }
+
+    fn adopted_claude() -> Self {
+        Self::with_provider(
+            "private adopted Claude task body".into(),
+            Provider::ClaudeCode,
+            true,
+        )
+    }
+
+    fn with_provider(body: String, provider: Provider, adopted: bool) -> Self {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let database = directory.path().join("factory.db");
         let project_root = directory.path().join("project");
         private_directory(&project_root);
+        let project_root = fs::canonicalize(project_root).unwrap();
         let runtime_root = directory.path().join("runs");
         private_directory(&runtime_root);
         let project_id = id::<ProjectId>("queued-project");
@@ -615,18 +717,27 @@ impl QueuedFixture {
                 2,
             )
             .unwrap();
-        store
-            .create_agent(
-                NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Codex,
-                },
-                3,
-            )
-            .unwrap();
+        let agent = NewAgent {
+            id: agent_id.clone(),
+            project_id: project_id.clone(),
+            parent_agent_id: None,
+            role: AgentRole::Worker,
+            provider,
+        };
+        if adopted {
+            store
+                .adopt_agent(
+                    agent,
+                    AdoptedProviderSession::ClaudeCode {
+                        session_id: THREAD_ID.into(),
+                        cwd: project_root.to_str().unwrap().into(),
+                    },
+                    3,
+                )
+                .unwrap();
+        } else {
+            store.create_agent(agent, 3).unwrap();
+        }
         let baseline = store.latest_event_sequence().unwrap();
         Self {
             _directory: directory,
@@ -644,6 +755,9 @@ impl QueuedFixture {
         Config {
             runner_program: PathBuf::from("/unused/factory-runner"),
             codex_program: PathBuf::from("/unused/codex"),
+            claude_program: PathBuf::from("/unused/claude"),
+            claude_max_turns: NonZeroU32::new(20).unwrap(),
+            claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
             runtime_root: self.runtime_root.clone(),
             max_active_runs: 1,
             startup_timeout: Duration::from_secs(1),
@@ -675,7 +789,8 @@ impl QueuedFixture {
 
 struct ScriptedRunner {
     program: PathBuf,
-    provider: PathBuf,
+    codex_provider: PathBuf,
+    claude_provider: PathBuf,
     launched: PathBuf,
     release: PathBuf,
     done: PathBuf,
@@ -697,7 +812,8 @@ impl ScriptedRunner {
     fn compile(directory: &Path) -> Self {
         let source = directory.join("scripted-runner.rs");
         let program = directory.join("scripted-runner");
-        let provider = directory.join("fake-codex");
+        let codex_provider = directory.join("fake-codex");
+        let claude_provider = directory.join("fake-claude");
         let launched = directory.join("runner-launched");
         let release = directory.join("release-runner");
         let done = directory.join("runner-done");
@@ -752,11 +868,14 @@ impl ScriptedRunner {
             "scripted runner compilation failed: {}",
             String::from_utf8_lossy(&compiled.stderr)
         );
-        fs::write(&provider, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+        for provider in [&codex_provider, &claude_provider] {
+            fs::write(provider, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+        }
         Self {
             program,
-            provider,
+            codex_provider,
+            claude_provider,
             launched,
             release,
             done,
@@ -798,7 +917,7 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
     let scripted = ScriptedRunner::compile(fixture._directory.path());
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.connect_grace = Duration::from_secs(5);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
@@ -809,7 +928,7 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
     let worktree = fixture.project_root.clone();
     let start = tokio::spawn(async move {
         start_handle
-            .start_codex(StartCodex {
+            .start_task(StartTask {
                 project_id,
                 task_id,
                 agent_id,
@@ -933,6 +1052,111 @@ async fn fresh_start_crosses_real_process_boundary_and_completes_durably() {
     stop(handle, join).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_and_adopted_claude_use_the_durable_provider_session_and_exact_cwd() {
+    for adopted in [false, true] {
+        let fixture = if adopted {
+            QueuedFixture::adopted_claude()
+        } else {
+            QueuedFixture::fresh_claude()
+        };
+        let scripted = ScriptedRunner::compile(fixture._directory.path());
+        let mut config = fixture.config();
+        config.runner_program = scripted.program.clone();
+        config.claude_program = scripted.claude_provider.clone();
+        config.connect_grace = Duration::from_secs(5);
+        let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
+
+        let started = handle
+            .start_task(StartTask {
+                project_id: fixture.project_id.clone(),
+                task_id: fixture.task_id.clone(),
+                agent_id: fixture.agent_id.clone(),
+                parent_run_id: None,
+                worktree: fixture.project_root.clone(),
+            })
+            .await
+            .unwrap();
+        wait_for_path(&scripted.launched).await;
+
+        let arguments = fs::read_to_string(&scripted.arguments).unwrap();
+        let arguments = arguments.lines().collect::<Vec<_>>();
+        let session_flag = if adopted { "--resume" } else { "--session-id" };
+        let session_index = arguments
+            .iter()
+            .position(|argument| *argument == session_flag)
+            .unwrap();
+        let launched_session = arguments[session_index + 1];
+        if adopted {
+            assert_eq!(launched_session, THREAD_ID);
+            assert!(!arguments.contains(&"--session-id"));
+        } else {
+            assert_eq!(
+                Uuid::parse_str(launched_session).unwrap().to_string(),
+                launched_session
+            );
+            assert!(!arguments.contains(&"--resume"));
+        }
+        for fixed in [
+            ["--max-turns", "20"],
+            ["--max-budget-usd", "5.00"],
+            ["--permission-mode", "acceptEdits"],
+        ] {
+            assert!(arguments.windows(2).any(|pair| pair == fixed));
+        }
+
+        let run_id = started.run_id.clone();
+        let (stored_provider, stored_session, resumes) = fixture
+            .state
+            .with_store(move |store| {
+                let target = store.execution_target(&run_id)?;
+                Ok((
+                    target.provider,
+                    target.provider_session_id,
+                    target.resumes_provider_session,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_provider, Provider::ClaudeCode);
+        assert_eq!(stored_session.as_deref(), Some(launched_session));
+        assert_eq!(resumes, adopted);
+
+        fs::write(&scripted.release, b"").unwrap();
+        wait_for_path(&scripted.done).await;
+        timeout(Duration::from_secs(5), async {
+            while fixture
+                .state
+                .with_store(|store| Ok(!store.recoverable_runs()?.is_empty()))
+                .await
+                .unwrap()
+            {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("Claude terminal acknowledgement was not durably reconciled");
+        let expected_input = if adopted {
+            "private adopted Claude task body"
+        } else {
+            "private fresh Claude task body"
+        };
+        assert_eq!(fs::read_to_string(&scripted.input).unwrap(), expected_input);
+        let baseline = fixture.baseline;
+        let public = fixture
+            .state
+            .with_store(move |store| {
+                Ok(serde_json::to_string(&store.events_after(baseline, 100)?)?)
+            })
+            .await
+            .unwrap();
+        assert!(!public.contains(launched_session));
+        assert!(!public.contains(expected_input));
+
+        stop(handle, join).await;
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn startup_input_timeout_kills_the_unready_wrapper_and_allows_shutdown() {
     let instructions = "x".repeat(factory_core::runner::MAX_STARTUP_STDIN_BYTES);
@@ -941,12 +1165,12 @@ async fn startup_input_timeout_kills_the_unready_wrapper_and_allows_shutdown() {
     fs::write(&scripted.launch_shutdown_mode, b"").unwrap();
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.startup_timeout = Duration::from_millis(50);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
     let started = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1020,12 +1244,12 @@ async fn pre_hello_child_exit_with_stale_socket_is_a_spawn_failure() {
     fs::write(&scripted.exit_before_hello_mode, b"").unwrap();
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.connect_grace = Duration::from_millis(50);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
     let started = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1094,12 +1318,12 @@ async fn signalled_pre_hello_wrapper_does_not_release_potentially_live_provider_
     fs::write(&scripted.pre_hello_hang_mode, b"").unwrap();
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.connect_grace = Duration::from_millis(50);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
     let started = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1158,7 +1382,7 @@ async fn signalled_pre_hello_wrapper_does_not_release_potentially_live_provider_
     }
     let mut recovery_config = fixture.config();
     recovery_config.runner_program = scripted.program.clone();
-    recovery_config.codex_program = scripted.provider.clone();
+    recovery_config.codex_program = scripted.codex_provider.clone();
     recovery_config.connect_grace = Duration::from_millis(50);
     let (recovery_handle, recovery_join) =
         execution::spawn(recovery_config, fixture.state.clone()).unwrap();
@@ -1191,12 +1415,12 @@ async fn signalled_authenticated_wrapper_keeps_the_run_assigned_and_recoverable(
     fs::write(&scripted.disconnect_mode, b"").unwrap();
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.connect_grace = Duration::from_millis(50);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
     let started = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1273,12 +1497,12 @@ async fn authenticated_disconnect_cannot_fail_a_still_running_wrapper() {
     fs::write(&scripted.disconnect_mode, b"").unwrap();
     let mut config = fixture.config();
     config.runner_program = scripted.program.clone();
-    config.codex_program = scripted.provider.clone();
+    config.codex_program = scripted.codex_provider.clone();
     config.connect_grace = Duration::from_millis(50);
     let (handle, join) = execution::spawn(config, fixture.state.clone()).unwrap();
 
     let started = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1396,7 +1620,7 @@ async fn invalid_worktree_is_rejected_before_db_or_event_mutation() {
     let mut published = fixture.state.subscribe();
     let (handle, join) = execution::spawn(fixture.config(), fixture.state.clone()).unwrap();
     let error = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -1424,7 +1648,7 @@ async fn post_commit_provider_launch_failure_keeps_run_id_and_fails_asynchronous
 
     let started = timeout(
         Duration::from_secs(2),
-        handle.start_codex(StartCodex {
+        handle.start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -2343,7 +2567,7 @@ async fn durable_capacity_rejects_start_without_an_in_memory_holding_queue() {
 
     let first_overflow = timeout(
         Duration::from_secs(2),
-        handle.start_codex(StartCodex {
+        handle.start_task(StartTask {
             project_id: id("project"),
             task_id: id("task"),
             agent_id: id("agent"),
@@ -2387,7 +2611,7 @@ async fn fixed_start_attempt_bound_returns_backpressure_without_waiting_for_stor
     // This reply proves actor startup (including its one recovery query) has
     // completed before the store is deliberately held below.
     let initialized = handle
-        .start_codex(StartCodex {
+        .start_task(StartTask {
             project_id: fixture.project_id.clone(),
             task_id: fixture.task_id.clone(),
             agent_id: fixture.agent_id.clone(),
@@ -2427,7 +2651,7 @@ async fn fixed_start_attempt_bound_returns_backpressure_without_waiting_for_stor
         let worktree = fixture.project_root.clone();
         starts.spawn(async move {
             caller
-                .start_codex(StartCodex {
+                .start_task(StartTask {
                     project_id,
                     task_id,
                     agent_id,
@@ -2775,4 +2999,194 @@ async fn shutdown_after_nonterminal_caught_up_sends_no_stop_or_acknowledgement()
     advance_and_settle(Duration::from_millis(1)).await;
     assert!(probe.await.unwrap().is_err());
     assert!(fixture.remains_recoverable().await);
+}
+
+#[tokio::test]
+async fn claude_recovery_replays_from_zero_with_a_fresh_provider_decoder() {
+    let fixture = RecoveryFixture::active_claude(true);
+    let socket = fixture.runtime_dir.join("control.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let expected_run = fixture.run_id.clone();
+    let expected_instance = fixture.runner_instance_id.clone();
+    let started = runner_event(1, RunnerEvent::Started { child_pid: 42 });
+    let initialized = claude_init_event(2);
+    let result = claude_result_event(3);
+    let exited = runner_event(
+        4,
+        RunnerEvent::Exited {
+            exit_code: Some(0),
+            signal: None,
+        },
+    );
+    let (first_replay_tx, first_replay_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut requests = Vec::new();
+
+        let (first, _) = listener.accept().await.unwrap();
+        let mut first = BufReader::new(first);
+        let mut line = String::new();
+        first.read_line(&mut line).await.unwrap();
+        requests.push(serde_json::from_str::<RequestEnvelope>(&line).unwrap());
+        for frame in [
+            RunnerFrame::Hello {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                run_id: expected_run.clone(),
+                runner_instance_id: expected_instance.clone(),
+                runner_pid: 42,
+                replay_through: 2,
+                terminal_sequence: None,
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: started.clone(),
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: initialized.clone(),
+            },
+            RunnerFrame::CaughtUp {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                sequence: 2,
+            },
+        ] {
+            first
+                .get_mut()
+                .write_all(&serde_json::to_vec(&frame).unwrap())
+                .await
+                .unwrap();
+            first.get_mut().write_all(b"\n").await.unwrap();
+        }
+        drop(first);
+        let _ = first_replay_tx.send(());
+
+        let (second, _) = listener.accept().await.unwrap();
+        let mut second = BufReader::new(second);
+        let mut line = String::new();
+        second.read_line(&mut line).await.unwrap();
+        requests.push(serde_json::from_str::<RequestEnvelope>(&line).unwrap());
+        for frame in [
+            RunnerFrame::Hello {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                run_id: expected_run,
+                runner_instance_id: expected_instance,
+                runner_pid: 42,
+                replay_through: 4,
+                terminal_sequence: Some(4),
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: started,
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: initialized,
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: result,
+            },
+            RunnerFrame::Event {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                event: exited,
+            },
+            RunnerFrame::CaughtUp {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                sequence: 4,
+            },
+        ] {
+            second
+                .get_mut()
+                .write_all(&serde_json::to_vec(&frame).unwrap())
+                .await
+                .unwrap();
+            second.get_mut().write_all(b"\n").await.unwrap();
+        }
+
+        let (ack, _) = listener.accept().await.unwrap();
+        let mut ack = BufReader::new(ack);
+        let mut line = String::new();
+        ack.read_line(&mut line).await.unwrap();
+        let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
+        requests.push(request.clone());
+        let command_id = match request.request {
+            RunnerRequest::AcknowledgeExit { command_id, .. } => command_id,
+            other => panic!("expected terminal acknowledgement, got {other:?}"),
+        };
+        let response = RunnerFrame::CommandAck {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            command_id,
+        };
+        ack.get_mut()
+            .write_all(&serde_json::to_vec(&response).unwrap())
+            .await
+            .unwrap();
+        ack.get_mut().write_all(b"\n").await.unwrap();
+        requests
+    });
+
+    let baseline = fixture
+        .state
+        .with_store(|store| store.latest_event_sequence())
+        .await
+        .unwrap();
+    let (handle, join) = execution::spawn(
+        fixture.config(Duration::from_millis(100)),
+        fixture.state.clone(),
+    )
+    .unwrap();
+    timeout(Duration::from_secs(5), first_replay_rx)
+        .await
+        .expect("initial Claude replay subscription timed out")
+        .unwrap();
+    let requests = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("Claude reconnect and terminal acknowledgement timed out")
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while fixture.remains_recoverable().await {
+            yield_now().await;
+        }
+    })
+    .await
+    .expect("Claude terminal acknowledgement was not reconciled");
+
+    assert_eq!(
+        requests,
+        vec![
+            RequestEnvelope::new(
+                fixture.run_id.clone(),
+                fixture.runner_instance_id.clone(),
+                RunnerRequest::Subscribe { after_sequence: 0 },
+            ),
+            RequestEnvelope::new(
+                fixture.run_id.clone(),
+                fixture.runner_instance_id.clone(),
+                RunnerRequest::Subscribe { after_sequence: 0 },
+            ),
+            RequestEnvelope::new(
+                fixture.run_id.clone(),
+                fixture.runner_instance_id.clone(),
+                RunnerRequest::AcknowledgeExit {
+                    command_id: "ack-4".into(),
+                    terminal_sequence: 4,
+                },
+            ),
+        ]
+    );
+    let events = fixture
+        .state
+        .with_store(move |store| store.events_after(baseline, 100))
+        .await
+        .unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::RunChanged { run }
+            if run.id == fixture.run_id && run.status == RunStatus::Succeeded
+    )));
+    let public = serde_json::to_string(&events).unwrap();
+    assert!(!public.contains(THREAD_ID));
+    assert!(!public.contains("private task body"));
+
+    stop(handle, join).await;
 }

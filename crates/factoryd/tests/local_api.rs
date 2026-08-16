@@ -1,4 +1,4 @@
-use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
+use std::{future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
     FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
@@ -85,6 +85,9 @@ fn execution_config(directory: &Path) -> execution::Config {
     execution::Config {
         runner_program: directory.join("missing-factory-runner"),
         codex_program: directory.join("missing-codex"),
+        claude_program: directory.join("missing-claude"),
+        claude_max_turns: NonZeroU32::new(20).unwrap(),
+        claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
         runtime_root: directory.join("runs"),
         max_active_runs: 1,
         startup_timeout: std::time::Duration::from_secs(1),

@@ -28,10 +28,11 @@ This file records constraints, not an aspirational component catalogue.
    terminal runner is marked reconciled only after its exact acknowledgement
    reply, or after its terminal outcome is durable and its runtime endpoint is
    proven absent; reconciliation itself is private cleanup, not a public state
-   transition. The first Codex execution actor reserves work before launch,
-   rebuilds its decoder from replay sequence zero, commits and publishes state
-   before acknowledging a terminal runner, and drops observation on daemon
-   shutdown without stopping the runner. A start request succeeds at durable
+   transition. The concrete Claude Code and Codex execution actor reserves work
+   before launch, rebuilds the provider decoder from replay sequence zero,
+   commits and publishes state before acknowledging a terminal runner, and
+   drops observation on daemon shutdown without stopping the runner. A start
+   request succeeds at durable
    reservation; runner readiness and completion are observed from run events,
    never hidden behind a long-lived request. Each run also persists observer
    health: `unknown` means no authenticated caught-up observation has been
@@ -43,9 +44,9 @@ This file records constraints, not an aspirational component catalogue.
    worktree. Codex may additionally bind an explicit, canonical, same-owner
    `CODEX_HOME`; it is injected through a closed provider-environment type after
    the ambient environment is cleared. Resume never falls back to a fresh
-   session or a different worktree/home. Claude identities are captured by the
-   same private store contract; executable Claude continuation lands before the
-   one-time Munder cutover.
+   session or a different worktree/home. Claude uses its exact daemon-bound
+   fresh or adopted session UUID on every launch and replay; both providers are
+   executable before the one-time Munder cutover.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,

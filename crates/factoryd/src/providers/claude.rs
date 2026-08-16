@@ -39,7 +39,7 @@ pub struct ClaudeLaunch {
 }
 
 pub enum Session {
-    New,
+    New { session_id: String },
     Resume { session_id: String },
 }
 
@@ -67,14 +67,16 @@ impl PreparedClaude {
 /// Builds fixed, non-interactive Claude arguments and exact task stdin bytes.
 ///
 /// Task content is present only in `launch_spec.startup_input`. The returned
-/// decoder is bound to the generated or resumed session identity.
+/// decoder is bound to the caller-allocated fresh or resumed session identity.
 pub fn prepare(input: ClaudeLaunch) -> Result<PreparedClaude, PrepareError> {
     let (session_id, resume) = match input.session {
-        Session::New => (Uuid::new_v4().hyphenated().to_string(), false),
-        Session::Resume { session_id } => {
-            validate_uuid(&session_id)?;
-            (session_id, true)
-        }
+        Session::New { session_id } => (session_id, false),
+        Session::Resume { session_id } => (session_id, true),
+    };
+    let decoder = if resume {
+        Decoder::resume(session_id.clone())?
+    } else {
+        Decoder::fresh(session_id.clone())?
     };
     let mut arguments = [
         "-p",
@@ -115,7 +117,7 @@ pub fn prepare(input: ClaudeLaunch) -> Result<PreparedClaude, PrepareError> {
             cwd: input.cwd,
             startup_input: input.instructions.into_bytes(),
         },
-        decoder: Decoder::new(session_id),
+        decoder,
     })
 }
 
@@ -334,6 +336,31 @@ pub struct Decoder {
 }
 
 impl Decoder {
+    /// Creates a decoder bound to a caller-allocated fresh session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::InvalidSessionId`] unless the expected identity
+    /// is a canonical UUID.
+    pub fn fresh(expected_session_id: String) -> Result<Self, PrepareError> {
+        Self::bound(expected_session_id)
+    }
+
+    /// Creates a recovery decoder bound to one exact resumed session identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PrepareError::InvalidSessionId`] unless the expected identity
+    /// is a canonical UUID.
+    pub fn resume(expected_session_id: String) -> Result<Self, PrepareError> {
+        Self::bound(expected_session_id)
+    }
+
+    fn bound(expected_session_id: String) -> Result<Self, PrepareError> {
+        validate_uuid(&expected_session_id)?;
+        Ok(Self::new(expected_session_id))
+    }
+
     fn new(expected_session_id: String) -> Self {
         Self {
             expected_session_id,
