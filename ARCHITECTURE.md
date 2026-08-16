@@ -28,7 +28,12 @@ This file records constraints, not an aspirational component catalogue.
    terminal runner is marked reconciled only after its exact acknowledgement
    reply, or after its terminal outcome is durable and its runtime endpoint is
    proven absent; reconciliation itself is private cleanup, not a public state
-   transition.
+   transition. The first Codex execution actor reserves work before launch,
+   rebuilds its decoder from replay sequence zero, commits and publishes state
+   before acknowledging a terminal runner, and drops observation on daemon
+   shutdown without stopping the runner. A start request succeeds at durable
+   reservation; runner readiness and completion are observed from run events,
+   never hidden behind a long-lived request.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
@@ -56,11 +61,19 @@ provider events, and streams persisted events to a sparse observer. The slice is
 complete only after a real provider command has run and the observer has been
 closed and reopened without affecting it.
 
+The Munder Difflin cutover is a one-time migration, not a permanent dual-run
+mode: capture agent/task/session/worktree state, pause new Munder allocation,
+resume only verifiable work, switch Minerva, and retire the old control path.
+No shadow-fleet or rollback subsystem is part of Dark Factory.
+
 ## Deliberately unresolved
 
-- Exact daemon-upgrade handoff is deferred until runner reconnection works in
-  the vertical slice. Initial recovery may mark unverifiable runs failed rather
-  than risk attaching to the wrong process.
+- Zero-downtime handoff between two daemon binaries is deferred. Ordinary
+  restart recovery reconnects to exact stable runners; unverifiable identities
+  fail visibly rather than risk attaching to the wrong process.
+- Durable observer-health state is required before the Munder cutover. Until
+  then a signalled runner wrapper remains assigned and recoverable, but its
+  degraded supervision is visible only in daemon diagnostics.
 - Webhook exposure beyond loopback and its authentication scheme will be chosen
   with the first inbound/outbound messaging slice.
 - Repository visibility is private during early dogfooding; making it public is

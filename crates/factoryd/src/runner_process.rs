@@ -7,6 +7,7 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
+    time::Duration,
 };
 
 use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
@@ -61,6 +62,41 @@ pub enum Error {
     Spawn(std::io::Error),
     #[error("could not write factory-runner startup input: {0}")]
     StartupInput(std::io::Error),
+    #[error("factory-runner did not consume startup input before the deadline")]
+    StartupInputTimedOut,
+}
+
+struct StartupChild {
+    child: Option<Child>,
+}
+
+impl StartupChild {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child.as_mut().expect("startup child is present")
+    }
+
+    async fn kill_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+
+    fn into_child(mut self) -> Child {
+        self.child.take().expect("startup child is present")
+    }
+}
+
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 struct CapturedEnvironment {
@@ -106,14 +142,30 @@ impl CapturedEnvironment {
 /// Returns an error before spawning when task bytes are oversized or either
 /// executable is missing or unusable. A spawn or startup-input write failure is
 /// also returned; a spawned child is explicitly killed and reaped after a write
-/// failure.
-pub async fn spawn_runner(spec: LaunchSpec) -> Result<Child, Error> {
-    spawn_runner_with_environment(spec, CapturedEnvironment::capture()).await
+/// failure or timeout. Cancellation synchronously kills a child that has not
+/// yet received its complete input; the stable runner cannot have launched the
+/// provider at that point.
+pub async fn spawn_runner(spec: LaunchSpec, startup_timeout: Duration) -> Result<Child, Error> {
+    spawn_runner_with_environment_and_timeout(
+        spec,
+        CapturedEnvironment::capture(),
+        Some(startup_timeout),
+    )
+    .await
 }
 
+#[cfg(test)]
 async fn spawn_runner_with_environment(
     spec: LaunchSpec,
     environment: CapturedEnvironment,
+) -> Result<Child, Error> {
+    spawn_runner_with_environment_and_timeout(spec, environment, None).await
+}
+
+async fn spawn_runner_with_environment_and_timeout(
+    spec: LaunchSpec,
+    environment: CapturedEnvironment,
+    startup_timeout: Option<Duration>,
 ) -> Result<Child, Error> {
     if spec.startup_input.len() > MAX_STARTUP_STDIN_BYTES {
         return Err(Error::StartupInputTooLarge {
@@ -148,19 +200,32 @@ async fn spawn_runner_with_environment(
         .stdin(Stdio::piped());
     apply_runner_environment(&mut command, &environment);
 
-    let mut child = command.spawn().map_err(Error::Spawn)?;
+    let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
     let mut stdin = child
+        .child_mut()
         .stdin
         .take()
         .expect("factory-runner was configured with piped stdin");
-    if let Err(error) = stdin.write_all(&spec.startup_input).await {
+    let write_result = match startup_timeout {
+        Some(limit) => {
+            match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
+                Ok(result) => result,
+                Err(_) => {
+                    drop(stdin);
+                    child.kill_and_reap().await;
+                    return Err(Error::StartupInputTimedOut);
+                }
+            }
+        }
+        None => stdin.write_all(&spec.startup_input).await,
+    };
+    if let Err(error) = write_result {
         drop(stdin);
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        child.kill_and_reap().await;
         return Err(Error::StartupInput(error));
     }
     drop(stdin);
-    Ok(child)
+    Ok(child.into_child())
 }
 
 fn apply_runner_environment(command: &mut Command, environment: &CapturedEnvironment) {
@@ -251,11 +316,13 @@ mod tests {
     };
 
     use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+    use rustix::process::{Pid, test_kill_process};
     use tokio::process::Command;
 
     use super::{
         CapturedEnvironment, LaunchSpec, SAFE_ENVIRONMENT_NAMES, apply_runner_environment,
         resolve_executable, spawn_runner_with_environment,
+        spawn_runner_with_environment_and_timeout,
     };
 
     fn id<T>(value: &str) -> T
@@ -583,6 +650,40 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         let message = error.to_string();
         assert!(message.contains("startup input"));
         assert!(!message.contains("write-failure-secret"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_startup_input_kills_the_not_yet_ready_runner() {
+        let directory = tempfile::tempdir().unwrap();
+        executable(
+            &directory.path().join("runner-probe"),
+            "#!/bin/sh\necho $$ > \"$TMPDIR/runner-pid\"\nwhile :; do :; done\n",
+        );
+        executable(
+            &directory.path().join("provider-probe"),
+            "#!/bin/sh\nexit 0\n",
+        );
+        let captured = probe_environment(directory.path(), directory.path());
+        let launch = tokio::spawn(spawn_runner_with_environment_and_timeout(
+            spec(directory.path(), vec![b'x'; MAX_STARTUP_STDIN_BYTES]),
+            captured,
+            None,
+        ));
+        let marker = directory.path().join("runner-pid");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let raw_pid = fs::read_to_string(marker).unwrap().trim().parse().unwrap();
+        let pid = Pid::from_raw(raw_pid).unwrap();
+
+        launch.abort();
+        assert!(launch.await.unwrap_err().is_cancelled());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while test_kill_process(pid).is_ok() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(test_kill_process(pid).is_err());
     }
 
     #[tokio::test]

@@ -891,6 +891,18 @@ fn recovery_survives_reopen_with_only_private_bounded_metadata() {
     assert_eq!(recoverable[0].target.runner_runtime, "/private/runners/run");
     assert_eq!(recoverable[0].target.last_committed_runner_sequence, 2);
     assert_eq!(recoverable[0].terminal_runner_sequence, None);
+    let slim = store.recoverable_executions().unwrap();
+    assert_eq!(slim.len(), 1);
+    assert_eq!(slim[0].run_id, id::<RunId>("run"));
+    assert_eq!(slim[0].provider, Provider::Codex);
+    assert_eq!(
+        slim[0].provider_session_id.as_deref(),
+        Some("private-session-id")
+    );
+    assert!(!slim[0].resumes_provider_session);
+    assert_eq!(slim[0].runner_instance_id, instance);
+    assert_eq!(slim[0].runner_runtime, "/private/runners/run");
+    assert_eq!(slim[0].terminal_runner_sequence, None);
 
     let events = serde_json::to_string(&store.events_after(0, 100).unwrap()).unwrap();
     assert!(!events.contains("private-session-id"));
@@ -940,6 +952,14 @@ fn recovery_survives_reopen_with_only_private_bounded_metadata() {
     assert!(resumed.target.resumes_provider_session);
     assert_eq!(
         resumed.target.provider_session_id.as_deref(),
+        Some("private-session-id")
+    );
+    let slim = store.recoverable_executions().unwrap();
+    assert_eq!(slim.len(), 1);
+    assert_eq!(slim[0].run_id, id::<RunId>("run-two"));
+    assert!(slim[0].resumes_provider_session);
+    assert_eq!(
+        slim[0].provider_session_id.as_deref(),
         Some("private-session-id")
     );
     drop(store);

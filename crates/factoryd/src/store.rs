@@ -97,6 +97,21 @@ pub struct RecoverableRun {
     pub runner_reconciled_at_ms: Option<i64>,
 }
 
+/// Minimal private identity required to resume observing a durable runner.
+///
+/// This deliberately omits task bodies and has no `Debug` or `Clone`
+/// implementation so daemon startup does not copy queued instructions for
+/// every recoverable run.
+pub struct RecoverableExecution {
+    pub run_id: RunId,
+    pub provider: Provider,
+    pub provider_session_id: Option<String>,
+    pub resumes_provider_session: bool,
+    pub runner_instance_id: RunnerInstanceId,
+    pub runner_runtime: String,
+    pub terminal_runner_sequence: Option<i64>,
+}
+
 /// Effects already normalized from exactly one runner event.
 ///
 /// This deliberately has no `Debug` implementation because provider session
@@ -743,6 +758,35 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    pub fn recoverable_executions(&self) -> Result<Vec<RecoverableExecution>> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.id, a.provider, r.provider_session_id,
+                    r.resumes_provider_session, r.runner_instance_id,
+                    r.runner_runtime, r.terminal_runner_sequence
+             FROM runs r
+             JOIN agents a
+               ON a.id = r.agent_id AND a.project_id = r.project_id
+             WHERE r.ended_at_ms IS NULL
+                OR (r.terminal_runner_sequence IS NOT NULL
+                    AND r.runner_reconciled_at_ms IS NULL)
+             ORDER BY r.project_id, r.started_at_ms, r.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let provider: String = row.get(1)?;
+            Ok(RecoverableExecution {
+                run_id: parse_id(row.get(0)?, 0)?,
+                provider: parse_provider(&provider, 1)?,
+                provider_session_id: row.get(2)?,
+                resumes_provider_session: row.get(3)?,
+                runner_instance_id: parse_id(row.get(4)?, 4)?,
+                runner_runtime: row.get(5)?,
+                terminal_runner_sequence: row.get(6)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
     }
 
     pub fn list_projects(

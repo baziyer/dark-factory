@@ -12,5 +12,8 @@ tempfile = "3.27.0"
 thiserror.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+factoryd = { path = "../factoryd" }
+
 [lints]
 workspace = true
