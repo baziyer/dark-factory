@@ -74,6 +74,7 @@ fn reservation(
         project_id: id(project),
         task_id: id(task),
         agent_id: id(agent),
+        expected_provider: Provider::Codex,
         run_id: id(run),
         parent_run_id: parent_run_id.map(id),
         worktree: format!("/work/{project}"),
@@ -81,6 +82,73 @@ fn reservation(
         runner_instance_id: id(&format!("instance-{run}")),
         runner_runtime: format!("/private/runners/{run}"),
     }
+}
+
+#[test]
+fn reservation_requires_the_agents_exact_provider_without_partial_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let mut store = Store::open(&database).unwrap();
+    create_project_and_task(&mut store, "project", "task", 1);
+    store
+        .create_agent(
+            NewAgent {
+                id: id("claude-worker"),
+                project_id: id("project"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::ClaudeCode,
+            },
+            3,
+        )
+        .unwrap();
+    let head = store.latest_event_sequence().unwrap();
+    let input = reservation("project", "task", "claude-worker", "run", None);
+
+    assert!(matches!(
+        store.reserve_task_run(input, 1, 4),
+        Err(StoreError::AgentProviderMismatch)
+    ));
+    assert_eq!(store.latest_event_sequence().unwrap(), head);
+    assert!(matches!(
+        store.execution_target(&id("run")),
+        Err(StoreError::RunNotFound)
+    ));
+    let task = &store.list_tasks(&id("project"), None, 10).unwrap()[0].snapshot;
+    assert_eq!(task.status, TaskStatus::Queued);
+    assert_eq!(task.assigned_agent_id, None);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let current_run: Option<String> = connection
+        .query_row(
+            "SELECT (SELECT id FROM runs
+                     WHERE agent_id = 'claude-worker' AND ended_at_ms IS NULL
+                     LIMIT 1)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let run_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM runs WHERE id = 'run'", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let event_head: i64 = connection
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(current_run, None);
+    assert_eq!(run_count, 0);
+    assert_eq!(event_head, head);
+    drop(connection);
+
+    let mut input = reservation("project", "task", "claude-worker", "run", None);
+    input.expected_provider = Provider::ClaudeCode;
+    let mut store = Store::open(&database).unwrap();
+    let reserved = store.reserve_task_run(input, 1, 5).unwrap();
+    assert_eq!(reserved.target.provider, Provider::ClaudeCode);
 }
 
 fn runner_event(sequence: i64, event: RunnerEvent) -> RunnerEventEnvelope {

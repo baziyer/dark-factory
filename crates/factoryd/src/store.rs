@@ -52,6 +52,7 @@ pub struct RunReservation {
     pub project_id: ProjectId,
     pub task_id: TaskId,
     pub agent_id: AgentId,
+    pub expected_provider: Provider,
     pub run_id: RunId,
     pub parent_run_id: Option<RunId>,
     pub worktree: String,
@@ -173,6 +174,8 @@ pub enum StoreError {
     CapacityReached { limit: usize },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
+    #[error("agent provider does not match the requested execution provider")]
+    AgentProviderMismatch,
     #[error("task is not queued in the requested project")]
     TaskNotQueued,
     #[error("only an idle same-project agent can reserve a task")]
@@ -429,6 +432,9 @@ impl Store {
         let agent_record = load_agent(&transaction, &input.agent_id)?
             .filter(|agent| agent.snapshot.project_id == input.project_id)
             .ok_or(StoreError::AgentNotFound)?;
+        if agent_record.snapshot.provider != input.expected_provider {
+            return Err(StoreError::AgentProviderMismatch);
+        }
         if agent_record.snapshot.current_run_id.is_some() {
             return Err(StoreError::AgentUnavailable);
         }
