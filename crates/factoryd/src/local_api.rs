@@ -456,6 +456,20 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::TaskRetried { task })
         }
+        LocalRequest::AssignTask {
+            project_id,
+            task_id,
+            agent_id,
+        } => {
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) =
+                        store.assign_task(&project_id, &task_id, agent_id.as_ref(), now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskAssigned { task })
+        }
         LocalRequest::GetRunTerminal { project_id, run_id } => {
             let lookup_run_id = run_id.clone();
             let target = state

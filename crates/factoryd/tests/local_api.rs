@@ -1,7 +1,7 @@
 use std::{future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
-    FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
+    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
         RequestEnvelope, ServerFrame,
@@ -24,6 +24,10 @@ fn project_id(value: &str) -> ProjectId {
 
 fn task_id(value: &str) -> TaskId {
     TaskId::try_from(value).unwrap()
+}
+
+fn agent_id(value: &str) -> AgentId {
+    AgentId::try_from(value).unwrap()
 }
 
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
@@ -679,6 +683,99 @@ async fn retry_is_a_local_control_operation_and_does_not_change_queued_tasks() {
                 },
                 ..
             }
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_task_assignment_is_a_local_control_operation() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Queue me".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+
+        let assigned = request(
+            &socket,
+            LocalRequest::AssignTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                agent_id: Some(agent_id("curie")),
+            },
+        )
+        .await;
+        assert!(matches!(
+            assigned,
+            ServerFrame::Response {
+                response: LocalResponse::TaskAssigned { ref task },
+                ..
+            } if task.snapshot.assigned_agent_id == Some(agent_id("curie"))
+        ));
+
+        let unassigned = request(
+            &socket,
+            LocalRequest::AssignTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                agent_id: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            unassigned,
+            ServerFrame::Response {
+                response: LocalResponse::TaskAssigned { ref task },
+                ..
+            } if task.snapshot.assigned_agent_id.is_none()
         ));
     })
     .await;

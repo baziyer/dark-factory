@@ -50,7 +50,10 @@ enum UiMessage {
         result: Result<RunTerminal, String>,
     },
     SubscriptionCaughtUp,
-    Operation(Result<String, String>),
+    Operation {
+        result: Result<String, String>,
+        assignment_task_id: Option<TaskId>,
+    },
     StreamFailed(String),
 }
 
@@ -74,6 +77,7 @@ struct FactoryApp {
     usage: Option<SubscriptionUsageStatus>,
     recent: Vec<EventEnvelope>,
     selected_project: Option<ProjectId>,
+    show_all_queue: bool,
     selected_task: Option<TaskId>,
     selected_agent: Option<AgentId>,
     terminal_run_id: Option<RunId>,
@@ -88,6 +92,7 @@ struct FactoryApp {
     create_agent: Option<AgentForm>,
     create_task: Option<TaskForm>,
     start: StartForm,
+    queue_owner_editor: Option<QueueOwnerEditor>,
 }
 
 #[derive(Clone, Copy)]
@@ -123,6 +128,67 @@ struct StartForm {
     worktree: String,
 }
 
+struct QueueOwnerEditor {
+    task_id: TaskId,
+    value: String,
+    base_value: String,
+    pending_value: Option<String>,
+    conflict: bool,
+}
+
+impl QueueOwnerEditor {
+    fn new(task_id: TaskId, value: String) -> Self {
+        Self {
+            task_id,
+            base_value: value.clone(),
+            value,
+            pending_value: None,
+            conflict: false,
+        }
+    }
+
+    fn mark_pending(&mut self) {
+        self.pending_value = Some(self.value.clone());
+    }
+
+    fn clear_pending(&mut self) {
+        self.pending_value = None;
+    }
+
+    fn sync_from_server(&mut self, value: &str) -> bool {
+        if let Some(pending) = self.pending_value.as_deref() {
+            if pending == value {
+                self.value = value.to_owned();
+                self.base_value = value.to_owned();
+                self.pending_value = None;
+                self.conflict = false;
+                return false;
+            }
+            if self.base_value == value {
+                return false;
+            }
+            self.pending_value = None;
+        }
+        if self.value == value {
+            self.base_value = value.to_owned();
+            self.conflict = false;
+            return false;
+        }
+        if self.value == self.base_value {
+            self.value = value.to_owned();
+            self.base_value = value.to_owned();
+            return false;
+        }
+        if self.base_value != value {
+            self.value = value.to_owned();
+            self.base_value = value.to_owned();
+            self.conflict = true;
+            return true;
+        }
+        false
+    }
+}
+
 impl FactoryApp {
     fn new(context: &eframe::CreationContext<'_>, client: Client) -> Self {
         context.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -140,6 +206,7 @@ impl FactoryApp {
             usage: None,
             recent: Vec::new(),
             selected_project: None,
+            show_all_queue: false,
             selected_task: None,
             selected_agent: None,
             terminal_run_id: None,
@@ -154,6 +221,7 @@ impl FactoryApp {
             create_agent: None,
             create_task: None,
             start: StartForm::default(),
+            queue_owner_editor: None,
         }
     }
 
@@ -238,12 +306,29 @@ impl FactoryApp {
                     Err(message) => self.notice = Some(message),
                 },
                 UiMessage::SubscriptionCaughtUp => self.refresh(context),
-                UiMessage::Operation(result) => match result {
+                UiMessage::Operation {
+                    result,
+                    assignment_task_id,
+                } => match result {
                     Ok(message) => {
                         self.notice = Some(message);
                         self.refresh(context);
                     }
-                    Err(message) => self.notice = Some(message),
+                    Err(message) => {
+                        let editor_task_id = self
+                            .queue_owner_editor
+                            .as_ref()
+                            .map(|editor| &editor.task_id);
+                        if should_clear_queue_owner_pending(
+                            editor_task_id,
+                            assignment_task_id.as_ref(),
+                        ) {
+                            if let Some(editor) = self.queue_owner_editor.as_mut() {
+                                editor.clear_pending();
+                            }
+                        }
+                        self.notice = Some(message);
+                    }
                 },
                 UiMessage::StreamFailed(message) => {
                     self.connection = ConnectionState::Degraded;
@@ -335,12 +420,28 @@ impl FactoryApp {
     }
 
     fn submit(&self, request: LocalRequest, context: &egui::Context) {
+        self.submit_operation(request, context, None);
+    }
+
+    fn submit_assignment(&self, request: LocalRequest, task_id: TaskId, context: &egui::Context) {
+        self.submit_operation(request, context, Some(task_id));
+    }
+
+    fn submit_operation(
+        &self,
+        request: LocalRequest,
+        context: &egui::Context,
+        assignment_task_id: Option<TaskId>,
+    ) {
         let client = self.client.clone();
         let sender = self.sender.clone();
         let context = context.clone();
         thread::spawn(move || {
             let result = request_response(&client, request).and_then(operation_message);
-            let _ = sender.send(UiMessage::Operation(result));
+            let _ = sender.send(UiMessage::Operation {
+                result,
+                assignment_task_id,
+            });
             context.request_repaint();
         });
     }
@@ -369,6 +470,27 @@ impl FactoryApp {
             .values()
             .filter(|task| &task.snapshot.project_id == project)
             .collect()
+    }
+
+    fn sync_queue_owner_editor(&mut self, task: &TaskDetail) {
+        let value = task
+            .snapshot
+            .assigned_agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let conflict = match self.queue_owner_editor.as_mut() {
+            Some(editor) if editor.task_id == task.snapshot.id => editor.sync_from_server(&value),
+            _ => {
+                self.queue_owner_editor =
+                    Some(QueueOwnerEditor::new(task.snapshot.id.clone(), value));
+                false
+            }
+        };
+        if conflict {
+            self.notice =
+                Some("Queue owner changed while you were editing; review and save again.".into());
+        }
     }
 
     fn run_for_agent(&self, agent: &AgentSnapshot) -> Option<&RunSnapshot> {
@@ -483,13 +605,27 @@ impl FactoryApp {
             .show(context, |ui| {
                 ui.heading("Projects");
                 ui.separator();
+                if ui
+                    .selectable_label(self.show_all_queue, "All queue")
+                    .on_hover_text("Scan queued work across every project")
+                    .clicked()
+                {
+                    self.show_all_queue = true;
+                    self.selected_task = None;
+                    self.selected_agent = None;
+                    self.terminal_run_id = None;
+                    self.terminal = None;
+                }
+                ui.separator();
                 for project in self.projects.values() {
-                    let selected = self.selected_project.as_ref() == Some(&project.id);
+                    let selected =
+                        !self.show_all_queue && self.selected_project.as_ref() == Some(&project.id);
                     if ui
                         .selectable_label(selected, project.name.clone())
                         .on_hover_text(format!("{}\n{}", project.id, project.root))
                         .clicked()
                     {
+                        self.show_all_queue = false;
                         self.selected_project = Some(project.id.clone());
                         self.selected_task = None;
                         self.selected_agent = None;
@@ -585,7 +721,91 @@ impl FactoryApp {
                 context,
             );
         }
-        if task.snapshot.status == TaskStatus::Queued {
+        if can_edit_task_assignment(task.snapshot.status) {
+            self.sync_queue_owner_editor(task);
+            ui.separator();
+            ui.label(RichText::new("Queue owner").strong());
+            let agents = self
+                .agents
+                .values()
+                .filter(|agent| agent.project_id == task.snapshot.project_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let selected_owner = self
+                .queue_owner_editor
+                .as_ref()
+                .map_or_else(String::new, |editor| editor.value.clone());
+            let pending = self
+                .queue_owner_editor
+                .as_ref()
+                .is_some_and(|editor| editor.pending_value.is_some());
+            ui.add_enabled_ui(!pending, |ui| {
+                egui::ComboBox::from_id_salt(("task-assignment", task.snapshot.id.clone()))
+                    .selected_text(if selected_owner.is_empty() {
+                        "Operator queue"
+                    } else {
+                        &selected_owner
+                    })
+                    .show_ui(ui, |ui| {
+                        if let Some(editor) = self.queue_owner_editor.as_mut() {
+                            let before = editor.value.clone();
+                            ui.selectable_value(&mut editor.value, String::new(), "Operator queue");
+                            for agent in &agents {
+                                ui.selectable_value(
+                                    &mut editor.value,
+                                    agent.id.to_string(),
+                                    format!("{} · {:?}", agent.id, agent.provider),
+                                );
+                            }
+                            if editor.value != before {
+                                editor.conflict = false;
+                                editor.pending_value = None;
+                            }
+                        }
+                    });
+            });
+            let (owner, dirty, conflict) = self.queue_owner_editor.as_ref().map_or_else(
+                || (String::new(), false, false),
+                |editor| {
+                    (
+                        editor.value.clone(),
+                        editor.value != editor.base_value,
+                        editor.conflict,
+                    )
+                },
+            );
+            if conflict {
+                ui.label(
+                    RichText::new("Changed remotely; choose the owner again before saving.")
+                        .small()
+                        .color(Color32::LIGHT_YELLOW),
+                );
+            }
+            if pending {
+                ui.label(RichText::new("Saving queue owner…").small().weak());
+            }
+            if ui
+                .add_enabled(
+                    dirty && !conflict && !pending,
+                    egui::Button::new("Save queue owner"),
+                )
+                .clicked()
+            {
+                if let Some(editor) = self.queue_owner_editor.as_mut() {
+                    editor.mark_pending();
+                }
+                self.submit_assignment(
+                    LocalRequest::AssignTask {
+                        project_id: task.snapshot.project_id.clone(),
+                        task_id: task.snapshot.id.clone(),
+                        agent_id: (!owner.is_empty()).then(|| {
+                            AgentId::try_from(owner).expect("agent selection comes from a snapshot")
+                        }),
+                    },
+                    task.snapshot.id.clone(),
+                    context,
+                );
+            }
             ui.separator();
             ui.label(RichText::new("Start task").strong());
             let agents = self
@@ -688,6 +908,57 @@ impl FactoryApp {
         }
     }
 
+    fn all_queue_view(&mut self, context: &egui::Context) {
+        egui::CentralPanel::default().show(context, |ui| {
+            let queued = self
+                .tasks
+                .values()
+                .filter(|task| task.snapshot.status == TaskStatus::Queued)
+                .collect::<Vec<_>>();
+            ui.heading("All queue");
+            ui.label(format!(
+                "{} queued across {} projects",
+                queued.len(),
+                self.projects.len()
+            ));
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("all-queue")
+                .show(ui, |ui| {
+                    if queued.is_empty() {
+                        ui.label(RichText::new("No queued work.").italics());
+                    }
+                    for task in queued {
+                        let project_name =
+                            self.projects.get(&task.snapshot.project_id).map_or_else(
+                                || task.snapshot.project_id.to_string(),
+                                |p| p.name.clone(),
+                            );
+                        let selected = self.selected_task.as_ref() == Some(&task.snapshot.id);
+                        if ui
+                            .selectable_label(selected, queue_task_card_text(task, &project_name))
+                            .clicked()
+                        {
+                            self.selected_project = Some(task.snapshot.project_id.clone());
+                            self.selected_task = Some(task.snapshot.id.clone());
+                            self.selected_agent = None;
+                            self.terminal_run_id = None;
+                            self.terminal = None;
+                            self.start.agent_id = task
+                                .snapshot
+                                .assigned_agent_id
+                                .as_ref()
+                                .map_or_else(String::new, ToString::to_string);
+                            self.start.worktree = self
+                                .projects
+                                .get(&task.snapshot.project_id)
+                                .map_or_else(String::new, |project| project.root.clone());
+                        }
+                    }
+                });
+        });
+    }
+
     fn load_terminal(&mut self, context: &egui::Context, run_id: RunId) {
         let Some(project_id) = self.runs.get(&run_id).map(|run| run.project_id.clone()) else {
             self.notice = Some("run is not present in the current snapshot".into());
@@ -707,6 +978,10 @@ impl FactoryApp {
     }
 
     fn factory_view(&mut self, context: &egui::Context) {
+        if self.show_all_queue {
+            self.all_queue_view(context);
+            return;
+        }
         egui::CentralPanel::default().show(context, |ui| {
             let Some(project) = self.project().cloned() else {
                 ui.centered_and_justified(|ui| {
@@ -807,32 +1082,38 @@ impl FactoryApp {
                 {
                     columns[index].label(RichText::new(title).strong());
                     columns[index].separator();
-                    for task in tasks
-                        .iter()
-                        .filter(|task| status.matches(task.snapshot.status))
-                    {
-                        let selected = self.selected_task.as_ref() == Some(&task.snapshot.id);
-                        if columns[index]
-                            .selectable_label(selected, task_card_text(task))
-                            .clicked()
-                        {
-                            let run_id = self.run_for_task(task).map(|run| run.id.clone());
-                            self.selected_task = Some(task.snapshot.id.clone());
-                            self.selected_agent = None;
-                            if let Some(run_id) = run_id {
-                                self.load_terminal(context, run_id);
-                            } else {
-                                self.terminal_run_id = None;
-                                self.terminal = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("task-column", index))
+                        .auto_shrink([false, false])
+                        .show(&mut columns[index], |ui| {
+                            for task in tasks
+                                .iter()
+                                .filter(|task| status.matches(task.snapshot.status))
+                            {
+                                let selected =
+                                    self.selected_task.as_ref() == Some(&task.snapshot.id);
+                                if ui
+                                    .selectable_label(selected, task_card_text(task))
+                                    .clicked()
+                                {
+                                    let run_id = self.run_for_task(task).map(|run| run.id.clone());
+                                    self.selected_task = Some(task.snapshot.id.clone());
+                                    self.selected_agent = None;
+                                    if let Some(run_id) = run_id {
+                                        self.load_terminal(context, run_id);
+                                    } else {
+                                        self.terminal_run_id = None;
+                                        self.terminal = None;
+                                    }
+                                    self.start.agent_id = task
+                                        .snapshot
+                                        .assigned_agent_id
+                                        .as_ref()
+                                        .map_or_else(String::new, ToString::to_string);
+                                    self.start.worktree = project.root.clone();
+                                }
                             }
-                            self.start.agent_id = task
-                                .snapshot
-                                .assigned_agent_id
-                                .as_ref()
-                                .map_or_else(String::new, ToString::to_string);
-                            self.start.worktree = project.root.clone();
-                        }
-                    }
+                        });
                 }
             });
         });
@@ -1032,6 +1313,17 @@ fn task_result_text(task: &TaskDetail) -> Option<&str> {
     task.result.as_deref()
 }
 
+fn can_edit_task_assignment(status: TaskStatus) -> bool {
+    status == TaskStatus::Queued
+}
+
+fn should_clear_queue_owner_pending(
+    editor_task_id: Option<&TaskId>,
+    assignment_task_id: Option<&TaskId>,
+) -> bool {
+    matches!((editor_task_id, assignment_task_id), (Some(editor), Some(operation)) if editor == operation)
+}
+
 fn task_assignee_text(task: &TaskDetail) -> String {
     task.snapshot.assigned_agent_id.as_ref().map_or_else(
         || "unassigned".into(),
@@ -1041,6 +1333,15 @@ fn task_assignee_text(task: &TaskDetail) -> String {
 
 fn task_card_text(task: &TaskDetail) -> String {
     format!("{}\n{}", task.snapshot.title, task_assignee_text(task))
+}
+
+fn queue_task_card_text(task: &TaskDetail, project_name: &str) -> String {
+    format!(
+        "{} · {}\n{}",
+        project_name,
+        task.snapshot.title,
+        task_assignee_text(task)
+    )
 }
 
 fn latest_run_for_task<'a>(
@@ -1486,6 +1787,9 @@ fn operation_message(response: LocalResponse) -> Result<String, String> {
         LocalResponse::ProjectCreated { project } => format!("Created project {}", project.id),
         LocalResponse::TaskCreated { task } => format!("Created task {}", task.snapshot.id),
         LocalResponse::TaskRetried { task } => format!("Requeued task {}", task.snapshot.id),
+        LocalResponse::TaskAssigned { task } => {
+            format!("Updated queue owner for task {}", task.snapshot.id)
+        }
         LocalResponse::AgentCreated { agent } => format!("Created agent {}", agent.id),
         LocalResponse::RunAccepted { run_id } => format!("Accepted run {run_id}"),
         LocalResponse::RunStopped { run_id } => format!("Stop requested for run {run_id}"),
@@ -1743,6 +2047,92 @@ mod tests {
         assert_eq!(allocation_counts(&tasks, None), (1, 0, 0, 0));
         assert_eq!(task_assignee_text(&tasks[0]), "assigned to curie");
         assert_eq!(task_assignee_text(&tasks[2]), "unassigned");
+    }
+
+    #[test]
+    fn only_queued_tasks_can_change_assignment() {
+        assert!(super::can_edit_task_assignment(TaskStatus::Queued));
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Blocked,
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            assert!(!super::can_edit_task_assignment(status));
+        }
+    }
+
+    #[test]
+    fn all_queue_cards_include_project_context_without_ids() {
+        let task = TaskDetail {
+            snapshot: TaskSnapshot {
+                id: factory_core::TaskId::try_from("task-1").unwrap(),
+                project_id: ProjectId::try_from("factory").unwrap(),
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
+                title: "Review the queue".into(),
+                status: TaskStatus::Queued,
+                priority: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            body: String::new(),
+            result: None,
+        };
+        let card = super::queue_task_card_text(&task, "Factory");
+        assert!(card.contains("Factory"));
+        assert!(card.contains("Review the queue"));
+        assert!(card.contains("curie"));
+        assert!(!card.contains("task-1"));
+    }
+
+    #[test]
+    fn queue_owner_editor_rejects_a_stale_live_reassignment() {
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let mut editor = super::QueueOwnerEditor::new(task_id, "curie".into());
+        editor.value = "turing".into();
+
+        assert!(editor.sync_from_server("other"));
+        assert_eq!(editor.value, "other");
+        assert_eq!(editor.base_value, "other");
+        assert!(editor.conflict);
+    }
+
+    #[test]
+    fn queue_owner_editor_accepts_its_pending_server_acknowledgement() {
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let mut editor = super::QueueOwnerEditor::new(task_id, "curie".into());
+        editor.value = "turing".into();
+        editor.mark_pending();
+
+        assert!(!editor.sync_from_server("curie"));
+        assert!(editor.pending_value.is_some());
+        assert!(!editor.sync_from_server("turing"));
+        assert_eq!(editor.base_value, "turing");
+        assert!(!editor.conflict);
+        assert!(editor.pending_value.is_none());
+
+        editor.value = "other".into();
+        editor.mark_pending();
+        editor.clear_pending();
+        assert!(editor.pending_value.is_none());
+    }
+
+    #[test]
+    fn only_the_matching_task_can_clear_a_queue_owner_pending_request() {
+        let first = factory_core::TaskId::try_from("task-1").unwrap();
+        let second = factory_core::TaskId::try_from("task-2").unwrap();
+        assert!(super::should_clear_queue_owner_pending(
+            Some(&first),
+            Some(&first)
+        ));
+        assert!(!super::should_clear_queue_owner_pending(
+            Some(&first),
+            Some(&second)
+        ));
+        assert!(!super::should_clear_queue_owner_pending(Some(&first), None));
     }
 
     #[test]

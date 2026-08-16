@@ -20,7 +20,7 @@ Commands:
   ui                                  Open the native control plane
   health                              Check the daemon
   project add|list                    Manage projects
-  task add|list|start|retry           Manage and run tasks
+  task add|list|start|assign|retry    Manage and run tasks
   agent add|list                      Manage agents
   run list                            List process attempts
   events [--follow]                   Read durable events
@@ -72,6 +72,11 @@ enum CliCommand {
     TaskRetry {
         project_id: String,
         task_id: String,
+    },
+    TaskAssign {
+        project_id: String,
+        task_id: String,
+        agent_id: Option<String>,
     },
     AgentAdd {
         id: Option<String>,
@@ -285,6 +290,17 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 task_id,
             })
         }
+        "assign" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            let agent_id = take_option(&mut args, "--agent")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskAssign {
+                project_id,
+                task_id,
+                agent_id,
+            })
+        }
         _ => Err(format!("unknown task action {action:?}")),
     }
 }
@@ -439,6 +455,15 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         } => Ok(LocalRequest::RetryTask {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
+        }),
+        CliCommand::TaskAssign {
+            project_id,
+            task_id,
+            agent_id,
+        } => Ok(LocalRequest::AssignTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+            agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
         }),
         CliCommand::AgentAdd {
             id,
@@ -711,6 +736,27 @@ mod tests {
                 }
             )
         );
+        assert_eq!(
+            parse_args(args(&[
+                "task",
+                "assign",
+                "--project",
+                "project-1",
+                "--task",
+                "task-1",
+                "--agent",
+                "curie",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::TaskAssign {
+                    project_id: "project-1".into(),
+                    task_id: "task-1".into(),
+                    agent_id: Some("curie".into()),
+                }
+            )
+        );
     }
 
     #[test]
@@ -807,6 +853,47 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(request, LocalRequest::StartTask { .. }));
+    }
+
+    #[test]
+    fn task_assignment_command_maps_agent_and_operator_queue() {
+        let (_, assigned) = parse_args(args(&[
+            "task",
+            "assign",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+            "--agent",
+            "curie",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(assigned).unwrap(),
+            LocalRequest::AssignTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+                agent_id: Some("curie".try_into().unwrap()),
+            }
+        );
+
+        let (_, unassigned) = parse_args(args(&[
+            "task",
+            "assign",
+            "--project",
+            "project-1",
+            "--task",
+            "task-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(unassigned).unwrap(),
+            LocalRequest::AssignTask {
+                project_id: "project-1".try_into().unwrap(),
+                task_id: "task-1".try_into().unwrap(),
+                agent_id: None,
+            }
+        );
     }
 
     #[test]

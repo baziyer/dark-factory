@@ -367,6 +367,64 @@ fn retry_task_has_a_small_versioned_local_shape() {
 }
 
 #[test]
+fn assign_task_has_a_small_versioned_local_shape() {
+    let request = LocalRequest::AssignTask {
+        project_id: project_id("factory"),
+        task_id: task_id("task-1"),
+        agent_id: Some(agent_id("curie")),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        serde_json::json!({
+            "type": "assign_task",
+            "data": {
+                "project_id": "factory",
+                "task_id": "task-1",
+                "agent_id": "curie"
+            }
+        })
+    );
+
+    let unassign = LocalRequest::AssignTask {
+        project_id: project_id("factory"),
+        task_id: task_id("task-1"),
+        agent_id: None,
+    };
+    assert_eq!(
+        serde_json::to_value(unassign).unwrap(),
+        serde_json::json!({
+            "type": "assign_task",
+            "data": {"project_id": "factory", "task_id": "task-1"}
+        })
+    );
+
+    let response = LocalResponse::TaskAssigned {
+        task: TaskDetail {
+            snapshot: TaskSnapshot {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: Some(agent_id("curie")),
+                title: "Assign me".into(),
+                status: TaskStatus::Queued,
+                priority: 0,
+                created_at_ms: 1,
+                updated_at_ms: 2,
+            },
+            body: "body".into(),
+            result: None,
+        },
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "task_assigned");
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(value).unwrap(),
+        response
+    );
+}
+
+#[test]
 fn the_largest_valid_task_page_fits_one_local_frame() {
     let tasks = (0..10)
         .map(|index| TaskDetail {

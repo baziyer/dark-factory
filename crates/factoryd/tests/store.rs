@@ -332,3 +332,93 @@ fn failed_tasks_can_be_requeued_without_losing_assignment_or_history() {
     );
     assert_eq!(snapshot.tasks[0].started_at_ms, None);
 }
+
+#[test]
+fn queued_tasks_can_be_assigned_unassigned_and_reopened() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let mut store = Store::open(&database).unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    for id in ["curie", "turing"] {
+        store
+            .create_agent(
+                NewAgent {
+                    id: AgentId::try_from(id).unwrap(),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+    }
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Queue me".into(),
+                body: "body".into(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+
+    let (assigned, assigned_event) = store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&AgentId::try_from("curie").unwrap()),
+            4,
+        )
+        .unwrap();
+    assert_eq!(
+        assigned.snapshot.assigned_agent_id,
+        Some(AgentId::try_from("curie").unwrap())
+    );
+    assert!(matches!(
+        assigned_event.event,
+        factory_core::FactoryEvent::TaskChanged { .. }
+    ));
+
+    let (reassigned, _) = store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&AgentId::try_from("turing").unwrap()),
+            5,
+        )
+        .unwrap();
+    assert_eq!(
+        reassigned.snapshot.assigned_agent_id,
+        Some(AgentId::try_from("turing").unwrap())
+    );
+
+    let (unassigned, _) = store
+        .assign_task(&project_id("factory"), &task_id("task-1"), None, 6)
+        .unwrap();
+    assert_eq!(unassigned.snapshot.assigned_agent_id, None);
+    drop(store);
+
+    let reopened = Store::open(&database).unwrap();
+    assert_eq!(
+        reopened
+            .get_task(&project_id("factory"), &task_id("task-1"))
+            .unwrap()
+            .snapshot
+            .assigned_agent_id,
+        None
+    );
+}
