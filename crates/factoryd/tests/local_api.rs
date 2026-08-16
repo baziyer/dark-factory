@@ -71,7 +71,7 @@ where
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
@@ -91,10 +91,13 @@ where
     execution_join.await.unwrap().unwrap();
 }
 
-fn execution_config(directory: &Path) -> execution::Config {
+fn execution_config(directory: &Path, socket: &Path) -> execution::Config {
     execution::Config {
+        runner_program: directory.join("factory-runner"),
+        factoryctl_path: directory.join("factoryctl"),
         runtime_root: directory.join("runs"),
         guidance_root: directory.to_path_buf(),
+        socket_path: socket.to_path_buf(),
         max_active_runs: 1,
     }
 }
@@ -404,7 +407,7 @@ async fn shutdown_closes_idle_connections_before_returning() {
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
@@ -448,7 +451,7 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
     }
     let state = ApiState::new(store);
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,

@@ -1177,6 +1177,77 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
+    /// The most recent provider session/thread identity this agent's prior
+    /// sessions confirmed, if any -- live or historical, most recent first.
+    /// A fresh session spawn passes this to `SpawnContext::resume` (when the
+    /// provider's `Capabilities::resume` allows it) instead of storing a
+    /// separate `resumes_provider_session` bit: TRACK5-DESIGN.md §1 --
+    /// "the daemon simply checks 'does this agent have a prior sessions row
+    /// with a non-null provider_session_id'".
+    pub fn last_provider_session_id(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<Option<String>> {
+        self.connection
+            .query_row(
+                "SELECT provider_session_id FROM sessions
+                 WHERE project_id = ?1 AND agent_id = ?2 AND provider_session_id IS NOT NULL
+                 ORDER BY started_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![project_id.as_str(), agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Marks a live session `waiting_for_input` outside the hook state
+    /// machine: the dispatcher's own synthetic transition for "typed
+    /// delivery went unacknowledged twice" (TRACK5-DESIGN.md §3/A3), as
+    /// opposed to [`Store::record_hook_event`]'s `Notification` arm, which
+    /// is the same state reached from a real hook.
+    pub fn mark_session_waiting(
+        &mut self,
+        session_id: &SessionId,
+        wait_reason: String,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        if wait_reason.is_empty() || wait_reason.len() > MAX_WAIT_REASON_BYTES {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        transaction.execute(
+            "UPDATE sessions
+             SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
+                 wait_reason = ?2
+             WHERE id = ?3",
+            params![now_ms, wait_reason, session_id.as_str()],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let event = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
     /// Every session the daemon must reconnect to after a restart.
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(

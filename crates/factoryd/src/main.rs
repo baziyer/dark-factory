@@ -16,6 +16,7 @@ struct Config {
     database: PathBuf,
     socket: PathBuf,
     runner: PathBuf,
+    factoryctl: PathBuf,
     codex: PathBuf,
     claude: PathBuf,
     runtime_root: PathBuf,
@@ -61,8 +62,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
+            runner_program: config.runner,
+            factoryctl_path: config.factoryctl,
             runtime_root: config.runtime_root,
             guidance_root: config.guidance_root,
+            socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
         },
         state.clone(),
@@ -212,10 +216,11 @@ async fn stop_execution(
 fn parse_config() -> Result<Config, Box<dyn Error>> {
     let home = factory_home()?;
     let current_executable = env::current_exe()?;
-    let runner = current_executable
+    let sibling_dir = current_executable
         .parent()
-        .ok_or("factoryd executable has no parent directory")?
-        .join("factory-runner");
+        .ok_or("factoryd executable has no parent directory")?;
+    let runner = sibling_dir.join("factory-runner");
+    let factoryctl = sibling_dir.join("factoryctl");
     let default_webhook_config = home.join("webhooks.json");
     let config = Config {
         database: home.join("factory.db"),
@@ -223,6 +228,7 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("f.sock")),
         runner,
+        factoryctl,
         codex: PathBuf::from("codex"),
         claude: PathBuf::from("claude"),
         runtime_root: home.join("runs"),
@@ -265,6 +271,9 @@ fn parse_arguments(
             Some("--runner") => {
                 config.runner = next_path(&mut arguments, "--runner")?;
             }
+            Some("--factoryctl") => {
+                config.factoryctl = next_path(&mut arguments, "--factoryctl")?;
+            }
             Some("--codex") => {
                 config.codex = next_path(&mut arguments, "--codex")?;
             }
@@ -292,7 +301,7 @@ fn parse_arguments(
             }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--codex PATH] [--claude PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--codex PATH] [--claude PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
                 );
                 std::process::exit(0);
             }
@@ -328,6 +337,7 @@ mod tests {
             database: PathBuf::from("/state/factory.db"),
             socket: PathBuf::from("/state/f.sock"),
             runner: PathBuf::from("/bin/factory-runner"),
+            factoryctl: PathBuf::from("/bin/factoryctl"),
             codex: PathBuf::from("codex"),
             claude: PathBuf::from("claude"),
             runtime_root: PathBuf::from("/state/runs"),
@@ -352,6 +362,8 @@ mod tests {
             args(&[
                 "--runner",
                 "/opt/dark-factory/factory-runner",
+                "--factoryctl",
+                "/opt/dark-factory/factoryctl",
                 "--codex",
                 "/opt/codex",
                 "--claude",
@@ -366,6 +378,10 @@ mod tests {
         assert_eq!(
             parsed.runner,
             PathBuf::from("/opt/dark-factory/factory-runner")
+        );
+        assert_eq!(
+            parsed.factoryctl,
+            PathBuf::from("/opt/dark-factory/factoryctl")
         );
         assert_eq!(parsed.codex, PathBuf::from("/opt/codex"));
         assert_eq!(parsed.claude, PathBuf::from("/opt/claude"));

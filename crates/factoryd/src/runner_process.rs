@@ -450,7 +450,7 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        CapturedEnvironment, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
+        CapturedEnvironment, Error, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
         apply_runner_environment, is_owned_directory, resolve_executable,
         spawn_runner_with_environment, spawn_runner_with_environment_and_timeout,
     };
@@ -670,6 +670,54 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             assert!(!message.contains("PRIVATE_"));
             assert!(!directory.path().join("runner-argv").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn session_environment_is_applied_on_top_of_the_safe_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.session_environment = vec![
+            ("DARK_FACTORY_AGENT".to_owned(), "curie".to_owned()),
+            (
+                "DARK_FACTORY_SESSION_TOKEN_FILE".to_owned(),
+                "/private/runs/session-1/hook.token".to_owned(),
+            ),
+        ];
+
+        let mut child = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let provider_env = fs::read_to_string(directory.path().join("provider-env")).unwrap();
+        assert!(
+            provider_env
+                .lines()
+                .any(|line| line == "DARK_FACTORY_AGENT=curie")
+        );
+        assert!(provider_env.lines().any(|line| {
+            line == "DARK_FACTORY_SESSION_TOKEN_FILE=/private/runs/session-1/hook.token"
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_environment_rejects_a_name_outside_the_fixed_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.session_environment = vec![("PATH".to_owned(), "/evil/bin".to_owned())];
+
+        let error = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidSessionEnvironment { name } if name == "PATH"
+        ));
+        assert!(!directory.path().join("runner-argv").exists());
     }
 
     #[test]

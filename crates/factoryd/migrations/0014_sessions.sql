@@ -83,8 +83,20 @@ CREATE TABLE sessions (
 CREATE UNIQUE INDEX sessions_one_live_per_agent
     ON sessions(agent_id) WHERE ended_at_ms IS NULL;
 
+-- Live-only: a provider session/thread identity can be resumed into more
+-- than one *historical* `sessions` row over an agent's lifetime (each
+-- `--resume <uuid>` launch after a stop is a fresh row carrying the same
+-- provider_session_id forward) -- only two *simultaneously live* sessions
+-- claiming the same identity would be a bug. Scoping this index to
+-- `ended_at_ms IS NULL` (like `sessions_one_live_per_agent` above) is a 5C
+-- amendment in place: as originally written (no such scope) the second-ever
+-- resume of the same Claude conversation would violate this constraint
+-- against the first (already-ended) session that also carried it, making
+-- --resume permanently unusable after one stop/restart cycle. Safe to amend
+-- in place for the same reason as the 'shell' CHECK above.
 CREATE UNIQUE INDEX sessions_one_owner_per_provider_session
-    ON sessions(provider, provider_session_id) WHERE provider_session_id IS NOT NULL;
+    ON sessions(provider, provider_session_id)
+    WHERE provider_session_id IS NOT NULL AND ended_at_ms IS NULL;
 
 CREATE INDEX sessions_by_project_agent ON sessions(project_id, agent_id, id);
 

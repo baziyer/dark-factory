@@ -11,7 +11,6 @@ use std::{
 
 use factory_core::{
     AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId, SessionId,
-    SessionSnapshot,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
@@ -191,8 +190,18 @@ impl From<execution::Error> for ApiFailure {
     fn from(error: execution::Error) -> Self {
         match error {
             execution::Error::NoLiveSession => Self::Conflict(
-                "agent has no live session yet; session spawning lands in a later track".into(),
+                "agent has no live session yet; it will be spawned once it has queued work, or \
+                 try again shortly"
+                    .into(),
             ),
+            execution::Error::SessionBusy => Self::Conflict(
+                "agent's live session is not idle; the task stays queued and will \
+                                 be delivered once it is"
+                    .into(),
+            ),
+            execution::Error::NoWorktree => {
+                Self::Invalid("agent has no worktree; create one first".into())
+            }
             execution::Error::State(DaemonStateError::Store(
                 error @ (StoreError::AgentNotFound
                 | StoreError::TaskNotQueued
@@ -763,6 +772,8 @@ async fn handle_request(
                     "agent message must be at most {MAX_AGENT_MESSAGE_BYTES} bytes"
                 )));
             }
+            let wake_project_id = project_id.clone();
+            let wake_agent_id = recipient_agent_id.clone();
             let message = state
                 .commit_and_publish(move |store| {
                     let message = store.send_agent_message(NewAgentMessage {
@@ -776,6 +787,7 @@ async fn handle_request(
                     Ok((message, Vec::new()))
                 })
                 .await?;
+            execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentMessageSent {
                 message: local_agent_message(message),
             })
@@ -869,12 +881,16 @@ async fn handle_request(
             project_id,
             task_id,
         } => {
+            let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) = store.retry_task(&project_id, &task_id, now_ms()?)?;
                     Ok((task, vec![event]))
                 })
                 .await?;
+            if let Some(agent_id) = task.snapshot.assigned_agent_id.clone() {
+                execution.wake(wake_project_id, agent_id);
+            }
             Ok(LocalResponse::TaskRetried { task })
         }
         LocalRequest::CancelTask {
@@ -972,6 +988,7 @@ async fn handle_request(
             task_id,
             agent_id,
         } => {
+            let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) =
@@ -979,6 +996,9 @@ async fn handle_request(
                     Ok((task, vec![event]))
                 })
                 .await?;
+            if let Some(agent_id) = task.snapshot.assigned_agent_id.clone() {
+                execution.wake(wake_project_id, agent_id);
+            }
             Ok(LocalResponse::TaskAssigned { task })
         }
         LocalRequest::GetRunTerminal { project_id, run_id } => {
@@ -1092,12 +1112,15 @@ async fn handle_request(
             project_id,
             agent_id,
         } => {
+            let wake_project_id = project_id.clone();
+            let wake_agent_id = agent_id.clone();
             let agent = state
                 .commit_and_publish(move |store| {
                     let (agent, event) = store.resume_agent(&project_id, &agent_id, now_ms()?)?;
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentResumed { agent })
         }
         LocalRequest::ListSessions {
@@ -1170,6 +1193,8 @@ async fn handle_request(
                 .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
                 .await?
                 .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
+            let project_id = session.project_id.clone();
+            let agent_id = session.agent_id.clone();
             let session_id = session.id;
             let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
             let record_session_id = session_id.clone();
@@ -1190,12 +1215,24 @@ async fn handle_request(
                 event,
                 ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
             ) {
-                state
-                    .with_store(move |store| Ok(stop_hook_reply(store, &updated_session)))
+                let stop_hook_active = payload
+                    .get("stop_hook_active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                execution::stop_hook_reply(state, guidance_root, &updated_session, stop_hook_active)
                     .await?
             } else {
                 serde_json::json!({})
             };
+            if event == ProviderHookEvent::SessionStart {
+                // Proof the CLI is up: an agent's very first delivery is
+                // PTY-typed (idle-session path), which needs this hook to
+                // have fired at least once before typing anything
+                // (TRACK5-DESIGN.md §3); anything queued before the session
+                // finished booting is picked up here rather than waiting
+                // for the 5 second safety tick.
+                execution.wake(project_id, agent_id);
+            }
             Ok(LocalResponse::ProviderHookReply { reply })
         }
         LocalRequest::AttachTerminal { .. } => {
@@ -1535,15 +1572,6 @@ fn bounded_hook_field(value: &str) -> String {
         end -= 1;
     }
     value[..end].to_owned()
-}
-
-/// 5C: deliver next work here. Once a session's `Stop`/`SubagentStop` hook
-/// reports durable state (an open run not yet delivered, or undelivered
-/// `agent_messages`), reply `{"decision":"block","reason":"<composed
-/// text>"}` to keep the CLI turning instead of going idle (TRACK5-DESIGN.md
-/// section 3). For now every reply is `{}`.
-fn stop_hook_reply(_store: &crate::store::Store, _session: &SessionSnapshot) -> serde_json::Value {
-    serde_json::json!({})
 }
 
 fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {
