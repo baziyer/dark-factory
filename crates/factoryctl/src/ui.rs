@@ -118,6 +118,9 @@ struct FactoryApp {
 
 struct AgentProfileDraft {
     model: String,
+    /// Not editable from this retired UI; carried through unchanged so
+    /// saving the profile does not clobber it back to the provider default.
+    permission_mode: String,
     instructions: String,
     memory: String,
 }
@@ -1139,6 +1142,8 @@ impl FactoryApp {
             .clicked()
         {
             let model = (!draft.model.trim().is_empty()).then(|| draft.model.trim().to_owned());
+            let permission_mode = (!draft.permission_mode.trim().is_empty())
+                .then(|| draft.permission_mode.trim().to_owned());
             self.agent_profile_pending = Some(agent.id.clone());
             spawn_agent_profile_update(
                 self.client.clone(),
@@ -1148,6 +1153,7 @@ impl FactoryApp {
                     project_id: agent.project_id.clone(),
                     agent_id: agent.id.clone(),
                     model,
+                    permission_mode,
                     instructions: draft.instructions.clone(),
                     memory: draft.memory.clone(),
                 },
@@ -1977,6 +1983,7 @@ fn load_task_detail(
 fn agent_profile_draft(detail: &AgentDetail) -> AgentProfileDraft {
     AgentProfileDraft {
         model: detail.profile.model.clone().unwrap_or_default(),
+        permission_mode: detail.profile.permission_mode.clone().unwrap_or_default(),
         instructions: detail.profile.instructions.clone(),
         memory: detail.profile.memory.clone(),
     }

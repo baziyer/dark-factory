@@ -21,10 +21,11 @@ Commands:
   ui                                          Open the native control plane
   health                                      Check the daemon
   usage                                       Probe Codex subscription usage on demand
-  project add|list|delete                     Manage projects
+  project add|list|delete|get|guidance        Manage projects and their guidance file
   task add|list|get|start|retry|assign|cancel|update|delete
                                                Manage and run tasks
-  agent add|list|delete|message|inbox         Manage agents and their durable messages
+  agent add|list|delete|get|profile|message|inbox
+                                               Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
   events [--follow]                           Read durable events
 
@@ -56,7 +57,8 @@ Options:
   --follow                   Stream events as they occur
   -h, --help                  Show this help";
 
-const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete> [options]
+const PROJECT_HELP: &str =
+    "usage: factoryctl project <add|list|delete|get|guidance> [options]
 
 Manage projects.
 
@@ -64,6 +66,8 @@ Actions:
   add       Create a new project
   list      List projects
   delete    Delete a project that has no non-terminal run
+  get       Fetch one project, including its guidance file path
+  guidance  Manage a project's standing guidance file
 
 Run `factoryctl project <action> --help` for action-specific options.";
 const PROJECT_ADD_HELP: &str = "usage: factoryctl project add --name TEXT --root PATH [options]
@@ -95,6 +99,28 @@ Required:
 
 Options:
   -h, --help              Show this help";
+const PROJECT_GET_HELP: &str = "usage: factoryctl project get --project ID
+
+Fetch one project, including the absolute path of its `PROJECT.md`
+guidance file and the file's current contents.
+
+Required:
+  --project ID           Project to fetch
+
+Options:
+  -h, --help              Show this help";
+const PROJECT_GUIDANCE_HELP: &str =
+    "usage: factoryctl project guidance set --project ID --file PATH
+
+Replace a project's `PROJECT.md` guidance file with the contents of a local
+file. Written atomically (bounded, temp file plus rename).
+
+Required:
+  --project ID           Project to update
+  --file PATH             Local file to read the new guidance text from
+
+Options:
+  -h, --help                Show this help";
 
 const TASK_HELP: &str =
     "usage: factoryctl task <add|list|get|start|retry|assign|cancel|update|delete> [options]
@@ -223,7 +249,8 @@ Required:
 Options:
   -h, --help              Show this help";
 
-const AGENT_HELP: &str = "usage: factoryctl agent <add|list|delete|message|inbox> [options]
+const AGENT_HELP: &str =
+    "usage: factoryctl agent <add|list|delete|get|profile|message|inbox> [options]
 
 Manage agents within a project and their durable messages.
 
@@ -231,6 +258,8 @@ Actions:
   add       Create a new agent
   list      List agents in a project
   delete    Delete an agent that has no open run
+  get       Fetch one agent, including its guidance file paths
+  profile   Manage an agent's model, permission mode, and guidance files
   message   Send a durable message from one agent to another
   inbox     List an agent's durable messages
 
@@ -275,6 +304,35 @@ Required:
 
 Options:
   -h, --help              Show this help";
+const AGENT_GET_HELP: &str = "usage: factoryctl agent get --project ID --agent ID
+
+Fetch one agent, including the absolute paths of its `instructions.md` and
+`memory.md` guidance files and their current contents.
+
+Required:
+  --project ID           Project the agent belongs to
+  --agent ID             Agent to fetch
+
+Options:
+  -h, --help              Show this help";
+const AGENT_PROFILE_HELP: &str =
+    "usage: factoryctl agent profile set --project ID --agent ID [options]
+
+Update an agent's model, permission mode, and/or guidance files. Any flag
+left unset carries the currently stored value forward unchanged, so this
+cannot silently clear standing instructions or memory it was not asked to
+change.
+
+Required:
+  --project ID                    Project the agent belongs to
+  --agent ID                      Agent to update
+
+Options:
+  --model MODEL                     Provider model identifier
+  --permission-mode MODE            Provider permission mode
+  --instructions-file PATH          Local file to read new instructions.md contents from
+  --memory-file PATH                Local file to read new memory.md contents from
+  -h, --help                          Show this help";
 const AGENT_MESSAGE_HELP: &str =
     "usage: factoryctl agent message --project ID --to AGENT_ID --body TEXT [options]
 
@@ -361,6 +419,13 @@ enum CliCommand {
     ProjectDelete {
         project_id: String,
     },
+    ProjectGet {
+        project_id: String,
+    },
+    ProjectGuidanceSet {
+        project_id: String,
+        file: String,
+    },
     TaskAdd {
         id: Option<String>,
         project_id: String,
@@ -420,6 +485,18 @@ enum CliCommand {
         project_id: String,
         after_id: Option<String>,
         limit: u32,
+    },
+    AgentGet {
+        project_id: String,
+        agent_id: String,
+    },
+    AgentProfileSet {
+        project_id: String,
+        agent_id: String,
+        model: Option<String>,
+        permission_mode: Option<String>,
+        instructions_file: Option<String>,
+        memory_file: Option<String>,
     },
     AgentMessage {
         id: Option<String>,
@@ -512,11 +589,86 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    if let CliCommand::AgentProfileSet {
+        project_id,
+        agent_id,
+        model,
+        permission_mode,
+        instructions_file,
+        memory_file,
+    } = command
+    {
+        let frame = agent_profile_set_frame(
+            &client,
+            project_id,
+            agent_id,
+            model,
+            permission_mode,
+            instructions_file,
+            memory_file,
+        )?;
+        write_frame(&mut output, &frame)?;
+        return Ok(if is_error(&frame) { 2 } else { 0 });
+    }
+
     let frame = client
         .request(request_for(command)?)
         .map_err(|error| error.to_string())?;
     write_frame(&mut output, &frame)?;
     Ok(if is_error(&frame) { 2 } else { 0 })
+}
+
+/// Applies `--model`/`--permission-mode`/`--instructions-file`/
+/// `--memory-file` as a patch over the agent's current profile: any flag
+/// left unset carries the currently stored value forward unchanged, so
+/// `agent profile set` cannot silently clear standing guidance or memory it
+/// was not asked to change.
+fn agent_profile_set_frame(
+    client: &Client,
+    project_id: String,
+    agent_id: String,
+    model: Option<String>,
+    permission_mode: Option<String>,
+    instructions_file: Option<String>,
+    memory_file: Option<String>,
+) -> Result<ServerFrame, String> {
+    let project_id: factory_core::ProjectId = parse_id(project_id, "project")?;
+    let agent_id: factory_core::AgentId = parse_id(agent_id, "agent")?;
+    let current = client
+        .request(LocalRequest::GetAgent {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+        })
+        .map_err(|error| error.to_string())?;
+    let ServerFrame::Response {
+        response: LocalResponse::Agent { agent },
+        ..
+    } = current
+    else {
+        return Ok(current);
+    };
+    let instructions = match instructions_file {
+        Some(path) => read_guidance_file(&path)?,
+        None => agent.profile.instructions,
+    };
+    let memory = match memory_file {
+        Some(path) => read_guidance_file(&path)?,
+        None => agent.profile.memory,
+    };
+    client
+        .request(LocalRequest::UpdateAgentProfile {
+            project_id,
+            agent_id,
+            model: model.or(agent.profile.model),
+            permission_mode: permission_mode.or(agent.profile.permission_mode),
+            instructions,
+            memory,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn read_guidance_file(path: &str) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|error| format!("cannot read {path}: {error}"))
 }
 
 fn write_frame(output: &mut impl Write, frame: &ServerFrame) -> Result<(), String> {
@@ -599,6 +751,8 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             "add" => PROJECT_ADD_HELP,
             "list" => PROJECT_LIST_HELP,
             "delete" => PROJECT_DELETE_HELP,
+            "get" => PROJECT_GET_HELP,
+            "guidance" => PROJECT_GUIDANCE_HELP,
             _ => PROJECT_HELP,
         }));
     }
@@ -620,6 +774,23 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             let project_id = required_option(&mut args, "--project")?;
             require_empty(&args)?;
             Ok(CliCommand::ProjectDelete { project_id })
+        }
+        "get" => {
+            let project_id = required_option(&mut args, "--project")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ProjectGet { project_id })
+        }
+        "guidance" => {
+            let sub_action = take_action(&mut args, "project guidance")?;
+            match sub_action.as_str() {
+                "set" => {
+                    let project_id = required_option(&mut args, "--project")?;
+                    let file = required_option(&mut args, "--file")?;
+                    require_empty(&args)?;
+                    Ok(CliCommand::ProjectGuidanceSet { project_id, file })
+                }
+                _ => Err(format!("unknown project guidance action {sub_action:?}")),
+            }
         }
         _ => Err(format!("unknown project action {action:?}")),
     }
@@ -768,6 +939,8 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             "add" => AGENT_ADD_HELP,
             "list" => AGENT_LIST_HELP,
             "delete" => AGENT_DELETE_HELP,
+            "get" => AGENT_GET_HELP,
+            "profile" => AGENT_PROFILE_HELP,
             "message" => AGENT_MESSAGE_HELP,
             "inbox" => AGENT_INBOX_HELP,
             _ => AGENT_HELP,
@@ -809,6 +982,38 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 after_id,
                 limit,
             })
+        }
+        "get" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentGet {
+                project_id,
+                agent_id,
+            })
+        }
+        "profile" => {
+            let sub_action = take_action(&mut args, "agent profile")?;
+            match sub_action.as_str() {
+                "set" => {
+                    let project_id = required_option(&mut args, "--project")?;
+                    let agent_id = required_option(&mut args, "--agent")?;
+                    let model = take_option(&mut args, "--model")?;
+                    let permission_mode = take_option(&mut args, "--permission-mode")?;
+                    let instructions_file = take_option(&mut args, "--instructions-file")?;
+                    let memory_file = take_option(&mut args, "--memory-file")?;
+                    require_empty(&args)?;
+                    Ok(CliCommand::AgentProfileSet {
+                        project_id,
+                        agent_id,
+                        model,
+                        permission_mode,
+                        instructions_file,
+                        memory_file,
+                    })
+                }
+                _ => Err(format!("unknown agent profile action {sub_action:?}")),
+            }
         }
         "message" => {
             let id = take_option(&mut args, "--id")?;
@@ -937,6 +1142,15 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::ProjectDelete { project_id } => Ok(LocalRequest::DeleteProject {
             project_id: parse_id(project_id, "project")?,
         }),
+        CliCommand::ProjectGet { project_id } => Ok(LocalRequest::GetProject {
+            project_id: parse_id(project_id, "project")?,
+        }),
+        CliCommand::ProjectGuidanceSet { project_id, file } => {
+            Ok(LocalRequest::UpdateProjectGuidance {
+                project_id: parse_id(project_id, "project")?,
+                text: read_guidance_file(&file)?,
+            })
+        }
         CliCommand::TaskAdd {
             id,
             project_id,
@@ -1060,6 +1274,16 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?,
             limit,
         }),
+        CliCommand::AgentGet {
+            project_id,
+            agent_id,
+        } => Ok(LocalRequest::GetAgent {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+        }),
+        CliCommand::AgentProfileSet { .. } => {
+            Err("agent profile set is resolved before the daemon request".into())
+        }
         CliCommand::AgentMessage {
             id,
             project_id,
@@ -1341,6 +1565,22 @@ mod tests {
                 .1,
             CliCommand::Help(PROJECT_DELETE_HELP)
         );
+        assert_eq!(
+            parse_args(args(&["project", "get", "--help"])).unwrap().1,
+            CliCommand::Help(PROJECT_GET_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "guidance", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_GUIDANCE_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "guidance", "set", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_GUIDANCE_HELP)
+        );
 
         assert_eq!(
             parse_args(args(&["task"])).unwrap().1,
@@ -1372,6 +1612,8 @@ mod tests {
             ("add", AGENT_ADD_HELP),
             ("list", AGENT_LIST_HELP),
             ("delete", AGENT_DELETE_HELP),
+            ("get", AGENT_GET_HELP),
+            ("profile", AGENT_PROFILE_HELP),
             ("message", AGENT_MESSAGE_HELP),
             ("inbox", AGENT_INBOX_HELP),
         ] {
@@ -1381,6 +1623,12 @@ mod tests {
                 "agent {action} --help"
             );
         }
+        assert_eq!(
+            parse_args(args(&["agent", "profile", "set", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(AGENT_PROFILE_HELP)
+        );
 
         assert_eq!(
             parse_args(args(&["run"])).unwrap().1,
@@ -1545,6 +1793,134 @@ mod tests {
             ]))
             .unwrap_err(),
             "--role must be orchestrator or worker"
+        );
+    }
+
+    #[test]
+    fn agent_get_and_project_get_are_bounded_local_reads() {
+        assert_eq!(
+            parse_args(args(&["project", "get", "--project", "factory"])).unwrap(),
+            (
+                None,
+                CliCommand::ProjectGet {
+                    project_id: "factory".into(),
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "get",
+                "--project",
+                "factory",
+                "--agent",
+                "god"
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::AgentGet {
+                    project_id: "factory".into(),
+                    agent_id: "god".into(),
+                }
+            )
+        );
+        let (_, request) = parse_args(args(&["project", "get", "--project", "factory"])).unwrap();
+        assert!(matches!(
+            request_for(request).unwrap(),
+            LocalRequest::GetProject { project_id } if project_id == "factory".try_into().unwrap()
+        ));
+    }
+
+    #[test]
+    fn project_guidance_set_reads_the_file_into_the_local_request() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "# Project\n\nBuild the thing.\n").unwrap();
+        let path = file.path().to_str().unwrap().to_owned();
+        let (_, command) = parse_args(args(&[
+            "project",
+            "guidance",
+            "set",
+            "--project",
+            "factory",
+            "--file",
+            &path,
+        ]))
+        .unwrap();
+        assert_eq!(
+            command,
+            CliCommand::ProjectGuidanceSet {
+                project_id: "factory".into(),
+                file: path,
+            }
+        );
+        assert!(matches!(
+            request_for(command).unwrap(),
+            LocalRequest::UpdateProjectGuidance { project_id, text }
+                if project_id == "factory".try_into().unwrap()
+                    && text == "# Project\n\nBuild the thing.\n"
+        ));
+    }
+
+    #[test]
+    fn agent_profile_set_parses_every_optional_flag() {
+        let instructions = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(instructions.path(), "Coordinate the team.").unwrap();
+        let memory = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(memory.path(), "Prefer small, reversible slices.").unwrap();
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "profile",
+                "set",
+                "--project",
+                "factory",
+                "--agent",
+                "god",
+                "--model",
+                "gpt-5-codex",
+                "--permission-mode",
+                "on-request",
+                "--instructions-file",
+                instructions.path().to_str().unwrap(),
+                "--memory-file",
+                memory.path().to_str().unwrap(),
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::AgentProfileSet {
+                    project_id: "factory".into(),
+                    agent_id: "god".into(),
+                    model: Some("gpt-5-codex".into()),
+                    permission_mode: Some("on-request".into()),
+                    instructions_file: Some(instructions.path().to_str().unwrap().into()),
+                    memory_file: Some(memory.path().to_str().unwrap().into()),
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "profile",
+                "set",
+                "--project",
+                "factory",
+                "--agent",
+                "god",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::AgentProfileSet {
+                    project_id: "factory".into(),
+                    agent_id: "god".into(),
+                    model: None,
+                    permission_mode: None,
+                    instructions_file: None,
+                    memory_file: None,
+                }
+            )
         );
     }
 
