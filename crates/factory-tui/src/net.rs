@@ -72,7 +72,9 @@ pub enum NetMsg {
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
         ServerFrame::Response { response, .. } => Ok(response),
-        ServerFrame::Event { .. } => Err("daemon returned an event instead of a response".into()),
+        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+            Err("daemon returned a stream frame instead of a response".into())
+        }
     }
 }
 
@@ -298,7 +300,9 @@ pub fn spawn_project_session(client: Client, project_id: ProjectId, tx: Sender<N
                                     return;
                                 }
                             }
-                            Ok(ServerFrame::Response { .. }) => {}
+                            Ok(
+                                ServerFrame::Response { .. } | ServerFrame::TerminalOutput { .. },
+                            ) => {}
                             Err(error) => {
                                 failure = error.to_string();
                                 break;
