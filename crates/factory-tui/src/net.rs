@@ -2,32 +2,46 @@
 //! back to the render loop over an `mpsc` channel (`NetMsg`) — the render loop never blocks on
 //! the daemon, and the daemon connection is retried with backoff rather than crashing the UI.
 //!
-//! Three kinds of thread run over the crate's lifetime:
-//! - [`spawn_project_list`]: one-shot (with retry-until-success), fetches the project list so
-//!   `main.rs` can auto-select or hand off to `Board`'s project picker.
-//! - [`spawn_project_session`]: started once a project is chosen. Loads a consistent initial
-//!   snapshot (agents/tasks/runs), then subscribes to the daemon's event stream forever,
-//!   reconnecting with backoff on failure. This is the only source of ongoing updates — no
-//!   polling.
-//! - [`spawn_request`]: fire-and-forget, one per operator action (`StartTask`, `CancelTask`, …).
+//! Two kinds of thread run over the crate's lifetime:
+//! - [`spawn_fleet_session`]: loads **every** project's agents/tasks/runs/sessions (FORTRESS is
+//!   fleet-wide — see `model/mod.rs`'s module doc), then subscribes to the daemon's event stream
+//!   forever, reconnecting with backoff on failure. This is the only source of ongoing updates —
+//!   no polling.
+//! - [`spawn_request`]: fire-and-forget, one per operator action (`CreateTask`, `StopSession`, …).
+//!
+//! `ListSessions` is called per-project alongside agents/tasks/runs; per the shared brief, the
+//! daemon may not implement it yet ("not implemented" error) — [`load_sessions`] tolerates that
+//! by treating any `LocalResponse::Error` as "no sessions yet" rather than a load failure, so the
+//! board still comes up (agents shown idle from run status, per `model::state::agent_state_from_run`)
+//! against a daemon that hasn't landed 5A/5C.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Duration;
 
-use factory_core::local::{
-    LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS,
-    MAX_TASK_PAGE_ITEMS, ServerFrame,
-};
+use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, ServerFrame};
 use factory_core::{
-    AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, TaskDetail,
+    AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, SessionSnapshot,
+    TaskDetail,
 };
 
 use factoryctl::Client;
 
 const MIN_BACKOFF: Duration = Duration::from_millis(400);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Page size for projects/agents/runs/sessions listing. Deliberately **not**
+/// `factory_core::local::MAX_{PROJECT,AGENT,RUN,SESSION}_PAGE_ITEMS` (each declared as `1000`):
+/// against the daemon this crate was built against, every one of those `list_*` store methods
+/// (`crates/factoryd/src/store.rs`) independently caps at its own `MAX_STATE_PAGE = 101` and
+/// rejects anything larger with `InvalidStateLimit` — so a client honoring the *documented*
+/// per-endpoint maximum from `factory-core` gets every listing call rejected. This is a
+/// pre-existing mismatch between `factory-core`'s declared limits and `factoryd`'s enforced one,
+/// out of this track's scope to fix (factory-tui may only touch its own crate); `100` is a safe
+/// page size under either bound, and this crate's pagination loops (`load_agents`, `load_runs`,
+/// `load_sessions`, `load_projects`) already handle multiple pages correctly regardless of size.
+const SAFE_STATE_PAGE_SIZE: u32 = 100;
 
 /// Resolves the control socket path using the same three-step rule as `factoryctl`
 /// (`crates/factoryctl/src/main.rs::resolve_socket_path`, not exported from its `lib.rs`, so
@@ -63,11 +77,12 @@ pub fn resolve_socket_path(explicit: Option<&str>) -> Result<PathBuf, String> {
 pub enum NetMsg {
     ConnectionRetrying(String),
     ConnectionLive,
-    Projects(Vec<ProjectSnapshot>),
-    ProjectSnapshot {
+    FleetSnapshot {
+        projects: Vec<ProjectSnapshot>,
         agents: Vec<AgentSnapshot>,
         tasks: Vec<TaskDetail>,
         runs: Vec<RunSnapshot>,
+        sessions: Vec<SessionSnapshot>,
     },
     Event(EventEnvelope),
     CaughtUp,
@@ -95,7 +110,7 @@ fn load_projects(client: &Client) -> Result<Vec<ProjectSnapshot>, String> {
             client,
             LocalRequest::ListProjects {
                 after_id: after,
-                limit: MAX_PROJECT_PAGE_ITEMS,
+                limit: SAFE_STATE_PAGE_SIZE,
             },
         )? {
             LocalResponse::Projects {
@@ -123,7 +138,7 @@ fn load_agents(client: &Client, project_id: &ProjectId) -> Result<Vec<AgentSnaps
             LocalRequest::ListAgents {
                 project_id: project_id.clone(),
                 after_id: after,
-                limit: MAX_AGENT_PAGE_ITEMS,
+                limit: SAFE_STATE_PAGE_SIZE,
             },
         )? {
             LocalResponse::Agents {
@@ -179,7 +194,7 @@ fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>
             LocalRequest::ListRuns {
                 project_id: project_id.clone(),
                 after_id: after,
-                limit: MAX_RUN_PAGE_ITEMS,
+                limit: SAFE_STATE_PAGE_SIZE,
             },
         )? {
             LocalResponse::Runs {
@@ -198,6 +213,40 @@ fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>
     }
 }
 
+/// Loads a project's sessions, tolerating a daemon that doesn't implement `ListSessions` yet: any
+/// `LocalResponse::Error` (the shared brief's documented "not implemented" case, but really any
+/// error — a daemon that can't list sessions for some other reason shouldn't block the rest of
+/// the board coming up either) is treated as "no sessions", not a load failure.
+fn load_sessions(client: &Client, project_id: &ProjectId) -> Result<Vec<SessionSnapshot>, String> {
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let response = request_response(
+            client,
+            LocalRequest::ListSessions {
+                project_id: project_id.clone(),
+                after_id: after,
+                limit: Some(SAFE_STATE_PAGE_SIZE as usize),
+            },
+        )?;
+        match response {
+            LocalResponse::Sessions {
+                sessions,
+                next_after_id,
+            } => {
+                let done = next_after_id.is_none() || sessions.is_empty();
+                after = next_after_id;
+                all.extend(sessions);
+                if done {
+                    return Ok(all);
+                }
+            }
+            LocalResponse::Error { .. } => return Ok(all),
+            other => return Err(format!("unexpected response to ListSessions: {other:?}")),
+        }
+    }
+}
+
 fn load_event_sequence(client: &Client) -> Result<i64, String> {
     match request_response(client, LocalRequest::LatestEventSequence)? {
         LocalResponse::EventHead { sequence } => Ok(sequence),
@@ -207,58 +256,46 @@ fn load_event_sequence(client: &Client) -> Result<i64, String> {
     }
 }
 
-type ProjectSnapshotData = (Vec<AgentSnapshot>, Vec<TaskDetail>, Vec<RunSnapshot>, i64);
+type FleetSnapshotData = (
+    Vec<ProjectSnapshot>,
+    Vec<AgentSnapshot>,
+    Vec<TaskDetail>,
+    Vec<RunSnapshot>,
+    Vec<SessionSnapshot>,
+    i64,
+);
 
-/// Loads agents/tasks/runs for a project together with the event sequence they're consistent
-/// with, retrying (bounded) if the daemon's event head moved mid-load.
-fn load_consistent_project_snapshot(
-    client: &Client,
-    project_id: &ProjectId,
-) -> Result<ProjectSnapshotData, String> {
+/// Loads every project's agents/tasks/runs/sessions together with the event sequence they're
+/// consistent with, retrying (bounded) if the daemon's event head moved mid-load.
+fn load_consistent_fleet_snapshot(client: &Client) -> Result<FleetSnapshotData, String> {
     for _ in 0..3 {
         let before = load_event_sequence(client)?;
-        let agents = load_agents(client, project_id)?;
-        let tasks = load_tasks(client, project_id)?;
-        let runs = load_runs(client, project_id)?;
+        let projects = load_projects(client)?;
+        let mut agents = Vec::new();
+        let mut tasks = Vec::new();
+        let mut runs = Vec::new();
+        let mut sessions = Vec::new();
+        for project in &projects {
+            agents.extend(load_agents(client, &project.id)?);
+            tasks.extend(load_tasks(client, &project.id)?);
+            runs.extend(load_runs(client, &project.id)?);
+            sessions.extend(load_sessions(client, &project.id)?);
+        }
         let after = load_event_sequence(client)?;
         if before == after {
-            return Ok((agents, tasks, runs, after));
+            return Ok((projects, agents, tasks, runs, sessions, after));
         }
     }
-    Err("daemon state changed while loading the project snapshot".into())
+    Err("daemon state changed while loading the fleet snapshot".into())
 }
 
-/// Fetches the project list, retrying with backoff until it succeeds. `main.rs` uses this to
-/// decide whether to auto-select a project or show the picker.
-pub fn spawn_project_list(client: Client, tx: Sender<NetMsg>) {
+/// Owns the whole network lifecycle: bootstrap the fleet snapshot, then subscribe to the
+/// daemon's event stream forever with reconnect/backoff. Never returns while `tx` is alive.
+pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
     thread::spawn(move || {
         let mut delay = MIN_BACKOFF;
-        loop {
-            match load_projects(&client) {
-                Ok(projects) => {
-                    let _ = tx.send(NetMsg::ConnectionLive);
-                    let _ = tx.send(NetMsg::Projects(projects));
-                    return;
-                }
-                Err(error) => {
-                    if tx.send(NetMsg::ConnectionRetrying(error)).is_err() {
-                        return;
-                    }
-                    thread::sleep(delay);
-                    delay = next_backoff(delay);
-                }
-            }
-        }
-    });
-}
-
-/// Owns the lifecycle of a chosen project: bootstrap snapshot, then subscribe to the daemon's
-/// event stream forever with reconnect/backoff. Never returns while `tx` is alive.
-pub fn spawn_project_session(client: Client, project_id: ProjectId, tx: Sender<NetMsg>) {
-    thread::spawn(move || {
-        let mut delay = MIN_BACKOFF;
-        let (agents, tasks, runs, mut after_sequence) = loop {
-            match load_consistent_project_snapshot(&client, &project_id) {
+        let (projects, agents, tasks, runs, sessions, mut after_sequence) = loop {
+            match load_consistent_fleet_snapshot(&client) {
                 Ok(snapshot) => break snapshot,
                 Err(error) => {
                     if tx.send(NetMsg::ConnectionRetrying(error)).is_err() {
@@ -271,10 +308,12 @@ pub fn spawn_project_session(client: Client, project_id: ProjectId, tx: Sender<N
         };
         let _ = tx.send(NetMsg::ConnectionLive);
         if tx
-            .send(NetMsg::ProjectSnapshot {
+            .send(NetMsg::FleetSnapshot {
+                projects,
                 agents,
                 tasks,
                 runs,
+                sessions,
             })
             .is_err()
         {
@@ -333,7 +372,7 @@ pub fn spawn_project_session(client: Client, project_id: ProjectId, tx: Sender<N
 }
 
 /// Fires one request in the background and reports the result. Used for every operator action
-/// (`s`/`c`/`r`/`a`/`x`/`n`/`m`/`S`) so the render loop is never blocked on the daemon.
+/// so the render loop is never blocked on the daemon.
 pub fn spawn_request(client: Client, tx: Sender<NetMsg>, request: LocalRequest) {
     thread::spawn(move || {
         let result = request_response(&client, request);

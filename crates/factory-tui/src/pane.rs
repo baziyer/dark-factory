@@ -1,9 +1,14 @@
-//! A single terminal pane: a child process running under a PTY, whose output is fed into a
-//! `vt100::Parser` for rendering and scanned for terminal queries (see `query.rs`).
+//! One terminal pane: either a local child process under a PTY (`--dev-local-pty`, offline
+//! testing only — see `README.md`), or a live daemon-proxied session attached over the wire
+//! contract (`AttachTerminal`/`TerminalInput`/`ResizeTerminal`, keyed by `session_id`). Either
+//! way, output is fed into a `vt100::Parser` for rendering and (local-PTY only) scanned for
+//! terminal queries (see `query.rs`) — everything downstream of "bytes arrived" is identical
+//! regardless of backend, per the spike's own forward-looking note in `SPIKE.md`.
 
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,30 +19,59 @@ use portable_pty::{
 // version tui-term was built against (see the Cargo.toml comment on this crate's dependencies).
 use tui_term::vt100;
 
+use factory_core::local::{LocalRequest, ServerFrame};
+use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
+use factory_core::{ProjectId, SessionId};
+
+use factoryctl::Client;
+
+use crate::attach::{self, AttachConnection};
 use crate::keys::KeyContext;
 use crate::query::QueryResponder;
 
-/// How long after spawn we keep appending raw PTY bytes to the debug log, per the spike's
-/// "detect which queries claude/codex actually send on startup" requirement.
+/// How long after a local-PTY spawn we keep appending raw PTY bytes to the debug log, per the
+/// spike's "detect which queries claude/codex actually send on startup" requirement.
 const DEBUG_LOG_WINDOW: Duration = Duration::from_secs(6);
+
+/// Which backend a [`Pane`] is reading from — surfaced so `ui/` can show a small "[dev-local-pty]"
+/// badge and README's "what's stubbed" story stays honest about which pane is real.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneKind {
+    LocalPty,
+    Daemon,
+}
+
+enum Backend {
+    LocalPty {
+        writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+        master: Box<dyn MasterPty + Send>,
+        child: Box<dyn Child + Send + Sync>,
+    },
+    Daemon {
+        attach: AttachConnection,
+        input_tx: mpsc::Sender<Vec<u8>>,
+        resize_tx: mpsc::Sender<(u16, u16)>,
+        disconnected: Arc<AtomicBool>,
+        attach_error: Arc<Mutex<Option<String>>>,
+    },
+}
 
 pub struct Pane {
     pub title: String,
     pub command: Vec<String>,
+    pub kind: PaneKind,
     parser: Arc<Mutex<vt100::Parser>>,
-    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    /// Set by the reader thread whenever new bytes were processed; cleared by the render loop.
+    /// Set by a reader thread whenever new bytes were processed; cleared by the render loop.
     dirty: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
+    backend: Backend,
 }
 
 impl Pane {
-    /// Spawns `command` under a new PTY sized `cols x rows`. `debug_log` is an optional path to
-    /// append raw PTY output bytes to for `DEBUG_LOG_WINDOW` after spawn (see `SPIKE.md`
-    /// "Terminal-query handling").
+    /// Spawns `command` under a new local PTY sized `cols x rows`. `--dev-local-pty` only — see
+    /// `README.md`. `debug_log` is an optional path to append raw PTY output bytes to for
+    /// `DEBUG_LOG_WINDOW` after spawn (see `SPIKE.md` "Terminal-query handling").
     pub fn spawn(
         title: impl Into<String>,
         command: &[String],
@@ -78,7 +112,7 @@ impl Pane {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let dirty = Arc::new(AtomicBool::new(true));
 
-        spawn_reader_thread(
+        spawn_local_reader_thread(
             reader,
             Arc::clone(&parser),
             Arc::clone(&writer),
@@ -89,13 +123,82 @@ impl Pane {
         Ok(Self {
             title: title.into(),
             command: command.to_vec(),
+            kind: PaneKind::LocalPty,
             parser,
-            writer,
-            master: pair.master,
-            child,
             dirty,
             rows,
             cols,
+            backend: Backend::LocalPty {
+                writer,
+                master: pair.master,
+                child,
+            },
+        })
+    }
+
+    /// Attaches to a live daemon-proxied session over the wire contract: opens
+    /// `AttachTerminal { since_offset: 0 }` on a dedicated connection (see `attach.rs` for why not
+    /// the multiplexed one), replays the retained log, then streams live bytes into the same
+    /// `vt100::Parser` a local-PTY pane would use. Reattach is identical — always from offset 0,
+    /// letting the retained log rebuild the correct current screen (per the wire contract: "no
+    /// partial resume in this client").
+    pub fn attach(
+        socket: PathBuf,
+        project_id: ProjectId,
+        session_id: SessionId,
+        title: impl Into<String>,
+        rows: u16,
+        cols: u16,
+    ) -> anyhow::Result<Self> {
+        let (attach_conn, reader_half) = AttachConnection::open(
+            &socket,
+            LocalRequest::AttachTerminal {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                since_offset: 0,
+            },
+        )?;
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
+        let dirty = Arc::new(AtomicBool::new(true));
+        let disconnected = Arc::new(AtomicBool::new(false));
+        let attach_error = Arc::new(Mutex::new(None));
+
+        spawn_attach_reader_thread(
+            reader_half,
+            Arc::clone(&parser),
+            Arc::clone(&dirty),
+            Arc::clone(&disconnected),
+            Arc::clone(&attach_error),
+        );
+
+        let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
+        let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>();
+        spawn_input_worker(
+            socket.clone(),
+            project_id.clone(),
+            session_id.clone(),
+            input_rx,
+        );
+        spawn_resize_worker(socket, project_id, session_id, resize_rx);
+
+        Ok(Self {
+            title: title.into(),
+            command: Vec::new(),
+            kind: PaneKind::Daemon,
+            parser,
+            dirty,
+            // Sentinel: forces the first `resize()` call to actually send, per the wire
+            // contract's "initial + on resize" — see that method's doc comment.
+            rows: 0,
+            cols: 0,
+            backend: Backend::Daemon {
+                attach: attach_conn,
+                input_tx,
+                resize_tx,
+                disconnected,
+                attach_error,
+            },
         })
     }
 
@@ -105,7 +208,7 @@ impl Pane {
     }
 
     /// Marks the pane dirty without checking - used to force a redraw (e.g. right after
-    /// resizing, before the child has written anything new).
+    /// resizing, before new bytes have arrived).
     pub fn mark_dirty(&self) {
         self.dirty.store(true, Ordering::Release);
     }
@@ -136,30 +239,50 @@ impl Pane {
         self.with_screen(vt100::Screen::bracketed_paste)
     }
 
-    /// Writes raw bytes to the child's stdin (already-encoded terminal input).
+    /// Writes raw, already-encoded terminal input to the child (local PTY) or forwards it to the
+    /// daemon as a `TerminalInput` request (daemon-attached) — best-effort either way; a failed
+    /// write here shows up to the operator as the pane simply not reacting, which matches how a
+    /// dropped keystroke over a flaky real terminal link would look too.
     pub fn write_input(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.write_all(bytes);
-            let _ = writer.flush();
+        match &self.backend {
+            Backend::LocalPty { writer, .. } => {
+                if let Ok(mut writer) = writer.lock() {
+                    let _ = writer.write_all(bytes);
+                    let _ = writer.flush();
+                }
+            }
+            Backend::Daemon { input_tx, .. } => {
+                let _ = input_tx.send(bytes.to_vec());
+            }
         }
     }
 
-    /// Resizes both the PTY (so the child gets SIGWINCH) and the `vt100` model.
+    /// Resizes both the PTY (local) or sends `ResizeTerminal` (daemon) and the `vt100` model. A
+    /// no-op if the size didn't change — except for a freshly `attach`ed pane, whose `rows`/`cols`
+    /// start at the sentinel `(0, 0)` specifically so the very first call here always sends,
+    /// satisfying the wire contract's "sends... size via `ResizeTerminal` (initial + on resize)".
     pub fn resize(&mut self, rows: u16, cols: u16) -> anyhow::Result<()> {
         if rows == self.rows && cols == self.cols {
             return Ok(());
         }
         self.rows = rows;
         self.cols = cols;
-        self.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        match &mut self.backend {
+            Backend::LocalPty { master, .. } => {
+                master.resize(PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })?;
+            }
+            Backend::Daemon { resize_tx, .. } => {
+                let _ = resize_tx.send((cols, rows));
+            }
+        }
         if let Ok(mut parser) = self.parser.lock() {
             parser.set_size(rows, cols);
         }
@@ -167,18 +290,82 @@ impl Pane {
         Ok(())
     }
 
-    /// Whether the child process has exited.
+    /// Whether the pane is no longer usable: the local child exited, or (daemon-attached) the
+    /// attach connection ended.
     #[must_use]
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        match &mut self.backend {
+            Backend::LocalPty { child, .. } => matches!(child.try_wait(), Ok(Some(_))),
+            Backend::Daemon { disconnected, .. } => disconnected.load(Ordering::Acquire),
+        }
     }
 
+    /// The last error the daemon sent back on this attach connection (e.g. "sessions are not
+    /// implemented yet" while 5A/5C haven't landed), if any — surfaced by `ui/terminals.rs`/
+    /// `ui/focus.rs` instead of a silent blank pane. Always `None` for a local-PTY pane.
+    #[must_use]
+    pub fn attach_error(&self) -> Option<String> {
+        match &self.backend {
+            Backend::LocalPty { .. } => None,
+            Backend::Daemon { attach_error, .. } => {
+                attach_error.lock().ok().and_then(|guard| guard.clone())
+            }
+        }
+    }
+
+    /// Ends this pane: kills the local child (`--dev-local-pty` only — never a real agent), or,
+    /// for a daemon-attached pane, **only** detaches (shuts the attach socket down so its reader
+    /// thread exits promptly). Detaching a daemon-attached pane must never stop the session it
+    /// was watching — "closing/crashing/rebuilding the TUI must not stop agents" is a hard
+    /// constraint from the design brief, not a preference.
     pub fn kill(&mut self) {
-        let _ = self.child.kill();
+        match &mut self.backend {
+            Backend::LocalPty { child, .. } => {
+                let _ = child.kill();
+            }
+            Backend::Daemon { attach, .. } => attach.shutdown(),
+        }
+    }
+
+    // -- scrollback (FOCUS's PgUp/PgDn) ------------------------------------------------------
+
+    /// How many scrollback lines are currently in view (0 = live tail). Reads straight from
+    /// `vt100::Screen::scrollback`, which is already clamped to how much history actually exists.
+    #[must_use]
+    pub fn scroll_offset(&self) -> usize {
+        self.with_screen(vt100::Screen::scrollback)
+    }
+
+    /// Scrolls further back into history by `lines`. `vt100::Parser::set_scrollback` clamps
+    /// internally to however much scrollback has actually accumulated, so over-scrolling is
+    /// always safe.
+    pub fn scroll_up(&self, lines: usize) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let target = parser.screen().scrollback() + lines;
+            parser.set_scrollback(target);
+        }
+        self.mark_dirty();
+    }
+
+    /// Scrolls back toward the live tail by `lines` (saturating at 0).
+    pub fn scroll_down(&self, lines: usize) {
+        if let Ok(mut parser) = self.parser.lock() {
+            let target = parser.screen().scrollback().saturating_sub(lines);
+            parser.set_scrollback(target);
+        }
+        self.mark_dirty();
+    }
+
+    /// Jumps back to the live tail.
+    pub fn scroll_reset(&self) {
+        if let Ok(mut parser) = self.parser.lock() {
+            parser.set_scrollback(0);
+        }
+        self.mark_dirty();
     }
 }
 
-fn spawn_reader_thread(
+fn spawn_local_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
@@ -230,3 +417,87 @@ fn spawn_reader_thread(
         }
     });
 }
+
+fn spawn_attach_reader_thread(
+    reader: std::os::unix::net::UnixStream,
+    parser: Arc<Mutex<vt100::Parser>>,
+    dirty: Arc<AtomicBool>,
+    disconnected: Arc<AtomicBool>,
+    attach_error: Arc<Mutex<Option<String>>>,
+) {
+    std::thread::spawn(move || {
+        attach::read_frames(reader, |frame| {
+            match frame {
+                ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
+                    Ok(decoded) => {
+                        if let Ok(mut parser) = parser.lock() {
+                            parser.process(&decoded);
+                            dirty.store(true, Ordering::Release);
+                        }
+                    }
+                    Err(error) => {
+                        if let Ok(mut guard) = attach_error.lock() {
+                            *guard = Some(format!("invalid terminal bytes: {error}"));
+                        }
+                    }
+                },
+                ServerFrame::Response { response, .. } => {
+                    if let factory_core::local::LocalResponse::Error { message, .. } = response {
+                        if let Ok(mut guard) = attach_error.lock() {
+                            *guard = Some(message);
+                        }
+                        return false;
+                    }
+                }
+                ServerFrame::Event { .. } => {}
+            }
+            true
+        });
+        disconnected.store(true, Ordering::Release);
+        dirty.store(true, Ordering::Release);
+    });
+}
+
+fn spawn_input_worker(
+    socket: PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
+    rx: mpsc::Receiver<Vec<u8>>,
+) {
+    std::thread::spawn(move || {
+        let client = Client::new(socket);
+        while let Ok(bytes) = rx.recv() {
+            let request = LocalRequest::TerminalInput {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                bytes: encode_terminal_bytes(&bytes),
+            };
+            let _ = client.request(request);
+        }
+    });
+}
+
+fn spawn_resize_worker(
+    socket: PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
+    rx: mpsc::Receiver<(u16, u16)>,
+) {
+    std::thread::spawn(move || {
+        let client = Client::new(socket);
+        while let Ok((cols, rows)) = rx.recv() {
+            let request = LocalRequest::ResizeTerminal {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                cols,
+                rows,
+            };
+            let _ = client.request(request);
+        }
+    });
+}
+
+/// The set of panes currently attached, keyed by session id — `main.rs` reconciles this against
+/// `Board::desired_sessions()` every loop iteration; `ui::terminals`/`ui::focus` render whatever's
+/// in it.
+pub type PaneMap = std::collections::HashMap<SessionId, Pane>;

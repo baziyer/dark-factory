@@ -1,8 +1,8 @@
 # factory-tui
 
 The operator board: a `ratatui` terminal app for watching and directing agents on a Dark Factory
-daemon. Dwarf-Fortress-flavored on purpose — a dense ASCII floor of agent glyphs, a scrolling
-announcements log, single-key-navigable unit/job lists, and one-line status/help — not a
+daemon. Dwarf-Fortress-flavored on purpose — a spatial floor plan of every project's agents,
+attention-ranked announcements, a per-project workshop drill-down, and live terminal panes — not a
 dashboard. See `SPIKE.md` for the terminal-pane rendering research this crate grew out of, and
 `/Users/baziyer/.claude/projects/-Users-baziyer-dark-factory/memory/tui-design-direction.md` for
 the owner's design note this board implements.
@@ -12,156 +12,182 @@ the owner's design note this board implements.
 ```sh
 cargo run -p factory-tui
 cargo run -p factory-tui -- --socket /path/to/f.sock
-cargo run -p factory-tui -- --project my-project
-cargo run -p factory-tui -- --dev-local-pty   # see "What's stubbed" below
+cargo run -p factory-tui -- --project my-project     # focus this project on startup
+cargo run -p factory-tui -- --theme plain             # ASCII glyphs, no hue-based color
+cargo run -p factory-tui -- --dev-local-pty           # see "What's stubbed" below
 ```
 
 Socket resolution matches `factoryctl` exactly (three steps, first match wins): `--socket`, then
 `$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then `$HOME/.dark-factory/f.sock`. If
 the daemon isn't reachable, the status line shows `RETRYING` with the connection error and keeps
-retrying with backoff (capped at 5s) — it never crashes or blocks the UI. If more than one
-project exists and `--project` doesn't pick one unambiguously, a picker appears at startup
-(`j`/`k`, `Enter`); with exactly one project, or a `--project` that matches, the board skips
-straight to it.
+retrying with backoff (capped at 5s) — it never crashes or blocks the UI.
 
-## Layout
+Unlike a picker-driven "select one project" client, this board loads **every** project's
+agents/tasks/runs/sessions at once (FORTRESS is fleet-wide) and simply *focuses* one project at a
+time for WORKSHOP/TERMINALS/FOCUS — `--project` sets that initial focus; otherwise the oldest
+project (by creation order) is focused by default, and `Enter` on an agent in FORTRESS re-focuses
+whichever project that agent belongs to.
+
+## The four views
+
+Per the owner's Ratatui UX brief, one `View` enum with a fixed depth ladder:
 
 ```
-┌ floor ─────────────────────────────┬ announcements ──────────────────┐
-│ *Ω orchestr  bob        carol      │ 20:41 bob      task#42 done      │
-│    [helm]     [desk]     [desk]    │ 20:42 carol    run waiting...    │
-│                                     │ 20:44 alice    run running       │
-├ units ───────────┬ jobs ───────────┴───────────────────────────────────┤
-│ > alice  working ⣀⣠⣤⣴ │ # t1  fix bug        → alice                  │
-│   bob    idle    ⠀⠀⠀⠀ │ ✓ t2  add tests      → bob                    │
-├──────────────────┴───────────────────────────────────────────────────┤
-│ LIVE  Tab switch  j/k move  Enter/l/z look  s start … q quit          │
-└─────────────────────────────────────────────────────────────────────┘
+FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4)
 ```
 
-Floor (top-left), announcements (top-right), units + jobs (middle), status/help (bottom). Below
-an 80x24 terminal (`ui/mod.rs::MIN_HEIGHT_FOR_FLOOR`/`MIN_WIDTH_FOR_FLOOR`) the floor is the first
-thing dropped, per the design brief — announcements gets its width instead. Units and jobs never
-disappear.
+- **FORTRESS** — the spatial factory overview. Every project is a persistent "workshop" box,
+  positioned deterministically by project creation order (left→right, wrapping); inside, agents
+  are glyphs at stations (orchestrator, Claude/Codex worker, sub-agent), with a route connector
+  from the orchestrator to each worker (`═` durable — it's been assigned work before; `─`
+  transient — it currently has an open episode), and an in-tray/capacity bar (`▒`/`░`, queued
+  work vs. idle capacity). Announcements float on the right, attention-ranked (failures/
+  needs-input bubble above routine chatter) rather than strictly by recency. A custom widget
+  writes every glyph directly into the `ratatui::buffer::Buffer` — no `Canvas`, no `Paragraph` for
+  the map (`fortress.rs`).
+- **WORKSHOP** — one focused project: its task queue (status glyphs, assignee), its agent
+  hierarchy as an indented tree (orchestrator → workers → sub-agents, with state, a braille
+  activity sparkline, and wait-reason/activity text), and a detail pane for whichever item is
+  selected (task body/result, or an agent's session state/last hook/worktree).
+- **TERMINALS** — tiled live PTYs of the focused project's live sessions, 2-4 panes
+  (`ui/terminals.rs::pane_rects`).
+- **FOCUS** — one pane, full-screen, with scrollback (`PgUp`/`PgDn`).
 
 ## Keys
 
-Board (default) mode:
-
 | Key | Action |
 |---|---|
-| `Tab` | switch focus between units and jobs |
-| `j`/`k`, `↓`/`↑` | move the focused panel's cursor |
-| `Enter`, `l`, `z` | look at (zoom into) the selected agent's terminal — units: the selected agent; jobs: the selected task's assignee |
-| `s` | start the selected task on its assigned agent (`a` first if unassigned) |
-| `c` | cancel the selected task |
-| `r` | retry the selected task |
-| `a` | assign/reassign the selected task — opens an agent picker |
-| `x`, `x` | delete the selected task (second `x` confirms; anything else cancels) |
-| `n` | new task — a two-field prompt (title, body) |
-| `m` | message the selected agent — a one-field prompt (body) |
-| `S` | stop the selected agent's current run |
-| `q` | quit |
+| `1`-`4` | switch view directly |
+| `Enter`, `→`, `l` | zoom in (context-sensitive — see below) |
+| `Esc`, `←`, `h` | zoom out one level |
+| `Tab` | cycle agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP) |
+| `j`/`k`, `↓`/`↑` | move |
+| `n` | new task (title; `Tab`/`Enter` to a second line for the body) — needs a focused project |
+| `m` | message the selected agent |
+| `o` | message the orchestrator (if several in scope, opens a picker — `Tab`/`j`/`k` to choose) |
+| `x` | stop the selected agent — `StopSession` if it has a session, else `StopRun` on its current run; 2-press confirm (`x` again, or `y`/`Enter`) |
+| `g` / `G` | jump to (`G`: and open FOCUS on) the next agent needing attention |
+| `!` | WORKSHOP: toggle "needs-attention only" filter on both lists |
+| `PgUp`/`PgDn` | FOCUS: scroll the pane's terminal scrollback |
+| `Ctrl-]` | TERMINALS/FOCUS: toggle between forwarding keys to the pane and board control |
+| `q` | detach — quits the client only, never stops the factory |
+| `?` | help overlay |
 
-Task actions (`s`/`c`/`r`/`a`/`x`) always target the jobs cursor; agent actions (`m`/`S`) always
-target the units cursor, regardless of which panel currently has focus (`Tab`) — the two cursors
-are independent, so this lets an operator line up a task and an agent without losing either
-selection.
+`Enter`'s meaning is contextual, per view: in FORTRESS it zooms into the selected agent's
+project's WORKSHOP; in WORKSHOP it opens the task action menu (tasks pane) or zooms into
+TERMINALS (agents pane); in TERMINALS it zooms into FOCUS on the selected pane. In WORKSHOP,
+`Enter` on a task opens a small action menu — **assign · cancel · retry · delete · edit title ·
+start** — the only place those live; `start` is what used to be a top-level `s` key
+("deliver now").
 
-Prompts (`n`, `m`): type to edit the current field, `Tab`/`Enter` moves to the next field,
-`Enter` on the last field submits, `Esc` cancels. Pickers (project, assign-agent): `j`/`k` moves,
-`Enter` selects, `Esc` cancels.
+Everything above is one `Action` enum and one `keymap()` function
+(`model/keymap.rs`) — the meaning of a key never depends on which view is active, only what
+`Board::dispatch` does with the resulting `Action`, per the repomon reference this design adopts
+(see `REFS-HERDR-REPOMON.md` in the shared brief materials).
 
-Zoomed into an agent's terminal: with `--dev-local-pty`, this is the spike's exact `Ctrl-]`
-toggle — `Ctrl-]` flips between forwarding keystrokes to the pane and a zoom-control substate
-where `Esc`/`z` exits back to the board (see `SPIKE.md` "Input routing" for why `Ctrl-]` and why
-the code says `Char('5')`). Without `--dev-local-pty` (the default), there's no live pane to type
-into, so `Esc`/`z`/`Enter`/`q` all just exit zoom.
+Prompts (`n`, `m`, `o`, edit title): type to edit the current field, `Tab`/`Enter` moves to the
+next field, `Enter` on the last field submits, `Esc` cancels. Pickers (assign-agent,
+message-orchestrator): `j`/`k`/`Tab` moves, `Enter` selects, `Esc` cancels.
 
-Every request that can fail (`StartTask`, `CancelTask`, …) reports `LocalResponse::Error` in the
-status line rather than panicking; a transport-level failure (daemon down, timeout) does too.
+Every request that can fail reports `LocalResponse::Error` in the status line rather than
+panicking; a transport-level failure (daemon down, timeout) does too.
 
-## How agent state is derived
+## Theme
 
-Every agent on the floor and in the units list is one of five states — idle, working, waiting,
-stopped, failed — computed by a single function, `model::agent_state`, from the agent's most
-recent `RunSnapshot` (`Board::latest_run_for`, itself just "the run with the greatest
-`started_at_ms`" — there's no cheaper source yet, see below):
+`--theme fortress` (default) or `--theme plain`. One `Theme` struct
+(`theme.rs`), two consts: `fortress` uses the full Dwarf-Fortress glyph set (`◆ C X c ▒ ░ ! × ✓ ═
+─`); `plain` is pure ASCII (`@ C X c # . ! x + = -`) with no color beyond bold/dim. Every glyph
+the board can draw comes from the active `Theme` — nothing falls back to a hardcoded Unicode
+character under `--theme plain` (`theme::tests::glyph_tables_are_complete_and_ascii_for_plain`
+guards this).
 
-- no run ever, or the latest run **succeeded** → idle
-- latest run **starting**/**running** → working
-- latest run **waiting**/**blocked**/**paused** → waiting (`RunStatus::Paused` isn't named in the
-  design brief's mapping; folded into waiting as the closest fit — it's not actively working, but
-  it isn't a terminal outcome either)
-- latest run **failed** → failed (stays failed, doesn't revert to idle, until retried)
-- latest run **stopped** → stopped (same)
+## How agent state and attention are derived
 
-This is a placeholder. The real target (see `ROADMAP.md`/the shared brief, "later track:
-hooks/sessions") is durable per-session state — idle/working/waiting_for_input/stopped/failed —
-reported directly by provider hooks, independent of process/run lifecycle. When that lands, only
-`agent_state` (and its data source, `Board::latest_run_for`) should need to change; every caller
-already goes through it rather than inspecting `RunStatus` itself, by design.
+Two functions are the single mapping points from durable daemon state onto what the board draws;
+every other piece of code calls them instead of inspecting `SessionState`/`RunStatus` itself:
 
-The orchestrator (`AgentRole::Orchestrator`) always renders first, with a distinct glyph (`Ω`)
-and a `[helm]` label instead of `[desk]` — the "god" desk, per the Munder-Difflin office
-reference in the design note.
+- `Board::agent_state` → the five-way `AgentState` (idle/working/waiting/stopped/failed) used for
+  glyph color everywhere.
+- `Board::agent_attention` → the four-way `Attention` taxonomy (routine < completed < failed <
+  needs-input, each with a `priority()`) used for fortress badges, announcement ordering, `g`/`G`,
+  and WORKSHOP's `!` filter.
 
-## Sparklines
+**Session state wins over run-status inference whenever a session exists** (hooks supersede
+inference, per the design brief). If an agent has no session yet, both functions fall back to the
+pre-sessions run-status mapping the original spike board used, and mark the result `inferred:
+true` — surfaced in WORKSHOP's detail pane as a `~` prefix (e.g. `~latest run: Failed`) so an
+operator can always tell observed-from-hooks state apart from guessed-from-run-history state.
 
-Each unit row shows a 10-column braille sparkline of that agent's event rate: a count of
-`TaskChanged`/`RunChanged`/`AgentChanged`/`AgentDeleted` events touching that agent, bucketed into
-one-minute buckets, over the last 30 minutes (`model::ActivitySeries`). This is a stand-in for a
-real tokens/turns-per-minute series, which needs the same provider-hook work as session state
-above (see `README.md`'s "how agent state is derived"). The buckets keep rolling forward on the
-board's 1Hz tick even for an idle agent, so the sparkline visibly slides even with no events.
+## What's pending on the daemon (5C)
 
-Braille levels (`model::BRAILLE_LEVELS`) match the exact glyph gradient in the owner's design
-note (`⣀⣠⣤⣴⣶⣾⣿`), plus a true-empty glyph (U+2800) for zero-count buckets, quantized with pure
-integer math (no float precision-loss lint dodging needed).
+This track (6c) designed and unit-tested every session-driven code path — `Board::agent_state`/
+`agent_attention`'s session precedence, `terminal_targets`/`focus_target`, the terminal-attach
+frame decode/parser-feed path (`attach.rs`), scrollback offset math (`pane.rs`) — against
+*synthetic* `SessionSnapshot`/`ServerFrame::TerminalOutput` fixtures, per the shared brief's
+instruction. None of it has been exercised against a real daemon yet, because:
 
-## What's stubbed pending later tracks
+- `ListSessions` currently returns `LocalResponse::Error` ("sessions are not implemented yet") on
+  the daemon this track built against — tolerated by `net::load_sessions`, which treats any error
+  response as "no sessions" rather than a load failure. In practice this means, against today's
+  daemon, `board.sessions` is always empty, every agent's state/attention falls back to the
+  run-inference path (`inferred: true` everywhere), and TERMINALS/FOCUS show "no live sessions in
+  this project yet" — exactly the graceful degradation the track brief asked for.
+- `AttachTerminal`/`TerminalInput`/`ResizeTerminal` are wired end-to-end against the real wire
+  contract (`factory_core::local::LocalRequest`, keyed by `session_id`) but nothing on the daemon
+  side publishes a `SessionSnapshot` with a live `SessionState` yet, so `Board::terminal_targets`/
+  `focus_target` never actually produce a session id to attach to against today's daemon (see
+  `--dev-local-pty` below for how to still exercise the pane mechanics).
+- When 5A (sessions store) and 5C (execution/delivery) land, only the daemon side should need to
+  change: `FactoryEvent::SessionChanged` events already flow into `Board::apply_event` today (see
+  `model/tests.rs::session_changed_event_updates_the_sessions_map`), and `ListSessions`'s
+  `LocalResponse::Sessions` success path is already implemented in `net::load_sessions`, just
+  never exercised because the daemon doesn't take it yet.
 
-- **Terminal attach.** "Looking at" an agent doesn't yet attach to a real daemon-proxied PTY
-  stream — that protocol doesn't exist yet (see `SPIKE.md`'s "For the next agent" section, and
-  the shared brief's "later track: hooks/sessions"). By default, zoom shows a placeholder
-  ("the daemon's terminal-attach protocol hasn't landed yet"). Pass `--dev-local-pty` to instead
-  spawn a local `bash` shell under a real PTY (reusing `pane.rs`'s `Pane`, `keys.rs`'s encoder,
-  and `query.rs`'s responder verbatim from the spike) so the zoom/pane-forwarding mechanics can be
-  exercised end-to-end against something real, without running `claude`/`codex` (out of scope for
-  this track per the shared brief). When the attach protocol lands, `pane.rs`'s `Pane` is meant to
-  grow a second constructor that streams from `Client::subscribe`/`request` by `run_id` instead of
-  spawning a child process — everything downstream of "bytes arrived" (the reader thread, the
-  `vt100::Parser`, `QueryResponder`) shouldn't need to change.
-- **Agent state and sparklines** come from `RunSnapshot` polling/events, not durable session
-  state or real token/turn counts — see the two sections above.
-- **Messages aren't displayed.** `m` sends an `AgentMessage` (`SendAgentMessage`), but there's no
-  panel for reading an agent's inbox (`ListAgentMessages`) — out of scope for this track.
-- **Times are UTC.** Announcement timestamps (`HH:MM`) are time-of-day arithmetic on the event's
-  epoch-ms, deliberately not run through a calendar/timezone crate (none is in the dependency
-  tree — see `SPIKE.md`'s MSRV section for why that tree is kept deliberately narrow).
-- **New-project/new-agent creation** isn't in the board (only an existing project can be picked,
-  and `n` only creates tasks) — `factoryctl` still owns those.
+`--dev-local-pty` stays available for offline testing of TERMINALS/FOCUS's pane mechanics without
+real sessions: every agent gets a deterministic synthetic pane target (`Board::session_id_for_pane`
+returns `dev-<agent_id>`, never inserted into `board.sessions`), which `main.rs::sync_panes`
+recognizes and spawns a local `bash` shell for instead of a daemon attach. It is **not** the
+default path — the default (no flag) always attempts a real `AttachTerminal`.
 
 ## Architecture
 
-- `model.rs` — the view-model (`Board`, `Mode`, `Intent`, `agent_state`, `RingBuffer`,
-  `ActivitySeries`, `braille_sparkline`) and all key-handling. No sockets, no PTYs, no `Frame` —
-  fully unit tested (`cargo test -p factory-tui`) without a terminal or a daemon.
-- `net.rs` — every socket touch: `resolve_socket_path`, project-list bootstrap, a project
-  session (consistent initial snapshot + `Subscribe` forever with reconnect/backoff), and one-shot
-  request threads for operator actions. Reports back to the render loop over an
-  `mpsc::Sender<NetMsg>` — nothing here ever touches the terminal.
-- `ui/` — pure rendering of `Board` (`floor.rs`, `log.rs`, `lists.rs`, `help.rs` for the
-  status line and the prompt/picker/confirm overlays), dispatched from `ui/mod.rs::draw`.
-- `pane.rs`, `keys.rs`, `query.rs` — unchanged from the fidelity spike (a local-PTY child, the
-  crossterm-key-to-terminal-bytes encoder, and the terminal-query responder). `main.rs` owns the
-  one `Pane` that can exist at a time (the zoomed agent's, only under `--dev-local-pty`) since
-  rendering it needs both `Board`'s mode and the pane's mutex-guarded `vt100::Screen` together —
-  everything else in `ui/` only ever needs `Board`.
-- `main.rs` — CLI args, terminal setup/teardown (raw mode, alt screen, bracketed paste, the
-  spike's panic hook restoring the terminal), and the event loop: `crossterm` input, a
-  non-blocking drain of `NetMsg`, a 1Hz tick, redraw only when something changed. Not a busy
-  poll — `event::poll` blocks efficiently (via the OS) for up to 150ms with ~0 CPU at idle.
+- `model/` — the view-model, fully unit tested (`cargo test -p factory-tui`) without a terminal,
+  daemon, or PTY:
+  - `mod.rs` — `Board` (fleet-wide state: every project's agents/tasks/runs/sessions),
+    `agent_state`/`agent_attention` (the session-vs-run precedence rule), fortress/workshop/
+    terminal-target derived views, fleet-snapshot/event application.
+  - `keymap.rs` — `View`, `Action`, the one `keymap()` function, `Mode` (prompts/pickers/task
+    menu/confirm/help), and all of `Board`'s key-handling.
+  - `attention.rs` — the shared `Attention` taxonomy and its session/run/task mappings.
+  - `state.rs` — the five-way `AgentState`, the announcements ring buffer, per-agent activity
+    sparklines (braille, `⣀⣠⣤⣴⣶⣾⣿`).
+  - `announcements.rs` — event → announcement-line formatting and attention-ranked ordering.
+- `fortress.rs` — FORTRESS's custom widget: `compute_workshops` (pure geometry — project/agent
+  identity in, deterministic `Rect`s out, no state) and `render` (writes glyphs/colors/badges
+  directly into a `ratatui::buffer::Buffer`, reading current state from `Board` only at draw
+  time).
+- `theme.rs` — the `Theme` struct and its two consts.
+- `net.rs` — every socket touch outside terminal attach: `resolve_socket_path`, the fleet
+  snapshot bootstrap (all projects, tolerant of `ListSessions` not being implemented yet), the
+  `Subscribe` event stream (reconnect/backoff), and one-shot request threads for operator actions.
+- `attach.rs` — a dedicated, raw `AttachTerminal` connection (deliberately not built on
+  `factoryctl::Client::attach_terminal` — see its module doc for why: this crate needs to hold a
+  socket handle it can `shutdown()` on detach, which the `Client` API doesn't expose).
+- `pane.rs` — `Pane`, with two backends: a local PTY child (`--dev-local-pty` only) and a
+  daemon-attached session (`Pane::attach`, the real path) — everything downstream of "bytes
+  arrived" (the `vt100::Parser`, `QueryResponder` for local-PTY, scrollback) is backend-agnostic.
+- `keys.rs`, `query.rs` — unchanged from the fidelity spike (the crossterm-key-to-terminal-bytes
+  encoder, and the terminal-query responder).
+- `ui/` — pure rendering of `Board` (plus, for TERMINALS/FOCUS, the live `Pane`s): `mod.rs`
+  dispatches by view and draws the shared status line/overlays; `fortress_view.rs`,
+  `workshop.rs`, `terminals.rs`, `focus.rs` render one view each; `announcements.rs` the ranked
+  log; `help.rs` the status line, prompts, pickers, task menu, confirm dialog, and `?` help.
+- `main.rs` — CLI args, terminal setup/teardown, and the event loop: `crossterm` input, a
+  non-blocking drain of `NetMsg`, pane reconciliation (`sync_panes`, diffing `Board::
+  desired_sessions()` against the currently attached panes every loop iteration — cheap, and
+  deliberately not gated on a redraw so leaving TERMINALS/FOCUS detaches promptly), a 1Hz tick,
+  redraw only when something changed. Not a busy poll — `event::poll` blocks efficiently (via the
+  OS) for up to 150ms with ~0 CPU at idle.
 
 ## Testing against a real (throwaway) daemon
 
