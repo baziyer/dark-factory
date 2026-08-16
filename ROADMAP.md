@@ -4,8 +4,8 @@ Status: 16 August 2026
 
 Dark Factory’s current baseline is the durable local supervisor and native
 control plane: explicit task starts, Claude and Codex runners, transactional
-results, queue assignment, retry/stop controls, provider usage visibility for
-5-hour and 7-day windows, provider-scoped model selection, standing agent
+results, queue assignment, retry/stop controls, on-demand Codex subscription
+usage via `factoryctl usage`, provider-scoped model selection, standing agent
 guidance, and a private durable message inbox delivered into the next launch.
 
 This file lists unfinished product work only. Completed launch work is not
@@ -45,9 +45,9 @@ repeated as a backlog item.
 
 ## Later: external operation
 
-- Add further generic webhook wire profiles and public-network deployment
-  hardening.
-- Keep Minerva as one configured generic webhook client, not a core concept.
+- Add further webhook wire profiles and public-network deployment hardening.
+- Minerva's `legacy_v1` endpoint is the only wire profile the config accepts
+  today; broadening beyond it is roadmap, not baseline.
 
 ## Product boundaries
 
