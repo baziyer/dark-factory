@@ -42,12 +42,14 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
     let codex_home = fs::canonicalize(codex_home).unwrap();
     let provider = directory.path().join("fake-codex");
     let thread_started = format!("{{\"type\":\"thread.started\",\"thread_id\":\"{THREAD_ID}\"}}");
+    let final_message = "{\"type\":\"item.completed\",\"item\":{\"id\":\"final\",\"type\":\"agent_message\",\"text\":\"codex done\"}}";
     let provider_script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$CODEX_HOME\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}' '{}'\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' \"$CODEX_HOME\" > '{}'\ncat > '{}'\nprintf '%s\\n' '{}' '{}' '{}'\n",
         provider_arguments.display(),
         provider_home.display(),
         provider_input.display(),
         thread_started,
+        final_message,
         "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"cached_input_tokens\":0,\"cache_write_input_tokens\":0,\"output_tokens\":1,\"reasoning_output_tokens\":0}}",
     );
     fs::write(&provider, provider_script).unwrap();
@@ -86,7 +88,7 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
                 parent_agent_id: None,
-                role: AgentRole::Worker,
+                role: AgentRole::Orchestrator,
                 provider: Provider::Codex,
             },
             AdoptedProviderSession::Codex {
@@ -182,15 +184,24 @@ async fn real_runner_resumes_an_adopted_codex_session_and_cleans_up() {
     );
 
     let run_id = started.run_id.clone();
-    let (events, target) = state
+    let project_for_snapshot = id::<ProjectId>("project");
+    let agent_for_snapshot = id::<AgentId>("agent");
+    let (events, target, result) = state
         .with_store(move |store| {
             Ok((
                 store.events_after(baseline, 100)?,
                 store.execution_target(&run_id)?,
+                store
+                    .webhook_snapshot(&project_for_snapshot, &agent_for_snapshot, 20)?
+                    .tasks
+                    .into_iter()
+                    .find(|task| task.id == id::<TaskId>("task"))
+                    .and_then(|task| task.result),
             ))
         })
         .await
         .unwrap();
+    assert_eq!(result.as_deref(), Some("codex done"));
     assert_eq!(target.provider_session_id.as_deref(), Some(THREAD_ID));
     let run_truth = events
         .iter()
@@ -317,7 +328,7 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
                 id: agent_id.clone(),
                 project_id: project_id.clone(),
                 parent_agent_id: None,
-                role: AgentRole::Worker,
+                role: AgentRole::Orchestrator,
                 provider: Provider::ClaudeCode,
             },
             AdoptedProviderSession::ClaudeCode {
@@ -418,15 +429,24 @@ async fn real_runner_resumes_an_adopted_claude_session_and_cleans_up() {
     );
 
     let run_id = started.run_id.clone();
-    let (events, target) = state
+    let project_for_snapshot = id::<ProjectId>("claude-project");
+    let agent_for_snapshot = id::<AgentId>("claude-agent");
+    let (events, target, result) = state
         .with_store(move |store| {
             Ok((
                 store.events_after(baseline, 100)?,
                 store.execution_target(&run_id)?,
+                store
+                    .webhook_snapshot(&project_for_snapshot, &agent_for_snapshot, 20)?
+                    .tasks
+                    .into_iter()
+                    .find(|task| task.id == id::<TaskId>("claude-task"))
+                    .and_then(|task| task.result),
             ))
         })
         .await
         .unwrap();
+    assert_eq!(result.as_deref(), Some("done"));
     assert_eq!(target.provider, Provider::ClaudeCode);
     assert_eq!(
         target.provider_session_id.as_deref(),

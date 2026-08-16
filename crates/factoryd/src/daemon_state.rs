@@ -68,6 +68,15 @@ impl DaemonState {
         let events = self.events.clone();
         self.run_with_store(move |store| {
             let (value, committed) = operation(store)?;
+            if let (Some(first), Some(last)) = (committed.first(), committed.last()) {
+                tracing::info!(
+                    target: "factoryd.state",
+                    event = "durable_events_committed",
+                    event_count = committed.len(),
+                    first_sequence = first.sequence,
+                    last_sequence = last.sequence
+                );
+            }
             for event in committed {
                 let _ = events.send(event);
             }

@@ -158,7 +158,7 @@ fn migrates_v2_acknowledgements_to_reconciliation_without_changing_recovery() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 7);
     let reconciled: Option<i64> = connection
         .query_row(
             "SELECT runner_reconciled_at_ms FROM runs WHERE id = 'run-reconciled'",

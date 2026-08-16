@@ -433,7 +433,7 @@ impl RecoveryFixture {
                     ),
                     RunnerEventEffects {
                         confirmed_provider_session_id: None,
-                        terminal_outcome: Some(TerminalOutcome::Succeeded),
+                        terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
                     },
                     7,
                 )
@@ -1142,6 +1142,19 @@ async fn fresh_and_adopted_claude_use_the_durable_provider_session_and_exact_cwd
             "private fresh Claude task body"
         };
         assert_eq!(fs::read_to_string(&scripted.input).unwrap(), expected_input);
+        let task_id = fixture.task_id.clone();
+        let result = fixture
+            .state
+            .with_store(move |store| {
+                Ok(store
+                    .list_tasks(&fixture.project_id, None, 10)?
+                    .into_iter()
+                    .find(|task| task.snapshot.id == task_id)
+                    .and_then(|task| task.result))
+            })
+            .await
+            .unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
         let baseline = fixture.baseline;
         let public = fixture
             .state

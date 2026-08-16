@@ -3,14 +3,18 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunStatus, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunId, RunStatus,
+    RunnerInstanceId, TaskId,
     local::{ErrorCode, LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    runner::{OutputStream, RUNNER_PROTOCOL_VERSION, RunnerEvent, RunnerEventEnvelope},
 };
 use factoryd::{
     daemon_state::DaemonState,
     execution,
     local_api::serve,
-    store::{NewAgent, Store},
+    store::{
+        NewAgent, RunReservation, RunnerEventEffects, RunnerEventInput, Store, TerminalOutcome,
+    },
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -113,6 +117,128 @@ async fn create_project_and_task(socket: &Path, root: &Path, task_body: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_task_list_exposes_a_real_persisted_result() {
+    with_server(|socket, state| async move {
+        let root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&root).unwrap();
+        create_project_and_task(&socket, &root, "bounded task").await;
+        request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: id::<AgentId>("agent-1"),
+                project_id: id::<ProjectId>("project-1"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+        )
+        .await;
+
+        let run_id = id::<RunId>("run-1");
+        let runner_instance_id = id::<RunnerInstanceId>("instance-1");
+        let root_string = root.to_string_lossy().into_owned();
+        let ingest_run_id = run_id.clone();
+        let ingest_instance_id = runner_instance_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let reserved = store.reserve_task_run(
+                    RunReservation {
+                        project_id: id::<ProjectId>("project-1"),
+                        task_id: id::<TaskId>("task-1"),
+                        agent_id: id::<AgentId>("agent-1"),
+                        expected_provider: Provider::Codex,
+                        run_id: run_id.clone(),
+                        parent_run_id: None,
+                        worktree: root_string.clone(),
+                        fresh_provider_session_id: None,
+                        runner_instance_id: runner_instance_id.clone(),
+                        runner_runtime: root_string.clone() + "/run",
+                    },
+                    1,
+                    10,
+                )?;
+                let ingested = store.ingest_runner_events(
+                    &ingest_run_id,
+                    &ingest_instance_id,
+                    vec![
+                        RunnerEventInput {
+                            event: RunnerEventEnvelope {
+                                protocol_version: RUNNER_PROTOCOL_VERSION,
+                                sequence: 1,
+                                occurred_at_ms: 11,
+                                event: RunnerEvent::Started { child_pid: 41 },
+                            },
+                            effects: RunnerEventEffects {
+                                confirmed_provider_session_id: None,
+                                terminal_outcome: None,
+                            },
+                        },
+                        RunnerEventInput {
+                            event: RunnerEventEnvelope {
+                                protocol_version: RUNNER_PROTOCOL_VERSION,
+                                sequence: 2,
+                                occurred_at_ms: 12,
+                                event: RunnerEvent::Output {
+                                    stream: OutputStream::Stdout,
+                                    text: "provider output".into(),
+                                    lossy: false,
+                                },
+                            },
+                            effects: RunnerEventEffects {
+                                confirmed_provider_session_id: Some(
+                                    "01a007ea-f53a-76c2-9a54-d44b3fce0fb7".into(),
+                                ),
+                                terminal_outcome: None,
+                            },
+                        },
+                        RunnerEventInput {
+                            event: RunnerEventEnvelope {
+                                protocol_version: RUNNER_PROTOCOL_VERSION,
+                                sequence: 3,
+                                occurred_at_ms: 13,
+                                event: RunnerEvent::Exited {
+                                    exit_code: Some(0),
+                                    signal: None,
+                                },
+                            },
+                            effects: RunnerEventEffects {
+                                confirmed_provider_session_id: None,
+                                terminal_outcome: Some(TerminalOutcome::Succeeded {
+                                    result: Some("Real local result".into()),
+                                }),
+                            },
+                        },
+                    ],
+                    20,
+                )?;
+                let mut events = reserved.events;
+                events.extend(ingested.events);
+                Ok(((), events))
+            })
+            .await
+            .unwrap();
+
+        match request(
+            &socket,
+            LocalRequest::ListTasks {
+                project_id: id::<ProjectId>("project-1"),
+                after_id: None,
+                limit: 10,
+            },
+        )
+        .await
+        {
+            ServerFrame::Response {
+                response: LocalResponse::Tasks { tasks, .. },
+                ..
+            } => assert_eq!(tasks[0].result.as_deref(), Some("Real local result")),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
     with_server(|socket, state| async move {
         let root = socket.parent().unwrap().join("project");
@@ -127,6 +253,7 @@ async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
                 project_id: id::<ProjectId>("project-1"),
                 parent_agent_id: None,
                 role: AgentRole::Worker,
+                provider: Provider::Codex,
             },
         )
         .await;
@@ -197,6 +324,7 @@ async fn an_invalid_worktree_is_rejected_without_reserving_the_task_or_echoing_t
                 project_id: id::<ProjectId>("project-1"),
                 parent_agent_id: None,
                 role: AgentRole::Worker,
+                provider: Provider::Codex,
             },
         )
         .await;
@@ -248,12 +376,12 @@ async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
     with_server(|socket, state| async move {
         let root = socket.parent().unwrap().join("project");
         std::fs::create_dir(&root).unwrap();
-        create_project_and_task(&socket, &root, "private migration task").await;
+        create_project_and_task(&socket, &root, "private Claude task").await;
         state
             .commit_and_publish(|store| {
                 let (agent, event) = store.create_agent(
                     NewAgent {
-                        id: id::<AgentId>("imported-claude"),
+                        id: id::<AgentId>("claude-agent"),
                         project_id: id::<ProjectId>("project-1"),
                         parent_agent_id: None,
                         role: AgentRole::Worker,
@@ -270,7 +398,7 @@ async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
             LocalRequest::StartTask {
                 project_id: id::<ProjectId>("project-1"),
                 task_id: id::<TaskId>("task-1"),
-                agent_id: id::<AgentId>("imported-claude"),
+                agent_id: id::<AgentId>("claude-agent"),
                 parent_run_id: None,
                 worktree: root.to_string_lossy().into_owned(),
             },
@@ -292,9 +420,25 @@ async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
         assert!(target.provider_session_id.is_some());
 
         let response = serde_json::to_string(&accepted).unwrap();
-        assert!(!response.contains("private migration task"));
+        assert!(!response.contains("private Claude task"));
         assert!(!response.contains("claude_code"));
         assert!(!response.contains("session"));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscription_usage_is_available_on_the_local_control_plane() {
+    with_server(|socket, _state| async move {
+        let response = request(&socket, LocalRequest::SubscriptionUsage).await;
+        assert!(matches!(
+            response,
+            ServerFrame::Response {
+                protocol_version: PROTOCOL_VERSION,
+                response: LocalResponse::SubscriptionUsage { ref usage },
+            } if usage.providers.is_empty()
+                && usage.overall_severity == factory_core::local::SubscriptionSeverity::Ok
+        ));
     })
     .await;
 }

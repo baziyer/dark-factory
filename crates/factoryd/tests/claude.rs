@@ -602,6 +602,9 @@ fn previews_are_utf8_bounded_and_unknown_additive_events_are_ignored() {
     let mut observations = decoder.push(&stdout(&stream));
     let _ = decoder.push(&exited(Some(0), None));
     let finished = decoder.finish();
+    let final_preview = finished.final_preview.as_ref().unwrap();
+    assert!(final_preview.truncated);
+    assert!(final_preview.text.len() <= MAX_CLAUDE_PREVIEW_BYTES);
     observations.extend(finished.observations);
     assert!(matches!(finished.outcome, Outcome::Succeeded { .. }));
     let preview = observations.iter().find_map(|event| match event {

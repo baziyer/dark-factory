@@ -321,6 +321,13 @@ fn decoder_reassembles_all_boundaries_and_accepts_a_valid_final_line() {
         observations.extend(decoder.push(&stdout(&unicode[split..])));
         observations.extend(decoder.push(&exited(Some(0), None)));
         let finished = decoder.finish();
+        assert_eq!(
+            finished
+                .final_preview
+                .as_ref()
+                .map(|preview| preview.text.as_str()),
+            Some("hello 🏭")
+        );
         observations.extend(finished.observations);
         assert!(matches!(finished.outcome, Outcome::Succeeded { .. }));
         assert!(observations.iter().any(|observation| matches!(

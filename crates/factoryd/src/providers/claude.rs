@@ -316,6 +316,7 @@ struct ToolState {
 pub struct Finished {
     pub observations: Vec<Observation>,
     pub outcome: Outcome,
+    pub final_preview: Option<BoundedText>,
 }
 
 /// Incremental, bounded decoder for one prepared Claude invocation.
@@ -417,6 +418,10 @@ impl Decoder {
             observations.extend(self.parse_line(&line));
         }
 
+        let final_preview = self
+            .result
+            .as_ref()
+            .and_then(|result| result.preview.clone());
         let outcome = if self.terminal.is_none() {
             self.failed(
                 FailureReason::Incomplete,
@@ -468,6 +473,7 @@ impl Decoder {
         Finished {
             observations,
             outcome,
+            final_preview,
         }
     }
 

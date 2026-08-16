@@ -269,6 +269,7 @@ enum RunnerTerminal {
 pub struct Finished {
     pub observations: Vec<Observation>,
     pub outcome: Outcome,
+    pub final_preview: Option<BoundedText>,
 }
 
 /// Incremental, bounded normalizer for one Codex attempt.
@@ -284,6 +285,7 @@ pub struct Decoder {
     turn_started: bool,
     completed_usage: Option<TokenUsage>,
     provider_failed: bool,
+    final_preview: Option<BoundedText>,
     terminal: Option<RunnerTerminal>,
     item_events: HashSet<(String, ItemPhase)>,
     violations: HashSet<ProtocolViolation>,
@@ -321,6 +323,7 @@ impl Decoder {
             turn_started: false,
             completed_usage: None,
             provider_failed: false,
+            final_preview: None,
             terminal: None,
             item_events: HashSet::new(),
             violations: HashSet::new(),
@@ -407,6 +410,7 @@ impl Decoder {
         Finished {
             observations,
             outcome,
+            final_preview: self.final_preview,
         }
     }
 
@@ -574,6 +578,9 @@ impl Decoder {
         } else {
             None
         };
+        if kind == ItemKind::AgentMessage && phase == ItemPhase::Completed {
+            self.final_preview = preview.clone();
+        }
         vec![Observation::ItemChanged {
             id: id.to_owned(),
             kind,
