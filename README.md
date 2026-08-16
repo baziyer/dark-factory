@@ -69,13 +69,29 @@ cargo run -p factoryctl -- task cancel --project PROJECT_ID --task TASK_ID
 cargo run -p factoryctl -- task update --project PROJECT_ID --task TASK_ID --title "Renamed"
 cargo run -p factoryctl -- task delete --project PROJECT_ID --task TASK_ID
 cargo run -p factoryctl -- run stop --project PROJECT_ID --run RUN_ID
+cargo run -p factoryctl -- agent pause --project PROJECT_ID --agent AGENT_ID
+cargo run -p factoryctl -- agent resume --project PROJECT_ID --agent AGENT_ID
+cargo run -p factoryctl -- task done --project PROJECT_ID --task TASK_ID --result "Done"
+cargo run -p factoryctl -- task blocked --project PROJECT_ID --task TASK_ID --reason "Needs input"
+cargo run -p factoryctl -- session list --project PROJECT_ID
+cargo run -p factoryctl -- session stop --project PROJECT_ID --session SESSION_ID
 cargo run -p factoryctl -- agent delete --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- project delete --project PROJECT_ID
 cargo run -p factoryctl -- attach --project PROJECT_ID --session SESSION_ID
+cargo run -p factoryctl -- attach --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
 cargo run -p factory-tui
 ```
+
+`task done`/`task blocked` are meant to be called by an agent itself, from
+inside its own session (they take no `--agent` flag — identity comes from
+the session's own environment, see "Provider hooks" below). Every
+`--project` may be omitted if `$DARK_FACTORY_PROJECT` is set, and `agent
+message --from` defaults to `$DARK_FACTORY_AGENT` when unset — both are set
+automatically inside a session's environment (once sessions are wired up;
+see below), so an agent coordinating via `factoryctl` does not need to
+repeat its own identity on every call.
 
 Every command, group, and subcommand accepts `--help`/`-h` and prints usage
 text to stdout without contacting the daemon (for example `factoryctl task
@@ -177,6 +193,67 @@ live bytes, forwards stdin as input, and forwards local window-size changes as
 resizes. Press `Ctrl-]` to detach; the terminal is restored on detach, EOF, or
 an unexpected exit. This is CLI-only, separate from `factory-tui`'s own
 embedded agent panes.
+
+## Provider hooks and resident sessions
+
+Dark Factory's target lifecycle is one resident, interactive `claude`/`codex`
+process per agent (a PTY-backed *session*), inside which many tasks run as
+*episodes* — not a fresh non-interactive process per task. That session
+delivery/dispatch machinery is being built incrementally; this section
+documents the piece that exists now: how a resident session for either
+provider would be launched, and how it reports back.
+
+`crates/factoryd/src/providers/{claude,codex}.rs` each implement a small
+`Provider` trait (`crates/factoryd/src/providers/mod.rs`,
+[`docs/providers.md`](docs/providers.md)) whose `spawn_spec` builds the
+exact interactive argv and any generated configuration a session needs —
+no API keys; both providers authenticate as subscription CLI apps:
+
+- **Claude**: `claude --settings <agent-dir>/claude-settings.json
+  (--session-id <uuid> | --resume <id>) [--model M] [--permission-mode M]`.
+  `claude-settings.json` is generated fresh per session (mode `0600`) with
+  hooks for `SessionStart`, `UserPromptSubmit`, `PreToolUse`/`PostToolUse`
+  (matching every tool), `Notification`, `Stop`, `SubagentStop`, and
+  `SessionEnd`, each pointing at `factoryctl hook --token-file <path>
+  <Event>`. No `-p`, `--output-format`, or `--safe-mode` — those are
+  print-mode-only or disable hooks outright.
+- **Codex**: `codex --dangerously-bypass-hook-trust [--model M] [-c
+  approval_policy="<mode>"] [resume <thread-id>]`, with `CODEX_HOME` pointed
+  at a per-*agent* (not per-session, so `resume` can find its own rollout
+  file across a restart) seeded home under
+  `$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/`:
+  copies the operator's real `~/.codex/config.toml` if present (else a
+  minimal one) and symlinks `auth.json`, then idempotently rewrites a hooks
+  block between `# --- dark-factory hooks BEGIN/END ---` markers on every
+  spawn — the rest of the file (model, provider, trust settings) is left
+  alone. `--dangerously-bypass-hook-trust` is unconditional: the hooks are
+  100% daemon-authored into an isolated home the operator never hand-edits,
+  which already is the vetting Codex's normal hook-trust prompt asks for.
+
+Every hook fires `factoryctl hook --token-file PATH <Event>`: it reads the
+hook's JSON payload from stdin (bounded to 64 KiB), forwards it plus the
+token file's contents to the daemon as one request, and prints the
+daemon's reply verbatim to stdout. It **always exits 0**, printing `{}` on
+any problem — unreadable token file, malformed stdin, or an unreachable,
+slow, or erroring daemon (5 second timeout) — because a broken or slow hook
+must never wedge the operator's live Claude Code or Codex session:
+
+```sh
+cargo run -p factoryctl -- hook --token-file RUNTIME_DIR/hook.token Stop
+```
+
+The per-session hook token is 32 random bytes, lowercase-hex-encoded to a
+64-character file (mode `0600`, generated by
+`providers::hooks::write_hook_token`) — never on argv or in an environment
+variable, matching the existing runner sandboxing philosophy.
+
+None of this is wired into dispatch yet: `factoryd` does not currently call
+`spawn_spec` to launch a resident session, and the daemon's `provider_hook`,
+`task done`/`blocked`, `agent pause`/`resume`, and `session list`/`stop`
+handlers are present on the wire (`factoryctl` already has commands for all
+of them) but respond "not implemented" until that piece lands. See
+[docs/providers.md](docs/providers.md) for the provider boundary itself and
+how to add a new provider.
 
 ## The Minerva webhook endpoint
 
