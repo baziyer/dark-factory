@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

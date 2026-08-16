@@ -239,6 +239,37 @@ pub enum LocalRequest {
         run_id: RunId,
         grace_ms: u64,
     },
+    /// Attaches to a terminal-mode run's retained-then-live PTY output on
+    /// this connection. The connection commits to terminal-proxy mode: after
+    /// the first `AttachTerminal`, only more `AttachTerminal` requests are
+    /// accepted on it (a client may attach several runs on one connection),
+    /// and `ServerFrame::TerminalOutput` frames for every attached run are
+    /// multiplexed onto it, tagged by `run_id`. Detaching happens implicitly
+    /// on disconnect. `TerminalInput` and `ResizeTerminal` are independent,
+    /// ordinary one-shot requests (like `StopRun`); they do not need to run
+    /// on an attached connection.
+    AttachTerminal {
+        project_id: ProjectId,
+        run_id: RunId,
+        since_offset: u64,
+    },
+    /// Writes operator input to a run's PTY. An ordinary one-shot request:
+    /// it does not require a prior or concurrent `AttachTerminal`, on this
+    /// connection or any other. `bytes` is base64-encoded raw bytes; opaque
+    /// to the daemon.
+    TerminalInput {
+        project_id: ProjectId,
+        run_id: RunId,
+        bytes: String,
+    },
+    /// Resizes a run's PTY. An ordinary one-shot request, like
+    /// `TerminalInput`.
+    ResizeTerminal {
+        project_id: ProjectId,
+        run_id: RunId,
+        cols: u16,
+        rows: u16,
+    },
     ListRuns {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -343,6 +374,12 @@ pub enum LocalResponse {
     RunStopped {
         run_id: RunId,
     },
+    TerminalInputAccepted {
+        run_id: RunId,
+    },
+    TerminalResized {
+        run_id: RunId,
+    },
     Tasks {
         tasks: Vec<TaskDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -384,6 +421,15 @@ pub enum ServerFrame {
         protocol_version: u16,
         event: EventEnvelope,
     },
+    /// One chunk of retained-then-live PTY output for a run attached on
+    /// this connection via `AttachTerminal`. `bytes` is base64-encoded raw
+    /// bytes; opaque to every layer between the runner and the client.
+    TerminalOutput {
+        protocol_version: u16,
+        run_id: RunId,
+        offset: u64,
+        bytes: String,
+    },
 }
 
 impl ServerFrame {
@@ -394,6 +440,9 @@ impl ServerFrame {
                 protocol_version, ..
             }
             | Self::Event {
+                protocol_version, ..
+            }
+            | Self::TerminalOutput {
                 protocol_version, ..
             } => *protocol_version,
         }

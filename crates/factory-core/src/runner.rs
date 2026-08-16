@@ -1,5 +1,6 @@
 //! Stable, provider-blind control and event wire for one runner process.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 
 use crate::{RunId, RunnerInstanceId};
@@ -16,6 +17,53 @@ pub const MAX_RUNNER_ERROR_BYTES: usize = 16 * 1024;
 pub const MAX_RUNNER_SPOOL_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum task bytes transferred from the daemon to a new runner over stdin.
 pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
+/// Maximum raw bytes accepted in one `TerminalInput` request, before base64
+/// encoding. Larger paste operations must be split across requests.
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+/// Maximum raw PTY bytes read into one `TerminalOutput` chunk, before base64
+/// encoding. Comfortably fits inside [`MAX_RUNNER_FRAME_BYTES`] once encoded.
+pub const MAX_TERMINAL_OUTPUT_CHUNK_BYTES: usize = 16 * 1024;
+/// Maximum raw bytes retained in one terminal log file before it is rotated.
+///
+/// The retained terminal log (`terminal.log`) is bounded and rotates exactly
+/// once: when the active file reaches this size, it is renamed to
+/// `terminal.log.1` (replacing any earlier rotation) and a fresh empty
+/// `terminal.log` is opened. Up to two files' worth of raw PTY bytes are
+/// retained at a time; older bytes are dropped for good.
+pub const MAX_TERMINAL_LOG_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Terminal dimensions for an interactive PTY-mode run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Encodes raw bytes for a binary-safe JSON string field.
+///
+/// PTY output and operator keystrokes are not guaranteed to be valid UTF-8
+/// (raw control bytes, partial multi-byte sequences, arbitrary pasted
+/// binary). Standard base64 keeps the wire format plain newline-delimited
+/// JSON, matching every other runner frame, instead of adding a second
+/// binary framing scheme just for terminal bytes.
+#[must_use]
+pub fn encode_terminal_bytes(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+/// Decodes bytes previously produced by [`encode_terminal_bytes`].
+///
+/// # Errors
+///
+/// Returns [`InvalidTerminalBytes`] when `encoded` is not valid standard
+/// base64.
+pub fn decode_terminal_bytes(encoded: &str) -> Result<Vec<u8>, InvalidTerminalBytes> {
+    STANDARD.decode(encoded).map_err(|_| InvalidTerminalBytes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("terminal bytes are not valid base64")]
+pub struct InvalidTerminalBytes;
 
 /// One authenticated, newline-delimited request sent to a runner.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -55,6 +103,25 @@ pub enum RunnerRequest {
     AcknowledgeExit {
         command_id: String,
         terminal_sequence: i64,
+    },
+    /// Attaches to a terminal-mode run's retained PTY output, replaying from
+    /// `since_offset` and then streaming live bytes. Rejected with
+    /// [`RunnerErrorCode::InvalidRequest`] on a run that was not launched
+    /// with a PTY.
+    AttachTerminal {
+        since_offset: u64,
+    },
+    /// Writes operator input to the PTY master. `bytes` is
+    /// [`encode_terminal_bytes`]-encoded and at most
+    /// [`MAX_TERMINAL_INPUT_BYTES`] once decoded.
+    TerminalInput {
+        bytes: String,
+    },
+    /// Resizes the PTY, which delivers `SIGWINCH` to the foreground process
+    /// group through the controlling terminal.
+    ResizeTerminal {
+        cols: u16,
+        rows: u16,
     },
 }
 
@@ -97,6 +164,14 @@ pub enum RunnerFrame {
         code: RunnerErrorCode,
         message: String,
     },
+    /// One chunk of retained-then-live PTY output for an attached terminal
+    /// session. `offset` is the byte-stream position of `bytes[0]`; the next
+    /// expected offset is `offset + bytes.len()` after decoding.
+    TerminalOutput {
+        protocol_version: u16,
+        offset: u64,
+        bytes: String,
+    },
 }
 
 impl RunnerFrame {
@@ -116,6 +191,9 @@ impl RunnerFrame {
                 protocol_version, ..
             }
             | Self::Error {
+                protocol_version, ..
+            }
+            | Self::TerminalOutput {
                 protocol_version, ..
             } => *protocol_version,
         }
