@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::BTreeMap,
     sync::mpsc::{self, Receiver, Sender},
     thread,
@@ -9,7 +10,7 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, TaskDetail, TaskId, TaskStatus,
     local::{
-        LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
+        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
         MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame, SubscriptionSeverity,
         SubscriptionUsageStatus,
     },
@@ -39,7 +40,7 @@ pub fn run(client: Client) -> Result<(), String> {
 enum UiMessage {
     Snapshot {
         snapshot: Snapshot,
-        event_sequence: i64,
+        event_sequence: Option<i64>,
         refresh_id: u64,
     },
     Event(EventEnvelope),
@@ -73,7 +74,7 @@ struct FactoryApp {
     selected_agent: Option<AgentId>,
     connection: ConnectionState,
     notice: Option<String>,
-    last_event_sequence: i64,
+    last_event_sequence: Option<i64>,
     last_snapshot_refresh_id: u64,
     next_refresh_id: u64,
     create_project: Option<ProjectForm>,
@@ -136,7 +137,7 @@ impl FactoryApp {
             selected_agent: None,
             connection: ConnectionState::Loading,
             notice: None,
-            last_event_sequence: -1,
+            last_event_sequence: None,
             last_snapshot_refresh_id: 0,
             next_refresh_id: 1,
             create_project: None,
@@ -163,7 +164,10 @@ impl FactoryApp {
                         continue;
                     }
                     self.merge_snapshot(snapshot);
-                    self.last_event_sequence = self.last_event_sequence.max(event_sequence);
+                    self.last_event_sequence = match (self.last_event_sequence, event_sequence) {
+                        (Some(current), Some(incoming)) => Some(current.max(incoming)),
+                        (None, incoming) | (incoming, None) => incoming,
+                    };
                     self.last_snapshot_refresh_id = refresh_id;
                     if self.selected_project.is_none() {
                         self.selected_project = self.projects.keys().next().cloned();
@@ -171,13 +175,16 @@ impl FactoryApp {
                     self.connection = ConnectionState::Live;
                 }
                 UiMessage::Event(event) => {
-                    if event.sequence <= self.last_event_sequence {
+                    if self
+                        .last_event_sequence
+                        .is_some_and(|sequence| event.sequence <= sequence)
+                    {
                         continue;
                     }
                     let task_was_known = task_id_from_event(&event)
                         .is_some_and(|task_id| self.tasks.contains_key(task_id));
                     let needs_task_detail = task_event_needs_detail(task_was_known, &event);
-                    self.last_event_sequence = event.sequence;
+                    self.last_event_sequence = Some(event.sequence);
                     let refresh_details = event_requires_detail_refresh(&event);
                     self.apply_event(event);
                     if needs_task_detail {
@@ -260,7 +267,7 @@ impl FactoryApp {
             let replace = self
                 .projects
                 .get(&project.id)
-                .is_none_or(|current| project.updated_at_ms >= current.updated_at_ms);
+                .is_none_or(|current| project.updated_at_ms > current.updated_at_ms);
             if replace {
                 self.projects.insert(project.id.clone(), project);
             }
@@ -276,7 +283,7 @@ impl FactoryApp {
             let replace = self
                 .agents
                 .get(&agent.id)
-                .is_none_or(|current| agent.updated_at_ms >= current.updated_at_ms);
+                .is_none_or(|current| agent.updated_at_ms > current.updated_at_ms);
             if replace {
                 self.agents.insert(agent.id.clone(), agent);
             }
@@ -285,7 +292,7 @@ impl FactoryApp {
             let replace = self
                 .runs
                 .get(&run.id)
-                .is_none_or(|current| run.updated_at_ms >= current.updated_at_ms);
+                .is_none_or(|current| run.updated_at_ms > current.updated_at_ms);
             if replace {
                 self.runs.insert(run.id.clone(), run);
             }
@@ -856,17 +863,50 @@ fn task_event_ids(envelope: Option<&EventEnvelope>) -> Option<(ProjectId, TaskId
 
 fn should_apply_snapshot(
     current_refresh_id: u64,
-    current_event_sequence: i64,
+    current_event_sequence: Option<i64>,
     incoming_refresh_id: u64,
-    incoming_event_sequence: i64,
+    incoming_event_sequence: Option<i64>,
 ) -> bool {
-    incoming_refresh_id >= current_refresh_id && incoming_event_sequence >= current_event_sequence
+    if incoming_refresh_id < current_refresh_id {
+        return false;
+    }
+    match (current_event_sequence, incoming_event_sequence) {
+        (Some(current), Some(incoming)) => incoming >= current,
+        _ => true,
+    }
 }
 
 fn merge_task_detail(current: &mut TaskDetail, incoming: TaskDetail) {
-    if incoming.snapshot.updated_at_ms >= current.snapshot.updated_at_ms {
-        *current = incoming;
+    match incoming
+        .snapshot
+        .updated_at_ms
+        .cmp(&current.snapshot.updated_at_ms)
+    {
+        Ordering::Greater => *current = incoming,
+        Ordering::Equal => {
+            if current.body.is_empty() && !incoming.body.is_empty() {
+                current.body = incoming.body;
+            }
+            if current.result.is_none() && incoming.result.is_some() {
+                current.result = incoming.result;
+            }
+        }
+        Ordering::Less => {}
     }
+}
+
+fn snapshot_heads_are_stable(before: Option<i64>, after: Option<i64>) -> bool {
+    before == after
+}
+
+fn is_unsupported_optional_request(response: &LocalResponse) -> bool {
+    matches!(
+        response,
+        LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            ..
+        }
+    )
 }
 
 fn short_id(prefix: &str) -> String {
@@ -919,9 +959,7 @@ fn spawn_refresh(
     refresh_id: u64,
 ) {
     thread::spawn(move || {
-        let result = load_snapshot(&client).and_then(|snapshot| {
-            load_event_sequence(&client).map(|event_sequence| (snapshot, event_sequence))
-        });
+        let result = load_consistent_snapshot(&client);
         let message = result.map_or_else(UiMessage::StreamFailed, |(snapshot, event_sequence)| {
             UiMessage::Snapshot {
                 snapshot,
@@ -934,6 +972,18 @@ fn spawn_refresh(
     });
 }
 
+fn load_consistent_snapshot(client: &Client) -> Result<(Snapshot, Option<i64>), String> {
+    for _ in 0..3 {
+        let before = load_event_sequence(client)?;
+        let snapshot = load_snapshot(client)?;
+        let after = load_event_sequence(client)?;
+        if snapshot_heads_are_stable(before, after) {
+            return Ok((snapshot, after.or(before)));
+        }
+    }
+    Err("daemon state changed while loading the UI snapshot".into())
+}
+
 fn spawn_task_detail(
     client: Client,
     sender: Sender<UiMessage>,
@@ -942,21 +992,33 @@ fn spawn_task_detail(
     task_id: TaskId,
 ) {
     thread::spawn(move || {
-        let result = match request_response(
-            &client,
-            LocalRequest::GetTask {
-                project_id,
-                task_id,
-            },
-        ) {
-            Ok(LocalResponse::Task { task }) => Ok(task),
-            Ok(LocalResponse::Error { message, .. }) => Err(message),
-            Ok(_) => Err("daemon returned an unexpected task detail response".into()),
-            Err(error) => Err(error),
-        };
+        let result = load_task_detail(&client, project_id, task_id);
         let _ = sender.send(UiMessage::TaskDetail(result));
         context.request_repaint();
     });
+}
+
+fn load_task_detail(
+    client: &Client,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<TaskDetail, String> {
+    let response = request_response(
+        client,
+        LocalRequest::GetTask {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+        },
+    )?;
+    match response {
+        LocalResponse::Task { task } => Ok(task),
+        response if is_unsupported_optional_request(&response) => load_tasks(client, &project_id)?
+            .into_iter()
+            .find(|task| task.snapshot.id == task_id)
+            .ok_or_else(|| "task was not found while hydrating the UI".into()),
+        LocalResponse::Error { message, .. } => Err(message),
+        _ => Err("daemon returned an unexpected task detail response".into()),
+    }
 }
 
 fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
@@ -1031,9 +1093,10 @@ fn load_usage(client: &Client) -> Result<SubscriptionUsageStatus, String> {
     }
 }
 
-fn load_event_sequence(client: &Client) -> Result<i64, String> {
+fn load_event_sequence(client: &Client) -> Result<Option<i64>, String> {
     match request_response(client, LocalRequest::LatestEventSequence)? {
-        LocalResponse::EventHead { sequence } => Ok(sequence),
+        LocalResponse::EventHead { sequence } => Ok(Some(sequence)),
+        response if is_unsupported_optional_request(&response) => Ok(None),
         _ => Err("daemon returned an unexpected event-head response".into()),
     }
 }
@@ -1174,9 +1237,12 @@ mod tests {
 
     #[test]
     fn older_snapshot_generations_and_event_heads_are_rejected() {
-        assert!(!super::should_apply_snapshot(4, 10, 3, 11));
-        assert!(!super::should_apply_snapshot(4, 10, 5, 9));
-        assert!(super::should_apply_snapshot(4, 10, 5, 10));
+        assert!(!super::should_apply_snapshot(4, Some(10), 3, Some(11)));
+        assert!(!super::should_apply_snapshot(4, Some(10), 5, Some(9)));
+        assert!(super::should_apply_snapshot(4, Some(10), 5, Some(10)));
+        assert!(super::snapshot_heads_are_stable(Some(10), Some(10)));
+        assert!(!super::snapshot_heads_are_stable(Some(10), Some(11)));
+        assert!(super::snapshot_heads_are_stable(None, None));
     }
 
     #[test]
@@ -1210,6 +1276,18 @@ mod tests {
         super::merge_task_detail(&mut current, older);
         assert_eq!(current.snapshot.status, TaskStatus::Succeeded);
         assert_eq!(current.result.as_deref(), Some("new result"));
+
+        let same_timestamp = TaskDetail {
+            snapshot: TaskSnapshot {
+                status: TaskStatus::Queued,
+                ..current.snapshot.clone()
+            },
+            body: "same-time stale body".into(),
+            result: None,
+        };
+        super::merge_task_detail(&mut current, same_timestamp);
+        assert_eq!(current.snapshot.status, TaskStatus::Succeeded);
+        assert_eq!(current.result.as_deref(), Some("new result"));
     }
 
     #[test]
@@ -1236,6 +1314,18 @@ mod tests {
 
         assert!(super::task_event_needs_detail(false, &event));
         assert!(!super::task_event_needs_detail(true, &event));
+    }
+
+    #[test]
+    fn invalid_request_event_head_errors_are_legacy_compatible() {
+        let response = factory_core::local::LocalResponse::Error {
+            code: factory_core::local::ErrorCode::InvalidRequest,
+            message: "unknown request".into(),
+        };
+        assert!(super::is_unsupported_optional_request(&response));
+        assert!(!super::is_unsupported_optional_request(
+            &factory_core::local::LocalResponse::Health
+        ));
     }
 
     #[test]
