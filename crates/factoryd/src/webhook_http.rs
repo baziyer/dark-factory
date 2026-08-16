@@ -49,7 +49,6 @@ const MAX_TITLE_CHARS: usize = 240;
 const MAX_STORED_TITLE_BYTES: usize = 160;
 const MAX_FROM_CHARS: usize = 240;
 const MAX_DOCUMENT_BYTES: usize = 128 * 1024;
-const GLOBAL_RATE_LIMIT: u64 = 120;
 const ENDPOINT_RATE_LIMIT: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const GENERIC_SECRET_HEADER: &str = "x-dark-factory-webhook-secret";
@@ -426,16 +425,12 @@ impl FixedWindow {
 
 #[derive(Default)]
 struct RateLimits {
-    global: FixedWindow,
     endpoints: HashMap<String, FixedWindow>,
     unknown: FixedWindow,
 }
 
 impl RateLimits {
     fn allow(&mut self, now: Instant, endpoint_id: Option<&str>) -> bool {
-        if !self.global.allow(now, GLOBAL_RATE_LIMIT) {
-            return false;
-        }
         match endpoint_id {
             Some(endpoint_id) => self
                 .endpoints

@@ -19,6 +19,7 @@ use tower::ServiceExt;
 
 const LEGACY_SECRET: &str = "private-legacy-secret-sentinel";
 const LAB_SECRET: &str = "private-lab-secret-sentinel";
+const THIRD_SECRET: &str = "private-third-secret-sentinel";
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
@@ -56,23 +57,48 @@ fn config_json(bind: &str, legacy_secret: &std::path::Path, lab_secret: &std::pa
     })
 }
 
+fn config_json_three(
+    bind: &str,
+    legacy_secret: &std::path::Path,
+    lab_secret: &std::path::Path,
+    third_secret: &std::path::Path,
+) -> Value {
+    let mut config = config_json(bind, legacy_secret, lab_secret);
+    config["endpoints"].as_array_mut().unwrap().push(json!({
+        "id": "third",
+        "wireProfile": "factory_v1",
+        "secretFile": third_secret,
+        "projectId": "third-project",
+        "orchestratorAgentId": "third-agent"
+    }));
+    config
+}
+
 fn fixture() -> (tempfile::TempDir, std::path::PathBuf, DaemonState) {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     let legacy_secret = directory.path().join("legacy.secret");
     let lab_secret = directory.path().join("lab.secret");
+    let third_secret = directory.path().join("third.secret");
     private_write(&legacy_secret, LEGACY_SECRET);
     private_write(&lab_secret, LAB_SECRET);
+    private_write(&third_secret, THIRD_SECRET);
     let config_path = directory.path().join("webhooks.json");
     private_write(
         &config_path,
-        serde_json::to_vec_pretty(&config_json("127.0.0.1:0", &legacy_secret, &lab_secret))
-            .unwrap(),
+        serde_json::to_vec_pretty(&config_json_three(
+            "127.0.0.1:0",
+            &legacy_secret,
+            &lab_secret,
+            &third_secret,
+        ))
+        .unwrap(),
     );
 
     let mut store = Store::open_in_memory().unwrap();
     for (project, name, root, orchestrator) in [
         ("factory", "Factory", "/tmp/factory", "god"),
         ("lab-project", "Lab", "/tmp/lab", "foreman"),
+        ("third-project", "Third", "/tmp/third", "third-agent"),
     ] {
         store
             .create_project(
@@ -267,6 +293,45 @@ async fn one_endpoint_cannot_exhaust_another_endpoints_request_budget() {
         .await
         .unwrap();
     assert_eq!(independent.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn three_configured_endpoints_keep_independent_request_budgets() {
+    let (_directory, config_path, state) = fixture();
+    let config = load_webhook_config(&config_path).unwrap();
+    let router = webhook_router(state, config, Arc::new(WebhookHttpMetrics::default()))
+        .await
+        .unwrap();
+
+    for (path, header, secret) in [
+        ("/minerva/snapshot", "x-md-webhook-secret", LEGACY_SECRET),
+        ("/lab/snapshot", "x-dark-factory-webhook-secret", LAB_SECRET),
+    ] {
+        for _ in 0..60 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::get(path)
+                        .header(header, secret)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    let third = router
+        .oneshot(
+            Request::get("/third/snapshot")
+                .header("x-dark-factory-webhook-secret", THIRD_SECRET)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(third.status(), StatusCode::OK);
 }
 
 #[test]
