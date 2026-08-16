@@ -27,7 +27,9 @@ CLI, native UI, and webhooks.
 - simulating an office or rendering continuous animation;
 - parsing terminal escape sequences when a provider exposes structured output;
 - automatic scheduling before explicit local operation earns it;
-- provider terminals, office animation, or a browser runtime inside the UI;
+- provider-specific terminals, office animation, or a browser runtime inside
+  the UI; the native UI exposes only bounded, local runner output for direct
+  inspection and an explicit stop request for the selected run;
 - a plugin framework or public network listener in the first launch.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants that constrain each
@@ -118,13 +120,14 @@ daemon.
 
 V1 is intentionally explicit: create projects, agents, and tasks, then choose
 the agent and worktree for each start. The native UI provides the same control
-surface as the JSON CLI plus project/task/agent/run inspection, observer health,
+surface as the JSON CLI plus project/task/agent/run inspection, bounded local
+runner output and stop control, assignment-derived queues, observer health,
 subscription capacity, and recent durable events.
 
 Deferred work is narrow and evidence-led:
 
 - scheduling and dependency-driven allocation;
-- stop/pause/retry controls with durable intent;
+- pause/retry controls and durable stop intent;
 - a separate agent function axis (`design`, `execution`, `operations`) shown as
   Studio, Workshop, and Control Room, without changing the authority roles
   `orchestrator` and `worker`;

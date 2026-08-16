@@ -11,7 +11,7 @@ use factory_core::{
     Provider, RunId, RunSnapshot, TaskDetail, TaskId, TaskStatus,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
-        MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame, SubscriptionSeverity,
+        MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RunTerminal, ServerFrame, SubscriptionSeverity,
         SubscriptionUsageStatus,
     },
 };
@@ -46,6 +46,7 @@ enum UiMessage {
     },
     Event(EventEnvelope),
     TaskDetail(Result<TaskDetail, String>),
+    RunTerminal(Result<RunTerminal, String>),
     SubscriptionCaughtUp,
     Operation(Result<String, String>),
     StreamFailed(String),
@@ -73,6 +74,8 @@ struct FactoryApp {
     selected_project: Option<ProjectId>,
     selected_task: Option<TaskId>,
     selected_agent: Option<AgentId>,
+    terminal_run_id: Option<RunId>,
+    terminal: Option<RunTerminal>,
     connection: ConnectionState,
     notice: Option<String>,
     last_event_sequence: Option<i64>,
@@ -136,6 +139,8 @@ impl FactoryApp {
             selected_project: None,
             selected_task: None,
             selected_agent: None,
+            terminal_run_id: None,
+            terminal: None,
             connection: ConnectionState::Loading,
             notice: None,
             last_event_sequence: None,
@@ -212,6 +217,13 @@ impl FactoryApp {
                             self.tasks.insert(task_id, task);
                         }
                     }
+                    Err(message) => self.notice = Some(message),
+                },
+                UiMessage::RunTerminal(result) => match result {
+                    Ok(terminal) if self.terminal_run_id.as_ref() == Some(&terminal.run_id) => {
+                        self.terminal = Some(terminal);
+                    }
+                    Ok(_) => {}
                     Err(message) => self.notice = Some(message),
                 },
                 UiMessage::SubscriptionCaughtUp => self.refresh(context),
@@ -355,6 +367,14 @@ impl FactoryApp {
             .and_then(|run| self.runs.get(run))
     }
 
+    fn run_for_task(&self, task: &TaskDetail) -> Option<&RunSnapshot> {
+        latest_run_for_task(
+            self.runs.values(),
+            &task.snapshot.project_id,
+            &task.snapshot.id,
+        )
+    }
+
     fn top_bar(&mut self, context: &egui::Context) {
         egui::TopBottomPanel::top("top_bar").show(context, |ui| {
             ui.horizontal(|ui| {
@@ -444,6 +464,8 @@ impl FactoryApp {
                         self.selected_project = Some(project.id.clone());
                         self.selected_task = None;
                         self.selected_agent = None;
+                        self.terminal_run_id = None;
+                        self.terminal = None;
                         self.start = StartForm {
                             agent_id: String::new(),
                             worktree: project.root.clone(),
@@ -462,13 +484,21 @@ impl FactoryApp {
                 ui.separator();
                 if let Some(task_id) = self.selected_task.clone() {
                     if let Some(task) = self.tasks.get(&task_id).cloned() {
+                        let run = self.run_for_task(&task).cloned();
                         self.task_inspector(ui, context, &task);
+                        if let Some(run) = run {
+                            self.terminal_panel(ui, context, &run);
+                        }
                         return;
                     }
                 }
                 if let Some(agent_id) = self.selected_agent.clone() {
-                    if let Some(agent) = self.agents.get(&agent_id) {
-                        agent_inspector(ui, agent, self.run_for_agent(agent));
+                    if let Some(agent) = self.agents.get(&agent_id).cloned() {
+                        let run = self.run_for_agent(&agent).cloned();
+                        agent_inspector(ui, &agent, run.as_ref());
+                        if let Some(run) = run {
+                            self.terminal_panel(ui, context, &run);
+                        }
                         return;
                     }
                 }
@@ -479,6 +509,7 @@ impl FactoryApp {
     fn task_inspector(&mut self, ui: &mut egui::Ui, context: &egui::Context, task: &TaskDetail) {
         ui.heading(&task.snapshot.title);
         ui.label(format!("{} · {:?}", task.snapshot.id, task.snapshot.status));
+        ui.label(task_assignee_text(task));
         ui.separator();
         ui.label(RichText::new("Instructions").strong());
         if task.body.is_empty() {
@@ -557,6 +588,79 @@ impl FactoryApp {
         }
     }
 
+    fn terminal_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context, run: &RunSnapshot) {
+        ui.separator();
+        ui.label(RichText::new("Terminal · local runner").strong());
+        ui.label(
+            RichText::new("Private bounded output; not part of public events.")
+                .small()
+                .weak(),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Refresh terminal").clicked() {
+                self.load_terminal(context, run.id.clone());
+            }
+            if !run.status.is_terminal()
+                && ui
+                    .button("Stop run")
+                    .on_hover_text("Ask this exact runner to stop gracefully")
+                    .clicked()
+            {
+                self.submit(
+                    LocalRequest::StopRun {
+                        project_id: run.project_id.clone(),
+                        run_id: run.id.clone(),
+                        grace_ms: 2_000,
+                    },
+                    context,
+                );
+            }
+        });
+        if self.terminal_run_id.as_ref() != Some(&run.id) {
+            ui.label("Refresh to load terminal output.");
+            return;
+        }
+        if let Some(terminal) = &self.terminal {
+            ui.label(format!(
+                "spool sequence {}{}",
+                terminal.head_sequence,
+                if terminal.truncated {
+                    " · tail shown"
+                } else {
+                    ""
+                }
+            ));
+            egui::ScrollArea::vertical()
+                .id_salt("run-terminal")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    if terminal.output.is_empty() {
+                        ui.label(RichText::new("No runner output yet.").italics());
+                    } else {
+                        ui.label(RichText::new(&terminal.output).monospace());
+                    }
+                });
+        } else {
+            ui.label(RichText::new("Loading terminal output…").italics());
+        }
+    }
+
+    fn load_terminal(&mut self, context: &egui::Context, run_id: RunId) {
+        let Some(project_id) = self.runs.get(&run_id).map(|run| run.project_id.clone()) else {
+            self.notice = Some("run is not present in the current snapshot".into());
+            return;
+        };
+        self.terminal_run_id = Some(run_id.clone());
+        self.terminal = None;
+        spawn_run_terminal(
+            self.client.clone(),
+            self.sender.clone(),
+            context.clone(),
+            project_id,
+            run_id,
+        );
+    }
+
     fn factory_view(&mut self, context: &egui::Context) {
         egui::CentralPanel::default().show(context, |ui| {
             let Some(project) = self.project().cloned() else {
@@ -567,6 +671,11 @@ impl FactoryApp {
             };
             ui.heading(project.name);
             ui.label(RichText::new(&project.root).small().weak());
+            let tasks = self
+                .project_tasks()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
             ui.separator();
             ui.label(RichText::new("Agents").strong());
             egui::ScrollArea::horizontal()
@@ -588,19 +697,55 @@ impl FactoryApp {
                                 )
                                 .clicked()
                             {
+                                let run_id = run.map(|run| run.id.clone());
                                 self.selected_agent = Some(agent.id);
                                 self.selected_task = None;
+                                if let Some(run_id) = run_id {
+                                    self.load_terminal(context, run_id);
+                                } else {
+                                    self.terminal_run_id = None;
+                                    self.terminal = None;
+                                }
                             }
                         }
                     });
                 });
             ui.separator();
-            ui.label(RichText::new("Tasks").strong());
-            let tasks = self
-                .project_tasks()
+            ui.label(RichText::new("Allocation").strong());
+            ui.label(
+                RichText::new("Explicit starts allocate v1 work; the scheduler remains roadmap.")
+                    .small()
+                    .weak(),
+            );
+            for agent in self
+                .project_agents()
                 .into_iter()
                 .cloned()
-                .collect::<Vec<_>>();
+                .collect::<Vec<_>>()
+            {
+                let counts = allocation_counts(&tasks, Some(&agent.id));
+                ui.collapsing(
+                    format!("{} · queued {} · active {}", agent.id, counts.0, counts.1),
+                    |ui| {
+                        for task in tasks.iter().filter(|task| {
+                            task.snapshot.assigned_agent_id.as_ref() == Some(&agent.id)
+                                && task.snapshot.status == TaskStatus::Queued
+                        }) {
+                            ui.label(format!("{} · {}", task.snapshot.id, task.snapshot.title));
+                        }
+                        if counts.0 == 0 && counts.1 == 0 {
+                            ui.label(RichText::new("No queued or active work.").italics());
+                        }
+                    },
+                );
+            }
+            let unassigned = allocation_counts(&tasks, None);
+            ui.label(format!(
+                "Operator queue · {} queued · {} active",
+                unassigned.0, unassigned.1
+            ));
+            ui.separator();
+            ui.label(RichText::new("Tasks").strong());
             ui.columns(4, |columns| {
                 for (index, (title, status)) in [
                     ("QUEUED", TaskColumn::Queued),
@@ -619,17 +764,18 @@ impl FactoryApp {
                     {
                         let selected = self.selected_task.as_ref() == Some(&task.snapshot.id);
                         if columns[index]
-                            .selectable_label(
-                                selected,
-                                format!(
-                                    "{}\n{} · p{}",
-                                    task.snapshot.title, task.snapshot.id, task.snapshot.priority
-                                ),
-                            )
+                            .selectable_label(selected, task_card_text(task))
                             .clicked()
                         {
+                            let run_id = self.run_for_task(task).map(|run| run.id.clone());
                             self.selected_task = Some(task.snapshot.id.clone());
                             self.selected_agent = None;
+                            if let Some(run_id) = run_id {
+                                self.load_terminal(context, run_id);
+                            } else {
+                                self.terminal_run_id = None;
+                                self.terminal = None;
+                            }
                             self.start.agent_id = task
                                 .snapshot
                                 .assigned_agent_id
@@ -835,6 +981,55 @@ fn task_result_text(task: &TaskDetail) -> Option<&str> {
     task.result.as_deref()
 }
 
+fn task_assignee_text(task: &TaskDetail) -> String {
+    task.snapshot.assigned_agent_id.as_ref().map_or_else(
+        || "unassigned".into(),
+        |agent| format!("assigned to {agent}"),
+    )
+}
+
+fn task_card_text(task: &TaskDetail) -> String {
+    format!(
+        "{}\n{} · p{}\n{}",
+        task.snapshot.title,
+        task.snapshot.id,
+        task.snapshot.priority,
+        task_assignee_text(task)
+    )
+}
+
+fn latest_run_for_task<'a>(
+    runs: impl Iterator<Item = &'a RunSnapshot>,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+) -> Option<&'a RunSnapshot> {
+    runs.filter(|run| run.project_id == *project_id && run.task_id.as_ref() == Some(task_id))
+        .max_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        })
+}
+
+fn allocation_counts(
+    tasks: &[TaskDetail],
+    agent_id: Option<&AgentId>,
+) -> (usize, usize, usize, usize) {
+    let mut counts = (0, 0, 0, 0);
+    for task in tasks
+        .iter()
+        .filter(|task| task.snapshot.assigned_agent_id.as_ref() == agent_id)
+    {
+        match task.snapshot.status {
+            TaskStatus::Queued => counts.0 += 1,
+            TaskStatus::Running => counts.1 += 1,
+            TaskStatus::Blocked => counts.2 += 1,
+            TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled => counts.3 += 1,
+        }
+    }
+    counts
+}
+
 fn event_requires_detail_refresh(envelope: &EventEnvelope) -> bool {
     matches!(
         &envelope.event,
@@ -1001,6 +1196,32 @@ fn spawn_task_detail(
         let _ = sender.send(UiMessage::TaskDetail(result));
         context.request_repaint();
     });
+}
+
+fn spawn_run_terminal(
+    client: Client,
+    sender: Sender<UiMessage>,
+    context: egui::Context,
+    project_id: ProjectId,
+    run_id: RunId,
+) {
+    thread::spawn(move || {
+        let result = load_run_terminal(&client, project_id, run_id);
+        let _ = sender.send(UiMessage::RunTerminal(result));
+        context.request_repaint();
+    });
+}
+
+fn load_run_terminal(
+    client: &Client,
+    project_id: ProjectId,
+    run_id: RunId,
+) -> Result<RunTerminal, String> {
+    match request_response_raw(client, LocalRequest::GetRunTerminal { project_id, run_id })? {
+        LocalResponse::RunTerminal { terminal } => Ok(terminal),
+        LocalResponse::Error { message, .. } => Err(message),
+        _ => Err("daemon returned an unexpected terminal response".into()),
+    }
 }
 
 fn load_task_detail(
@@ -1276,6 +1497,7 @@ fn operation_message(response: LocalResponse) -> Result<String, String> {
         LocalResponse::TaskCreated { task } => format!("Created task {}", task.snapshot.id),
         LocalResponse::AgentCreated { agent } => format!("Created agent {}", agent.id),
         LocalResponse::RunAccepted { run_id } => format!("Accepted run {run_id}"),
+        LocalResponse::RunStopped { run_id } => format!("Stop requested for run {run_id}"),
         _ => return Err("daemon returned an unexpected operation response".into()),
     };
     Ok(message)
@@ -1288,7 +1510,10 @@ mod tests {
         Provider, RunId, RunSnapshot, RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
     };
 
-    use super::{TaskColumn, agent_card_text, event_requires_detail_refresh, task_result_text};
+    use super::{
+        TaskColumn, agent_card_text, allocation_counts, event_requires_detail_refresh,
+        task_assignee_text, task_result_text,
+    };
 
     #[test]
     fn older_snapshot_generations_and_event_heads_are_rejected() {
@@ -1489,5 +1714,119 @@ mod tests {
         };
 
         assert!(event_requires_detail_refresh(&event));
+    }
+
+    #[test]
+    fn allocation_is_a_projection_of_existing_task_assignments() {
+        let curie = AgentId::try_from("curie").unwrap();
+        let other = AgentId::try_from("other").unwrap();
+        let tasks = vec![
+            TaskDetail {
+                snapshot: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("queued-curie").unwrap(),
+                    project_id: ProjectId::try_from("factory").unwrap(),
+                    parent_task_id: None,
+                    depends_on: Vec::new(),
+                    assigned_agent_id: Some(curie.clone()),
+                    title: "Queued for Curie".into(),
+                    status: TaskStatus::Queued,
+                    priority: 0,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                body: String::new(),
+                result: None,
+            },
+            TaskDetail {
+                snapshot: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("running-curie").unwrap(),
+                    status: TaskStatus::Running,
+                    assigned_agent_id: Some(curie.clone()),
+                    ..tasks_snapshot("running-curie")
+                },
+                body: String::new(),
+                result: None,
+            },
+            TaskDetail {
+                snapshot: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("unassigned").unwrap(),
+                    status: TaskStatus::Queued,
+                    assigned_agent_id: None,
+                    ..tasks_snapshot("unassigned")
+                },
+                body: String::new(),
+                result: None,
+            },
+            TaskDetail {
+                snapshot: TaskSnapshot {
+                    id: factory_core::TaskId::try_from("done-other").unwrap(),
+                    status: TaskStatus::Succeeded,
+                    assigned_agent_id: Some(other),
+                    ..tasks_snapshot("done-other")
+                },
+                body: String::new(),
+                result: None,
+            },
+        ];
+        assert_eq!(allocation_counts(&tasks, Some(&curie)), (1, 1, 0, 0));
+        assert_eq!(allocation_counts(&tasks, None), (1, 0, 0, 0));
+        assert_eq!(task_assignee_text(&tasks[0]), "assigned to curie");
+        assert_eq!(task_assignee_text(&tasks[2]), "unassigned");
+    }
+
+    #[test]
+    fn task_terminal_selection_prefers_the_most_recent_attempt() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let older = test_run("run-old", &project_id, &task_id, 10);
+        let newer = test_run("run-new", &project_id, &task_id, 20);
+
+        let selected =
+            super::latest_run_for_task([&newer, &older].into_iter(), &project_id, &task_id)
+                .unwrap();
+        assert_eq!(selected.id, newer.id);
+    }
+
+    fn test_run(
+        id: &str,
+        project_id: &ProjectId,
+        task_id: &factory_core::TaskId,
+        updated_at_ms: i64,
+    ) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::try_from(id).unwrap(),
+            project_id: project_id.clone(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+            parent_run_id: None,
+            task_id: Some(task_id.clone()),
+            status: RunStatus::Succeeded,
+            activity: None,
+            wait_reason: None,
+            worktree: "/work/curie".into(),
+            observer_health: ObserverHealth::Healthy,
+            observer_health_since_ms: updated_at_ms,
+            started_at_ms: updated_at_ms,
+            status_since_ms: updated_at_ms,
+            updated_at_ms,
+            ended_at_ms: Some(updated_at_ms),
+            exit_code: Some(0),
+            exit_signal: None,
+            failure_reason: None,
+        }
+    }
+
+    fn tasks_snapshot(id: &str) -> TaskSnapshot {
+        TaskSnapshot {
+            id: factory_core::TaskId::try_from(id).unwrap(),
+            project_id: ProjectId::try_from("factory").unwrap(),
+            parent_task_id: None,
+            depends_on: Vec::new(),
+            assigned_agent_id: None,
+            title: id.into(),
+            status: TaskStatus::Queued,
+            priority: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
     }
 }

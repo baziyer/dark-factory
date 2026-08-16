@@ -1,8 +1,9 @@
 //! Versioned local control and persisted event stream.
 
 use std::{
+    fs,
     future::Future,
-    io,
+    io::{self, Read},
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -14,13 +15,17 @@ use factory_core::{
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
         MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, RequestEnvelope, ServerFrame,
+        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
         SubscriptionFailureCategory as LocalSubscriptionFailureCategory,
         SubscriptionLimitWindow as LocalSubscriptionLimitWindow,
         SubscriptionProbeOutcome as LocalSubscriptionProbeOutcome,
         SubscriptionProviderStatus as LocalSubscriptionProviderStatus,
         SubscriptionSeverity as LocalSubscriptionSeverity,
         SubscriptionUsageStatus as LocalSubscriptionUsageStatus,
+    },
+    runner::{
+        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerEvent,
+        RunnerEventEnvelope,
     },
 };
 use tokio::{
@@ -36,8 +41,9 @@ pub use crate::daemon_state::DaemonState as ApiState;
 use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
+    runner_client::{RunnerClient, RunnerClientError},
     store::{
-        NewAgent, NewProject, NewTask, StoreError, SubscriptionFailureCategory,
+        NewAgent, NewProject, NewTask, RunControlTarget, StoreError, SubscriptionFailureCategory,
         SubscriptionLimitWindow, SubscriptionProbe, SubscriptionProbeOutcome, SubscriptionSeverity,
     },
 };
@@ -89,6 +95,10 @@ impl ApiFailure {
             Self::Store(StoreError::TaskNotFound) => (
                 ErrorCode::NotFound,
                 "task was not found in the project".into(),
+            ),
+            Self::Store(StoreError::RunNotFound) => (
+                ErrorCode::NotFound,
+                "run was not found in the project".into(),
             ),
             Self::Store(StoreError::TaskNotQueued) => (
                 ErrorCode::Conflict,
@@ -430,6 +440,40 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::Task { task })
         }
+        LocalRequest::GetRunTerminal { project_id, run_id } => {
+            let lookup_run_id = run_id.clone();
+            let target = state
+                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .await?;
+            let terminal = tokio::task::spawn_blocking(move || read_run_terminal(&target, run_id))
+                .await
+                .map_err(|_| ApiFailure::Internal("terminal reader stopped".into()))??;
+            Ok(LocalResponse::RunTerminal { terminal })
+        }
+        LocalRequest::StopRun {
+            project_id,
+            run_id,
+            grace_ms,
+        } => {
+            if grace_ms > 60_000 {
+                return Err(ApiFailure::Invalid(
+                    "runner stop grace must be at most 60000 ms".into(),
+                ));
+            }
+            let lookup_run_id = run_id.clone();
+            let target = state
+                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .await?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                run_id.clone(),
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(runner_control_failure)?;
+            Ok(LocalResponse::RunStopped { run_id })
+        }
         LocalRequest::ListRuns {
             project_id,
             after_id,
@@ -582,6 +626,120 @@ const fn local_subscription_window(
         SubscriptionLimitWindow::CurrentSession => LocalSubscriptionLimitWindow::CurrentSession,
         SubscriptionLimitWindow::CurrentWeek => LocalSubscriptionLimitWindow::CurrentWeek,
     }
+}
+
+fn runner_control_failure(error: RunnerClientError) -> ApiFailure {
+    match error {
+        RunnerClientError::RunnerRejected {
+            code: factory_core::runner::RunnerErrorCode::Conflict,
+        } => ApiFailure::Conflict("runner rejected the stop request".into()),
+        RunnerClientError::InvalidStopGrace { found } => ApiFailure::Invalid(format!(
+            "runner stop grace must be at most 60000 ms, got {found}"
+        )),
+        _ => ApiFailure::Internal("runner control request failed".into()),
+    }
+}
+
+fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerminal, ApiFailure> {
+    let spool_path = PathBuf::from(&target.runner_runtime).join("events.ndjson");
+    let file = match fs::File::open(spool_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RunTerminal {
+                run_id,
+                head_sequence: 0,
+                output: String::new(),
+                truncated: false,
+            });
+        }
+        Err(_) => {
+            return Err(ApiFailure::Internal(
+                "runner terminal spool could not be read".into(),
+            ));
+        }
+    };
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(MAX_RUNNER_SPOOL_BYTES + 1).expect("spool bound fits u64"))
+        .read_to_end(&mut bytes)
+        .map_err(|_| ApiFailure::Internal("runner terminal spool could not be read".into()))?;
+    if bytes.len() > MAX_RUNNER_SPOOL_BYTES {
+        return Err(ApiFailure::Internal(
+            "runner terminal spool exceeded its bound".into(),
+        ));
+    }
+
+    let terminated = bytes.last() == Some(&b'\n');
+    let lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let line_count = lines.len();
+    let mut head_sequence = 0;
+    let mut output = String::new();
+    let mut truncated = false;
+    for (index, line) in lines.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        if line.len() > MAX_RUNNER_FRAME_BYTES {
+            return Err(ApiFailure::Internal(
+                "runner terminal frame exceeded its bound".into(),
+            ));
+        }
+        let event: RunnerEventEnvelope = match serde_json::from_slice(line) {
+            Ok(event) => event,
+            Err(_) if !terminated && index + 1 == line_count => break,
+            Err(_) => {
+                return Err(ApiFailure::Internal(
+                    "runner terminal spool is invalid".into(),
+                ));
+            }
+        };
+        if event.protocol_version != factory_core::runner::RUNNER_PROTOCOL_VERSION {
+            return Err(ApiFailure::Internal(
+                "runner terminal protocol is unsupported".into(),
+            ));
+        }
+        head_sequence = head_sequence.max(event.sequence);
+        match event.event {
+            RunnerEvent::Output { stream, text, .. } => {
+                let prefix = match stream {
+                    OutputStream::Stdout => "[stdout] ",
+                    OutputStream::Stderr => "[stderr] ",
+                };
+                append_terminal_text(&mut output, prefix, &mut truncated);
+                let text = sanitize_terminal_text(&text);
+                append_terminal_text(&mut output, &text, &mut truncated);
+            }
+            RunnerEvent::OutputTruncated { .. } => truncated = true,
+            RunnerEvent::Started { .. }
+            | RunnerEvent::SpawnFailed { .. }
+            | RunnerEvent::Exited { .. } => {}
+        }
+    }
+
+    Ok(RunTerminal {
+        run_id,
+        head_sequence,
+        output,
+        truncated,
+    })
+}
+
+fn sanitize_terminal_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .collect()
+}
+
+fn append_terminal_text(output: &mut String, text: &str, truncated: &mut bool) {
+    output.push_str(text);
+    if output.len() <= MAX_TERMINAL_OUTPUT_BYTES {
+        return;
+    }
+    *truncated = true;
+    let mut first = output.len() - MAX_TERMINAL_OUTPUT_BYTES;
+    while !output.is_char_boundary(first) {
+        first += 1;
+    }
+    output.drain(..first);
 }
 
 async fn stream_events<W>(mut write: W, state: &ApiState, after_sequence: i64) -> io::Result<()>

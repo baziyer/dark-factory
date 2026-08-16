@@ -3,8 +3,8 @@ use factory_core::{
     Provider, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
-        RequestEnvelope, ServerFrame, SubscriptionLimitWindow, SubscriptionProviderStatus,
-        SubscriptionSeverity, SubscriptionUsageStatus,
+        RequestEnvelope, RunTerminal, ServerFrame, SubscriptionLimitWindow,
+        SubscriptionProviderStatus, SubscriptionSeverity, SubscriptionUsageStatus,
     },
 };
 
@@ -60,6 +60,61 @@ fn live_detail_requests_and_event_head_have_stable_shapes() {
     assert_eq!(
         serde_json::to_value(head).unwrap(),
         serde_json::json!({"type":"event_head","data":{"sequence":41}})
+    );
+}
+
+#[test]
+fn run_terminal_and_stop_requests_have_additive_local_shapes() {
+    let terminal_request = LocalRequest::GetRunTerminal {
+        project_id: project_id("project-1"),
+        run_id: run_id("run-1"),
+    };
+    let stop_request = LocalRequest::StopRun {
+        project_id: project_id("project-1"),
+        run_id: run_id("run-1"),
+        grace_ms: 2_000,
+    };
+    let terminal_response = LocalResponse::RunTerminal {
+        terminal: RunTerminal {
+            run_id: run_id("run-1"),
+            head_sequence: 4,
+            output: "[stdout] ready".into(),
+            truncated: false,
+        },
+    };
+    let stopped_response = LocalResponse::RunStopped {
+        run_id: run_id("run-1"),
+    };
+
+    assert_eq!(
+        serde_json::to_value(terminal_request).unwrap(),
+        serde_json::json!({
+            "type": "get_run_terminal",
+            "data": {"project_id": "project-1", "run_id": "run-1"}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(stop_request).unwrap(),
+        serde_json::json!({
+            "type": "stop_run",
+            "data": {"project_id": "project-1", "run_id": "run-1", "grace_ms": 2000}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(terminal_response).unwrap(),
+        serde_json::json!({
+            "type": "run_terminal",
+            "data": {"terminal": {
+                "run_id": "run-1",
+                "head_sequence": 4,
+                "output": "[stdout] ready",
+                "truncated": false
+            }}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(stopped_response).unwrap(),
+        serde_json::json!({"type": "run_stopped", "data": {"run_id": "run-1"}})
     );
 }
 
