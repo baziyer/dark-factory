@@ -20,6 +20,14 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 uuid.workspace = true
 
 [dev-dependencies]
+# Path deps purely so `env!("CARGO_BIN_EXE_factory-runner")`/
+# `env!("CARGO_BIN_EXE_factoryctl")` resolve in `tests/sessions_e2e.rs`,
+# which drives a real factoryd + factory-runner + factoryctl over the real
+# local socket protocol. `factory-runner` already dev-depends on `factoryd`
+# the same way for its own execution_e2e-style tests; Cargo permits a
+# dev-dependency cycle (it never participates in the normal build graph).
+factory-runner = { path = "../factory-runner" }
+factoryctl = { path = "../factoryctl" }
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

@@ -14,7 +14,15 @@ use uuid::Uuid;
 
 const SCHEMA_VERSION: i64 = 14;
 const MAX_EVENT_PAGE: usize = 10_000;
-const MAX_STATE_PAGE: usize = 101;
+/// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
+/// extra, to detect whether a next page exists) where `limit` is bounded by
+/// the largest wire page cap, `factory_core::local::MAX_*_PAGE_ITEMS`
+/// (1000). This used to be 101, silently rejecting a client that paged at
+/// the documented wire maximum (`factoryctl session list`, `agent list`,
+/// ... with no `--limit`, which default to the wire max) with "state page
+/// limit is outside the supported range" -- found while building this
+/// track's E2E tests, not a hypothetical.
+const MAX_STATE_PAGE: usize = 1_001;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_WEBHOOK_DOCUMENT_REFS: usize = 8;

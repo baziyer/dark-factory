@@ -6,7 +6,7 @@ use std::{
     io,
     io::{Read as _, Write as _},
     os::unix::{
-        fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
@@ -733,11 +733,43 @@ fn validate_config(config: &Config) -> Result<(), Error> {
     Ok(())
 }
 
+/// Creates `runtime_dir` fresh (mode `0700`), or -- new for resident
+/// sessions, see `factoryd::execution::spawn_session_for_agent` -- adopts
+/// one the daemon already created and staged a `hook.token` file into
+/// before spawning this process at all (the daemon needs that file to
+/// exist *before* the provider process can call `factoryctl hook`, so it
+/// can no longer be this runner's exclusive privilege to create the
+/// directory the way the old per-run ephemeral model assumed). Either way
+/// the result must be a real, non-symlink, owner-only directory; an
+/// existing directory that fails that check is rejected exactly as a
+/// creation failure would be.
+fn create_or_adopt_private_runtime_dir(runtime_dir: &Path) -> Result<(), Error> {
+    match std::fs::DirBuilder::new().mode(0o700).create(runtime_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(runtime_dir)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != rustix::process::geteuid().as_raw()
+                || metadata.mode() & 0o777 != 0o700
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "runtime directory exists but is not a private owner-only directory",
+                )
+                .into());
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn prepare_runtime(
     runtime_dir: &Path,
     terminal_mode: bool,
 ) -> Result<PreparedRuntime, Error> {
-    std::fs::DirBuilder::new().mode(0o700).create(runtime_dir)?;
+    create_or_adopt_private_runtime_dir(runtime_dir)?;
     let spool_path = runtime_dir.join("events.ndjson");
     let socket_path = runtime_dir.join("control.sock");
     let terminal_log_path = runtime_dir.join(TERMINAL_LOG_FILE);

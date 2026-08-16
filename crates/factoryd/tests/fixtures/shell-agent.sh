@@ -18,6 +18,12 @@
 #     daemon's dispatcher uses exactly this to hand a second task/message to
 #     an already-running session.
 #   - a line that is exactly `exit` posts SessionEnd and exits 0.
+#   - a line containing `sleep:<n>` sleeps `<n>` seconds between PreToolUse
+#     and PostToolUse (simulating a slow tool call), giving a test a window
+#     to assign a second task while this session is durably `working` --
+#     not part of the brief's original spec, added so
+#     sessions_e2e.rs can exercise Stop-hook block-reply delivery
+#     deterministically rather than racing a real turn's timing.
 #
 # `DARK_FACTORY_FACTORYCTL` and `DARK_FACTORY_SESSION_TOKEN_FILE` are set by
 # the daemon in every session's environment (see `runner_process.rs`'s
@@ -47,14 +53,20 @@ json_prompt() {
 }
 
 # reason_from_reply REPLY_JSON: extracts `reason` from
-# {"decision":"block","reason":"..."}, unescaping \" and \\. Anchored to the
-# daemon's exact compact serialization (`decision` then `reason`, no
-# whitespace) rather than a general JSON parse -- portable `sed` (this must
-# run under both GNU and BSD/macOS sed, which disagree on `\|` alternation
-# in basic regular expressions) has no easy general string-literal grammar.
+# {"decision":"block","reason":"..."}, unescaping \n and \" (order matters:
+# \n first, so a literal `\\n` -- an escaped backslash followed by the
+# letter n, not a newline escape -- is not misread; real composed delivery
+# text never contains a raw backslash, so this is not a fully general JSON
+# unescaper, just enough for it). Anchored to the daemon's exact compact
+# serialization (`decision` then `reason`, no whitespace) rather than a
+# general JSON parse -- portable `sed` (this must run under both GNU and
+# BSD/macOS sed, which disagree on `\|` alternation in basic regular
+# expressions) has no easy general string-literal grammar.
 reason_from_reply() {
     printf '%s' "$1" \
         | sed -n 's/^{"decision":"block","reason":"\(.*\)"}$/\1/p' \
+        | sed 's/\\n/\
+/g' \
         | sed 's/\\"/"/g; s/\\\\/\\/g'
 }
 
@@ -64,6 +76,15 @@ task_id_in() {
     printf '%s' "$1" | sed -n 's/.*task:\([A-Za-z0-9_-]*\).*/\1/p'
 }
 
+# sleep_seconds_in LINE: the `<n>` substring of an embedded `sleep:<n>`
+# marker, or empty if none is present -- lets a test put a task/agent
+# through a deliberately slow tool call (state stays `working` for `<n>`
+# seconds) to exercise Stop-hook block-reply delivery of a second task
+# assigned during that window, instead of the ordinary PTY-typed path.
+sleep_seconds_in() {
+    printf '%s' "$1" | sed -n 's/.*sleep:\([0-9][0-9]*\).*/\1/p'
+}
+
 # process_turn LINE: one simulated agent turn for LINE, following the
 # Stop-hook block-reply chain until the daemon replies `{}`.
 process_turn() {
@@ -71,6 +92,10 @@ process_turn() {
     while :; do
         post_hook UserPromptSubmit "$(json_prompt "$text")" >/dev/null
         post_hook PreToolUse '{"tool_name":"Bash"}' >/dev/null
+        sleep_seconds=$(sleep_seconds_in "$text")
+        if [ -n "$sleep_seconds" ]; then
+            sleep "$sleep_seconds"
+        fi
         post_hook PostToolUse '{"tool_name":"Bash"}' >/dev/null
         task_id=$(task_id_in "$text")
         if [ -n "$task_id" ]; then

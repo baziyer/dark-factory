@@ -1634,10 +1634,9 @@ async fn validate_agent_worktree(worktree: String) -> Result<String, ApiFailure>
 }
 
 fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {
-    // The store's generic state-page cap (`MAX_STATE_PAGE`, currently 101)
-    // is smaller than the wire's advertised `MAX_SESSION_PAGE_ITEMS`; a
-    // caller that omits `limit` gets a page that is guaranteed to fit
-    // rather than the wire maximum.
+    // `ListSessions.limit` is `Option<usize>` (every other `List*` request
+    // takes a required `u32`, defaulted client-side instead): a caller that
+    // omits it gets this default rather than the wire max.
     const DEFAULT_SESSION_PAGE: usize = 100;
     let limit = limit.unwrap_or(DEFAULT_SESSION_PAGE);
     if !(1..=MAX_SESSION_PAGE_ITEMS as usize).contains(&limit) {

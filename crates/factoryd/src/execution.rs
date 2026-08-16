@@ -356,6 +356,14 @@ async fn run_dispatcher(
     }
 }
 
+/// The store's generic state-page cap (`store::MAX_STATE_PAGE`, not
+/// exported) is smaller than the wire's advertised `MAX_*_PAGE_ITEMS`; a
+/// full-table reconciler pages through it rather than assuming everything
+/// fits in one call (a `LocalRequest::List*` caller gets the same
+/// treatment via `local_api::session_page_limit`'s comment on the same
+/// mismatch).
+const RECONCILE_PAGE: usize = 100;
+
 /// Re-scans every project's every agent for pending work, so a dropped or
 /// never-sent wake trigger is never fatal -- only ever delayed up to
 /// [`TICK_INTERVAL`].
@@ -364,22 +372,53 @@ async fn reconcile_all(
     state: &DaemonState,
     wake_tx: &mpsc::Sender<WakeAgent>,
 ) -> Result<(), Error> {
-    let projects = state
-        .with_store(|store| store.list_projects(None, 1000))
-        .await?;
-    for project in projects {
-        let project_id = project.id.clone();
-        let agents = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_agents(&project_id, None, 1000)
+    let mut after_project = None;
+    loop {
+        let lookup_after_project = after_project.clone();
+        let mut projects = state
+            .with_store(move |store| {
+                store.list_projects(lookup_after_project.as_ref(), RECONCILE_PAGE + 1)
             })
             .await?;
-        for agent in agents {
-            if let Err(error) = dispatch_agent(config, state, wake_tx, &project_id, &agent.id).await
-            {
-                tracing::warn!(%error, %project_id, agent_id = %agent.id, "reconcile dispatch failed");
+        let next_after_project = (projects.len() > RECONCILE_PAGE)
+            .then(|| projects.swap_remove(RECONCILE_PAGE))
+            .map(|project| project.id);
+        for project in projects {
+            let project_id = project.id.clone();
+            let mut after_agent = None;
+            loop {
+                let lookup_after_agent = after_agent.clone();
+                let mut agents = state
+                    .with_store({
+                        let project_id = project_id.clone();
+                        move |store| {
+                            store.list_agents(
+                                &project_id,
+                                lookup_after_agent.as_ref(),
+                                RECONCILE_PAGE + 1,
+                            )
+                        }
+                    })
+                    .await?;
+                let next_after_agent = (agents.len() > RECONCILE_PAGE)
+                    .then(|| agents.swap_remove(RECONCILE_PAGE))
+                    .map(|agent| agent.id);
+                for agent in agents {
+                    if let Err(error) =
+                        dispatch_agent(config, state, wake_tx, &project_id, &agent.id).await
+                    {
+                        tracing::warn!(%error, %project_id, agent_id = %agent.id, "reconcile dispatch failed");
+                    }
+                }
+                match next_after_agent {
+                    Some(cursor) => after_agent = Some(cursor),
+                    None => break,
+                }
             }
+        }
+        match next_after_project {
+            Some(cursor) => after_project = Some(cursor),
+            None => break,
         }
     }
     Ok(())
@@ -596,7 +635,7 @@ async fn spawn_session_for_agent(
         worktree,
         codex_home,
         hook_token,
-        runner_instance_id,
+        runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         runner_protocol_version: 1,
     };
@@ -610,7 +649,10 @@ async fn spawn_session_for_agent(
     tokio::spawn(supervise_child(
         state.clone(),
         wake_tx.clone(),
-        session_id,
+        session_id.clone(),
+        runtime_dir,
+        session_run_id(&session_id)?,
+        runner_instance_id,
         child,
     ));
     Ok(snapshot)
@@ -631,22 +673,96 @@ fn split_provider_environment(
     (codex_home, rest)
 }
 
-/// A freshly spawned session's liveness *is* its `Child` handle: this
-/// process holds it directly for as long as the daemon itself runs, so no
-/// control-socket subscription is needed (unlike a recovered session --
-/// see [`supervise_recovered`]).
+/// A freshly spawned session's *state* liveness is driven by hooks, not a
+/// decoded stream (unlike the pre-5A model) -- but the underlying
+/// `factory-runner` process's own liveness is not simply "until its `Child`
+/// handle resolves": `factory_runner::run` deliberately does not exit after
+/// an ordinary (non-signalled) termination of the program it supervises
+/// until a client sends it `AcknowledgeExit` for the exact terminal
+/// sequence it durably logged (this is what lets a recovered daemon replay
+/// a session's tail after a crash -- the runner holds the retained spool
+/// open until someone confirms they saw it). A bare `child.wait()` here
+/// would therefore hang forever after every ordinary session end (a
+/// `StopSession`, or the provider process just exiting on its own) unless
+/// the whole daemon itself is shutting down (which signals the runner
+/// directly, taking the `RunnerSignalled` bypass in `factory_runner::run`).
+/// So: subscribe like a recovered session does, wait for the runner's own
+/// `RunnerEvent::Exited`, acknowledge it (which is what actually lets the
+/// runner's process finish), and only then reap the `Child` handle. The
+/// exit code/signal in that event are the underlying PTY child's -- the
+/// wrapper `factory-runner` process's own `Child::wait()` status is not
+/// useful for that (its own exit code is 0/1 for its own success/failure,
+/// unrelated to the program it supervised), so it is only a fallback if
+/// the control socket could not be reached at all.
 async fn supervise_child(
     state: DaemonState,
     wake_tx: mpsc::Sender<WakeAgent>,
     session_id: SessionId,
+    runtime_dir: PathBuf,
+    run_id: RunId,
+    runner_instance_id: RunnerInstanceId,
     mut child: tokio::process::Child,
 ) {
-    let status = child.wait().await;
-    let (exit_code, exit_signal) = match status {
-        Ok(status) => (status.code(), status.signal()),
-        Err(_) => (None, None),
+    let event_exit = wait_for_runner_exit(&runtime_dir, run_id, runner_instance_id).await;
+    let wait_status = child.wait().await;
+    let (exit_code, exit_signal) = match event_exit {
+        Some(status) => status,
+        None => match wait_status {
+            Ok(status) => (status.code(), status.signal()),
+            Err(_) => (None, None),
+        },
     };
     end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
+}
+
+/// Subscribes to a freshly spawned session's own runner (retrying for up to
+/// [`CONNECT_GRACE`] -- `runner_process::spawn_runner` does not itself wait
+/// for the control socket to exist in terminal mode, so this can genuinely
+/// race the runner's own startup), then waits for and acknowledges its
+/// `RunnerEvent::Exited`, returning its `(exit_code, exit_signal)`. Returns
+/// `None` if the control socket was never reachable or the connection was
+/// lost before an exit event arrived -- best-effort, since the caller still
+/// has its own `Child::wait()` to fall back on rather than hang the
+/// dispatcher on one wedged session forever.
+async fn wait_for_runner_exit(
+    runtime_dir: &Path,
+    run_id: RunId,
+    runner_instance_id: RunnerInstanceId,
+) -> Option<(Option<i32>, Option<i32>)> {
+    let client = RunnerClient::new(runtime_dir, run_id, runner_instance_id);
+    let deadline = Instant::now() + CONNECT_GRACE;
+    let mut subscription = loop {
+        match client.subscribe().await {
+            Ok(subscription) => break subscription,
+            Err(error) if unavailable(&error) && Instant::now() < deadline => {
+                sleep_until((Instant::now() + CONNECT_RETRY_DELAY).min(deadline)).await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not subscribe to a freshly spawned runner's control socket"
+                );
+                return None;
+            }
+        }
+    };
+    loop {
+        match subscription.next_item().await {
+            Ok(RunnerStreamItem::Event(envelope)) => {
+                if let RunnerEvent::Exited { exit_code, signal } = envelope.event {
+                    if let Err(error) = client.acknowledge_exit(envelope.sequence).await {
+                        tracing::warn!(%error, "failed to acknowledge a runner's terminal event");
+                    }
+                    return Some((exit_code, signal));
+                }
+            }
+            Ok(RunnerStreamItem::CaughtUp { .. }) => {}
+            Err(error) => {
+                tracing::warn!(%error, "runner control connection failed before an exit event arrived");
+                return None;
+            }
+        }
+    }
 }
 
 // --- Delivery ----------------------------------------------------------
@@ -988,11 +1104,20 @@ async fn end_session_now(
         })
         .await;
     match result {
-        Ok(snapshot) => {
-            // A session ending frees its agent up: if other work is still
-            // queued, re-dispatch now rather than waiting for the safety
-            // tick (design's "session spawned/ended" wake trigger).
+        Ok(snapshot) if snapshot.state == SessionState::Stopped => {
+            // A clean/operator-requested end frees its agent up: if other
+            // work is still queued, re-dispatch now rather than waiting for
+            // the safety tick (design's "session spawned/ended" wake
+            // trigger).
             send_wake(wake_tx, snapshot.project_id, snapshot.agent_id);
+        }
+        Ok(_) => {
+            // A crash (`Failed`) deliberately does *not* get an immediate
+            // re-wake: if spawning is persistently broken (a missing/
+            // misconfigured provider binary), an immediate retry loop would
+            // busy-spin spawn attempts as fast as they fail. The 5 second
+            // safety tick still retries -- just rate-limited to once per
+            // tick instead of unbounded.
         }
         Err(error) => {
             // A session already ended by another path (an operator
@@ -1075,7 +1200,7 @@ async fn supervise_recovered(
                 continue;
             }
         };
-        match consume_until_exit(subscription, &mut shutdown_rx).await {
+        match consume_until_exit(&client, subscription, &mut shutdown_rx).await {
             ExitOutcome::Exited {
                 exit_code,
                 exit_signal,
@@ -1112,6 +1237,7 @@ enum ExitOutcome {
 }
 
 async fn consume_until_exit(
+    client: &RunnerClient,
     mut subscription: RunnerSubscription,
     shutdown: &mut watch::Receiver<bool>,
 ) -> ExitOutcome {
@@ -1123,6 +1249,18 @@ async fn consume_until_exit(
         match item {
             Ok(RunnerStreamItem::Event(envelope)) => {
                 if let RunnerEvent::Exited { exit_code, signal } = envelope.event {
+                    // As in `wait_for_runner_exit` (`supervise_child`'s
+                    // sibling for a freshly spawned session): the runner
+                    // will not let its own process exit after an ordinary
+                    // termination until this exact acknowledgement arrives.
+                    // A recovered session's runner is otherwise
+                    // indistinguishable from a fresh one here -- without
+                    // this, every session that happens to exit *after* a
+                    // daemon restart (not just before/during one) would
+                    // orphan its runner forever.
+                    if let Err(error) = client.acknowledge_exit(envelope.sequence).await {
+                        tracing::warn!(%error, "failed to acknowledge a recovered runner's terminal event");
+                    }
                     return ExitOutcome::Exited {
                         exit_code,
                         exit_signal: signal,
