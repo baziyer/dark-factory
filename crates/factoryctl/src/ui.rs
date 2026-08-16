@@ -20,6 +20,7 @@ use uuid::Uuid;
 use factoryctl::Client;
 
 const RECENT_EVENT_LIMIT: usize = 100;
+const MAX_LEGACY_DETAIL_PAGES: usize = 16;
 
 pub fn run(client: Client) -> Result<(), String> {
     let options = eframe::NativeOptions {
@@ -909,6 +910,10 @@ fn is_unsupported_optional_request(response: &LocalResponse) -> bool {
     )
 }
 
+fn legacy_detail_budget_exhausted(pages_read: usize) -> bool {
+    pages_read >= MAX_LEGACY_DETAIL_PAGES
+}
+
 fn short_id(prefix: &str) -> String {
     let uuid = Uuid::new_v4().simple().to_string();
     format!("{prefix}-{}", &uuid[..8])
@@ -1011,16 +1016,49 @@ fn load_task_detail(
         },
     )?;
     if is_unsupported_optional_request(&response) {
-        return load_tasks(client, &project_id)?
-            .into_iter()
-            .find(|task| task.snapshot.id == task_id)
-            .ok_or_else(|| "task was not found while hydrating the UI".into());
+        return load_legacy_task_detail(client, project_id, task_id);
     }
     match response {
         LocalResponse::Task { task } => Ok(task),
         LocalResponse::Error { message, .. } => Err(message),
         _ => Err("daemon returned an unexpected task detail response".into()),
     }
+}
+
+fn load_legacy_task_detail(
+    client: &Client,
+    project_id: ProjectId,
+    task_id: TaskId,
+) -> Result<TaskDetail, String> {
+    let mut after_id = None;
+    for pages_read in 0..MAX_LEGACY_DETAIL_PAGES {
+        let response = request_response(
+            client,
+            LocalRequest::ListTasks {
+                project_id: project_id.clone(),
+                after_id,
+                limit: MAX_TASK_PAGE_ITEMS,
+            },
+        )?;
+        let LocalResponse::Tasks {
+            tasks,
+            next_after_id,
+        } = response
+        else {
+            return Err("daemon returned an unexpected legacy task response".into());
+        };
+        if let Some(task) = tasks.into_iter().find(|task| task.snapshot.id == task_id) {
+            return Ok(task);
+        }
+        let Some(next) = next_after_id else {
+            return Err("task was not found while hydrating the UI".into());
+        };
+        if legacy_detail_budget_exhausted(pages_read + 1) {
+            return Err("legacy task hydration reached its bounded compatibility window".into());
+        }
+        after_id = Some(next);
+    }
+    Err("legacy task hydration reached its bounded compatibility window".into())
 }
 
 fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::Context) {
@@ -1350,6 +1388,8 @@ mod tests {
         assert!(!super::is_unsupported_optional_request(
             &factory_core::local::LocalResponse::Health
         ));
+        assert!(!super::legacy_detail_budget_exhausted(0));
+        assert!(super::legacy_detail_budget_exhausted(16));
     }
 
     #[test]
