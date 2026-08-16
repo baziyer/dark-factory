@@ -9,7 +9,9 @@ shared protocol, the daemon's SQLite state/event store, a versioned local Unix
 socket, a small machine-readable CLI, and a stable provider-blind process
 runner. The daemon now has a default-deny launch boundary that keeps ambient
 credentials out of runners and transfers bounded task input only over stdin.
-Provider adapters and the observer remain deliberately absent until their
+A concrete Codex 0.147 adapter builds fresh and resumed stdin-only turns and
+normalises its JSONL into bounded, privacy-safe observations. Daemon scheduling,
+the Claude adapter, and the observer remain deliberately absent until their
 vertical slices are executable.
 
 ## Non-goals
