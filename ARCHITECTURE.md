@@ -87,6 +87,9 @@ have both restarted without stopping or misidentifying it.
   owner-configured endpoint profiles with distinct secrets and projects.
 - Repository visibility is private during early operation; making it public is
   a separate product decision.
-- Pause and durable stop intent remain deferred; retry is an explicit requeue of
-  a terminal task, while the current stop control is a direct request to the
-  exact live runner from the local control plane.
+- Pause remains deferred, but stop intent is now durable: `StopRun` signals
+  the exact live runner and, once the runner accepts it, persists
+  `stop_requested_at_ms` on the run. When that run's terminal event lands,
+  the daemon records `stopped` (not `failed`) and moves its task to
+  `cancelled`; retry is an explicit requeue of a terminal task, including one
+  stopped this way.

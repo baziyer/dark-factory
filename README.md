@@ -59,10 +59,20 @@ cargo run -p factoryctl -- agent message --project PROJECT_ID --to AGENT_ID --bo
 cargo run -p factoryctl -- agent inbox --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
 cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
+cargo run -p factoryctl -- task cancel --project PROJECT_ID --task TASK_ID
+cargo run -p factoryctl -- task update --project PROJECT_ID --task TASK_ID --title "Renamed"
+cargo run -p factoryctl -- task delete --project PROJECT_ID --task TASK_ID
+cargo run -p factoryctl -- run stop --project PROJECT_ID --run RUN_ID
+cargo run -p factoryctl -- agent delete --project PROJECT_ID --agent AGENT_ID
+cargo run -p factoryctl -- project delete --project PROJECT_ID
 cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
 cargo run -p factoryctl -- ui
 ```
+
+Every command, group, and subcommand accepts `--help`/`-h` and prints usage
+text to stdout without contacting the daemon (for example `factoryctl task
+--help` or `factoryctl task cancel --help`).
 
 For the installed local release, use `./scripts/launch-ui.sh`. It checks the
 release binary and daemon first, then keeps the native UI attached to the
