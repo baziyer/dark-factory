@@ -1319,7 +1319,6 @@ mod tests {
                 id: task_id(id),
                 project_id: project_id("proj"),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: assigned.map(agent_id),
                 title: id.to_owned(),
                 status,
