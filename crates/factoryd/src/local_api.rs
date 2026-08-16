@@ -644,7 +644,19 @@ async fn handle_request(
                     Ok((agent, vec![event]))
                 })
                 .await?;
-            let agent = if let Some(worktree) = worktree {
+            let resolved_worktree = match worktree {
+                Some(worktree) => Some(worktree),
+                None => Some(
+                    provision_agent_worktree(
+                        state,
+                        guidance_root,
+                        &created_project_id,
+                        &created_agent_id,
+                    )
+                    .await?,
+                ),
+            };
+            let agent = if let Some(worktree) = resolved_worktree {
                 let worktree_project_id = created_project_id.clone();
                 let worktree_agent_id = created_agent_id.clone();
                 state
@@ -958,6 +970,7 @@ async fn handle_request(
         } => {
             let response_project_id = project_id.clone();
             let response_agent_id = agent_id.clone();
+            remove_agent_worktree_if_any(state, &response_project_id, &response_agent_id).await?;
             state
                 .commit_and_publish(move |store| {
                     let events = store.delete_agent(&project_id, &agent_id, now_ms()?)?;
@@ -1427,6 +1440,43 @@ async fn ensure_agent_guidance(
         .map_err(ApiFailure::from)
 }
 
+/// Resolves the worktree a newly created agent should get when `agent add`
+/// did not pass `--worktree` explicitly (D3, `TRACK5-WIRE.md`): a fresh
+/// `git worktree add -b agent/<agent_id>` under
+/// `agent_worktree_dir(guidance_root, project_id, agent_id)` from the
+/// project root's current `HEAD` when the project root is a git repo,
+/// else the project root itself. A `git worktree add` failure (a real one,
+/// not "branch already exists" -- `worktrees::add` already retries that)
+/// falls back to the project root rather than blocking agent creation
+/// entirely: a working root beats no agent at all.
+async fn provision_agent_worktree(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<String, ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&lookup_project_id))
+        .await?;
+    let project_root = PathBuf::from(&project.root);
+    if !crate::worktrees::is_git_repo(&project_root).await {
+        return Ok(project.root);
+    }
+    let worktree_dir = factory_core::paths::agent_worktree_dir(guidance_root, project_id, agent_id);
+    let branch = format!("agent/{}", agent_id.as_str());
+    match crate::worktrees::add(&project_root, &worktree_dir, &branch).await {
+        Ok(()) => Ok(path_to_string(&worktree_dir)),
+        Err(error) => {
+            tracing::warn!(
+                %error, %project_id, %agent_id,
+                "git worktree add failed; using the project root instead"
+            );
+            Ok(project.root)
+        }
+    }
+}
+
 /// Best-effort recursive removal of one agent's guidance directory, run
 /// after `DeleteAgent`'s transaction has already committed. The ledger row
 /// is gone either way, so a filesystem failure here is logged and otherwise
@@ -1445,6 +1495,55 @@ async fn remove_agent_guidance(guidance_root: &Path, project_id: &ProjectId, age
         }
         Err(error) => {
             tracing::warn!(%error, "guidance worker panicked while removing agent guidance directory");
+        }
+    }
+}
+
+/// Removes an agent's git worktree before `DeleteAgent`'s transaction
+/// commits (D3, `TRACK5-WIRE.md`): dirty refuses the whole request
+/// (`ApiFailure::Conflict`), matching the design's "unless dirty ->
+/// Conflict" -- the agent row and its worktree must not diverge. A missing
+/// worktree (already removed by hand) or one that equals the project root
+/// (the `provision_agent_worktree` fallback: not a git repo, or `git
+/// worktree add` itself failed at creation time -- nothing separate to
+/// remove either way) is a no-op. Any other git failure is logged and
+/// otherwise ignored: getting the agent row deleted matters more than a
+/// stray leftover directory the operator can clean up by hand.
+async fn remove_agent_worktree_if_any(
+    state: &ApiState,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let lookup_agent_id = agent_id.clone();
+    let agent = state
+        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
+        .await?;
+    let Some(worktree) = agent.snapshot.worktree else {
+        return Ok(());
+    };
+    let lookup_project_id = project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&lookup_project_id))
+        .await?;
+    let project_root = PathBuf::from(&project.root);
+    let worktree_path = PathBuf::from(&worktree);
+    if worktree_path == project_root || !worktree_path.exists() {
+        return Ok(());
+    }
+    match crate::worktrees::remove(&project_root, &worktree_path).await {
+        Ok(()) => Ok(()),
+        Err(crate::worktrees::WorktreeError::Dirty) => Err(ApiFailure::Conflict(
+            "agent worktree has modified or untracked files; commit, discard, or remove it \
+             manually with `git worktree remove --force` before deleting the agent"
+                .into(),
+        )),
+        Err(error) => {
+            tracing::warn!(
+                %error, %project_id, %agent_id,
+                "git worktree remove failed; deleting the agent anyway"
+            );
+            Ok(())
         }
     }
 }

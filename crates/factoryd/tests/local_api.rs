@@ -878,7 +878,10 @@ async fn local_agent_messages_round_trip_without_public_events() {
             request(&socket, LocalRequest::LatestEventSequence,).await,
             ServerFrame::Response {
                 protocol_version: PROTOCOL_VERSION,
-                response: LocalResponse::EventHead { sequence: 2 },
+                // ProjectChanged (1), AgentChanged from CreateAgent (2),
+                // AgentChanged again from provisioning its worktree (3) --
+                // SendAgentMessage publishes no public event.
+                response: LocalResponse::EventHead { sequence: 3 },
             }
         );
     })
@@ -1161,17 +1164,23 @@ async fn cancel_update_and_delete_are_local_control_operations() {
 
 /// `CreateAgent.worktree` validates an operator override (D3): rejects a
 /// non-existent path, accepts and durably records an existing one.
-/// `StartTask.worktree: None` defaults to the agent's recorded worktree, or
-/// is rejected when the agent has none. Every session-shaped request now
-/// has real behavior: `PauseAgent`/`ResumeAgent`/`ListSessions` succeed;
-/// requests naming a session/run/task-episode that doesn't exist yet
-/// surface the real `NotFound`/`Conflict`; an unrecognized hook token is
-/// rejected.
+/// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the
+/// project root here isn't a git repo, that falls back to the project root
+/// itself rather than a real `git worktree add` -- every agent ends up with
+/// *some* recorded worktree either way, so `StartTask.worktree: None` always
+/// has something to default to. Every session-shaped request now has real
+/// behavior: `PauseAgent`/`ResumeAgent`/`ListSessions` succeed; requests
+/// naming a session/run/task-episode that doesn't exist yet surface the
+/// real `NotFound`/`Conflict`; an unrecognized hook token is rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_shaped_requests_now_have_real_behavior() {
     with_server(|socket| async move {
         let project_root = socket.parent().unwrap().join("project");
         std::fs::create_dir(&project_root).unwrap();
+        // CreateProject durably stores a canonicalized root
+        // (`canonical_root`); compare against that below rather than this
+        // possibly-symlinked raw path (e.g. macOS's `/tmp` -> `/private/tmp`).
+        let project_root = std::fs::canonicalize(&project_root).unwrap();
         assert!(matches!(
             request(
                 &socket,
@@ -1255,50 +1264,39 @@ async fn session_shaped_requests_now_have_real_behavior() {
             }
         ));
 
-        // A worker with no recorded worktree cannot start a task without an
-        // explicit one.
-        assert!(matches!(
-            request(
-                &socket,
-                LocalRequest::CreateAgent {
-                    id: agent_id("no-worktree"),
-                    project_id: project_id("factory"),
-                    parent_agent_id: None,
-                    role: factory_core::AgentRole::Worker,
-                    provider: factory_core::Provider::Codex,
-                    model: None,
-                    worktree: None,
-                },
-            )
-            .await,
-            ServerFrame::Response {
-                response: LocalResponse::AgentCreated { .. },
-                ..
-            }
-        ));
-        assert!(matches!(
-            request(
-                &socket,
-                LocalRequest::StartTask {
-                    project_id: project_id("factory"),
-                    task_id: task_id("task-1"),
-                    agent_id: agent_id("no-worktree"),
-                    parent_run_id: None,
-                    worktree: None,
-                },
-            )
-            .await,
-            ServerFrame::Response {
-                response: LocalResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    ..
-                },
-                ..
-            }
-        ));
+        // Creating a worker with no --worktree in a non-git-repo project
+        // auto-provisions the project root itself as its worktree (5C) --
+        // there is no longer such a thing as an agent with *no* recorded
+        // worktree once CreateAgent has run.
+        let auto_provisioned = request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: agent_id("auto-worktree"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: None,
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentCreated { agent },
+            ..
+        } = auto_provisioned
+        else {
+            panic!("expected AgentCreated, got {auto_provisioned:?}");
+        };
+        assert_eq!(
+            agent.worktree,
+            Some(project_root.to_string_lossy().into_owned())
+        );
 
         // StartTask against curie (which has a worktree) fails cleanly with
-        // no live session yet -- spawning one is a later track.
+        // no live session yet -- spawning one requires pending queued work
+        // and a valid provider/runner binary, neither of which this fixture
+        // (a fake runner/factoryctl path, no real `codex`) provides.
         assert!(matches!(
             request(
                 &socket,
