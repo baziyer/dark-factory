@@ -1052,13 +1052,33 @@ async fn handle_request(
             .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_run_id = run_id.clone();
-            state
+            let run = state
                 .commit_and_publish(move |store| {
                     let (run, event) =
                         store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
                     Ok((run, vec![event]))
                 })
                 .await?;
+            // A run's process *is* its session's: `StopRun` kills the same
+            // runner `StopSession` would (above), so it must also record
+            // stop intent on the session, not just the run -- otherwise
+            // `end_session` (fired once the runner actually exits) cannot
+            // tell this apart from a crash and would wrongly close the
+            // episode `failed`/`session_ended` instead of
+            // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
+            if let Some(session_id) = run.session_id.clone() {
+                let session_project_id = project_id.clone();
+                let _ = state
+                    .commit_and_publish(move |store| {
+                        let (session, event) = store.request_session_stop(
+                            &session_project_id,
+                            &session_id,
+                            now_ms()?,
+                        )?;
+                        Ok((session, vec![event]))
+                    })
+                    .await;
+            }
             Ok(LocalResponse::RunStopped { run_id })
         }
         LocalRequest::CancelRun { project_id, run_id } => {

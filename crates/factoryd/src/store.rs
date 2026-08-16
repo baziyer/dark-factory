@@ -1049,9 +1049,13 @@ impl Store {
     }
 
     /// The provider process exited (or is being torn down): moves the
-    /// session to `stopped` (a clean exit, or one the operator asked for)
-    /// or `failed`, and -- in the same transaction -- closes any still-open
-    /// run episode as `failed`/`process`, `closed_by = session_ended`, task
+    /// session to `stopped` (a clean exit, or one the operator asked for
+    /// via `StopSession`/`StopRun`) or `failed` (anything else -- a crash,
+    /// an unverifiable absence after a daemon restart), and -- in the same
+    /// transaction -- closes any still-open run episode to match: an
+    /// operator-requested stop closes it `stopped`/`closed_by =
+    /// operator_stop`, task `cancelled` (TRACK5-DESIGN.md §6); anything
+    /// else closes it `failed`/`process`, `closed_by = session_ended`, task
     /// `failed`.
     pub fn end_session(
         &mut self,
@@ -1067,8 +1071,8 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
-        let graceful = session.stop_requested_at_ms.is_some()
-            || (exit_code == Some(0) && exit_signal.is_none());
+        let operator_stopped = session.stop_requested_at_ms.is_some();
+        let graceful = operator_stopped || (exit_code == Some(0) && exit_signal.is_none());
         let state = if graceful {
             SessionState::Stopped
         } else {
@@ -1091,17 +1095,43 @@ impl Store {
         let mut events = Vec::new();
         if let Some(run_id) = session.current_run_id.clone() {
             let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
-            let closed = close_run_in_transaction(
-                &transaction,
-                &run,
-                RunStatus::Failed,
-                RunClosedBy::SessionEnded,
-                Some(RunFailureReason::Process),
-                TaskStatus::Failed,
-                None,
-                None,
-                now_ms,
-            )?;
+            let closed = if operator_stopped {
+                close_run_in_transaction(
+                    &transaction,
+                    &run,
+                    RunStatus::Stopped,
+                    RunClosedBy::OperatorStop,
+                    None,
+                    TaskStatus::Cancelled,
+                    None,
+                    None,
+                    now_ms,
+                )?
+            } else {
+                // A confirmed OS exit status (from watching the process
+                // directly, or from a runner's own `RunnerEvent::Exited`)
+                // is `process`; a session recovered after a daemon restart
+                // whose control endpoint is simply gone, with no exit
+                // status ever observed, is `unverifiable` -- distinct
+                // enough to matter operationally (TRACK5-DESIGN.md §6's
+                // "unverifiable" recovery language).
+                let failure_reason = if exit_code.is_none() && exit_signal.is_none() {
+                    RunFailureReason::Unverifiable
+                } else {
+                    RunFailureReason::Process
+                };
+                close_run_in_transaction(
+                    &transaction,
+                    &run,
+                    RunStatus::Failed,
+                    RunClosedBy::SessionEnded,
+                    Some(failure_reason),
+                    TaskStatus::Failed,
+                    None,
+                    None,
+                    now_ms,
+                )?
+            };
             events.extend(closed.events);
         }
 

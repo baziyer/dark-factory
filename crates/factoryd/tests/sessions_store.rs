@@ -468,6 +468,28 @@ fn end_session_closes_the_open_episode_as_failed_process_session_ended() {
 }
 
 #[test]
+fn end_session_with_no_confirmed_exit_status_is_unverifiable_not_process() {
+    // A session recovered after a daemon restart whose control endpoint is
+    // simply gone (no OS exit status was ever observed) is a different,
+    // operationally distinct failure from a confirmed crash.
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let opened = store
+        .open_run_episode(&snapshot.id, &task_id("task-1"), 6)
+        .unwrap();
+
+    let (session, events) = store.end_session(&snapshot.id, None, None, 7).unwrap();
+    assert_eq!(session.state, SessionState::Failed);
+    assert!(events.iter().any(
+        |event| matches!(&event.event, FactoryEvent::RunChanged { run }
+            if run.id == opened.run.id
+                && run.failure_reason == Some(factory_core::RunFailureReason::Unverifiable))
+    ));
+}
+
+#[test]
 fn end_session_with_a_clean_exit_is_stopped_not_failed() {
     let mut store = fixture();
     let (snapshot, _) = store
@@ -475,6 +497,38 @@ fn end_session_with_a_clean_exit_is_stopped_not_failed() {
         .unwrap();
     let (session, _) = store.end_session(&snapshot.id, Some(0), None, 6).unwrap();
     assert_eq!(session.state, SessionState::Stopped);
+}
+
+#[test]
+fn end_session_after_an_operator_stop_closes_the_episode_stopped_not_failed() {
+    // TRACK5-DESIGN.md §6: an operator-requested StopSession/StopRun closes
+    // the open episode `stopped`/`closed_by = operator_stop`, task
+    // `cancelled` -- distinct from a crash, which closes it
+    // `failed`/`closed_by = session_ended` (the test above this one).
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let opened = store
+        .open_run_episode(&snapshot.id, &task_id("task-1"), 6)
+        .unwrap();
+    store
+        .request_session_stop(&project_id("factory"), &snapshot.id, 7)
+        .unwrap();
+
+    let (session, events) = store.end_session(&snapshot.id, None, Some(15), 8).unwrap();
+    assert_eq!(session.state, SessionState::Stopped);
+    assert!(events.iter().any(
+        |event| matches!(&event.event, FactoryEvent::RunChanged { run }
+            if run.id == opened.run.id
+                && run.status == factory_core::RunStatus::Stopped
+                && run.closed_by == Some(factory_core::RunClosedBy::OperatorStop)
+                && run.failure_reason.is_none())
+    ));
+    let task = store
+        .get_task(&project_id("factory"), &task_id("task-1"))
+        .unwrap();
+    assert_eq!(task.snapshot.status, TaskStatus::Cancelled);
 }
 
 // --- complete_task / block_task / cancel_run -----------------------------
