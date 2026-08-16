@@ -2,7 +2,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{EventEnvelope, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, TaskDetail, TaskId};
+use crate::{
+    AgentId, AgentRole, AgentSnapshot, EventEnvelope, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+    RunId, TaskDetail, TaskId,
+};
 
 /// Maximum JSON payload size. The newline delimiter is not part of this limit.
 pub const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
@@ -50,6 +53,21 @@ pub enum LocalRequest {
         body: String,
         priority: i32,
     },
+    CreateAgent {
+        id: AgentId,
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_agent_id: Option<AgentId>,
+        role: AgentRole,
+    },
+    StartTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+        agent_id: AgentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_run_id: Option<RunId>,
+        worktree: String,
+    },
     ListTasks {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +107,12 @@ pub enum LocalResponse {
     },
     TaskCreated {
         task: TaskDetail,
+    },
+    AgentCreated {
+        agent: AgentSnapshot,
+    },
+    RunAccepted {
+        run_id: RunId,
     },
     Tasks {
         tasks: Vec<TaskDetail>,

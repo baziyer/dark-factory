@@ -178,6 +178,7 @@ fn sigterm_is_a_clean_shutdown_and_the_socket_can_be_rebound() {
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let database = directory.path().join("factory.db");
     let socket = directory.path().join("f.sock");
+    let factory_home = directory.path().join("home");
     let mut child = Command::new(env!("CARGO_BIN_EXE_factoryd"))
         .args([
             "--database",
@@ -185,6 +186,7 @@ fn sigterm_is_a_clean_shutdown_and_the_socket_can_be_rebound() {
             "--socket",
             socket.to_str().unwrap(),
         ])
+        .env("DARK_FACTORY_HOME", factory_home)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

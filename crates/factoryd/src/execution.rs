@@ -1212,7 +1212,18 @@ fn prepare_runtime_root(path: &Path) -> Result<PathBuf, Error> {
         return Err(Error::InvalidRuntimeRoot);
     }
     let parent = path.parent().ok_or(Error::InvalidRuntimeRoot)?;
-    verify_private_directory(parent)?;
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => verify_private_directory_metadata(&metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(PRIVATE_DIRECTORY_MODE)
+                .create(parent)
+                .map_err(|_| Error::InvalidRuntimeRoot)?;
+            verify_private_directory(parent)?;
+        }
+        Err(_) => return Err(Error::InvalidRuntimeRoot),
+    }
     match fs::symlink_metadata(path) {
         Ok(metadata) => verify_private_directory_metadata(&metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {

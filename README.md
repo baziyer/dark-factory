@@ -14,9 +14,10 @@ stdin-only turns and normalise their JSONL into bounded, structurally filtered
 observations. A durable execution ledger now reserves tasks atomically, binds
 provider sessions, records run attempts, and supports exact runner replay and
 terminal reconciliation. A bounded Codex-only execution actor now launches and
-recovers stable runners without coupling their lifetime to the daemon. Local
-start commands and the native observer remain deliberately absent until their
-vertical slices are executable.
+recovers stable runners without coupling their lifetime to the daemon. The
+local control plane can now create Codex agents and durably reserve queued tasks
+for them; native observation remains deliberately absent until its vertical
+slice is executable.
 
 ## Non-goals
 
@@ -45,15 +46,24 @@ cargo run -p factoryd
 cargo run -p factoryctl -- health
 cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
 cargo run -p factoryctl -- project list
+cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator
+cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
+cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
 cargo run -p factoryctl -- events --follow
 ```
 
-Commands emit versioned JSON frames. Pass a returned project ID to
-`task add --project ID --title TITLE --body BODY`. Both programs use
+Commands emit versioned JSON frames. `task start` returns `run_accepted` once
+the task reservation is durable; runner readiness and completion arrive as
+events. Both programs use
 `$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
 `$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
 List commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
+
+By default `factoryd` starts the sibling `factory-runner`, resolves `codex`
+through the sanitized launch environment, stores runner state under
+`$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
+`--codex`, `--runtime-root`, and `--max-active-runs` to set those explicitly.
 
 State is private by construction. Custom database and socket paths must each
 have an immediate parent directory owned by the current user with mode `0700`;

@@ -1,5 +1,6 @@
 use std::{env, io::Write, path::PathBuf, process};
 
+use factory_core::AgentRole;
 use factory_core::local::{
     LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
     ServerFrame,
@@ -7,7 +8,7 @@ use factory_core::local::{
 use factoryctl::Client;
 use uuid::Uuid;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|project|task|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|project|task|agent|events> ...";
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
@@ -34,6 +35,18 @@ enum CliCommand {
         project_id: String,
         after_id: Option<String>,
         limit: u32,
+    },
+    TaskStart {
+        project_id: String,
+        task_id: String,
+        agent_id: String,
+        parent_run_id: Option<String>,
+        worktree: String,
+    },
+    AgentAdd {
+        project_id: String,
+        parent_agent_id: Option<String>,
+        role: AgentRole,
     },
     Events {
         after_sequence: i64,
@@ -125,6 +138,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         }
         "project" => parse_project(args).map(|command| (socket, command)),
         "task" => parse_task(args).map(|command| (socket, command)),
+        "agent" => parse_agent(args).map(|command| (socket, command)),
         "events" => parse_events(args).map(|command| (socket, command)),
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
     }
@@ -181,7 +195,44 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 limit,
             })
         }
+        "start" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let task_id = required_option(&mut args, "--task")?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            let parent_run_id = take_option(&mut args, "--parent-run")?;
+            let worktree = required_option(&mut args, "--worktree")?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskStart {
+                project_id,
+                task_id,
+                agent_id,
+                parent_run_id,
+                worktree,
+            })
+        }
         _ => Err(format!("unknown task action {action:?}")),
+    }
+}
+
+fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
+    let action = take_action(&mut args, "agent")?;
+    match action.as_str() {
+        "add" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let parent_agent_id = take_option(&mut args, "--parent")?;
+            let role = match required_option(&mut args, "--role")?.as_str() {
+                "orchestrator" => AgentRole::Orchestrator,
+                "worker" => AgentRole::Worker,
+                _ => return Err("--role must be orchestrator or worker".into()),
+            };
+            require_empty(&args)?;
+            Ok(CliCommand::AgentAdd {
+                project_id,
+                parent_agent_id,
+                role,
+            })
+        }
+        _ => Err(format!("unknown agent action {action:?}")),
     }
 }
 
@@ -244,6 +295,33 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
             limit,
+        }),
+        CliCommand::TaskStart {
+            project_id,
+            task_id,
+            agent_id,
+            parent_run_id,
+            worktree,
+        } => Ok(LocalRequest::StartTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+            agent_id: parse_id(agent_id, "agent")?,
+            parent_run_id: parent_run_id
+                .map(|id| parse_id(id, "parent run"))
+                .transpose()?,
+            worktree,
+        }),
+        CliCommand::AgentAdd {
+            project_id,
+            parent_agent_id,
+            role,
+        } => Ok(LocalRequest::CreateAgent {
+            id: generated_id()?,
+            project_id: parse_id(project_id, "project")?,
+            parent_agent_id: parent_agent_id
+                .map(|id| parse_id(id, "parent agent"))
+                .transpose()?,
+            role,
         }),
         CliCommand::Events {
             after_sequence,
@@ -371,7 +449,7 @@ fn take_limit(args: &mut Vec<String>, default: u32, maximum: u32) -> Result<(u32
 mod tests {
     use std::path::PathBuf;
 
-    use factory_core::local::LocalRequest;
+    use factory_core::{AgentRole, local::LocalRequest};
     use uuid::Uuid;
 
     use super::{CliCommand, parse_args, request_for, resolve_socket_path};
@@ -460,6 +538,96 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn parses_explicit_agent_creation_and_task_start_commands() {
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "add",
+                "--project",
+                "project-1",
+                "--parent",
+                "agent-parent",
+                "--role",
+                "worker",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::AgentAdd {
+                    project_id: "project-1".into(),
+                    parent_agent_id: Some("agent-parent".into()),
+                    role: AgentRole::Worker,
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "task",
+                "start",
+                "--project",
+                "project-1",
+                "--task",
+                "task-1",
+                "--agent",
+                "agent-1",
+                "--worktree",
+                "/work/agent-1",
+                "--parent-run",
+                "run-parent",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::TaskStart {
+                    project_id: "project-1".into(),
+                    task_id: "task-1".into(),
+                    agent_id: "agent-1".into(),
+                    parent_run_id: Some("run-parent".into()),
+                    worktree: "/work/agent-1".into(),
+                }
+            )
+        );
+
+        assert_eq!(
+            parse_args(args(&[
+                "agent",
+                "add",
+                "--project",
+                "project-1",
+                "--role",
+                "god",
+            ]))
+            .unwrap_err(),
+            "--role must be orchestrator or worker"
+        );
+    }
+
+    #[test]
+    fn agent_ids_are_client_generated_but_run_ids_are_daemon_generated() {
+        let request = request_for(CliCommand::AgentAdd {
+            project_id: "project-1".into(),
+            parent_agent_id: None,
+            role: AgentRole::Orchestrator,
+        })
+        .unwrap();
+        let LocalRequest::CreateAgent { id, role, .. } = request else {
+            panic!("expected create agent request");
+        };
+        assert!(Uuid::parse_str(id.as_str()).is_ok());
+        assert_eq!(role, AgentRole::Orchestrator);
+
+        let request = request_for(CliCommand::TaskStart {
+            project_id: "project-1".into(),
+            task_id: "task-1".into(),
+            agent_id: "agent-1".into(),
+            parent_run_id: None,
+            worktree: "/work/agent-1".into(),
+        })
+        .unwrap();
+        assert!(matches!(request, LocalRequest::StartTask { .. }));
     }
 
     #[test]
