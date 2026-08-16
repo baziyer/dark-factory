@@ -496,7 +496,7 @@ fn migrates_v4_session_cwd_without_changing_the_event_head() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(stored, ("/work/exact-old-cwd".into(), None));
     let unbound_cwd: Option<String> = connection
         .query_row(

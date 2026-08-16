@@ -231,7 +231,7 @@ fn migrates_v1_to_v5_without_losing_state_or_event_head() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     connection
         .execute_batch("PRAGMA foreign_keys = ON")
         .unwrap();
@@ -678,6 +678,103 @@ fn success_is_rejected_for_a_nonzero_or_signalled_process() {
             TaskStatus::Running
         );
     }
+}
+
+#[test]
+fn stop_intent_turns_a_failed_process_exit_into_stopped_and_cancels_the_task() {
+    let mut store = Store::open_in_memory().unwrap();
+    create_project_and_task(&mut store, "project", "task", 1);
+    create_worker(&mut store, "project", "worker", None, 3);
+    let input = reservation("project", "task", "worker", "run", None);
+    let instance = input.runner_instance_id.clone();
+    store.reserve_task_run(input, 1, 4).unwrap();
+    store
+        .ingest_runner_event(
+            &id("run"),
+            &instance,
+            &runner_event(1, RunnerEvent::Started { child_pid: 99 }),
+            no_effects(),
+            5,
+        )
+        .unwrap();
+
+    let (stopped_run, stop_event) = store
+        .request_run_stop(&id("project"), &id("run"), 6)
+        .unwrap();
+    assert_eq!(stopped_run.status, RunStatus::Running);
+    assert!(matches!(stop_event.event, FactoryEvent::RunChanged { .. }));
+
+    // Idempotent: a second stop request neither fails nor changes the
+    // already-durable stop timestamp.
+    store
+        .request_run_stop(&id("project"), &id("run"), 7)
+        .unwrap();
+
+    let terminal = runner_event(
+        2,
+        RunnerEvent::Exited {
+            exit_code: None,
+            signal: Some(15),
+        },
+    );
+    let completed = store
+        .ingest_runner_event(
+            &id("run"),
+            &instance,
+            &terminal,
+            RunnerEventEffects {
+                confirmed_provider_session_id: None,
+                terminal_outcome: Some(TerminalOutcome::Failed(RunFailureReason::Process)),
+            },
+            8,
+        )
+        .unwrap();
+    assert!(completed.events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::RunChanged { run }
+            if run.status == RunStatus::Stopped
+                && run.failure_reason.is_none()
+                && run.exit_signal == Some(15)
+    )));
+    assert!(completed.events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::TaskChanged { task } if task.status == TaskStatus::Cancelled
+    )));
+
+    // A duplicate delivery of the same terminal event must stay consistent
+    // with the durable (stop-overridden) state instead of erroring.
+    let duplicate = store
+        .ingest_runner_event(
+            &id("run"),
+            &instance,
+            &terminal,
+            RunnerEventEffects {
+                confirmed_provider_session_id: None,
+                terminal_outcome: Some(TerminalOutcome::Failed(RunFailureReason::Process)),
+            },
+            999,
+        )
+        .unwrap();
+    assert_eq!(duplicate.disposition, IngestDisposition::Duplicate);
+
+    let (retried, _) = store.retry_task(&id("project"), &id("task"), 9).unwrap();
+    assert_eq!(retried.snapshot.status, TaskStatus::Queued);
+}
+
+#[test]
+fn stop_is_refused_on_an_already_terminal_run() {
+    let mut store = Store::open_in_memory().unwrap();
+    create_project_and_task(&mut store, "project", "task", 1);
+    create_worker(&mut store, "project", "worker", None, 3);
+    let input = reservation("project", "task", "worker", "run", None);
+    let instance = input.runner_instance_id.clone();
+    store.reserve_task_run(input, 1, 4).unwrap();
+    store.fail_run_launch(&id("run"), &instance, 5).unwrap();
+
+    assert!(matches!(
+        store.request_run_stop(&id("project"), &id("run"), 6),
+        Err(StoreError::RunNotStoppable)
+    ));
 }
 
 #[test]

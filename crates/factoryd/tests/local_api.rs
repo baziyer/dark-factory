@@ -782,6 +782,7 @@ async fn queued_task_assignment_is_a_local_control_operation() {
     .await;
 }
 
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_messages_round_trip_without_public_events() {
     with_server(|socket| async move {
@@ -865,6 +866,253 @@ async fn local_agent_messages_round_trip_without_public_events() {
                 response: LocalResponse::EventHead { sequence: 2 },
             }
         );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_update_and_delete_are_local_control_operations() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Cancel me".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AssignTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    agent_id: Some(agent_id("curie")),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskAssigned { .. },
+                ..
+            }
+        ));
+
+        let cancelled = request(
+            &socket,
+            LocalRequest::CancelTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            cancelled,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCancelled { ref task },
+                ..
+            } if task.snapshot.status == factory_core::TaskStatus::Cancelled
+                && task.snapshot.assigned_agent_id == Some(agent_id("curie"))
+        ));
+
+        let cancel_again = request(
+            &socket,
+            LocalRequest::CancelTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            cancel_again,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::RetryTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskRetried { .. },
+                ..
+            }
+        ));
+
+        let no_fields = request(
+            &socket,
+            LocalRequest::UpdateTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                title: None,
+                body: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            no_fields,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let updated = request(
+            &socket,
+            LocalRequest::UpdateTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                title: Some("Updated title".into()),
+                body: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            updated,
+            ServerFrame::Response {
+                response: LocalResponse::TaskUpdated { ref task },
+                ..
+            } if task.snapshot.title == "Updated title"
+        ));
+
+        let fetched = request(
+            &socket,
+            LocalRequest::GetTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            fetched,
+            ServerFrame::Response {
+                response: LocalResponse::Task { ref task },
+                ..
+            } if task.snapshot.title == "Updated title"
+        ));
+
+        let deleted = request(
+            &socket,
+            LocalRequest::DeleteTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            deleted,
+            ServerFrame::Response {
+                response: LocalResponse::TaskDeleted { ref project_id, ref task_id },
+                ..
+            } if *project_id == self::project_id("factory") && *task_id == self::task_id("task-1")
+        ));
+
+        let missing = request(
+            &socket,
+            LocalRequest::GetTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            missing,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let agent_deleted = request(
+            &socket,
+            LocalRequest::DeleteAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            agent_deleted,
+            ServerFrame::Response {
+                response: LocalResponse::AgentDeleted { .. },
+                ..
+            }
+        ));
+
+        let project_deleted = request(
+            &socket,
+            LocalRequest::DeleteProject {
+                project_id: project_id("factory"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            project_deleted,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectDeleted { .. },
+                ..
+            }
+        ));
     })
     .await;
 }

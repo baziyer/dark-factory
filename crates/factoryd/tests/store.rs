@@ -1,7 +1,8 @@
 use factory_core::{
-    AgentId, AgentRole, ProjectId, Provider, RunId, RunnerInstanceId, TaskId, TaskStatus,
+    AgentId, AgentRole, FactoryEvent, ProjectId, Provider, RunId, RunnerInstanceId, TaskId,
+    TaskStatus,
 };
-use factoryd::store::{NewAgent, NewProject, NewTask, RunReservation, Store};
+use factoryd::store::{NewAgent, NewProject, NewTask, RunReservation, Store, StoreError};
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
@@ -9,6 +10,10 @@ fn project_id(value: &str) -> ProjectId {
 
 fn task_id(value: &str) -> TaskId {
     TaskId::try_from(value).unwrap()
+}
+
+fn agent_id(value: &str) -> AgentId {
+    AgentId::try_from(value).unwrap()
 }
 
 #[test]
@@ -421,4 +426,475 @@ fn queued_tasks_can_be_assigned_unassigned_and_reopened() {
             .assigned_agent_id,
         None
     );
+}
+
+fn reservation(project: &str, task: &str, agent: &str, run: &str) -> RunReservation {
+    RunReservation {
+        project_id: project_id(project),
+        task_id: task_id(task),
+        agent_id: agent_id(agent),
+        expected_provider: Provider::Codex,
+        run_id: RunId::try_from(run).unwrap(),
+        parent_run_id: None,
+        worktree: format!("/work/{project}"),
+        fresh_provider_session_id: None,
+        runner_instance_id: RunnerInstanceId::try_from(format!("instance-{run}")).unwrap(),
+        runner_runtime: format!("/private/runners/{run}"),
+    }
+}
+
+#[test]
+fn cancel_task_moves_queued_or_blocked_to_cancelled_and_keeps_assignment() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Cancel me".into(),
+                body: "body".into(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            4,
+        )
+        .unwrap();
+
+    let (cancelled, event) = store
+        .cancel_task(&project_id("factory"), &task_id("task-1"), 5)
+        .unwrap();
+    assert_eq!(cancelled.snapshot.status, TaskStatus::Cancelled);
+    assert_eq!(
+        cancelled.snapshot.assigned_agent_id,
+        Some(agent_id("curie"))
+    );
+    assert!(matches!(event.event, FactoryEvent::TaskChanged { .. }));
+
+    assert!(matches!(
+        store.cancel_task(&project_id("factory"), &task_id("task-1"), 6),
+        Err(StoreError::TaskNotCancellable)
+    ));
+
+    let (retried, _) = store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 7)
+        .unwrap();
+    assert_eq!(retried.snapshot.status, TaskStatus::Queued);
+
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 8)
+        .unwrap();
+    assert!(matches!(
+        store.cancel_task(&project_id("factory"), &task_id("task-1"), 9),
+        Err(StoreError::TaskNotCancellable)
+    ));
+}
+
+#[test]
+fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Original".into(),
+                body: "Original body".into(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+
+    let (updated, event) = store
+        .update_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some("New title".into()),
+            None,
+            4,
+        )
+        .unwrap();
+    assert_eq!(updated.snapshot.title, "New title");
+    assert_eq!(updated.body, "Original body");
+    assert!(matches!(event.event, FactoryEvent::TaskChanged { .. }));
+
+    let (updated, _) = store
+        .update_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            None,
+            Some("New body".into()),
+            5,
+        )
+        .unwrap();
+    assert_eq!(updated.snapshot.title, "New title");
+    assert_eq!(updated.body, "New body");
+
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 6)
+        .unwrap();
+    assert!(matches!(
+        store.update_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some("Too late".into()),
+            None,
+            7,
+        ),
+        Err(StoreError::TaskNotEditable)
+    ));
+}
+
+#[test]
+fn delete_task_requires_no_active_run_and_no_subtasks() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("parent"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Parent".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("child"),
+                project_id: project_id("factory"),
+                parent_task_id: Some(task_id("parent")),
+                title: "Child".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            4,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.delete_task(&project_id("factory"), &task_id("parent"), 5),
+        Err(StoreError::TaskHasSubtasks)
+    ));
+
+    let event = store
+        .delete_task(&project_id("factory"), &task_id("child"), 6)
+        .unwrap();
+    assert!(matches!(event.event, FactoryEvent::TaskDeleted { .. }));
+    assert!(
+        store
+            .list_tasks(&project_id("factory"), None, 100)
+            .unwrap()
+            .iter()
+            .all(|task| task.snapshot.id != task_id("child"))
+    );
+
+    store
+        .reserve_task_run(reservation("factory", "parent", "curie", "run-1"), 1, 7)
+        .unwrap();
+    assert!(matches!(
+        store.delete_task(&project_id("factory"), &task_id("parent"), 8),
+        Err(StoreError::TaskHasActiveRun)
+    ));
+
+    store
+        .fail_run_launch(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-run-1").unwrap(),
+            9,
+        )
+        .unwrap();
+    let event = store
+        .delete_task(&project_id("factory"), &task_id("parent"), 10)
+        .unwrap();
+    assert!(matches!(event.event, FactoryEvent::TaskDeleted { .. }));
+    assert!(
+        store
+            .list_tasks(&project_id("factory"), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Queued".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            4,
+        )
+        .unwrap();
+
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 5)
+        .unwrap();
+    assert!(matches!(
+        store.delete_agent(&project_id("factory"), &agent_id("curie"), 6),
+        Err(StoreError::AgentHasActiveRun)
+    ));
+
+    store
+        .fail_run_launch(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-run-1").unwrap(),
+            7,
+        )
+        .unwrap();
+    store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 8)
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            9,
+        )
+        .unwrap();
+
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("child-of-curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: Some(agent_id("curie")),
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            10,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.delete_agent(&project_id("factory"), &agent_id("curie"), 11),
+        Err(StoreError::AgentHasChildren)
+    ));
+    store
+        .delete_agent(&project_id("factory"), &agent_id("child-of-curie"), 12)
+        .unwrap();
+
+    let events = store
+        .delete_agent(&project_id("factory"), &agent_id("curie"), 13)
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(&event.event, FactoryEvent::AgentDeleted { .. }))
+    );
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::TaskChanged { task } if task.assigned_agent_id.is_none()
+    )));
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task_id("task-1"))
+            .unwrap()
+            .snapshot
+            .assigned_agent_id,
+        None
+    );
+    assert!(
+        store
+            .list_agents(&project_id("factory"), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn delete_project_requires_no_active_run_and_cascades() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Task".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 4)
+        .unwrap();
+    assert!(matches!(
+        store.delete_project(&project_id("factory"), 5),
+        Err(StoreError::ProjectHasActiveRun)
+    ));
+
+    store
+        .fail_run_launch(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-run-1").unwrap(),
+            6,
+        )
+        .unwrap();
+
+    let event = store.delete_project(&project_id("factory"), 7).unwrap();
+    assert!(matches!(event.event, FactoryEvent::ProjectDeleted { .. }));
+    assert!(
+        store
+            .list_projects(None, 100)
+            .unwrap()
+            .iter()
+            .all(|project| project.id != project_id("factory"))
+    );
+    assert!(
+        store
+            .list_tasks(&project_id("factory"), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_agents(&project_id("factory"), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+
+    assert!(matches!(
+        store.delete_project(&project_id("factory"), 8),
+        Err(StoreError::ProjectNotFound)
+    ));
 }

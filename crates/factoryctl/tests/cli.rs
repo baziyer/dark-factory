@@ -314,3 +314,50 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
     ));
     server.join().unwrap();
 }
+
+/// `--help` at every level must print human usage text and exit 0, and it
+/// must never attempt to reach the daemon: an unreachable socket path
+/// proves that, since any real request would fail to connect.
+#[test]
+fn help_prints_human_usage_and_exits_zero_without_touching_the_daemon() {
+    let unreachable_socket = "/nonexistent/dark-factory-help-test.sock";
+    for arguments in [
+        vec!["--help"],
+        vec!["-h"],
+        vec!["help"],
+        vec!["task", "--help"],
+        vec!["task", "add", "--help"],
+        vec!["task", "cancel", "--help"],
+        vec!["task", "delete", "--help"],
+        vec!["task", "update", "--help"],
+        vec!["task", "get", "--help"],
+        vec!["agent", "--help"],
+        vec!["agent", "delete", "--help"],
+        vec!["run", "--help"],
+        vec!["run", "stop", "--help"],
+        vec!["project", "--help"],
+        vec!["project", "delete", "--help"],
+        vec!["events", "--help"],
+    ] {
+        let mut full_args = vec!["--socket", unreachable_socket];
+        full_args.extend(arguments.iter().copied());
+        let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+            .args(&full_args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "factoryctl {full_args:?} did not exit 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.starts_with("usage:") || stdout.starts_with("Dark Factory"),
+            "factoryctl {full_args:?} did not print usage text: {stdout:?}"
+        );
+        assert!(
+            serde_json::from_str::<ServerFrame>(&stdout).is_err(),
+            "factoryctl {full_args:?} printed a JSON frame instead of help text"
+        );
+    }
+}
