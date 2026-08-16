@@ -11,8 +11,10 @@ runner. The daemon now has a default-deny launch boundary that keeps ambient
 credentials out of runners and transfers bounded task input only over stdin.
 Concrete Codex 0.147 and Claude Code 2.1.233 adapters build fresh and resumed
 stdin-only turns and normalise their JSONL into bounded, structurally filtered
-observations. Daemon scheduling and the observer remain deliberately absent
-until their vertical slices are executable.
+observations. A durable execution ledger now reserves tasks atomically, binds
+provider sessions, records run attempts, and supports exact runner replay and
+terminal acknowledgement. Process scheduling and the observer remain
+deliberately absent until their vertical slices are executable.
 
 ## Non-goals
 
