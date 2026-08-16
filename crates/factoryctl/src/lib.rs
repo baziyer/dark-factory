@@ -113,6 +113,19 @@ impl Client {
         })
     }
 
+    /// Opens a persistent connection for an `AttachTerminal` request and
+    /// returns every frame the daemon sends on it (retained-then-live
+    /// `ServerFrame::TerminalOutput` for the attached run, or an error
+    /// response). The connection stays open, unbounded by any read timeout,
+    /// until the returned iterator is dropped or the daemon closes it.
+    pub fn attach_terminal(&self, request: LocalRequest) -> Result<TerminalFrames, ClientError> {
+        let stream = self.connect(request)?;
+        Ok(TerminalFrames {
+            reader: BufReader::new(stream),
+            finished: false,
+        })
+    }
+
     fn connect(&self, request: LocalRequest) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
         stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
@@ -152,6 +165,39 @@ impl Iterator for Subscription {
                 Some(Err(ClientError::Disconnected {
                     after_sequence: self.after_sequence,
                 }))
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+/// Frames from one `AttachTerminal` connection. See [`Client::attach_terminal`].
+pub struct TerminalFrames {
+    reader: BufReader<UnixStream>,
+    finished: bool,
+}
+
+impl Iterator for TerminalFrames {
+    type Item = Result<ServerFrame, ClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match read_frame(&mut self.reader) {
+            Ok(Some(frame)) => match validate_frame(&frame) {
+                Ok(()) => Some(Ok(frame)),
+                Err(error) => {
+                    self.finished = true;
+                    Some(Err(error))
+                }
+            },
+            Ok(None) => {
+                self.finished = true;
+                None
             }
             Err(error) => {
                 self.finished = true;

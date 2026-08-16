@@ -8,11 +8,12 @@ use factory_core::{AgentRole, Provider};
 use factoryctl::Client;
 use uuid::Uuid;
 
+mod attach;
 mod ui;
 mod usage;
 
 const USAGE: &str =
-    "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|events> ...";
+    "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factoryctl ui` in a persistent terminal.
@@ -27,6 +28,7 @@ Commands:
   agent add|list|delete|get|profile|message|inbox
                                                Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
+  attach --project P --run R                  Attach to a terminal-mode run's PTY
   events [--follow]                           Read durable events
 
 Run `factoryctl <command> --help` or `factoryctl <command> <action> --help`
@@ -394,6 +396,22 @@ Options:
   --grace-ms N              Grace period before a harder stop (default 0, max 60000)
   -h, --help                  Show this help";
 
+const ATTACH_HELP: &str = "usage: factoryctl attach --project ID --run ID [--since-offset N]
+
+Attach to a terminal-mode run's PTY: puts the local terminal in raw mode,
+replays retained output from --since-offset (default 0, i.e. from the
+start), then streams live output and forwards stdin as operator input.
+Resizes the remote PTY to match the local terminal on attach and on every
+SIGWINCH. Detach with Ctrl-] without affecting the run.
+
+Required:
+  --project ID              Project the run belongs to
+  --run ID                  Run to attach to
+
+Options:
+  --since-offset N            Replay retained output from this byte offset (default 0)
+  -h, --help                    Show this help";
+
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
@@ -444,6 +462,11 @@ enum CliCommand {
         agent_id: String,
         parent_run_id: Option<String>,
         worktree: String,
+    },
+    Attach {
+        project_id: String,
+        run_id: String,
+        since_offset: u64,
     },
     TaskRetry {
         project_id: String,
@@ -565,6 +588,14 @@ fn run() -> Result<i32, String> {
     if matches!(command, CliCommand::Ui) {
         ui::run(client)?;
         return Ok(0);
+    }
+    if let CliCommand::Attach {
+        project_id,
+        run_id,
+        since_offset,
+    } = command
+    {
+        return attach::run(&client, &project_id, &run_id, since_offset);
     }
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -728,6 +759,12 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         }
         "project" => parse_project(args).map(|command| (socket, command)),
         "task" => parse_task(args).map(|command| (socket, command)),
+        "attach" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(ATTACH_HELP)));
+            }
+            parse_attach(args).map(|command| (socket, command))
+        }
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
         "events" => {
@@ -926,6 +963,21 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
         }
         _ => Err(format!("unknown task action {action:?}")),
     }
+}
+
+fn parse_attach(mut args: Vec<String>) -> Result<CliCommand, String> {
+    let project_id = required_option(&mut args, "--project")?;
+    let run_id = required_option(&mut args, "--run")?;
+    let since_offset = take_option(&mut args, "--since-offset")?
+        .map(|value| parse_number(&value, "--since-offset"))
+        .transpose()?
+        .unwrap_or(0);
+    require_empty(&args)?;
+    Ok(CliCommand::Attach {
+        project_id,
+        run_id,
+        since_offset,
+    })
 }
 
 fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
@@ -1194,6 +1246,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?,
             worktree,
         }),
+        CliCommand::Attach { .. } => Err("attach is handled before local requests".into()),
         CliCommand::TaskRetry {
             project_id,
             task_id,
@@ -1541,6 +1594,10 @@ mod tests {
             parse_args(args(&["events", "--help"])).unwrap().1,
             CliCommand::Help(EVENTS_HELP)
         );
+        assert_eq!(
+            parse_args(args(&["attach", "--help"])).unwrap().1,
+            CliCommand::Help(ATTACH_HELP)
+        );
 
         assert_eq!(
             parse_args(args(&["project"])).unwrap().1,
@@ -1829,6 +1886,57 @@ mod tests {
             request_for(request).unwrap(),
             LocalRequest::GetProject { project_id } if project_id == "factory".try_into().unwrap()
         ));
+    }
+
+    #[test]
+    fn attach_parses_project_run_and_defaults_since_offset_to_zero() {
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--run",
+                "run-1"
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::Attach {
+                    project_id: "project-1".into(),
+                    run_id: "run-1".into(),
+                    since_offset: 0,
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--run",
+                "run-1",
+                "--since-offset",
+                "4096",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::Attach {
+                    project_id: "project-1".into(),
+                    run_id: "run-1".into(),
+                    since_offset: 4096,
+                }
+            )
+        );
+        assert!(parse_args(args(&["attach", "--run", "run-1"])).is_err());
+        assert!(
+            request_for(CliCommand::Attach {
+                project_id: "project-1".into(),
+                run_id: "run-1".into(),
+                since_offset: 0,
+            })
+            .is_err()
+        );
     }
 
     #[test]

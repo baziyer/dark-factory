@@ -2186,6 +2186,7 @@ fn spawn_subscription(client: Client, sender: Sender<UiMessage>, context: egui::
                                 }
                             }
                             Ok(ServerFrame::Response { .. }) => {}
+                            Ok(ServerFrame::TerminalOutput { .. }) => {}
                             Err(error) => {
                                 failure = error.to_string();
                                 break;
@@ -2345,6 +2346,9 @@ fn request_response_raw(client: &Client, request: LocalRequest) -> Result<LocalR
     match client.request(request).map_err(|error| error.to_string())? {
         ServerFrame::Response { response, .. } => Ok(response),
         ServerFrame::Event { .. } => Err("daemon returned an event instead of a response".into()),
+        ServerFrame::TerminalOutput { .. } => {
+            Err("daemon returned terminal output instead of a response".into())
+        }
     }
 }
 
