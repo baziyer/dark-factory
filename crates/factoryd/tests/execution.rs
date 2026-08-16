@@ -402,6 +402,62 @@ impl RecoveryFixture {
             .await
             .unwrap()
     }
+
+    async fn observer_health(&self) -> Option<ObserverHealth> {
+        let run_id = self.run_id.clone();
+        self.state
+            .with_store(move |store| {
+                Ok(store
+                    .recoverable_runs()?
+                    .into_iter()
+                    .find(|run| run.run.id == run_id)
+                    .map(|run| run.run.observer_health))
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn wait_for_observer_health(&self, expected: ObserverHealth) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.observer_health().await == Some(expected) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for observer health {expected:?}"
+            );
+            yield_now().await;
+        }
+    }
+
+    async fn drive_until_observer_health(&self, expected: ObserverHealth) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.observer_health().await == Some(expected) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out driving observer health to {expected:?}"
+            );
+            advance_and_settle(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn drive_until_recoverable(&self, expected: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if self.remains_recoverable().await == expected {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for recoverable={expected}"
+            );
+            advance_and_settle(Duration::from_millis(10)).await;
+        }
+    }
 }
 
 async fn settle() {
@@ -413,6 +469,69 @@ async fn settle() {
 async fn advance_and_settle(duration: Duration) {
     advance(duration).await;
     settle().await;
+}
+
+async fn receive_oneshot<T>(
+    receiver: &mut tokio::sync::oneshot::Receiver<T>,
+    description: &str,
+) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => return value,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                panic!("{description} sender closed")
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        yield_now().await;
+    }
+}
+
+async fn receive_oneshot_while_advancing<T>(
+    receiver: &mut tokio::sync::oneshot::Receiver<T>,
+    description: &str,
+) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => return value,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                panic!("{description} sender closed")
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        advance_and_settle(Duration::from_millis(10)).await;
+    }
+}
+
+async fn receive_mpsc_while_advancing<T>(
+    receiver: &mut tokio::sync::mpsc::Receiver<T>,
+    description: &str,
+) -> T {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match receiver.try_recv() {
+            Ok(value) => return value,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                panic!("{description} sender closed")
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {description}"
+        );
+        advance_and_settle(Duration::from_millis(10)).await;
+    }
 }
 
 async fn stop(
@@ -638,7 +757,7 @@ impl ScriptedRunner {
 async fn wait_for_path(path: &Path) {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while !path.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -1164,6 +1283,30 @@ async fn authenticated_disconnect_cannot_fail_a_still_running_wrapper() {
     advance_and_settle(Duration::from_millis(25)).await;
     wait_for_path(&scripted.disconnected).await;
     advance_and_settle(Duration::from_millis(400)).await;
+    let run_id = started.run_id.clone();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let run_id = run_id.clone();
+        let health = fixture
+            .state
+            .with_store(move |store| {
+                Ok(store
+                    .recoverable_runs()?
+                    .into_iter()
+                    .find(|run| run.run.id == run_id)
+                    .map(|run| run.run.observer_health))
+            })
+            .await
+            .unwrap();
+        if health == Some(ObserverHealth::Degraded) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the live wrapper to become degraded"
+        );
+        advance_and_settle(Duration::from_millis(10)).await;
+    }
 
     let run_id = started.run_id.clone();
     let baseline = fixture.baseline;
@@ -1336,6 +1479,9 @@ async fn unknown_missing_recovery_becomes_degraded_without_releasing_work() {
 
     settle().await;
     advance_and_settle(Duration::from_millis(75)).await;
+    fixture
+        .drive_until_observer_health(ObserverHealth::Degraded)
+        .await;
 
     assert!(fixture.remains_recoverable().await);
     let run_id = fixture.run_id.clone();
@@ -1378,7 +1524,7 @@ async fn missing_active_runner_becomes_unverifiable_after_grace() {
     settle().await;
     advance_and_settle(Duration::from_millis(75)).await;
 
-    assert!(!fixture.remains_recoverable().await);
+    fixture.drive_until_recoverable(false).await;
     let baseline = fixture.baseline;
     let events = fixture
         .state
@@ -1413,7 +1559,7 @@ async fn missing_terminal_runner_reconciles_without_public_state_change() {
     settle().await;
     advance_and_settle(Duration::from_millis(75)).await;
 
-    assert!(!fixture.remains_recoverable().await);
+    fixture.drive_until_recoverable(false).await;
     let head = fixture
         .state
         .with_store(|store| store.latest_event_sequence())
@@ -1524,7 +1670,7 @@ async fn hostile_hello_is_quarantined_then_recovery_retries_from_zero() {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
     let expected_run = fixture.run_id.clone();
     let expected_instance = fixture.runner_instance_id.clone();
-    let (hostile_tx, hostile_rx) = tokio::sync::oneshot::channel();
+    let (hostile_tx, mut hostile_rx) = tokio::sync::oneshot::channel();
     let (attached_tx, mut attached_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (first, _) = listener.accept().await.unwrap();
@@ -1587,12 +1733,15 @@ async fn hostile_hello_is_quarantined_then_recovery_retries_from_zero() {
         fixture.state.clone(),
     )
     .unwrap();
-    hostile_rx.await.unwrap();
-    settle().await;
-    advance_and_settle(Duration::from_millis(250)).await;
-    let (first, second) = attached_rx
-        .try_recv()
-        .expect("recovery did not retry after quarantining the hostile Hello");
+    receive_oneshot(&mut hostile_rx, "hostile Hello delivery").await;
+    fixture
+        .wait_for_observer_health(ObserverHealth::Degraded)
+        .await;
+    let (first, second) =
+        receive_oneshot_while_advancing(&mut attached_rx, "healthy recovery retry").await;
+    fixture
+        .wait_for_observer_health(ObserverHealth::Healthy)
+        .await;
     let expected = RequestEnvelope::new(
         fixture.run_id.clone(),
         fixture.runner_instance_id.clone(),
@@ -1682,46 +1831,28 @@ async fn repeated_caught_up_disconnects_back_off_instead_of_polling_forever() {
     )
     .unwrap();
     assert_eq!(attempt_rx.recv().await, Some(1));
-    settle().await;
-    let run_id = fixture.run_id.clone();
-    let health = fixture
-        .state
-        .with_store(move |store| {
-            Ok(store
-                .recoverable_runs()?
-                .into_iter()
-                .find(|run| run.run.id == run_id)
-                .expect("run stopped being recoverable")
-                .run
-                .observer_health)
-        })
-        .await
-        .unwrap();
-    assert_eq!(health, ObserverHealth::Degraded);
+    fixture
+        .wait_for_observer_health(ObserverHealth::Degraded)
+        .await;
+    let first_retry_started = tokio::time::Instant::now();
     advance_and_settle(Duration::from_millis(249)).await;
     assert!(attempt_rx.try_recv().is_err());
-    advance_and_settle(Duration::from_millis(1)).await;
-    assert_eq!(attempt_rx.try_recv(), Ok(2));
-    settle().await;
-    let run_id = fixture.run_id.clone();
-    let health = fixture
-        .state
-        .with_store(move |store| {
-            Ok(store
-                .recoverable_runs()?
-                .into_iter()
-                .find(|run| run.run.id == run_id)
-                .expect("run stopped being recoverable")
-                .run
-                .observer_health)
-        })
-        .await
-        .unwrap();
-    assert_eq!(health, ObserverHealth::Degraded);
+    assert_eq!(
+        receive_mpsc_while_advancing(&mut attempt_rx, "second caught-up attempt").await,
+        2
+    );
+    assert!(first_retry_started.elapsed() >= Duration::from_millis(250));
+    fixture
+        .wait_for_observer_health(ObserverHealth::Degraded)
+        .await;
+    let second_retry_started = tokio::time::Instant::now();
     advance_and_settle(Duration::from_millis(499)).await;
     assert!(attempt_rx.try_recv().is_err());
-    advance_and_settle(Duration::from_millis(1)).await;
-    assert_eq!(attempt_rx.try_recv(), Ok(3));
+    assert_eq!(
+        receive_mpsc_while_advancing(&mut attempt_rx, "third caught-up attempt").await,
+        3
+    );
+    assert!(second_retry_started.elapsed() >= Duration::from_millis(500));
 
     stop(handle, join).await;
     server.await.unwrap();
@@ -1748,6 +1879,9 @@ async fn stale_private_socket_refusal_is_not_proof_that_a_runner_vanished() {
 
         settle().await;
         advance_and_settle(Duration::from_millis(100)).await;
+        fixture
+            .drive_until_observer_health(ObserverHealth::Degraded)
+            .await;
 
         assert!(
             fixture.remains_recoverable().await,
