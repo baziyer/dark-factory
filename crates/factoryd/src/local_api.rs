@@ -9,11 +9,18 @@ use std::{
 };
 
 use factory_core::{
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, TaskDetail, TaskId,
+    AgentId, AgentSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
+    TaskDetail, TaskId,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
-        MAX_PROJECT_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, RequestEnvelope,
-        ServerFrame,
+        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
+        MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
+        MAX_TASK_PAGE_ITEMS, RequestEnvelope, ServerFrame,
+        SubscriptionFailureCategory as LocalSubscriptionFailureCategory,
+        SubscriptionLimitWindow as LocalSubscriptionLimitWindow,
+        SubscriptionProbeOutcome as LocalSubscriptionProbeOutcome,
+        SubscriptionProviderStatus as LocalSubscriptionProviderStatus,
+        SubscriptionSeverity as LocalSubscriptionSeverity,
+        SubscriptionUsageStatus as LocalSubscriptionUsageStatus,
     },
 };
 use tokio::{
@@ -29,7 +36,10 @@ pub use crate::daemon_state::DaemonState as ApiState;
 use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
-    store::{NewAgent, NewProject, NewTask, StoreError},
+    store::{
+        NewAgent, NewProject, NewTask, StoreError, SubscriptionFailureCategory,
+        SubscriptionLimitWindow, SubscriptionProbe, SubscriptionProbeOutcome, SubscriptionSeverity,
+    },
 };
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
@@ -67,6 +77,10 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidStateLimit) => (
                 ErrorCode::InvalidRequest,
                 "state page limit is outside the supported range".into(),
+            ),
+            Self::Store(StoreError::InvalidSubscriptionProbe) => (
+                ErrorCode::InvalidRequest,
+                "subscription probe is invalid".into(),
             ),
             Self::Store(StoreError::AgentNotFound) => (
                 ErrorCode::NotFound,
@@ -330,6 +344,7 @@ async fn handle_request(
             project_id,
             parent_agent_id,
             role,
+            provider,
         } => {
             let agent = state
                 .commit_and_publish(move |store| {
@@ -339,7 +354,7 @@ async fn handle_request(
                             project_id,
                             parent_agent_id,
                             role,
-                            provider: Provider::Codex,
+                            provider,
                         },
                         now_ms()?,
                     )?;
@@ -347,6 +362,23 @@ async fn handle_request(
                 })
                 .await?;
             Ok(LocalResponse::AgentCreated { agent })
+        }
+        LocalRequest::ListAgents {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("agent", limit, MAX_AGENT_PAGE_ITEMS)?;
+            let mut agents = state
+                .with_store(move |store| {
+                    store.list_agents(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id = next_agent_cursor(&mut agents, limit);
+            Ok(LocalResponse::Agents {
+                agents,
+                next_after_id,
+            })
         }
         LocalRequest::StartTask {
             project_id,
@@ -385,6 +417,21 @@ async fn handle_request(
                 next_after_id,
             })
         }
+        LocalRequest::ListRuns {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("run", limit, MAX_RUN_PAGE_ITEMS)?;
+            let mut runs = state
+                .with_store(move |store| store.list_runs(&project_id, after_id.as_ref(), limit + 1))
+                .await?;
+            let next_after_id = next_run_cursor(&mut runs, limit);
+            Ok(LocalResponse::Runs {
+                runs,
+                next_after_id,
+            })
+        }
         LocalRequest::EventsAfter { sequence, limit } => {
             if sequence < 0 {
                 return Err(ApiFailure::Invalid(
@@ -397,7 +444,124 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::Events { events })
         }
+        LocalRequest::SubscriptionUsage => {
+            let snapshot = state
+                .with_store(|store| store.subscription_usage_snapshot())
+                .await?;
+            Ok(LocalResponse::SubscriptionUsage {
+                usage: LocalSubscriptionUsageStatus {
+                    overall_severity: local_subscription_severity(snapshot.overall_severity),
+                    providers: snapshot
+                        .providers
+                        .into_iter()
+                        .map(|provider| LocalSubscriptionProviderStatus {
+                            provider: provider.provider,
+                            last_attempt_at_ms: provider.last_attempt_at_ms,
+                            last_success_at_ms: provider.last_success_at_ms,
+                            used_percent: provider.used_percent,
+                            limit_window: provider.limit_window.map(local_subscription_window),
+                            resets_at_ms: provider.resets_at_ms,
+                            exhausted: provider.exhausted,
+                            severity: local_subscription_severity(provider.severity),
+                            consecutive_failures: provider.consecutive_failures,
+                        })
+                        .collect(),
+                },
+            })
+        }
+        LocalRequest::RecordSubscriptionProbe {
+            project_id,
+            orchestrator_agent_id,
+            provider,
+            attempted_at_ms,
+            outcome,
+            notification_task_id,
+        } => {
+            let outcome = store_subscription_outcome(outcome);
+            let committed = state
+                .commit_and_publish(move |store| {
+                    let committed = store.record_subscription_probe(SubscriptionProbe {
+                        project_id,
+                        orchestrator_agent_id,
+                        provider,
+                        attempted_at_ms,
+                        outcome,
+                        notification_task_id,
+                    })?;
+                    let response = (
+                        committed.state.provider,
+                        local_subscription_severity(committed.state.severity),
+                        committed.state.consecutive_failures,
+                        committed.notification_created,
+                    );
+                    Ok((response, committed.events))
+                })
+                .await?;
+            Ok(LocalResponse::SubscriptionProbeRecorded {
+                provider: committed.0,
+                severity: committed.1,
+                consecutive_failures: committed.2,
+                notification_created: committed.3,
+            })
+        }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
+    }
+}
+
+const fn store_subscription_outcome(
+    outcome: LocalSubscriptionProbeOutcome,
+) -> SubscriptionProbeOutcome {
+    match outcome {
+        LocalSubscriptionProbeOutcome::Observed {
+            used_percent,
+            limit_window,
+            resets_at_ms,
+            exhausted,
+        } => SubscriptionProbeOutcome::Observed {
+            used_percent,
+            limit_window: match limit_window {
+                LocalSubscriptionLimitWindow::Primary => SubscriptionLimitWindow::Primary,
+                LocalSubscriptionLimitWindow::Secondary => SubscriptionLimitWindow::Secondary,
+                LocalSubscriptionLimitWindow::CurrentSession => {
+                    SubscriptionLimitWindow::CurrentSession
+                }
+                LocalSubscriptionLimitWindow::CurrentWeek => SubscriptionLimitWindow::CurrentWeek,
+            },
+            resets_at_ms,
+            exhausted,
+        },
+        LocalSubscriptionProbeOutcome::Failed { category } => SubscriptionProbeOutcome::Failed {
+            category: match category {
+                LocalSubscriptionFailureCategory::Timeout => SubscriptionFailureCategory::Timeout,
+                LocalSubscriptionFailureCategory::Protocol => SubscriptionFailureCategory::Protocol,
+                LocalSubscriptionFailureCategory::Process => SubscriptionFailureCategory::Process,
+                LocalSubscriptionFailureCategory::OutputLimit => {
+                    SubscriptionFailureCategory::OutputLimit
+                }
+                LocalSubscriptionFailureCategory::Unavailable => {
+                    SubscriptionFailureCategory::Unavailable
+                }
+            },
+        },
+    }
+}
+
+const fn local_subscription_severity(severity: SubscriptionSeverity) -> LocalSubscriptionSeverity {
+    match severity {
+        SubscriptionSeverity::Ok => LocalSubscriptionSeverity::Ok,
+        SubscriptionSeverity::Warning => LocalSubscriptionSeverity::Warning,
+        SubscriptionSeverity::Critical => LocalSubscriptionSeverity::Critical,
+    }
+}
+
+const fn local_subscription_window(
+    window: SubscriptionLimitWindow,
+) -> LocalSubscriptionLimitWindow {
+    match window {
+        SubscriptionLimitWindow::Primary => LocalSubscriptionLimitWindow::Primary,
+        SubscriptionLimitWindow::Secondary => LocalSubscriptionLimitWindow::Secondary,
+        SubscriptionLimitWindow::CurrentSession => LocalSubscriptionLimitWindow::CurrentSession,
+        SubscriptionLimitWindow::CurrentWeek => LocalSubscriptionLimitWindow::CurrentWeek,
     }
 }
 
@@ -609,6 +773,22 @@ fn next_task_cursor(tasks: &mut Vec<TaskDetail>, limit: usize) -> Option<TaskId>
     }
     tasks.pop();
     tasks.last().map(|task| task.snapshot.id.clone())
+}
+
+fn next_agent_cursor(agents: &mut Vec<AgentSnapshot>, limit: usize) -> Option<AgentId> {
+    if agents.len() <= limit {
+        return None;
+    }
+    agents.pop();
+    agents.last().map(|agent| agent.id.clone())
+}
+
+fn next_run_cursor(runs: &mut Vec<RunSnapshot>, limit: usize) -> Option<RunId> {
+    if runs.len() <= limit {
+        return None;
+    }
+    runs.pop();
+    runs.last().map(|run| run.id.clone())
 }
 
 fn now_ms() -> Result<i64, StoreError> {

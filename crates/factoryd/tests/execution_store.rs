@@ -231,7 +231,7 @@ fn migrates_v1_to_v5_without_losing_state_or_event_head() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 7);
     connection
         .execute_batch("PRAGMA foreign_keys = ON")
         .unwrap();
@@ -504,7 +504,7 @@ fn terminal_frame_outcome_and_public_transitions_commit_atomically() {
             &terminal,
             RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
             },
             8,
         )
@@ -524,7 +524,7 @@ fn terminal_frame_outcome_and_public_transitions_commit_atomically() {
             &terminal,
             RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
             },
             999,
         )
@@ -552,7 +552,7 @@ fn terminal_frame_outcome_and_public_transitions_commit_atomically() {
             &terminal,
             RunnerEventEffects {
                 confirmed_provider_session_id: Some("other-session".into()),
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
             },
             999,
         ),
@@ -663,7 +663,7 @@ fn success_is_rejected_for_a_nonzero_or_signalled_process() {
             &runner_event(3, RunnerEvent::Exited { exit_code, signal }),
             RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
             },
             7,
         );
@@ -747,7 +747,7 @@ fn terminal_kind_and_effects_are_validated_before_any_cursor_change() {
         ),
         RunnerEventEffects {
             confirmed_provider_session_id: None,
-            terminal_outcome: Some(TerminalOutcome::Succeeded),
+            terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
         },
         5,
     );
@@ -921,7 +921,7 @@ fn recovery_survives_reopen_with_only_private_bounded_metadata() {
             ),
             RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded { result: None }),
             },
             7,
         )

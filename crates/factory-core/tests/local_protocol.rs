@@ -1,9 +1,10 @@
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider,
-    RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+    Provider, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
-        RequestEnvelope, ServerFrame,
+        RequestEnvelope, ServerFrame, SubscriptionLimitWindow, SubscriptionProviderStatus,
+        SubscriptionSeverity, SubscriptionUsageStatus,
     },
 };
 
@@ -60,6 +61,7 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
             updated_at_ms: 10,
         },
         body: "Use the local socket protocol.".into(),
+        result: Some("The local socket protocol is ready.".into()),
     };
     let response = LocalResponse::TaskCreated {
         task: detail.clone(),
@@ -73,9 +75,18 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
         "Use the local socket protocol."
     );
     assert_eq!(
+        value["data"]["task"]["result"],
+        "The local socket protocol is ready."
+    );
+    assert_eq!(
         serde_json::from_value::<LocalResponse>(value).unwrap(),
         response
     );
+    let event = serde_json::to_value(FactoryEvent::TaskChanged {
+        task: detail.snapshot,
+    })
+    .unwrap();
+    assert!(event["data"]["task"].get("result").is_none());
 }
 
 #[test]
@@ -85,6 +96,7 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         project_id: project_id("project-1"),
         parent_agent_id: Some(agent_id("agent-parent")),
         role: AgentRole::Worker,
+        provider: Provider::Codex,
     };
     let start = LocalRequest::StartTask {
         project_id: project_id("project-1"),
@@ -112,7 +124,7 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
     let create = serde_json::to_value(create).unwrap();
     assert_eq!(create["type"], "create_agent");
     assert_eq!(create["data"]["role"], "worker");
-    assert!(create["data"].get("provider").is_none());
+    assert_eq!(create["data"]["provider"], "codex");
 
     let start = serde_json::to_value(start).unwrap();
     assert_eq!(start["type"], "start_task");
@@ -129,6 +141,36 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         serde_json::to_value(accepted).unwrap(),
         serde_json::json!({"type":"run_accepted","data":{"run_id":"run-1"}})
     );
+}
+
+#[test]
+fn subscription_headroom_has_a_small_normalized_local_shape() {
+    let request = LocalRequest::SubscriptionUsage;
+    let response = LocalResponse::SubscriptionUsage {
+        usage: SubscriptionUsageStatus {
+            overall_severity: SubscriptionSeverity::Warning,
+            providers: vec![SubscriptionProviderStatus {
+                provider: Provider::Codex,
+                last_attempt_at_ms: 50,
+                last_success_at_ms: Some(50),
+                used_percent: Some(82),
+                limit_window: Some(SubscriptionLimitWindow::Secondary),
+                resets_at_ms: Some(1_000),
+                exhausted: Some(false),
+                severity: SubscriptionSeverity::Warning,
+                consecutive_failures: 0,
+            }],
+        },
+    };
+
+    assert_eq!(
+        serde_json::to_value(request).unwrap()["type"],
+        "subscription_usage"
+    );
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "subscription_usage");
+    assert_eq!(value["data"]["usage"]["providers"][0]["used_percent"], 82);
+    assert!(serde_json::from_value::<LocalResponse>(value).is_ok());
 }
 
 #[test]
@@ -230,6 +272,7 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
                 updated_at_ms: i64::MAX,
             },
             body: "x".repeat(MAX_TASK_BODY_BYTES),
+            result: None,
         })
         .collect();
     let frame = ServerFrame::Response {

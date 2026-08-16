@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+eframe = { version = "=0.32.0", default-features = false, features = ["default_fonts", "glow"] }
 factory-core = { path = "../factory-core" }
 serde_json.workspace = true
 uuid.workspace = true

@@ -46,7 +46,7 @@ This file records constraints, not an aspirational component catalogue.
    the ambient environment is cleared. Resume never falls back to a fresh
    session or a different worktree/home. Claude uses its exact daemon-bound
    fresh or adopted session UUID on every launch and replay; both providers are
-   executable before the one-time Munder cutover.
+   executable from a greenfield database.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
@@ -66,25 +66,21 @@ This file records constraints, not an aspirational component catalogue.
 8. The orchestrator uses the same durable task and message interfaces as other
    clients. It may choose work, but it cannot bypass daemon-owned limits.
 
-## First vertical slice
+## First launch
 
-One project has one persistent orchestrator task and one worker task. `factoryd`
-stores both, starts the worker through `factory-runner`, normalises structured
-provider events, and streams persisted events to a sparse observer. The slice is
-complete only after a real provider command has run and the observer has been
-closed and reopened without affecting it.
-
-The Munder Difflin cutover is a one-time migration, not a permanent dual-run
-mode: capture agent/task/session/worktree state, pause new Munder allocation,
-resume only verifiable work, switch Minerva, and retire the old control path.
-No shadow-fleet or rollback subsystem is part of Dark Factory.
+`factoryd` starts from an empty database. A human creates projects, agents, and
+tasks through `factoryctl` or its native UI and explicitly assigns each v1 run.
+The daemon starts the worker through `factory-runner`, normalises structured
+provider events, and streams persisted state to disposable observers. A launch
+is proven only after a real provider command has run and an observer and daemon
+have both restarted without stopping or misidentifying it.
 
 ## Deliberately unresolved
 
 - Zero-downtime handoff between two daemon binaries is deferred. Ordinary
   restart recovery reconnects to exact stable runners; unverifiable identities
   fail visibly rather than risk attaching to the wrong process.
-- Webhook exposure beyond loopback and its authentication scheme will be chosen
-  with the first inbound/outbound messaging slice.
-- Repository visibility is private during early dogfooding; making it public is
+- Webhook exposure beyond loopback remains external. The daemon accepts only
+  owner-configured endpoint profiles with distinct secrets and projects.
+- Repository visibility is private during early operation; making it public is
   a separate product decision.

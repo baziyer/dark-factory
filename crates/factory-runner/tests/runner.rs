@@ -752,7 +752,7 @@ fn spawn_failure_is_a_replayable_terminal_event() {
 }
 
 #[test]
-fn replay_cutover_delivers_later_output_and_exit_without_polling() {
+fn replay_boundary_delivers_later_output_and_exit_without_polling() {
     let release_directory = tempfile::tempdir().unwrap();
     let release = release_directory.path().join("release");
     let runner = RunningRunner::spawn(&[
@@ -883,8 +883,8 @@ fn replay_cutover_delivers_later_output_and_exit_without_polling() {
     );
     let terminal = terminal_sequence(&frames);
     assert_command_ack(
-        acknowledge(&runner, terminal, "cutover-persisted"),
-        "cutover-persisted",
+        acknowledge(&runner, terminal, "terminal-persisted"),
+        "terminal-persisted",
     );
     runner.wait_for_clean_exit();
 }

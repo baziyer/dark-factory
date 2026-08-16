@@ -8,7 +8,10 @@ use std::{
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, RunId, TaskId,
-    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    local::{
+        LocalRequest, LocalResponse, RequestEnvelope, ServerFrame, SubscriptionSeverity,
+        SubscriptionUsageStatus,
+    },
 };
 
 fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalResponse) {
@@ -21,6 +24,47 @@ fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalRe
     )
     .unwrap();
     stream.write_all(b"\n").unwrap();
+}
+
+#[test]
+fn usage_prints_the_normalized_daemon_snapshot() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::SubscriptionUsage)
+        );
+        write_response(
+            &mut stream,
+            LocalResponse::SubscriptionUsage {
+                usage: SubscriptionUsageStatus {
+                    overall_severity: SubscriptionSeverity::Ok,
+                    providers: Vec::new(),
+                },
+            },
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "usage"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(matches!(
+        serde_json::from_slice::<ServerFrame>(&output.stdout).unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::SubscriptionUsage { .. },
+            ..
+        }
+    ));
+    server.join().unwrap();
 }
 
 #[test]
@@ -158,6 +202,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             project_id,
             parent_agent_id,
             role,
+            provider,
         } = request.request
         else {
             panic!("expected create-agent request");
@@ -166,6 +211,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         assert_eq!(project_id, ProjectId::try_from("project-1").unwrap());
         assert_eq!(parent_agent_id, None);
         assert_eq!(role, AgentRole::Worker);
+        assert_eq!(provider, Provider::Codex);
         write_response(
             &mut agent_stream,
             LocalResponse::AgentCreated {
@@ -215,6 +261,8 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             "project-1",
             "--role",
             "worker",
+            "--provider",
+            "codex",
         ])
         .output()
         .unwrap();

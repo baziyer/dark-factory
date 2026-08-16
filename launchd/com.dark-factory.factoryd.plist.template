@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dark-factory.factoryd</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__FACTORYD__</string>
+        <string>--database</string>
+        <string>__DATABASE__</string>
+        <string>--socket</string>
+        <string>__SOCKET__</string>
+        <string>--runner</string>
+        <string>__FACTORY_RUNNER__</string>
+        <string>--codex</string>
+        <string>__CODEX__</string>
+        <string>--claude</string>
+        <string>__CLAUDE__</string>
+        <string>--runtime-root</string>
+        <string>__RUNTIME_ROOT__</string>
+        <string>--max-active-runs</string>
+        <string>__MAX_ACTIVE_RUNS__</string>
+        <string>--webhook-config</string>
+        <string>__WEBHOOK_CONFIG__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__WORKING_DIRECTORY__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Umask</key>
+    <integer>63</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIRECTORY__/factoryd.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIRECTORY__/factoryd.stderr.log</string>
+</dict>
+</plist>

@@ -65,7 +65,7 @@ fn fixture() -> (Store, RunId, RunnerInstanceId) {
                 id: id("agent"),
                 project_id: id("project"),
                 parent_agent_id: None,
-                role: AgentRole::Worker,
+                role: AgentRole::Orchestrator,
                 provider: Provider::Codex,
             },
             3,
@@ -134,7 +134,9 @@ fn contiguous_batch_commits_session_cursor_and_terminal_state_atomically() {
             ),
             effects: RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded {
+                    result: Some("Completed factory result".into()),
+                }),
             },
         },
     ];
@@ -173,6 +175,25 @@ fn contiguous_batch_commits_session_cursor_and_terminal_state_atomically() {
             .snapshot
             .status,
         TaskStatus::Succeeded
+    );
+    assert_eq!(
+        store
+            .list_tasks(&id::<ProjectId>("project"), None, 10)
+            .unwrap()[0]
+            .result
+            .as_deref(),
+        Some("Completed factory result")
+    );
+    let snapshot = store
+        .webhook_snapshot(
+            &id::<ProjectId>("project"),
+            &id::<factory_core::AgentId>("agent"),
+            20,
+        )
+        .unwrap();
+    assert_eq!(
+        snapshot.tasks[0].result.as_deref(),
+        Some("Completed factory result")
     );
 
     let serialized = serde_json::to_string(&store.events_after(0, 100).unwrap()).unwrap();
@@ -213,7 +234,9 @@ fn invalid_late_event_rolls_back_the_whole_batch() {
             ),
             effects: RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded {
+                    result: Some("stable result".into()),
+                }),
             },
         },
         input(event(
@@ -273,7 +296,9 @@ fn duplicate_prefix_and_new_suffix_have_one_explicit_result() {
             ),
             effects: RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded {
+                    result: Some("stable result".into()),
+                }),
             },
         },
     ];
@@ -315,7 +340,9 @@ fn duplicate_prefix_and_new_suffix_have_one_explicit_result() {
             ),
             effects: RunnerEventEffects {
                 confirmed_provider_session_id: None,
-                terminal_outcome: Some(TerminalOutcome::Succeeded),
+                terminal_outcome: Some(TerminalOutcome::Succeeded {
+                    result: Some("stable result".into()),
+                }),
             },
         },
     ];
@@ -326,6 +353,32 @@ fn duplicate_prefix_and_new_suffix_have_one_explicit_result() {
             .disposition,
         IngestDisposition::Duplicate
     );
+
+    let conflicting_terminal = RunnerEventInput {
+        event: event(
+            3,
+            RunnerEvent::Exited {
+                exit_code: Some(0),
+                signal: None,
+            },
+        ),
+        effects: RunnerEventEffects {
+            confirmed_provider_session_id: None,
+            terminal_outcome: Some(TerminalOutcome::Succeeded {
+                result: Some("changed replay result".into()),
+            }),
+        },
+    };
+    assert!(matches!(
+        store.ingest_runner_event(
+            &run_id,
+            &runner_instance_id,
+            &conflicting_terminal.event,
+            conflicting_terminal.effects,
+            8,
+        ),
+        Err(StoreError::InvalidTerminalOutcome)
+    ));
 }
 
 #[test]

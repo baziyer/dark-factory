@@ -1,22 +1,30 @@
 use std::{env, io::Write, path::PathBuf, process};
 
-use factory_core::AgentRole;
 use factory_core::local::{
-    LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
-    ServerFrame,
+    LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
+    MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame,
 };
+use factory_core::{AgentRole, Provider};
 use factoryctl::Client;
 use uuid::Uuid;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|project|task|agent|events> ...";
+mod ui;
+
+const USAGE: &str =
+    "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|events> ...";
 const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
+const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
+const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
 const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
 
 #[derive(Debug, Eq, PartialEq)]
 enum CliCommand {
+    Ui,
     Health,
+    Usage,
     ProjectAdd {
+        id: Option<String>,
         name: String,
         root: String,
     },
@@ -25,6 +33,7 @@ enum CliCommand {
         limit: u32,
     },
     TaskAdd {
+        id: Option<String>,
         project_id: String,
         parent_task_id: Option<String>,
         title: String,
@@ -44,9 +53,21 @@ enum CliCommand {
         worktree: String,
     },
     AgentAdd {
+        id: Option<String>,
         project_id: String,
         parent_agent_id: Option<String>,
         role: AgentRole,
+        provider: Provider,
+    },
+    AgentList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
+    },
+    RunList {
+        project_id: String,
+        after_id: Option<String>,
+        limit: u32,
     },
     Events {
         after_sequence: i64,
@@ -79,6 +100,10 @@ fn run() -> Result<i32, String> {
         home.as_deref(),
     )?;
     let client = Client::new(socket);
+    if matches!(command, CliCommand::Ui) {
+        ui::run(client)?;
+        return Ok(0);
+    }
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
@@ -136,9 +161,18 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             require_empty(&args)?;
             Ok((socket, CliCommand::Health))
         }
+        "usage" => {
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Usage))
+        }
+        "ui" => {
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Ui))
+        }
         "project" => parse_project(args).map(|command| (socket, command)),
         "task" => parse_task(args).map(|command| (socket, command)),
         "agent" => parse_agent(args).map(|command| (socket, command)),
+        "run" => parse_run(args).map(|command| (socket, command)),
         "events" => parse_events(args).map(|command| (socket, command)),
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
     }
@@ -148,10 +182,11 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
     let action = take_action(&mut args, "project")?;
     match action.as_str() {
         "add" => {
+            let id = take_option(&mut args, "--id")?;
             let name = required_option(&mut args, "--name")?;
             let root = required_option(&mut args, "--root")?;
             require_empty(&args)?;
-            Ok(CliCommand::ProjectAdd { name, root })
+            Ok(CliCommand::ProjectAdd { id, name, root })
         }
         "list" => {
             let after_id = take_option(&mut args, "--after")?;
@@ -167,6 +202,7 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
     let action = take_action(&mut args, "task")?;
     match action.as_str() {
         "add" => {
+            let id = take_option(&mut args, "--id")?;
             let project_id = required_option(&mut args, "--project")?;
             let parent_task_id = take_option(&mut args, "--parent")?;
             let title = required_option(&mut args, "--title")?;
@@ -177,6 +213,7 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 .unwrap_or(0);
             require_empty(&args)?;
             Ok(CliCommand::TaskAdd {
+                id,
                 project_id,
                 parent_task_id,
                 title,
@@ -218,6 +255,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
     let action = take_action(&mut args, "agent")?;
     match action.as_str() {
         "add" => {
+            let id = take_option(&mut args, "--id")?;
             let project_id = required_option(&mut args, "--project")?;
             let parent_agent_id = take_option(&mut args, "--parent")?;
             let role = match required_option(&mut args, "--role")?.as_str() {
@@ -225,14 +263,50 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 "worker" => AgentRole::Worker,
                 _ => return Err("--role must be orchestrator or worker".into()),
             };
+            let provider = match required_option(&mut args, "--provider")?.as_str() {
+                "claude" | "claude-code" => Provider::ClaudeCode,
+                "codex" => Provider::Codex,
+                _ => return Err("--provider must be claude or codex".into()),
+            };
             require_empty(&args)?;
             Ok(CliCommand::AgentAdd {
+                id,
                 project_id,
                 parent_agent_id,
                 role,
+                provider,
+            })
+        }
+        "list" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(&mut args, AGENT_LIST_LIMIT, MAX_AGENT_PAGE_ITEMS)?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentList {
+                project_id,
+                after_id,
+                limit,
             })
         }
         _ => Err(format!("unknown agent action {action:?}")),
+    }
+}
+
+fn parse_run(mut args: Vec<String>) -> Result<CliCommand, String> {
+    let action = take_action(&mut args, "run")?;
+    match action.as_str() {
+        "list" => {
+            let project_id = required_option(&mut args, "--project")?;
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(&mut args, RUN_LIST_LIMIT, MAX_RUN_PAGE_ITEMS)?;
+            require_empty(&args)?;
+            Ok(CliCommand::RunList {
+                project_id,
+                after_id,
+                limit,
+            })
+        }
+        _ => Err(format!("unknown run action {action:?}")),
     }
 }
 
@@ -259,9 +333,14 @@ fn parse_events(mut args: Vec<String>) -> Result<CliCommand, String> {
 
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
+        CliCommand::Ui => Err("ui is handled before local requests".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
-        CliCommand::ProjectAdd { name, root } => Ok(LocalRequest::CreateProject {
-            id: generated_id()?,
+        CliCommand::Usage => Ok(LocalRequest::SubscriptionUsage),
+        CliCommand::ProjectAdd { id, name, root } => Ok(LocalRequest::CreateProject {
+            id: id
+                .map(|id| parse_id(id, "project"))
+                .transpose()?
+                .unwrap_or(generated_id()?),
             name,
             root,
         }),
@@ -272,13 +351,17 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             limit,
         }),
         CliCommand::TaskAdd {
+            id,
             project_id,
             parent_task_id,
             title,
             body,
             priority,
         } => Ok(LocalRequest::CreateTask {
-            id: generated_id()?,
+            id: id
+                .map(|id| parse_id(id, "task"))
+                .transpose()?
+                .unwrap_or(generated_id()?),
             project_id: parse_id(project_id, "project")?,
             parent_task_id: parent_task_id
                 .map(|id| parse_id(id, "parent task"))
@@ -312,16 +395,42 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             worktree,
         }),
         CliCommand::AgentAdd {
+            id,
             project_id,
             parent_agent_id,
             role,
+            provider,
         } => Ok(LocalRequest::CreateAgent {
-            id: generated_id()?,
+            id: id
+                .map(|id| parse_id(id, "agent"))
+                .transpose()?
+                .unwrap_or(generated_id()?),
             project_id: parse_id(project_id, "project")?,
             parent_agent_id: parent_agent_id
                 .map(|id| parse_id(id, "parent agent"))
                 .transpose()?,
             role,
+            provider,
+        }),
+        CliCommand::AgentList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListAgents {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id
+                .map(|id| parse_id(id, "agent cursor"))
+                .transpose()?,
+            limit,
+        }),
+        CliCommand::RunList {
+            project_id,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListRuns {
+            project_id: parse_id(project_id, "project")?,
+            after_id: after_id.map(|id| parse_id(id, "run cursor")).transpose()?,
+            limit,
         }),
         CliCommand::Events {
             after_sequence,
@@ -449,7 +558,7 @@ fn take_limit(args: &mut Vec<String>, default: u32, maximum: u32) -> Result<(u32
 mod tests {
     use std::path::PathBuf;
 
-    use factory_core::{AgentRole, local::LocalRequest};
+    use factory_core::{AgentRole, Provider, local::LocalRequest};
     use uuid::Uuid;
 
     use super::{CliCommand, parse_args, request_for, resolve_socket_path};
@@ -506,6 +615,7 @@ mod tests {
             (
                 None,
                 CliCommand::ProjectAdd {
+                    id: None,
                     name: "Dark Factory".into(),
                     root: "/work/dark-factory".into(),
                 }
@@ -530,6 +640,7 @@ mod tests {
             (
                 None,
                 CliCommand::TaskAdd {
+                    id: None,
                     project_id: "project-1".into(),
                     parent_task_id: Some("task-0".into()),
                     title: "Build client".into(),
@@ -552,14 +663,18 @@ mod tests {
                 "agent-parent",
                 "--role",
                 "worker",
+                "--provider",
+                "codex",
             ]))
             .unwrap(),
             (
                 None,
                 CliCommand::AgentAdd {
+                    id: None,
                     project_id: "project-1".into(),
                     parent_agent_id: Some("agent-parent".into()),
                     role: AgentRole::Worker,
+                    provider: Provider::Codex,
                 }
             )
         );
@@ -608,9 +723,11 @@ mod tests {
     #[test]
     fn agent_ids_are_client_generated_but_run_ids_are_daemon_generated() {
         let request = request_for(CliCommand::AgentAdd {
+            id: None,
             project_id: "project-1".into(),
             parent_agent_id: None,
             role: AgentRole::Orchestrator,
+            provider: Provider::Codex,
         })
         .unwrap();
         let LocalRequest::CreateAgent { id, role, .. } = request else {
@@ -640,6 +757,16 @@ mod tests {
                 limit: 100,
                 follow: true,
             }
+        );
+    }
+
+    #[test]
+    fn usage_reads_the_normalized_subscription_snapshot() {
+        let (_, command) = parse_args(args(&["usage"])).unwrap();
+        assert_eq!(command, CliCommand::Usage);
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::SubscriptionUsage
         );
     }
 
@@ -706,6 +833,7 @@ mod tests {
     #[test]
     fn create_commands_generate_valid_uuid_ids() {
         let request = request_for(CliCommand::ProjectAdd {
+            id: None,
             name: "Dark Factory".into(),
             root: "/work/dark-factory".into(),
         })

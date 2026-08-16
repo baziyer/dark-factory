@@ -207,6 +207,8 @@ pub struct TaskSnapshot {
 pub struct TaskDetail {
     pub snapshot: TaskSnapshot,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 /// A durable agent identity. Process-attempt state belongs to [`RunSnapshot`].

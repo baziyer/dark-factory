@@ -4,32 +4,31 @@ A small Rust supervisor for coding-agent processes, with a disposable native
 observer. The target is closer to systemd for Claude Code and Codex than a
 desktop agent simulation.
 
-The repository is being built in working vertical slices. Today it contains the
-shared protocol, the daemon's SQLite state/event store, a versioned local Unix
-socket, a small machine-readable CLI, and a stable provider-blind process
-runner. The daemon now has a default-deny launch boundary that keeps ambient
-credentials out of runners and transfers bounded task input only over stdin.
-Concrete Codex 0.147 and Claude Code 2.1.233 adapters build fresh and resumed
-stdin-only turns and normalise their JSONL into bounded, structurally filtered
-observations. A durable execution ledger now reserves tasks atomically, binds
-provider sessions, records run attempts, and supports exact runner replay and
-terminal reconciliation. A bounded concrete execution actor now launches and
-recovers Claude Code and Codex runners without coupling their lifetime to the
-daemon. The local control plane can create Codex agents and durably start tasks
-for provider-bound Codex or adopted Claude agents. Existing Claude and Codex
-identities can be captured with their exact session worktree; adopted Codex
-sessions may also bind one explicit private
-`CODEX_HOME` without re-enabling ambient environment inheritance. Exact runner
-observation health is durable, so a restart cannot mistake degraded supervision
-for proof that an agent stopped; native
-observation remains deliberately absent until its vertical slice is executable.
+The first-launch system contains a SQLite-backed daemon, stable per-run process
+sidecars, concrete Claude Code and Codex adapters, a versioned private Unix
+socket, a machine-readable v1 CLI, and an event-driven native egui UI.
+Task reservation, provider-session ownership, runner replay, terminal outcome,
+and observer health are durable. Restarting the daemon, CLI, or UI does not stop
+an agent process.
+
+Provider input is bounded and sent only over stdin. Runners receive a small
+default-deny environment; provider output is decoded into bounded structural
+state and is never copied wholesale into events, logs, or webhook responses.
+On success, only the provider's bounded final answer is stored as the task
+result for capability-scoped webhook polling and snapshots.
+An optional loopback HTTP listener hosts multiple configured webhook endpoints
+with distinct secrets and projects. Subscription headroom is collected without
+an agent/model turn, normalized into deterministic severity, and visible to the
+CLI, native UI, and webhooks.
 
 ## Non-goals
 
 - embedding agent runtimes in the UI;
 - simulating an office or rendering continuous animation;
 - parsing terminal escape sequences when a provider exposes structured output;
-- designing a general distributed workflow engine before local dogfooding earns it.
+- automatic scheduling before explicit local operation earns it;
+- provider terminals, office animation, or a browser runtime inside the UI;
+- a plugin framework or public network listener in the first launch.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants that constrain each
 slice.
@@ -37,10 +36,12 @@ slice.
 ## Development
 
 ```sh
-cargo test --locked --workspace
-cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+./scripts/local-ci.sh
 ```
+
+The local gate is authoritative for this repository. GitHub
+Actions is manual-only so ordinary pushes and pull requests do not consume
+hosted-runner budget.
 
 ## Local control plane
 
@@ -51,10 +52,12 @@ cargo run -p factoryd
 cargo run -p factoryctl -- health
 cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
 cargo run -p factoryctl -- project list
-cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator
+cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator --provider codex
 cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
 cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
+cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
+cargo run -p factoryctl -- ui
 ```
 
 Commands emit versioned JSON frames. `task start` returns `run_accepted` once
@@ -69,10 +72,72 @@ By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
 `claude` through the sanitized launch environment, stores runner state under
 `$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
 `--codex`, `--claude`, `--runtime-root`, and `--max-active-runs` to set those
-explicitly. Claude runs are bounded to 20 turns and USD 5.00 in this first
-local cutover policy.
+explicitly. Claude runs are bounded to 20 turns and USD 5.00 in v1.
 
 State is private by construction. Custom database and socket paths must each
 have an immediate parent directory owned by the current user with mode `0700`;
 files and sockets use mode `0600`. The default state directory is created with
 those permissions automatically.
+
+## Generic webhook endpoints
+
+Webhooks are optional and loopback-only. `factoryd --webhook-config PATH` loads
+one owner-only (`0600`) JSON file and all endpoint secrets before it advertises
+readiness. Endpoint IDs, secrets, and projects are unique.
+
+```json
+{
+  "version": 1,
+  "bind": "127.0.0.1:3849",
+  "endpoints": [
+    {
+      "id": "minerva",
+      "wireProfile": "legacy_v1",
+      "secretFile": "/absolute/private/minerva.secret",
+      "projectId": "factory",
+      "orchestratorAgentId": "god"
+    },
+    {
+      "id": "another-client",
+      "wireProfile": "factory_v1",
+      "secretFile": "/absolute/private/another.secret",
+      "projectId": "another-project",
+      "orchestratorAgentId": "foreman"
+    }
+  ]
+}
+```
+
+The endpoint ID is the route prefix. `legacy_v1` preserves the existing Minerva
+wire aliases and header names; `factory_v1` uses
+`x-dark-factory-webhook-secret` and `x-dark-factory-webhook-token` and omits
+legacy cost placeholders. Tunnel or device exposure remains external to the
+daemon.
+
+## First-launch boundary and roadmap
+
+V1 is intentionally explicit: create projects, agents, and tasks, then choose
+the agent and worktree for each start. The native UI provides the same control
+surface as the JSON CLI plus project/task/agent/run inspection, observer health,
+subscription capacity, and recent durable events.
+
+Deferred work is narrow and evidence-led:
+
+- scheduling and dependency-driven allocation;
+- stop/pause/retry controls with durable intent;
+- a separate agent function axis (`design`, `execution`, `operations`) shown as
+  Studio, Workshop, and Control Room, without changing the authority roles
+  `orchestrator` and `worker`;
+- optional memorable display names drawn from scientists, philosophers,
+  engineers, and artists, never used as IDs or policy;
+- richer event/activity inspection and a first-class blocked-question/document
+  workflow for generic remote clients;
+- public-network webhook deployment and additional wire profiles.
+
+## Local service
+
+Templates in `launchd/` run the daemon and subscription monitor locally; they do
+not use GitHub Actions. Render placeholders to absolute canonical paths, keep
+state/config/log directories at `0700`, and install rendered plists at `0600`.
+The monitor stores only normalized allowance headroom and fixed failure
+categories—never raw provider terminal output or dollar estimates.

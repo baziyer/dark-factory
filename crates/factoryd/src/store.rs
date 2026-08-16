@@ -15,11 +15,20 @@ use rusqlite::{
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
+const MAX_WEBHOOK_DOCUMENT_REFS: usize = 8;
+const MAX_WEBHOOK_ACTIVE_TASKS: usize = 100;
+const MAX_WEBHOOK_DONE_TASKS: usize = 12;
+const MAX_WEBHOOK_SNAPSHOT_AGENTS: usize = 64;
+const MAX_WEBHOOK_CREATE_TITLE_BYTES: usize = 160;
+const MAX_BODY_BYTES: usize = 100_000;
+const MAX_WEBHOOK_TITLE_BYTES: usize = 240;
+const MAX_WEBHOOK_TEXT_BYTES: usize = 4_000;
+const MAX_TERMINAL_RESULT_BYTES: usize = 4 * 1024;
 pub const MAX_RUNNER_BATCH_EVENTS: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,6 +55,190 @@ pub struct NewAgent {
     pub parent_agent_id: Option<AgentId>,
     pub role: AgentRole,
     pub provider: Provider,
+}
+
+/// Provider-independent task vocabulary exposed by authenticated integrations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalTaskStatus {
+    Todo,
+    Doing,
+    Blocked,
+    Done,
+}
+
+/// Private task creation input accepted by an authenticated webhook endpoint.
+pub struct NewWebhookTask {
+    pub id: TaskId,
+    pub project_id: ProjectId,
+    pub orchestrator_agent_id: AgentId,
+    pub endpoint_id: String,
+    pub title: String,
+    pub body: String,
+    pub token_sha256: [u8; 32],
+    pub created_at_ms: i64,
+}
+
+/// Private question answer and the caller-generated notification identity.
+pub struct WebhookAnswer {
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub answer: String,
+    pub orchestrator_agent_id: AgentId,
+    pub notification_task_id: TaskId,
+    pub answered_at_ms: i64,
+}
+
+pub struct WebhookTaskCounts {
+    pub todo: i64,
+    pub doing: i64,
+    pub blocked: i64,
+    pub done: i64,
+}
+
+pub struct WebhookSnapshot {
+    pub generated_at_ms: i64,
+    pub counts: WebhookTaskCounts,
+    pub tasks: Vec<WebhookSnapshotTask>,
+    pub agents: Vec<WebhookSnapshotAgent>,
+    pub subscription_usage: SubscriptionUsageSnapshot,
+}
+
+/// Deterministic subscription headroom band. This is intentionally independent
+/// of imported per-run token and dollar receipts.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SubscriptionSeverity {
+    Ok,
+    Warning,
+    Critical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionFailureCategory {
+    Timeout,
+    Protocol,
+    Process,
+    OutputLimit,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionLimitWindow {
+    Primary,
+    Secondary,
+    CurrentSession,
+    CurrentWeek,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubscriptionProbeOutcome {
+    Observed {
+        used_percent: u8,
+        limit_window: SubscriptionLimitWindow,
+        resets_at_ms: Option<i64>,
+        exhausted: bool,
+    },
+    Failed {
+        category: SubscriptionFailureCategory,
+    },
+}
+
+pub struct SubscriptionProbe {
+    pub project_id: ProjectId,
+    pub orchestrator_agent_id: AgentId,
+    pub provider: Provider,
+    pub attempted_at_ms: i64,
+    pub outcome: SubscriptionProbeOutcome,
+    pub notification_task_id: TaskId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionProviderState {
+    pub provider: Provider,
+    pub last_attempt_at_ms: i64,
+    pub last_success_at_ms: Option<i64>,
+    pub used_percent: Option<u8>,
+    pub limit_window: Option<SubscriptionLimitWindow>,
+    pub resets_at_ms: Option<i64>,
+    pub exhausted: Option<bool>,
+    pub severity: SubscriptionSeverity,
+    pub consecutive_failures: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubscriptionUsageSnapshot {
+    pub overall_severity: SubscriptionSeverity,
+    pub providers: Vec<SubscriptionProviderState>,
+}
+
+pub struct SubscriptionProbeCommit {
+    pub state: SubscriptionProviderState,
+    pub notification_created: bool,
+    pub events: Vec<EventEnvelope>,
+}
+
+pub struct WebhookSnapshotTask {
+    pub id: TaskId,
+    pub title: String,
+    pub status: OperationalTaskStatus,
+    pub assignee: Option<String>,
+    pub depends_on: Vec<TaskId>,
+    pub priority: i32,
+    pub created_at_ms: i64,
+    pub started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub question: Option<WebhookOpenQuestion>,
+    pub result: Option<String>,
+}
+
+pub struct WebhookOpenQuestion {
+    pub text: String,
+    pub asked_at_ms: Option<i64>,
+    pub documents: Vec<WebhookDocumentRef>,
+}
+
+pub struct WebhookDocumentRef {
+    pub id: String,
+    pub name: String,
+    pub reference: String,
+}
+
+pub struct WebhookSnapshotAgent {
+    pub id: AgentId,
+    pub name: String,
+    pub role: String,
+    pub control_role: AgentRole,
+    pub provider: Option<Provider>,
+    pub is_orchestrator: bool,
+    pub last_active_sec_ago: Option<i64>,
+    pub inbox_backlog: i64,
+    pub observer_health: ObserverHealth,
+}
+
+/// Capability-scoped status. Result content keeps this non-`Debug`.
+pub struct WebhookTaskPoll {
+    pub status: OperationalTaskStatus,
+    pub title: String,
+    pub result: Option<String>,
+}
+
+pub struct WebhookCreated {
+    pub task_id: TaskId,
+    pub status: OperationalTaskStatus,
+    pub title: String,
+}
+
+pub struct WebhookMutation {
+    pub events: Vec<EventEnvelope>,
+    pub open_question_remains: bool,
+}
+
+/// Capability-scoped immutable document. Content keeps this non-`Debug`.
+pub struct WebhookDocument {
+    pub id: String,
+    pub name: String,
+    pub reference: String,
+    pub revision: String,
+    pub content: String,
 }
 
 /// Exact private provider context imported with an existing agent.
@@ -162,9 +355,9 @@ pub struct RunnerEventInput {
     pub effects: RunnerEventEffects,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum TerminalOutcome {
-    Succeeded,
+    Succeeded { result: Option<String> },
     Failed(RunFailureReason),
 }
 
@@ -273,6 +466,20 @@ pub enum StoreError {
     InvalidRunState,
     #[error("private execution metadata is empty, relative, or too large")]
     InvalidExecutionMetadata,
+    #[error("webhook input is invalid")]
+    InvalidWebhookInput,
+    #[error("webhook project was not found")]
+    WebhookProjectNotFound,
+    #[error("webhook orchestrator was not found")]
+    WebhookOrchestratorNotFound,
+    #[error("webhook task was not found")]
+    WebhookTaskNotFound,
+    #[error("webhook task has no open question")]
+    WebhookQuestionNotOpen,
+    #[error("webhook operational snapshot exceeds its bounded capacity")]
+    WebhookSnapshotTooLarge,
+    #[error("subscription usage input is invalid")]
+    InvalidSubscriptionProbe,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -364,6 +571,7 @@ impl Store {
                 updated_at_ms: now_ms,
             },
             body: input.body,
+            result: None,
         };
         let event = FactoryEvent::TaskChanged {
             task: record.snapshot.clone(),
@@ -620,7 +828,8 @@ impl Store {
         )?;
         let assigned = transaction.execute(
             "UPDATE tasks
-             SET assigned_agent_id = ?1, status = 'running', updated_at_ms = ?2
+             SET assigned_agent_id = ?1, status = 'running', updated_at_ms = ?2,
+                 started_at_ms = COALESCE(started_at_ms, ?2)
              WHERE id = ?3 AND project_id = ?4 AND status = 'queued'",
             params![
                 input.agent_id.as_str(),
@@ -963,6 +1172,713 @@ impl Store {
             .map_err(StoreError::from)
     }
 
+    /// Returns the bounded, public operational projection used by webhooks.
+    /// Counts cover the full project; task rows are capped to 100 active and
+    /// 12 most-recent terminal tasks.
+    pub fn webhook_snapshot(
+        &self,
+        project_id: &ProjectId,
+        orchestrator_agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<WebhookSnapshot> {
+        validate_webhook_project_and_orchestrator(
+            &self.connection,
+            project_id,
+            orchestrator_agent_id,
+        )?;
+        let (todo, doing, blocked, done) = self.connection.query_row(
+            "SELECT
+                COALESCE(SUM(status = 'queued'), 0),
+                COALESCE(SUM(status = 'running'), 0),
+                COALESCE(SUM(status = 'blocked'), 0),
+                COALESCE(SUM(status IN ('succeeded', 'failed', 'cancelled')), 0)
+             FROM tasks WHERE project_id = ?1",
+            params![project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let mut tasks = load_webhook_snapshot_tasks(
+            &self.connection,
+            project_id,
+            false,
+            MAX_WEBHOOK_ACTIVE_TASKS,
+        )?;
+        tasks.extend(load_webhook_snapshot_tasks(
+            &self.connection,
+            project_id,
+            true,
+            MAX_WEBHOOK_DONE_TASKS,
+        )?);
+
+        let agent_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM agents WHERE project_id = ?1",
+            params![project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if agent_count > usize_to_i64(MAX_WEBHOOK_SNAPSHOT_AGENTS)? {
+            return Err(StoreError::WebhookSnapshotTooLarge);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT a.id, a.role, a.provider,
+                    (SELECT MAX(r.updated_at_ms) FROM runs r WHERE r.agent_id = a.id),
+                    (SELECT COUNT(*) FROM tasks t
+                     WHERE t.project_id = a.project_id
+                       AND t.assigned_agent_id = a.id
+                       AND t.status IN ('queued', 'blocked')),
+                    (SELECT r.observer_health FROM runs r
+                     WHERE r.agent_id = a.id
+                     ORDER BY r.updated_at_ms DESC, r.id DESC LIMIT 1)
+             FROM agents a
+             WHERE a.project_id = ?1
+             ORDER BY a.id",
+        )?;
+        let agents = statement
+            .query_map(params![project_id.as_str()], |row| {
+                let id: AgentId = parse_id(row.get(0)?, 0)?;
+                let core_role: String = row.get(1)?;
+                let provider: String = row.get(2)?;
+                let core_role = parse_agent_role(&core_role, 1)?;
+                let last_active_at_ms: Option<i64> = row.get(3)?;
+                let observer_health: Option<String> = row.get(5)?;
+                Ok(WebhookSnapshotAgent {
+                    is_orchestrator: &id == orchestrator_agent_id,
+                    id: id.clone(),
+                    name: id.to_string(),
+                    role: agent_role_value(core_role).to_owned(),
+                    control_role: core_role,
+                    provider: Some(parse_provider(&provider, 2)?),
+                    last_active_sec_ago: last_active_at_ms
+                        .map(|last_active| now_ms.saturating_sub(last_active).max(0) / 1_000),
+                    inbox_backlog: row.get(4)?,
+                    observer_health: observer_health
+                        .as_deref()
+                        .map(|value| parse_observer_health(value, 5))
+                        .transpose()?
+                        .unwrap_or(ObserverHealth::Unknown),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        let subscription_usage = self.subscription_usage_snapshot()?;
+
+        Ok(WebhookSnapshot {
+            generated_at_ms: now_ms,
+            counts: WebhookTaskCounts {
+                todo,
+                doing,
+                blocked,
+                done,
+            },
+            tasks,
+            agents,
+            subscription_usage,
+        })
+    }
+
+    /// Records one bounded, normalized subscription-capacity probe. Raw CLI or
+    /// protocol output is never accepted by this store boundary.
+    pub fn record_subscription_probe(
+        &mut self,
+        input: SubscriptionProbe,
+    ) -> Result<SubscriptionProbeCommit> {
+        if input.attempted_at_ms < 0
+            || matches!(
+                input.outcome,
+                SubscriptionProbeOutcome::Observed {
+                    used_percent: 101..=u8::MAX,
+                    ..
+                }
+            )
+        {
+            return Err(StoreError::InvalidSubscriptionProbe);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_webhook_project_and_orchestrator(
+            &transaction,
+            &input.project_id,
+            &input.orchestrator_agent_id,
+        )?;
+        let provider = provider_value(input.provider);
+        let replayed = transaction
+            .query_row(
+                "SELECT outcome, used_percent, limit_window, resets_at_ms, exhausted,
+                    failure_category
+             FROM subscription_usage_probes
+             WHERE provider = ?1 AND attempted_at_ms = ?2",
+                params![provider, input.attempted_at_ms],
+                |row| {
+                    Ok(StoredSubscriptionProbe {
+                        outcome: row.get(0)?,
+                        used_percent: row.get(1)?,
+                        limit_window: row.get(2)?,
+                        resets_at_ms: row.get(3)?,
+                        exhausted: row.get(4)?,
+                        failure_category: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        if let Some(replayed) = replayed {
+            if !stored_subscription_probe_matches(&replayed, input.outcome) {
+                return Err(StoreError::InvalidSubscriptionProbe);
+            }
+            let state = load_subscription_provider_state(&transaction, input.provider)?
+                .ok_or(StoreError::InvalidSubscriptionProbe)?;
+            transaction.commit()?;
+            return Ok(SubscriptionProbeCommit {
+                state,
+                notification_created: false,
+                events: Vec::new(),
+            });
+        }
+
+        let prior = load_subscription_state_row(&transaction, input.provider)?;
+        if prior
+            .as_ref()
+            .is_some_and(|state| input.attempted_at_ms < state.public.last_attempt_at_ms)
+        {
+            return Err(StoreError::InvalidSubscriptionProbe);
+        }
+        let previous_severity = prior
+            .as_ref()
+            .map_or(SubscriptionSeverity::Ok, |state| state.public.severity);
+        let prior_capacity = prior
+            .as_ref()
+            .map_or(SubscriptionSeverity::Ok, |state| state.capacity_severity);
+        let prior_failures = prior
+            .as_ref()
+            .map_or(0, |state| state.public.consecutive_failures);
+        let prior_success = prior
+            .as_ref()
+            .and_then(|state| state.public.last_success_at_ms);
+        let prior_percent = prior.as_ref().and_then(|state| state.public.used_percent);
+        let prior_limit = prior.as_ref().and_then(|state| state.public.limit_window);
+        let prior_reset = prior.as_ref().and_then(|state| state.public.resets_at_ms);
+        let prior_exhausted = prior.as_ref().and_then(|state| state.public.exhausted);
+
+        let (
+            outcome_name,
+            used_percent,
+            limit_window,
+            resets_at_ms,
+            exhausted,
+            capacity_severity,
+            severity,
+            failures,
+            failure_category,
+            last_success_at_ms,
+        ) = match input.outcome {
+            SubscriptionProbeOutcome::Observed {
+                used_percent,
+                limit_window,
+                resets_at_ms,
+                exhausted,
+            } => {
+                if resets_at_ms.is_some_and(|reset| reset < 0) {
+                    return Err(StoreError::InvalidSubscriptionProbe);
+                }
+                let capacity = subscription_capacity_severity(used_percent, exhausted);
+                (
+                    "observed",
+                    Some(used_percent),
+                    Some(limit_window),
+                    resets_at_ms,
+                    Some(exhausted),
+                    capacity,
+                    capacity,
+                    0,
+                    None,
+                    Some(input.attempted_at_ms),
+                )
+            }
+            SubscriptionProbeOutcome::Failed { category } => {
+                let failures = prior_failures.saturating_add(1);
+                let visibility = if failures >= 3 {
+                    SubscriptionSeverity::Warning
+                } else {
+                    SubscriptionSeverity::Ok
+                };
+                (
+                    "failed",
+                    prior_percent,
+                    prior_limit,
+                    prior_reset,
+                    prior_exhausted,
+                    prior_capacity,
+                    prior_capacity.max(visibility),
+                    failures,
+                    Some(subscription_failure_value(category)),
+                    prior_success,
+                )
+            }
+        };
+        let upward_transition = severity > previous_severity;
+
+        transaction.execute(
+            "INSERT INTO subscription_usage_probes (
+                provider, attempted_at_ms, outcome, used_percent, limit_window,
+                resets_at_ms, exhausted, severity, failure_category, notification_task_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            params![
+                provider,
+                input.attempted_at_ms,
+                outcome_name,
+                if outcome_name == "observed" {
+                    used_percent.map(i64::from)
+                } else {
+                    None
+                },
+                if outcome_name == "observed" {
+                    limit_window.map(subscription_limit_window_value)
+                } else {
+                    None
+                },
+                if outcome_name == "observed" {
+                    resets_at_ms
+                } else {
+                    None
+                },
+                if outcome_name == "observed" {
+                    exhausted.map(i64::from)
+                } else {
+                    None
+                },
+                subscription_severity_value(severity),
+                failure_category,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO subscription_usage_state (
+                provider, last_attempt_at_ms, last_success_at_ms, used_percent, limit_window,
+                resets_at_ms, exhausted, capacity_severity, severity,
+                consecutive_failures
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(provider) DO UPDATE SET
+                last_attempt_at_ms = excluded.last_attempt_at_ms,
+                last_success_at_ms = excluded.last_success_at_ms,
+                used_percent = excluded.used_percent,
+                limit_window = excluded.limit_window,
+                resets_at_ms = excluded.resets_at_ms,
+                exhausted = excluded.exhausted,
+                capacity_severity = excluded.capacity_severity,
+                severity = excluded.severity,
+                consecutive_failures = excluded.consecutive_failures",
+            params![
+                provider,
+                input.attempted_at_ms,
+                last_success_at_ms,
+                used_percent.map(i64::from),
+                limit_window.map(subscription_limit_window_value),
+                resets_at_ms,
+                exhausted.map(i64::from),
+                subscription_severity_value(capacity_severity),
+                subscription_severity_value(severity),
+                i64::from(failures),
+            ],
+        )?;
+
+        let mut events = Vec::new();
+        if upward_transition {
+            let notification_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                params![input.notification_task_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if notification_exists {
+                return Err(StoreError::InvalidSubscriptionProbe);
+            }
+            let title = format!(
+                "Subscription {}: {}",
+                subscription_severity_value(severity),
+                subscription_provider_title(input.provider)
+            );
+            let body = subscription_notification_advice(input.outcome, severity);
+            transaction.execute(
+                "INSERT INTO tasks (
+                    id, project_id, parent_task_id, assigned_agent_id, title, body,
+                    status, priority, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'queued', 10, ?6, ?6)",
+                params![
+                    input.notification_task_id.as_str(),
+                    input.project_id.as_str(),
+                    input.orchestrator_agent_id.as_str(),
+                    title,
+                    body,
+                    input.attempted_at_ms,
+                ],
+            )?;
+            let snapshot = TaskSnapshot {
+                id: input.notification_task_id.clone(),
+                project_id: input.project_id,
+                parent_task_id: None,
+                depends_on: Vec::new(),
+                assigned_agent_id: Some(input.orchestrator_agent_id),
+                title,
+                status: TaskStatus::Queued,
+                priority: 10,
+                created_at_ms: input.attempted_at_ms,
+                updated_at_ms: input.attempted_at_ms,
+            };
+            let event = FactoryEvent::TaskChanged { task: snapshot };
+            let sequence = append_event(&transaction, input.attempted_at_ms, &event)?;
+            events.push(EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: input.attempted_at_ms,
+                event,
+            });
+            transaction.execute(
+                "UPDATE subscription_usage_probes SET notification_task_id = ?3
+                 WHERE provider = ?1 AND attempted_at_ms = ?2",
+                params![
+                    provider,
+                    input.attempted_at_ms,
+                    input.notification_task_id.as_str()
+                ],
+            )?;
+        }
+        let state = load_subscription_provider_state(&transaction, input.provider)?
+            .ok_or(StoreError::InvalidSubscriptionProbe)?;
+        transaction.commit()?;
+        Ok(SubscriptionProbeCommit {
+            state,
+            notification_created: upward_transition,
+            events,
+        })
+    }
+
+    /// Public, provider-neutral projection of the latest normalized allowance
+    /// state. It is intentionally independent from per-run billing receipts.
+    pub fn subscription_usage_snapshot(&self) -> Result<SubscriptionUsageSnapshot> {
+        let mut statement = self.connection.prepare(
+            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
+                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window
+             FROM subscription_usage_state ORDER BY provider",
+        )?;
+        let providers = statement
+            .query_map([], parse_subscription_provider_state)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let overall_severity = providers
+            .iter()
+            .map(|state| state.severity)
+            .max()
+            .unwrap_or(SubscriptionSeverity::Ok);
+        Ok(SubscriptionUsageSnapshot {
+            overall_severity,
+            providers,
+        })
+    }
+
+    /// Creates one queued task already assigned to the explicit orchestrator and
+    /// stores only the hash of the caller-returned capability token.
+    pub fn create_webhook_task(
+        &mut self,
+        input: NewWebhookTask,
+    ) -> Result<(WebhookCreated, Vec<EventEnvelope>)> {
+        validate_webhook_create_input(&input)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_webhook_project_and_orchestrator(
+            &transaction,
+            &input.project_id,
+            &input.orchestrator_agent_id,
+        )?;
+        let collision: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM tasks WHERE id = ?1
+                UNION ALL
+                SELECT 1 FROM webhook_task_capabilities WHERE token_sha256 = ?2
+             )",
+            params![input.id.as_str(), input.token_sha256.as_slice()],
+            |row| row.get(0),
+        )?;
+        if collision {
+            return Err(StoreError::InvalidWebhookInput);
+        }
+        transaction.execute(
+            "INSERT INTO tasks (
+                id, project_id, parent_task_id, assigned_agent_id, title, body,
+                status, priority, created_at_ms, updated_at_ms,
+                started_at_ms, completed_at_ms, result
+             ) VALUES (
+                ?1, ?2, NULL, ?3, ?4, ?5, 'queued', 1, ?6, ?6,
+                NULL, NULL, NULL
+             )",
+            params![
+                input.id.as_str(),
+                input.project_id.as_str(),
+                input.orchestrator_agent_id.as_str(),
+                input.title.as_str(),
+                input.body.as_str(),
+                input.created_at_ms,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO webhook_task_capabilities (
+                task_id, project_id, endpoint_id, token_sha256
+             ) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                input.id.as_str(),
+                input.project_id.as_str(),
+                input.endpoint_id.as_str(),
+                input.token_sha256.as_slice(),
+            ],
+        )?;
+        let snapshot = TaskSnapshot {
+            id: input.id.clone(),
+            project_id: input.project_id,
+            parent_task_id: None,
+            depends_on: Vec::new(),
+            assigned_agent_id: Some(input.orchestrator_agent_id),
+            title: input.title.clone(),
+            status: TaskStatus::Queued,
+            priority: 1,
+            created_at_ms: input.created_at_ms,
+            updated_at_ms: input.created_at_ms,
+        };
+        let event = FactoryEvent::TaskChanged { task: snapshot };
+        let sequence = append_event(&transaction, input.created_at_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            WebhookCreated {
+                task_id: input.id,
+                status: OperationalTaskStatus::Todo,
+                title: input.title,
+            },
+            vec![EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: input.created_at_ms,
+                event,
+            }],
+        ))
+    }
+
+    pub fn poll_webhook_task(
+        &self,
+        endpoint_id: &str,
+        project_id: &ProjectId,
+        token_sha256: &[u8; 32],
+    ) -> Result<Option<WebhookTaskPoll>> {
+        if !valid_endpoint_id(endpoint_id) {
+            return Ok(None);
+        }
+        self.connection
+            .query_row(
+                "SELECT t.status, t.title, t.result
+                 FROM webhook_task_capabilities mt
+                 JOIN tasks t ON t.id = mt.task_id
+                 WHERE mt.endpoint_id = ?1 AND mt.project_id = ?2
+                   AND mt.token_sha256 = ?3",
+                params![endpoint_id, project_id.as_str(), token_sha256.as_slice()],
+                |row| {
+                    let status: String = row.get(0)?;
+                    Ok(WebhookTaskPoll {
+                        status: operational_task_status(&status, 0)?,
+                        title: truncate_utf8(&row.get::<_, String>(1)?, MAX_WEBHOOK_TITLE_BYTES),
+                        result: row
+                            .get::<_, Option<String>>(2)?
+                            .map(|value| truncate_utf8(&value, MAX_WEBHOOK_TEXT_BYTES)),
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Records the latest open answer and queues a private orchestrator notification in
+    /// the same transaction. The source task's current status is preserved for
+    /// orchestrator review.
+    pub fn answer_webhook_question(&mut self, input: WebhookAnswer) -> Result<WebhookMutation> {
+        validate_webhook_answer_input(&input)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_webhook_project_and_orchestrator(
+            &transaction,
+            &input.project_id,
+            &input.orchestrator_agent_id,
+        )?;
+        let source = load_task(&transaction, &input.task_id)?
+            .filter(|task| task.snapshot.project_id == input.project_id)
+            .ok_or(StoreError::WebhookTaskNotFound)?;
+        if input.answered_at_ms < source.snapshot.updated_at_ms {
+            return Err(StoreError::InvalidWebhookInput);
+        }
+        let notification_exists: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM tasks WHERE id = ?1)",
+            params![input.notification_task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if notification_exists || input.notification_task_id == input.task_id {
+            return Err(StoreError::InvalidWebhookInput);
+        }
+        let question: Option<(i64, String)> = transaction
+            .query_row(
+                "SELECT id, text FROM task_questions
+                 WHERE task_id = ?1 AND project_id = ?2 AND answer IS NULL
+                 ORDER BY asked_at_ms DESC, ordinal DESC, id DESC
+                 LIMIT 1",
+                params![input.task_id.as_str(), input.project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let (question_id, question_text) = question.ok_or(StoreError::WebhookQuestionNotOpen)?;
+        let answered = transaction.execute(
+            "UPDATE task_questions
+             SET answer = ?1, answered_at_ms = ?2
+             WHERE id = ?3 AND project_id = ?4 AND answer IS NULL",
+            params![
+                input.answer.as_str(),
+                input.answered_at_ms,
+                question_id,
+                input.project_id.as_str(),
+            ],
+        )?;
+        if answered != 1 {
+            return Err(StoreError::WebhookQuestionNotOpen);
+        }
+        transaction.execute(
+            "UPDATE tasks SET updated_at_ms = ?1
+             WHERE id = ?2 AND project_id = ?3",
+            params![
+                input.answered_at_ms,
+                input.task_id.as_str(),
+                input.project_id.as_str(),
+            ],
+        )?;
+
+        let notification_title = format!("Webhook answer for {}", input.task_id.as_str());
+        let notification_body = format!(
+            "Source task: {}\nSource title: {}\n\nQuestion:\n{}\n\nAnswer:\n{}",
+            input.task_id.as_str(),
+            truncate_utf8(&source.snapshot.title, 512),
+            truncate_utf8(&question_text, 48_000),
+            truncate_utf8(&input.answer, 48_000),
+        );
+        transaction.execute(
+            "INSERT INTO tasks (
+                id, project_id, parent_task_id, assigned_agent_id, title, body,
+                status, priority, created_at_ms, updated_at_ms,
+                started_at_ms, completed_at_ms, result
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, 'queued', 1, ?7, ?7,
+                NULL, NULL, NULL
+             )",
+            params![
+                input.notification_task_id.as_str(),
+                input.project_id.as_str(),
+                input.task_id.as_str(),
+                input.orchestrator_agent_id.as_str(),
+                notification_title.as_str(),
+                notification_body.as_str(),
+                input.answered_at_ms,
+            ],
+        )?;
+
+        let source_snapshot = load_task(&transaction, &input.task_id)?
+            .ok_or(StoreError::WebhookTaskNotFound)?
+            .snapshot;
+        let notification_snapshot = TaskSnapshot {
+            id: input.notification_task_id,
+            project_id: input.project_id,
+            parent_task_id: Some(input.task_id),
+            depends_on: Vec::new(),
+            assigned_agent_id: Some(input.orchestrator_agent_id),
+            title: notification_title,
+            status: TaskStatus::Queued,
+            priority: 1,
+            created_at_ms: input.answered_at_ms,
+            updated_at_ms: input.answered_at_ms,
+        };
+        let factory_events = [
+            FactoryEvent::TaskChanged {
+                task: source_snapshot,
+            },
+            FactoryEvent::TaskChanged {
+                task: notification_snapshot,
+            },
+        ];
+        let events = factory_events
+            .into_iter()
+            .map(|event| {
+                let sequence = append_event(&transaction, input.answered_at_ms, &event)?;
+                Ok(EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence,
+                    occurred_at_ms: input.answered_at_ms,
+                    event,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let open_question_remains: bool = transaction.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM task_questions
+                WHERE task_id = ?1 AND project_id = ?2 AND answer IS NULL
+             )",
+            params![
+                source.snapshot.id.as_str(),
+                source.snapshot.project_id.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        Ok(WebhookMutation {
+            events,
+            open_question_remains,
+        })
+    }
+
+    /// Resolves only an immutable document still attached to an unanswered
+    /// question on the requested task.
+    pub fn webhook_document(
+        &self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        document_id: &str,
+    ) -> Result<Option<WebhookDocument>> {
+        if !valid_webhook_document_id(document_id) {
+            return Ok(None);
+        }
+        self.connection
+            .query_row(
+                "SELECT d.id, d.name, d.reference, d.revision, d.content
+                 FROM tasks t
+                 JOIN task_questions q
+                   ON q.task_id = t.id AND q.project_id = t.project_id
+                  AND q.id = (
+                      SELECT latest.id
+                      FROM task_questions latest
+                      WHERE latest.task_id = t.id
+                        AND latest.project_id = t.project_id
+                        AND latest.answer IS NULL
+                      ORDER BY latest.asked_at_ms DESC, latest.ordinal DESC,
+                               latest.id DESC
+                      LIMIT 1
+                  )
+                 JOIN task_question_documents qd
+                   ON qd.question_id = q.id AND qd.project_id = q.project_id
+                 JOIN task_documents d
+                   ON d.project_id = qd.project_id AND d.id = qd.document_id
+                 WHERE t.project_id = ?1 AND t.id = ?2 AND d.id = ?3
+                 LIMIT 1",
+                params![project_id.as_str(), task_id.as_str(), document_id],
+                |row| {
+                    Ok(WebhookDocument {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        reference: row.get(2)?,
+                        revision: row.get(3)?,
+                        content: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
     pub fn list_projects(
         &self,
         after_id: Option<&ProjectId>,
@@ -1004,7 +1920,7 @@ impl Store {
             return Err(StoreError::InvalidStateLimit);
         }
         let mut statement = self.connection.prepare(
-            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body,
+            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms
              FROM tasks
              WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
@@ -1020,7 +1936,7 @@ impl Store {
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
                 let assigned_id: Option<String> = row.get(3)?;
-                let status: String = row.get(6)?;
+                let status: String = row.get(7)?;
                 Ok(TaskDetail {
                     snapshot: TaskSnapshot {
                         id: parse_id(row.get(0)?, 0)?,
@@ -1029,17 +1945,91 @@ impl Store {
                         depends_on: Vec::new(),
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
-                        status: parse_task_status(&status, 6)?,
-                        priority: row.get(7)?,
-                        created_at_ms: row.get(8)?,
-                        updated_at_ms: row.get(9)?,
+                        status: parse_task_status(&status, 7)?,
+                        priority: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                        updated_at_ms: row.get(10)?,
                     },
                     body: row.get(5)?,
+                    result: row.get(6)?,
                 })
             },
         )?;
 
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        let mut tasks = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        for task in &mut tasks {
+            task.snapshot.depends_on = load_task_dependencies(&self.connection, &task.snapshot.id)?;
+        }
+        Ok(tasks)
+    }
+
+    pub fn list_agents(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&AgentId>,
+        limit: usize,
+    ) -> Result<Vec<AgentSnapshot>> {
+        if !(1..=MAX_STATE_PAGE).contains(&limit) {
+            return Err(StoreError::InvalidStateLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT a.id
+             FROM agents a
+             WHERE a.project_id = ?1 AND (?2 IS NULL OR a.id > ?2)
+             ORDER BY a.id
+             LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    after_id.map(AgentId::as_str),
+                    limit as i64
+                ],
+                |row| parse_id::<AgentId>(row.get(0)?, 0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| {
+                load_agent(&self.connection, &id)?
+                    .map(|record| record.snapshot)
+                    .ok_or(StoreError::AgentNotFound)
+            })
+            .collect()
+    }
+
+    pub fn list_runs(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&RunId>,
+        limit: usize,
+    ) -> Result<Vec<RunSnapshot>> {
+        if !(1..=MAX_STATE_PAGE).contains(&limit) {
+            return Err(StoreError::InvalidStateLimit);
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id
+             FROM runs
+             WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
+             ORDER BY id
+             LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    project_id.as_str(),
+                    after_id.map(RunId::as_str),
+                    limit as i64
+                ],
+                |row| parse_id::<RunId>(row.get(0)?, 0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|id| load_run(&self.connection, &id)?.ok_or(StoreError::RunNotFound))
+            .collect()
     }
 
     pub fn events_after(&self, sequence: i64, limit: usize) -> Result<Vec<EventEnvelope>> {
@@ -1104,6 +2094,458 @@ impl Store {
     }
 }
 
+struct SubscriptionStateRow {
+    public: SubscriptionProviderState,
+    capacity_severity: SubscriptionSeverity,
+}
+
+struct StoredSubscriptionProbe {
+    outcome: String,
+    used_percent: Option<i64>,
+    limit_window: Option<String>,
+    resets_at_ms: Option<i64>,
+    exhausted: Option<i64>,
+    failure_category: Option<String>,
+}
+
+fn stored_subscription_probe_matches(
+    stored: &StoredSubscriptionProbe,
+    requested: SubscriptionProbeOutcome,
+) -> bool {
+    match requested {
+        SubscriptionProbeOutcome::Observed {
+            used_percent,
+            limit_window,
+            resets_at_ms,
+            exhausted,
+        } => {
+            stored.outcome == "observed"
+                && stored.used_percent == Some(i64::from(used_percent))
+                && stored.limit_window.as_deref()
+                    == Some(subscription_limit_window_value(limit_window))
+                && stored.resets_at_ms == resets_at_ms
+                && stored.exhausted == Some(if exhausted { 1 } else { 0 })
+                && stored.failure_category.is_none()
+        }
+        SubscriptionProbeOutcome::Failed { category } => {
+            stored.outcome == "failed"
+                && stored.used_percent.is_none()
+                && stored.limit_window.is_none()
+                && stored.resets_at_ms.is_none()
+                && stored.exhausted.is_none()
+                && stored.failure_category.as_deref() == Some(subscription_failure_value(category))
+        }
+    }
+}
+
+fn load_subscription_state_row(
+    connection: &Connection,
+    provider: Provider,
+) -> Result<Option<SubscriptionStateRow>> {
+    connection
+        .query_row(
+            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
+                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
+                    capacity_severity
+             FROM subscription_usage_state WHERE provider = ?1",
+            params![provider_value(provider)],
+            |row| {
+                Ok(SubscriptionStateRow {
+                    public: parse_subscription_provider_state(row)?,
+                    capacity_severity: parse_subscription_severity(&row.get::<_, String>(9)?, 9)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn load_subscription_provider_state(
+    connection: &Connection,
+    provider: Provider,
+) -> Result<Option<SubscriptionProviderState>> {
+    connection
+        .query_row(
+            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
+                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window
+             FROM subscription_usage_state WHERE provider = ?1",
+            params![provider_value(provider)],
+            parse_subscription_provider_state,
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
+fn parse_subscription_provider_state(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SubscriptionProviderState> {
+    let provider = parse_provider(&row.get::<_, String>(0)?, 0)?;
+    let used_percent = row
+        .get::<_, Option<i64>>(3)?
+        .map(|value| {
+            u8::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
+            })
+        })
+        .transpose()?;
+    let exhausted = row
+        .get::<_, Option<i64>>(5)?
+        .map(|value| match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(rusqlite::Error::IntegralValueOutOfRange(5, value)),
+        })
+        .transpose()?;
+    let consecutive_failures = u32::try_from(row.get::<_, i64>(7)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+    })?;
+    Ok(SubscriptionProviderState {
+        provider,
+        last_attempt_at_ms: row.get(1)?,
+        last_success_at_ms: row.get(2)?,
+        used_percent,
+        limit_window: row
+            .get::<_, Option<String>>(8)?
+            .map(|value| parse_subscription_limit_window(&value, 8))
+            .transpose()?,
+        resets_at_ms: row.get(4)?,
+        exhausted,
+        severity: parse_subscription_severity(&row.get::<_, String>(6)?, 6)?,
+        consecutive_failures,
+    })
+}
+
+const fn subscription_capacity_severity(used_percent: u8, exhausted: bool) -> SubscriptionSeverity {
+    if exhausted || used_percent >= 95 {
+        SubscriptionSeverity::Critical
+    } else if used_percent >= 80 {
+        SubscriptionSeverity::Warning
+    } else {
+        SubscriptionSeverity::Ok
+    }
+}
+
+const fn subscription_severity_value(severity: SubscriptionSeverity) -> &'static str {
+    match severity {
+        SubscriptionSeverity::Ok => "ok",
+        SubscriptionSeverity::Warning => "warning",
+        SubscriptionSeverity::Critical => "critical",
+    }
+}
+
+fn parse_subscription_severity(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<SubscriptionSeverity> {
+    match value {
+        "ok" => Ok(SubscriptionSeverity::Ok),
+        "warning" => Ok(SubscriptionSeverity::Warning),
+        "critical" => Ok(SubscriptionSeverity::Critical),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid subscription severity",
+            )),
+        )),
+    }
+}
+
+const fn subscription_failure_value(category: SubscriptionFailureCategory) -> &'static str {
+    match category {
+        SubscriptionFailureCategory::Timeout => "timeout",
+        SubscriptionFailureCategory::Protocol => "protocol",
+        SubscriptionFailureCategory::Process => "process",
+        SubscriptionFailureCategory::OutputLimit => "output_limit",
+        SubscriptionFailureCategory::Unavailable => "unavailable",
+    }
+}
+
+const fn subscription_limit_window_value(window: SubscriptionLimitWindow) -> &'static str {
+    match window {
+        SubscriptionLimitWindow::Primary => "primary",
+        SubscriptionLimitWindow::Secondary => "secondary",
+        SubscriptionLimitWindow::CurrentSession => "current_session",
+        SubscriptionLimitWindow::CurrentWeek => "current_week",
+    }
+}
+
+fn parse_subscription_limit_window(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<SubscriptionLimitWindow> {
+    match value {
+        "primary" => Ok(SubscriptionLimitWindow::Primary),
+        "secondary" => Ok(SubscriptionLimitWindow::Secondary),
+        "current_session" => Ok(SubscriptionLimitWindow::CurrentSession),
+        "current_week" => Ok(SubscriptionLimitWindow::CurrentWeek),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid subscription limit window",
+            )),
+        )),
+    }
+}
+
+const fn subscription_provider_title(provider: Provider) -> &'static str {
+    match provider {
+        Provider::ClaudeCode => "Claude",
+        Provider::Codex => "Codex",
+    }
+}
+
+const fn subscription_notification_advice(
+    outcome: SubscriptionProbeOutcome,
+    severity: SubscriptionSeverity,
+) -> &'static str {
+    match outcome {
+        SubscriptionProbeOutcome::Failed { .. } => {
+            "The local subscription allowance collector has failed repeatedly. Verify the collector and account status. No work was automatically changed."
+        }
+        SubscriptionProbeOutcome::Observed { .. } => match severity {
+            SubscriptionSeverity::Critical => {
+                "Subscription headroom is critical. Review provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
+            }
+            SubscriptionSeverity::Warning | SubscriptionSeverity::Ok => {
+                "Subscription headroom needs review. Check provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
+            }
+        },
+    }
+}
+
+fn valid_endpoint_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn valid_webhook_document_id(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+fn usize_to_i64(value: usize) -> Result<i64> {
+    i64::try_from(value).map_err(|_| StoreError::InvalidStateLimit)
+}
+
+fn operational_task_status(status: &str, column: usize) -> rusqlite::Result<OperationalTaskStatus> {
+    match status {
+        "queued" => Ok(OperationalTaskStatus::Todo),
+        "running" => Ok(OperationalTaskStatus::Doing),
+        "blocked" => Ok(OperationalTaskStatus::Blocked),
+        "succeeded" | "failed" | "cancelled" => Ok(OperationalTaskStatus::Done),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            "invalid operational task status".into(),
+        )),
+    }
+}
+
+fn validate_webhook_project_and_orchestrator(
+    connection: &Connection,
+    project_id: &ProjectId,
+    orchestrator_agent_id: &AgentId,
+) -> Result<()> {
+    let project_exists: bool = connection.query_row(
+        "SELECT EXISTS (SELECT 1 FROM projects WHERE id = ?1)",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !project_exists {
+        return Err(StoreError::WebhookProjectNotFound);
+    }
+    let orchestrator_exists: bool = connection.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM agents
+            WHERE id = ?1 AND project_id = ?2 AND role = 'orchestrator'
+         )",
+        params![orchestrator_agent_id.as_str(), project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !orchestrator_exists {
+        return Err(StoreError::WebhookOrchestratorNotFound);
+    }
+    Ok(())
+}
+
+fn validate_webhook_create_input(input: &NewWebhookTask) -> Result<()> {
+    if input.created_at_ms < 0
+        || !valid_endpoint_id(&input.endpoint_id)
+        || input.title.is_empty()
+        || input.title.len() > MAX_WEBHOOK_CREATE_TITLE_BYTES
+        || input.body.is_empty()
+        || input.body.len() > MAX_BODY_BYTES
+    {
+        Err(StoreError::InvalidWebhookInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_webhook_answer_input(input: &WebhookAnswer) -> Result<()> {
+    if input.answered_at_ms < 0
+        || input.answer.trim().is_empty()
+        || input.answer.len() > MAX_BODY_BYTES
+    {
+        Err(StoreError::InvalidWebhookInput)
+    } else {
+        Ok(())
+    }
+}
+
+fn load_webhook_snapshot_tasks(
+    connection: &Connection,
+    project_id: &ProjectId,
+    terminal: bool,
+    limit: usize,
+) -> Result<Vec<WebhookSnapshotTask>> {
+    let predicate = if terminal {
+        "status IN ('succeeded', 'failed', 'cancelled')"
+    } else {
+        "status NOT IN ('succeeded', 'failed', 'cancelled')"
+    };
+    let ordering = if terminal {
+        "updated_at_ms DESC, id"
+    } else {
+        "priority DESC, created_at_ms, id"
+    };
+    let sql = format!(
+        "SELECT id, title, status,
+                assigned_agent_id, priority, created_at_ms, started_at_ms,
+                completed_at_ms, result
+         FROM tasks
+         WHERE project_id = ?1 AND {predicate}
+         ORDER BY {ordering}
+         LIMIT ?2"
+    );
+    let stored = {
+        let mut statement = connection.prepare(&sql)?;
+        let rows =
+            statement.query_map(params![project_id.as_str(), usize_to_i64(limit)?], |row| {
+                Ok((
+                    parse_id::<TaskId>(row.get(0)?, 0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i32>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    stored
+        .into_iter()
+        .map(
+            |(
+                id,
+                title,
+                status,
+                assignee,
+                priority,
+                created_at_ms,
+                started_at_ms,
+                completed_at_ms,
+                result,
+            )| {
+                Ok(WebhookSnapshotTask {
+                    depends_on: load_task_dependencies(connection, &id)?,
+                    question: load_webhook_open_question(connection, project_id, &id)?,
+                    id,
+                    title: truncate_utf8(&title, MAX_WEBHOOK_TITLE_BYTES),
+                    status: operational_task_status(&status, 2)?,
+                    assignee: assignee.map(|value| truncate_utf8(&value, 256)),
+                    priority,
+                    created_at_ms,
+                    started_at_ms,
+                    completed_at_ms,
+                    result: result.map(|value| truncate_utf8(&value, MAX_WEBHOOK_TEXT_BYTES)),
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_webhook_open_question(
+    connection: &Connection,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+) -> Result<Option<WebhookOpenQuestion>> {
+    let question: Option<(i64, String, Option<i64>)> = connection
+        .query_row(
+            "SELECT id, text, asked_at_ms
+             FROM task_questions
+             WHERE task_id = ?1 AND project_id = ?2 AND answer IS NULL
+             ORDER BY asked_at_ms DESC, ordinal DESC, id DESC
+             LIMIT 1",
+            params![task_id.as_str(), project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((question_id, text, asked_at_ms)) = question else {
+        return Ok(None);
+    };
+    let documents = {
+        let mut statement = connection.prepare(
+            "SELECT d.id, d.name, d.reference
+             FROM task_question_documents qd
+             JOIN task_documents d
+               ON d.project_id = qd.project_id AND d.id = qd.document_id
+             WHERE qd.question_id = ?1 AND qd.project_id = ?2
+             ORDER BY qd.ordinal
+             LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![
+                question_id,
+                project_id.as_str(),
+                usize_to_i64(MAX_WEBHOOK_DOCUMENT_REFS + 1)?,
+            ],
+            |row| {
+                Ok(WebhookDocumentRef {
+                    id: row.get(0)?,
+                    name: truncate_utf8(&row.get::<_, String>(1)?, 512),
+                    reference: truncate_utf8(&row.get::<_, String>(2)?, MAX_PATH_BYTES),
+                })
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    if documents.len() > MAX_WEBHOOK_DOCUMENT_REFS {
+        return Err(StoreError::WebhookSnapshotTooLarge);
+    }
+    Ok(Some(WebhookOpenQuestion {
+        text: truncate_utf8(&text, MAX_WEBHOOK_TEXT_BYTES),
+        asked_at_ms,
+        documents,
+    }))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
 fn duplicate_failure_transition(
     transaction: &Transaction<'_>,
     ledger: &RunLedger,
@@ -1158,7 +2600,8 @@ fn fail_run_in_transaction(
         .as_ref()
         .ok_or(StoreError::InvalidRunState)?;
     let changed = transaction.execute(
-        "UPDATE tasks SET status = 'failed', updated_at_ms = ?1
+        "UPDATE tasks SET status = 'failed', updated_at_ms = ?1,
+                          completed_at_ms = ?1
          WHERE id = ?2 AND project_id = ?3 AND assigned_agent_id = ?4
            AND (status = 'running' OR (?5 AND status = 'blocked'))",
         params![
@@ -1248,7 +2691,7 @@ fn ingest_runner_event_in_transaction(
         return Err(StoreError::InvalidSessionConfirmation);
     }
     let terminal_kind = terminal_kind(&event.event);
-    match (terminal_kind, effects.terminal_outcome) {
+    match (terminal_kind, effects.terminal_outcome.as_ref()) {
         (Some(_), None) => return Err(StoreError::TerminalOutcomeRequired),
         (None, Some(_)) => return Err(StoreError::UnexpectedTerminalOutcome),
         _ => {}
@@ -1291,6 +2734,7 @@ fn ingest_runner_event_in_transaction(
 
     let outcome = effects
         .terminal_outcome
+        .as_ref()
         .ok_or(StoreError::TerminalOutcomeRequired)?;
     let confirmed_session = transaction
         .query_row(
@@ -1326,12 +2770,13 @@ fn ingest_runner_event_in_transaction(
         .ok_or(StoreError::InvalidRunState)?;
     let changed = transaction.execute(
         "UPDATE tasks
-         SET status = ?1, updated_at_ms = ?2
-         WHERE id = ?3 AND project_id = ?4 AND assigned_agent_id = ?5
+         SET status = ?1, updated_at_ms = ?2, completed_at_ms = ?2, result = ?3
+         WHERE id = ?4 AND project_id = ?5 AND assigned_agent_id = ?6
            AND status = 'running'",
         params![
             task_status_value(terminal.task_status),
             now_ms,
+            terminal.result,
             task_id.as_str(),
             ledger.snapshot.project_id.as_str(),
             ledger.snapshot.agent_id.as_str(),
@@ -1409,6 +2854,7 @@ struct RunLedger {
     terminal_runner_sequence: Option<i64>,
     runner_reconciled_at_ms: Option<i64>,
     runner_terminal_kind: Option<String>,
+    task_result: Option<String>,
 }
 
 fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<RunLedger>> {
@@ -1420,7 +2866,8 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
             "SELECT provider_session_id, provider_session_confirmed_at_ms,
                     runner_instance_id, runner_protocol_version,
                     last_runner_sequence, terminal_runner_sequence,
-                    runner_reconciled_at_ms, runner_terminal_kind
+                    runner_reconciled_at_ms, runner_terminal_kind,
+                    (SELECT result FROM tasks WHERE id = runs.task_id)
              FROM runs WHERE id = ?1",
             params![run_id.as_str()],
             |row| {
@@ -1437,6 +2884,7 @@ fn load_run_ledger(connection: &Connection, run_id: &RunId) -> Result<Option<Run
                     terminal_runner_sequence: row.get(5)?,
                     runner_reconciled_at_ms: row.get(6)?,
                     runner_terminal_kind: row.get(7)?,
+                    task_result: row.get(8)?,
                 })
             },
         )
@@ -1582,6 +3030,7 @@ fn validate_duplicate(
     if Some(event.sequence) == ledger.terminal_runner_sequence {
         let outcome = effects
             .terminal_outcome
+            .as_ref()
             .ok_or(StoreError::TerminalOutcomeRequired)?;
         let kind = terminal_kind(&event.event).ok_or(StoreError::InvalidTerminalOutcome)?;
         if ledger.runner_terminal_kind.as_deref() != Some(kind) {
@@ -1596,6 +3045,7 @@ fn validate_duplicate(
             || ledger.snapshot.failure_reason != terminal.failure_reason
             || ledger.snapshot.exit_code != terminal.exit_code
             || ledger.snapshot.exit_signal != terminal.exit_signal
+            || ledger.task_result != terminal.result
         {
             return Err(StoreError::InvalidTerminalOutcome);
         }
@@ -1611,11 +3061,12 @@ struct TerminalState {
     failure_reason: Option<RunFailureReason>,
     exit_code: Option<i32>,
     exit_signal: Option<i32>,
+    result: Option<String>,
 }
 
 fn validate_terminal_outcome(
     event: &RunnerEvent,
-    outcome: TerminalOutcome,
+    outcome: &TerminalOutcome,
     provider_session_confirmed: bool,
 ) -> Result<TerminalState> {
     match (event, outcome) {
@@ -1626,6 +3077,7 @@ fn validate_terminal_outcome(
                 failure_reason: Some(RunFailureReason::Spawn),
                 exit_code: None,
                 exit_signal: None,
+                result: None,
             })
         }
         (
@@ -1633,27 +3085,40 @@ fn validate_terminal_outcome(
                 exit_code: Some(0),
                 signal: None,
             },
-            TerminalOutcome::Succeeded,
-        ) if provider_session_confirmed => Ok(TerminalState {
-            run_status: RunStatus::Succeeded,
-            task_status: TaskStatus::Succeeded,
-            failure_reason: None,
-            exit_code: Some(0),
-            exit_signal: None,
-        }),
+            TerminalOutcome::Succeeded { result },
+        ) if provider_session_confirmed && valid_terminal_result(result.as_deref()) => {
+            Ok(TerminalState {
+                run_status: RunStatus::Succeeded,
+                task_status: TaskStatus::Succeeded,
+                failure_reason: None,
+                exit_code: Some(0),
+                exit_signal: None,
+                result: result.clone(),
+            })
+        }
         (RunnerEvent::Exited { exit_code, signal }, TerminalOutcome::Failed(reason))
-            if valid_failed_process_outcome(*exit_code, *signal, reason) =>
+            if valid_failed_process_outcome(*exit_code, *signal, *reason) =>
         {
             Ok(TerminalState {
                 run_status: RunStatus::Failed,
                 task_status: TaskStatus::Failed,
-                failure_reason: Some(reason),
+                failure_reason: Some(*reason),
                 exit_code: *exit_code,
                 exit_signal: *signal,
+                result: None,
             })
         }
         _ => Err(StoreError::InvalidTerminalOutcome),
     }
+}
+
+fn valid_terminal_result(result: Option<&str>) -> bool {
+    result.is_none_or(|value| {
+        value.len() <= MAX_TERMINAL_RESULT_BYTES
+            && value
+                .chars()
+                .all(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+    })
 }
 
 fn valid_failed_process_outcome(
@@ -1710,16 +3175,16 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
 }
 
 fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDetail>> {
-    connection
+    let mut task = connection
         .query_row(
-            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body,
+            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms
              FROM tasks WHERE id = ?1",
             params![task_id.as_str()],
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
                 let assigned_id: Option<String> = row.get(3)?;
-                let status: String = row.get(6)?;
+                let status: String = row.get(7)?;
                 Ok(TaskDetail {
                     snapshot: TaskSnapshot {
                         id: parse_id(row.get(0)?, 0)?,
@@ -1728,16 +3193,31 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
                         depends_on: Vec::new(),
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
-                        status: parse_task_status(&status, 6)?,
-                        priority: row.get(7)?,
-                        created_at_ms: row.get(8)?,
-                        updated_at_ms: row.get(9)?,
+                        status: parse_task_status(&status, 7)?,
+                        priority: row.get(8)?,
+                        created_at_ms: row.get(9)?,
+                        updated_at_ms: row.get(10)?,
                     },
                     body: row.get(5)?,
+                    result: row.get(6)?,
                 })
             },
         )
         .optional()
+        .map_err(StoreError::from)?;
+    if let Some(task) = task.as_mut() {
+        task.snapshot.depends_on = load_task_dependencies(connection, &task.snapshot.id)?;
+    }
+    Ok(task)
+}
+
+fn load_task_dependencies(connection: &Connection, task_id: &TaskId) -> Result<Vec<TaskId>> {
+    let mut statement = connection.prepare(
+        "SELECT depends_on_task_id FROM task_dependencies
+         WHERE task_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = statement.query_map(params![task_id.as_str()], |row| parse_id(row.get(0)?, 0))?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StoreError::from)
 }
 
@@ -1976,6 +3456,20 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             "../migrations/0005_provider_session_context.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+        current = 5;
+    }
+    if current == 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0006_webhooks.sql"))?;
+        transaction.pragma_update(None, "user_version", 6)?;
+        transaction.commit()?;
+        current = 6;
+    }
+    if current == 6 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0007_subscription_usage.sql"))?;
+        transaction.pragma_update(None, "user_version", 7)?;
         transaction.commit()?;
     }
     Ok(())

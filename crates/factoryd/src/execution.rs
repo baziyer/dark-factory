@@ -379,6 +379,7 @@ async fn start_run_inner(
     let identity = state
         .with_store(move |store| store.agent_execution_identity(&identity_project, &identity_agent))
         .await?;
+    let provider = identity.provider;
     let fresh_provider_session_id =
         if identity.provider == Provider::ClaudeCode && !identity.has_provider_session {
             Some(Uuid::new_v4().hyphenated().to_string())
@@ -406,6 +407,12 @@ async fn start_run_inner(
             Ok((target, events))
         })
         .await?;
+    tracing::info!(
+        target: "factoryd.execution",
+        event = "run_reserved",
+        run_id = %run_id,
+        provider = provider_category(provider)
+    );
     if let Some(reply) = reply.take() {
         let _ = reply.send(Ok(StartedRun {
             run_id: run_id.clone(),
@@ -851,30 +858,44 @@ fn normalize_effects(
 
 fn finish_outcome(decoder: ProviderDecoder, session_seen: bool) -> TerminalOutcome {
     match decoder {
-        ProviderDecoder::Codex(decoder) => match decoder.finish().outcome {
-            CodexOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded,
-            CodexOutcome::Succeeded { .. } => TerminalOutcome::Failed(RunFailureReason::Protocol),
-            CodexOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
-                CodexFailureReason::Protocol => RunFailureReason::Protocol,
-                CodexFailureReason::Provider => RunFailureReason::Provider,
-                CodexFailureReason::Process => RunFailureReason::Process,
-                CodexFailureReason::Spawn => RunFailureReason::Spawn,
-                CodexFailureReason::Incomplete => RunFailureReason::Incomplete,
-            }),
-        },
-        ProviderDecoder::Claude { decoder, .. } => match decoder.finish().outcome {
-            ClaudeOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded,
-            ClaudeOutcome::Succeeded { .. } => TerminalOutcome::Failed(RunFailureReason::Protocol),
-            ClaudeOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
-                ClaudeFailureReason::Protocol => RunFailureReason::Protocol,
-                ClaudeFailureReason::Provider => RunFailureReason::Provider,
-                ClaudeFailureReason::Permission => RunFailureReason::Permission,
-                ClaudeFailureReason::Limit => RunFailureReason::Limit,
-                ClaudeFailureReason::Process => RunFailureReason::Process,
-                ClaudeFailureReason::Spawn => RunFailureReason::Spawn,
-                ClaudeFailureReason::Incomplete => RunFailureReason::Incomplete,
-            }),
-        },
+        ProviderDecoder::Codex(decoder) => {
+            let finished = decoder.finish();
+            match finished.outcome {
+                CodexOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded {
+                    result: finished.final_preview.map(|preview| preview.text),
+                },
+                CodexOutcome::Succeeded { .. } => {
+                    TerminalOutcome::Failed(RunFailureReason::Protocol)
+                }
+                CodexOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
+                    CodexFailureReason::Protocol => RunFailureReason::Protocol,
+                    CodexFailureReason::Provider => RunFailureReason::Provider,
+                    CodexFailureReason::Process => RunFailureReason::Process,
+                    CodexFailureReason::Spawn => RunFailureReason::Spawn,
+                    CodexFailureReason::Incomplete => RunFailureReason::Incomplete,
+                }),
+            }
+        }
+        ProviderDecoder::Claude { decoder, .. } => {
+            let finished = decoder.finish();
+            match finished.outcome {
+                ClaudeOutcome::Succeeded { .. } if session_seen => TerminalOutcome::Succeeded {
+                    result: finished.final_preview.map(|preview| preview.text),
+                },
+                ClaudeOutcome::Succeeded { .. } => {
+                    TerminalOutcome::Failed(RunFailureReason::Protocol)
+                }
+                ClaudeOutcome::Failed { reason, .. } => TerminalOutcome::Failed(match reason {
+                    ClaudeFailureReason::Protocol => RunFailureReason::Protocol,
+                    ClaudeFailureReason::Provider => RunFailureReason::Provider,
+                    ClaudeFailureReason::Permission => RunFailureReason::Permission,
+                    ClaudeFailureReason::Limit => RunFailureReason::Limit,
+                    ClaudeFailureReason::Process => RunFailureReason::Process,
+                    ClaudeFailureReason::Spawn => RunFailureReason::Spawn,
+                    ClaudeFailureReason::Incomplete => RunFailureReason::Incomplete,
+                }),
+            }
+        }
     }
 }
 
@@ -1009,7 +1030,7 @@ async fn reconcile_terminal(
     let run_id = context.run_id.clone();
     let runner_instance_id = context.target.runner_instance_id.clone();
     let reconciled_at_ms = now_ms()?;
-    state
+    let disposition = state
         .commit_and_publish(move |store| {
             let disposition = store.mark_runner_terminal_reconciled(
                 &run_id,
@@ -1020,6 +1041,14 @@ async fn reconcile_terminal(
             Ok((disposition, Vec::new()))
         })
         .await?;
+    if disposition == WriteDisposition::Applied {
+        tracing::info!(
+            target: "factoryd.execution",
+            event = "runner_terminal_reconciled",
+            run_id = %context.run_id,
+            terminal_sequence
+        );
+    }
     Ok(())
 }
 
@@ -1059,13 +1088,21 @@ async fn set_observer_health(
     let run_id = context.run_id.clone();
     let runner_instance_id = context.target.runner_instance_id.clone();
     let changed_at_ms = now_ms()?;
-    state
+    let disposition = state
         .commit_and_publish(move |store| {
             let transition =
                 store.set_observer_health(&run_id, &runner_instance_id, health, changed_at_ms)?;
             Ok((transition.disposition, transition.events))
         })
         .await?;
+    if disposition == WriteDisposition::Applied {
+        tracing::info!(
+            target: "factoryd.execution",
+            event = "observer_health_changed",
+            run_id = %context.run_id,
+            observer_health = observer_health_category(health)
+        );
+    }
     context.observer_health = health;
     Ok(())
 }
@@ -1262,6 +1299,21 @@ fn error_category(error: &Error) -> &'static str {
         Error::WorkerStopped => "worker_stopped",
         Error::InvalidClock => "invalid_clock",
         Error::CorruptExecution => "corrupt_execution",
+    }
+}
+
+const fn provider_category(provider: Provider) -> &'static str {
+    match provider {
+        Provider::ClaudeCode => "claude_code",
+        Provider::Codex => "codex",
+    }
+}
+
+const fn observer_health_category(health: ObserverHealth) -> &'static str {
+    match health {
+        ObserverHealth::Unknown => "unknown",
+        ObserverHealth::Healthy => "healthy",
+        ObserverHealth::Degraded => "degraded",
     }
 }
 
