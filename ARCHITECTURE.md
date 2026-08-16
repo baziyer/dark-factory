@@ -33,7 +33,12 @@ This file records constraints, not an aspirational component catalogue.
    before acknowledging a terminal runner, and drops observation on daemon
    shutdown without stopping the runner. A start request succeeds at durable
    reservation; runner readiness and completion are observed from run events,
-   never hidden behind a long-lived request.
+   never hidden behind a long-lived request. Each run also persists observer
+   health: `unknown` means no authenticated caught-up observation has been
+   proven, `healthy` means the exact runner has replayed durably through its
+   advertised head, and `degraded` means supervision was lost without proof
+   that the runner stopped. Only healthy observation makes a missing endpoint
+   authoritative after restart; degraded work remains assigned and recoverable.
 5. Provider adapters translate structured provider output into the shared
    protocol. Persisted observations contain bounded structural metadata and an
    explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
@@ -71,9 +76,6 @@ No shadow-fleet or rollback subsystem is part of Dark Factory.
 - Zero-downtime handoff between two daemon binaries is deferred. Ordinary
   restart recovery reconnects to exact stable runners; unverifiable identities
   fail visibly rather than risk attaching to the wrong process.
-- Durable observer-health state is required before the Munder cutover. Until
-  then a signalled runner wrapper remains assigned and recoverable, but its
-  degraded supervision is visible only in daemon diagnostics.
 - Webhook exposure beyond loopback and its authentication scheme will be chosen
   with the first inbound/outbound messaging slice.
 - Repository visibility is private during early dogfooding; making it public is

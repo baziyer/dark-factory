@@ -1,6 +1,8 @@
 use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
 
-use factory_core::{AgentId, AgentRole, FactoryEvent, ProjectId, Provider, RunStatus, TaskId};
+use factory_core::{
+    AgentId, AgentRole, FactoryEvent, ObserverHealth, ProjectId, Provider, RunStatus, TaskId,
+};
 use factoryd::{
     daemon_state::DaemonState,
     execution::{self, Config, StartCodex},
@@ -167,21 +169,48 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
         .await
         .unwrap();
     assert_eq!(target.provider_session_id.as_deref(), Some(THREAD_ID));
-    let statuses = events
+    let run_truth = events
         .iter()
         .filter_map(|event| match &event.event {
-            FactoryEvent::RunChanged { run } if run.id == started.run_id => Some(run.status),
+            FactoryEvent::RunChanged { run } if run.id == started.run_id => {
+                Some((run.status, run.observer_health))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
+    assert_eq!(run_truth.len(), 4);
     assert_eq!(
-        statuses,
+        run_truth.first(),
+        Some(&(RunStatus::Starting, ObserverHealth::Unknown))
+    );
+    assert_eq!(
+        run_truth.last(),
+        Some(&(RunStatus::Succeeded, ObserverHealth::Healthy))
+    );
+    assert!(run_truth.windows(2).all(|window| {
+        let status_changed = window[0].0 != window[1].0;
+        let health_changed = window[0].1 != window[1].1;
+        status_changed ^ health_changed
+    }));
+    let mut lifecycle = run_truth
+        .iter()
+        .map(|(status, _)| *status)
+        .collect::<Vec<_>>();
+    lifecycle.dedup();
+    assert_eq!(
+        lifecycle,
         [
             RunStatus::Starting,
             RunStatus::Running,
             RunStatus::Succeeded
         ]
     );
+    let mut health = run_truth
+        .iter()
+        .map(|(_, health)| *health)
+        .collect::<Vec<_>>();
+    health.dedup();
+    assert_eq!(health, [ObserverHealth::Unknown, ObserverHealth::Healthy]);
     let public_json = serde_json::to_string(&events).unwrap();
     for private in [
         "real runner private task",

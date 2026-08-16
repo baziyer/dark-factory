@@ -1,9 +1,9 @@
 use std::{path::Path, time::Duration};
 
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId,
-    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth,
+    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, RunFailureReason, RunId, RunSnapshot,
+    RunStatus, RunnerInstanceId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     runner::{RUNNER_PROTOCOL_VERSION, RunnerEvent, RunnerEventEnvelope},
 };
 use rusqlite::{
@@ -11,7 +11,7 @@ use rusqlite::{
 };
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -110,6 +110,7 @@ pub struct RecoverableExecution {
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub terminal_runner_sequence: Option<i64>,
+    pub observer_health: ObserverHealth,
 }
 
 /// Effects already normalized from exactly one runner event.
@@ -157,6 +158,12 @@ pub struct ExecutionTransition {
     pub disposition: WriteDisposition,
     pub task: TaskSnapshot,
     pub agent: AgentSnapshot,
+    pub run: RunSnapshot,
+    pub events: Vec<EventEnvelope>,
+}
+
+pub struct ObserverHealthTransition {
+    pub disposition: WriteDisposition,
     pub run: RunSnapshot,
     pub events: Vec<EventEnvelope>,
 }
@@ -478,11 +485,13 @@ impl Store {
                 runner_instance_id, runner_protocol_version, runner_runtime,
                 last_runner_sequence, terminal_runner_sequence,
                 runner_reconciled_at_ms, runner_terminal_kind,
+                observer_health, observer_health_since_ms,
                 started_at_ms, status_since_ms, updated_at_ms, ended_at_ms,
                 exit_code, exit_signal, failure_reason
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, 'starting', NULL, NULL, ?6, ?7, ?8,
-                NULL, ?9, ?10, ?11, 0, NULL, NULL, NULL, ?12, ?13, ?14,
+                NULL, ?9, ?10, ?11, 0, NULL, NULL, NULL, 'unknown', ?12,
+                ?13, ?14, ?15,
                 NULL, NULL, NULL, NULL
              )",
             params![
@@ -497,6 +506,7 @@ impl Store {
                 input.runner_instance_id.as_str(),
                 i64::from(RUNNER_PROTOCOL_VERSION),
                 input.runner_runtime,
+                now_ms,
                 now_ms,
                 now_ms,
                 now_ms,
@@ -720,6 +730,61 @@ impl Store {
         Ok(WriteDisposition::Applied)
     }
 
+    /// Changes the durable supervision state for one exact runner identity.
+    ///
+    /// Health is independent of run lifecycle, so terminal runs awaiting
+    /// reconciliation may also become degraded or healthy.
+    pub fn set_observer_health(
+        &mut self,
+        run_id: &RunId,
+        runner_instance_id: &RunnerInstanceId,
+        observer_health: ObserverHealth,
+        now_ms: i64,
+    ) -> Result<ObserverHealthTransition> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ledger = load_run_ledger(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+        if &ledger.runner_instance_id != runner_instance_id {
+            return Err(StoreError::RunnerIdentityMismatch);
+        }
+        if ledger.snapshot.observer_health == observer_health {
+            return Ok(ObserverHealthTransition {
+                disposition: WriteDisposition::Duplicate,
+                run: ledger.snapshot,
+                events: Vec::new(),
+            });
+        }
+
+        transaction.execute(
+            "UPDATE runs
+             SET observer_health = ?1, observer_health_since_ms = ?2,
+                 updated_at_ms = ?2
+             WHERE id = ?3 AND runner_instance_id = ?4",
+            params![
+                observer_health_value(observer_health),
+                now_ms,
+                run_id.as_str(),
+                runner_instance_id.as_str(),
+            ],
+        )?;
+        let run = load_run(&transaction, run_id)?.ok_or(StoreError::RunNotFound)?;
+        let event = FactoryEvent::RunChanged { run: run.clone() };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+
+        Ok(ObserverHealthTransition {
+            disposition: WriteDisposition::Applied,
+            run,
+            events: vec![EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            }],
+        })
+    }
+
     pub fn recoverable_runs(&self) -> Result<Vec<RecoverableRun>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider_session_confirmed_at_ms,
@@ -764,7 +829,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT r.id, a.provider, r.provider_session_id,
                     r.resumes_provider_session, r.runner_instance_id,
-                    r.runner_runtime, r.terminal_runner_sequence
+                    r.runner_runtime, r.terminal_runner_sequence,
+                    r.observer_health
              FROM runs r
              JOIN agents a
                ON a.id = r.agent_id AND a.project_id = r.project_id
@@ -775,6 +841,7 @@ impl Store {
         )?;
         let rows = statement.query_map([], |row| {
             let provider: String = row.get(1)?;
+            let observer_health: String = row.get(7)?;
             Ok(RecoverableExecution {
                 run_id: parse_id(row.get(0)?, 0)?,
                 provider: parse_provider(&provider, 1)?,
@@ -783,6 +850,7 @@ impl Store {
                 runner_instance_id: parse_id(row.get(4)?, 4)?,
                 runner_runtime: row.get(5)?,
                 terminal_runner_sequence: row.get(6)?,
+                observer_health: parse_observer_health(&observer_health, 7)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1527,7 +1595,8 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapsho
     connection
         .query_row(
             "SELECT id, project_id, agent_id, parent_run_id, task_id, status,
-                    activity, wait_reason, worktree, started_at_ms, status_since_ms,
+                    activity, wait_reason, worktree, observer_health,
+                    observer_health_since_ms, started_at_ms, status_since_ms,
                     updated_at_ms, ended_at_ms, exit_code, exit_signal, failure_reason
              FROM runs WHERE id = ?1",
             params![run_id.as_str()],
@@ -1535,7 +1604,8 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapsho
                 let parent_run_id: Option<String> = row.get(3)?;
                 let task_id: Option<String> = row.get(4)?;
                 let status: String = row.get(5)?;
-                let failure_reason: Option<String> = row.get(15)?;
+                let observer_health: String = row.get(9)?;
+                let failure_reason: Option<String> = row.get(17)?;
                 Ok(RunSnapshot {
                     id: parse_id(row.get(0)?, 0)?,
                     project_id: parse_id(row.get(1)?, 1)?,
@@ -1546,13 +1616,15 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapsho
                     activity: row.get(6)?,
                     wait_reason: row.get(7)?,
                     worktree: row.get(8)?,
-                    started_at_ms: row.get(9)?,
-                    status_since_ms: row.get(10)?,
-                    updated_at_ms: row.get(11)?,
-                    ended_at_ms: row.get(12)?,
-                    exit_code: row.get(13)?,
-                    exit_signal: row.get(14)?,
-                    failure_reason: parse_optional_failure_reason(failure_reason, 15)?,
+                    observer_health: parse_observer_health(&observer_health, 9)?,
+                    observer_health_since_ms: row.get(10)?,
+                    started_at_ms: row.get(11)?,
+                    status_since_ms: row.get(12)?,
+                    updated_at_ms: row.get(13)?,
+                    ended_at_ms: row.get(14)?,
+                    exit_code: row.get(15)?,
+                    exit_signal: row.get(16)?,
+                    failure_reason: parse_optional_failure_reason(failure_reason, 17)?,
                 })
             },
         )
@@ -1713,6 +1785,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0003_runner_reconciliation.sql"))?;
         transaction.pragma_update(None, "user_version", 3)?;
         transaction.commit()?;
+        current = 3;
+    }
+    if current == 3 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0004_observer_health.sql"))?;
+        transaction.pragma_update(None, "user_version", 4)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -1826,6 +1905,12 @@ fn parse_run_status(value: &str, column: usize) -> rusqlite::Result<RunStatus> {
     })
 }
 
+fn parse_observer_health(value: &str, column: usize) -> rusqlite::Result<ObserverHealth> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
 fn parse_optional_failure_reason(
     value: Option<String>,
     column: usize,
@@ -1863,6 +1948,14 @@ const fn run_status_value(value: RunStatus) -> &'static str {
         RunStatus::Succeeded => "succeeded",
         RunStatus::Failed => "failed",
         RunStatus::Stopped => "stopped",
+    }
+}
+
+const fn observer_health_value(value: ObserverHealth) -> &'static str {
+    match value {
+        ObserverHealth::Unknown => "unknown",
+        ObserverHealth::Healthy => "healthy",
+        ObserverHealth::Degraded => "degraded",
     }
 }
 
