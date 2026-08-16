@@ -1,5 +1,7 @@
-use factory_core::{AgentId, AgentRole, MessageId, ProjectId, Provider, TaskId};
-use factoryd::store::{NewAgent, NewAgentMessage, NewProject, NewTask, RunReservation, Store};
+use factory_core::{
+    AgentId, AgentRole, MessageId, ProjectId, Provider, RunnerInstanceId, SessionId, TaskId,
+};
+use factoryd::store::{NewAgent, NewAgentMessage, NewProject, NewSession, NewTask, Store};
 
 fn fixture() -> Store {
     let mut store = Store::open_in_memory().unwrap();
@@ -50,20 +52,43 @@ fn operator_message_is_durable_and_delivered_once() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].delivered_at_ms, None);
 
-    let delivered = store.deliver_agent_messages(&project, &agent, 4).unwrap();
+    let session_id = SessionId::try_from("session-god").unwrap();
+    store
+        .create_session(
+            NewSession {
+                id: session_id.clone(),
+                project_id: project.clone(),
+                agent_id: agent.clone(),
+                provider: Provider::Codex,
+                provider_session_id: None,
+                worktree: "/work/factory".into(),
+                codex_home: None,
+                hook_token: "a".repeat(64),
+                runner_instance_id: RunnerInstanceId::try_from("instance-god").unwrap(),
+                runner_runtime: "/private/runners/god".into(),
+                runner_protocol_version: 1,
+            },
+            3,
+        )
+        .unwrap();
+
+    let delivered = store
+        .deliver_agent_messages(&project, &agent, &session_id, 4)
+        .unwrap();
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0].body, "Continue from the last checkpoint.");
     assert_eq!(delivered[0].delivered_at_ms, Some(4));
+    assert_eq!(delivered[0].delivered_session_id, Some(session_id.clone()));
     assert!(
         store
-            .deliver_agent_messages(&project, &agent, 5)
+            .deliver_agent_messages(&project, &agent, &session_id, 5)
             .unwrap()
             .is_empty()
     );
 }
 
 #[test]
-fn reservation_delivers_messages_into_the_next_explicit_launch() {
+fn opening_a_run_episode_delivers_messages_into_the_new_episode() {
     let mut store = fixture();
     let project = ProjectId::try_from("factory").unwrap();
     let agent = AgentId::try_from("worker").unwrap();
@@ -102,36 +127,54 @@ fn reservation_delivers_messages_into_the_next_explicit_launch() {
             created_at_ms: 5,
         })
         .unwrap();
+    store
+        .assign_task(
+            &project,
+            &TaskId::try_from("task-1").unwrap(),
+            Some(&agent),
+            5,
+        )
+        .unwrap();
 
-    let reserved = store
-        .reserve_task_run(
-            RunReservation {
+    let session_id = SessionId::try_from("session-worker").unwrap();
+    store
+        .create_session(
+            NewSession {
+                id: session_id.clone(),
                 project_id: project.clone(),
-                task_id: TaskId::try_from("task-1").unwrap(),
                 agent_id: agent.clone(),
-                expected_provider: Provider::Codex,
-                run_id: factory_core::RunId::try_from("run-1").unwrap(),
-                parent_run_id: None,
+                provider: Provider::Codex,
+                provider_session_id: None,
                 worktree: "/work/factory".into(),
-                fresh_provider_session_id: None,
-                runner_instance_id: factory_core::RunnerInstanceId::try_from("runner-1").unwrap(),
-                runner_runtime: "/private/factory-runner-1".into(),
+                codex_home: None,
+                hook_token: "b".repeat(64),
+                runner_instance_id: RunnerInstanceId::try_from("instance-worker").unwrap(),
+                runner_runtime: "/private/runners/worker".into(),
+                runner_protocol_version: 1,
             },
-            1,
             6,
         )
         .unwrap();
-    assert_eq!(reserved.target.agent_messages.len(), 1);
+    let opened = store
+        .open_run_episode(&session_id, &TaskId::try_from("task-1").unwrap(), 6)
+        .unwrap();
+    assert_eq!(opened.agent_messages.len(), 1);
     assert_eq!(
-        reserved.target.agent_messages[0].sender_agent_id.as_ref(),
+        opened.agent_messages[0].sender_agent_id.as_ref(),
         Some(&AgentId::try_from("god").unwrap())
     );
-    assert_eq!(reserved.target.agent_messages[0].delivered_at_ms, Some(6));
-    let recovered_target = store
-        .execution_target(&factory_core::RunId::try_from("run-1").unwrap())
-        .unwrap();
+    assert_eq!(opened.agent_messages[0].delivered_at_ms, Some(6));
     assert_eq!(
-        recovered_target.agent_messages,
-        reserved.target.agent_messages
+        opened.agent_messages[0].delivered_run_id,
+        Some(opened.run.id.clone())
     );
+    assert_eq!(
+        opened.agent_messages[0].delivered_session_id,
+        Some(session_id)
+    );
+
+    let persisted = store
+        .list_agent_messages(&project, &agent, None, 100)
+        .unwrap();
+    assert_eq!(persisted, opened.agent_messages);
 }

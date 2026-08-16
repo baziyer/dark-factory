@@ -1,4 +1,4 @@
-use std::{future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::Path};
+use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
     AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
@@ -93,17 +93,9 @@ where
 
 fn execution_config(directory: &Path) -> execution::Config {
     execution::Config {
-        runner_program: directory.join("missing-factory-runner"),
-        codex_program: directory.join("missing-codex"),
-        claude_program: directory.join("missing-claude"),
-        claude_max_turns: NonZeroU32::new(20).unwrap(),
-        claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
         runtime_root: directory.join("runs"),
         guidance_root: directory.to_path_buf(),
         max_active_runs: 1,
-        startup_timeout: std::time::Duration::from_secs(1),
-        connect_grace: std::time::Duration::from_secs(1),
-        batch_delay: std::time::Duration::from_millis(25),
     }
 }
 
@@ -1164,12 +1156,16 @@ async fn cancel_update_and_delete_are_local_control_operations() {
     .await;
 }
 
-/// Step 0 of resident sessions adds the sessions/hook wire shapes without
-/// behavior: `CreateAgent.worktree`/`StartTask.worktree` reject rather than
-/// silently drop an operator's input, and every new session-shaped request
-/// is rejected uniformly until 5A/5C land.
+/// `CreateAgent.worktree` validates an operator override (D3): rejects a
+/// non-existent path, accepts and durably records an existing one.
+/// `StartTask.worktree: None` defaults to the agent's recorded worktree, or
+/// is rejected when the agent has none. Every session-shaped request now
+/// has real behavior: `PauseAgent`/`ResumeAgent`/`ListSessions` succeed;
+/// requests naming a session/run/task-episode that doesn't exist yet
+/// surface the real `NotFound`/`Conflict`; an unrecognized hook token is
+/// rejected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_shaped_requests_are_rejected_until_sessions_land() {
+async fn session_shaped_requests_now_have_real_behavior() {
     with_server(|socket| async move {
         let project_root = socket.parent().unwrap().join("project");
         std::fs::create_dir(&project_root).unwrap();
@@ -1189,6 +1185,7 @@ async fn session_shaped_requests_are_rejected_until_sessions_land() {
             }
         ));
 
+        // A worktree override that doesn't exist on disk is rejected.
         assert!(matches!(
             request(
                 &socket,
@@ -1199,7 +1196,7 @@ async fn session_shaped_requests_are_rejected_until_sessions_land() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
-                    worktree: Some("/work/curie".into()),
+                    worktree: Some("/nonexistent/curie-worktree".into()),
                 },
             )
             .await,
@@ -1212,11 +1209,56 @@ async fn session_shaped_requests_are_rejected_until_sessions_land() {
             }
         ));
 
+        // An existing absolute directory is accepted and durably recorded.
+        let worktree = project_root.to_string_lossy().into_owned();
+        let created = request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: Some(worktree.clone()),
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentCreated { agent },
+            ..
+        } = created
+        else {
+            panic!("expected AgentCreated, got {created:?}");
+        };
+        assert_eq!(agent.worktree, Some(worktree));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Uses the agent's worktree".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+
+        // A worker with no recorded worktree cannot start a task without an
+        // explicit one.
         assert!(matches!(
             request(
                 &socket,
                 LocalRequest::CreateAgent {
-                    id: agent_id("curie"),
+                    id: agent_id("no-worktree"),
                     project_id: project_id("factory"),
                     parent_agent_id: None,
                     role: factory_core::AgentRole::Worker,
@@ -1234,28 +1276,10 @@ async fn session_shaped_requests_are_rejected_until_sessions_land() {
         assert!(matches!(
             request(
                 &socket,
-                LocalRequest::CreateTask {
-                    id: task_id("task-1"),
-                    project_id: project_id("factory"),
-                    parent_task_id: None,
-                    title: "Needs a worktree".into(),
-                    body: "body".into(),
-                    priority: 0,
-                },
-            )
-            .await,
-            ServerFrame::Response {
-                response: LocalResponse::TaskCreated { .. },
-                ..
-            }
-        ));
-        assert!(matches!(
-            request(
-                &socket,
                 LocalRequest::StartTask {
                     project_id: project_id("factory"),
                     task_id: task_id("task-1"),
-                    agent_id: agent_id("curie"),
+                    agent_id: agent_id("no-worktree"),
                     parent_run_id: None,
                     worktree: None,
                 },
@@ -1270,59 +1294,175 @@ async fn session_shaped_requests_are_rejected_until_sessions_land() {
             }
         ));
 
-        let run_id = factory_core::RunId::try_from("run-1").unwrap();
-        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
-        let stubbed = [
-            LocalRequest::CancelRun {
-                project_id: project_id("factory"),
-                run_id,
-            },
-            LocalRequest::CompleteTask {
-                project_id: project_id("factory"),
-                task_id: task_id("task-1"),
-                result: "done".into(),
-            },
-            LocalRequest::BlockTask {
-                project_id: project_id("factory"),
-                task_id: task_id("task-1"),
-                reason: "blocked".into(),
-            },
+        // StartTask against curie (which has a worktree) fails cleanly with
+        // no live session yet -- spawning one is a later track.
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::StartTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    agent_id: agent_id("curie"),
+                    parent_run_id: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // PauseAgent/ResumeAgent are real, durable control operations.
+        let paused = request(
+            &socket,
             LocalRequest::PauseAgent {
                 project_id: project_id("factory"),
                 agent_id: agent_id("curie"),
             },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentPaused { agent },
+            ..
+        } = paused
+        else {
+            panic!("expected AgentPaused, got {paused:?}");
+        };
+        assert!(agent.paused);
+
+        let resumed = request(
+            &socket,
             LocalRequest::ResumeAgent {
                 project_id: project_id("factory"),
                 agent_id: agent_id("curie"),
             },
-            LocalRequest::ListSessions {
-                project_id: project_id("factory"),
-                after_id: None,
-                limit: None,
-            },
-            LocalRequest::StopSession {
-                project_id: project_id("factory"),
-                session_id,
-                grace_ms: 0,
-            },
-            LocalRequest::ProviderHook {
-                token: "token".into(),
-                event: factory_core::ProviderHookEvent::Stop,
-                payload: serde_json::json!({}),
-            },
-        ];
-        for stub in stubbed {
-            assert!(matches!(
-                request(&socket, stub).await,
-                ServerFrame::Response {
-                    response: LocalResponse::Error {
-                        code: ErrorCode::InvalidRequest,
-                        ..
-                    },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentResumed { agent },
+            ..
+        } = resumed
+        else {
+            panic!("expected AgentResumed, got {resumed:?}");
+        };
+        assert!(!agent.paused);
+
+        // ListSessions succeeds with an empty page: nothing has spawned one
+        // yet.
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ListSessions {
+                    project_id: project_id("factory"),
+                    after_id: None,
+                    limit: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Sessions { sessions, next_after_id: None },
+                ..
+            } if sessions.is_empty()
+        ));
+
+        // Requests naming a run/task-episode/session that doesn't exist yet
+        // surface the real not-found/conflict, not a blanket "unsupported".
+        let run_id = factory_core::RunId::try_from("run-1").unwrap();
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CancelRun {
+                    project_id: project_id("factory"),
+                    run_id,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
                     ..
-                }
-            ));
-        }
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CompleteTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    result: "done".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::BlockTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    reason: "blocked".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::StopSession {
+                    project_id: project_id("factory"),
+                    session_id,
+                    grace_ms: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ProviderHook {
+                    token: "unrecognized-token".into(),
+                    event: factory_core::ProviderHookEvent::Stop,
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
     })
     .await;
 }
