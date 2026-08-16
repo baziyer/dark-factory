@@ -26,7 +26,7 @@ Commands:
   agent add|list|delete|get|profile|message|inbox
                                                Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
-  attach --project P --run R                  Attach to a terminal-mode run's PTY
+  attach --project P --session S              Attach to a terminal-mode session's PTY
   events [--follow]                           Read durable events
 
 Run `factoryctl <command> --help` or `factoryctl <command> <action> --help`
@@ -390,17 +390,17 @@ Options:
   --grace-ms N              Grace period before a harder stop (default 0, max 60000)
   -h, --help                  Show this help";
 
-const ATTACH_HELP: &str = "usage: factoryctl attach --project ID --run ID [--since-offset N]
+const ATTACH_HELP: &str = "usage: factoryctl attach --project ID --session ID [--since-offset N]
 
-Attach to a terminal-mode run's PTY: puts the local terminal in raw mode,
-replays retained output from --since-offset (default 0, i.e. from the
-start), then streams live output and forwards stdin as operator input.
+Attach to a terminal-mode session's PTY: puts the local terminal in raw
+mode, replays retained output from --since-offset (default 0, i.e. from
+the start), then streams live output and forwards stdin as operator input.
 Resizes the remote PTY to match the local terminal on attach and on every
-SIGWINCH. Detach with Ctrl-] without affecting the run.
+SIGWINCH. Detach with Ctrl-] without affecting the session.
 
 Required:
-  --project ID              Project the run belongs to
-  --run ID                  Run to attach to
+  --project ID               Project the session belongs to
+  --session ID                Session to attach to (--run is accepted as an alias)
 
 Options:
   --since-offset N            Replay retained output from this byte offset (default 0)
@@ -458,7 +458,7 @@ enum CliCommand {
     },
     Attach {
         project_id: String,
-        run_id: String,
+        session_id: String,
         since_offset: u64,
     },
     TaskRetry {
@@ -580,11 +580,11 @@ fn run() -> Result<i32, String> {
     let client = Client::new(socket);
     if let CliCommand::Attach {
         project_id,
-        run_id,
+        session_id,
         since_offset,
     } = command
     {
-        return attach::run(&client, &project_id, &run_id, since_offset);
+        return attach::run(&client, &project_id, &session_id, since_offset);
     }
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -949,7 +949,19 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
 
 fn parse_attach(mut args: Vec<String>) -> Result<CliCommand, String> {
     let project_id = required_option(&mut args, "--project")?;
-    let run_id = required_option(&mut args, "--run")?;
+    // `--run` is a deprecated alias kept during the transition to resident
+    // sessions (a session's id is currently its run's id; see
+    // `local_api.rs`'s `resolve_transitional_run_id`).
+    let session = take_option(&mut args, "--session")?;
+    let run = take_option(&mut args, "--run")?;
+    let session_id = match (session, run) {
+        (Some(session_id), None) => session_id,
+        (None, Some(run_id)) => run_id,
+        (Some(_), Some(_)) => {
+            return Err("--session and --run may not both be provided".into());
+        }
+        (None, None) => return Err("--session is required".into()),
+    };
     let since_offset = take_option(&mut args, "--since-offset")?
         .map(|value| parse_number(&value, "--since-offset"))
         .transpose()?
@@ -957,7 +969,7 @@ fn parse_attach(mut args: Vec<String>) -> Result<CliCommand, String> {
     require_empty(&args)?;
     Ok(CliCommand::Attach {
         project_id,
-        run_id,
+        session_id,
         since_offset,
     })
 }
@@ -1225,7 +1237,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             parent_run_id: parent_run_id
                 .map(|id| parse_id(id, "parent run"))
                 .transpose()?,
-            worktree,
+            worktree: Some(worktree),
         }),
         CliCommand::Attach { .. } => Err("attach is handled before local requests".into()),
         CliCommand::TaskRetry {
@@ -1295,6 +1307,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             role,
             provider,
             model,
+            worktree: None,
         }),
         CliCommand::AgentList {
             project_id,
@@ -1866,7 +1879,58 @@ mod tests {
     }
 
     #[test]
-    fn attach_parses_project_run_and_defaults_since_offset_to_zero() {
+    fn attach_parses_project_session_and_defaults_since_offset_to_zero() {
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--session",
+                "session-1"
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::Attach {
+                    project_id: "project-1".into(),
+                    session_id: "session-1".into(),
+                    since_offset: 0,
+                }
+            )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--session",
+                "session-1",
+                "--since-offset",
+                "4096",
+            ]))
+            .unwrap(),
+            (
+                None,
+                CliCommand::Attach {
+                    project_id: "project-1".into(),
+                    session_id: "session-1".into(),
+                    since_offset: 4096,
+                }
+            )
+        );
+        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
+        assert!(
+            request_for(CliCommand::Attach {
+                project_id: "project-1".into(),
+                session_id: "session-1".into(),
+                since_offset: 0,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn attach_accepts_run_as_a_deprecated_alias_for_session() {
         assert_eq!(
             parse_args(args(&[
                 "attach",
@@ -1880,38 +1944,21 @@ mod tests {
                 None,
                 CliCommand::Attach {
                     project_id: "project-1".into(),
-                    run_id: "run-1".into(),
+                    session_id: "run-1".into(),
                     since_offset: 0,
                 }
             )
         );
-        assert_eq!(
+        assert!(
             parse_args(args(&[
                 "attach",
                 "--project",
                 "project-1",
+                "--session",
+                "session-1",
                 "--run",
-                "run-1",
-                "--since-offset",
-                "4096",
+                "run-1"
             ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::Attach {
-                    project_id: "project-1".into(),
-                    run_id: "run-1".into(),
-                    since_offset: 4096,
-                }
-            )
-        );
-        assert!(parse_args(args(&["attach", "--run", "run-1"])).is_err());
-        assert!(
-            request_for(CliCommand::Attach {
-                project_id: "project-1".into(),
-                run_id: "run-1".into(),
-                since_offset: 0,
-            })
             .is_err()
         );
     }

@@ -1,6 +1,7 @@
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
-    Provider, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, SessionId, SessionSnapshot, SessionState,
+    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
@@ -21,6 +22,10 @@ fn agent_id(value: &str) -> AgentId {
 
 fn run_id(value: &str) -> RunId {
     RunId::try_from(value).unwrap()
+}
+
+fn session_id(value: &str) -> SessionId {
+    SessionId::try_from(value).unwrap()
 }
 
 #[test]
@@ -169,13 +174,14 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         role: AgentRole::Worker,
         provider: Provider::Codex,
         model: None,
+        worktree: None,
     };
     let start = LocalRequest::StartTask {
         project_id: project_id("project-1"),
         task_id: task_id("task-1"),
         agent_id: agent_id("agent-1"),
         parent_run_id: Some(run_id("run-parent")),
-        worktree: "/work/dark-factory-agent-1".into(),
+        worktree: Some("/work/dark-factory-agent-1".into()),
     };
     let created = LocalResponse::AgentCreated {
         agent: AgentSnapshot {
@@ -185,6 +191,9 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
             role: AgentRole::Worker,
             provider: Provider::Codex,
             current_run_id: None,
+            paused: false,
+            current_session_id: None,
+            worktree: None,
             created_at_ms: 10,
             updated_at_ms: 10,
         },
@@ -224,6 +233,7 @@ fn agent_creation_can_carry_an_optional_model_without_exposing_an_id_field_contr
         role: AgentRole::Worker,
         provider: Provider::Codex,
         model: Some("gpt-5-codex".into()),
+        worktree: None,
     };
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["data"]["model"], "gpt-5-codex");
@@ -268,6 +278,9 @@ fn agent_profile_is_available_only_through_private_local_detail() {
         role: AgentRole::Orchestrator,
         provider: Provider::Codex,
         current_run_id: None,
+        paused: false,
+        current_session_id: None,
+        worktree: None,
         created_at_ms: 1,
         updated_at_ms: 2,
     };
@@ -501,4 +514,227 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
     };
 
     assert!(serde_json::to_vec(&frame).unwrap().len() <= MAX_LOCAL_FRAME_BYTES);
+}
+
+#[test]
+fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
+    let request = LocalRequest::ProviderHook {
+        token: "hook-token".into(),
+        event: ProviderHookEvent::Stop,
+        payload: serde_json::json!({"stop_hook_active": true, "session_id": "provider-session-1"}),
+    };
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "type": "provider_hook",
+            "data": {
+                "token": "hook-token",
+                "event": "stop",
+                "payload": {"stop_hook_active": true, "session_id": "provider-session-1"}
+            }
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<LocalRequest>(value).unwrap(),
+        request
+    );
+
+    let reply = LocalResponse::ProviderHookReply {
+        reply: serde_json::json!({"decision": "block", "reason": "deliver task-1"}),
+    };
+    let value = serde_json::to_value(&reply).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "type": "provider_hook_reply",
+            "data": {"reply": {"decision": "block", "reason": "deliver task-1"}}
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(value).unwrap(),
+        reply
+    );
+}
+
+#[test]
+fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
+    let session = SessionSnapshot {
+        id: session_id("session-1"),
+        project_id: project_id("project-1"),
+        agent_id: agent_id("agent-1"),
+        provider: Provider::ClaudeCode,
+        state: SessionState::Idle,
+        state_since_ms: 10,
+        worktree: "/work/agent-1".into(),
+        provider_session_id: None,
+        current_run_id: None,
+        last_hook_event: None,
+        last_hook_at_ms: None,
+        wait_reason: None,
+        observer_health: ObserverHealth::Unknown,
+        observer_health_since_ms: 0,
+        started_at_ms: 5,
+        updated_at_ms: 10,
+        ended_at_ms: None,
+        exit_code: None,
+        exit_signal: None,
+    };
+    let value = serde_json::to_value(&session).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "id": "session-1",
+            "project_id": "project-1",
+            "agent_id": "agent-1",
+            "provider": "claude_code",
+            "state": "idle",
+            "state_since_ms": 10,
+            "worktree": "/work/agent-1",
+            "observer_health": "unknown",
+            "observer_health_since_ms": 0,
+            "started_at_ms": 5,
+            "updated_at_ms": 10
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionSnapshot>(value).unwrap(),
+        session
+    );
+
+    let event = FactoryEvent::SessionChanged {
+        session: session.clone(),
+    };
+    let value = serde_json::to_value(&event).unwrap();
+    assert_eq!(value["type"], "session_changed");
+    assert_eq!(value["data"]["session"]["state"], "idle");
+    assert_eq!(
+        serde_json::from_value::<FactoryEvent>(value).unwrap(),
+        event
+    );
+}
+
+#[test]
+fn session_snapshot_carries_its_bounded_optionals_when_set() {
+    let session = SessionSnapshot {
+        id: session_id("session-1"),
+        project_id: project_id("project-1"),
+        agent_id: agent_id("agent-1"),
+        provider: Provider::Codex,
+        state: SessionState::WaitingForInput,
+        state_since_ms: 20,
+        worktree: "/work/agent-1".into(),
+        provider_session_id: Some("thread-1".into()),
+        current_run_id: Some(run_id("run-1")),
+        last_hook_event: Some(ProviderHookEvent::Notification),
+        last_hook_at_ms: Some(19),
+        wait_reason: Some("permission prompt".into()),
+        observer_health: ObserverHealth::Healthy,
+        observer_health_since_ms: 15,
+        started_at_ms: 5,
+        updated_at_ms: 20,
+        ended_at_ms: None,
+        exit_code: None,
+        exit_signal: None,
+    };
+    let value = serde_json::to_value(&session).unwrap();
+    assert_eq!(value["provider_session_id"], "thread-1");
+    assert_eq!(value["current_run_id"], "run-1");
+    assert_eq!(value["last_hook_event"], "notification");
+    assert_eq!(value["wait_reason"], "permission prompt");
+    assert_eq!(
+        serde_json::from_value::<SessionSnapshot>(value).unwrap(),
+        session
+    );
+}
+
+#[test]
+fn terminal_requests_and_frames_are_keyed_by_session_id() {
+    let attach = LocalRequest::AttachTerminal {
+        project_id: project_id("project-1"),
+        session_id: session_id("session-1"),
+        since_offset: 4,
+    };
+    assert_eq!(
+        serde_json::to_value(attach).unwrap(),
+        serde_json::json!({
+            "type": "attach_terminal",
+            "data": {"project_id": "project-1", "session_id": "session-1", "since_offset": 4}
+        })
+    );
+
+    let input = LocalRequest::TerminalInput {
+        project_id: project_id("project-1"),
+        session_id: session_id("session-1"),
+        bytes: "aGk=".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(input).unwrap(),
+        serde_json::json!({
+            "type": "terminal_input",
+            "data": {"project_id": "project-1", "session_id": "session-1", "bytes": "aGk="}
+        })
+    );
+
+    let accepted = LocalResponse::TerminalInputAccepted {
+        session_id: session_id("session-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(accepted).unwrap(),
+        serde_json::json!({"type": "terminal_input_accepted", "data": {"session_id": "session-1"}})
+    );
+
+    let frame = ServerFrame::TerminalOutput {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: session_id("session-1"),
+        offset: 4,
+        bytes: "aGk=".into(),
+    };
+    let value = serde_json::to_value(&frame).unwrap();
+    assert_eq!(value["type"], "terminal_output");
+    assert_eq!(value["data"]["session_id"], "session-1");
+    assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
+}
+
+#[test]
+fn session_lifecycle_requests_have_small_versioned_local_shapes() {
+    assert_eq!(
+        serde_json::to_value(LocalRequest::PauseAgent {
+            project_id: project_id("project-1"),
+            agent_id: agent_id("agent-1"),
+        })
+        .unwrap(),
+        serde_json::json!({
+            "type": "pause_agent",
+            "data": {"project_id": "project-1", "agent_id": "agent-1"}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(LocalRequest::CompleteTask {
+            project_id: project_id("project-1"),
+            task_id: task_id("task-1"),
+            result: "done".into(),
+        })
+        .unwrap(),
+        serde_json::json!({
+            "type": "complete_task",
+            "data": {"project_id": "project-1", "task_id": "task-1", "result": "done"}
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(LocalRequest::ListSessions {
+            project_id: project_id("project-1"),
+            after_id: None,
+            limit: None,
+        })
+        .unwrap(),
+        serde_json::json!({"type": "list_sessions", "data": {"project_id": "project-1"}})
+    );
+    assert_eq!(
+        serde_json::to_value(LocalResponse::SessionStopped {
+            session_id: session_id("session-1"),
+        })
+        .unwrap(),
+        serde_json::json!({"type": "session_stopped", "data": {"session_id": "session-1"}})
+    );
 }

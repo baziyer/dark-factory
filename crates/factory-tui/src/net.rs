@@ -55,6 +55,11 @@ pub fn resolve_socket_path(explicit: Option<&str>) -> Result<PathBuf, String> {
 }
 
 /// Messages the render loop consumes. `main.rs` drains these non-blockingly between draws.
+///
+/// `large_enum_variant` is allowed deliberately: these cross a channel at
+/// most once per network round-trip, not in a hot loop, and boxing payloads
+/// would ripple into every construction/match site for no runtime benefit.
+#[allow(clippy::large_enum_variant)]
 pub enum NetMsg {
     ConnectionRetrying(String),
     ConnectionLive,

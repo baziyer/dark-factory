@@ -101,6 +101,7 @@ id_type!(AgentId);
 id_type!(MessageId);
 id_type!(RunId);
 id_type!(RunnerInstanceId);
+id_type!(SessionId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +145,51 @@ pub enum ObserverHealth {
     Unknown,
     Healthy,
     Degraded,
+}
+
+/// Lifecycle state of one resident interactive provider process (one per
+/// agent, PTY-backed, spanning many task-episodes).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Starting,
+    Idle,
+    Working,
+    WaitingForInput,
+    Stopped,
+    Failed,
+}
+
+impl SessionState {
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        !matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
+/// The provider hook event a `factoryctl hook` invocation was called for.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHookEvent {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PostToolUse,
+    Notification,
+    Stop,
+    SubagentStop,
+    SessionEnd,
+}
+
+/// Why a run (task-episode) was closed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunClosedBy {
+    TaskDone,
+    TaskBlocked,
+    OperatorCancel,
+    OperatorStop,
+    SessionEnded,
 }
 
 /// A durable, privacy-safe category for a failed run.
@@ -223,6 +269,16 @@ pub struct AgentSnapshot {
     /// The active attempt, or `None` when this agent is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<RunId>,
+    /// Durable operator hold: while `true`, the daemon does not deliver new
+    /// work into this agent's session.
+    #[serde(default)]
+    pub paused: bool,
+    /// The agent's current resident session, or `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<SessionId>,
+    /// Absolute path to the agent's git worktree, once created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -237,6 +293,10 @@ pub struct RunSnapshot {
     pub parent_run_id: Option<RunId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
+    /// The resident session this episode ran inside. `None` only for runs
+    /// that predate the sessions migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub status: RunStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
@@ -258,6 +318,46 @@ pub struct RunSnapshot {
     pub exit_signal: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<RunFailureReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<RunClosedBy>,
+}
+
+/// One resident interactive provider process for one agent. Many task
+/// episodes ([`RunSnapshot`]) happen inside one session's lifetime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSnapshot {
+    pub id: SessionId,
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub provider: Provider,
+    pub state: SessionState,
+    pub state_since_ms: i64,
+    pub worktree: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<RunId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hook_event: Option<ProviderHookEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hook_at_ms: Option<i64>,
+    /// Bounded operator-facing explanation of why the session is waiting,
+    /// e.g. "permission prompt", "delivery unacknowledged"; at most 512
+    /// bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    #[serde(default)]
+    pub observer_health: ObserverHealth,
+    #[serde(default)]
+    pub observer_health_since_ms: i64,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -274,6 +374,9 @@ pub enum FactoryEvent {
     },
     RunChanged {
         run: RunSnapshot,
+    },
+    SessionChanged {
+        session: SessionSnapshot,
     },
     /// A task was permanently removed. Unlike `TaskChanged`, there is no
     /// surviving snapshot to publish.

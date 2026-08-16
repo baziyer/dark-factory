@@ -10,7 +10,7 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
+    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId, SessionId,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
@@ -295,7 +295,7 @@ async fn handle_connection(
 
     if let LocalRequest::AttachTerminal {
         project_id,
-        run_id,
+        session_id,
         since_offset,
     } = request
     {
@@ -309,7 +309,7 @@ async fn handle_connection(
                 state.clone(),
                 session_shutdown,
                 project_id,
-                run_id,
+                session_id,
                 since_offset,
             ) => result,
         };
@@ -341,11 +341,12 @@ fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
 }
 
 /// Persistent multiplexed connection for one or more `AttachTerminal`
-/// sessions: `ServerFrame::TerminalOutput` for every attached run (tagged by
-/// `run_id`) is interleaved onto the same connection. Only further
-/// `AttachTerminal` requests are accepted on it; anything else gets an error
-/// response. Detaching happens implicitly on client disconnect, which drops
-/// this function's `JoinSet` and aborts every attached forwarding task.
+/// sessions: `ServerFrame::TerminalOutput` for every attached session
+/// (tagged by `session_id`) is interleaved onto the same connection. Only
+/// further `AttachTerminal` requests are accepted on it; anything else gets
+/// an error response. Detaching happens implicitly on client disconnect,
+/// which drops this function's `JoinSet` and aborts every attached
+/// forwarding task.
 #[allow(clippy::too_many_arguments)]
 async fn terminal_attach_session(
     mut reader: LimitedReader,
@@ -353,7 +354,7 @@ async fn terminal_attach_session(
     state: ApiState,
     mut shutdown: watch::Receiver<bool>,
     project_id: ProjectId,
-    run_id: RunId,
+    session_id: SessionId,
     since_offset: u64,
 ) -> io::Result<()> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<ServerFrame>(TERMINAL_FRAME_CHANNEL_CAPACITY);
@@ -363,7 +364,7 @@ async fn terminal_attach_session(
         state.clone(),
         frame_tx.clone(),
         project_id,
-        run_id,
+        session_id,
         since_offset,
     );
 
@@ -379,13 +380,13 @@ async fn terminal_attach_session(
             result = read_next_line(&mut reader, &mut payload) => {
                 let Some(line) = result? else { return Ok(()); };
                 match parse_envelope(&line) {
-                    Ok(LocalRequest::AttachTerminal { project_id, run_id, since_offset }) => {
+                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset }) => {
                         spawn_terminal_attach(
                             &mut attaches,
                             state.clone(),
                             frame_tx.clone(),
                             project_id,
-                            run_id,
+                            session_id,
                             since_offset,
                         );
                     }
@@ -413,10 +414,19 @@ fn spawn_terminal_attach(
     state: ApiState,
     frame_tx: mpsc::Sender<ServerFrame>,
     project_id: ProjectId,
-    run_id: RunId,
+    session_id: SessionId,
     since_offset: u64,
 ) {
     attaches.spawn(async move {
+        // TRANSITION: sessions land in 5A/5C; until then the session id is
+        // the run id.
+        let run_id = match resolve_transitional_run_id(&session_id) {
+            Ok(run_id) => run_id,
+            Err(failure) => {
+                let _ = send_terminal_error(&frame_tx, failure.into_response()).await;
+                return;
+            }
+        };
         let lookup_run_id = run_id.clone();
         let target = match state
             .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
@@ -429,11 +439,7 @@ fn spawn_terminal_attach(
                 return;
             }
         };
-        let client = RunnerClient::new(
-            &target.runner_runtime,
-            run_id.clone(),
-            target.runner_instance_id,
-        );
+        let client = RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id);
         let mut subscription = match client.attach_terminal(since_offset).await {
             Ok(subscription) => subscription,
             Err(error) => {
@@ -447,7 +453,7 @@ fn spawn_terminal_attach(
                 Ok((offset, bytes)) => {
                     let frame = ServerFrame::TerminalOutput {
                         protocol_version: PROTOCOL_VERSION,
-                        run_id: run_id.clone(),
+                        session_id: session_id.clone(),
                         offset,
                         bytes,
                     };
@@ -572,7 +578,16 @@ async fn handle_request(
             role,
             provider,
             model,
+            worktree,
         } => {
+            if worktree.is_some() {
+                // TRANSITION: per-agent worktrees land in 5C (D3); accept
+                // nothing silently rather than dropping an operator's
+                // explicit override.
+                return Err(ApiFailure::Invalid(
+                    "per-agent worktrees are not implemented yet".into(),
+                ));
+            }
             let created_project_id = project_id.clone();
             let created_agent_id = id.clone();
             let agent = state
@@ -748,6 +763,13 @@ async fn handle_request(
             parent_run_id,
             worktree,
         } => {
+            // TRANSITION: per-agent worktrees (the `None` default) land in
+            // 5C (D3); until then the caller must supply one explicitly.
+            let Some(worktree) = worktree else {
+                return Err(ApiFailure::Invalid(
+                    "worktree is required until per-agent worktrees exist".into(),
+                ));
+            };
             let started = execution
                 .start_task(StartTask {
                     project_id,
@@ -949,47 +971,58 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::RunStopped { run_id })
         }
+        // TRANSITION: sessions land in 5A (state + handlers) and 5C
+        // (delivery/spawn); every session-shaped request is rejected here
+        // rather than left silently unhandled.
+        LocalRequest::CancelRun { .. }
+        | LocalRequest::CompleteTask { .. }
+        | LocalRequest::BlockTask { .. }
+        | LocalRequest::PauseAgent { .. }
+        | LocalRequest::ResumeAgent { .. }
+        | LocalRequest::ListSessions { .. }
+        | LocalRequest::StopSession { .. }
+        | LocalRequest::ProviderHook { .. } => Err(ApiFailure::Invalid(
+            "sessions are not implemented yet".into(),
+        )),
         LocalRequest::AttachTerminal { .. } => {
             unreachable!("AttachTerminal is handled per connection")
         }
         LocalRequest::TerminalInput {
             project_id,
-            run_id,
+            session_id,
             bytes,
         } => {
+            // TRANSITION: sessions land in 5A/5C; until then the session id
+            // is the run id.
+            let run_id = resolve_transitional_run_id(&session_id)?;
             let lookup_run_id = run_id.clone();
             let target = state
                 .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
                 .await?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                run_id.clone(),
-                target.runner_instance_id,
-            )
-            .terminal_input(bytes)
-            .await
-            .map_err(|error| runner_control_failure(error, "terminal input"))?;
-            Ok(LocalResponse::TerminalInputAccepted { run_id })
+            RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id)
+                .terminal_input(bytes)
+                .await
+                .map_err(|error| runner_control_failure(error, "terminal input"))?;
+            Ok(LocalResponse::TerminalInputAccepted { session_id })
         }
         LocalRequest::ResizeTerminal {
             project_id,
-            run_id,
+            session_id,
             cols,
             rows,
         } => {
+            // TRANSITION: sessions land in 5A/5C; until then the session id
+            // is the run id.
+            let run_id = resolve_transitional_run_id(&session_id)?;
             let lookup_run_id = run_id.clone();
             let target = state
                 .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
                 .await?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                run_id.clone(),
-                target.runner_instance_id,
-            )
-            .resize_terminal(cols, rows)
-            .await
-            .map_err(|error| runner_control_failure(error, "resize terminal"))?;
-            Ok(LocalResponse::TerminalResized { run_id })
+            RunnerClient::new(&target.runner_runtime, run_id, target.runner_instance_id)
+                .resize_terminal(cols, rows)
+                .await
+                .map_err(|error| runner_control_failure(error, "resize terminal"))?;
+            Ok(LocalResponse::TerminalResized { session_id })
         }
         LocalRequest::ListRuns {
             project_id,
@@ -1197,6 +1230,15 @@ fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
         created_at_ms: message.created_at_ms,
         delivered_at_ms: message.delivered_at_ms,
     }
+}
+
+/// TRANSITION: sessions land in 5A/5C; until then the session id is the run
+/// id, so every session-shaped terminal request is resolved as a lookup by
+/// run id. `SessionId` and `RunId` share the same charset/length validation,
+/// so this only fails if the daemon and client versions disagree.
+fn resolve_transitional_run_id(session_id: &SessionId) -> Result<RunId, ApiFailure> {
+    RunId::try_from(session_id.as_str())
+        .map_err(|_| ApiFailure::Invalid("session id is not a valid run id".into()))
 }
 
 fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {

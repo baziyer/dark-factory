@@ -4,7 +4,7 @@ use std::{
 
 use factory_core::{
     AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunId, RunStatus,
-    RunnerInstanceId, TaskId,
+    RunnerInstanceId, SessionId, TaskId,
     local::{ErrorCode, LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
     runner::{OutputStream, RUNNER_PROTOCOL_VERSION, RunnerEvent, RunnerEventEnvelope},
 };
@@ -153,6 +153,7 @@ async fn local_agent_profile_round_trips_without_changing_public_agent_events() 
                     role: AgentRole::Orchestrator,
                     provider: Provider::Codex,
                     model: Some("gpt-5-codex".into()),
+                    worktree: None,
                 },
             )
             .await,
@@ -298,6 +299,7 @@ async fn local_task_list_exposes_a_real_persisted_result() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -421,6 +423,7 @@ async fn local_run_terminal_reads_private_spool_and_stop_controls_the_exact_runn
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -576,6 +579,7 @@ async fn get_run_terminal_is_not_found_when_the_spool_is_missing() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -648,6 +652,7 @@ async fn get_run_terminal_degrades_a_malformed_non_final_line_to_truncated() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -754,11 +759,16 @@ async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
 
         let run_id = id::<RunId>("run-attach");
+        // TRANSITION: sessions land in 5A/5C; until then the session id is
+        // the run id, so the session id used on the wire is the run id's
+        // string content reinterpreted as a `SessionId`.
+        let session_id = id::<SessionId>("run-attach");
         let runner_instance_id = id::<RunnerInstanceId>("instance-attach");
         let runtime = root.join("run-attach");
         std::fs::create_dir(&runtime).unwrap();
@@ -846,7 +856,7 @@ async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let mut payload = serde_json::to_vec(&RequestEnvelope::new(LocalRequest::AttachTerminal {
             project_id: id::<ProjectId>("project-1"),
-            run_id: run_id.clone(),
+            session_id: session_id.clone(),
             since_offset: 0,
         }))
         .unwrap();
@@ -857,12 +867,12 @@ async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
         attach_reader.read_line(&mut line).await.unwrap();
         match serde_json::from_str::<ServerFrame>(&line).unwrap() {
             ServerFrame::TerminalOutput {
-                run_id: got_run_id,
+                session_id: got_session_id,
                 offset,
                 bytes,
                 ..
             } => {
-                assert_eq!(got_run_id, run_id);
+                assert_eq!(got_session_id, session_id);
                 assert_eq!(offset, 0);
                 assert_eq!(
                     factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
@@ -878,15 +888,15 @@ async fn local_attach_terminal_and_terminal_input_proxy_to_the_exact_runner() {
                 &socket,
                 LocalRequest::TerminalInput {
                     project_id: id::<ProjectId>("project-1"),
-                    run_id: run_id.clone(),
+                    session_id: session_id.clone(),
                     bytes: factory_core::runner::encode_terminal_bytes(b"marco"),
                 },
             )
             .await,
             ServerFrame::Response {
-                response: LocalResponse::TerminalInputAccepted { run_id: accepted },
+                response: LocalResponse::TerminalInputAccepted { session_id: accepted },
                 ..
-            } if accepted == run_id
+            } if accepted == session_id
         ));
 
         fake_runner.await.unwrap();
@@ -911,6 +921,7 @@ async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -929,7 +940,7 @@ async fn agent_creation_and_run_acceptance_are_durable_before_the_response() {
                 task_id: id::<TaskId>("task-1"),
                 agent_id: id::<AgentId>("agent-1"),
                 parent_run_id: None,
-                worktree: root.to_string_lossy().into_owned(),
+                worktree: Some(root.to_string_lossy().into_owned()),
             },
         )
         .await;
@@ -983,6 +994,7 @@ async fn an_invalid_worktree_is_rejected_without_reserving_the_task_or_echoing_t
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
                 model: None,
+                worktree: None,
             },
         )
         .await;
@@ -999,7 +1011,7 @@ async fn an_invalid_worktree_is_rejected_without_reserving_the_task_or_echoing_t
                 task_id: id::<TaskId>("task-1"),
                 agent_id: id::<AgentId>("agent-1"),
                 parent_run_id: None,
-                worktree: private_missing.to_string_lossy().into_owned(),
+                worktree: Some(private_missing.to_string_lossy().into_owned()),
             },
         )
         .await;
@@ -1058,7 +1070,7 @@ async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
                 task_id: id::<TaskId>("task-1"),
                 agent_id: id::<AgentId>("claude-agent"),
                 parent_run_id: None,
-                worktree: root.to_string_lossy().into_owned(),
+                worktree: Some(root.to_string_lossy().into_owned()),
             },
         )
         .await;

@@ -76,6 +76,8 @@ fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
                 agent_id: id::<AgentId>("worker-2"),
                 parent_run_id: Some(id::<RunId>("run-1")),
                 task_id: Some(id::<TaskId>("task-3")),
+                session_id: None,
+                closed_by: None,
                 status: RunStatus::Waiting,
                 activity: Some("Waiting for review".into()),
                 wait_reason: None,

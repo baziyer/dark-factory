@@ -71,7 +71,7 @@ cargo run -p factoryctl -- task delete --project PROJECT_ID --task TASK_ID
 cargo run -p factoryctl -- run stop --project PROJECT_ID --run RUN_ID
 cargo run -p factoryctl -- agent delete --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- project delete --project PROJECT_ID
-cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID
+cargo run -p factoryctl -- attach --project PROJECT_ID --session SESSION_ID
 cargo run -p factoryctl -- usage
 cargo run -p factoryctl -- events --follow
 cargo run -p factory-tui
@@ -167,8 +167,8 @@ snapshots, or tracing.
 run's PTY:
 
 ```sh
-cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID
-cargo run -p factoryctl -- attach --project PROJECT_ID --run RUN_ID --since-offset 0
+cargo run -p factoryctl -- attach --project PROJECT_ID --session SESSION_ID
+cargo run -p factoryctl -- attach --project PROJECT_ID --session SESSION_ID --since-offset 0
 ```
 
 It puts the local terminal in raw mode, replays the retained log from

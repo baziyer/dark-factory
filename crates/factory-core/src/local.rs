@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, RunId, RunSnapshot, TaskDetail, TaskId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, SessionId, SessionSnapshot,
+    TaskDetail, TaskId,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -75,6 +76,7 @@ pub const MAX_PROJECT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_PAGE_ITEMS: u32 = 10;
 pub const MAX_AGENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
+pub const MAX_SESSION_PAGE_ITEMS: u32 = 1000;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
@@ -143,6 +145,10 @@ pub enum LocalRequest {
         provider: Provider,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Overrides the daemon-managed per-agent worktree with an existing
+        /// absolute path. Not yet implemented; see local_api.rs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     GetAgent {
         project_id: ProjectId,
@@ -185,7 +191,11 @@ pub enum LocalRequest {
         agent_id: AgentId,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_run_id: Option<RunId>,
-        worktree: String,
+        /// Defaults to the agent's own worktree once per-agent worktrees
+        /// exist; until then a request without one is rejected. Semantics:
+        /// "deliver now / put at the front of the agent's queue".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
     },
     ListTasks {
         project_id: ProjectId,
@@ -239,34 +249,92 @@ pub enum LocalRequest {
         run_id: RunId,
         grace_ms: u64,
     },
-    /// Attaches to a terminal-mode run's retained-then-live PTY output on
-    /// this connection. The connection commits to terminal-proxy mode: after
-    /// the first `AttachTerminal`, only more `AttachTerminal` requests are
-    /// accepted on it (a client may attach several runs on one connection),
-    /// and `ServerFrame::TerminalOutput` frames for every attached run are
-    /// multiplexed onto it, tagged by `run_id`. Detaching happens implicitly
-    /// on disconnect. `TerminalInput` and `ResizeTerminal` are independent,
-    /// ordinary one-shot requests (like `StopRun`); they do not need to run
-    /// on an attached connection.
+    /// Closes an open run (task-episode) without touching its session's
+    /// process: `runs.status → stopped`, `closed_by = operator_cancel`. For
+    /// v1 this does not interrupt an in-flight turn.
+    CancelRun {
+        project_id: ProjectId,
+        run_id: RunId,
+    },
+    /// Marks a task's episode succeeded from inside its session: the run
+    /// closes with `closed_by = task_done`, the task becomes `succeeded`.
+    CompleteTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+        /// Bounded like today's persisted task result.
+        result: String,
+    },
+    /// Marks a task's episode blocked from inside its session: the run
+    /// closes with `closed_by = task_blocked`, the task becomes `blocked`.
+    BlockTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+        /// At most 4096 bytes.
+        reason: String,
+    },
+    /// Durably holds an agent's queue: the daemon stops delivering new work
+    /// into its session until `ResumeAgent`.
+    PauseAgent {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    ResumeAgent {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    ListSessions {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<SessionId>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
+    /// Kills a session's PTY-backed provider process group (graceful, like
+    /// `StopRun`); any open run closes with `closed_by = operator_stop`.
+    StopSession {
+        project_id: ProjectId,
+        session_id: SessionId,
+        grace_ms: u64,
+    },
+    /// One `factoryctl hook` invocation, forwarded verbatim from a
+    /// provider's hook subprocess. `token` is the contents of the session's
+    /// `hook.token` file; `payload` is the hook's JSON body, opaque here and
+    /// at most 64 KiB — the daemon extracts whatever fields (session/thread
+    /// id, prompt, message, tool name, `stop_hook_active`, ...) the event
+    /// needs.
+    ProviderHook {
+        token: String,
+        event: ProviderHookEvent,
+        payload: serde_json::Value,
+    },
+    /// Attaches to a terminal-mode session's retained-then-live PTY output
+    /// on this connection. The connection commits to terminal-proxy mode:
+    /// after the first `AttachTerminal`, only more `AttachTerminal` requests
+    /// are accepted on it (a client may attach several sessions on one
+    /// connection), and `ServerFrame::TerminalOutput` frames for every
+    /// attached session are multiplexed onto it, tagged by `session_id`.
+    /// Detaching happens implicitly on disconnect. `TerminalInput` and
+    /// `ResizeTerminal` are independent, ordinary one-shot requests (like
+    /// `StopRun`); they do not need to run on an attached connection.
     AttachTerminal {
         project_id: ProjectId,
-        run_id: RunId,
+        session_id: SessionId,
         since_offset: u64,
     },
-    /// Writes operator input to a run's PTY. An ordinary one-shot request:
-    /// it does not require a prior or concurrent `AttachTerminal`, on this
-    /// connection or any other. `bytes` is base64-encoded raw bytes; opaque
-    /// to the daemon.
+    /// Writes operator input to a session's PTY. An ordinary one-shot
+    /// request: it does not require a prior or concurrent `AttachTerminal`,
+    /// on this connection or any other. `bytes` is base64-encoded raw bytes;
+    /// opaque to the daemon.
     TerminalInput {
         project_id: ProjectId,
-        run_id: RunId,
+        session_id: SessionId,
         bytes: String,
     },
-    /// Resizes a run's PTY. An ordinary one-shot request, like
+    /// Resizes a session's PTY. An ordinary one-shot request, like
     /// `TerminalInput`.
     ResizeTerminal {
         project_id: ProjectId,
-        run_id: RunId,
+        session_id: SessionId,
         cols: u16,
         rows: u16,
     },
@@ -374,11 +442,38 @@ pub enum LocalResponse {
     RunStopped {
         run_id: RunId,
     },
-    TerminalInputAccepted {
+    RunCancelled {
         run_id: RunId,
     },
+    TaskCompleted {
+        task: TaskDetail,
+    },
+    TaskBlocked {
+        task: TaskDetail,
+    },
+    AgentPaused {
+        agent: AgentSnapshot,
+    },
+    AgentResumed {
+        agent: AgentSnapshot,
+    },
+    Sessions {
+        sessions: Vec<SessionSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<SessionId>,
+    },
+    SessionStopped {
+        session_id: SessionId,
+    },
+    /// The `reply` JSON is printed verbatim to stdout by `factoryctl hook`.
+    ProviderHookReply {
+        reply: serde_json::Value,
+    },
+    TerminalInputAccepted {
+        session_id: SessionId,
+    },
     TerminalResized {
-        run_id: RunId,
+        session_id: SessionId,
     },
     Tasks {
         tasks: Vec<TaskDetail>,
@@ -410,8 +505,15 @@ pub enum LocalResponse {
 }
 
 /// One newline-delimited frame sent by the daemon.
+///
+/// `large_enum_variant` is allowed deliberately: these are one-shot control
+/// frames on an already-buffered socket write, not a hot allocation path, and
+/// boxing individual response/event payloads would ripple through every
+/// construction and pattern match across the daemon, CLI, and TUI for no
+/// runtime benefit.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ServerFrame {
     Response {
         protocol_version: u16,
@@ -421,12 +523,12 @@ pub enum ServerFrame {
         protocol_version: u16,
         event: EventEnvelope,
     },
-    /// One chunk of retained-then-live PTY output for a run attached on
+    /// One chunk of retained-then-live PTY output for a session attached on
     /// this connection via `AttachTerminal`. `bytes` is base64-encoded raw
     /// bytes; opaque to every layer between the runner and the client.
     TerminalOutput {
         protocol_version: u16,
-        run_id: RunId,
+        session_id: SessionId,
         offset: u64,
         bytes: String,
     },

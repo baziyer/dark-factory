@@ -737,6 +737,7 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    worktree: None,
                 },
             )
             .await,
@@ -831,6 +832,7 @@ async fn local_agent_messages_round_trip_without_public_events() {
                     role: factory_core::AgentRole::Orchestrator,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    worktree: None,
                 },
             )
             .await,
@@ -918,6 +920,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    worktree: None,
                 },
             )
             .await,
@@ -1157,6 +1160,169 @@ async fn cancel_update_and_delete_are_local_control_operations() {
             !project_guidance_dir.exists(),
             "project guidance directory should be removed after delete"
         );
+    })
+    .await;
+}
+
+/// Step 0 of resident sessions adds the sessions/hook wire shapes without
+/// behavior: `CreateAgent.worktree`/`StartTask.worktree` reject rather than
+/// silently drop an operator's input, and every new session-shaped request
+/// is rejected uniformly until 5A/5C land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_shaped_requests_are_rejected_until_sessions_land() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: Some("/work/curie".into()),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Needs a worktree".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::StartTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    agent_id: agent_id("curie"),
+                    parent_run_id: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let run_id = factory_core::RunId::try_from("run-1").unwrap();
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let stubbed = [
+            LocalRequest::CancelRun {
+                project_id: project_id("factory"),
+                run_id,
+            },
+            LocalRequest::CompleteTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                result: "done".into(),
+            },
+            LocalRequest::BlockTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                reason: "blocked".into(),
+            },
+            LocalRequest::PauseAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+            LocalRequest::ResumeAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+            LocalRequest::ListSessions {
+                project_id: project_id("factory"),
+                after_id: None,
+                limit: None,
+            },
+            LocalRequest::StopSession {
+                project_id: project_id("factory"),
+                session_id,
+                grace_ms: 0,
+            },
+            LocalRequest::ProviderHook {
+                token: "token".into(),
+                event: factory_core::ProviderHookEvent::Stop,
+                payload: serde_json::json!({}),
+            },
+        ];
+        for stub in stubbed {
+            assert!(matches!(
+                request(&socket, stub).await,
+                ServerFrame::Response {
+                    response: LocalResponse::Error {
+                        code: ErrorCode::InvalidRequest,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
     })
     .await;
 }

@@ -13,7 +13,7 @@ use std::{
 };
 
 use factory_core::{
-    ProjectId, RunId,
+    ProjectId, SessionId,
     local::{LocalRequest, LocalResponse, ServerFrame},
     runner::{decode_terminal_bytes, encode_terminal_bytes},
 };
@@ -26,25 +26,25 @@ use rustix::termios::{self, OptionalActions, Termios};
 const DETACH_BYTE: u8 = 0x1D;
 const STDIN_CHUNK_BYTES: usize = 4096;
 
-/// Attaches to `run_id`'s PTY: puts the local terminal in raw mode, forwards
-/// stdin as `TerminalInput`, prints `TerminalOutput` to stdout, sends an
-/// initial resize plus one on every `SIGWINCH`, and restores the terminal on
-/// exit (including on panic, via unwind) or on `Ctrl-]`.
+/// Attaches to `session_id`'s PTY: puts the local terminal in raw mode,
+/// forwards stdin as `TerminalInput`, prints `TerminalOutput` to stdout,
+/// sends an initial resize plus one on every `SIGWINCH`, and restores the
+/// terminal on exit (including on panic, via unwind) or on `Ctrl-]`.
 pub fn run(
     client: &Client,
     project_id: &str,
-    run_id: &str,
+    session_id: &str,
     since_offset: u64,
 ) -> Result<i32, String> {
     let project_id = ProjectId::try_from(project_id.to_owned())
         .map_err(|error| format!("invalid project ID: {error}"))?;
-    let run_id =
-        RunId::try_from(run_id.to_owned()).map_err(|error| format!("invalid run ID: {error}"))?;
+    let session_id = SessionId::try_from(session_id.to_owned())
+        .map_err(|error| format!("invalid session ID: {error}"))?;
 
     let frames = client
         .attach_terminal(LocalRequest::AttachTerminal {
             project_id: project_id.clone(),
-            run_id: run_id.clone(),
+            session_id: session_id.clone(),
             since_offset,
         })
         .map_err(|error| error.to_string())?;
@@ -55,10 +55,10 @@ pub fn run(
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let output_thread = spawn_output_thread(frames, Arc::clone(&failed), Arc::clone(&failure));
 
-    send_resize(client, &project_id, &run_id);
-    spawn_resize_watcher(client.clone(), project_id.clone(), run_id.clone());
+    send_resize(client, &project_id, &session_id);
+    spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
-    let exit_code = forward_stdin(client, &project_id, &run_id, &failed);
+    let exit_code = forward_stdin(client, &project_id, &session_id, &failed);
 
     drop(raw_mode);
     let _ = output_thread.join();
@@ -121,7 +121,7 @@ fn set_failure(failure: &Mutex<Option<String>>, message: String) {
 fn forward_stdin(
     client: &Client,
     project_id: &ProjectId,
-    run_id: &RunId,
+    session_id: &SessionId,
     failed: &AtomicBool,
 ) -> i32 {
     let mut stdin = std::io::stdin();
@@ -137,30 +137,30 @@ fn forward_stdin(
         let chunk = &buffer[..read];
         if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
             if detach_at > 0 {
-                send_input(client, project_id, run_id, &chunk[..detach_at]);
+                send_input(client, project_id, session_id, &chunk[..detach_at]);
             }
             return 0;
         }
-        send_input(client, project_id, run_id, chunk);
+        send_input(client, project_id, session_id, chunk);
     }
 }
 
-fn send_input(client: &Client, project_id: &ProjectId, run_id: &RunId, bytes: &[u8]) {
+fn send_input(client: &Client, project_id: &ProjectId, session_id: &SessionId, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
     let _ = client.request(LocalRequest::TerminalInput {
         project_id: project_id.clone(),
-        run_id: run_id.clone(),
+        session_id: session_id.clone(),
         bytes: encode_terminal_bytes(bytes),
     });
 }
 
-fn send_resize(client: &Client, project_id: &ProjectId, run_id: &RunId) {
+fn send_resize(client: &Client, project_id: &ProjectId, session_id: &SessionId) {
     if let Ok((cols, rows)) = local_terminal_size() {
         let _ = client.request(LocalRequest::ResizeTerminal {
             project_id: project_id.clone(),
-            run_id: run_id.clone(),
+            session_id: session_id.clone(),
             cols,
             rows,
         });
@@ -172,14 +172,14 @@ fn local_terminal_size() -> std::io::Result<(u16, u16)> {
     Ok((winsize.ws_col, winsize.ws_row))
 }
 
-fn spawn_resize_watcher(client: Client, project_id: ProjectId, run_id: RunId) {
+fn spawn_resize_watcher(client: Client, project_id: ProjectId, session_id: SessionId) {
     let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH])
     else {
         return;
     };
     thread::spawn(move || {
         for _ in signals.forever() {
-            send_resize(&client, &project_id, &run_id);
+            send_resize(&client, &project_id, &session_id);
         }
     });
 }

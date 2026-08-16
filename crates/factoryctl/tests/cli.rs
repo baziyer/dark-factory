@@ -209,6 +209,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             role,
             provider,
             model,
+            worktree,
         } = request.request
         else {
             panic!("expected create-agent request");
@@ -219,6 +220,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         assert_eq!(role, AgentRole::Worker);
         assert_eq!(provider, Provider::Codex);
         assert_eq!(model, None);
+        assert_eq!(worktree, None);
         write_response(
             &mut agent_stream,
             LocalResponse::AgentCreated {
@@ -229,6 +231,9 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
                     role,
                     provider: Provider::Codex,
                     current_run_id: None,
+                    paused: false,
+                    current_session_id: None,
+                    worktree: None,
                     created_at_ms: 1,
                     updated_at_ms: 1,
                 },
@@ -247,7 +252,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
                 task_id: TaskId::try_from("task-1").unwrap(),
                 agent_id: AgentId::try_from("agent-1").unwrap(),
                 parent_run_id: None,
-                worktree: "/work/agent-1".into(),
+                worktree: Some("/work/agent-1".into()),
             })
         );
         write_response(

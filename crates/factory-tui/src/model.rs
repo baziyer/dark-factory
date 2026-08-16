@@ -228,7 +228,11 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         FactoryEvent::AgentDeleted { agent_id, .. } => {
             format!("{time} {} removed", truncate_id(agent_id.as_str(), 10))
         }
-        FactoryEvent::ProjectChanged { .. } | FactoryEvent::ProjectDeleted { .. } => return None,
+        // TRANSITION: sessions land in 5A/5C; the board has no session-based
+        // narration yet.
+        FactoryEvent::SessionChanged { .. }
+        | FactoryEvent::ProjectChanged { .. }
+        | FactoryEvent::ProjectDeleted { .. } => return None,
     };
     Some(Announcement {
         at_ms: event.occurred_at_ms,
@@ -244,7 +248,8 @@ fn event_agent(event: &FactoryEvent) -> Option<&AgentId> {
         FactoryEvent::RunChanged { run } => Some(&run.agent_id),
         FactoryEvent::AgentChanged { agent } => Some(&agent.id),
         FactoryEvent::AgentDeleted { agent_id, .. } => Some(agent_id),
-        FactoryEvent::TaskDeleted { .. }
+        FactoryEvent::SessionChanged { .. }
+        | FactoryEvent::TaskDeleted { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => None,
     }
@@ -258,6 +263,7 @@ fn event_project(event: &FactoryEvent) -> &ProjectId {
         FactoryEvent::TaskChanged { task } => &task.project_id,
         FactoryEvent::AgentChanged { agent } => &agent.project_id,
         FactoryEvent::RunChanged { run } => &run.project_id,
+        FactoryEvent::SessionChanged { session } => &session.project_id,
         FactoryEvent::TaskDeleted { project_id, .. }
         | FactoryEvent::AgentDeleted { project_id, .. }
         | FactoryEvent::ProjectDeleted { project_id } => project_id,
@@ -755,7 +761,11 @@ impl Board {
                 self.agents.remove(&agent_id);
                 self.activity.remove(&agent_id);
             }
-            FactoryEvent::ProjectChanged { .. } | FactoryEvent::ProjectDeleted { .. } => {}
+            // TRANSITION: sessions land in 5A/5C; the board has no session
+            // state to update yet.
+            FactoryEvent::SessionChanged { .. }
+            | FactoryEvent::ProjectChanged { .. }
+            | FactoryEvent::ProjectDeleted { .. } => {}
         }
         self.clamp_cursors();
     }
@@ -984,7 +994,7 @@ impl Board {
             task_id,
             agent_id,
             parent_run_id: None,
-            worktree,
+            worktree: Some(worktree),
         })
     }
 
@@ -1279,6 +1289,8 @@ mod tests {
             agent_id: agent_id(agent),
             parent_run_id: None,
             task_id: None,
+            session_id: None,
+            closed_by: None,
             status,
             activity: None,
             wait_reason: None,
@@ -1303,6 +1315,9 @@ mod tests {
             role,
             provider: Provider::ClaudeCode,
             current_run_id: current_run_id.map(|id| RunId::try_from(id.to_owned()).unwrap()),
+            paused: false,
+            current_session_id: None,
+            worktree: None,
             created_at_ms: 0,
             updated_at_ms: 0,
         }
@@ -1519,7 +1534,7 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(agent_id.as_str(), "alice");
-                assert_eq!(worktree, "/work");
+                assert_eq!(worktree.as_deref(), Some("/work"));
                 assert_eq!(sent_task_id.as_str(), "t1");
             }
             other => panic!("expected StartTask, got {other:?}"),

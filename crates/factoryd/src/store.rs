@@ -677,6 +677,11 @@ impl Store {
             role: input.role,
             provider: input.provider,
             current_run_id: None,
+            // TRANSITION: sessions land in 5A/5C; until then every agent is
+            // durably un-paused and has no session or per-agent worktree.
+            paused: false,
+            current_session_id: None,
+            worktree: None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
@@ -3534,6 +3539,13 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
                         role: parse_agent_role(&role, 3)?,
                         provider: parse_provider(&provider, 4)?,
                         current_run_id: parse_optional_id(current_run_id, 10)?,
+                        // TRANSITION: `agents.paused`/`worktree`/session
+                        // linkage land with the 0014 migration (5A); until
+                        // then every loaded agent reports the same defaults
+                        // `insert_agent` writes.
+                        paused: false,
+                        current_session_id: None,
+                        worktree: None,
                         created_at_ms: row.get(8)?,
                         updated_at_ms: row.get(9)?,
                     },
@@ -3618,6 +3630,11 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapsho
                     agent_id: parse_id(row.get(2)?, 2)?,
                     parent_run_id: parse_optional_id(parent_run_id, 3)?,
                     task_id: parse_optional_id(task_id, 4)?,
+                    // TRANSITION: `runs.session_id`/`closed_by` land with the
+                    // 0014 migration (5A); every pre-migration row reports
+                    // no session and no closed-by reason.
+                    session_id: None,
+                    closed_by: None,
                     status: parse_run_status(&status, 5)?,
                     activity: row.get(6)?,
                     wait_reason: row.get(7)?,
@@ -4066,6 +4083,12 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             task_id: run.task_id.as_ref(),
             agent_id: Some(&run.agent_id),
             run_id: Some(&run.id),
+        },
+        FactoryEvent::SessionChanged { session } => EventMetadata {
+            project_id: Some(&session.project_id),
+            task_id: None,
+            agent_id: Some(&session.agent_id),
+            run_id: session.current_run_id.as_ref(),
         },
         FactoryEvent::TaskDeleted {
             project_id,
