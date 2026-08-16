@@ -420,6 +420,8 @@ pub enum StoreError {
     CapacityReached { limit: usize },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
+    #[error("task was not found in the requested project")]
+    TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("task is not queued in the requested project")]
@@ -1962,6 +1964,14 @@ impl Store {
             task.snapshot.depends_on = load_task_dependencies(&self.connection, &task.snapshot.id)?;
         }
         Ok(tasks)
+    }
+
+    pub fn get_task(&self, project_id: &ProjectId, task_id: &TaskId) -> Result<TaskDetail> {
+        let task = load_task(&self.connection, task_id)?.ok_or(StoreError::TaskNotFound)?;
+        if task.snapshot.project_id != *project_id {
+            return Err(StoreError::TaskNotFound);
+        }
+        Ok(task)
     }
 
     pub fn list_agents(

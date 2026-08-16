@@ -149,6 +149,10 @@ pub enum LocalRequest {
         after_id: Option<TaskId>,
         limit: u32,
     },
+    GetTask {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
     ListRuns {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,6 +163,7 @@ pub enum LocalRequest {
         sequence: i64,
         limit: u32,
     },
+    LatestEventSequence,
     SubscriptionUsage,
     RecordSubscriptionProbe {
         project_id: ProjectId,
@@ -198,6 +203,9 @@ pub enum LocalResponse {
     TaskCreated {
         task: TaskDetail,
     },
+    Task {
+        task: TaskDetail,
+    },
     AgentCreated {
         agent: AgentSnapshot,
     },
@@ -221,6 +229,9 @@ pub enum LocalResponse {
     },
     Events {
         events: Vec<EventEnvelope>,
+    },
+    EventHead {
+        sequence: i64,
     },
     SubscriptionUsage {
         usage: SubscriptionUsageStatus,

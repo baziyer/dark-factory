@@ -86,6 +86,10 @@ impl ApiFailure {
                 ErrorCode::NotFound,
                 "agent was not found in the project".into(),
             ),
+            Self::Store(StoreError::TaskNotFound) => (
+                ErrorCode::NotFound,
+                "task was not found in the project".into(),
+            ),
             Self::Store(StoreError::TaskNotQueued) => (
                 ErrorCode::Conflict,
                 "task is not queued in the project".into(),
@@ -417,6 +421,15 @@ async fn handle_request(
                 next_after_id,
             })
         }
+        LocalRequest::GetTask {
+            project_id,
+            task_id,
+        } => {
+            let task = state
+                .with_store(move |store| store.get_task(&project_id, &task_id))
+                .await?;
+            Ok(LocalResponse::Task { task })
+        }
         LocalRequest::ListRuns {
             project_id,
             after_id,
@@ -443,6 +456,12 @@ async fn handle_request(
                 .with_store(move |store| store.events_after(sequence, limit))
                 .await?;
             Ok(LocalResponse::Events { events })
+        }
+        LocalRequest::LatestEventSequence => {
+            let sequence = state
+                .with_store(|store| store.latest_event_sequence())
+                .await?;
+            Ok(LocalResponse::EventHead { sequence })
         }
         LocalRequest::SubscriptionUsage => {
             let snapshot = state
