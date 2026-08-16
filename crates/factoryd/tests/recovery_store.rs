@@ -65,6 +65,7 @@ fn create_reserved_run(
                 project_id: id(project),
                 task_id: id(task),
                 agent_id: id(agent),
+                expected_provider: Provider::Codex,
                 run_id: id(run),
                 parent_run_id: None,
                 worktree: format!("/work/{project}"),

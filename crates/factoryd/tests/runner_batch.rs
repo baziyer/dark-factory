@@ -80,6 +80,7 @@ fn fixture() -> (Store, RunId, RunnerInstanceId) {
                 project_id: id("project"),
                 task_id: id("task"),
                 agent_id: id("agent"),
+                expected_provider: Provider::Codex,
                 run_id: run_id.clone(),
                 parent_run_id: None,
                 worktree: "/work/project".into(),
