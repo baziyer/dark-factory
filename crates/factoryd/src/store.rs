@@ -1112,6 +1112,15 @@ impl Store {
         }
         let transition =
             fail_run_in_transaction(&transaction, &ledger, RunFailureReason::Spawn, now_ms)?;
+        // The run never actually launched, so any agent messages that were
+        // marked delivered to it (by `reserve_run`) never reached a live
+        // session. Revert their delivery so the next successful launch for
+        // this agent re-delivers them instead of losing them silently.
+        transaction.execute(
+            "UPDATE agent_messages SET delivered_at_ms = NULL, delivered_run_id = NULL
+             WHERE delivered_run_id = ?1",
+            params![run_id.as_str()],
+        )?;
         transaction.commit()?;
         Ok(transition)
     }
@@ -2398,6 +2407,18 @@ impl Store {
              WHERE notification_task_id = ?1",
             params![task_id.as_str()],
         )?;
+        // Agent messages delivered to a run of this task reference that run
+        // via delivered_run_id. The run row is about to be deleted, but the
+        // message itself is history: it was genuinely delivered, so it is
+        // kept (not deleted) with delivered_run_id cleared rather than
+        // cascading the delete onto it.
+        transaction.execute(
+            "UPDATE agent_messages SET delivered_run_id = NULL
+             WHERE delivered_run_id IN (
+                 SELECT id FROM runs WHERE task_id = ?1 AND project_id = ?2
+             )",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
         transaction.execute(
             "DELETE FROM runs WHERE task_id = ?1 AND project_id = ?2",
             params![task_id.as_str(), project_id.as_str()],
@@ -2498,6 +2519,23 @@ impl Store {
             }
         }
 
+        // Messages addressed to this agent are its inbox; once the agent is
+        // gone there is no one to read them, so they are deleted. Messages
+        // it sent to others are history for the recipient and survive, with
+        // the sender reference cleared.
+        transaction.execute(
+            "DELETE FROM agent_messages WHERE recipient_agent_id = ?1 AND project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE agent_messages SET sender_agent_id = NULL
+             WHERE sender_agent_id = ?1 AND project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_profiles WHERE agent_id = ?1",
+            params![agent_id.as_str()],
+        )?;
         transaction.execute(
             "DELETE FROM runs WHERE agent_id = ?1 AND project_id = ?2",
             params![agent_id.as_str(), project_id.as_str()],
@@ -2570,6 +2608,15 @@ impl Store {
         transaction.execute(
             "UPDATE subscription_usage_probes SET notification_task_id = NULL
              WHERE notification_task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_messages WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM agent_profiles
+             WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)",
             params![project_id.as_str()],
         )?;
         transaction.execute(

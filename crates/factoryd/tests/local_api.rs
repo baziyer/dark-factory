@@ -782,7 +782,6 @@ async fn queued_task_assignment_is_a_local_control_operation() {
     .await;
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_agent_messages_round_trip_without_public_events() {
     with_server(|socket| async move {

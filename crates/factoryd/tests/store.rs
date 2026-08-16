@@ -1,8 +1,11 @@
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, ProjectId, Provider, RunId, RunnerInstanceId, TaskId,
-    TaskStatus,
+    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, RunId, RunnerInstanceId,
+    TaskId, TaskStatus,
 };
-use factoryd::store::{NewAgent, NewProject, NewTask, RunReservation, Store, StoreError};
+use factoryd::store::{
+    NewAgent, NewAgentMessage, NewProject, NewTask, RunReservation, Store, StoreError,
+    UpdateAgentProfile,
+};
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
@@ -897,4 +900,379 @@ fn delete_project_requires_no_active_run_and_cascades() {
         store.delete_project(&project_id("factory"), 8),
         Err(StoreError::ProjectNotFound)
     ));
+}
+
+#[test]
+fn delete_agent_deletes_its_profile_and_inbox_but_keeps_sent_messages_with_sender_cleared() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("god"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Codex,
+            },
+            3,
+        )
+        .unwrap();
+
+    // Give curie a profile row; if the delete cascade forgets to remove it,
+    // the deferred foreign key check at commit time fails the delete below.
+    store
+        .update_agent_profile(
+            &project_id("factory"),
+            &agent_id("curie"),
+            UpdateAgentProfile {
+                model: Some("claude-test".into()),
+                instructions: "Be terse.".into(),
+                memory: "Nothing yet.".into(),
+            },
+            4,
+        )
+        .unwrap();
+
+    // A message curie sent to god: history for god, should survive.
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-sent-by-curie").unwrap(),
+            project_id: project_id("factory"),
+            sender_agent_id: Some(agent_id("curie")),
+            recipient_agent_id: agent_id("god"),
+            body: "Status update.".into(),
+            created_at_ms: 5,
+        })
+        .unwrap();
+    // A message addressed to curie: it's curie's inbox, should be deleted.
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-to-curie").unwrap(),
+            project_id: project_id("factory"),
+            sender_agent_id: Some(agent_id("god")),
+            recipient_agent_id: agent_id("curie"),
+            body: "New instructions.".into(),
+            created_at_ms: 6,
+        })
+        .unwrap();
+
+    store
+        .delete_agent(&project_id("factory"), &agent_id("curie"), 7)
+        .unwrap();
+
+    let gods_inbox = store
+        .list_agent_messages(&project_id("factory"), &agent_id("god"), None, 100)
+        .unwrap();
+    assert_eq!(gods_inbox.len(), 1);
+    assert_eq!(
+        gods_inbox[0].id,
+        MessageId::try_from("message-sent-by-curie").unwrap()
+    );
+    assert_eq!(gods_inbox[0].sender_agent_id, None);
+
+    let curies_inbox = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert!(curies_inbox.is_empty());
+}
+
+#[test]
+fn delete_project_cascades_agent_profiles_and_messages() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("god"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Codex,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .update_agent_profile(
+            &project_id("factory"),
+            &agent_id("curie"),
+            UpdateAgentProfile {
+                model: Some("claude-test".into()),
+                instructions: "Be terse.".into(),
+                memory: "Nothing yet.".into(),
+            },
+            4,
+        )
+        .unwrap();
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-1").unwrap(),
+            project_id: project_id("factory"),
+            sender_agent_id: Some(agent_id("curie")),
+            recipient_agent_id: agent_id("god"),
+            body: "Hello.".into(),
+            created_at_ms: 5,
+        })
+        .unwrap();
+
+    // Would fail on a deferred foreign key violation if agent_profiles or
+    // agent_messages rows for this project were left behind.
+    store.delete_project(&project_id("factory"), 6).unwrap();
+
+    assert!(
+        store
+            .list_agents(&project_id("factory"), None, 100)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn delete_task_nulls_delivered_run_id_on_agent_messages_but_keeps_them_as_history() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Task".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-1").unwrap(),
+            project_id: project_id("factory"),
+            sender_agent_id: None,
+            recipient_agent_id: agent_id("curie"),
+            body: "Please look at task-1.".into(),
+            created_at_ms: 4,
+        })
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            5,
+        )
+        .unwrap();
+
+    // Reserving the run delivers the message into it.
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 6)
+        .unwrap();
+    let delivered = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert!(delivered[0].delivered_at_ms.is_some());
+    assert_eq!(
+        delivered[0].delivered_run_id,
+        Some(RunId::try_from("run-1").unwrap())
+    );
+
+    // The run actually launched and later became unverifiable (unlike a
+    // spawn-launch failure, this does not revert delivery), so the task can
+    // now be deleted once the run is terminal.
+    store
+        .fail_run_unverifiable(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-run-1").unwrap(),
+            7,
+        )
+        .unwrap();
+
+    store
+        .delete_task(&project_id("factory"), &task_id("task-1"), 8)
+        .unwrap();
+
+    let after_delete = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert_eq!(after_delete.len(), 1);
+    assert!(after_delete[0].delivered_at_ms.is_some());
+    assert_eq!(after_delete[0].delivered_run_id, None);
+}
+
+#[test]
+fn fail_run_launch_reverts_agent_message_delivery_so_the_next_reserve_redelivers() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Task".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-1").unwrap(),
+            project_id: project_id("factory"),
+            sender_agent_id: None,
+            recipient_agent_id: agent_id("curie"),
+            body: "Please look at task-1.".into(),
+            created_at_ms: 4,
+        })
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            5,
+        )
+        .unwrap();
+
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-1"), 1, 6)
+        .unwrap();
+    let delivered = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert_eq!(delivered.len(), 1);
+    assert!(delivered[0].delivered_at_ms.is_some());
+    assert_eq!(
+        delivered[0].delivered_run_id,
+        Some(RunId::try_from("run-1").unwrap())
+    );
+
+    // The runner never actually launched the process.
+    store
+        .fail_run_launch(
+            &RunId::try_from("run-1").unwrap(),
+            &RunnerInstanceId::try_from("instance-run-1").unwrap(),
+            7,
+        )
+        .unwrap();
+
+    let reverted = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert_eq!(reverted.len(), 1);
+    assert_eq!(reverted[0].delivered_at_ms, None);
+    assert_eq!(reverted[0].delivered_run_id, None);
+
+    // The next launch attempt for the same task re-delivers the message.
+    store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 8)
+        .unwrap();
+    store
+        .assign_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            Some(&agent_id("curie")),
+            9,
+        )
+        .unwrap();
+    store
+        .reserve_task_run(reservation("factory", "task-1", "curie", "run-2"), 1, 10)
+        .unwrap();
+
+    let redelivered = store
+        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
+        .unwrap();
+    assert_eq!(redelivered.len(), 1);
+    assert!(redelivered[0].delivered_at_ms.is_some());
+    assert_eq!(
+        redelivered[0].delivered_run_id,
+        Some(RunId::try_from("run-2").unwrap())
+    );
 }
