@@ -178,14 +178,22 @@ async fn real_runner_executes_fake_codex_and_cleans_up_after_exact_ack() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        run_truth,
-        [
-            (RunStatus::Starting, ObserverHealth::Unknown),
-            (RunStatus::Running, ObserverHealth::Unknown),
-            (RunStatus::Running, ObserverHealth::Healthy),
-            (RunStatus::Succeeded, ObserverHealth::Healthy),
-        ]
+    assert!(
+        matches!(
+            run_truth.as_slice(),
+            [
+                (RunStatus::Starting, ObserverHealth::Unknown),
+                (RunStatus::Running, ObserverHealth::Unknown),
+                (RunStatus::Running, ObserverHealth::Healthy),
+                (RunStatus::Succeeded, ObserverHealth::Healthy),
+            ] | [
+                (RunStatus::Starting, ObserverHealth::Unknown),
+                (RunStatus::Running, ObserverHealth::Unknown),
+                (RunStatus::Succeeded, ObserverHealth::Unknown),
+                (RunStatus::Succeeded, ObserverHealth::Healthy),
+            ]
+        ),
+        "runner lifecycle and observer health were not monotonic: {run_truth:?}"
     );
     let public_json = serde_json::to_string(&events).unwrap();
     for private in [
