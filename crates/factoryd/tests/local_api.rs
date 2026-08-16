@@ -3,8 +3,8 @@ use std::{future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::P
 use factory_core::{
     AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
-        RequestEnvelope, ServerFrame,
+        ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
     },
 };
 use factoryd::{
@@ -564,7 +564,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 &socket,
                 LocalRequest::EventsAfter {
                     sequence: 0,
-                    limit: 101,
+                    limit: MAX_EVENT_PAGE_ITEMS + 1,
                 },
             )
             .await,

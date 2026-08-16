@@ -662,19 +662,3 @@ async fn a_claude_agent_is_accepted_with_a_durable_fresh_session() {
     })
     .await;
 }
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subscription_usage_is_available_on_the_local_control_plane() {
-    with_server(|socket, _state| async move {
-        let response = request(&socket, LocalRequest::SubscriptionUsage).await;
-        assert!(matches!(
-            response,
-            ServerFrame::Response {
-                protocol_version: PROTOCOL_VERSION,
-                response: LocalResponse::SubscriptionUsage { ref usage },
-            } if usage.providers.is_empty()
-                && usage.overall_severity == factory_core::local::SubscriptionSeverity::Ok
-        ));
-    })
-    .await;
-}

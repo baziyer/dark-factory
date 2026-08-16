@@ -192,8 +192,6 @@ pub struct TaskSnapshot {
     pub project_id: ProjectId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<TaskId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_agent_id: Option<AgentId>,
     pub title: String,

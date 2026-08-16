@@ -3,7 +3,6 @@ use std::{
     collections::BTreeMap,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use eframe::egui::{self, Color32, RichText};
@@ -13,8 +12,6 @@ use factory_core::{
     local::{
         AgentDetail, AgentMessage, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS,
         MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RunTerminal, ServerFrame,
-        SubscriptionLimitWindow, SubscriptionProviderStatus, SubscriptionSeverity,
-        SubscriptionUsageStatus,
     },
 };
 use uuid::Uuid;
@@ -81,7 +78,6 @@ struct Snapshot {
     tasks: Vec<TaskDetail>,
     agents: Vec<AgentSnapshot>,
     runs: Vec<RunSnapshot>,
-    usage: Option<SubscriptionUsageStatus>,
 }
 
 struct FactoryApp {
@@ -94,7 +90,6 @@ struct FactoryApp {
     agent_details: BTreeMap<AgentId, AgentDetail>,
     agent_messages: BTreeMap<AgentId, Vec<AgentMessage>>,
     runs: BTreeMap<RunId, RunSnapshot>,
-    usage: Option<SubscriptionUsageStatus>,
     recent: Vec<EventEnvelope>,
     selected_project: Option<ProjectId>,
     show_all_queue: bool,
@@ -243,7 +238,6 @@ impl FactoryApp {
             agent_details: BTreeMap::new(),
             agent_messages: BTreeMap::new(),
             runs: BTreeMap::new(),
-            usage: None,
             recent: Vec::new(),
             selected_project: None,
             show_all_queue: false,
@@ -513,7 +507,6 @@ impl FactoryApp {
                 self.runs.insert(run.id.clone(), run);
             }
         }
-        self.usage = snapshot.usage;
     }
 
     fn refresh(&mut self, context: &egui::Context) {
@@ -699,18 +692,6 @@ impl FactoryApp {
                     .filter(|task| task.snapshot.status == TaskStatus::Blocked)
                     .count();
                 ui.label(format!("{running} active · {blocked} blocked"));
-                if let Some(usage) = &self.usage {
-                    ui.separator();
-                    for provider in &usage.providers {
-                        let color = match provider.severity {
-                            SubscriptionSeverity::Ok => Color32::LIGHT_GREEN,
-                            SubscriptionSeverity::Warning => Color32::YELLOW,
-                            SubscriptionSeverity::Critical => Color32::LIGHT_RED,
-                        };
-                        ui.label(RichText::new(provider_usage_line(provider)).color(color))
-                            .on_hover_ui(|ui| provider_usage_details(ui, provider));
-                    }
-                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh").clicked() {
                         self.refresh(context);
@@ -856,18 +837,6 @@ impl FactoryApp {
                     .show(ui, |ui| {
                         ui.label(result);
                     });
-            });
-        }
-        if !task.snapshot.depends_on.is_empty() {
-            ui.collapsing("Dependencies", |ui| {
-                ui.label(
-                    task.snapshot
-                        .depends_on
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                );
             });
         }
         if matches!(
@@ -1706,107 +1675,6 @@ fn task_is_visible(status: TaskStatus, show_history: bool) -> bool {
         )
 }
 
-fn provider_usage_line(provider: &SubscriptionProviderStatus) -> String {
-    let provider_name = match provider.provider {
-        Provider::Codex => "Codex",
-        Provider::ClaudeCode => "Claude",
-    };
-    let buckets = [
-        SubscriptionLimitWindow::Primary,
-        SubscriptionLimitWindow::Secondary,
-        SubscriptionLimitWindow::CurrentSession,
-        SubscriptionLimitWindow::CurrentWeek,
-    ]
-    .into_iter()
-    .filter_map(|window| {
-        provider
-            .windows
-            .iter()
-            .find(|usage| usage.window == window)
-            .map(|usage| {
-                format!(
-                    "{} {}%",
-                    usage_window_label(provider.provider, window),
-                    usage.used_percent
-                )
-            })
-    })
-    .collect::<Vec<_>>();
-    if buckets.is_empty() {
-        provider.used_percent.map_or_else(
-            || format!("{provider_name} · usage unavailable"),
-            |percent| format!("{provider_name} · {percent}%"),
-        )
-    } else {
-        format!("{provider_name} · {}", buckets.join(" · "))
-    }
-}
-
-fn provider_usage_details(ui: &mut egui::Ui, provider: &SubscriptionProviderStatus) {
-    ui.label(RichText::new(provider_usage_line(provider)).strong());
-    if provider.windows.is_empty() {
-        ui.label("No separate 5h/7d buckets were returned by the provider.");
-    } else {
-        for usage in &provider.windows {
-            let reset = usage
-                .resets_at_ms
-                .map_or_else(|| "reset time unavailable".to_owned(), format_reset);
-            ui.label(format!(
-                "{}: {}% used · {}{}",
-                usage_window_label(provider.provider, usage.window),
-                usage.used_percent,
-                reset,
-                if usage.exhausted { " · exhausted" } else { "" },
-            ));
-        }
-    }
-    if provider.consecutive_failures > 0 {
-        ui.label(format!(
-            "{} consecutive usage probe failures",
-            provider.consecutive_failures
-        ));
-    }
-}
-
-fn usage_window_label(provider: Provider, window: SubscriptionLimitWindow) -> &'static str {
-    match (provider, window) {
-        (Provider::Codex, SubscriptionLimitWindow::Primary)
-        | (Provider::ClaudeCode, SubscriptionLimitWindow::CurrentSession) => "5h",
-        (Provider::Codex, SubscriptionLimitWindow::Secondary)
-        | (Provider::ClaudeCode, SubscriptionLimitWindow::CurrentWeek) => "7d",
-        (_, SubscriptionLimitWindow::Primary) => "primary",
-        (_, SubscriptionLimitWindow::Secondary) => "secondary",
-        (_, SubscriptionLimitWindow::CurrentSession) => "session",
-        (_, SubscriptionLimitWindow::CurrentWeek) => "week",
-    }
-}
-
-fn format_reset(reset_at_ms: i64) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(reset_at_ms);
-    let remaining_ms = reset_at_ms.saturating_sub(now_ms);
-    match remaining_ms.cmp(&0) {
-        Ordering::Equal => "reset now".to_owned(),
-        Ordering::Less => "reset overdue".to_owned(),
-        Ordering::Greater => {
-            let minutes = remaining_ms / 60_000;
-            let days = minutes / (24 * 60);
-            let hours = (minutes % (24 * 60)) / 60;
-            let minutes = minutes % 60;
-            if days > 0 {
-                format!("resets in {days}d {hours}h")
-            } else if hours > 0 {
-                format!("resets in {hours}h {minutes}m")
-            } else {
-                format!("resets in {minutes}m")
-            }
-        }
-    }
-}
-
 impl TaskColumn {
     const fn matches(self, status: TaskStatus) -> bool {
         match self {
@@ -2338,7 +2206,6 @@ fn load_snapshot(client: &Client) -> Result<Snapshot, String> {
     let projects = load_projects(client)?;
     let mut snapshot = Snapshot {
         projects,
-        usage: Some(load_usage(client)?),
         ..Snapshot::default()
     };
     for project in &snapshot.projects {
@@ -2347,13 +2214,6 @@ fn load_snapshot(client: &Client) -> Result<Snapshot, String> {
         snapshot.runs.extend(load_runs(client, &project.id)?);
     }
     Ok(snapshot)
-}
-
-fn load_usage(client: &Client) -> Result<SubscriptionUsageStatus, String> {
-    match request_response(client, LocalRequest::SubscriptionUsage)? {
-        LocalResponse::SubscriptionUsage { usage } => Ok(usage),
-        _ => Err("daemon returned an unexpected subscription usage response".into()),
-    }
 }
 
 fn load_event_sequence(client: &Client) -> Result<Option<i64>, String> {
@@ -2503,14 +2363,13 @@ mod tests {
     use factory_core::{
         AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ObserverHealth, ProjectId,
         Provider, RunId, RunSnapshot, RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
-        local::{RunTerminal, SubscriptionSeverity},
+        local::RunTerminal,
     };
 
     use super::{
         TaskColumn, agent_card_text, agent_profile_guidance_help, agent_profile_load_message,
         allocation_counts, event_requires_detail_refresh, parent_agent_options,
-        provider_model_options, provider_usage_line, task_assignee_text, task_is_visible,
-        task_result_text,
+        provider_model_options, task_assignee_text, task_is_visible, task_result_text,
     };
 
     #[test]
@@ -2600,7 +2459,6 @@ mod tests {
                 id: factory_core::TaskId::try_from("task-1").unwrap(),
                 project_id: ProjectId::try_from("factory").unwrap(),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: None,
                 title: "Current".into(),
                 status: TaskStatus::Succeeded,
@@ -2649,7 +2507,6 @@ mod tests {
                     id: factory_core::TaskId::try_from("task-1").unwrap(),
                     project_id: ProjectId::try_from("factory").unwrap(),
                     parent_task_id: None,
-                    depends_on: Vec::new(),
                     assigned_agent_id: None,
                     title: "New task".into(),
                     status: TaskStatus::Queued,
@@ -2676,36 +2533,6 @@ mod tests {
         ] {
             assert!(TaskColumn::Done.matches(status));
         }
-    }
-
-    #[test]
-    fn provider_usage_line_names_both_five_hour_and_seven_day_buckets() {
-        let provider = factory_core::local::SubscriptionProviderStatus {
-            provider: Provider::Codex,
-            last_attempt_at_ms: 1,
-            last_success_at_ms: Some(1),
-            used_percent: Some(98),
-            limit_window: Some(factory_core::local::SubscriptionLimitWindow::Primary),
-            resets_at_ms: Some(2),
-            exhausted: Some(false),
-            severity: SubscriptionSeverity::Critical,
-            consecutive_failures: 0,
-            windows: vec![
-                factory_core::local::SubscriptionUsageWindow {
-                    window: factory_core::local::SubscriptionLimitWindow::Primary,
-                    used_percent: 98,
-                    resets_at_ms: Some(2),
-                    exhausted: false,
-                },
-                factory_core::local::SubscriptionUsageWindow {
-                    window: factory_core::local::SubscriptionLimitWindow::Secondary,
-                    used_percent: 61,
-                    resets_at_ms: Some(3),
-                    exhausted: false,
-                },
-            ],
-        };
-        assert_eq!(provider_usage_line(&provider), "Codex · 5h 98% · 7d 61%");
     }
 
     #[test]
@@ -2761,7 +2588,6 @@ mod tests {
                 id: factory_core::TaskId::try_from("task-1").unwrap(),
                 project_id: ProjectId::try_from("factory").unwrap(),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: None,
                 title: "Completed task".into(),
                 status: TaskStatus::Succeeded,
@@ -2787,7 +2613,6 @@ mod tests {
                     id: factory_core::TaskId::try_from("task-1").unwrap(),
                     project_id: ProjectId::try_from("factory").unwrap(),
                     parent_task_id: None,
-                    depends_on: Vec::new(),
                     assigned_agent_id: None,
                     title: "Completed task".into(),
                     status: TaskStatus::Succeeded,
@@ -2811,7 +2636,6 @@ mod tests {
                     id: factory_core::TaskId::try_from("queued-curie").unwrap(),
                     project_id: ProjectId::try_from("factory").unwrap(),
                     parent_task_id: None,
-                    depends_on: Vec::new(),
                     assigned_agent_id: Some(curie.clone()),
                     title: "Queued for Curie".into(),
                     status: TaskStatus::Queued,
@@ -2880,7 +2704,6 @@ mod tests {
                 id: factory_core::TaskId::try_from("task-1").unwrap(),
                 project_id: ProjectId::try_from("factory").unwrap(),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
                 title: "Review the queue".into(),
                 status: TaskStatus::Queued,
@@ -2990,7 +2813,6 @@ mod tests {
                 id: factory_core::TaskId::try_from("task-1").unwrap(),
                 project_id: ProjectId::try_from("factory").unwrap(),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
                 title: "Ship the operator view".into(),
                 status: TaskStatus::Queued,
@@ -3040,7 +2862,6 @@ mod tests {
             id: factory_core::TaskId::try_from(id).unwrap(),
             project_id: ProjectId::try_from("factory").unwrap(),
             parent_task_id: None,
-            depends_on: Vec::new(),
             assigned_agent_id: None,
             title: id.into(),
             status: TaskStatus::Queued,

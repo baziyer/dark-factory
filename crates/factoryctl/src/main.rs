@@ -9,6 +9,7 @@ use factoryctl::Client;
 use uuid::Uuid;
 
 mod ui;
+mod usage;
 
 const USAGE: &str =
     "usage: factoryctl [--socket PATH] <ui|health|usage|project|task|agent|run|events> ...";
@@ -19,7 +20,7 @@ Run the daemon separately (launchd keeps it alive), then run `factoryctl ui` in 
 Commands:
   ui                                          Open the native control plane
   health                                      Check the daemon
-  usage                                       Read normalized subscription usage
+  usage                                       Probe Codex subscription usage on demand
   project add|list|delete                     Manage projects
   task add|list|get|start|retry|assign|cancel|update|delete
                                                Manage and run tasks
@@ -38,7 +39,9 @@ const HEALTH_HELP: &str = "usage: factoryctl health
 Check that the daemon is reachable and responding.";
 const USAGE_HELP: &str = "usage: factoryctl usage
 
-Read the normalized subscription usage snapshot (on-demand probe status).";
+Run a local Codex JSON-RPC probe against `codex` on PATH and print the
+result. No daemon or socket is involved and nothing is persisted; Claude's
+usage is read by running `/usage` inside Claude's own interactive terminal.";
 const UI_HELP: &str = "usage: factoryctl ui
 
 Open the native (egui) control plane. It is being retired in favor of a
@@ -469,6 +472,9 @@ fn run() -> Result<i32, String> {
     if let CliCommand::Help(text) = command {
         println!("{text}");
         return Ok(0);
+    }
+    if matches!(command, CliCommand::Usage) {
+        return Ok(usage::run());
     }
     let environment_socket = env::var("DARK_FACTORY_SOCKET").ok();
     let factory_home = env::var("DARK_FACTORY_HOME").ok();
@@ -913,7 +919,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Ui => Err("ui is handled before local requests".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
-        CliCommand::Usage => Ok(LocalRequest::SubscriptionUsage),
+        CliCommand::Usage => Err("usage is handled before local requests".into()),
         CliCommand::ProjectAdd { id, name, root } => Ok(LocalRequest::CreateProject {
             id: id
                 .map(|id| parse_id(id, "project"))
@@ -1661,20 +1667,16 @@ mod tests {
             command,
             CliCommand::Events {
                 after_sequence: 12,
-                limit: 100,
+                limit: EVENT_LIST_LIMIT,
                 follow: true,
             }
         );
     }
 
     #[test]
-    fn usage_reads_the_normalized_subscription_snapshot() {
+    fn usage_parses_with_no_arguments() {
         let (_, command) = parse_args(args(&["usage"])).unwrap();
         assert_eq!(command, CliCommand::Usage);
-        assert_eq!(
-            request_for(command).unwrap(),
-            LocalRequest::SubscriptionUsage
-        );
     }
 
     #[test]
@@ -1717,7 +1719,15 @@ mod tests {
             )
         );
 
-        assert!(parse_args(args(&["project", "list", "--limit", "101"])).is_err());
+        assert!(
+            parse_args(args(&[
+                "project",
+                "list",
+                "--limit",
+                &(MAX_PROJECT_PAGE_ITEMS + 1).to_string(),
+            ]))
+            .is_err()
+        );
         assert!(
             parse_args(args(&[
                 "task",

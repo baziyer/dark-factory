@@ -1,6 +1,6 @@
 use std::{
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixListener,
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     process::Command,
     thread,
 };
@@ -8,10 +8,7 @@ use std::{
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, RunId, TaskId,
-    local::{
-        LocalRequest, LocalResponse, RequestEnvelope, ServerFrame, SubscriptionSeverity,
-        SubscriptionUsageStatus,
-    },
+    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 
 fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalResponse) {
@@ -26,45 +23,53 @@ fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalRe
     stream.write_all(b"\n").unwrap();
 }
 
+/// `factoryctl usage` never touches the daemon: it probes `codex` on `PATH`
+/// directly. This exercises the real subprocess/JSON-RPC path against a fake
+/// `codex` script rather than the real provider CLI.
 #[test]
-fn usage_prints_the_normalized_daemon_snapshot() {
+fn usage_prints_observed_codex_snapshot_from_a_fake_codex_on_path() {
     let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("factory.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::SubscriptionUsage)
-        );
-        write_response(
-            &mut stream,
-            LocalResponse::SubscriptionUsage {
-                usage: SubscriptionUsageStatus {
-                    overall_severity: SubscriptionSeverity::Ok,
-                    providers: Vec::new(),
-                },
-            },
-        );
-    });
+    let fake_codex = directory.path().join("codex");
+    std::fs::write(
+        &fake_codex,
+        "#!/bin/sh\nread -r _initialize\nprintf '{\"id\":1,\"result\":{}}\\n'\nread -r _initialized\nread -r _rate_limits\nprintf '{\"id\":2,\"result\":{\"rateLimits\":{\"primary\":{\"usedPercent\":42,\"resetsAt\":100}}}}\\n'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = directory.path().join("home");
+    let codex_home = directory.path().join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    std::fs::create_dir(&codex_home).unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-        .args(["--socket", socket.to_str().unwrap(), "usage"])
+        .args(["usage"])
+        .env("PATH", directory.path())
+        .env("HOME", &home)
+        .env("CODEX_HOME", &codex_home)
+        .env("TMPDIR", "/tmp")
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert!(matches!(
-        serde_json::from_slice::<ServerFrame>(&output.stdout).unwrap(),
-        ServerFrame::Response {
-            response: LocalResponse::SubscriptionUsage { .. },
-            ..
-        }
-    ));
-    server.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["provider"], "codex");
+    assert_eq!(value["usedPercent"], 42);
+    assert_eq!(value["limitWindow"], "primary");
+    assert_eq!(value["exhausted"], false);
+}
+
+#[test]
+fn usage_fails_clearly_when_codex_is_not_on_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["usage"])
+        .env("PATH", directory.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["category"], "not_found");
 }
 
 #[test]

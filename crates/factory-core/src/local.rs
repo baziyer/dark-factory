@@ -7,85 +7,6 @@ use crate::{
     ProjectSnapshot, Provider, RunId, RunSnapshot, TaskDetail, TaskId,
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionLimitWindow {
-    Primary,
-    Secondary,
-    CurrentSession,
-    CurrentWeek,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionFailureCategory {
-    Timeout,
-    Protocol,
-    Process,
-    OutputLimit,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(tag = "type", content = "data", rename_all = "snake_case")]
-pub enum SubscriptionProbeOutcome {
-    Observed {
-        used_percent: u8,
-        limit_window: SubscriptionLimitWindow,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        resets_at_ms: Option<i64>,
-        exhausted: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        windows: Vec<SubscriptionUsageWindow>,
-    },
-    Failed {
-        category: SubscriptionFailureCategory,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SubscriptionSeverity {
-    Ok,
-    Warning,
-    Critical,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SubscriptionUsageWindow {
-    pub window: SubscriptionLimitWindow,
-    pub used_percent: u8,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at_ms: Option<i64>,
-    pub exhausted: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SubscriptionProviderStatus {
-    pub provider: Provider,
-    pub last_attempt_at_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_success_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub used_percent: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub limit_window: Option<SubscriptionLimitWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resets_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exhausted: Option<bool>,
-    pub severity: SubscriptionSeverity,
-    pub consecutive_failures: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub windows: Vec<SubscriptionUsageWindow>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SubscriptionUsageStatus {
-    pub overall_severity: SubscriptionSeverity,
-    pub providers: Vec<SubscriptionProviderStatus>,
-}
-
 /// Private operator-facing configuration. It is deliberately not part of an
 /// `AgentSnapshot` or `FactoryEvent`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,11 +40,16 @@ pub struct AgentMessage {
 
 /// Maximum JSON payload size. The newline delimiter is not part of this limit.
 pub const MAX_LOCAL_FRAME_BYTES: usize = 1024 * 1024;
-pub const MAX_PROJECT_PAGE_ITEMS: u32 = 100;
+pub const MAX_PROJECT_PAGE_ITEMS: u32 = 1000;
+/// Deliberately far lower than the other page caps: a `TaskDetail` carries a
+/// full body (up to [`MAX_TASK_BODY_BYTES`]) plus an optional result, so this
+/// stays small enough that a page of worst-case tasks still fits one
+/// [`MAX_LOCAL_FRAME_BYTES`] frame (see
+/// `the_largest_valid_task_page_fits_one_local_frame`).
 pub const MAX_TASK_PAGE_ITEMS: u32 = 10;
-pub const MAX_AGENT_PAGE_ITEMS: u32 = 100;
-pub const MAX_RUN_PAGE_ITEMS: u32 = 100;
-pub const MAX_EVENT_PAGE_ITEMS: u32 = 100;
+pub const MAX_AGENT_PAGE_ITEMS: u32 = 1000;
+pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
+pub const MAX_EVENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
@@ -289,15 +215,6 @@ pub enum LocalRequest {
         limit: u32,
     },
     LatestEventSequence,
-    SubscriptionUsage,
-    RecordSubscriptionProbe {
-        project_id: ProjectId,
-        orchestrator_agent_id: AgentId,
-        provider: Provider,
-        attempted_at_ms: i64,
-        outcome: SubscriptionProbeOutcome,
-        notification_task_id: TaskId,
-    },
     Subscribe {
         after_sequence: i64,
     },
@@ -400,15 +317,6 @@ pub enum LocalResponse {
     },
     EventHead {
         sequence: i64,
-    },
-    SubscriptionUsage {
-        usage: SubscriptionUsageStatus,
-    },
-    SubscriptionProbeRecorded {
-        provider: Provider,
-        severity: SubscriptionSeverity,
-        consecutive_failures: u32,
-        notification_created: bool,
     },
     Subscribed {
         after_sequence: i64,

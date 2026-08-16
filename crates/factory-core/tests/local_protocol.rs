@@ -4,8 +4,6 @@ use factory_core::{
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
-        SubscriptionLimitWindow, SubscriptionProviderStatus, SubscriptionSeverity,
-        SubscriptionUsageStatus,
     },
 };
 
@@ -126,7 +124,6 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
             id: task_id("task-1"),
             project_id: project_id("project-1"),
             parent_task_id: None,
-            depends_on: Vec::new(),
             assigned_agent_id: None,
             title: "Build the client".into(),
             status: TaskStatus::Queued,
@@ -260,37 +257,6 @@ fn operator_messages_have_a_private_durable_wire_shape() {
         serde_json::to_value(response).unwrap()["type"],
         "agent_message_sent"
     );
-}
-
-#[test]
-fn subscription_headroom_has_a_small_normalized_local_shape() {
-    let request = LocalRequest::SubscriptionUsage;
-    let response = LocalResponse::SubscriptionUsage {
-        usage: SubscriptionUsageStatus {
-            overall_severity: SubscriptionSeverity::Warning,
-            providers: vec![SubscriptionProviderStatus {
-                provider: Provider::Codex,
-                last_attempt_at_ms: 50,
-                last_success_at_ms: Some(50),
-                used_percent: Some(82),
-                limit_window: Some(SubscriptionLimitWindow::Secondary),
-                resets_at_ms: Some(1_000),
-                exhausted: Some(false),
-                severity: SubscriptionSeverity::Warning,
-                consecutive_failures: 0,
-                windows: Vec::new(),
-            }],
-        },
-    };
-
-    assert_eq!(
-        serde_json::to_value(request).unwrap()["type"],
-        "subscription_usage"
-    );
-    let value = serde_json::to_value(&response).unwrap();
-    assert_eq!(value["type"], "subscription_usage");
-    assert_eq!(value["data"]["usage"]["providers"][0]["used_percent"], 82);
-    assert!(serde_json::from_value::<LocalResponse>(value).is_ok());
 }
 
 #[test]
@@ -428,7 +394,6 @@ fn retry_task_has_a_small_versioned_local_shape() {
                 id: task_id("task-1"),
                 project_id: project_id("factory"),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: None,
                 title: "Retry".into(),
                 status: TaskStatus::Queued,
@@ -484,7 +449,6 @@ fn assign_task_has_a_small_versioned_local_shape() {
                 id: task_id("task-1"),
                 project_id: project_id("factory"),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: Some(agent_id("curie")),
                 title: "Assign me".into(),
                 status: TaskStatus::Queued,
@@ -512,7 +476,6 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
                 id: task_id(&format!("task-{index}")),
                 project_id: project_id("project-1"),
                 parent_task_id: None,
-                depends_on: Vec::new(),
                 assigned_agent_id: None,
                 title: "x".repeat(240),
                 status: TaskStatus::Queued,

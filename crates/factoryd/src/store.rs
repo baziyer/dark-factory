@@ -12,11 +12,10 @@ use factory_core::{
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const MAX_EVENT_PAGE: usize = 10_000;
 const MAX_STATE_PAGE: usize = 101;
 const MAX_PROVIDER_SESSION_BYTES: usize = 256;
@@ -146,90 +145,6 @@ pub struct WebhookSnapshot {
     pub counts: WebhookTaskCounts,
     pub tasks: Vec<WebhookSnapshotTask>,
     pub agents: Vec<WebhookSnapshotAgent>,
-    pub subscription_usage: SubscriptionUsageSnapshot,
-}
-
-/// Deterministic subscription headroom band. This is intentionally independent
-/// of imported per-run token and dollar receipts.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum SubscriptionSeverity {
-    Ok,
-    Warning,
-    Critical,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SubscriptionFailureCategory {
-    Timeout,
-    Protocol,
-    Process,
-    OutputLimit,
-    Unavailable,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum SubscriptionLimitWindow {
-    Primary,
-    Secondary,
-    CurrentSession,
-    CurrentWeek,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SubscriptionUsageWindow {
-    pub window: SubscriptionLimitWindow,
-    pub used_percent: u8,
-    pub resets_at_ms: Option<i64>,
-    pub exhausted: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SubscriptionProbeOutcome {
-    Observed {
-        used_percent: u8,
-        limit_window: SubscriptionLimitWindow,
-        resets_at_ms: Option<i64>,
-        exhausted: bool,
-        windows: Vec<SubscriptionUsageWindow>,
-    },
-    Failed {
-        category: SubscriptionFailureCategory,
-    },
-}
-
-pub struct SubscriptionProbe {
-    pub project_id: ProjectId,
-    pub orchestrator_agent_id: AgentId,
-    pub provider: Provider,
-    pub attempted_at_ms: i64,
-    pub outcome: SubscriptionProbeOutcome,
-    pub notification_task_id: TaskId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubscriptionProviderState {
-    pub provider: Provider,
-    pub last_attempt_at_ms: i64,
-    pub last_success_at_ms: Option<i64>,
-    pub used_percent: Option<u8>,
-    pub limit_window: Option<SubscriptionLimitWindow>,
-    pub resets_at_ms: Option<i64>,
-    pub exhausted: Option<bool>,
-    pub severity: SubscriptionSeverity,
-    pub consecutive_failures: u32,
-    pub windows: Vec<SubscriptionUsageWindow>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SubscriptionUsageSnapshot {
-    pub overall_severity: SubscriptionSeverity,
-    pub providers: Vec<SubscriptionProviderState>,
-}
-
-pub struct SubscriptionProbeCommit {
-    pub state: SubscriptionProviderState,
-    pub notification_created: bool,
-    pub events: Vec<EventEnvelope>,
 }
 
 pub struct WebhookSnapshotTask {
@@ -237,7 +152,6 @@ pub struct WebhookSnapshotTask {
     pub title: String,
     pub status: OperationalTaskStatus,
     pub assignee: Option<String>,
-    pub depends_on: Vec<TaskId>,
     pub priority: i32,
     pub created_at_ms: i64,
     pub started_at_ms: Option<i64>,
@@ -554,8 +468,6 @@ pub enum StoreError {
     WebhookQuestionNotOpen,
     #[error("webhook operational snapshot exceeds its bounded capacity")]
     WebhookSnapshotTooLarge,
-    #[error("subscription usage input is invalid")]
-    InvalidSubscriptionProbe,
     #[error("project was not found")]
     ProjectNotFound,
     #[error("task is not cancellable in the requested project")]
@@ -660,7 +572,6 @@ impl Store {
                 id: input.id,
                 project_id: input.project_id,
                 parent_task_id: input.parent_task_id,
-                depends_on: Vec::new(),
                 assigned_agent_id: None,
                 title: input.title,
                 status: TaskStatus::Queued,
@@ -1408,7 +1319,6 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
-        let subscription_usage = self.subscription_usage_snapshot()?;
 
         Ok(WebhookSnapshot {
             generated_at_ms: now_ms,
@@ -1420,329 +1330,6 @@ impl Store {
             },
             tasks,
             agents,
-            subscription_usage,
-        })
-    }
-
-    /// Records one bounded, normalized subscription-capacity probe. Raw CLI or
-    /// protocol output is never accepted by this store boundary.
-    pub fn record_subscription_probe(
-        &mut self,
-        input: SubscriptionProbe,
-    ) -> Result<SubscriptionProbeCommit> {
-        if input.attempted_at_ms < 0
-            || matches!(
-                input.outcome,
-                SubscriptionProbeOutcome::Observed {
-                    used_percent: 101..=u8::MAX,
-                    ..
-                }
-            )
-        {
-            return Err(StoreError::InvalidSubscriptionProbe);
-        }
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_webhook_project_and_orchestrator(
-            &transaction,
-            &input.project_id,
-            &input.orchestrator_agent_id,
-        )?;
-        let provider = provider_value(input.provider);
-        let replayed = transaction
-            .query_row(
-                "SELECT outcome, used_percent, limit_window, resets_at_ms, exhausted,
-                    failure_category, windows_json
-             FROM subscription_usage_probes
-             WHERE provider = ?1 AND attempted_at_ms = ?2",
-                params![provider, input.attempted_at_ms],
-                |row| {
-                    Ok(StoredSubscriptionProbe {
-                        outcome: row.get(0)?,
-                        used_percent: row.get(1)?,
-                        limit_window: row.get(2)?,
-                        resets_at_ms: row.get(3)?,
-                        exhausted: row.get(4)?,
-                        failure_category: row.get(5)?,
-                        windows_json: row.get(6)?,
-                    })
-                },
-            )
-            .optional()?;
-        if let Some(replayed) = replayed {
-            if !stored_subscription_probe_matches(&replayed, input.outcome) {
-                return Err(StoreError::InvalidSubscriptionProbe);
-            }
-            let state = load_subscription_provider_state(&transaction, input.provider)?
-                .ok_or(StoreError::InvalidSubscriptionProbe)?;
-            transaction.commit()?;
-            return Ok(SubscriptionProbeCommit {
-                state,
-                notification_created: false,
-                events: Vec::new(),
-            });
-        }
-
-        let prior = load_subscription_state_row(&transaction, input.provider)?;
-        if prior
-            .as_ref()
-            .is_some_and(|state| input.attempted_at_ms < state.public.last_attempt_at_ms)
-        {
-            return Err(StoreError::InvalidSubscriptionProbe);
-        }
-        let previous_severity = prior
-            .as_ref()
-            .map_or(SubscriptionSeverity::Ok, |state| state.public.severity);
-        let prior_capacity = prior
-            .as_ref()
-            .map_or(SubscriptionSeverity::Ok, |state| state.capacity_severity);
-        let prior_failures = prior
-            .as_ref()
-            .map_or(0, |state| state.public.consecutive_failures);
-        let prior_success = prior
-            .as_ref()
-            .and_then(|state| state.public.last_success_at_ms);
-        let prior_percent = prior.as_ref().and_then(|state| state.public.used_percent);
-        let prior_limit = prior.as_ref().and_then(|state| state.public.limit_window);
-        let prior_reset = prior.as_ref().and_then(|state| state.public.resets_at_ms);
-        let prior_exhausted = prior.as_ref().and_then(|state| state.public.exhausted);
-        let prior_windows = prior
-            .as_ref()
-            .map(|state| state.public.windows.clone())
-            .unwrap_or_default();
-
-        let (
-            outcome_name,
-            used_percent,
-            limit_window,
-            resets_at_ms,
-            exhausted,
-            capacity_severity,
-            severity,
-            failures,
-            failure_category,
-            last_success_at_ms,
-            windows,
-        ) = match input.outcome {
-            SubscriptionProbeOutcome::Observed {
-                used_percent,
-                limit_window,
-                resets_at_ms,
-                exhausted,
-                windows,
-            } => {
-                if resets_at_ms.is_some_and(|reset| reset < 0) {
-                    return Err(StoreError::InvalidSubscriptionProbe);
-                }
-                let windows = canonical_subscription_windows(
-                    used_percent,
-                    limit_window,
-                    resets_at_ms,
-                    exhausted,
-                    windows,
-                )?;
-                let capacity = subscription_capacity_severity(used_percent, exhausted);
-                (
-                    "observed",
-                    Some(used_percent),
-                    Some(limit_window),
-                    resets_at_ms,
-                    Some(exhausted),
-                    capacity,
-                    capacity,
-                    0,
-                    None,
-                    Some(input.attempted_at_ms),
-                    windows,
-                )
-            }
-            SubscriptionProbeOutcome::Failed { category } => {
-                let failures = prior_failures.saturating_add(1);
-                let visibility = if failures >= 3 {
-                    SubscriptionSeverity::Warning
-                } else {
-                    SubscriptionSeverity::Ok
-                };
-                (
-                    "failed",
-                    prior_percent,
-                    prior_limit,
-                    prior_reset,
-                    prior_exhausted,
-                    prior_capacity,
-                    prior_capacity.max(visibility),
-                    failures,
-                    Some(subscription_failure_value(category)),
-                    prior_success,
-                    prior_windows,
-                )
-            }
-        };
-        let upward_transition = severity > previous_severity;
-        let windows_json = if outcome_name == "observed" {
-            Some(serde_json::to_string(&windows)?)
-        } else {
-            None
-        };
-
-        transaction.execute(
-            "INSERT INTO subscription_usage_probes (
-                provider, attempted_at_ms, outcome, used_percent, limit_window,
-                resets_at_ms, exhausted, severity, failure_category, notification_task_id,
-                windows_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
-            params![
-                provider,
-                input.attempted_at_ms,
-                outcome_name,
-                if outcome_name == "observed" {
-                    used_percent.map(i64::from)
-                } else {
-                    None
-                },
-                if outcome_name == "observed" {
-                    limit_window.map(subscription_limit_window_value)
-                } else {
-                    None
-                },
-                if outcome_name == "observed" {
-                    resets_at_ms
-                } else {
-                    None
-                },
-                if outcome_name == "observed" {
-                    exhausted.map(i64::from)
-                } else {
-                    None
-                },
-                subscription_severity_value(severity),
-                failure_category,
-                windows_json,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO subscription_usage_state (
-                provider, last_attempt_at_ms, last_success_at_ms, used_percent, limit_window,
-                resets_at_ms, exhausted, windows_json, capacity_severity, severity,
-                consecutive_failures
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(provider) DO UPDATE SET
-                last_attempt_at_ms = excluded.last_attempt_at_ms,
-                last_success_at_ms = excluded.last_success_at_ms,
-                used_percent = excluded.used_percent,
-                limit_window = excluded.limit_window,
-                resets_at_ms = excluded.resets_at_ms,
-                exhausted = excluded.exhausted,
-                windows_json = excluded.windows_json,
-                capacity_severity = excluded.capacity_severity,
-                severity = excluded.severity,
-                consecutive_failures = excluded.consecutive_failures",
-            params![
-                provider,
-                input.attempted_at_ms,
-                last_success_at_ms,
-                used_percent.map(i64::from),
-                limit_window.map(subscription_limit_window_value),
-                resets_at_ms,
-                exhausted.map(i64::from),
-                windows_json,
-                subscription_severity_value(capacity_severity),
-                subscription_severity_value(severity),
-                i64::from(failures),
-            ],
-        )?;
-
-        let mut events = Vec::new();
-        if upward_transition {
-            let notification_exists: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
-                params![input.notification_task_id.as_str()],
-                |row| row.get(0),
-            )?;
-            if notification_exists {
-                return Err(StoreError::InvalidSubscriptionProbe);
-            }
-            let title = format!(
-                "Subscription {}: {}",
-                subscription_severity_value(severity),
-                subscription_provider_title(input.provider)
-            );
-            let body = subscription_notification_advice(outcome_name == "observed", severity);
-            transaction.execute(
-                "INSERT INTO tasks (
-                    id, project_id, parent_task_id, assigned_agent_id, title, body,
-                    status, priority, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'queued', 10, ?6, ?6)",
-                params![
-                    input.notification_task_id.as_str(),
-                    input.project_id.as_str(),
-                    input.orchestrator_agent_id.as_str(),
-                    title,
-                    body,
-                    input.attempted_at_ms,
-                ],
-            )?;
-            let snapshot = TaskSnapshot {
-                id: input.notification_task_id.clone(),
-                project_id: input.project_id,
-                parent_task_id: None,
-                depends_on: Vec::new(),
-                assigned_agent_id: Some(input.orchestrator_agent_id),
-                title,
-                status: TaskStatus::Queued,
-                priority: 10,
-                created_at_ms: input.attempted_at_ms,
-                updated_at_ms: input.attempted_at_ms,
-            };
-            let event = FactoryEvent::TaskChanged { task: snapshot };
-            let sequence = append_event(&transaction, input.attempted_at_ms, &event)?;
-            events.push(EventEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                sequence,
-                occurred_at_ms: input.attempted_at_ms,
-                event,
-            });
-            transaction.execute(
-                "UPDATE subscription_usage_probes SET notification_task_id = ?3
-                 WHERE provider = ?1 AND attempted_at_ms = ?2",
-                params![
-                    provider,
-                    input.attempted_at_ms,
-                    input.notification_task_id.as_str()
-                ],
-            )?;
-        }
-        let state = load_subscription_provider_state(&transaction, input.provider)?
-            .ok_or(StoreError::InvalidSubscriptionProbe)?;
-        transaction.commit()?;
-        Ok(SubscriptionProbeCommit {
-            state,
-            notification_created: upward_transition,
-            events,
-        })
-    }
-
-    /// Public, provider-neutral projection of the latest normalized allowance
-    /// state. It is intentionally independent from per-run billing receipts.
-    pub fn subscription_usage_snapshot(&self) -> Result<SubscriptionUsageSnapshot> {
-        let mut statement = self.connection.prepare(
-            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
-                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
-                    windows_json
-             FROM subscription_usage_state ORDER BY provider",
-        )?;
-        let providers = statement
-            .query_map([], parse_subscription_provider_state)?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let overall_severity = providers
-            .iter()
-            .map(|state| state.severity)
-            .max()
-            .unwrap_or(SubscriptionSeverity::Ok);
-        Ok(SubscriptionUsageSnapshot {
-            overall_severity,
-            providers,
         })
     }
 
@@ -1806,7 +1393,6 @@ impl Store {
             id: input.id.clone(),
             project_id: input.project_id,
             parent_task_id: None,
-            depends_on: Vec::new(),
             assigned_agent_id: Some(input.orchestrator_agent_id),
             title: input.title.clone(),
             status: TaskStatus::Queued,
@@ -1961,7 +1547,6 @@ impl Store {
             id: input.notification_task_id,
             project_id: input.project_id,
             parent_task_id: Some(input.task_id),
-            depends_on: Vec::new(),
             assigned_agent_id: Some(input.orchestrator_agent_id),
             title: notification_title,
             status: TaskStatus::Queued,
@@ -2118,7 +1703,6 @@ impl Store {
                         id: parse_id(row.get(0)?, 0)?,
                         project_id: parse_id(row.get(1)?, 1)?,
                         parent_task_id: parse_optional_id(parent_id, 2)?,
-                        depends_on: Vec::new(),
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
                         status: parse_task_status(&status, 7)?,
@@ -2132,12 +1716,7 @@ impl Store {
             },
         )?;
 
-        let mut tasks = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        for task in &mut tasks {
-            task.snapshot.depends_on = load_task_dependencies(&self.connection, &task.snapshot.id)?;
-        }
-        Ok(tasks)
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn get_task(&self, project_id: &ProjectId, task_id: &TaskId) -> Result<TaskDetail> {
@@ -2331,9 +1910,8 @@ impl Store {
 
     /// Deletes a task that has no non-terminal run, no subtasks, and no run
     /// that is itself the parent of another run. Terminal runs and every row
-    /// that references the task (questions, dependencies, webhook
-    /// capabilities, subscription notifications) are removed in the same
-    /// transaction.
+    /// that references the task (questions, webhook capabilities) are
+    /// removed in the same transaction.
     pub fn delete_task(
         &mut self,
         project_id: &ProjectId,
@@ -2394,18 +1972,8 @@ impl Store {
             params![task_id.as_str(), project_id.as_str()],
         )?;
         transaction.execute(
-            "DELETE FROM task_dependencies
-             WHERE (task_id = ?1 OR depends_on_task_id = ?1) AND project_id = ?2",
-            params![task_id.as_str(), project_id.as_str()],
-        )?;
-        transaction.execute(
             "DELETE FROM webhook_task_capabilities WHERE task_id = ?1 AND project_id = ?2",
             params![task_id.as_str(), project_id.as_str()],
-        )?;
-        transaction.execute(
-            "UPDATE subscription_usage_probes SET notification_task_id = NULL
-             WHERE notification_task_id = ?1",
-            params![task_id.as_str()],
         )?;
         // Agent messages delivered to a run of this task reference that run
         // via delivered_run_id. The run row is about to be deleted, but the
@@ -2598,16 +2166,7 @@ impl Store {
             params![project_id.as_str()],
         )?;
         transaction.execute(
-            "DELETE FROM task_dependencies WHERE project_id = ?1",
-            params![project_id.as_str()],
-        )?;
-        transaction.execute(
             "DELETE FROM webhook_task_capabilities WHERE project_id = ?1",
-            params![project_id.as_str()],
-        )?;
-        transaction.execute(
-            "UPDATE subscription_usage_probes SET notification_task_id = NULL
-             WHERE notification_task_id IN (SELECT id FROM tasks WHERE project_id = ?1)",
             params![project_id.as_str()],
         )?;
         transaction.execute(
@@ -3035,297 +2594,6 @@ impl Store {
     }
 }
 
-struct SubscriptionStateRow {
-    public: SubscriptionProviderState,
-    capacity_severity: SubscriptionSeverity,
-}
-
-struct StoredSubscriptionProbe {
-    outcome: String,
-    used_percent: Option<i64>,
-    limit_window: Option<String>,
-    resets_at_ms: Option<i64>,
-    exhausted: Option<i64>,
-    failure_category: Option<String>,
-    windows_json: Option<String>,
-}
-
-fn stored_subscription_probe_matches(
-    stored: &StoredSubscriptionProbe,
-    requested: SubscriptionProbeOutcome,
-) -> bool {
-    match requested {
-        SubscriptionProbeOutcome::Observed {
-            used_percent,
-            limit_window,
-            resets_at_ms,
-            exhausted,
-            windows,
-        } => {
-            stored.outcome == "observed"
-                && stored.used_percent == Some(i64::from(used_percent))
-                && stored.limit_window.as_deref()
-                    == Some(subscription_limit_window_value(limit_window))
-                && stored.resets_at_ms == resets_at_ms
-                && stored.exhausted == Some(if exhausted { 1 } else { 0 })
-                && stored.failure_category.is_none()
-                && stored_windows_match(stored.windows_json.as_deref(), &windows)
-        }
-        SubscriptionProbeOutcome::Failed { category } => {
-            stored.outcome == "failed"
-                && stored.used_percent.is_none()
-                && stored.limit_window.is_none()
-                && stored.resets_at_ms.is_none()
-                && stored.exhausted.is_none()
-                && stored.failure_category.as_deref() == Some(subscription_failure_value(category))
-        }
-    }
-}
-
-fn stored_windows_match(stored: Option<&str>, requested: &[SubscriptionUsageWindow]) -> bool {
-    if requested.is_empty() {
-        return true;
-    }
-    stored
-        .and_then(|value| serde_json::from_str::<Vec<SubscriptionUsageWindow>>(value).ok())
-        .is_some_and(|value| value == requested)
-}
-
-fn load_subscription_state_row(
-    connection: &Connection,
-    provider: Provider,
-) -> Result<Option<SubscriptionStateRow>> {
-    connection
-        .query_row(
-            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
-                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
-                    windows_json, capacity_severity
-             FROM subscription_usage_state WHERE provider = ?1",
-            params![provider_value(provider)],
-            |row| {
-                Ok(SubscriptionStateRow {
-                    public: parse_subscription_provider_state(row)?,
-                    capacity_severity: parse_subscription_severity(&row.get::<_, String>(10)?, 10)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(StoreError::from)
-}
-
-fn load_subscription_provider_state(
-    connection: &Connection,
-    provider: Provider,
-) -> Result<Option<SubscriptionProviderState>> {
-    connection
-        .query_row(
-            "SELECT provider, last_attempt_at_ms, last_success_at_ms, used_percent,
-                    resets_at_ms, exhausted, severity, consecutive_failures, limit_window,
-                    windows_json
-             FROM subscription_usage_state WHERE provider = ?1",
-            params![provider_value(provider)],
-            parse_subscription_provider_state,
-        )
-        .optional()
-        .map_err(StoreError::from)
-}
-
-fn parse_subscription_provider_state(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SubscriptionProviderState> {
-    let provider = parse_provider(&row.get::<_, String>(0)?, 0)?;
-    let used_percent = row
-        .get::<_, Option<i64>>(3)?
-        .map(|value| {
-            u8::try_from(value).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, Box::new(error))
-            })
-        })
-        .transpose()?;
-    let exhausted = row
-        .get::<_, Option<i64>>(5)?
-        .map(|value| match value {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(rusqlite::Error::IntegralValueOutOfRange(5, value)),
-        })
-        .transpose()?;
-    let consecutive_failures = u32::try_from(row.get::<_, i64>(7)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
-    })?;
-    let limit_window = row
-        .get::<_, Option<String>>(8)?
-        .map(|value| parse_subscription_limit_window(&value, 8))
-        .transpose()?;
-    let resets_at_ms: Option<i64> = row.get(4)?;
-    let windows_json: Option<String> = row.get(9)?;
-    let windows = windows_json
-        .as_deref()
-        .map(|value| {
-            serde_json::from_str(value).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
-            })
-        })
-        .transpose()?
-        .unwrap_or_else(|| {
-            used_percent
-                .zip(limit_window)
-                .map(|(used_percent, window)| SubscriptionUsageWindow {
-                    window,
-                    used_percent,
-                    resets_at_ms,
-                    exhausted: exhausted.unwrap_or(false),
-                })
-                .into_iter()
-                .collect()
-        });
-    Ok(SubscriptionProviderState {
-        provider,
-        last_attempt_at_ms: row.get(1)?,
-        last_success_at_ms: row.get(2)?,
-        used_percent,
-        limit_window,
-        resets_at_ms,
-        exhausted,
-        severity: parse_subscription_severity(&row.get::<_, String>(6)?, 6)?,
-        consecutive_failures,
-        windows,
-    })
-}
-
-fn canonical_subscription_windows(
-    used_percent: u8,
-    limit_window: SubscriptionLimitWindow,
-    resets_at_ms: Option<i64>,
-    exhausted: bool,
-    windows: Vec<SubscriptionUsageWindow>,
-) -> Result<Vec<SubscriptionUsageWindow>> {
-    let windows = if windows.is_empty() {
-        vec![SubscriptionUsageWindow {
-            window: limit_window,
-            used_percent,
-            resets_at_ms,
-            exhausted,
-        }]
-    } else {
-        windows
-    };
-    if windows.len() > 4
-        || windows.iter().any(|window| {
-            window.used_percent > 100 || window.resets_at_ms.is_some_and(|reset| reset < 0)
-        })
-        || windows.iter().enumerate().any(|(index, window)| {
-            windows[..index]
-                .iter()
-                .any(|prior| prior.window == window.window)
-        })
-    {
-        return Err(StoreError::InvalidSubscriptionProbe);
-    }
-    Ok(windows)
-}
-
-const fn subscription_capacity_severity(used_percent: u8, exhausted: bool) -> SubscriptionSeverity {
-    if exhausted || used_percent >= 95 {
-        SubscriptionSeverity::Critical
-    } else if used_percent >= 80 {
-        SubscriptionSeverity::Warning
-    } else {
-        SubscriptionSeverity::Ok
-    }
-}
-
-const fn subscription_severity_value(severity: SubscriptionSeverity) -> &'static str {
-    match severity {
-        SubscriptionSeverity::Ok => "ok",
-        SubscriptionSeverity::Warning => "warning",
-        SubscriptionSeverity::Critical => "critical",
-    }
-}
-
-fn parse_subscription_severity(
-    value: &str,
-    column: usize,
-) -> rusqlite::Result<SubscriptionSeverity> {
-    match value {
-        "ok" => Ok(SubscriptionSeverity::Ok),
-        "warning" => Ok(SubscriptionSeverity::Warning),
-        "critical" => Ok(SubscriptionSeverity::Critical),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            column,
-            Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid subscription severity",
-            )),
-        )),
-    }
-}
-
-const fn subscription_failure_value(category: SubscriptionFailureCategory) -> &'static str {
-    match category {
-        SubscriptionFailureCategory::Timeout => "timeout",
-        SubscriptionFailureCategory::Protocol => "protocol",
-        SubscriptionFailureCategory::Process => "process",
-        SubscriptionFailureCategory::OutputLimit => "output_limit",
-        SubscriptionFailureCategory::Unavailable => "unavailable",
-    }
-}
-
-const fn subscription_limit_window_value(window: SubscriptionLimitWindow) -> &'static str {
-    match window {
-        SubscriptionLimitWindow::Primary => "primary",
-        SubscriptionLimitWindow::Secondary => "secondary",
-        SubscriptionLimitWindow::CurrentSession => "current_session",
-        SubscriptionLimitWindow::CurrentWeek => "current_week",
-    }
-}
-
-fn parse_subscription_limit_window(
-    value: &str,
-    column: usize,
-) -> rusqlite::Result<SubscriptionLimitWindow> {
-    match value {
-        "primary" => Ok(SubscriptionLimitWindow::Primary),
-        "secondary" => Ok(SubscriptionLimitWindow::Secondary),
-        "current_session" => Ok(SubscriptionLimitWindow::CurrentSession),
-        "current_week" => Ok(SubscriptionLimitWindow::CurrentWeek),
-        _ => Err(rusqlite::Error::FromSqlConversionFailure(
-            column,
-            Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid subscription limit window",
-            )),
-        )),
-    }
-}
-
-const fn subscription_provider_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::ClaudeCode => "Claude",
-        Provider::Codex => "Codex",
-    }
-}
-
-const fn subscription_notification_advice(
-    observed: bool,
-    severity: SubscriptionSeverity,
-) -> &'static str {
-    if !observed {
-        "The local subscription allowance collector has failed repeatedly. Verify the collector and account status. No work was automatically changed."
-    } else {
-        match severity {
-            SubscriptionSeverity::Critical => {
-                "Subscription headroom is critical. Review provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
-            }
-            SubscriptionSeverity::Warning | SubscriptionSeverity::Ok => {
-                "Subscription headroom needs review. Check provider availability and current work allocation. No work was automatically paused, switched, purchased, or reassigned."
-            }
-        }
-    }
-}
-
 fn valid_endpoint_id(value: &str) -> bool {
     (1..=64).contains(&value.len())
         && value
@@ -3472,7 +2740,6 @@ fn load_webhook_snapshot_tasks(
                 result,
             )| {
                 Ok(WebhookSnapshotTask {
-                    depends_on: load_task_dependencies(connection, &id)?,
                     question: load_webhook_open_question(connection, project_id, &id)?,
                     id,
                     title: truncate_utf8(&title, MAX_WEBHOOK_TITLE_BYTES),
@@ -4270,7 +3537,7 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
 }
 
 fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDetail>> {
-    let mut task = connection
+    connection
         .query_row(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms
@@ -4285,7 +3552,6 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
                         id: parse_id(row.get(0)?, 0)?,
                         project_id: parse_id(row.get(1)?, 1)?,
                         parent_task_id: parse_optional_id(parent_id, 2)?,
-                        depends_on: Vec::new(),
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
                         status: parse_task_status(&status, 7)?,
@@ -4299,20 +3565,6 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
             },
         )
         .optional()
-        .map_err(StoreError::from)?;
-    if let Some(task) = task.as_mut() {
-        task.snapshot.depends_on = load_task_dependencies(connection, &task.snapshot.id)?;
-    }
-    Ok(task)
-}
-
-fn load_task_dependencies(connection: &Connection, task_id: &TaskId) -> Result<Vec<TaskId>> {
-    let mut statement = connection.prepare(
-        "SELECT depends_on_task_id FROM task_dependencies
-         WHERE task_id = ?1 ORDER BY ordinal",
-    )?;
-    let rows = statement.query_map(params![task_id.as_str()], |row| parse_id(row.get(0)?, 0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StoreError::from)
 }
 
@@ -4650,6 +3902,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0011_run_stop_intent.sql"))?;
         transaction.pragma_update(None, "user_version", 11)?;
+        transaction.commit()?;
+        current = 11;
+    }
+    if current == 11 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0012_drop_subscription_usage_and_task_dependencies.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 12)?;
         transaction.commit()?;
     }
     Ok(())
