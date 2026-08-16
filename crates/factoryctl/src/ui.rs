@@ -368,10 +368,11 @@ impl FactoryApp {
     }
 
     fn run_for_task(&self, task: &TaskDetail) -> Option<&RunSnapshot> {
-        self.runs.values().find(|run| {
-            run.project_id == task.snapshot.project_id
-                && run.task_id.as_ref() == Some(&task.snapshot.id)
-        })
+        latest_run_for_task(
+            self.runs.values(),
+            &task.snapshot.project_id,
+            &task.snapshot.id,
+        )
     }
 
     fn top_bar(&mut self, context: &egui::Context) {
@@ -995,6 +996,19 @@ fn task_card_text(task: &TaskDetail) -> String {
         task.snapshot.priority,
         task_assignee_text(task)
     )
+}
+
+fn latest_run_for_task<'a>(
+    runs: impl Iterator<Item = &'a RunSnapshot>,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+) -> Option<&'a RunSnapshot> {
+    runs.filter(|run| run.project_id == *project_id && run.task_id.as_ref() == Some(task_id))
+        .max_by(|left, right| {
+            left.updated_at_ms
+                .cmp(&right.updated_at_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        })
 }
 
 fn allocation_counts(
@@ -1758,6 +1772,47 @@ mod tests {
         assert_eq!(allocation_counts(&tasks, None), (1, 0, 0, 0));
         assert_eq!(task_assignee_text(&tasks[0]), "assigned to curie");
         assert_eq!(task_assignee_text(&tasks[2]), "unassigned");
+    }
+
+    #[test]
+    fn task_terminal_selection_prefers_the_most_recent_attempt() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let task_id = factory_core::TaskId::try_from("task-1").unwrap();
+        let older = test_run("run-old", &project_id, &task_id, 10);
+        let newer = test_run("run-new", &project_id, &task_id, 20);
+
+        let selected =
+            super::latest_run_for_task([&newer, &older].into_iter(), &project_id, &task_id)
+                .unwrap();
+        assert_eq!(selected.id, newer.id);
+    }
+
+    fn test_run(
+        id: &str,
+        project_id: &ProjectId,
+        task_id: &factory_core::TaskId,
+        updated_at_ms: i64,
+    ) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::try_from(id).unwrap(),
+            project_id: project_id.clone(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+            parent_run_id: None,
+            task_id: Some(task_id.clone()),
+            status: RunStatus::Succeeded,
+            activity: None,
+            wait_reason: None,
+            worktree: "/work/curie".into(),
+            observer_health: ObserverHealth::Healthy,
+            observer_health_since_ms: updated_at_ms,
+            started_at_ms: updated_at_ms,
+            status_since_ms: updated_at_ms,
+            updated_at_ms,
+            ended_at_ms: Some(updated_at_ms),
+            exit_code: Some(0),
+            exit_signal: None,
+            failure_reason: None,
+        }
     }
 
     fn tasks_snapshot(id: &str) -> TaskSnapshot {
