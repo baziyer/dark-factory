@@ -5,8 +5,9 @@ use factory_core::{
     runner::{MAX_RUNNER_OUTPUT_TEXT_BYTES, OutputStream, RunnerEvent},
 };
 use factoryd::providers::codex::{
-    CodexLaunch, FailureReason, ItemKind, ItemPhase, ItemResult, MAX_CODEX_JSON_LINE_BYTES,
-    MAX_CODEX_PREVIEW_BYTES, Observation, Outcome, ProtocolViolation, Session, TokenUsage, prepare,
+    CodexLaunch, Decoder, FailureReason, ItemKind, ItemPhase, ItemResult,
+    MAX_CODEX_JSON_LINE_BYTES, MAX_CODEX_PREVIEW_BYTES, Observation, Outcome, ProtocolViolation,
+    Session, TokenUsage, prepare,
 };
 
 const THREAD_ID: &str = "0195d40a-1111-7000-8000-000000000001";
@@ -60,6 +61,50 @@ fn decode(text: &str, terminal: RunnerEvent) -> (Vec<Observation>, Outcome) {
     let finished = decoder.finish();
     observations.extend(finished.observations);
     (observations, finished.outcome)
+}
+
+#[test]
+fn recovery_decoders_rebuild_fresh_or_exact_resumed_thread_identity() {
+    let mut fresh = Decoder::fresh();
+    let observations = fresh.push(&stdout(complete_line(THREAD_ID)));
+    assert!(observations.contains(&Observation::ThreadStarted {
+        thread_id: THREAD_ID.to_owned(),
+    }));
+    let _ = fresh.push(&exited(Some(0), None));
+    assert_eq!(fresh.finish().outcome.thread_id(), Some(THREAD_ID));
+
+    let mut resumed = Decoder::resume(THREAD_ID.to_owned()).unwrap();
+    let observations = resumed.push(&stdout(complete_line(THREAD_ID)));
+    assert!(observations.contains(&Observation::ThreadStarted {
+        thread_id: THREAD_ID.to_owned(),
+    }));
+    let _ = resumed.push(&exited(Some(0), None));
+    assert_eq!(resumed.finish().outcome.thread_id(), Some(THREAD_ID));
+
+    let mut mismatched = Decoder::resume(THREAD_ID.to_owned()).unwrap();
+    let observations = mismatched.push(&stdout(complete_line(OTHER_THREAD_ID)));
+    assert!(
+        observations
+            .iter()
+            .all(|observation| !matches!(observation, Observation::ThreadStarted { .. }))
+    );
+    let _ = mismatched.push(&exited(Some(0), None));
+    let finished = mismatched.finish();
+    assert_eq!(finished.outcome.thread_id(), None);
+    assert_eq!(
+        finished.outcome.failure_reason(),
+        Some(FailureReason::Protocol)
+    );
+
+    for invalid in ["", "--last", "not-a-uuid", "0195d40a\nsecret"] {
+        let error = match Decoder::resume(invalid.to_owned()) {
+            Ok(_) => panic!("invalid recovery thread ID was accepted"),
+            Err(error) => error,
+        };
+        if !invalid.is_empty() {
+            assert!(!error.to_string().contains(invalid));
+        }
+    }
 }
 
 #[test]
