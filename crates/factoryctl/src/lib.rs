@@ -93,8 +93,20 @@ impl Client {
     }
 
     pub fn request(&self, request: LocalRequest) -> Result<ServerFrame, ClientError> {
-        let stream = self.connect(request)?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        self.request_with_timeout(request, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::request`] but with an explicit read/write timeout
+    /// instead of the default 15 seconds — e.g. `factoryctl hook`'s 5-second
+    /// fail-open budget, so a slow or wedged daemon never blocks a live
+    /// provider hook invocation.
+    pub fn request_with_timeout(
+        &self,
+        request: LocalRequest,
+        timeout: Duration,
+    ) -> Result<ServerFrame, ClientError> {
+        let stream = self.connect_with_timeout(request, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
         let mut reader = BufReader::new(stream);
         let frame = read_frame(&mut reader)?.ok_or(ClientError::UnexpectedEof)?;
         validate_frame(&frame)?;
@@ -127,8 +139,16 @@ impl Client {
     }
 
     fn connect(&self, request: LocalRequest) -> Result<UnixStream, ClientError> {
+        self.connect_with_timeout(request, REQUEST_TIMEOUT)
+    }
+
+    fn connect_with_timeout(
+        &self,
+        request: LocalRequest,
+        timeout: Duration,
+    ) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(timeout))?;
         write_request(&mut stream, &RequestEnvelope::new(request))?;
         Ok(stream)
     }

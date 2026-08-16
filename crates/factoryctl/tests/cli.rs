@@ -1,13 +1,13 @@
 use std::{
     io::{BufRead, BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixListener},
-    process::Command,
+    process::{Command, Stdio},
     thread,
 };
 
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, RunId, TaskId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskId,
     local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 
@@ -322,6 +322,220 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             ..
         }
     ));
+    server.join().unwrap();
+}
+
+/// `factoryctl hook` forwards its stdin payload and the token file's
+/// contents to the daemon, then prints the daemon's `reply` verbatim (not
+/// wrapped in a `ServerFrame`) and exits 0.
+#[test]
+fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let token_path = directory.path().join("hook.token");
+    std::fs::write(&token_path, "session-token-value").unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::ProviderHook {
+                token: "session-token-value".into(),
+                event: ProviderHookEvent::Stop,
+                payload: serde_json::json!({"stop_hook_active": false}),
+            })
+        );
+        write_response(
+            &mut stream,
+            LocalResponse::ProviderHookReply {
+                reply: serde_json::json!({"decision": "block", "reason": "deliver next task"}),
+            },
+        );
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "hook",
+            "--token-file",
+            token_path.to_str().unwrap(),
+            "Stop",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"stop_hook_active": false}"#)
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        reply,
+        serde_json::json!({"decision": "block", "reason": "deliver next task"})
+    );
+    server.join().unwrap();
+}
+
+/// A hook invocation must never wedge the operator's live provider session:
+/// an unreachable daemon socket still exits 0 and prints `{}`.
+#[test]
+fn hook_fails_open_and_prints_an_empty_object_when_the_daemon_is_unreachable() {
+    let directory = tempfile::tempdir().unwrap();
+    let token_path = directory.path().join("hook.token");
+    std::fs::write(&token_path, "session-token-value").unwrap();
+    let unreachable_socket = directory.path().join("no-daemon-here.sock");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            unreachable_socket.to_str().unwrap(),
+            "hook",
+            "--token-file",
+            token_path.to_str().unwrap(),
+            "SessionStart",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({})
+    );
+}
+
+/// Same fail-open contract when the token file itself cannot be read (a
+/// provider misconfiguration, not a daemon problem) — still exits 0 and
+/// prints `{}`, without ever attempting to contact the daemon.
+#[test]
+fn hook_fails_open_when_the_token_file_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let unreachable_socket = directory.path().join("no-daemon-here.sock");
+    let missing_token = directory.path().join("missing.token");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            unreachable_socket.to_str().unwrap(),
+            "hook",
+            "--token-file",
+            missing_token.to_str().unwrap(),
+            "Notification",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({})
+    );
+}
+
+/// `--project` may be omitted anywhere it is otherwise required if
+/// `$DARK_FACTORY_PROJECT` is set in the process environment, matching how
+/// the daemon exports it into a session.
+#[test]
+fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::GetProject {
+                project_id: ProjectId::try_from("factory").unwrap(),
+            })
+        );
+        // The request having reached the daemon with the env-resolved
+        // project ID, matched above, is what this test is checking; the
+        // response contents are irrelevant, so a minimal frame is enough.
+        write_response(&mut stream, LocalResponse::Health);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "project", "get"])
+        .env("DARK_FACTORY_PROJECT", "factory")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    server.join().unwrap();
+}
+
+/// `agent message --from` falls back to `$DARK_FACTORY_AGENT`, matching how
+/// the daemon exports it into a session so an agent's own `factoryctl agent
+/// message` calls are attributed to it without repeating `--from`.
+#[test]
+fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
+        let LocalRequest::SendAgentMessage {
+            sender_agent_id,
+            recipient_agent_id,
+            body,
+            ..
+        } = request.request
+        else {
+            panic!("expected send-agent-message request");
+        };
+        assert_eq!(
+            sender_agent_id,
+            Some(AgentId::try_from("worker-1").unwrap())
+        );
+        assert_eq!(recipient_agent_id, AgentId::try_from("god").unwrap());
+        assert_eq!(body, "status update");
+        write_response(&mut stream, LocalResponse::Health);
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "agent",
+            "message",
+            "--project",
+            "factory",
+            "--to",
+            "god",
+            "--body",
+            "status update",
+        ])
+        .env("DARK_FACTORY_AGENT", "worker-1")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
     server.join().unwrap();
 }
 

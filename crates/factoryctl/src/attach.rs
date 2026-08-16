@@ -13,7 +13,7 @@ use std::{
 };
 
 use factory_core::{
-    ProjectId, SessionId,
+    AgentId, ProjectId, SessionId,
     local::{LocalRequest, LocalResponse, ServerFrame},
     runner::{decode_terminal_bytes, encode_terminal_bytes},
 };
@@ -25,21 +25,39 @@ use rustix::termios::{self, OptionalActions, Termios};
 /// consumed locally and never forwarded to the remote PTY.
 const DETACH_BYTE: u8 = 0x1D;
 const STDIN_CHUNK_BYTES: usize = 4096;
+/// Page size used while paging through `ListSessions` to resolve
+/// `--agent`; the maximum allowed, so resolving an agent's live session
+/// costs at most one round trip for any project with a normal number of
+/// sessions.
+const RESOLVE_AGENT_PAGE_LIMIT: usize = 1000;
 
-/// Attaches to `session_id`'s PTY: puts the local terminal in raw mode,
+/// What to attach to: either an explicit session, or an agent whose live
+/// session is resolved via `ListSessions` before attaching.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttachTarget {
+    Session(String),
+    Agent(String),
+}
+
+/// Attaches to a session's PTY: puts the local terminal in raw mode,
 /// forwards stdin as `TerminalInput`, prints `TerminalOutput` to stdout,
 /// sends an initial resize plus one on every `SIGWINCH`, and restores the
-/// terminal on exit (including on panic, via unwind) or on `Ctrl-]`.
+/// terminal on exit (including on panic, via unwind) or on `Ctrl-]`. When
+/// `target` is [`AttachTarget::Agent`], first resolves that agent's live
+/// session via `ListSessions`.
 pub fn run(
     client: &Client,
     project_id: &str,
-    session_id: &str,
+    target: &AttachTarget,
     since_offset: u64,
 ) -> Result<i32, String> {
     let project_id = ProjectId::try_from(project_id.to_owned())
         .map_err(|error| format!("invalid project ID: {error}"))?;
-    let session_id = SessionId::try_from(session_id.to_owned())
-        .map_err(|error| format!("invalid session ID: {error}"))?;
+    let session_id = match target {
+        AttachTarget::Session(session_id) => SessionId::try_from(session_id.clone())
+            .map_err(|error| format!("invalid session ID: {error}"))?,
+        AttachTarget::Agent(agent_id) => resolve_agent_session(client, &project_id, agent_id)?,
+    };
 
     let frames = client
         .attach_terminal(LocalRequest::AttachTerminal {
@@ -164,6 +182,53 @@ fn send_resize(client: &Client, project_id: &ProjectId, session_id: &SessionId) 
             cols,
             rows,
         });
+    }
+}
+
+/// Resolves `agent_id`'s current live session by paging through
+/// `ListSessions` until a live session for that agent is found or the
+/// project's sessions are exhausted.
+fn resolve_agent_session(
+    client: &Client,
+    project_id: &ProjectId,
+    agent_id: &str,
+) -> Result<SessionId, String> {
+    let agent_id = AgentId::try_from(agent_id.to_owned())
+        .map_err(|error| format!("invalid agent ID: {error}"))?;
+    let mut after_id: Option<SessionId> = None;
+    loop {
+        let frame = client
+            .request(LocalRequest::ListSessions {
+                project_id: project_id.clone(),
+                after_id: after_id.clone(),
+                limit: Some(RESOLVE_AGENT_PAGE_LIMIT),
+            })
+            .map_err(|error| error.to_string())?;
+        let (sessions, next_after_id) = match frame {
+            ServerFrame::Response {
+                response:
+                    LocalResponse::Sessions {
+                        sessions,
+                        next_after_id,
+                    },
+                ..
+            } => (sessions, next_after_id),
+            ServerFrame::Response {
+                response: LocalResponse::Error { message, .. },
+                ..
+            } => return Err(message),
+            _ => return Err("unexpected daemon response listing sessions".into()),
+        };
+        if let Some(session) = sessions
+            .into_iter()
+            .find(|session| session.agent_id == agent_id && session.state.is_live())
+        {
+            return Ok(session.id);
+        }
+        match next_after_id {
+            Some(next) => after_id = Some(next),
+            None => return Err(format!("agent {agent_id} has no live session to attach to")),
+        }
     }
 }
 
