@@ -75,20 +75,21 @@ Where `checks` runs is a **policy, not a mechanism**: a pull request runs
 the workflow file it carries, so the `runs-on` expression only governs an
 unmodified workflow.
 
-- **Same-repository refs** (branches only collaborators can push, and
-  `main` itself) run on the maintainer's persistent Mac, the self-hosted
-  runner `dark-factory-mac` — warm cargo cache, real macOS, no hosted
-  minutes.
-- **Pull requests from forks** run on an ephemeral hosted macOS runner —
-  *if* their workflow file is unmodified. Every fork's workflow run waits
-  for the maintainer's approval; a fork PR that edits `runs-on` in
-  `.github/workflows/ci.yml` would run on the Mac the moment that approval
-  is given. So the boundary is the maintainer reading `.github/workflows/`
-  in a fork's diff before approving it — GitHub's own guidance is that
-  self-hosted runners and public repositories don't mix for exactly this
-  reason. If that discipline ever feels thin, switching `runs-on` to
-  `macos-latest` for all pull requests is a one-line change (hosted
-  minutes are free for public repositories).
+- **Every pull request** — same-repository or a fork — runs on an
+  ephemeral hosted macOS runner (`macos-latest`; hosted minutes are free
+  for public repositories). PR code hasn't been reviewed yet, so it never
+  touches the operator's own machine, regardless of who opened the PR.
+  Every fork's workflow run additionally waits for the maintainer's
+  approval before it runs at all (`scripts/github-repo-settings.sh` sets
+  that policy) — GitHub's own guidance is that self-hosted runners and
+  public repositories don't mix, so a fork PR gets no path to the
+  self-hosted runner at all, approved or not.
+- **`push` to `main`** (already merged, already reviewed — the only way
+  code lands there is `main-review`'s CODEOWNERS-approval ruleset above)
+  runs on the maintainer's persistent Mac, the self-hosted runner
+  `dark-factory-mac` — warm cargo cache, real macOS, no hosted minutes.
+  `release.yml`'s tag-push trigger uses the same runner for the same
+  reason: only a maintainer can push a tag.
 
 Known problems are GitHub issues labelled `known-issue`, see
 `CONTRIBUTING.md`.

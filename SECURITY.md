@@ -68,13 +68,20 @@ operator from their own agents. Concretely:
 
 ## For contributors
 
-`.github/workflows/ci.yml` runs pull requests from this repository's own
-branches on the maintainer's persistent Mac and pull requests from forks on
-an ephemeral hosted runner. That split is decided by the workflow file the
-pull request itself carries, so it is a policy, not a mechanism: every
-workflow run from a fork needs the maintainer's approval, and the
-maintainer reads `.github/workflows/` in the fork's diff before granting
-it. A change to that boundary is a security change and gets reviewed as
-one. AGENTS.md's adversarial review explicitly includes "security: nothing
-widens what an agent session, a webhook caller, or an untrusted PR can
-reach".
+`.github/workflows/ci.yml` never runs pull request code — from this
+repository's own branches or a fork — on the maintainer's persistent Mac,
+because a pull request's `checks` run uses the workflow file *the pull
+request itself carries*, so a same-repository branch could edit `runs-on`
+in its own diff exactly as easily as a fork could: no PR is trusted more
+than any other before it's been reviewed. Every `pull_request` event runs
+on an ephemeral hosted macOS runner instead, and a fork's workflow run
+additionally needs the maintainer's approval before it runs at all. The
+persistent Mac only ever executes a commit that's already on protected
+`main` (via `main-review`'s CODEOWNERS-approval ruleset) or a maintainer's
+own tag push in `release.yml` — both refs a pull request diff cannot
+reach. An agent's own generated PR code is held to that same boundary: it
+runs `local-ci.sh` on the hosted runner, never on the operator's machine,
+until it's merged. A change to any of this is a security change and gets
+reviewed as one. AGENTS.md's adversarial review explicitly includes
+"security: nothing widens what an agent session, a webhook caller, or an
+untrusted PR can reach".
