@@ -1,11 +1,11 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     os::unix::{fs::PermissionsExt, net::UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use factory_core::{
@@ -23,9 +23,44 @@ const INSTANCE_ID: &str = "instance-1";
 
 struct RunningRunner {
     child: Option<Child>,
-    stderr: Option<std::process::ChildStderr>,
     runtime: PathBuf,
     _directory: tempfile::TempDir,
+}
+
+// TEMPORARY: investigation instrumentation for #55, removed before the real
+// fix lands. `cargo test` only captures the *test process's* own stdout and
+// stderr; the runner subprocess's stderr (where lib.rs's `stop_trace` writes)
+// is otherwise piped and silently dropped. Forward it line-by-line onto the
+// test's own stderr, prefixed by pid, so it lands in the `cargo test`
+// (and therefore CI log) output next to the test that triggered it.
+fn forward_stderr(pid: u32, stderr: std::process::ChildStderr) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => eprintln!("[runner pid={pid} stderr] {line}"),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+// TEMPORARY: investigation instrumentation for #55. libtest captures
+// eprintln! from the test's own thread and only shows it for a *failing*
+// test; printing from a throwaway background thread bypasses that capture
+// so timing shows up for green runs too, which is what we need to compare
+// runner-side timestamps against test-observed timestamps across the many
+// reruns this investigation needs on hosted macOS.
+fn trace(message: impl Into<String>) {
+    let message = message.into();
+    let _ = thread::spawn(move || eprintln!("[test-trace {}] {message}", now_ms())).join();
 }
 
 impl RunningRunner {
@@ -50,10 +85,12 @@ impl RunningRunner {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let stderr = child.stderr.take();
+        let pid = child.id();
+        if let Some(stderr) = child.stderr.take() {
+            forward_stderr(pid, stderr);
+        }
         let mut runner = Self {
             child: Some(child),
-            stderr,
             runtime,
             _directory: directory,
         };
@@ -76,7 +113,10 @@ impl RunningRunner {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-        let stderr = child.stderr.take();
+        let pid = child.id();
+        if let Some(stderr) = child.stderr.take() {
+            forward_stderr(pid, stderr);
+        }
         let mut stdin = child.stdin.take().unwrap();
         let input = input.to_vec();
         let (sent, received) = std::sync::mpsc::channel();
@@ -87,7 +127,6 @@ impl RunningRunner {
         });
         let mut runner = Self {
             child: Some(child),
-            stderr,
             runtime,
             _directory: directory,
         };
@@ -114,11 +153,9 @@ impl RunningRunner {
                 return;
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = self.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                panic!("runner exited before ready: {status}; stderr: {stderr:?}");
+                panic!(
+                    "runner exited before ready: {status}; see forwarded [runner stderr] lines above"
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -126,7 +163,12 @@ impl RunningRunner {
     }
 
     fn wait_for_terminal_spool(&self) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let started = Instant::now();
+        trace(format!(
+            "wait_for_terminal_spool start runner_pid={}",
+            self.runner_pid()
+        ));
+        let deadline = started + Duration::from_secs(8);
         while Instant::now() < deadline {
             let spool = fs::read_to_string(self.spool()).unwrap_or_default();
             if spool.lines().any(|line| {
@@ -137,11 +179,33 @@ impl RunningRunner {
                     )
                 })
             }) {
+                trace(format!(
+                    "wait_for_terminal_spool observed terminal event after {:?}",
+                    started.elapsed()
+                ));
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("runner did not persist a terminal event");
+        // TEMPORARY: investigation instrumentation for #55, removed before
+        // the real fix lands. Dump everything we can about the runner's
+        // state at the moment the 8s deadline actually fired.
+        let elapsed = started.elapsed();
+        let spool = fs::read_to_string(self.spool()).unwrap_or_default();
+        let ps = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,stat,command"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+        trace(format!(
+            "wait_for_terminal_spool TIMED OUT runner_pid={} elapsed={elapsed:?}",
+            self.runner_pid()
+        ));
+        eprintln!(
+            "[wait_for_terminal_spool timeout] runner_pid={} elapsed={elapsed:?}\nspool contents:\n{spool}\nfull ps -eo pid,ppid,pgid,stat,command:\n{ps}",
+            self.runner_pid()
+        );
+        panic!("runner did not persist a terminal event (elapsed={elapsed:?})");
     }
 
     fn assert_still_running(&mut self) {

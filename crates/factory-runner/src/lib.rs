@@ -1540,11 +1540,15 @@ async fn supervise_piped(
     let mut runner_signalled = false;
     let status = loop {
         tokio::select! {
-            status = child.wait() => break status?,
+            status = child.wait() => {
+                stop_trace(pid, "child.wait() returned in primary loop");
+                break status?
+            },
             command = stops.recv() => {
                 let Some(command) = command else {
                     continue;
                 };
+                stop_trace(pid, &format!("stop received grace_ms={}", command.grace.as_millis()));
                 if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
@@ -1560,6 +1564,7 @@ async fn supervise_piped(
                 begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                stop_trace(pid, "primary grace elapsed, sending SIGKILL to group");
                 signal_process_group(pid, Signal::KILL)?;
                 kill_deadline = None;
             }
@@ -1582,11 +1587,21 @@ async fn supervise_piped(
         }
     };
 
-    if process_group_exists(pid)? {
+    let group_exists = process_group_exists(pid)?;
+    stop_trace(
+        pid,
+        &format!("post-wait process_group_exists={group_exists}"),
+    );
+    if group_exists {
         begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+        stop_trace(
+            pid,
+            "second-stage group_termination armed (DEFAULT_GROUP_GRACE)",
+        );
         loop {
             tokio::select! {
                 () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                    stop_trace(pid, "second-stage grace elapsed, sending SIGKILL to group");
                     signal_process_group(pid, Signal::KILL)?;
                     break;
                 }
@@ -1603,6 +1618,7 @@ async fn supervise_piped(
                 }
             }
         }
+        stop_trace(pid, "second-stage loop exited");
     }
 
     let output_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
@@ -1610,6 +1626,10 @@ async fn supervise_piped(
         stderr_task.join().await
     })
     .await;
+    stop_trace(
+        pid,
+        &format!("output drain finished ok={}", output_result.is_ok()),
+    );
     match output_result {
         Ok(result) => result?,
         Err(_) => {
@@ -1628,6 +1648,7 @@ async fn supervise_piped(
         true,
     )
     .await?;
+    stop_trace(pid, "Exited event persisted to spool");
     process_group.disarm();
     if runner_signalled {
         Ok(SupervisionOutcome::RunnerSignalled)
@@ -2068,6 +2089,25 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+// TEMPORARY: investigation instrumentation for #55, removed before the real
+// fix lands. Prints a timestamped line (plus a `ps` snapshot of the child's
+// process group) to the runner's own stderr, which the test harness does not
+// otherwise consume, so this is safe under the pipe-buffer limits of a
+// handful of lines per test.
+fn stop_trace(pid: Pid, message: &str) {
+    let snapshot = std::process::Command::new("ps")
+        .args(["-o", "pid,ppid,pgid,stat,command", "-g"])
+        .arg(pid.as_raw_nonzero().to_string())
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+    eprintln!(
+        "[stop-trace {} pid={}] {message}\n{snapshot}",
+        now_ms(),
+        pid.as_raw_nonzero()
+    );
 }
 
 #[cfg(test)]
