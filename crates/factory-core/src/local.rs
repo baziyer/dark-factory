@@ -371,10 +371,15 @@ pub enum LocalResponse {
     /// two sibling binaries -- both already confirmed executable at
     /// startup by the daemon's own preflight (see `factoryd::main`'s
     /// `preflight_sibling_binaries`), so a healthy response is always a
-    /// guarantee, not just a snapshot of configuration.
+    /// guarantee, not just a snapshot of configuration -- and the daemon's
+    /// own version (`CARGO_PKG_VERSION`; empty from a daemon older than
+    /// this field), so `factoryctl update`/`doctor` can tell whether the
+    /// binaries on disk are the ones actually running.
     Health {
         runner_path: String,
         factoryctl_path: String,
+        #[serde(default)]
+        version: String,
     },
     ProjectCreated {
         project: ProjectSnapshot,

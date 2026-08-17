@@ -94,6 +94,7 @@ fn health_prints_exactly_one_machine_readable_server_frame() {
                 response: LocalResponse::Health {
                     runner_path: "/opt/factory-runner".to_owned(),
                     factoryctl_path: "/opt/factoryctl".to_owned(),
+                    version: "0.1.0".to_owned(),
                 },
             },
         )
@@ -482,6 +483,7 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
             LocalResponse::Health {
                 runner_path: "/opt/factory-runner".to_owned(),
                 factoryctl_path: "/opt/factoryctl".to_owned(),
+                version: "0.1.0".to_owned(),
             },
         );
     });
@@ -530,6 +532,7 @@ fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable(
             LocalResponse::Health {
                 runner_path: "/opt/factory-runner".to_owned(),
                 factoryctl_path: "/opt/factoryctl".to_owned(),
+                version: "0.1.0".to_owned(),
             },
         );
     });
