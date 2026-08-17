@@ -61,6 +61,13 @@ fn init_creates_the_home_installs_this_build_and_activates_it() {
     assert!(stdout.contains("git: "), "{stdout}");
     assert!(
         stdout.contains(&format!(
+            "codex home for agents: {}",
+            root.path().join("user-home/.codex").display()
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
             "install: bin/current -> {}",
             factoryctl::update::CURRENT_VERSION
         )),
@@ -160,5 +167,10 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
     assert_eq!(status("launchd"), "warn");
     assert_eq!(status("git"), "ok");
     assert_eq!(status("claude.json"), "warn");
+    assert_eq!(
+        status("codex-seed"),
+        "warn",
+        "the throwaway HOME has no ~/.codex/auth.json"
+    );
     assert_eq!(status("update"), "warn");
 }

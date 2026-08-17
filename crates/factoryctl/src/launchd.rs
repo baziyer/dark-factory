@@ -31,6 +31,11 @@ pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Enough to find Homebrew/system tools; the provider CLIs' own directories
 /// are prepended by [`merged_path`].
 pub const BASE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+/// Daemon settings that live in the job's environment and are taken from
+/// the environment `factoryctl init`/`update --install` run in when set
+/// there (an existing job's value is kept otherwise). `CODEX_HOME` is which
+/// Codex account agents seed their credentials from.
+pub const CARRIED_ENVIRONMENT: [&str; 1] = ["CODEX_HOME"];
 const BOOTSTRAP_ATTEMPTS: u32 = 6;
 const BOOTSTRAP_RETRY: Duration = Duration::from_millis(500);
 
@@ -257,6 +262,11 @@ pub fn apply(
     let mut environment = existing
         .map(|job| job.environment.clone())
         .unwrap_or_default();
+    for key in CARRIED_ENVIRONMENT {
+        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
+        }
+    }
     let path = merged_path(
         environment.get("PATH").map(String::as_str),
         provider_directories,

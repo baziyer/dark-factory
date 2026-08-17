@@ -73,6 +73,22 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         }
     }
 
+    // Which Codex account agents will use: the launchd job's setting if it
+    // has one, else this shell's, else the operator's own ~/.codex.
+    let plist = launchd::plist_path(&user_home);
+    let existing = launchd::read_existing(&plist)?;
+    let seed_home =
+        probes::codex_seed_home(existing.as_ref().map(|job| &job.environment), &user_home);
+    println!(
+        "codex home for agents: {} ({}; run init with CODEX_HOME=<other home> to use another account)",
+        seed_home.display(),
+        if seed_home.join("auth.json").is_file() {
+            "auth.json present"
+        } else {
+            "no auth.json -- Codex agents will have no credentials until that home is logged in"
+        }
+    );
+
     // 3. Install this build.
     let source = env::current_exe()
         .map_err(|error| error.to_string())?
@@ -107,7 +123,6 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     // 4. What Dark Factory writes outside $DARK_FACTORY_HOME -- said every
     //    time, whether or not launchd is touched.
-    let plist = launchd::plist_path(&user_home);
     let claude_json = user_home.join(".claude.json");
     println!(
         "\nDark Factory writes three things outside {}:\n  \
@@ -116,10 +131,11 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
            never blocks on the trust prompt (only if that file already exists and parses; nothing else in it changes)\n  \
          - each project's own git repository: `git worktree add -b agent/<id>` per agent (the worktree goes with the\n    \
            agent; the branch stays)\n  \
-         Codex sessions get a per-agent CODEX_HOME seeded from ~/.codex/config.toml with auth.json symlinked, inside {}.",
+         Codex sessions get a per-agent CODEX_HOME seeded from {}'s config.toml with its auth.json symlinked, inside {}.",
         home.display(),
         plist.display(),
         claude_json.display(),
+        seed_home.display(),
         home.display()
     );
     if !claude_json.is_file() {
@@ -145,7 +161,6 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     // 5. The launchd job. Refuse to race a daemon someone started by hand
     //    on the same socket: launchd's copy would crash-loop on AddrInUse
     //    while the old one kept answering health.
-    let existing = launchd::read_existing(&plist)?;
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
     }
