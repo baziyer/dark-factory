@@ -302,12 +302,11 @@ again on every reconnect attempt is harmless.
 If the tty stays in canonical mode for 120 s, the runner emits
 `RunnerEvent::TerminalRawTimedOut`. The daemon logs a warning for a Codex
 session, does not synthesize `SessionStart`, and leaves the session
-`starting`. Issue #52 adds the durable session-start deadline and needs the
-session to remain `starting` so it can fail and retry it. Until #52 lands,
-there is no durable backstop: the session stays `starting` until an operator
-posts its `SessionStart` hook by hand. An old runner under a new daemon does
-not know `TerminalRaw`, so it cannot trigger synthesis and has the same
-outcome. The bounded poll never loops or guesses that the terminal is ready.
+`starting`. Issue #52 provides the durable session-start deadline and needs
+the session to remain `starting` so it can fail and retry it. An old runner
+under a new daemon does not know `TerminalRaw`, so it cannot trigger
+synthesis and relies on the same deadline. The bounded poll never loops or
+guesses that the terminal is ready.
 
 No config on the Dark Factory side can fix Codex's own deferred
 `SessionStart` dispatch — it is Codex's own session-lifecycle timing, not a
