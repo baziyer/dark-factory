@@ -60,6 +60,12 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
             ));
         }
     }
+    if let Some(version) = &board.update_available {
+        spans.push(Span::styled(
+            format!("  update v{version} available: factoryctl update --install"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

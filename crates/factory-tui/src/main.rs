@@ -81,6 +81,10 @@ fn parse_args() -> Config {
                 print_help();
                 std::process::exit(0);
             }
+            "--version" | "-V" => {
+                println!("factory-tui {}", factoryctl::update::CURRENT_VERSION);
+                std::process::exit(0);
+            }
             other => {
                 eprintln!("factory-tui: unknown argument {other:?}\n");
                 print_help();
@@ -109,7 +113,8 @@ fn print_help() {
          --dev-local-pty       TERMINALS/FOCUS attach a local shell instead of a live daemon\n                          \
          session (offline testing only — see README.md)\n    \
          --debug-log DIR       With --dev-local-pty, log a pane's raw PTY bytes to DIR\n    \
-         -h, --help            Show this help\n\n\
+         -h, --help            Show this help\n    \
+         --version             Print the version\n\n\
          See README.md for the full key reference."
     );
 }
@@ -215,7 +220,9 @@ fn run(
     // time; redraws themselves only happen when something actually changed (see `needs_redraw`).
     let tick = Duration::from_millis(150);
     let mut last_second = Instant::now();
+    let mut last_update_check = Instant::now();
     let mut cli_project_applied = false;
+    net::spawn_update_check(tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, debug_log);
     terminal.draw(|frame| ui::draw(frame, board, panes))?;
@@ -263,6 +270,10 @@ fn run(
             board.tick(now_ms());
             last_second = Instant::now();
             needs_redraw = true;
+            if last_update_check.elapsed() >= factoryctl::update::CHECK_INTERVAL {
+                net::spawn_update_check(tx.clone(), now_ms());
+                last_update_check = Instant::now();
+            }
         }
 
         if needs_redraw {
@@ -455,6 +466,9 @@ fn apply_net_msg(
         NetMsg::OperationResult(result) => board.apply_response(result),
         NetMsg::TaskDetailResult { task_id, result } => {
             board.apply_task_detail_result(task_id, result);
+        }
+        NetMsg::UpdateCheck(check) => {
+            board.update_available = check.available().map(|manifest| manifest.version.clone());
         }
     }
 }
