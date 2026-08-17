@@ -27,6 +27,7 @@ use factory_core::{
         encode_terminal_bytes,
     },
 };
+use nix::sys::termios::LocalFlags;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{
     Pid, Signal, WaitOptions, kill_process_group, test_kill_process_group, waitpid,
@@ -81,6 +82,16 @@ const GROUP_CLEANUP_GRACE: Duration = Duration::from_millis(200);
 /// the full grace it was given.
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_COMMAND_ID_BYTES: usize = 128;
+/// How often [`pty_raw_mode_poll_loop`] calls `tcgetattr` on the pty
+/// master while waiting for the child to leave canonical mode.
+const RAW_MODE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long [`pty_raw_mode_poll_loop`] keeps polling before giving up.
+/// Matches the order of magnitude of `factoryd::execution::STARTUP_GRACE`
+/// (the daemon's own bound on a provider process becoming reachable at
+/// all) -- a provider that has not left canonical mode by then is not
+/// going to, and the daemon must not wait on `RunnerEvent::TerminalRaw`
+/// forever either (`docs/providers.md`).
+const RAW_MODE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
 const TERMINAL_LOG_FILE: &str = "terminal.log";
@@ -1754,12 +1765,24 @@ async fn supervise_terminal(
         .master
         .take_writer()
         .map_err(|error| Error::Task(format!("failed to take pty writer: {error}")))?;
-    let master = pair.master;
+    // Shared (not moved outright) so `pty_raw_mode_poll_loop` can keep
+    // calling the trait's own safe `get_termios()` from a second thread
+    // without needing `unsafe` fd tricks (this workspace forbids
+    // `unsafe_code`) -- `MasterPty::resize`/`get_termios` both take `&self`,
+    // so a `tokio::sync::Mutex` (locked with `blocking_lock`, since both
+    // holders are plain OS threads, not tasks) around the one `Box<dyn
+    // MasterPty + Send>` is enough; there is no other mutation to race.
+    let master = Arc::new(Mutex::new(pair.master));
 
     let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(64);
     std::thread::spawn(move || pty_reader_loop(reader, output_tx));
     let (control_tx, control_rx) = mpsc::channel::<PtyControl>(TERMINAL_COMMAND_CAPACITY);
-    std::thread::spawn(move || pty_control_loop(master, writer, control_rx));
+    std::thread::spawn({
+        let master = Arc::clone(&master);
+        move || pty_control_loop(master, writer, control_rx)
+    });
+    let (raw_mode_tx, mut raw_mode_rx) = oneshot::channel();
+    std::thread::spawn(move || pty_raw_mode_poll_loop(master, raw_mode_tx));
     let (exit_tx, mut exit_rx) = oneshot::channel();
     std::thread::spawn(move || {
         let result = waitpid(Some(pid), WaitOptions::empty()).map_err(io::Error::from);
@@ -1770,6 +1793,7 @@ async fn supervise_terminal(
     let mut runner_signalled = false;
     let mut stop_requested = false;
     let mut reader_open = true;
+    let mut raw_mode_pending = true;
     let status = loop {
         tokio::select! {
             result = &mut exit_rx => {
@@ -1786,6 +1810,18 @@ async fn supervise_terminal(
                 Some(bytes) => terminal_log.append(bytes).await?,
                 None => reader_open = false,
             },
+            // Once we have received (or the sender was dropped, meaning the
+            // poll thread's own deadline elapsed with nothing detected) we
+            // stop selecting on this branch entirely rather than leaving a
+            // completed future to poll forever. See `RunnerEvent::
+            // TerminalRaw`'s own doc comment for why this is logged once,
+            // non-terminal, like `Started`.
+            result = &mut raw_mode_rx, if raw_mode_pending => {
+                raw_mode_pending = false;
+                if result.is_ok() {
+                    log.append_lifecycle(RunnerEvent::TerminalRaw, false).await?;
+                }
+            }
             command = stops.recv() => {
                 let Some(command) = command else {
                     continue;
@@ -1893,7 +1929,7 @@ fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, output_tx: mpsc::S
 }
 
 fn pty_control_loop(
-    master: Box<dyn MasterPty + Send>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     mut writer: Box<dyn std::io::Write + Send>,
     mut control_rx: mpsc::Receiver<PtyControl>,
 ) {
@@ -1904,7 +1940,7 @@ fn pty_control_loop(
                 let _ = writer.flush();
             }
             PtyControl::Resize { cols, rows } => {
-                let _ = master.resize(PtySize {
+                let _ = master.blocking_lock().resize(PtySize {
                     rows,
                     cols,
                     pixel_width: 0,
@@ -1914,6 +1950,38 @@ fn pty_control_loop(
         }
     }
     drop(master);
+}
+
+/// The dedicated thread `supervise_terminal` starts alongside
+/// `pty_control_loop`, sharing the same `master` (see its own doc comment
+/// for why a `Mutex` rather than moving it outright): polls the pty's line
+/// discipline every [`RAW_MODE_POLL_INTERVAL`] for up to
+/// [`RAW_MODE_POLL_TIMEOUT`], sending once, only once, the moment `ICANON`
+/// clears -- the child took its controlling tty out of canonical mode. See
+/// `RunnerEvent::TerminalRaw`'s own doc comment for why that is the signal
+/// `supervise_terminal` waits on before logging it. If the deadline elapses
+/// with nothing detected, `detected` is simply dropped -- `TerminalRaw` is
+/// an optimization the daemon can act on, never something a session's
+/// liveness depends on (`#52`'s deadline is the honest fallback if it
+/// never arrives).
+fn pty_raw_mode_poll_loop(
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    detected: oneshot::Sender<()>,
+) {
+    let deadline = std::time::Instant::now() + RAW_MODE_POLL_TIMEOUT;
+    loop {
+        let termios = master.blocking_lock().get_termios();
+        if let Some(termios) = termios {
+            if !termios.local_flags.contains(LocalFlags::ICANON) {
+                let _ = detected.send(());
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(RAW_MODE_POLL_INTERVAL);
+    }
 }
 
 fn prepare_startup_stdin(input: Option<Vec<u8>>) -> Result<Stdio, Error> {

@@ -297,6 +297,7 @@ version = "0.1.0"
 dependencies = [
  "factory-core",
  "factoryd",
+ "nix",
  "portable-pty",
  "rustix 1.1.4",
  "serde_json",

@@ -159,6 +159,12 @@ fn event_frames_freeze_started_output_and_exited_shapes() {
             }),
         ),
         (
+            RunnerEvent::TerminalRaw,
+            serde_json::json!({
+                "type": "terminal_raw"
+            }),
+        ),
+        (
             RunnerEvent::Exited {
                 exit_code: Some(0),
                 signal: None,
