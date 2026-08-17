@@ -89,17 +89,42 @@ catalogue.
    directly or via its own session's shell access to it) — it may choose and
    delegate work, but it cannot bypass daemon-owned limits or reach SQLite
    directly.
-9. Once deletion of an agent or project begins, no component may create new
-   state under that identity. `DeleteAgent`/`DeleteProject` mark the
-   identity deleting under the execution manager's own dispatch lock before
-   touching anything else, so the dispatcher's next look at that agent
-   declines to begin a new spawn preparation (composing guidance, writing a
-   provider's generated config) for it; the request then waits, bounded,
-   for a preparation already in flight to finish, and only then deletes the
-   database rows and the identity's owned files, in that order. A file
-   removal that still fails after that wait is the request's own error, not
-   a log line and a swallowed failure — deletion never reports success
-   while files it was supposed to remove still exist.
+9. Once deletion of an agent or project begins, every known writer of files
+   under its identity is blocked from starting a new write and drained if
+   one is already running, before any of those files are removed. The
+   mechanism is a per-identity `deleting` mark plus an in-flight `preparing`
+   count (`execution::DeleteGate`, generic over `AgentId`/`ProjectId`),
+   checked and incremented atomically under one lock so a delete beginning
+   and a fresh write can never race past each other. `DeleteAgent`/
+   `DeleteProject` set the mark first, then wait (bounded, 5s) for
+   `preparing` to reach zero; every gated writer below participates by
+   wrapping its write in the same check-in/check-out pair. Once a delete's
+   wait returns, it removes the identity's owned files, *then* its database
+   row (files first, so a removal failure — unrelated to this race, e.g. a
+   permission problem — leaves the row intact and the request retryable,
+   rather than a ledger entry with no request left able to target its
+   leftover files); a removal that still fails is the request's own error,
+   never a log line and a swallowed failure.
+   - Agent-scoped (`AgentId` gate, embedded in `SpawnBackoff`): gates the
+     dispatcher's spawn preparation (composing guidance, writing a
+     provider's generated config), an idle session's delivery composition
+     (`compose_text`'s `guidance::read_or_create`), and the local-API
+     handlers that read-or-lazily-create or overwrite an agent's guidance
+     files outside the dispatcher (`GetAgent`/`AgentStatus`,
+     `UpdateAgentProfile`).
+   - Project-scoped (`ProjectId` gate, `Handle::project_gate`): gates
+     `CreateAgent`'s worktree/guidance-tree provisioning for a brand-new
+     agent id — the one writer a `DeleteProject` already in progress can
+     never have covered through the agent-scoped gate above, since that id
+     didn't exist yet for it to mark.
+   - Known gap, not gated: a `Stop`/`SubagentStop` hook reply
+     (`stop_hook_reply`, reached directly from the local control API's
+     `ProviderHook` handler, not through the dispatcher) composes a
+     delivery the same way the dispatcher's idle-session path does, but
+     without access to the execution manager's gate from that call chain.
+     Reaching it requires a live session to end its episode exactly while
+     a delete is draining — narrow, and left as a follow-up rather than
+     threading the gate through the hook-reply path in this change.
 
 ## First launch
 

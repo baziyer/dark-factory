@@ -1322,6 +1322,141 @@ async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
     .await;
 }
 
+/// Regression test for PR #50's review, should-fix 4: a `DeleteAgent`
+/// whose guidance-directory removal fails for a reason unrelated to #42's
+/// race (a permission problem is the reviewer's own deterministic repro,
+/// reused here) must leave the agent's ledger row intact so the operator
+/// can fix the problem and retry -- not report the row deleted while its
+/// files linger with no `DeleteAgent` left able to target them.
+/// `delete_agent_locked` now removes files *before* the database row
+/// (see its doc comment), so this is deterministic: chmod the agent's
+/// parent `agents/` directory to `0500` (read+execute, no write) so
+/// `fs::remove_dir_all` on the agent's own directory fails with `EACCES`
+/// -- no timing involved at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_guidance_removal_leaves_the_agent_retryable_not_half_deleted() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Shell,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+
+        let guidance_root = socket.parent().unwrap();
+        let agents_root = factory_core::paths::agents_root(guidance_root, &project_id("factory"));
+        let agent_guidance_dir = factory_core::paths::agent_dir(
+            guidance_root,
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        assert!(agent_guidance_dir.is_dir());
+
+        // Removing an entry needs write+execute on its *parent*, not the
+        // entry itself -- chmod the shared `agents/` directory, not
+        // `curie`'s own.
+        std::fs::set_permissions(&agents_root, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let first_attempt = request(
+            &socket,
+            LocalRequest::DeleteAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                first_attempt,
+                ServerFrame::Response {
+                    response: LocalResponse::Error {
+                        code: ErrorCode::Internal,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "removal failure must surface as this request's own error, got {first_attempt:?}"
+        );
+        assert!(
+            agent_guidance_dir.is_dir(),
+            "the failed removal must not have partially removed the directory"
+        );
+
+        let still_there = request(
+            &socket,
+            LocalRequest::GetAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                still_there,
+                ServerFrame::Response {
+                    response: LocalResponse::Agent { .. },
+                    ..
+                }
+            ),
+            "the agent's row must survive a failed delete so the operator can retry, got \
+             {still_there:?}"
+        );
+
+        // Fix the permission problem and retry: this is exactly the
+        // recovery path the reordering exists to make possible.
+        std::fs::set_permissions(&agents_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let retry = request(
+            &socket,
+            LocalRequest::DeleteAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            retry,
+            ServerFrame::Response {
+                response: LocalResponse::AgentDeleted { .. },
+                ..
+            }
+        ));
+        assert!(!agent_guidance_dir.exists());
+    })
+    .await;
+}
+
 /// `CreateAgent.worktree` validates an operator override (D3): rejects a
 /// non-existent path, accepts and durably records an existing one.
 /// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the
