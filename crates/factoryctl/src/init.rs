@@ -73,8 +73,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         }
     }
 
-    // Which Codex account agents will use: the launchd job's setting if it
-    // has one, else this shell's, else the operator's own ~/.codex.
+    // Which Codex account agents will use.
     let plist = launchd::plist_path(&user_home);
     let existing = launchd::read_existing(&plist)?;
     // The same precedence launchd::apply uses: this shell's CODEX_HOME wins,
