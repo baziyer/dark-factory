@@ -611,12 +611,17 @@ struct BackoffTiming {
     consecutive_failures: u32,
     /// How many of `consecutive_failures` in a row, most recently, were a
     /// [`SESSION_START_DEADLINE`] expiry specifically (issue #24 finding
-    /// 4) rather than any other kind of spawn failure -- cleared by
-    /// [`SpawnBackoff::record_success`] exactly like everything else in
-    /// this entry, so an unrelated ordinary spawn failure in between two
-    /// deadline expiries also resets the streak (it is not "3 deadline
-    /// failures ever", it is "3 in a row with nothing else, including a
-    /// success, in between").
+    /// 4) rather than any other kind of spawn failure -- cleared only by
+    /// [`SpawnBackoff::record_success`]'s whole-entry reset (the session
+    /// actually reaching `idle`, or an operator resume,
+    /// [`Handle::resume_backoff`]). An ordinary spawn failure
+    /// ([`SpawnBackoff::record_failure`]) does *not* clear it: `bump`
+    /// only touches `delay`/`consecutive_failures`/`next_attempt_at`, on
+    /// purpose -- a spawn that fails outright (e.g. a broken runner path)
+    /// says nothing about whether the *provider's own hook* is working,
+    /// so it must not excuse a run of deadline expiries. This is "3
+    /// deadline failures since the last success", not "3 in an unbroken
+    /// row with literally nothing else in between".
     consecutive_start_deadlines: u32,
 }
 
@@ -1086,7 +1091,19 @@ async fn dispatch_agent(
             )
             .await
         }
-        Some(_) => Ok(()),
+        Some(_) => {
+            // `working`/`waiting_for_input` (the only states left --
+            // `live_session_for_agent` only ever returns a still-live row,
+            // so `stopped`/`failed` can't reach here): reachable only via
+            // hook transitions that themselves require `SessionStart` to
+            // have already fired (`record_hook_event`'s state machine), so
+            // this is exactly as much proof of success as the `Idle` arm
+            // above -- a session the dispatcher's own polling never
+            // happened to catch sitting `idle` (busy again by the very
+            // next observation) must not leave a stale streak behind.
+            backoff.record_success(agent_id);
+            Ok(())
+        }
     }
 }
 
