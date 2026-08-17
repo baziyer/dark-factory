@@ -615,3 +615,51 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     );
     runner.wait_for_clean_exit();
 }
+
+/// Terminal-mode equivalent of `runner.rs`'s
+/// `natural_leader_exit_terminates_a_descendant_that_retains_output_pipes`:
+/// the leader exits entirely on its own (no `Stop` is ever sent), leaving a
+/// well-behaved backgrounded descendant that the group cleanup has to reap.
+/// `supervise_piped` and `supervise_terminal` share that cleanup
+/// (`reap_group_stragglers` in `lib.rs`) but reach it through separate,
+/// independently maintained spawn/wait/PTY plumbing, so a regression
+/// specific to the PTY path (or to how `supervise_terminal` calls the
+/// shared helper) would still slip through without PTY-mode coverage of its
+/// own. `sleep`, with no trap, dies from the cleanup's first TERM almost
+/// immediately, so this should complete in well under a second, not the
+/// ~2s a blind wait would take.
+#[test]
+fn natural_leader_exit_reaps_a_well_behaved_descendant_without_the_old_multi_second_wait() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("background.pid");
+    let runner = RunningTerminalRunner::spawn(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "sleep 30 & echo $! > \"$1\"",
+            "sh",
+            marker.to_str().unwrap(),
+        ],
+        80,
+        24,
+    );
+    wait_for_path(&marker);
+    let started = Instant::now();
+    runner.wait_for_terminal_spool();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "reaping a well-behaved descendant after the leader's natural exit took {elapsed:?}; \
+         group cleanup should poll and notice the group is empty almost immediately, not wait \
+         out a multi-second grace it doesn't need"
+    );
+    let terminal = runner.terminal_sequence();
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::AcknowledgeExit {
+            command_id: "ack-natural-exit-descendant".into(),
+            terminal_sequence: terminal,
+        },
+    ));
+    runner.wait_for_clean_exit();
+}
