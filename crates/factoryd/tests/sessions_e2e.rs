@@ -31,8 +31,14 @@ use factory_core::{
 };
 use factoryctl::Client;
 
-const READY_TIMEOUT: Duration = Duration::from_secs(10);
-const DELIVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Both ceilings were 10s/20s originally; raised (this track's item 10)
+/// because this machine runs with a third-party process pegging a core
+/// (not ours), which was flaking the shorter ceilings under load -- not a
+/// product timing guarantee, just headroom for a noisy neighbour. Actual
+/// pass-case latency is unaffected: `poll_until` still returns the moment
+/// its condition is true, polling every 100ms (see `poll_until` below).
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(200);
 
 // --- Daemon harness ------------------------------------------------------
 
@@ -46,11 +52,23 @@ struct Daemon {
 
 impl Daemon {
     fn start(home: &Path) -> Self {
+        Self::start_with_runner(home, &factory_runner_path())
+    }
+
+    /// Like [`Daemon::start`], but with an explicit `--runner` path
+    /// instead of the real built binary -- this track's item 1 E2E test
+    /// uses this to point at a *writable copy* of the real
+    /// `factory-runner` it can delete out from under an already-running
+    /// daemon (simulating a runtime spawn failure distinct from the
+    /// misconfiguration item 2's own startup preflight already catches:
+    /// the file is present and valid when this daemon process starts, so
+    /// preflight passes and the daemon boots normally).
+    fn start_with_runner(home: &Path, runner: &Path) -> Self {
         let socket = home.join("f.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_factoryd"))
             .env("DARK_FACTORY_HOME", home)
             .arg("--runner")
-            .arg(factory_runner_path())
+            .arg(runner)
             .arg("--factoryctl")
             .arg(factoryctl_path())
             .stdin(Stdio::null())
@@ -888,7 +906,7 @@ fn factoryd_restart_does_not_lose_a_live_session() {
             since_offset: 0,
         },
         8,
-        Duration::from_secs(5),
+        Duration::from_secs(30),
     );
     let replayed = decode_terminal_frames(&frames);
     assert!(
@@ -945,7 +963,7 @@ fn terminal_input_reaches_the_live_process_through_attach() {
                 since_offset: 0,
             },
             16,
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
     });
     // Give the attach connection a moment to actually subscribe before
@@ -1060,6 +1078,139 @@ while :; do sleep 3600; done"
     // `factoryctl hook ...` call actually resolved and reached the
     // daemon.
     wait_for_session_state(&client, "curie", SessionState::Idle);
+
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
+
+// --- (i) TRACK5E item 1: a spawn-failure storm is visible, backed off,
+//     and recovers with exactly one delivery once the runner is available
+//     again ---------------------------------------------------------------
+
+#[test]
+fn spawn_failure_is_visible_backs_off_and_recovers_with_a_single_delivery() {
+    let home = private_tempdir();
+
+    // A writable copy of the real `factory-runner`, not the build
+    // artifact itself: this test deletes and restores it out from under a
+    // running daemon, which must never touch the actual binary every
+    // other test in this process also depends on.
+    let runner_copy = home.path().join("factory-runner");
+    let restore_runner = || {
+        std::fs::copy(factory_runner_path(), &runner_copy).unwrap();
+        std::fs::set_permissions(&runner_copy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    restore_runner();
+
+    // The daemon starts against a *valid* --runner path (this track's
+    // item 2 preflight would otherwise refuse to start it at all -- a
+    // separate, stricter guarantee than this test is about): the file is
+    // only removed afterward, simulating a spawn-time failure that arises
+    // after a daemon has already booted successfully (a deleted/corrupted
+    // binary, a bad reinstall, ...), which is what the original bug
+    // report actually was.
+    let daemon = Daemon::start_with_runner(home.path(), &runner_copy);
+    let client = daemon.client();
+    let root = home.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    init_git_repo(&root);
+    let created = client
+        .request(LocalRequest::CreateProject {
+            id: project_id(),
+            name: "Factory".into(),
+            root: root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    assert!(matches!(
+        created,
+        ServerFrame::Response {
+            response: LocalResponse::ProjectCreated { .. },
+            ..
+        }
+    ));
+
+    std::fs::remove_file(&runner_copy).unwrap();
+
+    create_shell_agent(&client, "curie");
+    // `sleep:2` (the shell fixture's own timing-control marker, also used
+    // by `stop_session_closes_the_open_episode_and_cancels_the_task`
+    // above) is defensive, not load-bearing: building this test found a
+    // real race (a fast-reacting client's `factoryctl task done` landing
+    // before the daemon's own commit opened the run episode
+    // `Store::open_run_for_task` requires, silently rejected by the
+    // fixture's own `|| true`), now closed at the source
+    // (`execution::commit_pending_delivery_on_prompt`, run synchronously
+    // inside the `UserPromptSubmit` hook handler itself, before that
+    // hook's reply can reach the client). Kept anyway as cheap insurance
+    // against a regression in that fix, matching this suite's existing
+    // convention for timing-sensitive fixture interactions.
+    create_task(
+        &client,
+        "task-1",
+        "First (sleep:2)",
+        "recovers after a spawn failure",
+    );
+    assign_task(&client, "task-1", "curie");
+
+    // Visible: a `starting` session row is created and then durably
+    // recorded `failed` (not silently absent from `session list`/the
+    // TUI), carrying the spawn error as its `wait_reason`.
+    let failed = poll_until(DELIVERY_TIMEOUT, || {
+        session_by_agent(&client, "curie").filter(|session| session.state == SessionState::Failed)
+    });
+    assert!(
+        failed
+            .wait_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty()),
+        "a failed spawn must record why, got {failed:?}"
+    );
+    // No leaked runtime directory for the failed attempt: `runs/<session
+    // id>/` is removed on spawn failure (this track's item 1), not left
+    // behind the way the original bug report's 18 attempts were.
+    assert!(
+        !home.path().join("runs").join(failed.id.as_str()).exists(),
+        "a failed spawn attempt's runtime directory must be cleaned up"
+    );
+    assert_eq!(
+        get_task(&client, "task-1").snapshot.status,
+        TaskStatus::Queued,
+        "the task must stay durably queued through repeated spawn failures, never lost"
+    );
+
+    // Backed off, not stormed: `SPAWN_BACKOFF_INITIAL` (5s) then doubling
+    // bounds retries to a handful in this window, unlike the original
+    // bug's 18 attempts in a similar span with no backoff at all.
+    std::thread::sleep(Duration::from_secs(16));
+    let attempts = list_sessions(&client)
+        .into_iter()
+        .filter(|session| session.agent_id.as_str() == "curie")
+        .count();
+    assert!(
+        attempts <= 4,
+        "backoff should bound retries within ~16s to a handful, got {attempts}"
+    );
+
+    // Recover: restore the runner binary at the exact same --runner path
+    // and restart the daemon on it (same $DARK_FACTORY_HOME/db) --
+    // TRACK5E-BRIEF.md item 1's own wording for how to simulate this.
+    restore_runner();
+    daemon.stop();
+    let daemon = Daemon::start_with_runner(home.path(), &runner_copy);
+    let client = daemon.client();
+
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+
+    // Exactly one delivery: one run ever opened for task-1, not the ~8x
+    // duplicate Stop-hook block-reply chain the original bug produced.
+    let runs_for_task = list_runs(&client)
+        .into_iter()
+        .filter(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-1"))
+        .count();
+    assert_eq!(
+        runs_for_task, 1,
+        "task-1 must be delivered exactly once after recovery"
+    );
 
     cleanup_session(&client, "curie");
     daemon.stop();

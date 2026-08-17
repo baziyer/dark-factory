@@ -1127,6 +1127,33 @@ impl Store {
         exit_signal: Option<i32>,
         now_ms: i64,
     ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        self.end_session_with_reason(session_id, exit_code, exit_signal, None, now_ms)
+    }
+
+    /// [`Store::end_session`], additionally recording `reason` (bounded,
+    /// like `record_hook_event`'s `activity`/`wait_reason`) into both the
+    /// ended session's `activity` and `wait_reason` columns instead of
+    /// clearing them to `NULL` -- used when the daemon itself supplies a
+    /// reason a live session never got the chance to report through a
+    /// hook, concretely a spawn failure (`execution.rs`'s
+    /// `spawn_session_for_agent`, this track's item 1): the session never
+    /// got past `starting`, so this is the only way its failure is ever
+    /// explained anywhere durable/visible (`session list`/the TUI), not
+    /// just in the daemon's own log.
+    pub fn end_session_with_reason(
+        &mut self,
+        session_id: &SessionId,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        if reason
+            .as_deref()
+            .is_some_and(|value| value.len() > MAX_WAIT_REASON_BYTES)
+        {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1144,13 +1171,14 @@ impl Store {
         transaction.execute(
             "UPDATE sessions
              SET state = ?1, state_since_ms = ?2, updated_at_ms = ?2, ended_at_ms = ?2,
-                 exit_code = ?3, exit_signal = ?4, activity = NULL, wait_reason = NULL
-             WHERE id = ?5",
+                 exit_code = ?3, exit_signal = ?4, activity = ?5, wait_reason = ?5
+             WHERE id = ?6",
             params![
                 session_state_value(state),
                 now_ms,
                 exit_code,
                 exit_signal,
+                reason,
                 session_id.as_str()
             ],
         )?;

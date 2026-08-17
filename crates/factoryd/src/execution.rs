@@ -27,13 +27,14 @@
 //! `RunnerEvent::Exited`" since there is no decoder to feed anymore.
 
 use std::{
+    collections::HashMap,
     fs, io,
     os::unix::{
         fs::{DirBuilderExt, FileTypeExt, MetadataExt},
         process::ExitStatusExt,
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -89,6 +90,13 @@ const MAX_DELIVERY_TEXT_BYTES: usize = 48_000;
 /// Per-task-body budget inside a composed delivery, leaving room for
 /// guidance sections within [`MAX_DELIVERY_TEXT_BYTES`].
 const MAX_DELIVERY_TASK_BODY_BYTES: usize = 16_384;
+/// Mirrors `store.rs`'s own private `MAX_WAIT_REASON_BYTES` (the
+/// `sessions.wait_reason`/`activity` CHECK bound, migration 0014): a spawn
+/// failure's error text (`spawn_session_for_agent`) is bounded before it
+/// ever reaches `Store::end_session_with_reason`, so an unusually long OS
+/// error message can never itself turn a spawn failure into a second,
+/// confusing store error.
+const MAX_WAIT_REASON_BYTES: usize = 512;
 const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
 (DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
@@ -151,6 +159,8 @@ pub enum Error {
     NoLiveSession,
     #[error("agent's live session is not idle")]
     SessionBusy,
+    #[error("a delivery for this agent is already in flight; retry shortly")]
+    DeliveryInProgress,
     #[error("agent has no worktree; create one first")]
     NoWorktree,
     #[error("system clock is before the Unix epoch")]
@@ -239,6 +249,16 @@ impl Handle {
         if session.state != SessionState::Idle {
             return Err(Error::SessionBusy);
         }
+        // Single pending-delivery slot (this track's item 1): held for the
+        // rest of this call, so a concurrent `Stop`/`SubagentStop` hook
+        // reply racing this exact agent (`stop_hook_reply`, called
+        // directly from `local_api.rs`, not through this dispatcher) can
+        // never independently compose and deliver the same pending
+        // task/messages while this explicit operator request is already
+        // mid-flight.
+        let Some(_delivery_slot) = self.state.try_delivery_slot(&agent_id) else {
+            return Err(Error::DeliveryInProgress);
+        };
 
         let opened_at_ms = now_ms()?;
         let session_id = session.id.clone();
@@ -341,6 +361,77 @@ pub fn spawn(
     ))
 }
 
+/// Per-agent exponential backoff for session-spawn attempts (this track's
+/// item 1). Without this, a persistently broken spawn path -- the concrete
+/// repro that motivated it: `--runner` pointed at a missing
+/// `factory-runner` -- retried on every dispatcher wake/tick, unboundedly
+/// often. Doubles from [`SPAWN_BACKOFF_INITIAL`] up to
+/// [`SPAWN_BACKOFF_MAX`] per agent on each consecutive failure; a
+/// successful spawn clears it. Never pruned, same reasoning as
+/// `DaemonState::delivery_slots`.
+struct SpawnBackoff {
+    state: Mutex<HashMap<AgentId, BackoffEntry>>,
+}
+
+struct BackoffEntry {
+    next_attempt_at: Instant,
+    delay: Duration,
+    consecutive_failures: u32,
+}
+
+const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
+const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+impl SpawnBackoff {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `true` if `agent_id` has never failed a spawn, or its last
+    /// recorded failure's delay has fully elapsed.
+    fn ready(&self, agent_id: &AgentId) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .get(agent_id)
+            .is_none_or(|entry| Instant::now() >= entry.next_attempt_at)
+    }
+
+    /// Doubles (capped) `agent_id`'s delay and returns `(new_delay,
+    /// consecutive_failures)` so the caller can log both.
+    fn record_failure(&self, agent_id: &AgentId) -> (Duration, u32) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(agent_id.clone()).or_insert(BackoffEntry {
+            next_attempt_at: Instant::now(),
+            delay: Duration::ZERO,
+            consecutive_failures: 0,
+        });
+        entry.delay = if entry.delay.is_zero() {
+            SPAWN_BACKOFF_INITIAL
+        } else {
+            entry.delay.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
+        };
+        entry.consecutive_failures += 1;
+        entry.next_attempt_at = Instant::now() + entry.delay;
+        (entry.delay, entry.consecutive_failures)
+    }
+
+    fn record_success(&self, agent_id: &AgentId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.remove(agent_id);
+    }
+}
+
 async fn run_dispatcher(
     config: Arc<Config>,
     state: DaemonState,
@@ -350,6 +441,7 @@ async fn run_dispatcher(
 ) -> Result<(), Error> {
     recover_sessions(&state, &wake_tx, &shutdown_rx).await;
 
+    let backoff = SpawnBackoff::new();
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -364,13 +456,13 @@ async fn run_dispatcher(
                     return Ok(());
                 };
                 if let Err(error) =
-                    dispatch_agent(&config, &state, &wake_tx, &project_id, &agent_id).await
+                    dispatch_agent(&config, &state, &wake_tx, &backoff, &project_id, &agent_id).await
                 {
                     tracing::warn!(%error, %project_id, %agent_id, "dispatch failed");
                 }
             }
             _ = tick.tick() => {
-                if let Err(error) = reconcile_all(&config, &state, &wake_tx).await {
+                if let Err(error) = reconcile_all(&config, &state, &wake_tx, &backoff).await {
                     tracing::warn!(%error, "reconcile tick failed");
                 }
             }
@@ -393,6 +485,7 @@ async fn reconcile_all(
     config: &Config,
     state: &DaemonState,
     wake_tx: &mpsc::Sender<WakeAgent>,
+    backoff: &SpawnBackoff,
 ) -> Result<(), Error> {
     let mut after_project = None;
     loop {
@@ -427,7 +520,8 @@ async fn reconcile_all(
                     .map(|agent| agent.id);
                 for agent in agents {
                     if let Err(error) =
-                        dispatch_agent(config, state, wake_tx, &project_id, &agent.id).await
+                        dispatch_agent(config, state, wake_tx, backoff, &project_id, &agent.id)
+                            .await
                     {
                         tracing::warn!(%error, %project_id, agent_id = %agent.id, "reconcile dispatch failed");
                     }
@@ -450,6 +544,7 @@ async fn dispatch_agent(
     config: &Config,
     state: &DaemonState,
     wake_tx: &mpsc::Sender<WakeAgent>,
+    backoff: &SpawnBackoff,
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<(), Error> {
@@ -476,10 +571,29 @@ async fn dispatch_agent(
     match live {
         None => {
             if has_pending_work(state, project_id, agent_id).await? {
-                if let Err(error) =
-                    spawn_session_for_agent(config, state, wake_tx, project_id, agent_id).await
-                {
-                    tracing::warn!(%error, %project_id, %agent_id, "session spawn failed");
+                // Backoff (this track's item 1): a persistently broken
+                // spawn path must not busy-retry on every wake/tick --
+                // `backoff.ready` silently declines attempts still inside
+                // their delay window (no log spam beyond the one already
+                // emitted when the failure that started the delay was
+                // recorded).
+                if backoff.ready(agent_id) {
+                    match spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
+                        .await
+                    {
+                        Ok(_) => backoff.record_success(agent_id),
+                        Err(error) => {
+                            let (retry_in, attempt) = backoff.record_failure(agent_id);
+                            tracing::warn!(
+                                %error,
+                                %project_id,
+                                %agent_id,
+                                attempt,
+                                retry_in_secs = retry_in.as_secs(),
+                                "session spawn failed; backing off"
+                            );
+                        }
+                    }
                 }
             }
             Ok(())
@@ -644,8 +758,14 @@ async fn spawn_session_for_agent(
             rows: 50,
         }),
     };
-    let child = runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await?;
-
+    // Created *before* the process spawn attempt (this track's item 1): a
+    // `starting` session row makes a spawn failure durably visible
+    // (`session list`/the TUI, an announcement + a red X) instead of
+    // silent -- previously the daemon's own log was the only place a
+    // persistently broken spawn path (concretely: `--runner` pointed at a
+    // missing `factory-runner`) ever showed up, and it retried forever
+    // with no visible trace and no runtime-directory cleanup (18 leaked
+    // `runs/<uuid>/` directories in the repro that motivated this).
     let created_at_ms = now_ms()?;
     let new_session = crate::store::NewSession {
         id: session_id.clone(),
@@ -666,6 +786,33 @@ async fn spawn_session_for_agent(
             Ok((snapshot, vec![event]))
         })
         .await?;
+
+    let child = match runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await {
+        Ok(child) => child,
+        Err(error) => {
+            // Nothing ever ran in this attempt's runtime directory (the
+            // hook token file, and any provider-seeded config written
+            // into it by `spawn_spec` above) -- remove it rather than
+            // leaving one leaked directory behind per failed attempt.
+            let _ = fs::remove_dir_all(&runtime_dir);
+            let reason = truncate_utf8(&error.to_string(), MAX_WAIT_REASON_BYTES);
+            let fail_session_id = session_id.clone();
+            let fail_at_ms = now_ms().unwrap_or(created_at_ms);
+            let _ = state
+                .commit_and_publish(move |store| {
+                    let (snapshot, events) = store.end_session_with_reason(
+                        &fail_session_id,
+                        None,
+                        None,
+                        Some(reason),
+                        fail_at_ms,
+                    )?;
+                    Ok((snapshot, events))
+                })
+                .await;
+            return Err(Error::Spawn(error));
+        }
+    };
 
     tokio::spawn(supervise_child(
         state.clone(),
@@ -846,17 +993,107 @@ async fn commit_delivery(
     let session_id = session_id.clone();
     state
         .commit_and_publish(move |store| match delivery.task_id {
-            Some(task_id) => {
-                let opened = store.open_run_episode(&session_id, &task_id, now_ms)?;
-                let run_id = opened.run.id.clone();
-                Ok((Some(run_id), opened.events))
-            }
+            Some(task_id) => match store.open_run_episode(&session_id, &task_id, now_ms) {
+                Ok(opened) => {
+                    let run_id = opened.run.id.clone();
+                    Ok((Some(run_id), opened.events))
+                }
+                // Already open: `commit_pending_delivery_on_prompt` (called
+                // synchronously from `local_api.rs`'s `ProviderHook`
+                // handler, *before* its own reply reaches the client) won
+                // this exact commit already -- this caller's own ack-wait
+                // just observed the same delivery landing a little later.
+                // Not an error: the episode this call wanted open *is*
+                // open, just not by this call (see that function's own
+                // doc comment for why committing here, first, used to
+                // lose a real race against a fast-reacting client).
+                Err(StoreError::AgentUnavailable) => Ok((None, Vec::new())),
+                Err(error) => Err(error),
+            },
             None => {
                 store.deliver_agent_messages(&project_id, &agent_id, &session_id, now_ms)?;
                 Ok((None, Vec::new()))
             }
         })
         .await
+}
+
+/// Best-effort: if a pending task/message delivery exists for `session`'s
+/// agent, commits it (opens the run episode / marks messages delivered)
+/// right now, in-line. Called synchronously from `local_api.rs`'s
+/// `ProviderHook` handler for `UserPromptSubmit`, *before* that hook
+/// request's own reply reaches the client.
+///
+/// Why this needs to exist at all, found manually building this track's
+/// own E2E test (TRACK5E-BRIEF.md item 1): `deliver_pending`'s
+/// `type_and_await_ack` treats "a `UserPromptSubmit` hook for this
+/// session, timestamped after the write" as proof a PTY-typed delivery
+/// landed, then commits it (`commit_delivery`, above) -- but that ack
+/// detection is a *separate* task (a broadcast-event subscriber) racing
+/// the real client's own next steps, which the client takes as soon as
+/// its *own* `factoryctl hook ... UserPromptSubmit` call returns, with no
+/// reason to wait for the daemon's unrelated internal bookkeeping to
+/// finish first. A client that reacts fast enough -- a zero-latency
+/// deterministic test fixture reliably does under any real machine load;
+/// a real Claude Code/Codex turn practically never does, but the daemon
+/// must not depend on that -- can call `factoryctl task done` before
+/// `commit_delivery` ran, which `Store::open_run_for_task` then rejects
+/// (no run open yet) with nothing but a swallowed error on the client
+/// side and a task stuck `running`-that-never-opened forever.
+///
+/// The fix is not "wait longer" (raising `ACK_TIMEOUT` does not help: the
+/// commit that needs to win the race is instant, the problem is *when* it
+/// runs relative to the client, not how long anything waits) -- it is to
+/// make the commit happen as part of handling the exact hook request the
+/// client is itself blocked on, so it is durable before that request's
+/// response can reach the client at all. `deliver_pending`'s own later
+/// `commit_delivery` call becomes a redundant, harmless retry of the same
+/// idempotent commit once its own ack-wait notices (the
+/// `StoreError::AgentUnavailable` tolerance above).
+///
+/// Gated on [`DaemonState::delivery_in_flight`]: *every* `UserPromptSubmit`
+/// reaches this function (an operator's own direct keystroke into an
+/// attached terminal fires the identical hook, indistinguishable from the
+/// dispatcher's own typed delivery from inside the hook payload alone), so
+/// composing and committing unconditionally would auto-attach whatever
+/// task happens to be next in this agent's queue to a turn that has
+/// nothing to do with it -- silently "delivering" a task nobody typed,
+/// permanently blocking its real delivery behind `runs_one_open_per_agent`
+/// with no way for the agent to ever complete it (it does not know the
+/// task exists). Only when the dispatcher's own `deliver_pending`/
+/// `Handle::start_task` is actively holding the slot -- meaning this
+/// prompt submission is at least plausibly the one they just typed -- is
+/// it safe to treat as that delivery's ack.
+pub(crate) async fn commit_pending_delivery_on_prompt(
+    state: &DaemonState,
+    guidance_root: &Path,
+    session: &SessionSnapshot,
+) -> Result<(), DaemonStateError> {
+    if !state.delivery_in_flight(&session.agent_id) {
+        return Ok(());
+    }
+    let Some(delivery) =
+        compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
+    else {
+        return Ok(());
+    };
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0),
+    )
+    .unwrap_or(0);
+    commit_delivery(
+        state,
+        &session.project_id,
+        &session.agent_id,
+        &session.id,
+        delivery,
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// The passive per-agent auto-delivery path: compose, type, wait for
@@ -870,6 +1107,19 @@ async fn deliver_pending(
     agent_id: &AgentId,
     session: &SessionSnapshot,
 ) -> Result<(), Error> {
+    // Single pending-delivery slot (this track's item 1), claimed *before*
+    // `compose_delivery`'s read: a `Stop`/`SubagentStop` hook for this same
+    // agent can arrive concurrently (on a per-connection task in
+    // `local_api.rs`, entirely independent of this dispatcher loop) and
+    // race straight into `stop_hook_reply`'s own `compose_delivery` call.
+    // Without claiming the slot first, both could read the same pending
+    // task/messages before either commits, and both would then act on it
+    // -- typing it into the PTY here *and* replying `block` with it there.
+    // Skip silently on a lost race: the winner's own commit already
+    // satisfies whatever this wake was for.
+    let Some(_delivery_slot) = state.try_delivery_slot(agent_id) else {
+        return Ok(());
+    };
     let Some(delivery) =
         compose_delivery(state, &config.guidance_root, project_id, agent_id).await?
     else {
@@ -1018,6 +1268,17 @@ pub async fn stop_hook_reply(
     if stop_hook_active {
         return Ok(serde_json::json!({}));
     }
+    // Single pending-delivery slot (this track's item 1), claimed *before*
+    // `compose_delivery`'s read -- see `deliver_pending`'s matching
+    // comment for the exact race this closes (the dispatcher's
+    // tick-driven PTY-typed delivery racing this same hook reply). Losing
+    // the race replies `{}`: safe, since either the winner is this same
+    // agent's dispatcher path (which will actually deliver the pending
+    // work) or another concurrent `Stop`/`SubagentStop` reply for this
+    // same session (which will).
+    let Some(_delivery_slot) = state.try_delivery_slot(&session.agent_id) else {
+        return Ok(serde_json::json!({}));
+    };
     let Some(delivery) =
         compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
     else {

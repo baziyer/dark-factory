@@ -220,12 +220,18 @@ case.
 First run once: `cargo build --workspace` (or `--release`). `factoryd`
 launches sessions by resolving `factory-runner` next to its own executable,
 not as a compile-time dependency — `cargo run -p factoryd` alone only builds
-`factoryd` itself. If `factory-runner` is missing, `task assign` still
+`factoryd` itself. `factoryd` refuses to start at all if `--runner`/
+`--factoryctl` do not resolve to an executable file, with a one-line error
+telling you to build the workspace — build it first and this never comes
+up. If the binary is later removed, moved, or corrupted out from under an
+already-running daemon (a bad reinstall, a deleted build artifact) and a
+task is assigned to an agent with no live session, `task assign` still
 returns success (the task is durably queued) but the daemon can't spawn a
-session for it; it retries silently and the failure only shows up in
-`factoryd`'s own log (`session spawn failed error=runner launch failed: ...`),
-not in `task get`/`session list` or the TUI. Build the workspace first and
-this never comes up.
+session for it: a `starting` session row appears and durably transitions
+to `failed` (visible in `session list`/the TUI, with the spawn error as its
+`wait_reason`), retried with exponential backoff (5s, doubling, capped at
+5 minutes) rather than silently forever. Fix the binary and the next
+attempt (or a daemon restart) picks the queued task back up.
 
 ```sh
 # Terminal 1: run the daemon in the foreground (or use launchd, see below)

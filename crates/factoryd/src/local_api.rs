@@ -1260,6 +1260,20 @@ async fn handle_request(
             } else {
                 serde_json::json!({})
             };
+            if event == ProviderHookEvent::UserPromptSubmit {
+                // Commit any pending PTY-typed delivery *now*, before this
+                // hook request's own reply reaches the client -- closes a
+                // race a fast-reacting client can otherwise win against
+                // the dispatcher's own separate ack-detection/commit
+                // (`execution::commit_pending_delivery_on_prompt`'s own
+                // doc comment has the full story; this track's item 1).
+                execution::commit_pending_delivery_on_prompt(
+                    state,
+                    guidance_root,
+                    &updated_session,
+                )
+                .await?;
+            }
             if event == ProviderHookEvent::SessionStart {
                 // Codex reports its own thread id back in this hook's
                 // payload (a Claude-shaped `session_id` field -- its
