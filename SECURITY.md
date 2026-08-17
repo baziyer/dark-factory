@@ -30,15 +30,27 @@ operator from their own agents. Concretely:
 - **Provider processes run as you, with your subscriptions.** A `claude` or
   `codex` session is your CLI, authenticated the way your shell's is, in a
   git worktree the daemon created. Whatever that CLI can do on your machine,
-  a session can ask it to do. Codex runs under its `workspace-write`
-  sandbox with network access on (needed for `git push`/`gh pr create` and
-  the daemon's own control socket, which seatbelt has no "just localhost"
-  exception for) and `approval_policy = "never"` plus a pre-seeded
-  `factoryctl` prefix rule so it never stalls on a native prompt nobody is
-  attached to answer; Claude Code keeps its native permission prompts, with
-  only `Bash(factoryctl *)` pre-approved (see `README.md`, "Unattended
-  operation"). An agent's own `permission_mode` widens or narrows that. See
-  `docs/providers.md` for the full write-up and rationale.
+  a session can ask it to do. Every Codex agent, orchestrator and worker
+  alike, runs under `workspace-write` with `network_access = true`: reads
+  are already unrestricted under `workspace-write`, so this means a Codex
+  session can read anything the operator's own user account can read and
+  send it anywhere on the internet, with no prompt at any point in the
+  session (needed for `git push`/`gh pr create`, and for the daemon's own
+  control socket, which seatbelt has no "just localhost" exception for).
+  `approval_policy = "never"` is the shipped default for every Codex agent,
+  under which the pre-seeded `CODEX_HOME/rules/default.rules` `factoryctl`
+  prefix rule is inert — `never` never consults rules at all, so nothing is
+  ever asked in the first place. If an operator overrides an agent to
+  `approval_policy = "on-request"` (`agent profile set --permission-mode
+  on-request`), that rule becomes live and pre-approves **unsandboxed**
+  execution of any command whose parsed prefix is `factoryctl` — every
+  subcommand, including `factoryctl update` (replaces the installed
+  binaries) and `factoryctl init` (rewrites the launchd job), not just the
+  task/agent verbs a session's own delivery composes. Claude Code keeps its
+  native permission prompts, with only `Bash(factoryctl *)` pre-approved
+  (see `README.md`, "Unattended operation"). An agent's own
+  `permission_mode` widens or narrows any of this. See `docs/providers.md`
+  for the full write-up and rationale.
 - **Hooks are authenticated; the rest is your user.** A provider's hook
   invocations identify their session by a per-session random token in a
   `0600` file (never on argv or in the environment). An agent's own `task
