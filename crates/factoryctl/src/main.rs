@@ -15,7 +15,10 @@ use factoryctl::Client;
 use uuid::Uuid;
 
 mod attach;
+mod install;
+mod launchd;
 mod outbox;
+mod update_command;
 mod usage;
 
 /// A session's own guidance directory, exported in every session's
@@ -31,7 +34,7 @@ const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|usage|project|task|agent|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|usage|update|version|project|task|agent|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -39,6 +42,8 @@ Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a 
 Commands:
   health                                      Check the daemon
   usage                                       Probe Codex subscription usage on demand
+  update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
+  version                                     Print this factoryctl's version
   project add|list|delete|get|guidance        Manage projects and their guidance file
   task add|list|get|start|retry|assign|cancel|update|delete|done|blocked
                                                Manage and run tasks
@@ -63,6 +68,25 @@ Options:
 const HEALTH_HELP: &str = "usage: factoryctl health
 
 Check that the daemon is reachable and responding.";
+const UPDATE_HELP: &str = "usage: factoryctl update [--install]
+
+Fetch the newest release's manifest and report whether it is newer than
+this build (JSON on stdout; the result is also cached in
+$DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads
+at most hourly).
+
+With --install: download that release for this platform, verify its SHA-256
+against the manifest, unpack it into $DARK_FACTORY_HOME/bin/<version>/, and
+repoint $DARK_FACTORY_HOME/bin/current at it. If this user's launchd job
+(~/Library/LaunchAgents/com.dark-factory.factoryd.plist) exists it is
+rewritten to run from bin/current and reloaded -- only the daemon restarts;
+every running session survives. Without a launchd job, restart the daemon
+yourself afterwards. Nothing is deleted: to roll back, repoint bin/current
+at the previous version directory and restart the daemon.
+
+Options:
+  --install                  Download, verify, install, and activate the newer release
+  -h, --help                 Show this help";
 const USAGE_HELP: &str = "usage: factoryctl usage
 
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
@@ -579,6 +603,10 @@ enum CliCommand {
     Help(&'static str),
     Health,
     Usage,
+    Version,
+    Update {
+        install: bool,
+    },
     ProjectAdd {
         id: Option<String>,
         name: String,
@@ -763,6 +791,10 @@ fn run() -> Result<i32, String> {
     if matches!(command, CliCommand::Usage) {
         return Ok(usage::run());
     }
+    if matches!(command, CliCommand::Version) {
+        println!("factoryctl {}", factoryctl::update::CURRENT_VERSION);
+        return Ok(0);
+    }
     let environment_socket = env::var("DARK_FACTORY_SOCKET").ok();
     let factory_home = env::var("DARK_FACTORY_HOME").ok();
     let home = env::var("HOME").ok();
@@ -772,6 +804,9 @@ fn run() -> Result<i32, String> {
         factory_home.as_deref(),
         home.as_deref(),
     )?;
+    if let CliCommand::Update { install } = command {
+        return update_command::run(&update_command::Options { install }, &socket);
+    }
     let client = Client::new(socket);
     if let CliCommand::Attach {
         project_id,
@@ -1073,6 +1108,18 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             }
             require_empty(&args)?;
             Ok((socket, CliCommand::Health))
+        }
+        "version" | "--version" | "-V" => {
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Version))
+        }
+        "update" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(UPDATE_HELP)));
+            }
+            let install = take_flag(&mut args, "--install")?;
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Update { install }))
         }
         "usage" => {
             if wants_help(&args) {
@@ -1627,7 +1674,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
-        CliCommand::Usage => Err("usage is handled before local requests".into()),
+        CliCommand::Usage | CliCommand::Version | CliCommand::Update { .. } => {
+            Err("handled before local requests".into())
+        }
         CliCommand::ProjectAdd { id, name, root } => Ok(LocalRequest::CreateProject {
             id: id
                 .map(|id| parse_id(id, "project"))
@@ -2122,6 +2171,28 @@ mod tests {
     }
 
     #[test]
+    fn update_and_version_parse_without_a_daemon_request() {
+        assert_eq!(
+            parse_args(args(&["update"])).unwrap().1,
+            CliCommand::Update { install: false }
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--install"])).unwrap().1,
+            CliCommand::Update { install: true }
+        );
+        assert!(parse_args(args(&["update", "--force"])).is_err());
+        assert_eq!(
+            parse_args(args(&["version"])).unwrap().1,
+            CliCommand::Version
+        );
+        assert_eq!(
+            parse_args(args(&["--version"])).unwrap().1,
+            CliCommand::Version
+        );
+        assert!(request_for(CliCommand::Update { install: false }).is_err());
+    }
+
+    #[test]
     fn every_group_and_subcommand_has_its_own_help_text() {
         assert_eq!(
             parse_args(args(&["health", "--help"])).unwrap().1,
@@ -2130,6 +2201,10 @@ mod tests {
         assert_eq!(
             parse_args(args(&["usage", "--help"])).unwrap().1,
             CliCommand::Help(USAGE_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--help"])).unwrap().1,
+            CliCommand::Help(UPDATE_HELP)
         );
         assert_eq!(
             parse_args(args(&["events", "--help"])).unwrap().1,
