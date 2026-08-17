@@ -79,6 +79,20 @@ fn random_hex() -> Result<String, getrandom::Error> {
 /// write failure; nothing is ever left partially written at `path` itself,
 /// since the final step is a single rename.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    write_file_with_mode(path, contents, PRIVATE_FILE_MODE)
+}
+
+/// Same atomic temp-file-plus-rename write as [`write_private_file`], but
+/// with an explicit file `mode` instead of the fixed `0600` private-file
+/// default. Used by [`crate::providers::claude::pretrust_worktree`] to
+/// rewrite the operator's real `~/.claude.json` in place without silently
+/// tightening its existing permissions -- that file is not a Dark Factory
+/// generated artifact, unlike every other caller of [`write_private_file`].
+///
+/// # Errors
+///
+/// See [`write_private_file`].
+pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_private_dir(parent)?;
     let temp_path = parent.join(format!(
@@ -93,7 +107,7 @@ pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(PRIVATE_FILE_MODE)
+            .mode(mode)
             .custom_flags(nofollow_flag())
             .open(&temp_path)?;
         file.write_all(contents)?;
