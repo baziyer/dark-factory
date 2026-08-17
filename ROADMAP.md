@@ -36,6 +36,11 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
   the task board.
 - Demonstrate one real orchestrator delegating to real workers end to end
   (#38).
+- Authenticate an agent's own `factoryctl` calls with its session token
+  and add roles (what an orchestrator may do that a worker may not) with a
+  durable review queue for actions that need the operator's approval —
+  today every local-API request is authorised by socket access alone
+  (`SECURITY.md`).
 
 ## Next: intervention and operations
 
