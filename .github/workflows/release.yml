@@ -16,8 +16,10 @@ jobs:
   release:
     name: release
     # Only maintainers can push tags, so this is a trusted ref (same boundary
-    # as CI's same-repository jobs): the persistent Mac, warm cache, real
-    # macOS arm64.
+    # as CI's `push` to `main`, the only other trigger that reaches the
+    # persistent Mac — every pull request, same-repository or a fork, runs
+    # on a hosted runner instead; see ci.yml): the persistent Mac, warm
+    # cache, real macOS arm64.
     runs-on: dark-factory-mac
     timeout-minutes: 60
     env:
