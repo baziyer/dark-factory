@@ -7,29 +7,19 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>__FACTORYD__</string>
-        <string>--database</string>
-        <string>__DATABASE__</string>
-        <string>--socket</string>
-        <string>__SOCKET__</string>
-        <string>--runner</string>
-        <string>__FACTORY_RUNNER__</string>
-        <string>--factoryctl</string>
-        <string>__FACTORYCTL__</string>
-        <string>--runtime-root</string>
-        <string>__RUNTIME_ROOT__</string>
-        <string>--webhook-config</string>
-        <string>__WEBHOOK_CONFIG__</string>
+__PROGRAM_ARGUMENTS__
     </array>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>__PATH__</string>
+        <key>DARK_FACTORY_HOME</key>
+        <string>__DARK_FACTORY_HOME__</string>
     </dict>
 
     <key>WorkingDirectory</key>
-    <string>__WORKING_DIRECTORY__</string>
+    <string>__DARK_FACTORY_HOME__</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -41,8 +31,8 @@
     <key>Umask</key>
     <integer>63</integer>
     <key>StandardOutPath</key>
-    <string>__LOG_DIRECTORY__/factoryd.stdout.log</string>
+    <string>__DARK_FACTORY_HOME__/logs/factoryd.stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>__LOG_DIRECTORY__/factoryd.stderr.log</string>
+    <string>__DARK_FACTORY_HOME__/logs/factoryd.stderr.log</string>
 </dict>
 </plist>

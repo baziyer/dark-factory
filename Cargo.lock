@@ -325,7 +325,9 @@ version = "0.1.0"
 dependencies = [
  "factory-core",
  "rustix 1.1.4",
+ "serde",
  "serde_json",
+ "sha2",
  "signal-hook",
  "tempfile",
  "thiserror 2.0.20",
