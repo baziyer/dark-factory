@@ -124,7 +124,9 @@ impl QueryResponder {
     fn reply_for(&self, kind: QueryKind, cursor_row: u16, cursor_col: u16) -> Vec<u8> {
         match kind {
             QueryKind::Da1 => b"\x1b[?1;2c".to_vec(),
-            QueryKind::XtVersion => b"\x1bP>|factory-tui 0.1.0\x1b\\".to_vec(),
+            QueryKind::XtVersion => {
+                format!("\x1bP>|factory-tui {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
+            }
             QueryKind::CursorPosition => {
                 format!("\x1b[{};{}R", cursor_row + 1, cursor_col + 1).into_bytes()
             }
@@ -175,7 +177,10 @@ mod tests {
         let mut r = QueryResponder::new();
         assert_eq!(r.scan(b"\x1b[?u", 0, 0), b"\x1b[?0u");
         let mut r = QueryResponder::new();
-        assert_eq!(r.scan(b"\x1b[>0q", 0, 0), b"\x1bP>|factory-tui 0.1.0\x1b\\");
+        assert_eq!(
+            r.scan(b"\x1b[>0q", 0, 0),
+            format!("\x1bP>|factory-tui {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
+        );
         let mut r = QueryResponder::new();
         assert_eq!(
             r.scan(b"\x1b]10;?\x1b\\", 0, 0),
