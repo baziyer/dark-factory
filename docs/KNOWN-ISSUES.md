@@ -83,6 +83,22 @@ on timeout-based teardown.
 
 ## TUI
 
+### A task created after board startup shows "(no body)" permanently
+**Symptom**: assign a task while `factory-tui` is already running, and its
+WORKSHOP detail pane shows "(no body)" forever, even after the task
+completes.
+**Evidence**: `FactoryEvent::TaskChanged` (`crates/factory-core/src/lib.rs`)
+carries only a `TaskSnapshot`, never a task's `body`/`result` (those live
+in the separate `TaskDetail` returned by `GetTask`); `Board::apply_event`'s
+`TaskChanged` arm (`crates/factory-tui/src/model/mod.rs`) deliberately
+preserves whatever `body`/`result` it already has for a task it already
+knew about, which is correct for a task loaded at the initial fleet
+snapshot — but a task created afterward has no prior body to preserve.
+**Suggested fix**: add `body`/`result` to `FactoryEvent::TaskChanged`
+(mirrors how `SessionChanged` already carries its full snapshot inline)
+rather than having the client round-trip a `GetTask` after the fact.
+**Size**: S.
+
 ### `factory-tui` can't create projects or agents
 **Symptom**: FORTRESS/WORKSHOP have no key or prompt for `project add`/
 `agent add`; a brand-new project with zero agents can only be created via
