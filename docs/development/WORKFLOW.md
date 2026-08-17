@@ -72,24 +72,55 @@ It applies, idempotently:
   fork needs approval".
 
 Where `checks` runs is a **policy, not a mechanism**: a pull request runs
-the workflow file it carries, so the `runs-on` expression only governs an
-unmodified workflow.
+the workflow file it carries, so the `runs-on` expression at `ci.yml:33`
+only governs a PR that leaves it unmodified — a PR (or a manual run) that
+edits it can route itself elsewhere. Four routes, in increasing order of
+trust:
 
-- **Every pull request** — same-repository or a fork — runs on an
-  ephemeral hosted macOS runner (`macos-latest`; hosted minutes are free
-  for public repositories). PR code hasn't been reviewed yet, so it never
-  touches the operator's own machine, regardless of who opened the PR.
-  Every fork's workflow run additionally waits for the maintainer's
-  approval before it runs at all (`scripts/github-repo-settings.sh` sets
-  that policy) — GitHub's own guidance is that self-hosted runners and
-  public repositories don't mix, so a fork PR gets no path to the
-  self-hosted runner at all, approved or not.
-- **`push` to `main`** (already merged, already reviewed — the only way
-  code lands there is `main-review`'s CODEOWNERS-approval ruleset above)
-  runs on the maintainer's persistent Mac, the self-hosted runner
-  `dark-factory-mac` — warm cargo cache, real macOS, no hosted minutes.
-  `release.yml`'s tag-push trigger uses the same runner for the same
-  reason: only a maintainer can push a tag.
+- **A pull request whose `runs-on` is unmodified** — same-repository or a
+  fork — runs on an ephemeral hosted macOS runner (`macos-latest`; hosted
+  minutes are free for public repositories). This is the default and the
+  overwhelming majority of runs.
+- **A fork's workflow run additionally needs the maintainer's approval**
+  before it runs at all (`scripts/github-repo-settings.sh` sets that
+  policy, confirmed live: `gh api
+  repos/baziyer/dark-factory/actions/permissions/fork-pr-contributor-approval`
+  returns `all_external_contributors`). Approval, not the runner choice,
+  is the actual gate: self-hosted runners accept any job matching their
+  label regardless of which workflow or branch produced it, so an
+  approved fork run that edited `runs-on` to `dark-factory-mac` *would*
+  execute there. Read `.github/workflows/` in a fork's diff before
+  approving it — that's still the boundary.
+- **A same-repository branch gets no approval gate at all** — GitHub's
+  fork-approval setting only ever covers external contributors — so it
+  can route `checks` straight to `dark-factory-mac` by editing `runs-on`
+  in its own diff, unreviewed, the moment the PR opens or updates; no
+  repo-level setting closes this. But only the maintainer's own GitHub
+  account can push a same-repository branch — every agent's `agent/<id>`
+  branch is pushed under that account (see the worktree note above) — so
+  this policy removes the *default and accidental* path onto the
+  persistent Mac, not a *determined* one from an account that already has
+  push access and can reach the daemon locally anyway. `workflow_dispatch`
+  (`ci.yml:7`) is the same trust level again: any collaborator with write
+  access can manually run `checks` against any ref from the Actions
+  UI/API, and it always evaluates to `dark-factory-mac`
+  (`event_name != 'pull_request'`). The real backstop for a
+  same-repository PR is that a green `checks` run never authorizes a
+  merge by itself — `main-review` still requires one CODEOWNERS approval
+  and every thread resolved, per the ruleset above.
+- **`push` to `main`** (already merged, already reviewed via that same
+  `main-review` ruleset) and **a maintainer's tag push** in `release.yml`
+  are the only routes that don't depend on any account's intent — both
+  require code to already be on a protected ref. These run on the
+  maintainer's persistent Mac, the self-hosted runner `dark-factory-mac`
+  — warm cargo cache, real macOS, no hosted minutes.
+
+**Follow-up, not done yet**: the remaining hardening for a determined
+same-repository or write-access actor is isolating the persistent runner
+itself — a separate macOS user with no access to the operator's home
+directory, credentials, or the `factoryd` socket, or replacing it with an
+ephemeral self-hosted runner — tracked as
+[#54](https://github.com/baziyer/dark-factory/issues/54).
 
 Known problems are GitHub issues labelled `known-issue`, see
 `CONTRIBUTING.md`.

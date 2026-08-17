@@ -68,20 +68,31 @@ operator from their own agents. Concretely:
 
 ## For contributors
 
-`.github/workflows/ci.yml` never runs pull request code — from this
-repository's own branches or a fork — on the maintainer's persistent Mac,
-because a pull request's `checks` run uses the workflow file *the pull
-request itself carries*, so a same-repository branch could edit `runs-on`
-in its own diff exactly as easily as a fork could: no PR is trusted more
-than any other before it's been reviewed. Every `pull_request` event runs
-on an ephemeral hosted macOS runner instead, and a fork's workflow run
-additionally needs the maintainer's approval before it runs at all. The
-persistent Mac only ever executes a commit that's already on protected
-`main` (via `main-review`'s CODEOWNERS-approval ruleset) or a maintainer's
-own tag push in `release.yml` — both refs a pull request diff cannot
-reach. An agent's own generated PR code is held to that same boundary: it
-runs `local-ci.sh` on the hosted runner, never on the operator's machine,
-until it's merged. A change to any of this is a security change and gets
-reviewed as one. AGENTS.md's adversarial review explicitly includes
-"security: nothing widens what an agent session, a webhook caller, or an
-untrusted PR can reach".
+By default, `.github/workflows/ci.yml`'s `checks` job runs pull request
+code on an ephemeral, GitHub-hosted macOS runner, not the maintainer's
+persistent Mac — but only for a PR that leaves `runs-on` unmodified,
+because a PR's `checks` run uses the workflow file *the PR itself
+carries*. A fork's workflow run additionally needs the maintainer's
+approval before it runs at all, and approval — not the runner choice — is
+the real gate: the maintainer reads `.github/workflows/` in the fork's
+diff before approving it, because an approved fork run that edited
+`runs-on` does execute on the persistent Mac (self-hosted runners accept
+any job matching their label, from any workflow or branch). A
+same-repository branch — including an agent's own generated PR, before
+any review — gets no approval gate at all and can route itself to the
+persistent Mac the same way; only the maintainer's own GitHub account can
+push one, and `workflow_dispatch` is the same trust level again (any
+write-access collaborator can already run `checks` against any ref
+manually). So this boundary keeps the *default and accidental* path onto
+the persistent Mac closed, not a *determined* one from an account that
+already has push and daemon access there — the actual backstop for a
+same-repository PR is that a green `checks` run never authorizes a merge
+by itself (`docs/development/WORKFLOW.md`'s `main-review` ruleset still
+requires CODEOWNERS approval). Isolating the persistent runner itself
+from the operator's own account is the remaining hardening and is not
+done yet: [issue #54](https://github.com/baziyer/dark-factory/issues/54).
+Full enumeration of every route: `docs/development/WORKFLOW.md`, "CI and
+GitHub". A change to any of this is a security change and gets reviewed
+as one. AGENTS.md's adversarial review explicitly includes "security:
+nothing widens what an agent session, a webhook caller, or an untrusted
+PR can reach".
