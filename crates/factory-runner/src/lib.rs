@@ -45,17 +45,40 @@ use tokio::{
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
+/// Grace before escalating a process-group `TERM` to `KILL`. Used for the
+/// primary escalation when the runner itself is torn down
+/// (`runner_shutdown`), and — see `GROUP_CLEANUP_GRACE` below — reused for
+/// the group cleanup's own first TERM when the leader exited entirely on
+/// its own, with no `Stop`/shutdown ever requested.
 const DEFAULT_GROUP_GRACE: Duration = Duration::from_secs(2);
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Once the leader has already exited (its own grace period, if any, has
-/// already been honored), any process still holding the group is a straggler
-/// being mopped up, not a workload owed a fresh multi-second courtesy: cap
-/// how long the group cleanup waits for it to react to a TERM before
-/// escalating to KILL.
+/// Grace the group cleanup (the pass that reaps anything still holding the
+/// process group after the leader itself has already exited) gives a
+/// straggler *only when a `Stop` or runner shutdown was actually requested*
+/// during the leader's lifetime: that request's own grace/kill cycle
+/// (`DEFAULT_GROUP_GRACE`, or the caller's `grace_ms`) has already run its
+/// course by the time cleanup runs, so a straggler here is a race artifact
+/// being mopped up, not a workload owed a second multi-second courtesy.
+///
+/// When the leader instead exited entirely on its own — no `Stop` was ever
+/// requested — this grace does *not* apply; the cleanup uses
+/// `DEFAULT_GROUP_GRACE` instead, because that TERM is the straggler's
+/// first and only grace period, not a mop-up of one already spent.
+///
+/// Either way, the cleanup now polls (`GROUP_POLL_INTERVAL`) instead of
+/// blind-waiting the full grace regardless of whether the group already
+/// emptied out. See #55: an unconditional `DEFAULT_GROUP_GRACE` blind wait
+/// here, stacked with `POST_KILL_DRAIN_TIMEOUT`, pushed a run's worst-case
+/// stop-to-`Exited` latency to ~7.2-7.7s against `tests/runner.rs`'s and
+/// `tests/terminal.rs`'s fixed 8s deadline; a deterministic repro
+/// (`natural_leader_exit_terminates_a_descendant_that_retains_output_pipes`)
+/// measured ~2.05s pre-fix vs. ~0.2-0.3s post-fix for a well-behaved
+/// straggler reaped via the (still 2s-capped, but now polled) natural-exit
+/// path.
 const GROUP_CLEANUP_GRACE: Duration = Duration::from_millis(200);
-/// How often the group cleanup re-checks whether the straggler has already
-/// exited, so it can move on immediately instead of always waiting out the
-/// full `GROUP_CLEANUP_GRACE`.
+/// How often the group cleanup re-checks whether the group has already
+/// emptied out, so it can move on immediately instead of always waiting out
+/// the full grace it was given.
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
@@ -1548,6 +1571,7 @@ async fn supervise_piped(
     )));
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut runner_signalled = false;
+    let mut stop_requested = false;
     let status = loop {
         tokio::select! {
             status = child.wait() => break status?,
@@ -1555,6 +1579,7 @@ async fn supervise_piped(
                 let Some(command) = command else {
                     continue;
                 };
+                stop_requested = true;
                 if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
@@ -1592,32 +1617,20 @@ async fn supervise_piped(
         }
     };
 
-    if process_group_exists(pid)? {
-        begin_group_termination(pid, GROUP_CLEANUP_GRACE, &mut kill_deadline)?;
-        loop {
-            if !process_group_exists(pid)? {
-                break;
-            }
-            tokio::select! {
-                () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
-                    signal_process_group(pid, Signal::KILL)?;
-                    break;
-                }
-                () = sleep(GROUP_POLL_INTERVAL) => {}
-                command = stops.recv() => {
-                    let Some(command) = command else {
-                        continue;
-                    };
-                    shorten_deadline(command.grace, &mut kill_deadline);
-                    let _ = command.response.send(Ok(()));
-                }
-                changed = runner_shutdown.changed(), if !runner_signalled => {
-                    changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
-                    runner_signalled = true;
-                }
-            }
-        }
-    }
+    let cleanup_grace = if stop_requested || runner_signalled {
+        GROUP_CLEANUP_GRACE
+    } else {
+        DEFAULT_GROUP_GRACE
+    };
+    reap_group_stragglers(
+        pid,
+        cleanup_grace,
+        &mut kill_deadline,
+        &mut stops,
+        &mut runner_shutdown,
+        &mut runner_signalled,
+    )
+    .await?;
 
     let output_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
         stdout_task.join().await?;
@@ -1755,6 +1768,7 @@ async fn supervise_terminal(
 
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut runner_signalled = false;
+    let mut stop_requested = false;
     let mut reader_open = true;
     let status = loop {
         tokio::select! {
@@ -1776,6 +1790,7 @@ async fn supervise_terminal(
                 let Some(command) = command else {
                     continue;
                 };
+                stop_requested = true;
                 if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
@@ -1811,32 +1826,20 @@ async fn supervise_terminal(
     };
     let status = wait_status_to_exit(status);
 
-    if process_group_exists(pid)? {
-        begin_group_termination(pid, GROUP_CLEANUP_GRACE, &mut kill_deadline)?;
-        loop {
-            if !process_group_exists(pid)? {
-                break;
-            }
-            tokio::select! {
-                () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
-                    signal_process_group(pid, Signal::KILL)?;
-                    break;
-                }
-                () = sleep(GROUP_POLL_INTERVAL) => {}
-                command = stops.recv() => {
-                    let Some(command) = command else {
-                        continue;
-                    };
-                    shorten_deadline(command.grace, &mut kill_deadline);
-                    let _ = command.response.send(Ok(()));
-                }
-                changed = runner_shutdown.changed(), if !runner_signalled => {
-                    changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
-                    runner_signalled = true;
-                }
-            }
-        }
-    }
+    let cleanup_grace = if stop_requested || runner_signalled {
+        GROUP_CLEANUP_GRACE
+    } else {
+        DEFAULT_GROUP_GRACE
+    };
+    reap_group_stragglers(
+        pid,
+        cleanup_grace,
+        &mut kill_deadline,
+        &mut stops,
+        &mut runner_shutdown,
+        &mut runner_signalled,
+    )
+    .await?;
 
     if reader_open {
         let drain_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
@@ -1947,10 +1950,28 @@ fn shorten_deadline(grace: Duration, deadline: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
+/// A process-group ID stops being ours the moment its leader is reaped: the
+/// kernel is then free to hand that same numeric PID to an unrelated future
+/// process on the same host. If that new process belongs to a different
+/// user or session, `kill(-pgid, ...)` reaching it can return `EPERM`
+/// instead of the `ESRCH` a truly-gone group would give — same underlying
+/// situation (nothing of ours is there anymore), different errno. On a busy
+/// host (this repo's own self-hosted runner spawns dozens of these
+/// processes concurrently) that reuse window is real, not theoretical:
+/// reproduced directly by spawning this exact natural-leader-exit scenario
+/// in a tight loop — 3 `EPERM` crashes in 20 runs on `main`, pre-`GROUP_POLL_INTERVAL`.
+/// Polling `process_group_exists` far more often than the old single check
+/// did only widens the exposure. Treat both errnos as "gone", not a hard
+/// I/O failure that aborts the run without ever recording its `Exited`
+/// event.
+fn is_group_gone(error: rustix::io::Errno) -> bool {
+    matches!(error, rustix::io::Errno::SRCH | rustix::io::Errno::PERM)
+}
+
 fn signal_process_group(pid: Pid, signal: Signal) -> Result<(), Error> {
     match kill_process_group(pid, signal) {
         Ok(()) => Ok(()),
-        Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
+        Err(error) if is_group_gone(error) => Ok(()),
         Err(error) => Err(Error::Io(error.into())),
     }
 }
@@ -1958,7 +1979,7 @@ fn signal_process_group(pid: Pid, signal: Signal) -> Result<(), Error> {
 fn process_group_exists(pid: Pid) -> Result<bool, Error> {
     match test_kill_process_group(pid) {
         Ok(()) => Ok(true),
-        Err(error) if error == rustix::io::Errno::SRCH => Ok(false),
+        Err(error) if is_group_gone(error) => Ok(false),
         Err(error) => Err(Error::Io(error.into())),
     }
 }
@@ -1968,6 +1989,53 @@ async fn wait_for_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
         deadline.as_mut().await;
     } else {
         pending::<()>().await;
+    }
+}
+
+/// Reaps anything still holding the process group after the leader itself
+/// has already exited: a no-op if the group is already empty, otherwise a
+/// single TERM followed by polling (`GROUP_POLL_INTERVAL`) for the group to
+/// empty out on its own, escalating to KILL only once `grace` elapses
+/// without that happening. `grace` is the caller's choice — see
+/// `GROUP_CLEANUP_GRACE`'s doc comment for why it differs depending on
+/// whether a `Stop`/shutdown was ever requested. Shared by both
+/// `supervise_piped` and `supervise_terminal`, whose stop/shutdown handling
+/// (and therefore this cleanup pass) is otherwise identical.
+async fn reap_group_stragglers(
+    pid: Pid,
+    grace: Duration,
+    kill_deadline: &mut Option<Pin<Box<Sleep>>>,
+    stops: &mut mpsc::Receiver<StopCommand>,
+    runner_shutdown: &mut watch::Receiver<bool>,
+    runner_signalled: &mut bool,
+) -> Result<(), Error> {
+    if !process_group_exists(pid)? {
+        return Ok(());
+    }
+    begin_group_termination(pid, grace, kill_deadline)?;
+    loop {
+        tokio::select! {
+            () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
+                signal_process_group(pid, Signal::KILL)?;
+                return Ok(());
+            }
+            () = sleep(GROUP_POLL_INTERVAL) => {
+                if !process_group_exists(pid)? {
+                    return Ok(());
+                }
+            }
+            command = stops.recv() => {
+                let Some(command) = command else {
+                    continue;
+                };
+                shorten_deadline(command.grace, kill_deadline);
+                let _ = command.response.send(Ok(()));
+            }
+            changed = runner_shutdown.changed(), if !*runner_signalled => {
+                changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
+                *runner_signalled = true;
+            }
+        }
     }
 }
 

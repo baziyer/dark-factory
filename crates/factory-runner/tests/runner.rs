@@ -942,6 +942,15 @@ fn stop_is_idempotent_and_terminates_the_owned_process_group() {
     runner.wait_for_clean_exit();
 }
 
+/// The leader here exits entirely on its own — no `Stop` is ever sent — so
+/// the group cleanup reaches this descendant with `DEFAULT_GROUP_GRACE`
+/// (2s), not the shorter `GROUP_CLEANUP_GRACE`: this straggler's TERM is its
+/// first and only grace period, not a mop-up of one already spent (see
+/// `GROUP_CLEANUP_GRACE`'s doc comment). That grace is still capped at 2s,
+/// same as before this fix, but the cleanup now polls instead of blindly
+/// waiting it out: `sleep`, with no trap, dies from that first TERM almost
+/// immediately, so this should complete in well under a second, not the ~2s
+/// the pre-fix blind wait took for this exact scenario.
 #[test]
 fn natural_leader_exit_terminates_a_descendant_that_retains_output_pipes() {
     let directory = tempfile::tempdir().unwrap();
@@ -956,7 +965,15 @@ fn natural_leader_exit_terminates_a_descendant_that_retains_output_pipes() {
         ],
     );
     let descendant_pid = wait_for_pid_file(&marker);
+    let started = Instant::now();
     runner.wait_for_terminal_spool();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "reaping a well-behaved descendant after the leader's natural exit took {elapsed:?}; \
+         group cleanup should poll and notice the group is empty almost immediately, not wait \
+         out a multi-second grace it doesn't need"
+    );
     wait_for_process_exit(descendant_pid);
     let frames = subscribe_through_terminal(&runner, 0);
     assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
@@ -1048,67 +1065,6 @@ fn stop_escalates_only_after_the_requested_grace_period() {
     assert_command_ack(
         acknowledge(&runner, terminal, "escalated-persisted"),
         "escalated-persisted",
-    );
-    runner.wait_for_clean_exit();
-}
-
-/// The group cleanup (the pass that reaps anything still in the process
-/// group after the leader itself has already exited) must not blindly wait
-/// out a multi-second grace regardless of whether the straggler is already
-/// gone: it should poll and, when the straggler ignores TERM, escalate to
-/// KILL within a bounded, sub-second window.
-///
-/// This mirrors `natural_leader_exit_terminates_a_descendant_that_retains_output_pipes`
-/// (leader exits on its own, no `Stop` request is ever sent, so the group
-/// cleanup's deadline starts genuinely unarmed rather than inheriting a
-/// stop request's already-ticking grace) so the timing bound is
-/// deterministic: unlike relying on a fork/signal race to produce a
-/// straggler that escapes a `Stop`'s own group-wide `SIGKILL` (which this
-/// suite's local and hosted CI runs alike were never able to reproduce even
-/// under heavy load), backgrounding a descendant that ignores TERM via its
-/// own `trap ''` reliably survives the leader's exit and reaches the group
-/// cleanup every time (`SIG_IGN` survives `fork`+`exec`, so the effect
-/// holds whether or not the shell tail-calls into `sleep`).
-#[test]
-fn natural_leader_exit_reaps_a_term_ignoring_descendant_without_the_old_multi_second_wait() {
-    let directory = tempfile::tempdir().unwrap();
-    let marker = directory.path().join("background.pid");
-    let runner = RunningRunner::spawn_program(
-        Path::new("/bin/sh"),
-        &[
-            "-c",
-            "sh -c 'trap \"\" TERM; sleep 5' & echo $! > \"$1\"",
-            "sh",
-            marker.to_str().unwrap(),
-        ],
-    );
-    let descendant_pid = wait_for_pid_file(&marker);
-    let started = Instant::now();
-    runner.wait_for_terminal_spool();
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "reaping a TERM-ignoring descendant after the leader's natural exit took {elapsed:?}; \
-         group cleanup should poll and escalate within GROUP_CLEANUP_GRACE (200ms), not wait \
-         out a multi-second grace"
-    );
-    wait_for_process_exit(descendant_pid);
-    let frames = subscribe_through_terminal(&runner, 0);
-    assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Exited {
-            exit_code: Some(0),
-            signal: None,
-        }
-    )));
-    let terminal = terminal_sequence(&frames);
-    assert_command_ack(
-        acknowledge(
-            &runner,
-            terminal,
-            "term-ignoring-descendant-reaped-promptly",
-        ),
-        "term-ignoring-descendant-reaped-promptly",
     );
     runner.wait_for_clean_exit();
 }
