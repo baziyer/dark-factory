@@ -223,15 +223,25 @@ pub struct Handle {
     config: Arc<Config>,
     wake_tx: mpsc::Sender<WakeAgent>,
     shutdown: watch::Sender<bool>,
-    /// Shared with [`run_dispatcher`]'s own [`SpawnBackoff`] (this task's
-    /// mechanism, ARCHITECTURE.md's delete invariant): lets
-    /// [`Handle::begin_delete`]/[`Handle::end_delete`], called from
-    /// `local_api.rs`'s `DeleteAgent`/`DeleteProject` handlers, mark an
-    /// agent so [`dispatch_agent`] never begins a new spawn preparation for
-    /// it, and wait for one already in flight to finish -- the same style
-    /// of seam `local_api.rs` already uses for [`stop_hook_reply`] and
-    /// [`Handle::wake`].
+    /// Shared with [`run_dispatcher`]'s own [`SpawnBackoff`] (ARCHITECTURE.md
+    /// invariant 9's agent-scoped mechanism): lets
+    /// [`Handle::begin_delete`]/[`Handle::end_delete`]/
+    /// [`Handle::try_begin_agent_write`]/[`Handle::end_agent_write`],
+    /// called from `local_api.rs`'s `DeleteAgent`, `DeleteProject`,
+    /// `GetAgent`/`AgentStatus`, `UpdateAgentProfile`, and `CreateAgent`
+    /// handlers, mark an agent so no writer -- spawn preparation
+    /// (`dispatch_agent`), an idle-session delivery (`deliver_pending`), or
+    /// one of those handlers -- ever begins a new write into its guidance
+    /// directory while it is being deleted, and wait for one already in
+    /// flight to finish -- the same style of seam `local_api.rs` already
+    /// uses for [`stop_hook_reply`] and [`Handle::wake`].
     backoff: Arc<SpawnBackoff>,
+    /// Project-scoped half of the same invariant (PR #50 review, finding
+    /// 3): guards `CreateAgent`, the one writer under a project that
+    /// `backoff`'s per-agent marks can never already cover, because the
+    /// agent it is about to create does not exist yet for `DeleteProject`
+    /// to have marked. See [`Handle::begin_delete_project`].
+    project_gate: Arc<DeleteGate<ProjectId>>,
 }
 
 impl Handle {
@@ -356,14 +366,14 @@ impl Handle {
         send_wake(&self.wake_tx, project_id, agent_id);
     }
 
-    /// Begins deletion of `agent_id` (this task's mechanism for
-    /// ARCHITECTURE.md's "once deletion begins, no component may create new
-    /// state under that identity" invariant): marks the agent so
-    /// [`dispatch_agent`] declines to begin any new spawn preparation for
-    /// it (composing guidance, writing the provider's generated config),
-    /// then waits up to [`DELETE_DRAIN_TIMEOUT`] for a preparation already
-    /// in flight to finish, so a caller that gets `Ok` back knows no
-    /// further writes into the agent's guidance directory can start before
+    /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's
+    /// agent-scoped mechanism): marks the agent so no writer --
+    /// [`dispatch_agent`]'s spawn preparation, [`deliver_pending`]'s
+    /// delivery composition, or a handler using
+    /// [`Handle::try_begin_agent_write`] -- can begin a new write into its
+    /// guidance directory, then waits up to [`DELETE_DRAIN_TIMEOUT`] for a
+    /// write already in flight to finish, so a caller that gets `Ok` back
+    /// knows nothing can write into the agent's guidance directory before
     /// [`Handle::end_delete`] is called. On timeout, clears its own mark
     /// (so the agent is not left permanently undispatchable by a delete
     /// that never completed) and returns [`Error::DeleteDrainTimeout`] --
@@ -384,14 +394,81 @@ impl Handle {
     }
 
     /// Ends a deletion begun by [`Handle::begin_delete`]: clears the mark
-    /// and any stale backoff data so an agent later created with the same
+    /// (never the entry itself, and never the in-flight write count -- see
+    /// [`DeleteGate::end_delete`]) so an agent later created with the same
     /// id dispatches normally. Must be called exactly once after every
     /// `begin_delete` that returned `Ok`, regardless of whether the delete
     /// itself went on to succeed (the row may still exist, e.g. a
-    /// `DeleteAgent` refused because a spawn that finished draining left it
+    /// `DeleteAgent` refused because a write that finished draining left it
     /// with a live session).
     pub fn end_delete(&self, agent_id: &AgentId) {
         self.backoff.end_delete(agent_id);
+    }
+
+    /// `true` (and records one write in flight) if `agent_id` is not
+    /// currently being deleted; declines (`false`) if it is. Used by
+    /// handlers that read-or-lazily-create or overwrite an existing
+    /// agent's guidance files outside the dispatcher
+    /// (`GetAgent`/`AgentStatus`, `UpdateAgentProfile`) so they
+    /// participate in the same drain [`Handle::begin_delete`] waits on --
+    /// the same mechanism [`dispatch_agent`] uses for spawn preparation,
+    /// just reached from a request handler instead of the dispatcher.
+    /// Call [`Handle::end_agent_write`] exactly once after, regardless of
+    /// outcome.
+    #[must_use]
+    pub fn try_begin_agent_write(&self, agent_id: &AgentId) -> bool {
+        self.backoff.try_begin_preparation(agent_id)
+    }
+
+    /// Ends a write begun by [`Handle::try_begin_agent_write`].
+    pub fn end_agent_write(&self, agent_id: &AgentId) {
+        self.backoff.end_preparation(agent_id);
+    }
+
+    /// Begins deletion of `project_id` (ARCHITECTURE.md invariant 9's
+    /// project-scoped mechanism, PR #50 review finding 3): marks the
+    /// project so [`Handle::try_begin_project_write`] declines a
+    /// `CreateAgent` not yet past its own worktree/guidance-tree writes,
+    /// then waits up to [`DELETE_DRAIN_TIMEOUT`] for a `CreateAgent`
+    /// already in flight to finish. Same contract as
+    /// [`Handle::begin_delete`], one level up: on timeout, clears its own
+    /// mark and returns [`Error::DeleteDrainTimeout`].
+    pub async fn begin_delete_project(&self, project_id: &ProjectId) -> Result<(), Error> {
+        self.project_gate.begin_delete(project_id);
+        if self
+            .project_gate
+            .wait_for_drain(project_id, DELETE_DRAIN_TIMEOUT)
+            .await
+        {
+            Ok(())
+        } else {
+            self.project_gate.end_delete(project_id);
+            Err(Error::DeleteDrainTimeout)
+        }
+    }
+
+    /// Ends a deletion begun by [`Handle::begin_delete_project`]. Same
+    /// contract as [`Handle::end_delete`], one level up.
+    pub fn end_delete_project(&self, project_id: &ProjectId) {
+        self.project_gate.end_delete(project_id);
+    }
+
+    /// `true` (and records one write in flight) if `project_id` is not
+    /// currently being deleted; used by `CreateAgent` to gate provisioning
+    /// a new agent's worktree and guidance tree under a project that might
+    /// be mid-`DeleteProject` -- the one writer `DeleteProject`'s own
+    /// per-agent marks can never cover, since the agent being created
+    /// doesn't exist yet for it to have marked. Call
+    /// [`Handle::end_project_write`] exactly once after, regardless of
+    /// outcome.
+    #[must_use]
+    pub fn try_begin_project_write(&self, project_id: &ProjectId) -> bool {
+        self.project_gate.try_begin_preparation(project_id)
+    }
+
+    /// Ends a write begun by [`Handle::try_begin_project_write`].
+    pub fn end_project_write(&self, project_id: &ProjectId) {
+        self.project_gate.end_preparation(project_id);
     }
 
     /// Stops the dispatcher. Live sessions are untouched: closing/crashing
@@ -439,85 +516,97 @@ pub fn spawn(
             wake_tx,
             shutdown: shutdown_tx,
             backoff,
+            // Not shared with the dispatcher task at all: `CreateAgent`'s
+            // writes it guards run on request-handling tasks, never on
+            // `run_dispatcher`'s (see `Handle::try_begin_project_write`).
+            project_gate: Arc::new(DeleteGate::new()),
         },
         join,
     ))
 }
 
 /// Per-agent exponential backoff for session-spawn attempts (this track's
-/// item 1), and -- this task's addition -- the same per-agent lock's home
-/// for deletion's "no new state under a deleting identity" invariant
-/// (ARCHITECTURE.md): `deleting` and `preparing` below. Without the
-/// backoff, a persistently broken spawn path -- the concrete repro that
-/// motivated it: `--runner` pointed at a missing `factory-runner` --
-/// retried on every dispatcher wake/tick, unboundedly often. Doubles from
-/// [`SPAWN_BACKOFF_INITIAL`] up to [`SPAWN_BACKOFF_MAX`] per agent on each
-/// consecutive failure; a successful spawn clears it. Entries persist until
-/// a delete explicitly clears them (`end_delete`) or a spawn succeeds
-/// (`record_success`) -- otherwise never pruned, same reasoning as
-/// `DaemonState::delivery_slots`.
+/// item 1). Without it, a persistently broken spawn path -- the concrete
+/// repro that motivated it: `--runner` pointed at a missing
+/// `factory-runner` -- retried on every dispatcher wake/tick, unboundedly
+/// often. Doubles from [`SPAWN_BACKOFF_INITIAL`] up to [`SPAWN_BACKOFF_MAX`]
+/// per agent on each consecutive failure; a successful spawn clears the
+/// timer ([`SpawnBackoff::record_success`]). Never pruned, same reasoning
+/// as `DaemonState::delivery_slots`.
+///
+/// Embeds, but is deliberately backed by a *separate* lock from, its own
+/// [`DeleteGate<AgentId>`] (PR #50 review, findings 1 and 2): an earlier
+/// version kept `deleting`/`preparing` in the same map and entry as this
+/// backoff timer, and clearing the timer -- on a successful spawn
+/// (`record_success`) or a timed-out delete's own cleanup (`end_delete`)
+/// -- was one `state.remove` that erased the *other* concern's state too,
+/// silently reopening the exact race this whole mechanism exists to
+/// close. Splitting them so neither operation can touch the other's data
+/// makes that class of bug structurally impossible rather than merely
+/// fixed once.
 struct SpawnBackoff {
-    state: Mutex<HashMap<AgentId, BackoffEntry>>,
+    timing: Mutex<HashMap<AgentId, BackoffTiming>>,
+    /// The delete-gating half of this struct (ARCHITECTURE.md invariant
+    /// 9): [`SpawnBackoff::try_begin_preparation`]/
+    /// [`SpawnBackoff::end_preparation`]/[`SpawnBackoff::begin_delete`]/
+    /// [`SpawnBackoff::end_delete`]/[`SpawnBackoff::wait_for_drain`] all
+    /// delegate here.
+    gate: DeleteGate<AgentId>,
 }
 
-struct BackoffEntry {
+struct BackoffTiming {
     next_attempt_at: Instant,
     delay: Duration,
     consecutive_failures: u32,
-    /// Set by [`SpawnBackoff::begin_delete`]: `dispatch_agent` must not
-    /// begin (`try_begin_preparation` returns `false`) a new spawn
-    /// preparation for this agent while set.
-    deleting: bool,
-    /// Count of spawn preparations for this agent currently between
-    /// `try_begin_preparation` returning `true` and the matching
-    /// `end_preparation` -- `wait_for_drain` blocks until this reaches
-    /// zero, so deletion never removes files a preparation might still be
-    /// writing.
-    preparing: u32,
 }
 
-impl Default for BackoffEntry {
+impl Default for BackoffTiming {
     fn default() -> Self {
         Self {
             next_attempt_at: Instant::now(),
             delay: Duration::ZERO,
             consecutive_failures: 0,
-            deleting: false,
-            preparing: 0,
         }
     }
 }
 
 const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(300);
-/// Bounds how long [`Handle::begin_delete`] waits for an in-flight spawn
-/// preparation to finish before giving up: a preparation is a handful of
-/// synchronous file writes (seed/rewrite the provider's generated config),
-/// not a network call, so a few seconds is generous headroom while still
-/// keeping a stuck delete request bounded rather than hanging indefinitely.
+/// Bounds how long [`Handle::begin_delete`]/[`Handle::begin_delete_project`]
+/// wait for an in-flight write to finish before giving up. The window this
+/// bounds is not just a handful of file writes: for the agent-scoped gate
+/// it is the whole of [`spawn_session_for_agent`] -- several `with_store`
+/// round-trips on the shared store mutex, `hooks::write_hook_token`, the
+/// provider's `spawn_spec`, a `create_session` commit and event publish,
+/// and `runner_process::spawn_runner` -- which PR #50's review measured as
+/// reachable in a few seconds on a loaded machine, exactly the condition
+/// #42 was filed under. So this is a real, sometimes-hit bound, not a
+/// formality: a delete on a busy daemon can genuinely time out and must
+/// retry.
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Poll granularity for [`SpawnBackoff::wait_for_drain`]. Polling (rather
+/// Poll granularity for [`DeleteGate::wait_for_drain`]. Polling (rather
 /// than a `Notify`) is the simplest correct option here: preparation
 /// windows are short, deletes are rare, and this reuses the same
-/// lock-and-check shape as the rest of `SpawnBackoff` instead of adding a
+/// lock-and-check shape as the rest of [`DeleteGate`] instead of adding a
 /// second synchronization primitive.
 const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 impl SpawnBackoff {
     fn new() -> Self {
         Self {
-            state: Mutex::new(HashMap::new()),
+            timing: Mutex::new(HashMap::new()),
+            gate: DeleteGate::new(),
         }
     }
 
     /// `true` if `agent_id` has never failed a spawn, or its last
     /// recorded failure's delay has fully elapsed.
     fn ready(&self, agent_id: &AgentId) -> bool {
-        let state = self
-            .state
+        let timing = self
+            .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state
+        timing
             .get(agent_id)
             .is_none_or(|entry| Instant::now() >= entry.next_attempt_at)
     }
@@ -525,11 +614,11 @@ impl SpawnBackoff {
     /// Doubles (capped) `agent_id`'s delay and returns `(new_delay,
     /// consecutive_failures)` so the caller can log both.
     fn record_failure(&self, agent_id: &AgentId) -> (Duration, u32) {
-        let mut state = self
-            .state
+        let mut timing = self
+            .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state.entry(agent_id.clone()).or_default();
+        let entry = timing.entry(agent_id.clone()).or_default();
         entry.delay = if entry.delay.is_zero() {
             SPAWN_BACKOFF_INITIAL
         } else {
@@ -540,27 +629,92 @@ impl SpawnBackoff {
         (entry.delay, entry.consecutive_failures)
     }
 
+    /// Clears `agent_id`'s backoff timer after a successful spawn. Only
+    /// ever touches [`SpawnBackoff::timing`] -- never `gate` (PR #50
+    /// review finding 1): a concurrent [`Handle::begin_delete`] may have
+    /// marked this exact agent deleting while this spawn was still in
+    /// flight, and this call must not erase that mark or the in-flight
+    /// write count backing it.
     fn record_success(&self, agent_id: &AgentId) {
-        let mut state = self
-            .state
+        let mut timing = self
+            .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.remove(agent_id);
+        timing.remove(agent_id);
     }
 
-    /// Atomically checks that `agent_id` is not currently being deleted
-    /// and, if so, records one spawn preparation for it in flight;
-    /// declines (returns `false`) if a delete is in progress. Checked and
-    /// incremented under the same lock as [`SpawnBackoff::begin_delete`]
-    /// and [`SpawnBackoff::wait_for_drain`], so a fresh preparation and a
-    /// delete beginning can never race past each other: whichever runs
-    /// first under the lock determines the outcome.
     fn try_begin_preparation(&self, agent_id: &AgentId) -> bool {
+        self.gate.try_begin_preparation(agent_id)
+    }
+
+    fn end_preparation(&self, agent_id: &AgentId) {
+        self.gate.end_preparation(agent_id);
+    }
+
+    /// Marks `agent_id` as being deleted (ARCHITECTURE.md invariant 9).
+    /// Deliberately does not touch the backoff timer (nit 8, PR #50
+    /// review): `deleting` alone is what `try_begin_preparation` checks,
+    /// so resetting timing here changes nothing about admission and used
+    /// to just cost a persistently-broken agent its accumulated backoff on
+    /// every refused delete attempt (`AgentHasChildren`,
+    /// `AgentHasLiveSession`, ...).
+    fn begin_delete(&self, agent_id: &AgentId) {
+        self.gate.begin_delete(agent_id);
+    }
+
+    fn end_delete(&self, agent_id: &AgentId) {
+        self.gate.end_delete(agent_id);
+    }
+
+    async fn wait_for_drain(&self, agent_id: &AgentId, budget: Duration) -> bool {
+        self.gate.wait_for_drain(agent_id, budget).await
+    }
+}
+
+/// Per-identity "no new state once deletion begins" gate (ARCHITECTURE.md
+/// invariant 9): a `deleting` mark plus an in-flight `preparing` count.
+/// Generic over the identity type so the exact same mechanism guards an
+/// agent's guidance directory ([`SpawnBackoff`]'s `gate` field, keyed by
+/// `AgentId`) and a project's, including agents an operator might still be
+/// creating under it while the project itself is being deleted
+/// (`Handle`'s `project_gate` field, keyed by `ProjectId`) -- see PR #50's
+/// review, finding 3.
+///
+/// Never pruned (same reasoning as `DaemonState::delivery_slots`):
+/// [`DeleteGate::end_delete`] clears only `deleting`, never removes the
+/// entry and never touches `preparing`. Dropping the entry (or the
+/// in-flight count with it) here is exactly the mistake `SpawnBackoff`
+/// used to make -- see its doc comment.
+struct DeleteGate<Id: Eq + std::hash::Hash + Clone> {
+    state: Mutex<HashMap<Id, GateEntry>>,
+}
+
+#[derive(Default)]
+struct GateEntry {
+    deleting: bool,
+    preparing: u32,
+}
+
+impl<Id: Eq + std::hash::Hash + Clone> DeleteGate<Id> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Atomically checks that `id` is not currently being deleted and, if
+    /// not, records one write in flight for it; declines (returns
+    /// `false`) if a delete is in progress. Checked and incremented under
+    /// the same lock as [`DeleteGate::begin_delete`] and
+    /// [`DeleteGate::wait_for_drain`], so a fresh write and a delete
+    /// beginning can never race past each other: whichever runs first
+    /// under the lock determines the outcome.
+    fn try_begin_preparation(&self, id: &Id) -> bool {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state.entry(agent_id.clone()).or_default();
+        let entry = state.entry(id.clone()).or_default();
         if entry.deleting {
             return false;
         }
@@ -568,51 +722,51 @@ impl SpawnBackoff {
         true
     }
 
-    /// Ends one spawn preparation recorded by
-    /// [`SpawnBackoff::try_begin_preparation`], whether it succeeded or
-    /// failed -- lets a concurrent [`SpawnBackoff::wait_for_drain`] proceed
-    /// once every preparation for `agent_id` has ended.
-    fn end_preparation(&self, agent_id: &AgentId) {
+    /// Ends one write recorded by [`DeleteGate::try_begin_preparation`],
+    /// whether it succeeded or failed -- lets a concurrent
+    /// [`DeleteGate::wait_for_drain`] proceed once every write for `id`
+    /// has ended.
+    fn end_preparation(&self, id: &Id) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(agent_id) {
+        if let Some(entry) = state.get_mut(id) {
             entry.preparing = entry.preparing.saturating_sub(1);
         }
     }
 
-    /// Marks `agent_id` as being deleted and clears any pending backoff
-    /// timer for it (this task's mechanism): from this call on,
-    /// `try_begin_preparation` declines new spawn preparations for it.
-    /// Idempotent.
-    fn begin_delete(&self, agent_id: &AgentId) {
+    /// Marks `id` as being deleted: from this call on,
+    /// `try_begin_preparation` declines new writes for it. Idempotent.
+    fn begin_delete(&self, id: &Id) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state.entry(agent_id.clone()).or_default();
-        entry.deleting = true;
-        entry.delay = Duration::ZERO;
-        entry.consecutive_failures = 0;
-        entry.next_attempt_at = Instant::now();
+        state.entry(id.clone()).or_default().deleting = true;
     }
 
-    /// Clears every trace of `agent_id` (deleting mark, in-flight
-    /// preparation count, and backoff timer) so an agent later created
-    /// with the same id starts clean.
-    fn end_delete(&self, agent_id: &AgentId) {
+    /// Clears only the deleting mark begun by `begin_delete` -- never
+    /// removes the entry and never touches `preparing`. `preparing` may
+    /// genuinely still be nonzero here: a drain timeout, or a write
+    /// admitted the instant before `begin_delete` set the mark and not
+    /// yet finished. Dropping it was exactly what let a retried delete
+    /// report "drained" while a write was still running (PR #50 review,
+    /// finding 2). Idempotent.
+    fn end_delete(&self, id: &Id) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.remove(agent_id);
+        if let Some(entry) = state.get_mut(id) {
+            entry.deleting = false;
+        }
     }
 
-    /// Polls (bounded by `budget`) until `agent_id` has no spawn
-    /// preparation in flight; returns `false` on timeout. See
-    /// [`DELETE_DRAIN_POLL`] for why polling rather than a `Notify`.
-    async fn wait_for_drain(&self, agent_id: &AgentId, budget: Duration) -> bool {
+    /// Polls (bounded by `budget`) until `id` has no write in flight;
+    /// returns `false` on timeout. See [`DELETE_DRAIN_POLL`] for why
+    /// polling rather than a `Notify`.
+    async fn wait_for_drain(&self, id: &Id, budget: Duration) -> bool {
         let deadline = Instant::now() + budget;
         loop {
             let drained = {
@@ -620,7 +774,7 @@ impl SpawnBackoff {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.get(agent_id).is_none_or(|entry| entry.preparing == 0)
+                state.get(id).is_none_or(|entry| entry.preparing == 0)
             };
             if drained {
                 return true;
@@ -816,7 +970,15 @@ async fn dispatch_agent(
             Ok(())
         }
         Some(session) if session.state == SessionState::Idle => {
-            deliver_pending(config, state, project_id, agent_id, &session.snapshot()).await
+            deliver_pending(
+                config,
+                state,
+                backoff,
+                project_id,
+                agent_id,
+                &session.snapshot(),
+            )
+            .await
         }
         Some(_) => Ok(()),
     }
@@ -1356,6 +1518,7 @@ pub(crate) async fn commit_pending_delivery_on_prompt(
 async fn deliver_pending(
     config: &Config,
     state: &DaemonState,
+    backoff: &SpawnBackoff,
     project_id: &ProjectId,
     agent_id: &AgentId,
     session: &SessionSnapshot,
@@ -1373,9 +1536,21 @@ async fn deliver_pending(
     let Some(_delivery_slot) = state.try_delivery_slot(agent_id) else {
         return Ok(());
     };
-    let Some(delivery) =
-        compose_delivery(state, &config.guidance_root, project_id, agent_id).await?
-    else {
+    // Deletion (ARCHITECTURE.md invariant 9, PR #50 review finding 5):
+    // `compose_delivery` calls `compose_text`, which lazily recreates this
+    // agent's guidance files (`guidance::read_or_create`) if missing --
+    // gated exactly like spawn preparation, under the same per-agent lock,
+    // so `Handle::begin_delete`'s drain can never miss it. A decline here
+    // is silent, matching the delivery-slot miss above: whatever wake this
+    // was for gets retried once the delete (or whatever else is deleting
+    // this agent) finishes.
+    if !backoff.try_begin_preparation(agent_id) {
+        return Ok(());
+    }
+    let delivery_result =
+        compose_delivery(state, &config.guidance_root, project_id, agent_id).await;
+    backoff.end_preparation(agent_id);
+    let Some(delivery) = delivery_result? else {
         return Ok(());
     };
     let target = state
@@ -2232,6 +2407,18 @@ mod tests {
     /// "not attempted" assertion `dispatch_agent_defers_spawn_at_the_concurrency_limit`
     /// makes for the concurrency limit, above. Deterministic: no timing,
     /// just direct state.
+    ///
+    /// The agent is given a real worktree on disk (unlike that sibling
+    /// test) precisely so this one is *not* vacuous (PR #50 review,
+    /// should-fix 6): without a worktree, `spawn_session_for_agent` bails
+    /// at `Error::NoWorktree` before ever reaching `create_session`, so
+    /// `sessions.is_empty()` would hold whether or not
+    /// `try_begin_preparation`'s gate exists at all. With a worktree,
+    /// `spawn_session_for_agent` gets as far as `create_session` before
+    /// failing at the nonexistent `runner_program` -- verified by mutation:
+    /// hard-coding `try_begin_preparation` to always return `true` makes
+    /// this assertion fail (a session row does get created), and reverting
+    /// that makes it pass again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dispatch_agent_declines_to_prepare_for_a_deleting_agent() {
         let directory = private_tempdir();
@@ -2262,6 +2449,10 @@ mod tests {
                 1_000,
             )
             .unwrap();
+        store
+            .set_agent_worktree(&project_id, &agent_id, worktree.clone(), 1_000)
+            .unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
         store
             .create_task(
                 crate::store::NewTask {
@@ -2367,6 +2558,121 @@ mod tests {
         assert!(
             waiter.await.unwrap(),
             "must observe the drain once the preparation ends, well within its budget"
+        );
+    }
+
+    /// PR #50 review, blocking finding 1, reproduced verbatim as a unit
+    /// probe: a spawn that *succeeds* while a delete is draining used to
+    /// have its `record_success` (`state.remove`, back when `SpawnBackoff`
+    /// kept backoff timing and the delete mark in one entry) erase the
+    /// concurrent `deleting` mark, so the drain reported "drained" with no
+    /// mark set at all -- reopening #42's exact race for the *next*
+    /// dispatch. Now that `SpawnBackoff::timing` and `SpawnBackoff::gate`
+    /// are separate locks, `record_success` cannot reach `gate` no matter
+    /// what it does.
+    #[tokio::test]
+    async fn record_success_during_a_drain_does_not_erase_the_deleting_mark() {
+        let backoff = SpawnBackoff::new();
+        let agent_id = AgentId::try_from("curie").unwrap();
+
+        assert!(backoff.try_begin_preparation(&agent_id));
+        backoff.begin_delete(&agent_id);
+        // dispatch_agent's own sequence on a successful spawn
+        // (execution.rs's spawn branch): end the preparation, then record
+        // the backoff success.
+        backoff.end_preparation(&agent_id);
+        backoff.record_success(&agent_id);
+
+        assert!(
+            backoff
+                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
+                .await,
+            "the preparation already ended, so this must drain immediately"
+        );
+        assert!(
+            !backoff.try_begin_preparation(&agent_id),
+            "the deleting mark must survive a concurrent record_success"
+        );
+    }
+
+    /// PR #50 review, blocking finding 2, reproduced verbatim: the retry
+    /// `Handle::begin_delete`'s own error message tells the operator to
+    /// make ("try the delete again") used to bypass the drain entirely,
+    /// because `end_delete`'s timeout-branch call was `state.remove`,
+    /// which discarded the `preparing` count of the write that was *still
+    /// running*. The very next `begin_delete` then saw a fresh, empty
+    /// entry and reported "drained" immediately. `end_delete` now clears
+    /// only `deleting`, so a retry keeps seeing the real in-flight count
+    /// until the write actually ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_drain_retry_still_waits_for_the_still_in_flight_preparation() {
+        let backoff = SpawnBackoff::new();
+        let agent_id = AgentId::try_from("curie").unwrap();
+
+        // A preparation that outlives the drain timeout entirely.
+        assert!(backoff.try_begin_preparation(&agent_id));
+
+        backoff.begin_delete(&agent_id);
+        assert!(
+            !backoff
+                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
+                .await,
+            "must time out while the preparation is still in flight"
+        );
+        // `Handle::begin_delete`'s timeout branch, verbatim.
+        backoff.end_delete(&agent_id);
+
+        // The operator retries, exactly as the error message says to.
+        backoff.begin_delete(&agent_id);
+        assert!(
+            !backoff
+                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
+                .await,
+            "the retry must still see the still-in-flight preparation, not report drained"
+        );
+
+        // The preparation finally ends -- a third attempt now genuinely
+        // drains.
+        backoff.end_preparation(&agent_id);
+        backoff.begin_delete(&agent_id);
+        assert!(
+            backoff
+                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
+                .await
+        );
+    }
+
+    /// PR #50 review, blocking finding 3/should-fix 5: `Handle`'s
+    /// project-scoped `DeleteGate<ProjectId>` (`try_begin_project_write`/
+    /// `begin_delete_project`, used by `CreateAgent`/`DeleteProject`) is
+    /// the exact same generic mechanism as the agent-scoped one the tests
+    /// above already prove correct, just instantiated over `ProjectId`
+    /// instead of `AgentId`. This drives it directly rather than only
+    /// trusting that the generic code behaves identically for a different
+    /// key type: a `CreateAgent`-equivalent write declines once the
+    /// project is marked deleting, and a fresh write is accepted again
+    /// once the mark clears.
+    #[tokio::test]
+    async fn project_delete_gate_declines_a_create_agent_style_write_while_deleting() {
+        let gate: DeleteGate<ProjectId> = DeleteGate::new();
+        let project_id = ProjectId::try_from("factory").unwrap();
+
+        assert!(
+            gate.try_begin_preparation(&project_id),
+            "an ordinary CreateAgent-style write is accepted before any delete begins"
+        );
+        gate.end_preparation(&project_id);
+
+        gate.begin_delete(&project_id);
+        assert!(
+            !gate.try_begin_preparation(&project_id),
+            "CreateAgent must decline outright once DeleteProject has marked the project"
+        );
+
+        gate.end_delete(&project_id);
+        assert!(
+            gate.try_begin_preparation(&project_id),
+            "clearing the mark must restore normal CreateAgent behavior"
         );
     }
 
