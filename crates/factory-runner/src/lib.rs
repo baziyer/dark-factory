@@ -1989,17 +1989,10 @@ fn pty_control_loop(
 /// [`RAW_MODE_POLL_TIMEOUT`], sending once, only once, the moment `ICANON`
 /// clears -- the child took its controlling tty out of canonical mode. See
 /// `RunnerEvent::TerminalRaw`'s own doc comment for why that is the signal
-/// `supervise_terminal` waits on before logging it. If the deadline elapses
-/// with nothing detected, `detected` is simply dropped -- `TerminalRaw` is
-/// an optimization the daemon can act on, never something a session's
-/// liveness depends on (`#52`'s deadline is the honest fallback if it
-/// never arrives).
-/// Sends exactly one outcome on `result` before returning: `true` the
-/// moment `ICANON` clears, `false` if [`RAW_MODE_POLL_TIMEOUT`] elapses
-/// first with it never clearing. Never leaves `result` unsent -- the
-/// caller (`supervise_terminal`) relies on this to distinguish "still
-/// polling" from "gave up silently", which round 2's finding B is about
-/// closing.
+/// `supervise_terminal` waits on before logging it. Sends exactly one
+/// outcome on `result` before returning: `true` when `ICANON` clears, or
+/// `false` when the deadline expires. `supervise_terminal` maps the latter
+/// to `RunnerEvent::TerminalRawTimedOut`, so a timeout is never silent.
 fn pty_raw_mode_poll_loop(
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     result: oneshot::Sender<bool>,
