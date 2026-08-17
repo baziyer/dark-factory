@@ -605,16 +605,20 @@ impl Board {
         self.set_status(text, StatusLevel::Error);
     }
 
-    /// The text the bottom status/help line should show right now: a recent status/error message
-    /// if one is still "sticky", otherwise the key-help reminder for the current mode/view.
+    /// The text the bottom status/help line should show right now: the key-help reminder for the
+    /// current mode/view *always* renders, so the operator never loses the "what keys work"
+    /// reference — a recent status/error message, while still "sticky", is prepended alongside
+    /// it rather than replacing it (the fix for hints vanishing for several seconds after
+    /// cancelling a prompt).
     #[must_use]
     pub fn status_line_text(&self) -> String {
-        if let Some(status) = &self.status {
-            if self.now_ms - status.at_ms < STATUS_STICKY_MS {
-                return status.text.clone();
+        let hint = self.help_text();
+        match &self.status {
+            Some(status) if self.now_ms - status.at_ms < STATUS_STICKY_MS => {
+                format!("{}   {hint}", status.text)
             }
+            _ => hint,
         }
-        self.help_text()
     }
 
     #[must_use]
