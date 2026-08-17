@@ -4,8 +4,8 @@
 //! these types only needs updating in one place.
 
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, ProjectId, ProjectSnapshot, Provider, TaskDetail, TaskId,
-    TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, ObserverHealth, ProjectId, ProjectSnapshot, Provider, RunId,
+    RunSnapshot, RunStatus, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
 };
 
 pub(crate) fn project(id: &str, created_at_ms: i64) -> ProjectSnapshot {
@@ -61,5 +61,35 @@ pub(crate) fn task(
         body: String::new(),
         result: None,
         blocked_reason: None,
+    }
+}
+
+pub(crate) fn run(
+    agent_id: &str,
+    project: &str,
+    status: RunStatus,
+    started_at_ms: i64,
+) -> RunSnapshot {
+    RunSnapshot {
+        id: RunId::try_from(format!("run-{agent_id}-{started_at_ms}")).unwrap(),
+        project_id: ProjectId::try_from(project).unwrap(),
+        agent_id: AgentId::try_from(agent_id).unwrap(),
+        parent_run_id: None,
+        task_id: None,
+        session_id: None,
+        closed_by: None,
+        status,
+        activity: None,
+        wait_reason: None,
+        worktree: "/work".into(),
+        observer_health: ObserverHealth::Unknown,
+        observer_health_since_ms: 0,
+        started_at_ms,
+        status_since_ms: started_at_ms,
+        updated_at_ms: started_at_ms,
+        ended_at_ms: None,
+        exit_code: None,
+        exit_signal: None,
+        failure_reason: None,
     }
 }

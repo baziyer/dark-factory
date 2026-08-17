@@ -1033,8 +1033,8 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 mod tests {
     use super::*;
     use crate::model::state::AgentState;
-    use crate::test_fixtures::{agent, project, task};
-    use factory_core::{AgentRole, ObserverHealth, RunSnapshot, RunStatus, TaskStatus};
+    use crate::test_fixtures::{agent, project, run, task};
+    use factory_core::{AgentRole, RunStatus, TaskStatus};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1235,31 +1235,8 @@ mod tests {
     #[test]
     fn g_jumps_to_next_agent_needing_attention() {
         let mut board = board_with_one_project();
-        board.runs.insert(
-            RunId::try_from("run-1").unwrap(),
-            RunSnapshot {
-                id: RunId::try_from("run-1").unwrap(),
-                project_id: ProjectId::try_from("proj").unwrap(),
-                agent_id: AgentId::try_from("alice").unwrap(),
-                parent_run_id: None,
-                task_id: None,
-                session_id: None,
-                closed_by: None,
-                status: RunStatus::Blocked,
-                activity: None,
-                wait_reason: None,
-                worktree: "/work".into(),
-                observer_health: ObserverHealth::Unknown,
-                observer_health_since_ms: 0,
-                started_at_ms: 0,
-                status_since_ms: 0,
-                updated_at_ms: 0,
-                ended_at_ms: None,
-                exit_code: None,
-                exit_signal: None,
-                failure_reason: None,
-            },
-        );
+        let blocked = run("alice", "proj", RunStatus::Blocked, 0);
+        board.runs.insert(blocked.id.clone(), blocked);
         let intent = board.handle_key(key(KeyCode::Char('g')));
         assert!(matches!(intent, Intent::Redraw));
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
@@ -1276,31 +1253,8 @@ mod tests {
     #[test]
     fn capital_g_jumps_and_switches_to_focus() {
         let mut board = board_with_one_project();
-        board.runs.insert(
-            RunId::try_from("run-1").unwrap(),
-            RunSnapshot {
-                id: RunId::try_from("run-1").unwrap(),
-                project_id: ProjectId::try_from("proj").unwrap(),
-                agent_id: AgentId::try_from("alice").unwrap(),
-                parent_run_id: None,
-                task_id: None,
-                session_id: None,
-                closed_by: None,
-                status: RunStatus::Failed,
-                activity: None,
-                wait_reason: None,
-                worktree: "/work".into(),
-                observer_health: ObserverHealth::Unknown,
-                observer_health_since_ms: 0,
-                started_at_ms: 0,
-                status_since_ms: 0,
-                updated_at_ms: 0,
-                ended_at_ms: None,
-                exit_code: None,
-                exit_signal: None,
-                failure_reason: None,
-            },
-        );
+        let failed = run("alice", "proj", RunStatus::Failed, 0);
+        board.runs.insert(failed.id.clone(), failed);
         board.handle_key(key(KeyCode::Char('G')));
         assert_eq!(board.view, View::Focus);
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
