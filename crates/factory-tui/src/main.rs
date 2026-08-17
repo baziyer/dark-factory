@@ -485,6 +485,7 @@ fn apply_net_msg(
             }
         }
         NetMsg::Event(event) => board.apply_event(event),
+        NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
         NetMsg::TaskDetailResult { task_id, result } => {

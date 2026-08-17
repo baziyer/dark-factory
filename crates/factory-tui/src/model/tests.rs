@@ -187,6 +187,139 @@ fn first_session_changed_event_for_a_session_always_announces() {
     assert_eq!(b.announcements.len(), 1);
 }
 
+// -- connect-time replay (#67 backfilled announcements, #70 backfilled sparklines) ----------
+
+#[test]
+fn apply_replay_adds_announcements_in_time_order_regardless_of_batch_order() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    // Fed newest-first on purpose — `apply_replay` must not just trust whatever order the batch
+    // arrived in.
+    b.apply_replay(vec![
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 2,
+            occurred_at_ms: 200,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-1", "alice", "a", SessionState::WaitingForInput),
+            },
+        },
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 100,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-1", "alice", "a", SessionState::Working),
+            },
+        },
+    ]);
+    let texts: Vec<&str> = b.announcements.iter().map(|a| a.text.as_str()).collect();
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[0].contains("working"),
+        "oldest event first: {texts:?}"
+    );
+    assert!(
+        texts[1].contains("waiting for input"),
+        "newest event last: {texts:?}"
+    );
+}
+
+#[test]
+fn apply_replay_does_not_repeat_unchanged_session_states_within_the_batch() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let events = (0..5)
+        .map(|i| EventEnvelope {
+            protocol_version: 1,
+            sequence: i,
+            occurred_at_ms: i,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-1", "alice", "a", SessionState::Working),
+            },
+        })
+        .collect();
+    b.apply_replay(events);
+    assert_eq!(
+        b.announcements.len(),
+        1,
+        "same dedupe as the live path: a repeated unchanged state announces once"
+    );
+}
+
+#[test]
+fn apply_replay_then_a_live_redelivery_of_the_same_event_does_not_duplicate() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let event = EventEnvelope {
+        protocol_version: 1,
+        sequence: 7,
+        occurred_at_ms: 700,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    };
+    b.apply_replay(vec![event.clone()]);
+    assert_eq!(b.announcements.len(), 1);
+    // The live subscription starts right where the replay left off, but must stay correct even if
+    // it (or a later reconnect) redelivers an event the replay already announced.
+    b.apply_event(event);
+    assert_eq!(
+        b.announcements.len(),
+        1,
+        "the same event id (sequence) must never announce twice"
+    );
+}
+
+#[test]
+fn apply_replay_feeds_the_activity_sparkline() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let alice = AgentId::try_from("alice").unwrap();
+    assert!(
+        !b.activity.contains_key(&alice),
+        "no activity before any event arrives"
+    );
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    }]);
+    let counts = b.activity.get(&alice).unwrap().counts();
+    assert_eq!(
+        counts.iter().sum::<u64>(),
+        1,
+        "the sparkline's data source must be fed from replayed events too (#70)"
+    );
+}
+
 // -- state/attention precedence ----------------------------------------------------------------
 
 #[test]
