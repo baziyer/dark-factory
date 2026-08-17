@@ -2474,3 +2474,241 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
         ApiFailure::Store(error) => error.to_string(),
     })
 }
+
+/// Wiring-level tests for the two deletion-gate call sites this file adds
+/// around `execution::stop_hook_reply`/`execution::commit_pending_delivery_on_prompt`
+/// (PR #50 review, round 3's nit): every existing `tests/local_api.rs`/
+/// `tests/sessions_e2e.rs` suite still passes even if `try_begin_agent_write`'s
+/// result is discarded at both call sites (the reviewer verified this by
+/// mutation), because neither hook path's *ordinary* behavior depends on
+/// the gate -- only the race this PR closes does, and that race needs a
+/// second, concurrent request to observe. These tests drive
+/// `handle_request` directly (visible here, not from the external
+/// `tests/` crate, since it is module-private) with the agent already
+/// marked deleting, so no real race or timing is needed: the assertion is
+/// "this exact call, with the mark already set, must not touch the store
+/// the way it normally would" -- exactly what the mutation the reviewer
+/// tried would break.
+#[cfg(test)]
+mod deletion_gate_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use factory_core::{AgentRole, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus};
+
+    use super::*;
+    use crate::store::{NewAgent, NewProject, NewSession, NewTask, Store};
+
+    fn private_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    fn config(directory: &Path) -> execution::Config {
+        execution::Config {
+            runner_program: directory.join("factory-runner"),
+            factoryctl_path: directory.join("factoryctl"),
+            runtime_root: directory.join("runs"),
+            guidance_root: directory.to_path_buf(),
+            socket_path: directory.join("f.sock"),
+            max_active_runs: 1,
+        }
+    }
+
+    const HOOK_TOKEN_LEN: usize = 64;
+
+    /// A project, one agent, one live session (with a fixed, known hook
+    /// token so a test can address it via `LocalRequest::ProviderHook`
+    /// exactly like a real provider process would), and one task assigned
+    /// to that agent -- pending work for `compose_delivery` to find, so a
+    /// gate decline is distinguishable from "nothing to deliver anyway".
+    async fn setup(
+        directory: &Path,
+    ) -> (
+        ApiState,
+        execution::Handle,
+        tokio::task::JoinHandle<Result<(), execution::Error>>,
+        ProjectId,
+        AgentId,
+        TaskId,
+    ) {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let task_id = TaskId::try_from("task-1").unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: directory.to_string_lossy().into_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    provider_session_id: None,
+                    worktree: directory.to_string_lossy().into_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(HOOK_TOKEN_LEN),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: directory
+                        .join("runs")
+                        .join("session-1")
+                        .to_string_lossy()
+                        .into_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Do the thing".to_owned(),
+                    body: "Do the thing.".to_owned(),
+                    priority: 0,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 1_000)
+            .unwrap();
+
+        let state = ApiState::new(store);
+        let (execution, join) = execution::spawn(config(directory), state.clone()).unwrap();
+        (state, execution, join, project_id, agent_id, task_id)
+    }
+
+    /// `commit_pending_delivery_on_prompt`'s gated call site
+    /// (`UserPromptSubmit`): with `curie` marked deleting, a
+    /// `UserPromptSubmit` hook -- even with a delivery genuinely in
+    /// flight (`try_delivery_slot` held, satisfying
+    /// `commit_pending_delivery_on_prompt`'s own precondition) and a task
+    /// assigned and waiting -- must not open the run episode. Verified by
+    /// mutation: discarding `try_begin_agent_write`'s result at that call
+    /// site (matching the reviewer's own repro) makes this test's final
+    /// assertion fail (`task-1` moves to `Running`); restoring the gate
+    /// makes it pass again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_pending_delivery_on_prompt_declines_while_the_agent_is_deleting() {
+        let directory = private_tempdir();
+        let (state, execution, join, project_id, agent_id, task_id) = setup(directory.path()).await;
+
+        let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
+        execution.begin_delete(&agent_id).await.unwrap();
+
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::UserPromptSubmit,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await;
+        assert!(
+            response.is_ok(),
+            "a declined gate must not surface as the hook request's own error, got {response:?}"
+        );
+
+        let task = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.get_task(&project_id, &task_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            task.snapshot.status,
+            TaskStatus::Queued,
+            "no run episode must open for a deleting agent's UserPromptSubmit hook"
+        );
+
+        execution.end_delete(&agent_id);
+        execution.shutdown().await.unwrap();
+        join.await.unwrap().unwrap();
+    }
+
+    /// `stop_hook_reply`'s gated call site (`Stop`/`SubagentStop`): with
+    /// `curie` marked deleting, a `Stop` hook -- with a task assigned and
+    /// waiting, and the delivery slot free so `stop_hook_reply` could
+    /// otherwise claim it -- must reply `{}` (nothing to deliver, from
+    /// this hook's point of view) rather than block-replying the pending
+    /// task, and must not open its run episode either. Verified by
+    /// mutation the same way as the `UserPromptSubmit` test above.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_hook_reply_declines_while_the_agent_is_deleting() {
+        let directory = private_tempdir();
+        let (state, execution, join, project_id, agent_id, task_id) = setup(directory.path()).await;
+
+        execution.begin_delete(&agent_id).await.unwrap();
+
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::Stop,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                &response,
+                LocalResponse::ProviderHookReply { reply } if *reply == serde_json::json!({})
+            ),
+            "a declined gate must reply {{}} even with pending work, got {response:?}"
+        );
+
+        let task = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.get_task(&project_id, &task_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            task.snapshot.status,
+            TaskStatus::Queued,
+            "no run episode must open for a deleting agent's Stop hook"
+        );
+
+        execution.end_delete(&agent_id);
+        execution.shutdown().await.unwrap();
+        join.await.unwrap().unwrap();
+    }
+}
