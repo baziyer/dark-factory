@@ -37,13 +37,18 @@ jobs:
       # nothing to retry. A plain `git fetch` talks straight to GitHub's
       # git server instead, so this job never depends on that download.
       #
-      # This runner's workspace persists between jobs, so the step below
-      # must leave a clean tree at exactly $GITHUB_SHA even if a previous
-      # job left files behind: initialize the workspace as a repo if it
-      # isn't one yet, fetch that one commit, force-checkout it detached,
-      # then `git clean -ffdx` everything else a prior job left. That clean
-      # never touches the cargo cache: CARGO_TARGET_DIR lives outside this
-      # workspace (see docs/development/WORKFLOW.md, "The self-hosted
+      # This runner's workspace persists between jobs, and the
+      # `cancel-in-progress` concurrency group above can SIGTERM a job
+      # mid-checkout (an ordinary fixup push while the previous push's
+      # `checks` is still running), so a prior job can leave more than
+      # stray files behind: a `.git/index.lock`, a half-written pack, a
+      # stale shallow boundary. `rm -rf .git && git init` before every
+      # fetch throws all of that away in one move instead of trying to
+      # detect and repair each kind of leftover state, then `git checkout
+      # --force --detach` lands on the target commit and `git clean -ffdx`
+      # removes anything else a prior job left in the working tree. That
+      # clean never touches the cargo cache: CARGO_TARGET_DIR lives outside
+      # this workspace (see docs/development/WORKFLOW.md, "The self-hosted
       # runner").
       #
       # $GITHUB_SHA is the PR's merge commit for `pull_request` events and
@@ -55,10 +60,8 @@ jobs:
       - name: Check out $GITHUB_SHA
         run: |
           set -euxo pipefail
-          if [ ! -d .git ]; then
-            git init
-          fi
-          git remote remove origin 2>/dev/null || true
+          rm -rf .git
+          git init
           git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
           git fetch --depth=1 origin "$GITHUB_SHA"
           git checkout --force --detach FETCH_HEAD
