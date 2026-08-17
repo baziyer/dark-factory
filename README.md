@@ -211,6 +211,16 @@ Resident sessions are wired end to end: assigning a task to an agent spawns
 process automatically — there is no separate "start" step in the common
 case.
 
+First run once: `cargo build --workspace` (or `--release`). `factoryd`
+launches sessions by resolving `factory-runner` next to its own executable,
+not as a compile-time dependency — `cargo run -p factoryd` alone only builds
+`factoryd` itself. If `factory-runner` is missing, `task assign` still
+returns success (the task is durably queued) but the daemon can't spawn a
+session for it; it retries silently and the failure only shows up in
+`factoryd`'s own log (`session spawn failed error=runner launch failed: ...`),
+not in `task get`/`session list` or the TUI. Build the workspace first and
+this never comes up.
+
 ```sh
 # Terminal 1: run the daemon in the foreground (or use launchd, see below)
 cargo run -p factoryd
@@ -246,6 +256,16 @@ take no `--agent`; identity comes from the session's own environment):
 factoryctl task done --project demo --task t1 --result "Fixed the race; added a regression test."
 factoryctl task blocked --project demo --task t1 --reason "Needs a decision on retry semantics."
 ```
+
+The composed task text an agent receives spells these out as bare
+`factoryctl` commands, so `factoryctl` needs to already resolve on the
+session's `PATH` for a real `claude`/`codex` agent to run them directly (a
+generated hook, by contrast, always invokes it by an absolute, daemon-known
+path). Running only from `cargo run`/`target/debug` without ever putting
+that directory on `PATH` (as opposed to a normal `cargo install`ed or
+packaged `factoryctl`) means a real agent may spend a few tool calls
+locating the right binary the first time it tries to close out a task —
+harmless, but worth knowing about before you assume something's wrong.
 
 **The orchestrator ("god") is just another agent**, driven the same way —
 `--role orchestrator` instead of `worker`, and typically talking to

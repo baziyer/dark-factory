@@ -198,6 +198,11 @@ Never point this at `~/.dark-factory` or the live `launchd` daemon. Use a privat
 export DARK_FACTORY_HOME=$(mktemp -d)
 chmod 700 "$DARK_FACTORY_HOME"
 target/debug/factoryd &
+# If factoryd instead exits with "path must be shorter than SUN_LEN": the socket path
+# ($DARK_FACTORY_HOME/f.sock) is over the platform's ~104-byte Unix-socket-path limit, which
+# `mktemp -d` alone can't guarantee from a deeply nested working directory (long on some CI
+# runners and synced folders even though plain `mktemp -d` is short on a typical macOS shell).
+# Pick a shallower base explicitly instead, e.g. `mktemp -d /tmp/df-ui.XXXXXX`.
 target/debug/factoryctl project add --name demo --root "$PWD"
 target/debug/factoryctl agent add --project demo --role orchestrator --provider codex
 target/debug/factoryctl agent add --project demo --role worker --provider claude-code

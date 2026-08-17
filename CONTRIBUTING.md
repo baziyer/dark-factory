@@ -57,3 +57,25 @@ catches a theme missing a glyph the board can actually draw.
   unresolved"). Threading the raw hook payload through
   `Store::record_hook_event` is the shape of the fix; it touches roughly a
   dozen call sites in `crates/factoryd/tests/sessions_store.rs`.
+- `factory-tui`'s `Board::apply_event`'s `TaskChanged` arm
+  (`crates/factory-tui/src/model/mod.rs`) deliberately preserves whatever
+  `body`/`result` it already has for a task, because the wire event only
+  ever carries the durable `TaskSnapshot` — never the body. That's correct
+  for a task the board already knows about, but a task created *after* the
+  board's initial fleet-snapshot bootstrap has no prior `body` to preserve,
+  so WORKSHOP's detail pane shows "(no body)" for it permanently (confirmed
+  live: assign a task while `factory-tui` is already running and watch its
+  detail pane). Smallest fix: add `body`/`result` to
+  `FactoryEvent::TaskChanged` in `crates/factory-core/src/lib.rs` (mirrors
+  how `SessionChanged` already carries its full snapshot inline) rather than
+  having the client round-trip a `GetTask` after the fact.
+- FORTRESS's selection model is entirely agent-based (`Board::selected_agent`
+  drives `Tab` cycling and `Enter`-to-zoom in `crates/factory-tui/src/model/
+  keymap.rs`), so a project with zero agents has no station glyph to select
+  and is unreachable from FORTRESS by keyboard — only `factory-tui --project
+  ID` at startup can focus one. Confirmed live: `project add` a second
+  project, then try to `Tab`/`Enter` into it from FORTRESS before it has any
+  agent. Smallest fix: let `cycle_selected_agent`/`zoom_in`'s `Fortress` arm
+  also stop on (and zoom into) a project's empty-agents placeholder station,
+  not just real agent glyphs — the WORKSHOP side already renders that case
+  correctly (see the empty-state hints in `ui/workshop.rs`).
