@@ -582,6 +582,165 @@ fn user_prompt_pre_tool_and_post_tool_move_the_session_to_working() {
     assert_eq!(session.state, SessionState::Working);
 }
 
+/// Adversarial review finding 9b: Codex's own real `SessionStart` always
+/// arrives *after* the daemon has already synthesized one and moved a
+/// session past `starting` (`docs/providers.md`'s Codex `SessionStart`
+/// section) -- often once a turn is already `working`. A second
+/// `SessionStart` mid-turn must never drop the session back to `idle`, and
+/// must never disturb its own `activity`/`state_since_ms`, since nothing
+/// about the session's real progress changed.
+#[test]
+fn a_second_session_start_while_working_does_not_regress_the_session() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            6,
+        )
+        .unwrap();
+    let (working, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::UserPromptSubmit,
+            Some("thinking".into()),
+            true,
+            None,
+            7,
+        )
+        .unwrap();
+    assert_eq!(working.state, SessionState::Working);
+
+    let (session, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            8,
+        )
+        .unwrap();
+    assert_eq!(
+        session.state,
+        SessionState::Working,
+        "a second SessionStart while working must not drop the session back to idle"
+    );
+    assert_eq!(session.activity, working.activity);
+    assert_eq!(
+        session.state_since_ms, working.state_since_ms,
+        "state did not change, so state_since_ms must not either"
+    );
+    assert_eq!(
+        session.last_hook_event,
+        Some(ProviderHookEvent::SessionStart)
+    );
+}
+
+/// `Store::synthesize_session_start` (`crates/factoryd/src/execution.rs`'s
+/// `synthesize_codex_session_start` calls this once `RunnerEvent::
+/// TerminalRaw` arrives for a Codex session -- see its own doc comment)
+/// makes the exact same `starting -> idle` transition a real `SessionStart`
+/// hook does, but must stay durably distinguishable from one: it never
+/// touches `last_hook_event`, so `state = idle` with no `last_hook_event`
+/// can only be reached this way.
+#[test]
+fn synthesize_session_start_moves_starting_to_idle_without_claiming_a_hook_fired() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    assert_eq!(snapshot.state, SessionState::Starting);
+    assert_eq!(snapshot.last_hook_event, None);
+
+    let (session, _) = store
+        .synthesize_session_start(&snapshot.id, 6)
+        .unwrap()
+        .expect("a starting session must synthesize");
+    assert_eq!(session.state, SessionState::Idle);
+    assert_eq!(
+        session.last_hook_event, None,
+        "synthesis must never claim a hook that never fired"
+    );
+
+    // Idempotent: a second synthesis attempt (e.g. a recovered session
+    // replaying RunnerEvent::TerminalRaw again on reconnect) is a no-op,
+    // not a second SessionChanged event for nothing.
+    assert!(
+        store
+            .synthesize_session_start(&snapshot.id, 7)
+            .unwrap()
+            .is_none()
+    );
+
+    // And once a real hook does arrive, it is recorded normally --
+    // synthesis never blocks the real signal from eventually landing.
+    let (session, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            8,
+        )
+        .unwrap();
+    assert_eq!(session.state, SessionState::Idle);
+    assert_eq!(
+        session.last_hook_event,
+        Some(ProviderHookEvent::SessionStart)
+    );
+}
+
+/// A session that already moved on (working, or ended) before synthesis is
+/// ever attempted -- e.g. the real hook won the race -- must be left alone.
+#[test]
+fn synthesize_session_start_is_a_no_op_once_the_session_is_no_longer_starting() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            6,
+        )
+        .unwrap();
+    let (working, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::UserPromptSubmit,
+            Some("thinking".into()),
+            true,
+            None,
+            7,
+        )
+        .unwrap();
+    assert_eq!(working.state, SessionState::Working);
+
+    assert!(
+        store
+            .synthesize_session_start(&snapshot.id, 8)
+            .unwrap()
+            .is_none(),
+        "a session no longer starting must never be touched by synthesis"
+    );
+    let target = store
+        .session_control_target(&project_id("factory"), &snapshot.id)
+        .unwrap();
+    assert_eq!(target.runner_instance_id.as_str(), "instance-s1");
+}
+
 #[test]
 fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
     let mut store = fixture();

@@ -1473,11 +1473,21 @@ async fn handle_request(
                         .await?;
                 }
                 // Proof the CLI is up: an agent's very first delivery is
-                // PTY-typed (idle-session path), which needs this hook to
-                // have fired at least once before typing anything
-                // (TRACK5-DESIGN.md §3); anything queued before the session
-                // finished booting is picked up here rather than waiting
-                // for the 5 second safety tick.
+                // PTY-typed (idle-session path), which needs the session to
+                // be `idle` before typing anything (TRACK5-DESIGN.md §3);
+                // anything queued before the session finished booting is
+                // picked up here rather than waiting for the 5 second
+                // safety tick. For Claude and `shell`, this real hook is
+                // what makes that transition. For Codex, it is usually
+                // already `idle` by the time this real (once-delayed) hook
+                // arrives -- `execution::synthesize_codex_session_start`
+                // made that transition earlier, once
+                // `RunnerEvent::TerminalRaw` reported the provider's own
+                // tty leaving canonical mode (`docs/providers.md`'s Codex
+                // `SessionStart` section) -- so this `wake` is then a
+                // harmless no-op for an agent that is already delivering;
+                // it still matters for the (bounded) window before that
+                // signal arrives, and for every other provider.
                 execution.wake(project_id, agent_id);
             }
             Ok(LocalResponse::ProviderHookReply { reply })
@@ -2228,6 +2238,7 @@ fn read_run_terminal(
             RunnerEvent::OutputTruncated { .. } => truncated = true,
             RunnerEvent::Started { .. }
             | RunnerEvent::SpawnFailed { .. }
+            | RunnerEvent::TerminalRaw
             | RunnerEvent::Exited { .. } => {}
         }
     }

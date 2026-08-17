@@ -225,6 +225,27 @@ pub enum RunnerEvent {
     OutputTruncated {
         limit_bytes: u64,
     },
+    /// The spawned child took its controlling tty out of canonical mode
+    /// (`ICANON` cleared, observed via `tcgetattr` on the pty master --
+    /// `crates/factory-runner/src/lib.rs`'s `supervise_terminal`) --
+    /// a kernel-level fact about the child's own terminal setup, not
+    /// terminal-output inference (`ARCHITECTURE.md` invariant 5's
+    /// Codex carve-out). A newly opened pty pair starts in canonical mode
+    /// with echo on (`openpty`'s own default, `termp = NULL`); most
+    /// interactive CLIs (including every real Codex/Claude release so
+    /// far) switch to raw mode once during their own startup and never
+    /// switch back, so this is logged as a lifecycle event exactly like
+    /// [`Self::Started`] (once, non-terminal), not a stream of
+    /// transitions. Additive to the wire since [`RUNNER_PROTOCOL_VERSION`]
+    /// 1: an older reader that does not know this variant fails to parse
+    /// only the one frame carrying it (`serde_json` rejects an unknown
+    /// `type` for the whole enum), which is the same degraded-but-isolated
+    /// outcome any future additive `RunnerEvent` variant already has under
+    /// `docs/development/WORKFLOW.md`'s "runner control protocol must stay
+    /// backward compatible within a major version" contract; every other
+    /// frame on the same connection, including this session's own
+    /// `Exited`, is unaffected.
+    TerminalRaw,
     Exited {
         exit_code: Option<i32>,
         signal: Option<i32>,

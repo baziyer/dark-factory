@@ -394,6 +394,7 @@ fn runner_event_kind(event: &RunnerEvent) -> &'static str {
         RunnerEvent::Output { .. } => "output",
         RunnerEvent::SpawnFailed { .. } => "spawn_failed",
         RunnerEvent::OutputTruncated { .. } => "output_truncated",
+        RunnerEvent::TerminalRaw => "terminal_raw",
         RunnerEvent::Exited { .. } => "exited",
     }
 }

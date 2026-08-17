@@ -663,3 +663,97 @@ fn natural_leader_exit_reaps_a_well_behaved_descendant_without_the_old_multi_sec
     ));
     runner.wait_for_clean_exit();
 }
+
+fn spool_events(runner: &RunningTerminalRunner) -> Vec<RunnerEvent> {
+    fs::read_to_string(runner.spool())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RunnerEventEnvelope>(line).ok())
+        .map(|envelope| envelope.event)
+        .collect()
+}
+
+fn wait_for_terminal_raw(runner: &RunningTerminalRunner) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if spool_events(runner)
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::TerminalRaw))
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("runner never recorded RunnerEvent::TerminalRaw");
+}
+
+/// The daemon-side synthesis this event exists for (`factoryd::execution::
+/// synthesize_codex_session_start`) needs `RunnerEvent::TerminalRaw` to
+/// actually show up when a child does what every real interactive CLI
+/// does once during its own startup: take its pty out of canonical mode.
+/// `stty raw -echo` does exactly that to its own controlling terminal, no
+/// fake-agent flag needed.
+#[test]
+fn terminal_raw_mode_is_recorded_once_a_child_leaves_canonical_mode() {
+    let runner = RunningTerminalRunner::spawn(
+        Path::new("/bin/sh"),
+        &["-c", "stty raw -echo; sleep 5"],
+        80,
+        24,
+    );
+    wait_for_terminal_raw(&runner);
+    assert_eq!(
+        spool_events(&runner)
+            .iter()
+            .filter(|event| matches!(event, RunnerEvent::TerminalRaw))
+            .count(),
+        1,
+        "TerminalRaw must be logged exactly once, like Started -- the poll \
+         thread stops the instant it detects raw mode"
+    );
+
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::Stop {
+            command_id: "stop-raw-mode".into(),
+            grace_ms: 500,
+        },
+    ));
+    runner.wait_for_terminal_spool();
+    let terminal = runner.terminal_sequence();
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::AcknowledgeExit {
+            command_id: "ack-raw-mode".into(),
+            terminal_sequence: terminal,
+        },
+    ));
+    runner.wait_for_clean_exit();
+}
+
+/// The other half of the same contract: a child that never leaves
+/// canonical mode (an ordinary, non-interactive `/bin/sh` one-liner that
+/// just exits) must never get a synthesized-readiness signal it never
+/// earned -- `RunnerEvent::TerminalRaw` never appears in its spool at all,
+/// not even after it has already exited.
+#[test]
+fn terminal_raw_mode_is_never_recorded_for_a_child_that_stays_canonical() {
+    let mut runner = RunningTerminalRunner::spawn(Path::new("/bin/sh"), &["-c", "sleep 1"], 80, 24);
+    // Let the child exit on its own; it never calls `stty raw`.
+    runner.wait_for_terminal_spool();
+    assert!(
+        !spool_events(&runner)
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::TerminalRaw)),
+        "a child that never leaves canonical mode must never get TerminalRaw"
+    );
+    let terminal = runner.terminal_sequence();
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::AcknowledgeExit {
+            command_id: "ack-stays-canonical".into(),
+            terminal_sequence: terminal,
+        },
+    ));
+    runner.wait_for_process_exit();
+}

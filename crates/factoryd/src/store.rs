@@ -1029,6 +1029,70 @@ impl Store {
         ))
     }
 
+    /// Synthesizes exactly the `starting -> idle` transition a real
+    /// `SessionStart` hook would make (this arm of
+    /// [`Self::record_hook_event`]), for a Codex session whose own hook is
+    /// not expected to arrive before the daemon needs to start delivering
+    /// (`crates/factoryd/src/execution.rs`'s `synthesize_codex_session_start`
+    /// -- see its own doc comment, and `docs/providers.md`, for why Codex
+    /// 0.147 does not fire it at TUI startup).
+    ///
+    /// Deliberately never touches `last_hook_event`/`last_hook_at_ms`,
+    /// unlike [`Self::record_hook_event`] -- leaving them at whatever they
+    /// already were (`None` for a session no hook has ever reached) keeps a
+    /// synthesized start durably distinguishable from a real one: `state =
+    /// idle` with `last_hook_event IS NULL` can only happen here, never
+    /// from a genuine hook POST. `session list`/`agent status` already
+    /// surface `last_hook_event`, so no schema or wire change is needed to
+    /// tell the two apart.
+    ///
+    /// A no-op -- `Ok(None)`, publishing nothing -- once the session is no
+    /// longer `starting` (already live-delivered, already ended, or a
+    /// second `RunnerEvent::TerminalRaw` for the same session): stricter
+    /// than `record_hook_event`'s own "second `SessionStart` is harmless"
+    /// contract, since this only ever exists to make the one transition it
+    /// asserts, nothing else worth logging again.
+    pub fn synthesize_session_start(
+        &mut self,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<Option<(SessionSnapshot, EventEnvelope)>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if session.state != SessionState::Starting {
+            return Ok(None);
+        }
+        transaction.execute(
+            "UPDATE sessions
+             SET state = ?1, state_since_ms = ?2, activity = NULL, activity_inferred = 0,
+                 wait_reason = NULL, updated_at_ms = ?2
+             WHERE id = ?3",
+            params![
+                session_state_value(SessionState::Idle),
+                now_ms,
+                session_id.as_str(),
+            ],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        transaction.commit()?;
+        Ok(Some((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: changed,
+            },
+        )))
+    }
+
     /// Persists a session's provider-assigned identity once it becomes
     /// known after the session was created without one -- today only
     /// Codex, whose thread id the daemon does not choose up front (unlike

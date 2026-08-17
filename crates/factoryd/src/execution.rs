@@ -1554,14 +1554,11 @@ async fn spawn_session_for_agent(
         }
     };
 
-    if agent.snapshot.provider == Provider::Codex {
-        synthesize_codex_session_start(state, wake_tx, project_id, agent_id, &session_id).await;
-    }
-
     tokio::spawn(supervise_child(
         state.clone(),
         wake_tx.clone(),
         session_id.clone(),
+        agent.snapshot.provider == Provider::Codex,
         runtime_dir,
         session_run_id(&session_id)?,
         runner_instance_id,
@@ -1590,16 +1587,20 @@ async fn spawn_session_for_agent(
 /// typed prompt to begin the turn that would fire `SessionStart`; the
 /// daemon waits for `SessionStart` before typing anything.
 ///
-/// This synthesizes that exact transition automatically, immediately once
-/// the provider process is confirmed spawned: the same
-/// `record_hook_event(SessionStart)` call a real hook POST would make, run
-/// directly against the store instead of arriving over the control socket.
-/// It does not read or wait on any terminal output -- PTY input is
-/// kernel-buffered, so composing and typing a delivery before Codex's own
-/// read loop starts is safe, exactly as safe as the operator's manual nudge
-/// already proved live. If Codex's own real (once-delayed)
-/// `SessionStart(source=startup)` arrives later anyway -- e.g. after the
-/// first turn it caused -- it is a harmless no-op here:
+/// This synthesizes that exact transition (`Store::synthesize_session_start`,
+/// which -- unlike a real hook -- leaves `last_hook_event` alone, so the
+/// synthesis stays durably distinguishable from a genuine hook POST) once
+/// [`RunnerEvent::TerminalRaw`] reports the provider's own tty left
+/// canonical mode (`wait_for_runner_exit`/`consume_until_exit`, below,
+/// which call this): a kernel-level fact about the child's own terminal
+/// setup, not terminal-output inference (`ARCHITECTURE.md` invariant 5's
+/// Codex carve-out), and specifically *not* "the process merely spawned" --
+/// an earlier version of this fix synthesized immediately on spawn
+/// confirmation, before the pty leaves canonical mode with echo on, which a
+/// real repro showed silently truncates (and can duplicate) the very first
+/// delivery typed into it (`MAX_CANON`, `docs/providers.md`). If Codex's
+/// own real (once-delayed) `SessionStart(source=startup)` arrives later
+/// anyway -- e.g. after the first turn it caused -- it is a harmless no-op:
 /// `record_hook_event`'s `SessionStart` arm only transitions a session that
 /// is still `Starting`, and `local_api.rs`'s `set_provider_session_id` call
 /// is already idempotent once a provider session id is set.
@@ -1611,8 +1612,6 @@ async fn spawn_session_for_agent(
 async fn synthesize_codex_session_start(
     state: &DaemonState,
     wake_tx: &mpsc::Sender<WakeAgent>,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
     session_id: &SessionId,
 ) {
     let Ok(hook_at_ms) = now_ms() else {
@@ -1621,19 +1620,14 @@ async fn synthesize_codex_session_start(
     let hook_session_id = session_id.clone();
     let result = state
         .commit_and_publish(move |store| {
-            let (_, event) = store.record_hook_event(
-                &hook_session_id,
-                ProviderHookEvent::SessionStart,
-                None,
-                false,
-                None,
-                hook_at_ms,
-            )?;
-            Ok(((), vec![event]))
+            match store.synthesize_session_start(&hook_session_id, hook_at_ms)? {
+                Some((snapshot, event)) => Ok((Some(snapshot), vec![event])),
+                None => Ok((None, Vec::new())),
+            }
         })
         .await;
-    if result.is_ok() {
-        send_wake(wake_tx, project_id.clone(), agent_id.clone());
+    if let Ok(Some(snapshot)) = result {
+        send_wake(wake_tx, snapshot.project_id, snapshot.agent_id);
     }
 }
 
@@ -1673,16 +1667,27 @@ fn split_provider_environment(
 /// useful for that (its own exit code is 0/1 for its own success/failure,
 /// unrelated to the program it supervised), so it is only a fallback if
 /// the control socket could not be reached at all.
+#[allow(clippy::too_many_arguments)]
 async fn supervise_child(
     state: DaemonState,
     wake_tx: mpsc::Sender<WakeAgent>,
     session_id: SessionId,
+    synthesize_on_raw_mode: bool,
     runtime_dir: PathBuf,
     run_id: RunId,
     runner_instance_id: RunnerInstanceId,
     mut child: tokio::process::Child,
 ) {
-    let event_exit = wait_for_runner_exit(&runtime_dir, run_id, runner_instance_id).await;
+    let event_exit = wait_for_runner_exit(
+        &state,
+        &wake_tx,
+        &session_id,
+        synthesize_on_raw_mode,
+        &runtime_dir,
+        run_id,
+        runner_instance_id,
+    )
+    .await;
     let wait_status = child.wait().await;
     let (exit_code, exit_signal) = match event_exit {
         Some(status) => status,
@@ -1694,16 +1699,34 @@ async fn supervise_child(
     end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
 }
 
+/// Whether `event` is the trigger [`synthesize_codex_session_start`] exists
+/// for -- `synthesize_on_raw_mode` is `true` only for a Codex session still
+/// waiting on it (`supervise_child`'s and `supervise_recovered`'s own
+/// callers gate this on `Provider::Codex`, once, before either loop below
+/// ever starts -- this function does not re-derive it from the event
+/// itself, so it is exactly as testable in isolation as "does synthesis
+/// happen for Codex and never for Claude/shell" asks for).
+fn should_synthesize_session_start(synthesize_on_raw_mode: bool, event: &RunnerEvent) -> bool {
+    synthesize_on_raw_mode && matches!(event, RunnerEvent::TerminalRaw)
+}
+
 /// Subscribes to a freshly spawned session's own runner (retrying for up to
 /// [`CONNECT_GRACE`] -- `runner_process::spawn_runner` does not itself wait
 /// for the control socket to exist in terminal mode, so this can genuinely
-/// race the runner's own startup), then waits for and acknowledges its
-/// `RunnerEvent::Exited`, returning its `(exit_code, exit_signal)`. Returns
-/// `None` if the control socket was never reachable or the connection was
-/// lost before an exit event arrived -- best-effort, since the caller still
-/// has its own `Child::wait()` to fall back on rather than hang the
-/// dispatcher on one wedged session forever.
+/// race the runner's own startup), then watches its event stream until
+/// `RunnerEvent::Exited`, synthesizing Codex's `SessionStart` along the way
+/// the moment `RunnerEvent::TerminalRaw` arrives (`synthesize_on_raw_mode`;
+/// see `synthesize_codex_session_start`'s own doc comment), and returns the
+/// exit's `(exit_code, exit_signal)`. Returns `None` if the control socket
+/// was never reachable or the connection was lost before an exit event
+/// arrived -- best-effort, since the caller still has its own
+/// `Child::wait()` to fall back on rather than hang the dispatcher on one
+/// wedged session forever.
 async fn wait_for_runner_exit(
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    session_id: &SessionId,
+    synthesize_on_raw_mode: bool,
     runtime_dir: &Path,
     run_id: RunId,
     runner_instance_id: RunnerInstanceId,
@@ -1733,6 +1756,9 @@ async fn wait_for_runner_exit(
                         tracing::warn!(%error, "failed to acknowledge a runner's terminal event");
                     }
                     return Some((exit_code, signal));
+                }
+                if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
+                    synthesize_codex_session_start(state, wake_tx, session_id).await;
                 }
             }
             Ok(RunnerStreamItem::CaughtUp { .. }) => {}
@@ -2357,7 +2383,17 @@ async fn supervise_recovered(
                 continue;
             }
         };
-        match consume_until_exit(&client, subscription, &mut shutdown_rx).await {
+        match consume_until_exit(
+            &state,
+            &wake_tx,
+            &recovered.session_id,
+            recovered.provider == Provider::Codex,
+            &client,
+            subscription,
+            &mut shutdown_rx,
+        )
+        .await
+        {
             ExitOutcome::Exited {
                 exit_code,
                 exit_signal,
@@ -2403,7 +2439,21 @@ enum ExitOutcome {
     Reconnect,
 }
 
+/// Like `wait_for_runner_exit`, but for a session recovered after a daemon
+/// restart, whose subscription is a fresh "replay-plus-live" stream from
+/// sequence zero every time this reconnects (`RunnerClient::subscribe`'s
+/// own doc comment): a Codex session recovered while still `starting`
+/// therefore sees `RunnerEvent::TerminalRaw` again on replay if the runner
+/// already logged it before the restart -- "the runner re-reports on
+/// subscribe" is exactly this, no separate request needed
+/// (`docs/providers.md`). `synthesize_codex_session_start` is idempotent
+/// (`Store::synthesize_session_start`'s own doc comment) so seeing it again
+/// on every reconnect attempt is harmless.
 async fn consume_until_exit(
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    session_id: &SessionId,
+    synthesize_on_raw_mode: bool,
     client: &RunnerClient,
     mut subscription: RunnerSubscription,
     shutdown: &mut watch::Receiver<bool>,
@@ -2432,6 +2482,9 @@ async fn consume_until_exit(
                         exit_code,
                         exit_signal: signal,
                     };
+                }
+                if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
+                    synthesize_codex_session_start(state, wake_tx, session_id).await;
                 }
             }
             Ok(RunnerStreamItem::CaughtUp { .. }) => {}
@@ -3192,6 +3245,218 @@ mod tests {
         assert!(session.ended_at_ms.is_none());
         assert!(session.wait_reason.is_none());
         assert!(backoff.ready(&agent_id));
+    }
+
+    /// Q1 fix (`synthesize_codex_session_start`'s own doc comment has the
+    /// live/empirical evidence): Codex 0.147 never fires its own
+    /// `SessionStart` hook at TUI startup, so a fresh Codex session would
+    /// otherwise sit in `starting` forever. This test proves the automatic
+    /// transition wakes delivery and stays distinguishable from a real hook.
+    #[tokio::test]
+    async fn synthesize_codex_session_start_moves_a_fresh_codex_session_to_idle_and_wakes_it() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("worker-1").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: "/tmp/factory".to_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                1_000,
+            )
+            .unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let (snapshot, _) = store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Codex,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory/worktree".to_owned(),
+                    codex_home: Some("/tmp/factory/codex-home".to_owned()),
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory/runs/session-1".to_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(snapshot.state, SessionState::Starting);
+
+        let state = DaemonState::new(store);
+        let (wake_tx, mut wake_rx) = mpsc::channel(8);
+        synthesize_codex_session_start(&state, &wake_tx, &session_id).await;
+
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].state, SessionState::Idle);
+        assert_eq!(sessions[0].last_hook_event, None);
+
+        let woken = wake_rx
+            .try_recv()
+            .expect("synthesis must wake the dispatcher");
+        assert_eq!(woken.project_id, project_id);
+        assert_eq!(woken.agent_id, agent_id);
+    }
+
+    /// Adversarial review finding 1's fix, condition (b): a pure unit test
+    /// of the exact gate `wait_for_runner_exit`/`consume_until_exit` use --
+    /// `synthesize_on_raw_mode` is derived once, at each caller's own spawn
+    /// or recovery site, from `provider == Provider::Codex`; this proves
+    /// the gate itself only ever says yes for that combination.
+    #[test]
+    fn should_synthesize_session_start_only_for_codex_and_only_on_terminal_raw() {
+        assert!(should_synthesize_session_start(
+            true,
+            &RunnerEvent::TerminalRaw
+        ));
+        assert!(!should_synthesize_session_start(
+            false,
+            &RunnerEvent::TerminalRaw
+        ));
+        assert!(!should_synthesize_session_start(
+            true,
+            &RunnerEvent::Started { child_pid: 1 }
+        ));
+        assert!(!should_synthesize_session_start(
+            false,
+            &RunnerEvent::Started { child_pid: 1 }
+        ));
+    }
+
+    /// End-to-end version of the same gate (review finding 9b): three
+    /// sessions -- Codex, Claude, `shell` -- each `starting`, each observes
+    /// the same `RunnerEvent::TerminalRaw` with `synthesize_on_raw_mode`
+    /// derived exactly as `spawn_session_for_agent`/`supervise_recovered` do
+    /// it (`provider == Provider::Codex`). Only the Codex session reaches
+    /// `idle`; Claude and `shell` are left alone for their own real hooks.
+    #[tokio::test]
+    async fn terminal_raw_only_synthesizes_session_start_for_codex_never_for_claude_or_shell() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: "/tmp/factory".to_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let providers = [
+            (
+                "codex-agent",
+                Provider::Codex,
+                "11111111-1111-4111-8111-111111111111",
+            ),
+            (
+                "claude-agent",
+                Provider::ClaudeCode,
+                "22222222-2222-4222-8222-222222222222",
+            ),
+            (
+                "shell-agent",
+                Provider::Shell,
+                "33333333-3333-4333-8333-333333333333",
+            ),
+        ];
+        let mut session_ids = Vec::new();
+        for (agent_name, provider, session_uuid) in providers {
+            let agent_id = AgentId::try_from(agent_name).unwrap();
+            store
+                .create_agent(
+                    crate::store::NewAgent {
+                        id: agent_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider,
+                    },
+                    1_000,
+                )
+                .unwrap();
+            let session_id = SessionId::try_from(session_uuid).unwrap();
+            store
+                .create_session(
+                    crate::store::NewSession {
+                        id: session_id.clone(),
+                        project_id: project_id.clone(),
+                        agent_id,
+                        provider,
+                        provider_session_id: None,
+                        worktree: "/tmp/factory/worktree".to_owned(),
+                        codex_home: None,
+                        hook_token: "a".repeat(64),
+                        runner_instance_id: RunnerInstanceId::try_from(session_uuid).unwrap(),
+                        runner_runtime: format!("/tmp/factory/runs/{agent_name}"),
+                        runner_protocol_version: 1,
+                    },
+                    1_000,
+                )
+                .unwrap();
+            session_ids.push((provider, session_id));
+        }
+
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        for (provider, session_id) in &session_ids {
+            let synthesize_on_raw_mode = *provider == Provider::Codex;
+            if should_synthesize_session_start(synthesize_on_raw_mode, &RunnerEvent::TerminalRaw) {
+                synthesize_codex_session_start(&state, &wake_tx, session_id).await;
+            }
+        }
+
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        for session in sessions {
+            if session.provider == Provider::Codex {
+                assert_eq!(
+                    session.state,
+                    SessionState::Idle,
+                    "the Codex session must be synthesized to idle"
+                );
+            } else {
+                assert_eq!(
+                    session.state,
+                    SessionState::Starting,
+                    "{:?} must never be synthesized -- it waits for its own real hook",
+                    session.provider
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
