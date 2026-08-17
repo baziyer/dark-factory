@@ -276,10 +276,19 @@ Two different test doubles exist at two different layers, easy to conflate:
 - They do not own a PTY, call `send_input`/`resize`/`stop`, or read process
   output — that is generic, implemented once.
 - They do not guess precise session state when the underlying CLI does not
-  expose it. `Notification` (Claude) or its Codex equivalent is treated
-  uniformly as "waiting for input," whether that's a permission prompt or
-  genuine idle-wait — providers report what actually happened; the state
-  machine, not the provider, decides what it means.
+  expose it. Claude's `Notification` hook and Codex's `PermissionRequest`
+  hook (added in Codex 0.147.0; no Claude equivalent name, since Claude's
+  permission prompts already surface through `Notification`) are both
+  treated uniformly as "waiting for input," whether that's a permission
+  prompt or genuine idle-wait — providers report what actually happened;
+  the state machine, not the provider, decides what it means. A provider
+  never *answers* a permission prompt on the operator's behalf, even when
+  the underlying hook contract would let it: Codex's own
+  `permission-request.command.output` schema accepts a `decision` with
+  `behavior: allow`/`deny` that would auto-approve or auto-deny the tool
+  call, but `factoryctl hook`'s reply for this event is always `{}`
+  (`local_api.rs`'s `ProviderHook` handler only builds a real reply for
+  `Stop`/`SubagentStop`'s delivery contract) — Dark Factory only observes.
 - They do not manage ambient environment (`HOME`, `PATH`, ...); that is the
   session runner's sanitized-environment concern.
   `InteractiveLaunch::env` is only for provider-specific additions, like

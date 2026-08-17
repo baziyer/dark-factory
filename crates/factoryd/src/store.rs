@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -972,7 +972,7 @@ impl Store {
                 next_inferred = inferred;
                 next_wait_reason = None;
             }
-            ProviderHookEvent::Notification => {
+            ProviderHookEvent::Notification | ProviderHookEvent::PermissionRequest => {
                 state = SessionState::WaitingForInput;
                 next_wait_reason = wait_reason;
             }
@@ -4230,6 +4230,23 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_no_foreign_key_violations(connection)?;
+        current = 14;
+    }
+    if current == 14 {
+        // `runs.session_id`/`agent_messages.delivered_session_id` both
+        // reference `sessions`, rebuilt below to widen its
+        // `last_hook_event` CHECK -- same off/verify dance as 0014, for
+        // the same reason (`PRAGMA foreign_keys` cannot toggle inside a
+        // transaction).
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0015_permission_request_hook_event.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 15)?;
+        transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
 }
@@ -4574,6 +4591,7 @@ const fn provider_hook_event_value(value: ProviderHookEvent) -> &'static str {
         ProviderHookEvent::SessionStart => "session_start",
         ProviderHookEvent::UserPromptSubmit => "user_prompt_submit",
         ProviderHookEvent::PreToolUse => "pre_tool_use",
+        ProviderHookEvent::PermissionRequest => "permission_request",
         ProviderHookEvent::PostToolUse => "post_tool_use",
         ProviderHookEvent::Notification => "notification",
         ProviderHookEvent::Stop => "stop",

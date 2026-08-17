@@ -193,7 +193,9 @@ pub fn hook_command(
 /// configuration, in the order the daemon's state machine reasons about
 /// them (see `TRACK5-DESIGN.md` sections 2 and 3): boot, delivery
 /// acknowledgement, tool activity (start/finish), idle-wait, turn-complete,
-/// subagent-complete, and process shutdown.
+/// subagent-complete, and process shutdown. Codex additionally wires one
+/// more, Codex-only event (`PermissionRequest`) on top of this shared set
+/// -- see `providers::codex::CODEX_ONLY_HOOK_EVENTS`.
 pub const HOOK_EVENTS: [factory_core::ProviderHookEvent; 8] = [
     factory_core::ProviderHookEvent::SessionStart,
     factory_core::ProviderHookEvent::UserPromptSubmit,

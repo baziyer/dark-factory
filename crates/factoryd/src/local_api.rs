@@ -2105,6 +2105,26 @@ fn compute_hook_fields(
                 .unwrap_or("waiting for input");
             (None, false, Some(bounded_hook_field(message)))
         }
+        ProviderHookEvent::PermissionRequest => {
+            // Codex's own approval prompt (`docs/providers.md`'s
+            // observe-only contract: this daemon never answers it, only
+            // records that the session is now blocked on one). Claude
+            // Code's equivalent surfaces through `Notification` above --
+            // both land the session in the same `waiting_for_input` state
+            // via `Store::record_hook_event`, with a wait reason an
+            // operator can read at a glance.
+            let tool_name = payload
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (
+                None,
+                false,
+                Some(bounded_hook_field(&format!(
+                    "provider approval prompt: {tool_name}"
+                ))),
+            )
+        }
         ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => (None, false, None),
     }
 }
