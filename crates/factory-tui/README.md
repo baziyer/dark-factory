@@ -51,11 +51,16 @@ FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4) — see the top-le
 - **FOCUS** — one pane, full-screen, with scrollback (`PgUp`/`PgDn`).
 
 `Enter` is contextual per view (zoom into WORKSHOP from FORTRESS; open the task action menu or zoom
-into TERMINALS from WORKSHOP; zoom into FOCUS from TERMINALS). WORKSHOP's task action menu —
-**assign · cancel · retry · delete · edit title · start** — is the only place those actions live.
-Everything is one `Action` enum and one `keymap()` function (`model/keymap.rs`): the meaning of a
-key never depends on which view is active, only what `Board::dispatch` does with the resulting
-`Action`.
+into TERMINALS from WORKSHOP; zoom into FOCUS from TERMINALS). On FORTRESS `h`/`j`/`k`/`l` and the
+arrows move a cursor over the floor, Dwarf-Fortress style — left/right along a row of stations,
+up/down to the nearest station on the row above/below — over exactly the layout that is on screen
+(the renderer records the width it drew with, `Board::fortress_width`, and navigation recomputes
+the same deterministic layout); an empty workshop is a stop too, so a project with no agents yet
+is reachable. Elsewhere `←`/`h` and `→`/`l` zoom out/in and `j`/`k` move within lists. WORKSHOP's
+task action menu — **assign · cancel · retry · delete · edit title · start** — is the only place
+those actions live. Everything is one `Action` enum and one `keymap()` function
+(`model/keymap.rs`): a key always produces the same `Action`; only what `Board::dispatch` does
+with it depends on the view.
 
 ## Theme
 

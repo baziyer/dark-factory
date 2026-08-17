@@ -102,6 +102,11 @@ pub struct Board {
     /// `factoryd --max-active-runs`, learned from `FleetStatus` after bootstrap; the status line
     /// shows live sessions against it.
     pub live_session_cap: Option<u32>,
+    /// The inner width the FORTRESS floor was last rendered at (`ui::fortress_view` records it
+    /// each frame). Keyboard navigation over the floor recomputes the same layout from it, so
+    /// the cursor moves over exactly what is on screen. A `Cell` because the renderer only holds
+    /// `&Board`.
+    pub fortress_width: std::cell::Cell<u16>,
 
     /// Every project on the daemon, in whatever order the last snapshot/event delivered them —
     /// use [`Board::projects_sorted`] for creation order.
@@ -170,6 +175,7 @@ impl Board {
             connection_detail: None,
             update_available: None,
             live_session_cap: None,
+            fortress_width: std::cell::Cell::new(fortress::MIN_WORKSHOP_WIDTH),
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
@@ -616,6 +622,11 @@ impl Board {
             }
             return "CONTROL  1-4 views  Tab/j/k switch pane  Enter/l zoom  Esc/h back  \
                      Ctrl-] back to pane  ? help"
+                .to_owned();
+        }
+        if self.view == View::Fortress {
+            return "1-4 views  hjkl/arrows move cursor  Tab cycle  Enter zoom in  n new  \
+                    m message  o orchestrator  p project  x stop  g/G attention  ? help  q detach"
                 .to_owned();
         }
         "1-4 views  j/k move  Tab switch  Enter/l zoom in  Esc/h zoom out  n new  m message  \

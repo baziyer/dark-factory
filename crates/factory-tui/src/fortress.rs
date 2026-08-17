@@ -165,6 +165,78 @@ pub fn compute_workshops(
     out
 }
 
+/// Something the FORTRESS cursor can rest on: an agent's station, or an empty workshop's
+/// placeholder (so a project with no agents yet is reachable by keyboard).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CursorTarget {
+    Agent(AgentId),
+    Workshop(ProjectId),
+}
+
+/// The keyboard-navigable cells of a layout, in layout-relative coordinates: one per station at
+/// `(rect.x + 1 + offset, rect.y + 1)`, or one per empty workshop at its first inner cell.
+#[must_use]
+pub fn cursor_targets(workshops: &[WorkshopLayout]) -> Vec<(u16, u16, CursorTarget)> {
+    let mut targets = Vec::new();
+    for workshop in workshops {
+        let y = workshop.rect.y + 1;
+        if workshop.stations.is_empty() {
+            targets.push((
+                workshop.rect.x + 1,
+                y,
+                CursorTarget::Workshop(workshop.project_id.clone()),
+            ));
+        }
+        for station in &workshop.stations {
+            targets.push((
+                workshop.rect.x + 1 + station.offset,
+                y,
+                CursorTarget::Agent(station.agent_id.clone()),
+            ));
+        }
+    }
+    targets
+}
+
+/// A direction the FORTRESS cursor can move (`h`/`j`/`k`/`l`, arrows).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Where the cursor goes from `from` in `direction`: on the same row, the nearest target that
+/// way; up/down, the nearest row that way and, within it, the target nearest in `x`. `None` if
+/// nothing lies that way. `from == None` (no cursor yet) goes to the first target.
+#[must_use]
+pub fn step_cursor(
+    targets: &[(u16, u16, CursorTarget)],
+    from: Option<&CursorTarget>,
+    direction: Direction,
+) -> Option<CursorTarget> {
+    let (cx, cy) = match from.and_then(|from| targets.iter().find(|(_, _, t)| t == from)) {
+        Some(&(x, y, _)) => (x, y),
+        None => return targets.first().map(|(_, _, target)| target.clone()),
+    };
+    let candidates = targets.iter().filter(|(x, y, _)| match direction {
+        Direction::Left => *y == cy && *x < cx,
+        Direction::Right => *y == cy && *x > cx,
+        Direction::Up => *y < cy,
+        Direction::Down => *y > cy,
+    });
+    let best = match direction {
+        // Nearest horizontally: largest x to the left, smallest to the right.
+        Direction::Left => candidates.max_by_key(|(x, _, _)| *x),
+        Direction::Right => candidates.min_by_key(|(x, _, _)| *x),
+        // Nearest row first (largest y above / smallest below), then nearest column.
+        Direction::Up => candidates.min_by_key(|(x, y, _)| (cy - *y, x.abs_diff(cx))),
+        Direction::Down => candidates.min_by_key(|(x, y, _)| (*y - cy, x.abs_diff(cx))),
+    };
+    best.map(|(_, _, target)| target.clone())
+}
+
 /// Total virtual size (in cells) the last-computed layout occupies, so a caller can decide
 /// whether to offer scrolling. `compute_workshops` always starts at `(0, 0)`.
 #[must_use]
@@ -455,6 +527,78 @@ mod tests {
                 b.stations.iter().map(|s| s.offset).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn cursor_steps_across_stations_rows_and_empty_workshops() {
+        // Three projects: "a" (orchestrator + worker), "b" (empty), "c" (one orchestrator),
+        // wrapped so "c" lands on a second row under "a".
+        let projects = vec![project("a", 0), project("b", 1), project("c", 2)];
+        let agents = vec![
+            agent("orch-a", "a", AgentRole::Orchestrator, None),
+            agent("worker-a", "a", AgentRole::Worker, None),
+            agent("orch-c", "c", AgentRole::Orchestrator, None),
+        ];
+        let width_a = workshop_width(2);
+        let width_b = workshop_width(0);
+        let layout = compute_workshops(&projects, &agents, width_a + width_b);
+        assert_eq!(
+            layout[2].rect.y, WORKSHOP_HEIGHT,
+            "c wrapped to the second row"
+        );
+        let targets = cursor_targets(&layout);
+        let a = |id: &str| CursorTarget::Agent(AgentId::try_from(id).unwrap());
+        let ws = |id: &str| CursorTarget::Workshop(ProjectId::try_from(id).unwrap());
+
+        assert_eq!(
+            step_cursor(&targets, None, Direction::Right),
+            Some(a("orch-a"))
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("orch-a")), Direction::Right),
+            Some(a("worker-a"))
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("worker-a")), Direction::Right),
+            Some(ws("b")),
+            "empty workshops are reachable"
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&ws("b")), Direction::Right),
+            None,
+            "row end"
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&ws("b")), Direction::Left),
+            Some(a("worker-a"))
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("orch-a")), Direction::Left),
+            None
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("orch-a")), Direction::Down),
+            Some(a("orch-c"))
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&ws("b")), Direction::Down),
+            Some(a("orch-c")),
+            "nearest column on the row below"
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("orch-c")), Direction::Up),
+            Some(a("orch-a"))
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("orch-c")), Direction::Down),
+            None
+        );
+        assert_eq!(
+            step_cursor(&targets, Some(&a("ghost")), Direction::Up),
+            Some(a("orch-a")),
+            "an unknown cursor restarts at the first target"
+        );
+        assert_eq!(step_cursor(&[], None, Direction::Left), None);
     }
 
     #[test]

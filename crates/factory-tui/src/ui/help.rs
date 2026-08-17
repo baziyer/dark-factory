@@ -257,9 +257,10 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
 
 const HELP_TEXT: &[&str] = &[
     "1-4        switch view (Fortress / Workshop / Terminals / Focus)",
-    "Enter/→/l  zoom in       Esc/←/h  zoom out",
+    "Enter      zoom in       Esc      zoom out",
+    "h/j/k/l    Fortress: move the cursor over stations (arrows too); elsewhere ←/h back, →/l in",
     "Tab        cycle agents (Fortress/Terminals/Focus) or panes (Workshop)",
-    "j/k, ↑/↓   move",
+    "j/k, ↑/↓   move (Fortress: a row up/down)",
     "[ / ]      Fortress: cycle selected workshop (reaches a project with no agents yet)",
     "n          new task (needs a focused project)",
     "m          message the selected agent",

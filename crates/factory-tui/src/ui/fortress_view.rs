@@ -54,6 +54,7 @@ fn render_floor(frame: &mut Frame, area: Rect, board: &Board) {
 
     let projects = board.projects_sorted();
     let agents = board.agents_vec();
+    board.fortress_width.set(inner.width);
     let workshops = fortress::compute_workshops(&projects, &agents, inner.width);
     fortress::render(
         frame.buffer_mut(),
