@@ -1591,6 +1591,146 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
     .await;
 }
 
+/// Regression test for PR #50's round-3 re-review: `CreateAgent` gated the
+/// project and the *new* agent id (round 2) but not `parent_agent_id`, so
+/// `AgentHasChildren` -- the one precondition a *different* concurrent
+/// request can flip from false to true -- could still go false-to-true
+/// between `delete_agent_locked`'s precheck and its DB delete, destroying
+/// the parent's files anyway (reproduced 13/16 with 0-12ms delays by the
+/// review). `CreateAgent` now also takes the agent-write gate on
+/// `parent_agent_id` when present, declining outright if the parent is
+/// being deleted.
+///
+/// No artificial delay between firing the two requests, and no git repo
+/// (so this test's race window is narrower than the review's own probe,
+/// which used a real worktree for extra width) -- the assertion inside
+/// the loop is unconditional either way: whenever the racing `DeleteAgent`
+/// is refused, `boss`'s files must be completely intact, regardless of
+/// whether this particular iteration's interleaving actually landed
+/// inside the (now much narrower, gate-protected) window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_files() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+
+        const MARKER: &str = "PLEASE DO NOT LOSE THIS";
+        for iteration in 0..20u32 {
+            let boss = agent_id(&format!("boss{iteration}"));
+            let kid = agent_id(&format!("kid{iteration}"));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::CreateAgent {
+                        id: boss.clone(),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: factory_core::AgentRole::Worker,
+                        provider: factory_core::Provider::Shell,
+                        model: None,
+                        worktree: None,
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::AgentCreated { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::UpdateAgentProfile {
+                        project_id: project_id("factory"),
+                        agent_id: boss.clone(),
+                        model: None,
+                        permission_mode: None,
+                        instructions: MARKER.into(),
+                        memory: String::new(),
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::AgentProfileUpdated { .. },
+                    ..
+                }
+            ));
+
+            // Fired concurrently, no delay: DeleteAgent(boss) racing
+            // CreateAgent(kid, parent=boss).
+            let (delete_result, _create_result) = tokio::join!(
+                request(
+                    &socket,
+                    LocalRequest::DeleteAgent {
+                        project_id: project_id("factory"),
+                        agent_id: boss.clone(),
+                    },
+                ),
+                request(
+                    &socket,
+                    LocalRequest::CreateAgent {
+                        id: kid,
+                        project_id: project_id("factory"),
+                        parent_agent_id: Some(boss.clone()),
+                        role: factory_core::AgentRole::Worker,
+                        provider: factory_core::Provider::Shell,
+                        model: None,
+                        worktree: None,
+                    },
+                ),
+            );
+
+            let delete_refused = matches!(
+                delete_result,
+                ServerFrame::Response {
+                    response: LocalResponse::Error {
+                        code: ErrorCode::Conflict,
+                        ..
+                    },
+                    ..
+                }
+            );
+            if delete_refused {
+                let fetched = request(
+                    &socket,
+                    LocalRequest::GetAgent {
+                        project_id: project_id("factory"),
+                        agent_id: boss.clone(),
+                    },
+                )
+                .await;
+                assert!(
+                    matches!(
+                        &fetched,
+                        ServerFrame::Response {
+                            response: LocalResponse::Agent { agent },
+                            ..
+                        } if agent.profile.instructions == MARKER
+                    ),
+                    "iteration {iteration}: a refused delete racing a concurrent create naming \
+                     boss as parent must leave boss's files intact, got {fetched:?}"
+                );
+            }
+        }
+    })
+    .await;
+}
+
 /// `CreateAgent.worktree` validates an operator override (D3): rejects a
 /// non-existent path, accepts and durably records an existing one.
 /// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the

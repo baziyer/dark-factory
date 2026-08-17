@@ -713,19 +713,30 @@ async fn handle_request(
             };
             let created_project_id = project_id.clone();
             let created_agent_id = id.clone();
+            let created_parent_agent_id = parent_agent_id.clone();
             // Deletion invariant (ARCHITECTURE.md #9, PR #50 review finding
             // 3): declines outright -- rather than silently skipping like
-            // the dispatcher does -- if this project or this exact agent
-            // id is currently being deleted. Checked and recorded in
-            // flight atomically with `DeleteProject`/`DeleteAgent`'s own
-            // mark under the same lock, so a delete already draining can
-            // never miss this create's writes (`provision_agent_worktree`,
-            // `ensure_agent_guidance`, below): the new agent's worktree
-            // and guidance directory are exactly what a `DeleteProject`
-            // running concurrently would otherwise `rm -rf` right out from
-            // under this request. The agent-id check also covers the
-            // narrower case of reusing an id an in-flight `DeleteAgent`
-            // hasn't finished removing files for yet.
+            // the dispatcher does -- if this project, this exact agent id,
+            // or its intended parent is currently being deleted. Checked
+            // and recorded in flight atomically with `DeleteProject`/
+            // `DeleteAgent`'s own mark under the same lock, so a delete
+            // already draining can never miss this create's writes
+            // (`provision_agent_worktree`, `ensure_agent_guidance`,
+            // below): the new agent's worktree and guidance directory are
+            // exactly what a `DeleteProject` running concurrently would
+            // otherwise `rm -rf` right out from under this request. The
+            // agent-id check also covers the narrower case of reusing an
+            // id an in-flight `DeleteAgent` hasn't finished removing files
+            // for yet. The parent-id check (PR #50 re-review round 3):
+            // `AgentHasChildren` is the one precondition a *different*
+            // request can flip from false to true after `DeleteAgent`'s
+            // own precheck already passed -- without gating the parent
+            // too, `CreateAgent --parent boss` racing `DeleteAgent boss`
+            // could still turn it true after `boss`'s files were already
+            // removed (reproduced 13/16 by the review), and leak a raw
+            // `FOREIGN KEY constraint failed` SQLite error on the create's
+            // own response on the other interleaving instead of this
+            // gate's clear message.
             if !execution.try_begin_project_write(&created_project_id) {
                 return Err(ApiFailure::Conflict(
                     "project is being deleted; cannot create an agent under it".into(),
@@ -738,6 +749,17 @@ async fn handle_request(
                      finish"
                         .into(),
                 ));
+            }
+            if let Some(parent) = &created_parent_agent_id {
+                if !execution.try_begin_agent_write(parent) {
+                    execution.end_agent_write(&created_agent_id);
+                    execution.end_project_write(&created_project_id);
+                    return Err(ApiFailure::Conflict(
+                        "the parent agent is currently being deleted; wait for the delete to \
+                         finish"
+                            .into(),
+                    ));
+                }
             }
             let create_result = create_agent_locked(
                 state,
@@ -754,6 +776,9 @@ async fn handle_request(
             )
             .await;
             execution.end_agent_write(&created_agent_id);
+            if let Some(parent) = &created_parent_agent_id {
+                execution.end_agent_write(parent);
+            }
             execution.end_project_write(&created_project_id);
             let agent = create_result?;
             Ok(LocalResponse::AgentCreated { agent })
