@@ -39,8 +39,11 @@ operator from their own agents. Concretely:
   control socket, which seatbelt has no "just localhost" exception for).
   `approval_policy = "never"` is the shipped default for every Codex agent,
   under which the pre-seeded `CODEX_HOME/rules/default.rules` `factoryctl`
-  prefix rule is inert — `never` never consults rules at all, so nothing is
-  ever asked in the first place. If an operator overrides an agent to
+  prefix rule is inert — `never` never asks, so an `allow` rule is never
+  consulted (a `forbid_rule` an operator's own `rules/*.rules` carries
+  forward, and Codex's own exec-policy checks, still apply regardless of
+  `approval_policy`; only the `allow` side is gated by it). If an operator
+  overrides an agent to
   `approval_policy = "on-request"` (`agent profile set --permission-mode
   on-request`), that rule becomes live and pre-approves **unsandboxed**
   execution of any command whose parsed prefix is `factoryctl` — every

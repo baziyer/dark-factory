@@ -7,6 +7,13 @@ license.workspace = true
 
 [dependencies]
 factory-core = { path = "../factory-core" }
+# Version-coupled to whatever `portable-pty` resolves internally, not
+# independent: `MasterPty::get_termios()` returns `nix::sys::termios::
+# Termios` concretely, so this must stay on the exact `nix` release
+# `portable-pty` links against (both resolve to 0.28 today, one copy in
+# Cargo.lock) or `LocalFlags`/`local_flags` stop matching that return
+# type. A `portable-pty` bump that moves its own `nix` requirement needs
+# this bumped in lockstep; `cargo tree -i nix` shows the shared version.
 nix = { version = "0.28", default-features = false, features = ["term"] }
 portable-pty = "0.9"
 rustix.workspace = true

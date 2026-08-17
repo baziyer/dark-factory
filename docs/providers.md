@@ -382,8 +382,11 @@ gates were involved, and both had to change:
   not exist yet: a real dogfood agent already had a `rules/default.rules`
   from Codex approving some other command, with no `factoryctl` rule in
   it, and a seed-once-if-missing check would never have reached it. **This
-  rule is inert under the shipped default.** `approval_policy = "never"`
-  never consults rules at all, `allow` or `forbid`, so this line does
+  `allow` rule is inert under the shipped default.** `approval_policy =
+  "never"` never consults `allow` rules — only the `allow` side is ever
+  gated by `approval_policy`; Codex's own exec-policy checks and any
+  `forbid_rule` an operator's own `rules/*.rules` carries forward (see
+  below) apply regardless of `approval_policy` — so this line does
   nothing until an operator overrides an agent to `on-request` — at which
   point it pre-approves **unsandboxed** execution of any command whose
   parsed prefix is `factoryctl`, every subcommand (including `factoryctl
@@ -392,7 +395,13 @@ gates were involved, and both had to change:
   documented in the 0.147 binary's own strings as valid "only with
   `sandbox_permissions: \"require_escalated\"`"). It is seeded anyway so an
   operator who does override one agent does not also have to rediscover
-  and re-approve `factoryctl` by hand.
+  and re-approve `factoryctl` by hand. If an operator's own copied-forward
+  `default.rules` already mentions `factoryctl` at all — including a
+  `forbid_rule` — `ensure_factoryctl_rule_present` leaves the file alone
+  rather than appending its own `allow` line next to a possibly
+  contradictory existing decision (which of the two Codex's own conflict
+  resolution would apply is not established); an operator's own explicit
+  `factoryctl` decision, once made, is never second-guessed.
 
   Separately, and unlike `config.toml`'s `mcp_servers`/`projects`/`hooks`
   tables (deliberately dropped, above): every `source_home/rules/*.rules`
