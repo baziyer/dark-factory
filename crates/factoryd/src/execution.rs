@@ -41,7 +41,7 @@ use std::{
 use factory_core::{
     AgentId, AgentRole, EventEnvelope, FactoryEvent, ProjectId, Provider, ProviderHookEvent, RunId,
     RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail,
-    runner::{RunnerEvent, TerminalSize, encode_terminal_bytes},
+    runner::{RunnerEvent, RunnerEventEnvelope, TerminalSize, encode_terminal_bytes},
 };
 use thiserror::Error;
 use tokio::{
@@ -1710,6 +1710,50 @@ fn should_synthesize_session_start(synthesize_on_raw_mode: bool, event: &RunnerE
     synthesize_on_raw_mode && matches!(event, RunnerEvent::TerminalRaw)
 }
 
+/// Logs (at `debug` -- expected, not a fault) any runner event this daemon
+/// build does not recognize (`RunnerEvent::Unknown`'s own doc comment has
+/// the compatibility story: a future variant a newer runner sent that this
+/// build has no name, or no matching shape, for). A no-op for every known
+/// event. Called from both `wait_for_runner_exit` and `consume_until_exit`
+/// right where they already treat "not `Exited`" as ordinary -- observability
+/// only, per adversarial review round 2 finding A: an unrecognized event
+/// must never be silent, even though it is always harmless.
+fn log_unrecognized_runner_event(session_id: &SessionId, envelope: &RunnerEventEnvelope) {
+    if matches!(envelope.event, RunnerEvent::Unknown) {
+        tracing::debug!(
+            session_id = %session_id,
+            sequence = envelope.sequence,
+            "ignoring a runner event this daemon build does not recognize"
+        );
+    }
+}
+
+/// Adversarial review round 2, finding B: `RunnerEvent::TerminalRawTimedOut`
+/// (its own doc comment has the full story) used to vanish in total
+/// silence -- an operator watching a Codex session stuck `starting` had no
+/// breadcrumb at all. Logs a `tracing::warn!`, deliberately the *only*
+/// reaction: no session state or `wait_reason` change, which stays
+/// reserved for `#52`'s own deadline (keyed off `state == starting`) --
+/// changing state here would make this session invisible to that
+/// deadline's own check, silently disabling the actual backstop for
+/// exactly the session it exists to catch. Only meaningful for a Codex
+/// session still waiting on synthesis (`synthesize_on_raw_mode`); a
+/// no-op for Claude/`shell`, which never depend on this signal.
+fn warn_on_raw_mode_timeout(
+    session_id: &SessionId,
+    synthesize_on_raw_mode: bool,
+    envelope: &RunnerEventEnvelope,
+) {
+    if synthesize_on_raw_mode && matches!(envelope.event, RunnerEvent::TerminalRawTimedOut) {
+        tracing::warn!(
+            session_id = %session_id,
+            "Codex session's pty never left canonical mode within the runner's raw-mode \
+             poll window; SessionStart was never synthesized for it and it may still be \
+             starting -- see docs/providers.md's Codex SessionStart section"
+        );
+    }
+}
+
 /// Subscribes to a freshly spawned session's own runner (retrying for up to
 /// [`CONNECT_GRACE`] -- `runner_process::spawn_runner` does not itself wait
 /// for the control socket to exist in terminal mode, so this can genuinely
@@ -1757,6 +1801,8 @@ async fn wait_for_runner_exit(
                     }
                     return Some((exit_code, signal));
                 }
+                log_unrecognized_runner_event(session_id, &envelope);
+                warn_on_raw_mode_timeout(session_id, synthesize_on_raw_mode, &envelope);
                 if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
                     synthesize_codex_session_start(state, wake_tx, session_id).await;
                 }
@@ -2483,6 +2529,8 @@ async fn consume_until_exit(
                         exit_signal: signal,
                     };
                 }
+                log_unrecognized_runner_event(session_id, &envelope);
+                warn_on_raw_mode_timeout(session_id, synthesize_on_raw_mode, &envelope);
                 if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
                     synthesize_codex_session_start(state, wake_tx, session_id).await;
                 }

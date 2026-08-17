@@ -2239,7 +2239,9 @@ fn read_run_terminal(
             RunnerEvent::Started { .. }
             | RunnerEvent::SpawnFailed { .. }
             | RunnerEvent::TerminalRaw
-            | RunnerEvent::Exited { .. } => {}
+            | RunnerEvent::TerminalRawTimedOut
+            | RunnerEvent::Exited { .. }
+            | RunnerEvent::Unknown => {}
         }
     }
 

@@ -236,20 +236,92 @@ pub enum RunnerEvent {
     /// far) switch to raw mode once during their own startup and never
     /// switch back, so this is logged as a lifecycle event exactly like
     /// [`Self::Started`] (once, non-terminal), not a stream of
-    /// transitions. Additive to the wire since [`RUNNER_PROTOCOL_VERSION`]
-    /// 1: an older reader that does not know this variant fails to parse
-    /// only the one frame carrying it (`serde_json` rejects an unknown
-    /// `type` for the whole enum), which is the same degraded-but-isolated
-    /// outcome any future additive `RunnerEvent` variant already has under
-    /// `docs/development/WORKFLOW.md`'s "runner control protocol must stay
-    /// backward compatible within a major version" contract; every other
-    /// frame on the same connection, including this session's own
-    /// `Exited`, is unaffected.
+    /// transitions.
+    ///
+    /// This was the first additive `RunnerEvent` variant since
+    /// [`RUNNER_PROTOCOL_VERSION`] 1 shipped, and adding it here is what
+    /// caught (verified against a scratch binary built on this exact
+    /// `factory-core`) that an older reader did **not** degrade the way an
+    /// earlier version of this doc comment claimed: with no catch-all
+    /// variant, an unrecognized `type` failed `serde_json` deserialization
+    /// for the *whole* `RunnerEventEnvelope`, which `read_frame`
+    /// (`crates/factoryd/src/runner_client.rs`) turned into
+    /// `RunnerClientError::InvalidJson` for that entire frame -- and
+    /// because that error path returns before the exit-acknowledgement
+    /// call (`wait_for_runner_exit`/`consume_until_exit`,
+    /// `crates/factoryd/src/execution.rs`), it abandoned the control
+    /// stream and orphaned the runner (issue #26's shape), not "just the
+    /// one frame". `docs/development/WORKFLOW.md`'s "runner control
+    /// protocol must stay backward compatible within a major version" is
+    /// a real, exercised contract -- "daemon N spawns runner N+1" happens
+    /// on every in-place update -- and it did not hold for this variant
+    /// until [`Self::Unknown`] existed to catch it. It holds now, for
+    /// this dataless variant, at the one-time cost of adding that
+    /// catch-all before anything shipped -- [`Self::Unknown`]'s own doc
+    /// comment has the important caveat: the same protection is not
+    /// automatic for a future variant that carries `data`.
     TerminalRaw,
+    /// The poll [`Self::TerminalRaw`]'s own doc comment describes gave up:
+    /// the child's tty never left canonical mode within
+    /// `factory-runner::RAW_MODE_POLL_TIMEOUT`. Logged once, non-terminal,
+    /// exactly like [`Self::TerminalRaw`] itself -- the two are mutually
+    /// exclusive outcomes of the same one-shot poll, never both for the
+    /// same session. Adversarial review round 2 finding B: an earlier
+    /// version of this poll gave up in total silence, so an operator
+    /// watching a Codex session stuck `starting` had zero breadcrumbs.
+    /// The daemon logs a `tracing::warn!` on this event for a Codex
+    /// session (`docs/providers.md`) -- deliberately *not* a session state
+    /// or `wait_reason` change: that stays reserved for `#52`'s own
+    /// deadline (`SESSION_START_DEADLINE`, keyed off `state == starting`),
+    /// which must keep seeing this session as `starting` to ever fire;
+    /// changing state here would silently disable that backstop for
+    /// exactly the sessions it exists to catch.
+    TerminalRawTimedOut,
     Exited {
         exit_code: Option<i32>,
         signal: Option<i32>,
     },
+    /// Catch-all for any `type` this build does not recognize (a future
+    /// variant a newer runner sends to an older daemon -- the direction
+    /// [`Self::TerminalRaw`]'s own doc comment above has the full story
+    /// on). `#[serde(other)]` on an adjacently tagged (`tag`/`content`)
+    /// enum deserializes an unrecognized `type` into this variant instead
+    /// of failing the whole frame, *provided its `data` is absent or
+    /// `null`* -- serde requires `#[serde(other)]` to sit on a unit
+    /// variant, which can only ever deserialize from an empty/null
+    /// payload, never an arbitrary one (verified: a scratch enum with the
+    /// same `tag`/`content` shape parses `{"type":"x"}` and
+    /// `{"type":"x","data":null}` into its `other` variant, but
+    /// `{"type":"x","data":{"a":1}}` still fails outright, "invalid type:
+    /// map, expected unit variant"). Every event added so far follows
+    /// that shape -- [`Self::TerminalRaw`] itself has no `data` field at
+    /// all -- but this is a real, narrower guarantee than "any future
+    /// variant is forward-compatible": a future variant whose own payload
+    /// carries data reproduces this exact bug for an older reader unless
+    /// its own author widens this mechanism (e.g. a hand-written
+    /// `Deserialize` impl dispatching through `serde_json::Value`) at the
+    /// same time. Known variants are unaffected either way and still
+    /// deserialize into themselves.
+    ///
+    /// Never constructed to be sent -- only ever produced by deserializing
+    /// a frame this build's own enum does not have a name (or a matching
+    /// shape) for. Every consumer's own match already treats "not
+    /// `Exited`, not `TerminalRaw`" as an ordinary no-op
+    /// (`wait_for_runner_exit`/`consume_until_exit`, which additionally
+    /// log it at `debug` for observability), so this variant needs no
+    /// special handling beyond existing at all.
+    ///
+    /// The reverse direction -- an *older* runner talking to a newer
+    /// daemon -- needs no catch-all: an old runner simply never sends
+    /// `TerminalRaw` (it does not know the event exists), so a Codex
+    /// session it supervises never gets synthesized this way. Today,
+    /// with `#52` not yet merged, that session sits `starting` until an
+    /// operator manually posts the hook by hand, exactly as before this
+    /// track (`docs/providers.md`'s Codex `SessionStart` section states
+    /// this plainly rather than implying a backstop that does not exist
+    /// yet).
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -85,13 +85,21 @@ const MAX_COMMAND_ID_BYTES: usize = 128;
 /// How often [`pty_raw_mode_poll_loop`] calls `tcgetattr` on the pty
 /// master while waiting for the child to leave canonical mode.
 const RAW_MODE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How long [`pty_raw_mode_poll_loop`] keeps polling before giving up.
-/// Matches the order of magnitude of `factoryd::execution::STARTUP_GRACE`
-/// (the daemon's own bound on a provider process becoming reachable at
-/// all) -- a provider that has not left canonical mode by then is not
-/// going to, and the daemon must not wait on `RunnerEvent::TerminalRaw`
-/// forever either (`docs/providers.md`).
-const RAW_MODE_POLL_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long [`pty_raw_mode_poll_loop`] keeps polling before giving up and
+/// reporting [`RunnerEvent::TerminalRawTimedOut`] instead. Matches
+/// `SESSION_START_DEADLINE = 120s` in `crates/factoryd/src/execution.rs`
+/// (`#52`, "generous for a cold Codex start with many MCP servers") rather
+/// than picking an independent number this crate cannot actually agree
+/// with: `factory-runner` has no (and must not gain, `ARCHITECTURE.md`
+/// invariant 1) dependency on `factoryd`, so the two constants are
+/// duplicated, not shared, until both live somewhere common in
+/// `factory-core` -- worth doing the next time either changes, not
+/// blocking this one. Whichever gives up first is fine either way: this
+/// bound only decides when the daemon stops hoping for a synthesized
+/// `SessionStart`, and `#52`'s own deadline is the actual, durable
+/// backstop that fails and retries a session stuck `starting`
+/// (`docs/providers.md`).
+const RAW_MODE_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
 const TERMINAL_LOG_FILE: &str = "terminal.log";
@@ -1815,11 +1823,33 @@ async fn supervise_terminal(
             // stop selecting on this branch entirely rather than leaving a
             // completed future to poll forever. See `RunnerEvent::
             // TerminalRaw`'s own doc comment for why this is logged once,
-            // non-terminal, like `Started`.
+            // non-terminal, like `Started` -- and `RunnerEvent::
+            // TerminalRawTimedOut`'s for why a timeout is now reported
+            // too, not silently dropped (review round 2 finding B).
             result = &mut raw_mode_rx, if raw_mode_pending => {
                 raw_mode_pending = false;
-                if result.is_ok() {
-                    log.append_lifecycle(RunnerEvent::TerminalRaw, false).await?;
+                let event = match result {
+                    Ok(true) => Some(RunnerEvent::TerminalRaw),
+                    Ok(false) => Some(RunnerEvent::TerminalRawTimedOut),
+                    // The sender side always sends exactly one of the two
+                    // outcomes above before returning (`pty_raw_mode_poll_loop`'s
+                    // own doc comment); a dropped sender with nothing sent
+                    // would mean the poll thread panicked, which is not
+                    // this event's job to paper over.
+                    Err(_) => None,
+                };
+                if let Some(event) = event {
+                    // Best-effort, matching this event's own doc comment
+                    // ("an optimization the daemon can act on, never
+                    // something a session's liveness depends on"): a
+                    // failure to append it (spool full -- practically
+                    // unreachable, a terminal-mode spool holds a handful
+                    // of events -- or some other I/O error) must not
+                    // propagate out of the whole terminal supervision via
+                    // `?`, which review round 2 finding F caught this
+                    // doing. `Started`/`Exited`, by contrast, are load
+                    // -bearing and correctly still use `?`.
+                    let _ = log.append_lifecycle(event, false).await;
                 }
             }
             command = stops.recv() => {
@@ -1964,20 +1994,27 @@ fn pty_control_loop(
 /// an optimization the daemon can act on, never something a session's
 /// liveness depends on (`#52`'s deadline is the honest fallback if it
 /// never arrives).
+/// Sends exactly one outcome on `result` before returning: `true` the
+/// moment `ICANON` clears, `false` if [`RAW_MODE_POLL_TIMEOUT`] elapses
+/// first with it never clearing. Never leaves `result` unsent -- the
+/// caller (`supervise_terminal`) relies on this to distinguish "still
+/// polling" from "gave up silently", which round 2's finding B is about
+/// closing.
 fn pty_raw_mode_poll_loop(
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    detected: oneshot::Sender<()>,
+    result: oneshot::Sender<bool>,
 ) {
     let deadline = std::time::Instant::now() + RAW_MODE_POLL_TIMEOUT;
     loop {
         let termios = master.blocking_lock().get_termios();
         if let Some(termios) = termios {
             if !termios.local_flags.contains(LocalFlags::ICANON) {
-                let _ = detected.send(());
+                let _ = result.send(true);
                 return;
             }
         }
         if std::time::Instant::now() >= deadline {
+            let _ = result.send(false);
             return;
         }
         std::thread::sleep(RAW_MODE_POLL_INTERVAL);
