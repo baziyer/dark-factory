@@ -65,6 +65,82 @@ sandbox_mode = \"workspace-write\"";
 const MINIMAL_CONFIG_TOML: &str =
     "# Dark Factory generated Codex home (no ~/.codex/config.toml was found to copy).\n";
 
+/// Top-level tables never copied from the operator's real `~/.codex/
+/// config.toml` into a fresh per-agent seed (this track's item 7):
+///
+/// - `mcp_servers`: the concrete bug this exists to fix -- Codex stalls at
+///   "Starting MCP servers" launching every one of the operator's own MCP
+///   servers inside a headless factory worker session that never needed
+///   them, several of which expect an interactive terminal/browser/local
+///   dev server that is not there.
+/// - `projects`: the operator's own per-repo trust decisions (which repos
+///   *they* have approved running Codex against unprompted) have no
+///   bearing on a factory worker's own worktree, which
+///   `rewrite_config_block` already grants trust to explicitly, every
+///   spawn, on its own terms.
+/// - `hooks`: covers both `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]`
+///   (the operator's own hook commands, which must never run inside a
+///   daemon-owned session -- this seed's whole point is that
+///   `rewrite_hooks_block` is the *only* source of hooks here) and the
+///   plain `[hooks.state]` table Codex persists trust decisions into
+///   (`docs/providers.md` documents the exact shape found on a real
+///   machine) -- neither belongs in an isolated `CODEX_HOME` that never
+///   asks for hook trust in the first place
+///   (`--dangerously-bypass-hook-trust`).
+///
+/// Anything else -- `model`, `model_provider`/`model_providers.*`,
+/// `approval_policy`, the operator's own `sandbox_mode` (immediately
+/// overridden by `rewrite_config_block` anyway, but harmless to inherit as
+/// a starting point), and any other root-level scalar -- is kept: those
+/// are exactly "what a factory worker needs" per this track's brief, and
+/// none of them reference the operator's own environment.
+const DROPPED_SEED_TABLES: [&str; 3] = ["mcp_servers", "projects", "hooks"];
+
+/// Filters `document` (a copy of the operator's real `config.toml`) down
+/// to the allow-list [`DROPPED_SEED_TABLES`] documents, for the *initial*
+/// seed only (`seed_codex_home_once` never overwrites an existing seeded
+/// `config.toml` -- this runs once per agent, not once per spawn). Not a
+/// general TOML parser, same tradeoff every other marker/table scanner in
+/// this module already makes (`strip_marked_block`,
+/// `first_table_header_offset`): a table is identified purely by its
+/// `[table]`/`[[array-of-tables]]` header line, dropped (header line
+/// through the line before the next header) if its top-level key --
+/// everything before the first `.` inside the brackets -- is in
+/// [`DROPPED_SEED_TABLES`]. Root-level scalars (before the first header)
+/// are never dropped by this function.
+fn filter_operator_config_for_seed(document: &str) -> String {
+    let mut kept = String::with_capacity(document.len());
+    let mut dropping = false;
+    for line in document.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            dropping = table_header_top_level_key(line)
+                .is_some_and(|key| DROPPED_SEED_TABLES.contains(&key.as_str()));
+        }
+        if !dropping {
+            kept.push_str(line);
+        }
+    }
+    kept
+}
+
+/// The top-level key of a `[table]`/`[[array-of-tables]]` header line --
+/// `"hooks"` for both `[hooks.state]` and `[[hooks.SessionStart.hooks]]`,
+/// `"projects"` for `[projects."/abs/path"]` -- or `None` if `line` is not
+/// a recognizable header line at all.
+fn table_header_top_level_key(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix("[[")
+        .and_then(|rest| rest.strip_suffix("]]"))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('[')
+                .and_then(|rest| rest.strip_suffix(']'))
+        })?;
+    let key = inner.split('.').next().unwrap_or(inner).trim();
+    Some(key.trim_matches('"').to_owned())
+}
+
 /// Interactive-session [`Provider`] for Codex. Launches `codex
 /// --dangerously-bypass-hook-trust [--model M] [-c
 /// approval_policy="<permission_mode>"] [resume <thread-id>]` with
@@ -156,11 +232,13 @@ impl Provider for CodexProvider {
 }
 
 /// Idempotently seeds `codex_home` (mode `0700`, created if missing) the
-/// first time it is used: copies `source_home/config.toml` if present, else
-/// writes [`MINIMAL_CONFIG_TOML`]; symlinks `source_home/auth.json` if
-/// present and not already linked. Existing files are never overwritten —
-/// this is a one-time seed, not a sync. The hooks block is refreshed
-/// separately, every spawn, by [`rewrite_hooks_block`].
+/// first time it is used: copies `source_home/config.toml` if present
+/// (filtered down to what a factory worker needs by
+/// [`filter_operator_config_for_seed`] -- see [`DROPPED_SEED_TABLES`]),
+/// else writes [`MINIMAL_CONFIG_TOML`]; symlinks `source_home/auth.json`
+/// if present and not already linked. Existing files are never
+/// overwritten — this is a one-time seed, not a sync. The hooks block is
+/// refreshed separately, every spawn, by [`rewrite_hooks_block`].
 fn seed_codex_home_once(
     codex_home: &Path,
     source_home: Option<&Path>,
@@ -174,7 +252,8 @@ fn seed_codex_home_once(
     if !config_path.exists() {
         let contents = source_home
             .map(|home| home.join("config.toml"))
-            .and_then(|path| fs::read(path).ok())
+            .and_then(|path| fs::read_to_string(path).ok())
+            .map(|raw| filter_operator_config_for_seed(&raw).into_bytes())
             .unwrap_or_else(|| MINIMAL_CONFIG_TOML.as_bytes().to_vec());
         hooks::write_private_file(&config_path, &contents).map_err(|source| {
             ProviderError::Seed {
@@ -790,15 +869,22 @@ mod provider_tests {
     }
 
     #[test]
-    fn a_real_configs_own_sandbox_mode_is_replaced_not_duplicated_and_its_trailing_project_tables_survive()
+    fn a_real_configs_own_sandbox_mode_is_replaced_not_duplicated_and_a_surviving_trailing_table_is_undisturbed()
      {
         // The exact shape this track's manual check found on a real
         // machine's `~/.codex/config.toml`: root-level scalars (including
         // the operator's own `sandbox_mode`), then dozens of trailing
-        // `[projects."..."]` tables. Appending Dark Factory's own
-        // `sandbox_mode` line naively after those tables would silently
-        // make it a member of the *last* `[projects...]` table instead of
-        // the root table -- this proves it does not.
+        // `[projects."..."]` tables (dropped entirely at seed time by
+        // this track's `filter_operator_config_for_seed` -- see the
+        // dedicated `operator_config_is_filtered_...` test below -- so
+        // this fixture also keeps one *surviving* trailing table,
+        // `[model_providers.*]`, to prove `insert_root_level_line`
+        // still finds the correct root-table boundary when a real
+        // dropped-then-kept mix of trailing tables is present, not just
+        // when every trailing table happens to be dropped). Appending
+        // Dark Factory's own `sandbox_mode` line naively after those
+        // tables would silently make it a member of the *last* survivor
+        // instead of the root table -- this proves it does not.
         let directory = tempfile::tempdir().unwrap();
         let real_home = directory.path().join("real-codex-home");
         fs::create_dir_all(&real_home).unwrap();
@@ -812,7 +898,10 @@ mod provider_tests {
              trust_level = \"trusted\"\n\
              \n\
              [projects.\"/Users/op/another-repo\"]\n\
-             trust_level = \"trusted\"\n",
+             trust_level = \"trusted\"\n\
+             \n\
+             [model_providers.custom]\n\
+             name = \"Custom\"\n",
         )
         .unwrap();
 
@@ -830,13 +919,20 @@ mod provider_tests {
         assert_eq!(contents.matches("sandbox_mode = \"").count(), 1);
         assert!(contents.contains("sandbox_mode = \"workspace-write\""));
         assert!(!contents.contains("\"read-only\""));
-        // The operator's own settings and both pre-existing project trust
-        // entries round-trip untouched.
+        // The operator's own non-project settings round-trip untouched,
+        // including a trailing table not on the drop list.
         assert!(contents.contains("model = \"gpt-5.6\""));
         assert!(contents.contains("approval_policy = \"on-request\""));
-        assert!(contents.contains("[projects.\"/Users/op/other-repo\"]"));
-        assert!(contents.contains("[projects.\"/Users/op/another-repo\"]"));
-        // This agent's own worktree gains a trust entry too.
+        assert!(contents.contains("[model_providers.custom]"));
+        assert!(contents.contains("name = \"Custom\""));
+        // The operator's own project trust entries do not: an operator's
+        // decision to trust *their own* repos has no bearing on this
+        // factory worker's session (this track's item 7).
+        assert!(!contents.contains("/Users/op/other-repo"));
+        assert!(!contents.contains("/Users/op/another-repo"));
+        // This agent's own worktree still gains a trust entry, from
+        // `rewrite_config_block` -- unrelated to what was (or wasn't)
+        // seeded.
         assert!(contents.contains(&format!(
             "[projects.{}]",
             toml_string(&ctx.worktree.to_string_lossy())
@@ -858,5 +954,143 @@ mod provider_tests {
             report["checks"]["config.load"]["details"]["config.toml parse"],
             "ok"
         );
+    }
+
+    /// This track's item 7, dedicated fixture: an operator `config.toml`
+    /// carrying exactly the three shapes that motivated the fix --
+    /// `[mcp_servers.*]` (the "Starting MCP servers" stall), `[projects.*]`
+    /// (an operator's own repo trust, irrelevant to a factory worker), and
+    /// `[hooks.state]` (Codex's own persisted hook-trust bookkeeping) plus
+    /// the `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]` shape a real
+    /// `~/.codex/config.toml` could also carry if the operator has their
+    /// own hooks configured -- both variants have top-level key `hooks`.
+    /// None of it should survive the seed; ordinary root-level settings
+    /// and an unrelated table should.
+    #[test]
+    fn operator_config_is_filtered_to_the_documented_allow_list_at_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let real_home = directory.path().join("real-codex-home");
+        fs::create_dir_all(&real_home).unwrap();
+        fs::write(
+            real_home.join("config.toml"),
+            "model = \"gpt-5.6\"\n\
+             model_provider = \"openai\"\n\
+             approval_policy = \"on-request\"\n\
+             \n\
+             [mcp_servers.filesystem]\n\
+             command = \"npx\"\n\
+             args = [\"-y\", \"@modelcontextprotocol/server-filesystem\"]\n\
+             \n\
+             [mcp_servers.browser]\n\
+             command = \"mcp-browser\"\n\
+             \n\
+             [projects.\"/Users/op/some-repo\"]\n\
+             trust_level = \"trusted\"\n\
+             \n\
+             [hooks.state]\n\
+             \"/Users/op/.codex/config.toml:SessionStart:0:0\" = true\n\
+             \n\
+             [[hooks.SessionStart]]\n\
+             [[hooks.SessionStart.hooks]]\n\
+             type = \"command\"\n\
+             command = \"/Users/op/bin/operators-own-hook.sh\"\n\
+             \n\
+             [model_providers.custom]\n\
+             name = \"Custom\"\n",
+        )
+        .unwrap();
+
+        let ctx = context(directory.path());
+        CodexProvider::with_source_home(real_home)
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let codex_home = directory.path().join("agent-dir").join("codex-home");
+        let contents = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+
+        // Dropped: every shape in `DROPPED_SEED_TABLES`.
+        assert!(!contents.contains("mcp_servers"));
+        assert!(!contents.contains("server-filesystem"));
+        assert!(!contents.contains("mcp-browser"));
+        assert!(!contents.contains("/Users/op/some-repo"));
+        assert!(!contents.contains("hooks.state"));
+        assert!(!contents.contains("operators-own-hook.sh"));
+        // `[[hooks.SessionStart]]` is dropped from the *seed*; the daemon's
+        // own identical-looking header still appears, written fresh by
+        // `rewrite_hooks_block` -- this is what proves the seed's own copy
+        // was actually filtered, not that the file has zero
+        // `hooks.SessionStart` headers at all.
+        assert_eq!(contents.matches("[[hooks.SessionStart]]").count(), 1);
+        assert!(contents.contains("factoryctl' hook --token-file"));
+
+        // Kept: ordinary settings and an unrelated table.
+        assert!(contents.contains("model = \"gpt-5.6\""));
+        assert!(contents.contains("model_provider = \"openai\""));
+        assert!(contents.contains("approval_policy = \"on-request\""));
+        assert!(contents.contains("[model_providers.custom]"));
+        assert!(contents.contains("name = \"Custom\""));
+
+        if !codex_is_installed() {
+            eprintln!(
+                "skipping real codex doctor check: codex is not installed in this environment"
+            );
+            return;
+        }
+        let output = std::process::Command::new("codex")
+            .env("CODEX_HOME", &codex_home)
+            .args(["--strict-config", "doctor", "--json"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["checks"]["config.load"]["details"]["config.toml parse"],
+            "ok"
+        );
+    }
+
+    #[test]
+    fn filter_operator_config_for_seed_keeps_only_the_allow_list() {
+        let filtered = filter_operator_config_for_seed(
+            "model = \"gpt-5.6\"\n\
+             \n\
+             [mcp_servers.filesystem]\n\
+             command = \"npx\"\n\
+             \n\
+             [projects.\"/abs/repo\"]\n\
+             trust_level = \"trusted\"\n\
+             \n\
+             [hooks.state]\n\
+             key = true\n\
+             \n\
+             [model_providers.custom]\n\
+             name = \"Custom\"\n",
+        );
+        assert!(filtered.contains("model = \"gpt-5.6\""));
+        assert!(filtered.contains("[model_providers.custom]"));
+        assert!(filtered.contains("name = \"Custom\""));
+        assert!(!filtered.contains("mcp_servers"));
+        assert!(!filtered.contains("projects"));
+        assert!(!filtered.contains("hooks"));
+    }
+
+    #[test]
+    fn table_header_top_level_key_reads_the_key_before_the_first_dot() {
+        assert_eq!(
+            table_header_top_level_key("[hooks.state]"),
+            Some("hooks".to_owned())
+        );
+        assert_eq!(
+            table_header_top_level_key("[[hooks.SessionStart.hooks]]"),
+            Some("hooks".to_owned())
+        );
+        assert_eq!(
+            table_header_top_level_key("[projects.\"/abs/repo\"]"),
+            Some("projects".to_owned())
+        );
+        assert_eq!(
+            table_header_top_level_key("[model_providers.custom]"),
+            Some("model_providers".to_owned())
+        );
+        assert_eq!(table_header_top_level_key("not a header"), None);
     }
 }

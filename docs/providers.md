@@ -141,6 +141,40 @@ them into `factory_core::ProviderHookEvent` values (see
    sign the boundary needs to grow — raise it rather than routing around
    it with provider-specific glue elsewhere in the daemon.
 
+## Codex: `CODEX_HOME` seeding is filtered, not a raw copy
+
+`CodexProvider` seeds each agent's isolated `CODEX_HOME` once
+(`seed_codex_home_once`, `crates/factoryd/src/providers/codex.rs`) by
+copying the operator's real `~/.codex/config.toml` — but filtered, not
+verbatim. Copying it whole was the original design and stalled every
+session at "Starting MCP servers" on a real machine: the operator's own
+`config.toml` brings along `[mcp_servers.*]` (Codex launches every one of
+them before a session becomes usable, several of which expect an
+interactive terminal/browser/local dev server that plainly is not there
+inside a headless factory worker), `[projects.*]` (the operator's own
+per-repo trust decisions — irrelevant to a factory worker's own worktree,
+which gets its own explicit trust entry from `rewrite_config_block` every
+spawn regardless), and `[hooks.*]` (both the array-of-tables shape,
+`[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]`, if the operator has their
+own hooks configured, and the plain `[hooks.state]` table Codex persists
+hook-trust decisions into — confirmed on a real machine's
+`~/.codex/config.toml`, keyed `"<config-path>:<event>:0:<n>"`). None of
+these belong in a daemon-owned, `--dangerously-bypass-hook-trust` session
+that never asks for hook trust in the first place.
+
+The allow-list (`filter_operator_config_for_seed`/`DROPPED_SEED_TABLES`)
+is table-scoped, not key-scoped: **dropped** — any top-level table whose
+name (the part before the first `.` inside `[...]`/`[[...]]`) is
+`mcp_servers`, `projects`, or `hooks`. **Kept** — every root-level scalar
+(before the first table header at all: `model`, `model_provider`,
+`approval_policy`, the operator's own `sandbox_mode`, ...) and every other
+table (e.g. `[model_providers.custom]`) verbatim. This only runs once, at
+first seed — `seed_codex_home_once` never overwrites an existing seeded
+`config.toml` on a later spawn, so a real edit an operator makes to a
+seeded home (or Codex's own writes back into it) is never clobbered by a
+later filter pass. See `operator_config_is_filtered_to_the_documented_allow_list_at_seed`
+in `codex.rs`'s test module for the fixture-driven proof.
+
 ## Example/mock provider
 
 Two different test doubles exist at two different layers, easy to conflate:
