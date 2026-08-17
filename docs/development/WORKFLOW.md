@@ -124,59 +124,77 @@ each job.) Finally `./svc.sh install && ./svc.sh start`, and confirm it is
 remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
 --token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/remove-token --jq .token)"`.
 
-## Release and update design — not implemented
+## Release and update
 
-Everything below is a design, not shipped code. No `factoryctl update`,
-manifest, or Homebrew/npm packaging exists yet. Recorded here so the shape
-is agreed before anyone builds it.
+GitHub Releases are the source of truth for binaries; nothing else builds
+them.
 
-**Distribution, in order**: a hosted manifest first (this repo's GitHub
-Releases, mirrored by `~/dark-factory-site`'s Vercel deployment for a
-stable static URL), then npm, then Homebrew — never block a standalone
-Rust binary on the packaging story.
-
-1. **Build**: a semver tag triggers GitHub Actions to build release
-   binaries for macOS arm64 (x86_64 and Linux later) and attach them, plus
-   a SHA256 manifest, to a GitHub Release.
-2. **Manifest**: a small JSON "latest" manifest (version, per-platform
-   download URL, SHA256) is mirrored by `dark-factory-site` (Vercel) so a
-   stable static URL exists independent of GitHub's own API.
-3. **Update signal**: `factoryctl update` checks the manifest against the
-   running version. `factory-tui` shows "update vX available" in its
-   status line, checked at most hourly, in-process — no background
-   service, no polling daemon.
-4. **Install**: `factoryctl update --install` downloads the new release to
-   `$DARK_FACTORY_HOME/bin/<version>/`, verifies its SHA256 against the
-   manifest, atomically repoints a `current` symlink at it, rewrites and
-   reloads the `launchd` job (see `launchd/README.md`), and restarts the
-   daemon.
-5. **Migrations** run automatically at daemon start (already how SQLite
-   migrations work today — see `crates/factoryd/migrations/`), so an
-   update never needs a separate migration step.
-6. **Zero lost work**: sessions and runners are independent process trees
-   (invariant 4) — the daemon restart itself is on the order of a second,
-   and no agent process is touched. `factory-tui`'s existing
-   reconnect/backoff means the board reattaches on its own.
-7. **Rollback**: repoint `current` back to the previous version's
-   directory and restart; nothing is deleted on install, so a rollback
-   never needs a re-download.
-8. **Later**: a Homebrew tap and an npm wrapper, both consuming the exact
+1. **Build and publish**: pushing a semver tag (`git tag v0.1.1 && git push
+   origin v0.1.1`, on a commit whose `Cargo.toml` workspace version is
+   `0.1.1` — the workflow refuses a mismatch) runs
+   `.github/workflows/release.yml` on the self-hosted Mac: `cargo build
+   --locked --release`, then `scripts/package-release.sh` produces
+   `dark-factory-<tag>-aarch64-apple-darwin.tar.gz` (the four binaries,
+   flat), `SHA256SUMS`, and `latest.json`, and `gh release create` attaches
+   all three. `latest.json` is `{version, tag, assets: {<target>: {url,
+   sha256}}}`; the newest one is always at
+   `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
+   (a static URL, so no Vercel mirror is needed unless GitHub is
+   unreachable from somewhere that matters). Only macOS arm64 is built
+   today; other targets are more `assets` keys when someone needs them.
+2. **Update signal**: `factoryctl update` fetches that manifest (via
+   `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
+   and prints JSON: `current`, `latest`, `update_available`, the platform
+   `asset`. The result is cached in `$DARK_FACTORY_HOME/update-check.json`;
+   `factory-tui` reads the same cache and refetches at most hourly, in a
+   background thread of the running board — no background service — and
+   shows `update vX available: factoryctl update --install` in its status
+   line. `factoryctl health` now also returns the daemon's `version`.
+3. **Install**: `factoryctl update --install` downloads the platform
+   asset, verifies its SHA-256 against the manifest, unpacks it into
+   `$DARK_FACTORY_HOME/bin/<version>/` (staged and renamed into place only
+   once every binary checked out), atomically repoints
+   `$DARK_FACTORY_HOME/bin/current` at it, and — if
+   `~/Library/LaunchAgents/com.dark-factory.factoryd.plist` exists —
+   rewrites that job to run `bin/current/factoryd` (keeping its `PATH` and
+   any other daemon arguments), `bootout`s and `bootstrap`s it, and waits
+   for `health` from the new daemon. Without a launchd job it stops after
+   activation and says so; restart the daemon however you run it.
+4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
+   an update never needs a separate migration step.
+5. **No lost work**: sessions and runners are independent process trees
+   (`ARCHITECTURE.md`, invariant 4). The daemon restart is on the order of
+   a second and touches no agent process; `factory-tui` reconnects on its
+   own. Two compatibility rules follow: the runner control protocol must
+   stay backward compatible within a major version (a runner spawned by
+   version N is supervised by daemon N+1 after an update), and running
+   sessions' hooks keep working because they invoke `factoryctl` through
+   the `bin/current` symlink, which now resolves to the new version.
+6. **Rollback**: `ln -sfn <previous-version> $DARK_FACTORY_HOME/bin/current`
+   (or repoint it the same atomic way) and `launchctl kickstart -k
+   gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
+   so a rollback never re-downloads.
+7. **Later**: a Homebrew tap and an npm wrapper, both consuming the exact
    same release assets and manifest — no separate build path.
+
+Add `$DARK_FACTORY_HOME/bin/current` to your shell `PATH` to run the
+installed `factoryctl`/`factory-tui`; `launchd/README.md` covers the job
+itself.
 
 ### Operator install/doctor — design
 
-`factoryctl doctor` (not implemented): checks `claude`/`codex` are on
-`PATH` and reports their versions, whether the `launchd` job is loaded and
-healthy, whether the socket is reachable, that `$DARK_FACTORY_HOME`
-permissions match the `0700`/`0600` requirements in `ARCHITECTURE.md`, and
-that the current directory's git installation supports worktrees. Prints
-one pass/fail line per check; exits non-zero if anything fails.
+`factoryctl init` and `factoryctl doctor` (not implemented yet): `init`
+creates `$DARK_FACTORY_HOME`, installs the running build's sibling
+binaries as `bin/<version>` + `current`, checks `claude`/`codex`/`git`,
+renders the launchd job with a `PATH` that can find them, and loads it.
+`doctor` runs the same checks read-only (plus socket reachability, daemon
+vs. binary version, `0700`/`0600` permissions, stale agent worktrees) and
+prints one pass/fail line per check, exiting non-zero if anything fails.
 
 ## Task list for whoever picks this up
 
-- [ ] GitHub Actions release workflow (tag → build → attach binaries + manifest)
-- [ ] `dark-factory-site` route mirroring the manifest JSON
-- [ ] `factoryctl update` (check-only) and `factory-tui` status-line signal
-- [ ] `factoryctl update --install` (download, verify, repoint, reload, restart)
-- [ ] `factoryctl doctor`
+- [x] GitHub Actions release workflow (tag → build → attach binaries + manifest)
+- [x] `factoryctl update` (check-only) and `factory-tui` status-line signal
+- [x] `factoryctl update --install` (download, verify, repoint, reload, restart)
+- [ ] `factoryctl init` and `factoryctl doctor`
 - [ ] Homebrew tap, npm wrapper (after the above is proven)

@@ -136,6 +136,9 @@ agent state and attention are derived from durable daemon state.
 $DARK_FACTORY_HOME/
   factory.db, f.sock, runs/           # SQLite ledger, control socket, per-session runtime dirs
   webhooks.json                       # optional; loaded automatically if present
+  logs/                               # the launchd job's stdout/stderr
+  bin/<version>/, bin/current         # installed releases; `current` is what launchd runs
+  update-check.json                   # cached result of the last release-manifest check
   projects/<project_id>/PROJECT.md
   projects/<project_id>/agents/<agent_id>/instructions.md
   projects/<project_id>/agents/<agent_id>/memory.md
@@ -191,15 +194,23 @@ file and its referenced secret file must both be owner-only (`0600`):
 Tunnel or device exposure beyond loopback is external to the daemon (see
 `ARCHITECTURE.md`'s "Deliberately unresolved").
 
-## Local service
+## Local service, releases, and updates
 
 `launchd/` keeps `factoryd` running as a login service; see
-[launchd/README.md](launchd/README.md) to render and install it. It does
-not use GitHub Actions. Once installed, `./scripts/launch-ui.sh` checks
-the release binaries and daemon health, then keeps `factory-tui` attached
-to the current terminal (`Ctrl-C` closes the observer only — `factoryd`
-keeps running). Subscription headroom has no background service — run
-`factoryctl usage` on demand instead.
+[launchd/README.md](launchd/README.md). Once installed,
+`./scripts/launch-ui.sh` checks the release binaries and daemon health,
+then keeps `factory-tui` attached to the current terminal (`Ctrl-C` closes
+the observer only — `factoryd` keeps running). Subscription headroom has no
+background service — run `factoryctl usage` on demand instead.
+
+Tagged releases publish macOS arm64 binaries on GitHub Releases.
+`factoryctl update` reports whether a newer one exists (and `factory-tui`
+says so in its status line, checked at most hourly); `factoryctl update
+--install` downloads and verifies it into `$DARK_FACTORY_HOME/bin/<version>`,
+repoints `bin/current`, and reloads the launchd job — only the daemon
+restarts, every running session survives. Details, rollback, and the
+compatibility rules this relies on: [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md),
+"Release and update".
 
 ## Development
 
