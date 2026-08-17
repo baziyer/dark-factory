@@ -24,9 +24,36 @@ jobs:
       TAG: ${{ github.ref_name }}
       TARGET: aarch64-apple-darwin
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
+      # No actions/checkout: codeload.github.com (which serves an action's
+      # tarball) can 429 independently of git itself, so this job never
+      # depends on that download — a plain `git fetch` talks straight to
+      # GitHub's git server instead. See ci.yml for the full rationale;
+      # this is the same step.
+      #
+      # This runner's workspace persists between jobs (it is shared with
+      # ci.yml's `checks` job), so the step below must leave a clean tree
+      # at exactly $GITHUB_SHA even if a previous job left files behind:
+      # initialize the workspace as a repo if it isn't one yet, fetch that
+      # one commit, force-checkout it detached, then `git clean -ffdx`
+      # everything else a prior job left. That clean never touches the
+      # cargo cache: CARGO_TARGET_DIR lives outside this workspace (see
+      # docs/development/WORKFLOW.md, "The self-hosted runner").
+      #
+      # For a tag push, $GITHUB_SHA is the commit the tag points at; GitHub
+      # serves `git fetch` by arbitrary commit SHA (verified against this
+      # repository). The repo is public, so the fetch is unauthenticated
+      # and nothing is written to .git/config that could leak a credential.
+      - name: Check out $GITHUB_SHA
+        run: |
+          set -euxo pipefail
+          if [ ! -d .git ]; then
+            git init
+          fi
+          git remote remove origin 2>/dev/null || true
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          git clean -ffdx
 
       - name: Install the pinned toolchain
         run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
