@@ -254,6 +254,6 @@ compatibility problem.
 - `crates/factory-core/src/paths.rs`'s module doc comment (lines 14-19)
   still marks `codex-home/`, `claude-settings.json`, and `worktrees/<agent_id>`
   as "reserved, not yet created" — all three are created today (see
-  README's "Guidance files" section). Trivial doc-comment fix, left for a
-  future change since this pass is docs-only outside `AGENTS.md`/`CLAUDE.md`/
-  `scripts/new-worktree.sh`/`.gitignore`.
+  README's "How it works, in one screen" section). Trivial doc-comment
+  fix, left for a future change since this pass is docs-only outside
+  `AGENTS.md`/`CLAUDE.md`/`scripts/new-worktree.sh`/`.gitignore`.
