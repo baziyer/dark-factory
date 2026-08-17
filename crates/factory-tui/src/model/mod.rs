@@ -820,7 +820,9 @@ impl Board {
         // transition at the time.
         let mut last_session_state: HashMap<SessionId, SessionState> = HashMap::new();
         for event in events {
-            if let Some(agent_id) = event_agent(&event.event) {
+            if let FactoryEvent::AgentDeleted { agent_id, .. } = &event.event {
+                self.activity.remove(agent_id);
+            } else if let Some(agent_id) = event_agent(&event.event) {
                 self.activity
                     .entry(agent_id.clone())
                     .or_default()

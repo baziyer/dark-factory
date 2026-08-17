@@ -491,7 +491,7 @@ impl Board {
             WorkshopPane::Tasks => {
                 let task_id = self.selected_task.clone().or_else(|| {
                     self.focused_project.as_ref().and_then(|project_id| {
-                        self.tasks_in(project_id)
+                        self.visible_tasks(project_id)
                             .first()
                             .map(|t| t.snapshot.id.clone())
                     })
@@ -1509,6 +1509,25 @@ mod tests {
         let intent = board.handle_key(key(KeyCode::Enter));
         assert!(matches!(intent, Intent::Redraw));
         assert!(matches!(board.mode, Mode::TaskMenu(_)));
+    }
+
+    #[test]
+    fn workshop_enter_targets_the_first_visible_task_when_attention_is_filtered() {
+        let mut board = board_in_workshop();
+        board.tasks.insert(
+            TaskId::try_from("failed").unwrap(),
+            task("failed", "proj", TaskStatus::Failed, None, 10),
+        );
+        board.attention_filter = true;
+        assert_eq!(board.selected_task, None, "no movement key pressed yet");
+
+        let intent = board.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(intent, Intent::Redraw));
+        let Mode::TaskMenu(state) = &board.mode else {
+            panic!("Enter should open the visible task's menu");
+        };
+        assert_eq!(state.task_id.as_str(), "failed");
     }
 
     #[test]

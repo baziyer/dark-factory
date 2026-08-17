@@ -320,6 +320,35 @@ fn apply_replay_feeds_the_activity_sparkline() {
     );
 }
 
+#[test]
+fn apply_replay_drops_activity_for_an_agent_deleted_during_the_replay_window() {
+    let mut b = board();
+    let alice = AgentId::try_from("alice").unwrap();
+    b.apply_replay(vec![
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 0,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-1", "alice", "a", SessionState::Working),
+            },
+        },
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 2,
+            occurred_at_ms: 1,
+            event: FactoryEvent::AgentDeleted {
+                project_id: ProjectId::try_from("a").unwrap(),
+                agent_id: alice.clone(),
+            },
+        },
+    ]);
+    assert!(
+        !b.activity.contains_key(&alice),
+        "a deleted agent must not leave an orphaned activity series"
+    );
+}
+
 // -- state/attention precedence ----------------------------------------------------------------
 
 #[test]

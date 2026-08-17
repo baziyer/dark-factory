@@ -270,12 +270,11 @@ fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
     let list = ui::styled_list(items, block);
 
     let mut state = ListState::default();
-    if !tree.is_empty() {
-        let cursor = board
-            .selected_agent
-            .as_ref()
-            .and_then(|id| tree.iter().position(|(row_id, _)| row_id == id))
-            .unwrap_or(0);
+    if let Some(agent) = agent_at_cursor(board, project_id) {
+        let cursor = tree
+            .iter()
+            .position(|(row_id, _)| row_id == &agent.id)
+            .expect("agent_at_cursor returns an agent from the visible tree");
         state.select(Some(cursor));
     }
     frame.render_stateful_widget(list, area, &mut state);
@@ -297,7 +296,7 @@ fn render_detail(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
 
     let lines = match board.workshop_focus {
         WorkshopPane::Tasks => task_detail_lines(board, project_id),
-        WorkshopPane::Agents => agent_detail_lines(board),
+        WorkshopPane::Agents => agent_detail_lines(board, project_id),
     };
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
@@ -320,6 +319,22 @@ fn task_at_cursor<'a>(
         .and_then(|id| visible.iter().find(|task| &task.snapshot.id == id))
         .or_else(|| visible.first())
         .copied()
+}
+
+/// The agent WORKSHOP's cursor is actually resting on, using the same visible tree as the list.
+/// This mirrors [`task_at_cursor`]: before a movement key sets `selected_agent`, the list already
+/// highlights its first row, so the detail pane and Enter target must treat that row as selected.
+fn agent_at_cursor<'a>(
+    board: &'a Board,
+    project_id: &ProjectId,
+) -> Option<&'a factory_core::AgentSnapshot> {
+    let visible = board.visible_agent_tree(project_id);
+    let agent_id = board
+        .selected_agent
+        .as_ref()
+        .filter(|id| visible.iter().any(|(row_id, _)| row_id == *id))
+        .or_else(|| visible.first().map(|(id, _)| id))?;
+    board.agents.get(agent_id)
 }
 
 fn task_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static>> {
@@ -413,12 +428,8 @@ fn push_run_history_lines(
     }
 }
 
-fn agent_detail_lines(board: &Board) -> Vec<Line<'static>> {
-    let Some(agent) = board
-        .selected_agent
-        .as_ref()
-        .and_then(|id| board.agents.get(id))
-    else {
+fn agent_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static>> {
+    let Some(agent) = agent_at_cursor(board, project_id) else {
         return vec![Line::from("(no agent selected)")];
     };
     let mut lines = vec![
@@ -558,6 +569,31 @@ mod tests {
         assert_eq!(lines[0].to_string(), "t2");
     }
 
+    #[test]
+    fn agent_detail_shows_the_first_visible_agent_before_any_movement_key() {
+        let mut board = Board::new(false, 0, crate::theme::FORTRESS);
+        let project_id = ProjectId::try_from("proj").unwrap();
+        board.apply_fleet_snapshot(
+            vec![crate::test_fixtures::project("proj", 0)],
+            vec![crate::test_fixtures::agent(
+                "alice",
+                "proj",
+                AgentRole::Worker,
+                None,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        assert_eq!(board.selected_agent, None, "no movement key pressed yet");
+        let lines = agent_detail_lines(&board, &project_id);
+        assert_eq!(
+            lines[0].to_string(),
+            "alice",
+            "detail must show the first row highlighted by the agents list"
+        );
+    }
+
     // -- #68: names get the width, truncated from the middle -----------------------------------
 
     #[test]
@@ -594,7 +630,7 @@ mod tests {
             )],
         );
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        let text = agent_detail_lines(&board)
+        let text = agent_detail_lines(&board, &ProjectId::try_from("proj").unwrap())
             .iter()
             .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
@@ -625,7 +661,7 @@ mod tests {
             Vec::new(),
         );
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        let text = agent_detail_lines(&board)
+        let text = agent_detail_lines(&board, &ProjectId::try_from("proj").unwrap())
             .iter()
             .map(std::string::ToString::to_string)
             .collect::<Vec<_>>()
