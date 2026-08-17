@@ -15,6 +15,7 @@ use factory_core::local::LocalRequest;
 use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId};
 
 use super::{Board, StatusLevel};
+use crate::fortress;
 
 // ---------------------------------------------------------------------------------------------
 // View
@@ -78,15 +79,19 @@ pub enum WorkshopPane {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     SwitchView(View),
-    /// `Enter`/`→`/`l`.
+    /// `Enter`.
     ZoomIn,
-    /// `Esc`/`←`/`h`.
+    /// `Esc`.
     ZoomOut,
+    /// `→`/`l`: FORTRESS moves the cursor right; every other view zooms in.
+    Right,
+    /// `←`/`h`: FORTRESS moves the cursor left; every other view zooms out.
+    Left,
     /// `Tab`: cycles agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP).
     Tab,
-    /// `j`/`↓`.
+    /// `j`/`↓`: FORTRESS moves the cursor down a row; elsewhere, next item.
     MoveNext,
-    /// `k`/`↑`.
+    /// `k`/`↑`: FORTRESS moves the cursor up a row; elsewhere, previous item.
     MovePrev,
     /// `]`: FORTRESS-only, cycles `selected_workshop` forward. See its field doc comment.
     NextWorkshop,
@@ -124,8 +129,10 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
             let n = digit as u8 - b'0';
             View::from_number(n).map(Action::SwitchView)
         }
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Some(Action::ZoomIn),
-        KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => Some(Action::ZoomOut),
+        KeyCode::Enter => Some(Action::ZoomIn),
+        KeyCode::Esc => Some(Action::ZoomOut),
+        KeyCode::Right | KeyCode::Char('l') => Some(Action::Right),
+        KeyCode::Left | KeyCode::Char('h') => Some(Action::Left),
         KeyCode::Tab => Some(Action::Tab),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::MovePrev),
@@ -338,7 +345,21 @@ impl Board {
             Action::SwitchView(view) => self.switch_view(view),
             Action::ZoomIn => self.zoom_in(),
             Action::ZoomOut => self.zoom_out(),
+            Action::Right if self.view == View::Fortress => {
+                self.move_fortress_cursor(fortress::Direction::Right)
+            }
+            Action::Left if self.view == View::Fortress => {
+                self.move_fortress_cursor(fortress::Direction::Left)
+            }
+            Action::Right => self.zoom_in(),
+            Action::Left => self.zoom_out(),
             Action::Tab => self.handle_tab(),
+            Action::MoveNext if self.view == View::Fortress => {
+                self.move_fortress_cursor(fortress::Direction::Down)
+            }
+            Action::MovePrev if self.view == View::Fortress => {
+                self.move_fortress_cursor(fortress::Direction::Up)
+            }
             Action::MoveNext => self.handle_move(true),
             Action::MovePrev => self.handle_move(false),
             Action::NextWorkshop => self.cycle_selected_workshop(true),
@@ -507,6 +528,45 @@ impl Board {
             View::Fortress | View::Terminals | View::Focus => self.cycle_selected_agent(forward),
             View::Workshop => self.move_within_workshop(forward),
         }
+    }
+
+    /// FORTRESS: moves the cursor spatially over the same layout the floor renders (its width is
+    /// what the renderer last drew with — `Board::fortress_width`), landing on the nearest station
+    /// or empty workshop in `direction`. A cursor that isn't on the floor yet lands on the first
+    /// target. Selecting a station also focuses its project, exactly like `Tab`.
+    fn move_fortress_cursor(&mut self, direction: fortress::Direction) -> Intent {
+        let workshops = fortress::compute_workshops(
+            &self.projects_sorted(),
+            &self.agents_vec(),
+            self.fortress_width.get(),
+        );
+        let targets = fortress::cursor_targets(&workshops);
+        let current = self
+            .selected_agent
+            .clone()
+            .map(fortress::CursorTarget::Agent)
+            .or_else(|| {
+                self.selected_workshop
+                    .clone()
+                    .map(fortress::CursorTarget::Workshop)
+            });
+        let Some(next) = fortress::step_cursor(&targets, current.as_ref(), direction) else {
+            return Intent::Redraw;
+        };
+        match next {
+            fortress::CursorTarget::Agent(agent_id) => {
+                if let Some(agent) = self.agents.get(&agent_id) {
+                    self.focused_project = Some(agent.project_id.clone());
+                }
+                self.selected_agent = Some(agent_id);
+                self.selected_workshop = None;
+            }
+            fortress::CursorTarget::Workshop(project_id) => {
+                self.selected_workshop = Some(project_id);
+                self.selected_agent = None;
+            }
+        }
+        Intent::Redraw
     }
 
     fn cycle_selected_agent(&mut self, forward: bool) -> Intent {
@@ -1105,11 +1165,11 @@ mod tests {
             (KeyCode::Char('3'), Action::SwitchView(View::Terminals)),
             (KeyCode::Char('4'), Action::SwitchView(View::Focus)),
             (KeyCode::Enter, Action::ZoomIn),
-            (KeyCode::Right, Action::ZoomIn),
-            (KeyCode::Char('l'), Action::ZoomIn),
+            (KeyCode::Right, Action::Right),
+            (KeyCode::Char('l'), Action::Right),
             (KeyCode::Esc, Action::ZoomOut),
-            (KeyCode::Left, Action::ZoomOut),
-            (KeyCode::Char('h'), Action::ZoomOut),
+            (KeyCode::Left, Action::Left),
+            (KeyCode::Char('h'), Action::Left),
             (KeyCode::Tab, Action::Tab),
             (KeyCode::Char('j'), Action::MoveNext),
             (KeyCode::Down, Action::MoveNext),
@@ -1151,8 +1211,57 @@ mod tests {
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
         board.handle_key(key(KeyCode::Tab));
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
-        board.handle_key(key(KeyCode::Char('k')));
+        board.handle_key(key(KeyCode::Char('h')));
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
+    }
+
+    #[test]
+    fn fortress_hjkl_and_arrows_move_the_cursor_over_the_floor() {
+        // Two workshops rendered narrow enough that "empty" wraps under "proj".
+        let mut board = board_with_an_empty_second_project();
+        board
+            .fortress_width
+            .set(crate::fortress::MIN_WORKSHOP_WIDTH);
+        assert_eq!(board.selected_agent, None);
+
+        board.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(
+            board.selected_agent.as_ref().unwrap().as_str(),
+            "orch",
+            "first target"
+        );
+        board.handle_key(key(KeyCode::Right));
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
+        board.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(
+            board.selected_agent.as_ref().unwrap().as_str(),
+            "alice",
+            "row end: no move"
+        );
+        board.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
+
+        board.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(board.selected_agent, None);
+        assert_eq!(
+            board.selected_workshop.as_ref().unwrap().as_str(),
+            "empty",
+            "down lands on the empty workshop's placeholder"
+        );
+        board.handle_key(key(KeyCode::Up));
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
+        assert_eq!(board.selected_workshop, None);
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "proj");
+        assert_eq!(board.view, View::Fortress, "moving never changes the view");
+
+        // Enter still zooms into whatever the cursor is on.
+        board.handle_key(key(KeyCode::Char('j')));
+        board.handle_key(key(KeyCode::Enter));
+        assert_eq!(board.view, View::Workshop);
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "empty");
+        // ...and outside FORTRESS, h/l keep zooming.
+        board.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(board.view, View::Fortress);
     }
 
     #[test]

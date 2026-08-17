@@ -149,8 +149,9 @@ tasks and agent hierarchy) → TERMINALS (tiled live PTYs) → FOCUS
 | Key | Action |
 |---|---|
 | `1`-`4` | switch view directly |
-| `Enter`/`→`/`l`, `Esc`/`←`/`h` | zoom in / out one level |
-| `Tab`, `j`/`k` | cycle agents or panes; move |
+| `Enter`, `Esc` | zoom in / out one level |
+| `h`/`j`/`k`/`l`, arrows | FORTRESS: move the cursor over stations (empty workshops included); elsewhere `←`/`h` back, `→`/`l` in, `j`/`k` move |
+| `Tab` | cycle agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP) |
 | `[`/`]` | FORTRESS: cycle the selected workshop |
 | `n` | new task |
 | `m` / `o` | message the selected agent / the orchestrator |
