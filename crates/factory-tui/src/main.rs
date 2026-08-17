@@ -178,9 +178,11 @@ fn main() -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<NetMsg>();
     net::spawn_fleet_session(client.clone(), tx.clone());
     // `--project` wins; otherwise open on whatever was focused last time — but only for the
-    // daemon `$DARK_FACTORY_HOME` names: an explicit `--socket` may be a scratch daemon, whose
-    // projects must not overwrite (or be seeded from) the real home's remembered focus.
-    let remember_focus = config.socket.is_none();
+    // daemon `$DARK_FACTORY_HOME` names: an explicit `--socket`/`$DARK_FACTORY_SOCKET` may be a
+    // scratch daemon, whose projects must not overwrite (or be seeded from) the real home's
+    // remembered focus.
+    let remember_focus = config.socket.is_none()
+        && std::env::var_os("DARK_FACTORY_SOCKET").is_none_or(|value| value.is_empty());
     let initial_project = cli_project.or_else(|| {
         remember_focus
             .then(client_state::load_focused_project)

@@ -149,9 +149,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
     }
-    if !probes::launchd_loaded()
-        && probes::wait_for_daemon(socket, Duration::from_secs(2), None).is_ok()
-    {
+    if !probes::launchd_loaded() && probes::daemon_answers(socket) {
         return Err(format!(
             "a factoryd already answers at {} but is not managed by launchd; stop it first",
             socket.display()
@@ -189,9 +187,11 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
 /// Whether `a` and `b` hold byte-identical copies of the four binaries.
 fn same_binaries(a: &Path, b: &Path) -> bool {
-    install::BINARIES
-        .iter()
-        .all(|name| fs::read(a.join(name)).ok() == fs::read(b.join(name)).ok())
+    install::BINARIES.iter().all(|name| {
+        fs::read(a.join(name))
+            .ok()
+            .is_some_and(|bytes| Some(bytes) == fs::read(b.join(name)).ok())
+    })
 }
 
 fn print_next_steps(home: &Path, daemon: bool) {

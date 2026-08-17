@@ -1,5 +1,6 @@
-//! Small local probes shared by `update --install` (and, later, `init`/
-//! `doctor`): where the provider CLIs live, and whether a daemon answers.
+//! Small local probes shared by `init`, `doctor`, and `update --install`:
+//! where the provider CLIs live, their versions, whether the launchd job is
+//! loaded, and whether a daemon answers.
 
 use std::{
     fs,
@@ -98,6 +99,15 @@ pub fn launchd_loaded() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Whether anything answers `health` at `socket` right now (one request,
+/// no waiting).
+#[must_use]
+pub fn daemon_answers(socket: &Path) -> bool {
+    Client::new(socket)
+        .request_with_timeout(LocalRequest::Health, Duration::from_secs(2))
+        .is_ok()
 }
 
 /// Polls `health` at `socket` until a daemon answers — with `version`
