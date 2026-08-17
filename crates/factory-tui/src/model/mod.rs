@@ -741,6 +741,25 @@ impl Board {
         }
     }
 
+    /// Whether `event` is worth a new announcement line. Every event type narrates
+    /// unconditionally except `SessionChanged`: the daemon emits one for *every* hook
+    /// (`SessionStart`/`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/...), and most of those
+    /// don't change `state` at all — only `activity`/`last_hook_event`, which the detail pane
+    /// already shows. Without this, a session working through one task announces "working"
+    /// dozens of times (65 in a few minutes during the first dogfood run) and drowns the handful
+    /// of real transitions. Compares against the state this board already has recorded for the
+    /// session (`None`, i.e. never seen before, always announces) rather than tracking a separate
+    /// "last announced" snapshot — `self.sessions` already *is* that snapshot as of the moment
+    /// just before this event folds into it.
+    fn should_announce(&self, event: &EventEnvelope) -> bool {
+        let FactoryEvent::SessionChanged { session } = &event.event else {
+            return true;
+        };
+        self.sessions
+            .get(&session.id)
+            .is_none_or(|previous| previous.state != session.state)
+    }
+
     pub fn apply_event(&mut self, event: EventEnvelope) {
         if let Some(agent_id) = event_agent(&event.event) {
             self.activity
@@ -749,8 +768,10 @@ impl Board {
                 .record(event.occurred_at_ms);
         }
 
-        if let Some(announcement) = announcements::format_event(&event) {
-            self.announcements.push(announcement);
+        if self.should_announce(&event) {
+            if let Some(announcement) = announcements::format_event(&event) {
+                self.announcements.push(announcement);
+            }
         }
 
         match event.event {
