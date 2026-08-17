@@ -471,6 +471,8 @@ pub enum StoreError {
     RunNotStoppable,
     #[error("could not migrate stored agent instructions/memory to guidance files: {0}")]
     AgentProfileMigration(String),
+    #[error("a starting session unexpectedly has an open run episode")]
+    StartingSessionHasOpenRun,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -1258,12 +1260,21 @@ impl Store {
     /// while the session is still exactly `starting` -- `WHERE state =
     /// 'starting'` inside the same `IMMEDIATE` transaction that commits it,
     /// not `SessionState::is_live()` (`execution.rs`'s
-    /// `enforce_start_deadline`, issue #24's start deadline: between
-    /// reading a session as `starting` and this call, the provider's own
-    /// `SessionStart` hook can land and race it through
-    /// `record_hook_event` on a different connection -- `is_live()` alone
-    /// would still accept an `idle`/`working` session and overwrite it
-    /// with a `failed`/`stopped` reason that is by then false). Returns
+    /// `enforce_start_deadline`, issue #24's start deadline). `DaemonState`
+    /// serializes every store access through one `Arc<Mutex<Store>>`
+    /// (`daemon_state.rs`) -- there is no second connection, and the two
+    /// paths can never interleave *inside* one transaction -- but that
+    /// mutex is released between separate `with_store`/`commit_and_publish`
+    /// calls, and the caller's own read of the session (one such call) and
+    /// this method's own later transaction (another) are exactly two such
+    /// calls: the provider's own `SessionStart` hook can fully run via
+    /// `record_hook_event`, in its own transaction, in the gap between
+    /// them. `is_live()` alone would still accept the `idle`/`working`
+    /// session that leaves behind and overwrite it with a `failed`/
+    /// `stopped` reason that is by then false; this guard is belt-and-
+    /// braces on top of that serialization, not a substitute for it, and
+    /// makes the invariant checkable at this one statement instead of
+    /// depending on a fact about `DaemonState` two files away. Returns
     /// `Ok(None)`, not an error, if the session had already left
     /// `starting` by the time this committed -- the caller's enforcement
     /// then becomes a no-op instead of clobbering a session its own hook
@@ -1297,12 +1308,17 @@ impl Store {
         // every path that opens one (`open_run_episode`'s callers) only
         // ever does so once a session has reached `idle` or later -- so,
         // unlike `end_session_with_reason`, there is never one to close
-        // here. Checked, not just asserted in a comment: a violation
-        // would silently orphan an open `runs` row.
-        debug_assert!(
-            session.current_run_id.is_none(),
-            "a starting session must never have an open run episode"
-        );
+        // here. A real, always-compiled check, not `debug_assert!`
+        // (compiled out of release builds): if this invariant is ever
+        // violated, silently proceeding to fail the session below would
+        // orphan the still-open `runs` row forever, exactly the failure
+        // mode this whole guarded method exists to avoid elsewhere. Fails
+        // the transaction instead (the session stays `starting`, visible
+        // and retried, rather than corrupted) -- believed unreachable
+        // today, not merely assumed so.
+        if session.current_run_id.is_some() {
+            return Err(StoreError::StartingSessionHasOpenRun);
+        }
         let operator_stopped = session.stop_requested_at_ms.is_some();
         let new_state = if operator_stopped {
             SessionState::Stopped
