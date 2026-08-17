@@ -1385,11 +1385,13 @@ mod tests {
         assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "proj");
         assert_eq!(board.view, View::Workshop);
 
-        // No projects at all: a status message, no picker.
+        // No projects at all: a status message, no picker — alongside the key hints, not
+        // instead of them (see `status_line_keeps_the_key_hints_visible_after_cancelling_a_prompt`).
         let mut empty = Board::new(false, 0, crate::theme::FORTRESS);
         empty.handle_key(key(KeyCode::Char('p')));
         assert!(matches!(empty.mode, Mode::Normal));
-        assert_eq!(empty.status_line_text(), "no projects yet");
+        assert!(empty.status_line_text().contains("no projects yet"));
+        assert!(empty.status_line_text().contains(&empty.help_text()));
     }
 
     #[test]
@@ -1992,6 +1994,28 @@ mod tests {
         assert!(matches!(board.mode, Mode::Help));
         board.handle_key(key(KeyCode::Esc));
         assert!(matches!(board.mode, Mode::Normal));
+    }
+
+    // -- status line -------------------------------------------------------------------------
+
+    /// The bug: after Esc out of a prompt, the status bar showed only the "cancelled" message
+    /// until it expired, several seconds during which the operator had no key-hint reference at
+    /// all. The hint line must always be present, with the status message alongside it.
+    #[test]
+    fn status_line_keeps_the_key_hints_visible_after_cancelling_a_prompt() {
+        let mut board = board_with_one_project();
+        board.handle_key(key(KeyCode::Char('n'))); // open the new-task prompt
+        assert!(matches!(board.mode, Mode::Prompt(_)));
+
+        board.handle_key(key(KeyCode::Esc)); // cancel — sets a sticky "cancelled" status
+        assert!(matches!(board.mode, Mode::Normal));
+
+        let text = board.status_line_text();
+        assert!(text.contains("cancelled"), "status message missing: {text}");
+        assert!(
+            text.contains(&board.help_text()),
+            "key hints must not disappear behind the status message: {text}"
+        );
     }
 
     // -- state precedence smoke test (see also model::tests) ----------------------------------
