@@ -265,6 +265,15 @@ async fn spawn_runner_with_environment_and_timeout(
     let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
     let terminal = spec.terminal;
     let mut command = Command::new(runner);
+    // The runner is its own process-group leader: a session must outlive
+    // whatever started the daemon. Without this, launchd's default
+    // behaviour on `bootout`/`kickstart -k` (and a terminal's Ctrl-C) kills
+    // every process in the daemon's group -- every runner and, with it,
+    // every session -- which `ARCHITECTURE.md` invariant 4 forbids. Verified
+    // on macOS: a same-group child dies with the job, a group leader of its
+    // own survives it (see docs/development/WORKFLOW.md, "Release and
+    // update", and `factoryd_process_group_kill_does_not_take_sessions`).
+    command.process_group(0);
     command
         .arg("--run-id")
         .arg(spec.run_id.as_str())

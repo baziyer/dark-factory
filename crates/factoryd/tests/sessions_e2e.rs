@@ -17,7 +17,7 @@
 //! system-wide.
 
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -64,8 +64,21 @@ impl Daemon {
     /// the file is present and valid when this daemon process starts, so
     /// preflight passes and the daemon boots normally).
     fn start_with_runner(home: &Path, runner: &Path) -> Self {
+        Self::spawn(home, runner, false)
+    }
+
+    /// Like [`Daemon::start`], but the daemon is the leader of its own
+    /// process group, so [`Daemon::stop_process_group`] can do what
+    /// launchd's `bootout`/`kickstart -k` (and a terminal's Ctrl-C) do:
+    /// signal the whole group, not just the daemon's pid.
+    fn start_in_own_process_group(home: &Path) -> Self {
+        Self::spawn(home, &factory_runner_path(), true)
+    }
+
+    fn spawn(home: &Path, runner: &Path, own_process_group: bool) -> Self {
         let socket = home.join("f.sock");
-        let child = Command::new(env!("CARGO_BIN_EXE_factoryd"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_factoryd"));
+        command
             .env("DARK_FACTORY_HOME", home)
             .arg("--runner")
             .arg(runner)
@@ -73,9 +86,11 @@ impl Daemon {
             .arg(factoryctl_path())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn factoryd");
+            .stderr(Stdio::null());
+        if own_process_group {
+            command.process_group(0);
+        }
+        let child = command.spawn().expect("spawn factoryd");
         wait_for_socket(&socket, READY_TIMEOUT);
         Self { socket, child }
     }
@@ -93,6 +108,17 @@ impl Daemon {
     fn stop(mut self) {
         let pid = self.child.id().to_string();
         let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let _ = self.child.wait();
+    }
+
+    /// SIGTERM to the daemon's whole process group (it must have been
+    /// started with [`Daemon::start_in_own_process_group`]) -- exactly what
+    /// launchd does to a job it boots out (`AbandonProcessGroup` aside) and
+    /// what Ctrl-C does to a foreground `factoryd`. Every runner spawns as
+    /// its own group leader precisely so this reaches nothing but the daemon.
+    fn stop_process_group(mut self) {
+        let group = format!("-{}", self.child.id());
+        let _ = Command::new("kill").args(["-TERM", "--", &group]).status();
         let _ = self.child.wait();
     }
 }
@@ -299,8 +325,25 @@ struct Project {
     root: PathBuf,
 }
 
+/// How many `factory-runner` processes on this machine were spawned for
+/// `home` (their `--runtime-dir` lives under `<home>/runs/`).
+fn live_runners_under(home: &Path) -> usize {
+    let needle = format!("--runtime-dir {}/runs/", home.display());
+    let output = Command::new("ps")
+        .args(["-axo", "command"])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.contains("factory-runner") && line.contains(&needle))
+        .count()
+}
+
 fn setup_project(home: &Path) -> Project {
-    let daemon = Daemon::start(home);
+    setup_project_with(Daemon::start(home), home)
+}
+
+fn setup_project_with(daemon: Daemon, home: &Path) -> Project {
     let root = home.join("repo");
     std::fs::create_dir(&root).unwrap();
     init_git_repo(&root);
@@ -957,6 +1000,53 @@ fn factoryd_restart_does_not_lose_a_live_session() {
 }
 
 // --- (f) direct attach: operator keystrokes reach the real process -----
+
+#[test]
+fn factoryd_process_group_kill_does_not_take_sessions() {
+    // launchd `bootout`/`kickstart -k` and a terminal's Ctrl-C signal the
+    // daemon's whole process group. A session must survive that: its
+    // runner is spawned as its own process-group leader
+    // (`runner_process::spawn_runner`), and the launchd template also sets
+    // `AbandonProcessGroup`. This is the restart test's scenario with the
+    // group-wide signal instead of a pid-targeted one.
+    let home = private_tempdir();
+    let project = setup_project_with(
+        Daemon::start_in_own_process_group(home.path()),
+        home.path(),
+    );
+    let client = project.daemon.client();
+    create_shell_agent(&client, "curie");
+    create_task(&client, "task-1", "First", "before the group kill");
+    assign_task(&client, "task-1", "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let session_before = wait_for_stable_idle(&client, "curie");
+
+    assert_eq!(live_runners_under(home.path()), 1);
+    project.daemon.stop_process_group();
+    // The decisive check: the runner process is still there after the
+    // whole group was signalled -- and stays there (a signalled runner
+    // would be tearing its provider down right now).
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        live_runners_under(home.path()),
+        1,
+        "the runner must survive a SIGTERM to the daemon's process group"
+    );
+    let daemon = Daemon::start(home.path());
+    let client = daemon.client();
+
+    let sessions = list_sessions(&client);
+    assert_eq!(sessions.len(), 1, "the session must neither be lost nor duplicated");
+    assert_eq!(sessions[0].id, session_before.id);
+    assert_eq!(sessions[0].state, SessionState::Idle);
+
+    create_task(&client, "task-2", "Second", "after the group kill");
+    assign_task(&client, "task-2", "curie");
+    wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
+    assert_eq!(session_by_agent(&client, "curie").unwrap().id, session_before.id);
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
 
 #[test]
 fn terminal_input_reaches_the_live_process_through_attach() {
