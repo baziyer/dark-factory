@@ -221,18 +221,59 @@ not yet root-caused). Because delivery only happens once `SessionStart`
 moves a session `starting` → `idle`, an affected session used to stay
 `starting` forever with no work ever delivered. A session `starting` for
 more than 120 seconds is now treated exactly like a failed spawn attempt:
-`factoryd` stops its runner, records it `failed` with a reason explaining
-what happened, and backs off and retries the spawn like any other broken
-launch — visible the same way (`factoryctl session list`, `factoryctl
-agent status`, the TUI's attention view), no new state or command to learn.
-If a session is genuinely just slow to initialize (a cold Codex start with
-many MCP servers) rather than actually stuck, an operator can unblock it by
-hand before the deadline by invoking its exact `SessionStart` hook command:
-find the session's token file at
-`$DARK_FACTORY_HOME/runs/<session-id>/hook.token` (`factoryctl session
-list` for the id) and run
-`factoryctl hook --token-file <that file> SessionStart` (payload `{}` on
-stdin) — every other hook then fires normally for the rest of the session.
+`factoryd` stops its runner and records it `failed` with a reason
+explaining what happened — unless the session's own hook wins the race in
+the meantime, in which case the deadline is a no-op and the session is left
+exactly as healthy as it already was. The stop is best-effort: if the
+runner's control socket is itself wedged (plausible for exactly the stuck
+shape this is meant to catch), the old provider process can be left
+running and holding the worktree while the retry launches a new one into
+the same worktree — the same orphaned-process class [known issue
+#26](https://github.com/baziyer/dark-factory/issues/26) already covers,
+just reachable as a steady-state path now instead of only across a daemon
+restart; there is no reaper for it here. A `paused` agent's `starting` session
+is the one exception: pausing freezes dispatch entirely (`agent
+pause`/`resume`), so its deadline never fires either — this is also the
+escape hatch that actually works, since it buys unlimited time to recover a
+session by hand (below) instead of racing a 120 second clock.
+
+Backing off and retrying only goes so far: a provider whose spawn always
+succeeds but whose hook never arrives would otherwise cycle forever at
+this deadline's own ~2 minute cadence, killing and relaunching a real
+`claude`/`codex` process indefinitely. After 3 consecutive start-deadline
+failures for the same agent, `factoryd` pauses it instead of respawning
+again — visible the normal way (`factoryctl status`/`agent status`, the
+TUI's attention view already show a paused agent's last session as
+`failed`, no new state or command to learn) — and `factoryctl agent
+resume` is the way back in, which also resets the streak. Note the
+practical ceiling this puts on visibility: for roughly the first 3 cycles
+(a few minutes) the operator mostly still sees `starting`, the same
+symptom #24 was filed about, with only the daemon's own log and the
+announcement/event trail showing the churn in between; the pause is what
+finally surfaces it durably.
+
+Recovering a session by hand only works *before* its deadline fires — once
+a session is `failed`, its hook token is no longer recognized and
+`factoryctl hook` fails open silently (`{}`, exit 0), so there is nothing
+useful to run against an already-failed session. If a `starting` session's
+provider TUI looks fully ready (verified by attaching, or simply waiting
+past the point a real user would expect it to respond) but its hook just
+hasn't arrived, an operator can unblock it directly by invoking its exact
+`SessionStart` hook command: find the session's id (`factoryctl session
+list`), then its token file at (by default)
+`$DARK_FACTORY_HOME/runs/<session-id>/hook.token` — overridden by
+`factoryd --runtime-root` if set — and run
+
+```sh
+printf '{}' | factoryctl hook --token-file <that file> SessionStart
+```
+
+(the `printf` matters: an empty/terminal stdin reads as no payload, which
+also fails open silently). Every other hook then fires normally for the
+rest of the session. If a session keeps hitting the deadline instead of
+recovering — repeatedly, across resumes — start with `factoryctl doctor`
+(the provider CLI itself on `PATH`, versions, install health) and, beyond
+that, the provider's own hook configuration (`docs/providers.md`).
 
 ## The Minerva webhook endpoint
 
