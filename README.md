@@ -160,7 +160,8 @@ tasks and agent hierarchy) → TERMINALS (tiled live PTYs) → FOCUS
 | `g` / `G` | jump to (and `G`: focus) the next agent needing attention |
 | `!` | WORKSHOP: needs-attention-only filter |
 | `PgUp`/`PgDn` | FOCUS: scroll terminal scrollback |
-| `Ctrl-]` | TERMINALS/FOCUS: toggle key forwarding to the pane |
+| `i` | TERMINALS: start typing into the focused pane (FOCUS starts there already) |
+| `Ctrl-]` | TERMINALS/FOCUS: toggle typing into the pane vs. board control |
 | `q` | detach — never stops the factory |
 | `?` | help overlay |
 
