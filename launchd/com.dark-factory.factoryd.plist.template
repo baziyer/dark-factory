@@ -14,14 +14,10 @@
         <string>__SOCKET__</string>
         <string>--runner</string>
         <string>__FACTORY_RUNNER__</string>
-        <string>--codex</string>
-        <string>__CODEX__</string>
-        <string>--claude</string>
-        <string>__CLAUDE__</string>
+        <string>--factoryctl</string>
+        <string>__FACTORYCTL__</string>
         <string>--runtime-root</string>
         <string>__RUNTIME_ROOT__</string>
-        <string>--max-active-runs</string>
-        <string>__MAX_ACTIVE_RUNS__</string>
         <string>--webhook-config</string>
         <string>__WEBHOOK_CONFIG__</string>
     </array>
