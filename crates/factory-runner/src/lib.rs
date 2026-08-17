@@ -40,13 +40,23 @@ use tokio::{
     process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
-    time::{Instant, Sleep, timeout},
+    time::{Instant, Sleep, sleep, timeout},
 };
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
 const DEFAULT_GROUP_GRACE: Duration = Duration::from_secs(2);
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Once the leader has already exited (its own grace period, if any, has
+/// already been honored), any process still holding the group is a straggler
+/// being mopped up, not a workload owed a fresh multi-second courtesy: cap
+/// how long the group cleanup waits for it to react to a TERM before
+/// escalating to KILL.
+const GROUP_CLEANUP_GRACE: Duration = Duration::from_millis(200);
+/// How often the group cleanup re-checks whether the straggler has already
+/// exited, so it can move on immediately instead of always waiting out the
+/// full `GROUP_CLEANUP_GRACE`.
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const MAX_COMMAND_ID_BYTES: usize = 128;
 const BROADCAST_CAPACITY: usize = 32;
 const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
@@ -1583,13 +1593,17 @@ async fn supervise_piped(
     };
 
     if process_group_exists(pid)? {
-        begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+        begin_group_termination(pid, GROUP_CLEANUP_GRACE, &mut kill_deadline)?;
         loop {
+            if !process_group_exists(pid)? {
+                break;
+            }
             tokio::select! {
                 () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
                     signal_process_group(pid, Signal::KILL)?;
                     break;
                 }
+                () = sleep(GROUP_POLL_INTERVAL) => {}
                 command = stops.recv() => {
                     let Some(command) = command else {
                         continue;
@@ -1798,13 +1812,17 @@ async fn supervise_terminal(
     let status = wait_status_to_exit(status);
 
     if process_group_exists(pid)? {
-        begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+        begin_group_termination(pid, GROUP_CLEANUP_GRACE, &mut kill_deadline)?;
         loop {
+            if !process_group_exists(pid)? {
+                break;
+            }
             tokio::select! {
                 () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
                     signal_process_group(pid, Signal::KILL)?;
                     break;
                 }
+                () = sleep(GROUP_POLL_INTERVAL) => {}
                 command = stops.recv() => {
                     let Some(command) = command else {
                         continue;
