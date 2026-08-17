@@ -2676,6 +2676,41 @@ mod tests {
         );
     }
 
+    /// PR #50 re-review, round 3's remaining finding: `CreateAgent` must
+    /// decline when its `parent_agent_id` is currently being deleted, not
+    /// just when the project or the new agent's own id is -- otherwise
+    /// `AgentHasChildren` (the one delete precondition a *different*
+    /// request can flip from false to true) can go stale between
+    /// `DeleteAgent`'s precheck and its actual removals. Deterministic:
+    /// this is the exact `try_begin_preparation`/`begin_delete`/
+    /// `end_delete` sequence `Handle::begin_delete` and `CreateAgent`'s
+    /// new parent-id check both go through, with no timing involved.
+    #[test]
+    fn create_agent_declines_a_parent_currently_being_deleted() {
+        let backoff = SpawnBackoff::new();
+        let parent_id = AgentId::try_from("boss").unwrap();
+
+        // Simulates `Handle::begin_delete`'s first step for `DeleteAgent
+        // boss`: the mark is set before its precheck or any file removal
+        // runs.
+        backoff.begin_delete(&parent_id);
+
+        // This is exactly what `CreateAgent`'s new parent-id check calls.
+        assert!(
+            !backoff.try_begin_preparation(&parent_id),
+            "CreateAgent must decline when its intended parent is currently being deleted"
+        );
+
+        // `Handle::end_delete`, called once `DeleteAgent boss` finishes
+        // (refused or not) -- restores normal `CreateAgent` behavior for
+        // the same id.
+        backoff.end_delete(&parent_id);
+        assert!(
+            backoff.try_begin_preparation(&parent_id),
+            "clearing the mark must restore normal CreateAgent behavior for the parent id"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_task_without_a_live_session_fails_clearly() {
         let directory = private_tempdir();
