@@ -545,6 +545,96 @@ fn hook_events_are_rejected_once_the_session_has_ended() {
     ));
 }
 
+// --- fail_starting_session (issue #24's session-start deadline) --------
+//
+// Adversarial review of #24 findings 1/2/6: `execution.rs`'s
+// `enforce_start_deadline` used to commit the `failed` transition guarded
+// only by `SessionState::is_live()` (via `end_session_with_reason`), which
+// also accepts `idle`/`working` -- so a `SessionStart` hook landing in the
+// `await` gap between reading a session as `starting` and committing its
+// failure could be silently overwritten with a false reason.
+// `fail_starting_session` is guarded on `state = 'starting'` specifically;
+// these are the reviewer's own throwaway probes, now permanent.
+
+#[test]
+fn fail_starting_session_ends_a_starting_session_failed_with_the_reason() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let (session, events) = store
+        .fail_starting_session(&snapshot.id, "no hook arrived".into(), 6)
+        .unwrap()
+        .expect("a starting session must be failed");
+    assert_eq!(session.state, SessionState::Failed);
+    assert_eq!(session.wait_reason.as_deref(), Some("no hook arrived"));
+    assert_eq!(session.ended_at_ms, Some(6));
+    assert!(events.iter().any(
+        |event| matches!(&event.event, FactoryEvent::SessionChanged { session }
+                if session.id == snapshot.id && session.state == SessionState::Failed)
+    ));
+}
+
+#[test]
+fn fail_starting_session_is_a_no_op_once_the_hook_already_moved_it_to_idle() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    // The session's own `SessionStart` hook wins the race first.
+    store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            6,
+        )
+        .unwrap();
+
+    let outcome = store
+        .fail_starting_session(&snapshot.id, "no hook arrived".into(), 7)
+        .unwrap();
+    assert!(
+        outcome.is_none(),
+        "a session already past starting must not be failed"
+    );
+
+    // Untouched: still idle, never ended, no false reason attached.
+    let sessions = store
+        .list_sessions(&project_id("factory"), None, 10)
+        .unwrap();
+    let session = sessions
+        .iter()
+        .find(|session| session.id == snapshot.id)
+        .unwrap();
+    assert_eq!(session.state, SessionState::Idle);
+    assert!(session.ended_at_ms.is_none());
+    assert!(session.wait_reason.is_none());
+}
+
+#[test]
+fn fail_starting_session_ends_a_stop_requested_session_stopped_not_failed() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .request_session_stop(&project_id("factory"), &snapshot.id, 6)
+        .unwrap();
+
+    let (session, _) = store
+        .fail_starting_session(&snapshot.id, "no hook arrived".into(), 7)
+        .unwrap()
+        .expect("a starting session (even stop-requested) is still guarded on `starting`");
+    assert_eq!(
+        session.state,
+        SessionState::Stopped,
+        "an operator stop already in flight must end the session stopped, not failed"
+    );
+}
+
 // --- end_session closes the open episode --------------------------------
 
 #[test]

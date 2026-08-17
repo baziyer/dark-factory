@@ -1254,6 +1254,100 @@ impl Store {
         Ok((snapshot, events))
     }
 
+    /// [`Store::end_session_with_reason`], but guarded to only ever apply
+    /// while the session is still exactly `starting` -- `WHERE state =
+    /// 'starting'` inside the same `IMMEDIATE` transaction that commits it,
+    /// not `SessionState::is_live()` (`execution.rs`'s
+    /// `enforce_start_deadline`, issue #24's start deadline: between
+    /// reading a session as `starting` and this call, the provider's own
+    /// `SessionStart` hook can land and race it through
+    /// `record_hook_event` on a different connection -- `is_live()` alone
+    /// would still accept an `idle`/`working` session and overwrite it
+    /// with a `failed`/`stopped` reason that is by then false). Returns
+    /// `Ok(None)`, not an error, if the session had already left
+    /// `starting` by the time this committed -- the caller's enforcement
+    /// then becomes a no-op instead of clobbering a session its own hook
+    /// already rescued.
+    ///
+    /// Like [`Store::end_session_with_reason`], an already-pending
+    /// operator stop (`stop_requested_at_ms`) still ends the session
+    /// `stopped` rather than `failed`; callers that want a deadline's
+    /// specific reason text to never attach to an operator-initiated stop
+    /// should check `stop_requested_at_ms` themselves before calling this
+    /// (`enforce_start_deadline` does, so the ordinary stop-completion
+    /// path -- not this one -- is what ends that session, with its real
+    /// exit status, not a synthesized deadline reason).
+    pub fn fail_starting_session(
+        &mut self,
+        session_id: &SessionId,
+        reason: String,
+        now_ms: i64,
+    ) -> Result<Option<(SessionSnapshot, Vec<EventEnvelope>)>> {
+        if reason.len() > MAX_WAIT_REASON_BYTES {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if session.state != SessionState::Starting {
+            return Ok(None);
+        }
+        // A session still `starting` never has an open run episode --
+        // every path that opens one (`open_run_episode`'s callers) only
+        // ever does so once a session has reached `idle` or later -- so,
+        // unlike `end_session_with_reason`, there is never one to close
+        // here. Checked, not just asserted in a comment: a violation
+        // would silently orphan an open `runs` row.
+        debug_assert!(
+            session.current_run_id.is_none(),
+            "a starting session must never have an open run episode"
+        );
+        let operator_stopped = session.stop_requested_at_ms.is_some();
+        let new_state = if operator_stopped {
+            SessionState::Stopped
+        } else {
+            SessionState::Failed
+        };
+        let changed_rows = transaction.execute(
+            "UPDATE sessions
+             SET state = ?1, state_since_ms = ?2, updated_at_ms = ?2, ended_at_ms = ?2,
+                 activity = ?3, wait_reason = ?3
+             WHERE id = ?4 AND state = ?5",
+            params![
+                session_state_value(new_state),
+                now_ms,
+                reason,
+                session_id.as_str(),
+                session_state_value(SessionState::Starting),
+            ],
+        )?;
+        if changed_rows == 0 {
+            // Lost the guard inside this same transaction: belt-and-braces
+            // for the identical condition the load above already tested
+            // (`IMMEDIATE` already serializes writers against each other,
+            // so this is not expected to actually differ from the load,
+            // just cheap insurance against ever relying on that alone).
+            return Ok(None);
+        }
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        transaction.commit()?;
+        Ok(Some((
+            snapshot,
+            vec![EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: changed,
+            }],
+        )))
+    }
+
     pub fn list_sessions(
         &self,
         project_id: &ProjectId,
