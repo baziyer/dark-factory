@@ -45,6 +45,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// `load_sessions`, `load_projects`) already handle multiple pages correctly regardless of size.
 const SAFE_STATE_PAGE_SIZE: u32 = 100;
 
+/// How many past events `spawn_fleet_session` backfills into announcements/activity on connect
+/// (issue #67, #70), via the same `EventsAfter` request `factoryctl events` already uses — a fresh
+/// client otherwise starts with empty history even though the daemon retains everything. Bounded,
+/// not "everything ever": a busy fleet emits far more than this in an hour, so this is "recent",
+/// not "complete".
+const REPLAY_BACKFILL_EVENTS: u32 = 200;
+
 /// Resolves the control socket path using the same three-step rule as `factoryctl`
 /// (`crates/factoryctl/src/main.rs::resolve_socket_path`, not exported from its `lib.rs`, so
 /// reimplemented here verbatim): an explicit path wins, then `$DARK_FACTORY_SOCKET`, then
@@ -87,6 +94,9 @@ pub enum NetMsg {
         sessions: Vec<SessionSnapshot>,
     },
     Event(EventEnvelope),
+    /// The bounded connect-time backfill (`REPLAY_BACKFILL_EVENTS`), oldest first — fed through
+    /// `Board::apply_replay`, never `apply_event` (see that method's doc comment for why).
+    EventsReplay(Vec<EventEnvelope>),
     CaughtUp,
     OperationResult(Result<LocalResponse, String>),
     /// The result of a background `GetTask` fetch issued by `spawn_task_detail_request` — kept
@@ -306,6 +316,22 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
             .is_err()
         {
             return;
+        }
+        // Backfill the last `REPLAY_BACKFILL_EVENTS` events (issue #67/#70) via the cursor the
+        // live subscribe below is about to start from — `after_sequence - N` (floored at 0),
+        // best-effort: a daemon too old for `EventsAfter`, or any other error, just leaves the
+        // board with the empty history it already had rather than blocking startup on it.
+        let backfill_from = after_sequence.saturating_sub(i64::from(REPLAY_BACKFILL_EVENTS));
+        if let Ok(LocalResponse::Events { events }) = request_response(
+            &client,
+            LocalRequest::EventsAfter {
+                sequence: backfill_from.max(0),
+                limit: REPLAY_BACKFILL_EVENTS,
+            },
+        ) {
+            if !events.is_empty() && tx.send(NetMsg::EventsReplay(events)).is_err() {
+                return;
+            }
         }
         let mut delay = MIN_BACKOFF;
         loop {

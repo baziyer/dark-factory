@@ -12,6 +12,10 @@ pub struct Announcement {
     pub at_ms: i64,
     pub text: String,
     pub attention: Attention,
+    /// The originating event's wire sequence — the daemon's unique event id. Used to dedupe the
+    /// connect-time replay (`Board::apply_replay`, issue #67) against whatever the live stream
+    /// then delivers for the same events.
+    pub sequence: i64,
 }
 
 fn clock(at_ms: i64) -> String {
@@ -124,6 +128,7 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         at_ms: event.occurred_at_ms,
         text,
         attention,
+        sequence: event.sequence,
     })
 }
 
@@ -204,11 +209,13 @@ mod tests {
             at_ms: 0,
             text: "old urgent".into(),
             attention: Attention::NeedsInput,
+            sequence: 0,
         };
         let new_but_routine = Announcement {
             at_ms: 100,
             text: "new routine".into(),
             attention: Attention::Routine,
+            sequence: 1,
         };
         let items = [new_but_routine.clone(), old_but_urgent.clone()];
         let result = ranked(items.iter(), 10);
@@ -222,11 +229,13 @@ mod tests {
             at_ms: 0,
             text: "a".into(),
             attention: Attention::Routine,
+            sequence: 0,
         };
         let b = Announcement {
             at_ms: 100,
             text: "b".into(),
             attention: Attention::Routine,
+            sequence: 1,
         };
         let items = [a, b];
         let result = ranked(items.iter(), 10);
@@ -241,6 +250,7 @@ mod tests {
                 at_ms: i,
                 text: format!("{i}"),
                 attention: Attention::Routine,
+                sequence: i,
             })
             .collect();
         let result = ranked(items.iter(), 2);

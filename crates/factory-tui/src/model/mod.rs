@@ -25,12 +25,13 @@ pub mod announcements;
 mod keymap;
 pub mod state;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use factory_core::local::{ErrorCode, LocalResponse};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
-    Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, TaskDetail, TaskId, TaskStatus,
+    Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    TaskStatus,
 };
 
 pub use announcements::Announcement;
@@ -776,6 +777,66 @@ impl Board {
             .is_none_or(|previous| previous.state != session.state)
     }
 
+    /// Pushes `event`'s announcement (if `worth_announcing` and it produces one via
+    /// `announcements::format_event`) unless an announcement for this exact event — by
+    /// `sequence`, the daemon's unique event id — is already in the log. The dedupe that keeps
+    /// the connect-time backfill (`apply_replay`, issue #67) and the live stream that starts
+    /// right after it from ever double-announcing the same event, however they overlap.
+    fn maybe_announce(&mut self, event: &EventEnvelope, worth_announcing: bool) {
+        if !worth_announcing {
+            return;
+        }
+        if self
+            .announcements
+            .iter()
+            .any(|a| a.sequence == event.sequence)
+        {
+            return;
+        }
+        if let Some(announcement) = announcements::format_event(event) {
+            self.announcements.push(announcement);
+        }
+    }
+
+    /// Feeds a batch of already-durable events through the announcement and per-agent activity
+    /// paths only — never through [`Board::apply_event`]'s full state fold. Used once at connect
+    /// time for the bounded backfill `net::spawn_fleet_session` fetches via `EventsAfter` (oldest
+    /// first regardless of the order they arrive in) right before subscribing live: a fresh board
+    /// otherwise starts with an empty announcements log and blank activity sparklines, even though
+    /// the daemon retains everything (issue #67, and #70's blank-sparkline symptom, which shares
+    /// the same root cause — a fresh client had never been fed any of the recent history that made
+    /// up the sparkline in the first place).
+    ///
+    /// Deliberately doesn't fold `event.event` into `agents`/`tasks`/`runs`/`sessions`:
+    /// `apply_fleet_snapshot` already has the current, authoritative state for those, and replaying
+    /// stale historical snapshots on top of it would regress them. `maybe_announce`'s
+    /// sequence-based dedupe covers the case where the live stream (started right after this
+    /// backfill, or after a later reconnect) overlaps it.
+    pub fn apply_replay(&mut self, mut events: Vec<EventEnvelope>) {
+        events.sort_by_key(|event| event.sequence);
+        // A local, replay-only view of "what did we last see this session at" — distinct from
+        // `should_announce`'s use of `self.sessions` (the board's *current* state), which isn't
+        // the right reference point for judging whether an old event in this batch was a real
+        // transition at the time.
+        let mut last_session_state: HashMap<SessionId, SessionState> = HashMap::new();
+        for event in events {
+            if let Some(agent_id) = event_agent(&event.event) {
+                self.activity
+                    .entry(agent_id.clone())
+                    .or_default()
+                    .record(event.occurred_at_ms);
+            }
+            let worth_announcing = match &event.event {
+                FactoryEvent::SessionChanged { session } => {
+                    last_session_state.insert(session.id.clone(), session.state)
+                        != Some(session.state)
+                }
+                _ => true,
+            };
+            self.maybe_announce(&event, worth_announcing);
+        }
+    }
+
     pub fn apply_event(&mut self, event: EventEnvelope) {
         if let Some(agent_id) = event_agent(&event.event) {
             self.activity
@@ -784,11 +845,8 @@ impl Board {
                 .record(event.occurred_at_ms);
         }
 
-        if self.should_announce(&event) {
-            if let Some(announcement) = announcements::format_event(&event) {
-                self.announcements.push(announcement);
-            }
-        }
+        let worth_announcing = self.should_announce(&event);
+        self.maybe_announce(&event, worth_announcing);
 
         match event.event {
             FactoryEvent::ProjectChanged { project } => {
