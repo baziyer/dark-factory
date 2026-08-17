@@ -37,12 +37,24 @@ catalogue.
    5 minute cap), never busy-loops. A session still `starting` past a fixed
    deadline (120s, generous enough for a cold Codex start with many MCP
    servers) is treated exactly like a failure by that same path -- the
-   daemon stops it, records it `failed`, and backs off -- rather than
-   staying `starting` forever if the provider's own `SessionStart` hook
-   never reaches the daemon (`execution.rs`'s `SESSION_START_DEADLINE`,
-   [known issue #24](https://github.com/baziyer/dark-factory/issues/24));
-   this also catches a session recovered `starting` after a daemon
-   restart. Delivery into an idle session types
+   daemon stops it and records it `failed` -- rather than staying
+   `starting` forever if the provider's own `SessionStart` hook never
+   reaches the daemon (`execution.rs`'s `SESSION_START_DEADLINE`, [known
+   issue #24](https://github.com/baziyer/dark-factory/issues/24)); the
+   commit is itself guarded on the session still being exactly `starting`,
+   so a hook that lands while this is in flight always wins the race and
+   the deadline becomes a no-op, never overwriting an already-recovered
+   session with a false reason. "Success" for this backoff is reaching
+   `idle`, not merely a spawn call returning `Ok` -- a provider whose spawn
+   always succeeds but whose hook never arrives has nowhere else to
+   escalate to, so after 3 consecutive start-deadline failures the daemon
+   pauses the agent instead of respawning again; `agent resume` is the way
+   back in and resets that streak. This also catches a session recovered
+   `starting` after a daemon restart, and never fires at all for a paused
+   agent (dispatch for a paused agent returns before reaching it) or a
+   session with an operator `StopSession` already in flight (that
+   resolves through the ordinary stop-completion path instead, with its
+   own real exit status). Delivery into an idle session types
    composed text into its PTY and waits for the provider's own
    `UserPromptSubmit` hook to acknowledge receipt before committing the
    delivery durably, synchronously, as part of handling that exact hook
