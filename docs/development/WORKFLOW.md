@@ -125,8 +125,9 @@ CARGO_TARGET_DIR=/Users/<you>/actions-runner-dark-factory-repo/_cargo-target
 pins `cargo +1.85.0` explicitly and never changes the default toolchain,
 so sharing keeps it warm without repinning anything. `CARGO_TARGET_DIR`
 lives outside `_work` because the checkout step in `ci.yml`/`release.yml`
-runs `git clean -ffdx` each job — see "CI and GitHub" below.) Finally
-`./svc.sh install && ./svc.sh start`, and confirm it is
+runs `git clean -ffdx` each job — see the comment on that step in either
+workflow file for why.) Finally `./svc.sh install && ./svc.sh start`, and
+confirm it is
 `online` with `gh api repos/baziyer/dark-factory/actions/runners`. To
 remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
 --token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/remove-token --jq .token)"`.
