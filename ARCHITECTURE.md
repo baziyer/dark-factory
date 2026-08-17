@@ -19,68 +19,58 @@ This file records constraints, not an aspirational component catalogue.
    their content as part of the durable ledger.
 3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
-4. Each run is launched through a small, stable `factory-runner` process.
-   `factoryd` resolves a trusted absolute runner path before spawning it, clears
-   the daemon's ambient environment to a fixed non-secret allowlist, and sends
-   bounded task bytes only over runner stdin—not argv or environment variables.
-   It creates a private socket and bounded event spool before directly spawning
-   one process group. Events are appended before publication. A launch spec may
-   instead select terminal mode: the runner spawns the provider under a PTY of
-   the given size, does not send startup input (an interactive program takes
-   input from the operator), and appends raw output to a second bounded,
-   retained log (`terminal.log`, rotated once to `terminal.log.1` on overflow)
-   instead of decoding stdout into structural output events; `Started`,
-   `Exited`, and `SpawnFailed` lifecycle events are still recorded exactly as
-   in piped mode. Runners prove both
-   run ID and a random runner-instance ID, retain terminal state until its exact
-   sequence is acknowledged, and never adopt or signal from PID coincidence
-   alone. A graceful runner signal stops the group but preserves an unacknowledged
-   spool for diagnosis and recovery; acknowledgement itself removes only the
-   control socket, since the durable event spool and, in terminal mode, the
-   retained terminal log are private per-run files kept for operator
-   inspection, not deleted. After a daemon restart, adapter state is
-   rebuilt by replaying that spool from sequence zero; SQLite's committed runner
-   sequence is only the deduplication boundary for durable state and events. A
-   terminal runner is marked reconciled only after its exact acknowledgement
-   reply, or after its terminal outcome is durable and its runtime endpoint is
-   proven absent; reconciliation itself is private cleanup, not a public state
-   transition. The concrete Claude Code and Codex execution actor reserves work
-   before launch, rebuilds the provider decoder from replay sequence zero,
-   commits and publishes state before acknowledging a terminal runner, and
-   drops observation on daemon shutdown without stopping the runner. A start
-   request succeeds at durable
-   reservation; runner readiness and completion are observed from run events,
-   never hidden behind a long-lived request. Each run also persists observer
-   health: `unknown` means no authenticated caught-up observation has been
-   proven, `healthy` means the exact runner has replayed durably through its
-   advertised head, and `degraded` means supervision was lost without proof
-   that the runner stopped. Only healthy observation makes a missing endpoint
-   authoritative after restart; degraded work remains assigned and recoverable.
-   An adopted provider session is inseparable from its exact canonical
-   worktree. Codex may additionally bind an explicit, canonical, same-owner
-   `CODEX_HOME`; it is injected through a closed provider-environment type after
-   the ambient environment is cleared. Resume never falls back to a fresh
-   session or a different worktree/home. Claude uses its exact daemon-bound
-   fresh or adopted session UUID on every launch and replay; both providers are
-   executable from a greenfield database.
-5. Provider adapters translate structured provider output into the shared
-   protocol. Persisted observations contain bounded structural metadata and an
-   explicitly user-visible, bounded final preview; raw reasoning, tool inputs,
-   command output, and patches remain transient runner data. The native local
-   control API may expose a bounded, sanitized tail of the private runner spool,
-   or—for a terminal-mode run—attach live to its retained PTY output and accept
-   operator input and resize requests, for inspection; none of this ever enters
-   public events, webhook snapshots, or tracing, and the daemon proxy treats
-   attached bytes as opaque (never logged, never decoded). The runner supports a
-   first-class PTY mode with its own bounded, retained log and control-socket
-   wire protocol, but it is not the system's state model: durable state and
-   structural events are always driven by the provider decoder's normalized
-   output, never by raw terminal bytes, and the concrete Claude Code and Codex
-   adapters do not yet launch their provider interactively under it. The first
-   Claude adapter uses `--safe-mode`, deliberately
-   disabling ambient settings, hooks, plugins, MCP servers, and project
-   instructions; enabling project Claude configuration requires a later explicit
-   trusted-worktree policy.
+4. A **session**, not a run, is the unit `factory-runner` supervises: one
+   resident, interactive provider process per agent (Claude Code, Codex, or
+   the minimal `shell` provider), spawned under a PTY and living across many
+   task *episodes* — not a fresh process per task. `factoryd` resolves a
+   trusted absolute runner path before spawning it, clears the daemon's
+   ambient environment to a fixed non-secret allowlist (plus a small,
+   allowlisted `session_environment` — `DARK_FACTORY_AGENT/PROJECT/SOCKET/
+   SESSION_TOKEN_FILE/FACTORYCTL` — the provider's only way to reach
+   `factoryctl` and identify itself), and creates a private socket and
+   bounded, retained `terminal.log` before spawning one process group under
+   the PTY. Runners prove both a run ID and a random runner-instance ID and
+   never adopt or signal from PID coincidence alone. Delivery into an idle
+   session types composed text into its PTY and waits for the provider's own
+   hook to acknowledge receipt (a `UserPromptSubmit`) before committing the
+   delivery durably; a session that is already `working`/`waiting_for_input`
+   is instead delivered into via its `Stop`/`SubagentStop` hook's block-reply
+   contract, so a second task can land without interrupting a live turn.
+   `factoryd`'s own restart never stops a session: `factory-runner` is a
+   detached process tree, and a fresh daemon recovers by reconnecting to its
+   control socket and replaying its retained spool from sequence zero (a
+   session with no live connection at all, endpoint proven absent, is the
+   only case recorded as ended). A supervised program's *own* process is not
+   free to exit the instant it terminates, either: `factory-runner`
+   deliberately holds the control socket open, retaining `terminal.log`,
+   until a client acknowledges the exact terminal sequence it durably
+   logged (`AcknowledgeExit`) — the daemon does this itself, immediately,
+   for both a freshly spawned and a recovered session, whether the exit was
+   an operator `StopSession` or the provider exiting on its own; skipping
+   that acknowledgement (a defect this track fixed, not a design choice)
+   orphans the runner process forever. One git worktree per agent
+   (`agent/<id>`, provisioned on `CreateAgent`, removed on `DeleteAgent`,
+   both best-effort against the underlying git repository) keeps concurrent
+   agents from colliding in the same working tree; an operator may still
+   override it with an explicit `--worktree`.
+5. Provider adapters answer exactly two questions for the daemon's generic
+   session runner, and nothing else: how to launch (`spawn_spec` — an
+   executable, argv, environment additions, and any generated configuration
+   file, e.g. Claude's per-session `--settings` file or Codex's per-agent
+   seeded `CODEX_HOME`), and what they can do (`capabilities` — whether hooks
+   drive state, whether resume is meaningful, which permission-mode strings
+   are accepted). A provider never owns a PTY, never parses the provider's
+   own terminal output, and never owns process lifecycle — that is the
+   session runner's job, once, generically, for every provider including the
+   `shell` reference implementation (see `docs/providers.md`). Durable
+   session state is driven entirely by the provider's own hook invocations
+   (`factoryctl hook --token-file PATH <Event>`, normalized into
+   `factory_core::ProviderHookEvent`), never by decoding raw terminal bytes;
+   the local control API may still expose a bounded, sanitized tail of a
+   session's retained `terminal.log`, or attach live to it and accept
+   operator input and resize requests, for inspection — none of this ever
+   enters public events, webhook snapshots, or tracing, and the daemon proxy
+   treats attached bytes as opaque (never logged, never decoded).
 6. The local control and event API uses a private Unix socket by default. A
    subscription captures a durable replay head and marks when it has caught up.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
@@ -89,18 +79,25 @@ This file records constraints, not an aspirational component catalogue.
    repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
    for elapsed-time labels and activity sparklines while visible; no
    background animation or state polling is a source of truth.
-8. The orchestrator uses the same durable task and message interfaces as other
-   clients. It may choose work, but it cannot bypass daemon-owned limits.
+8. The orchestrator is an agent like any other: it drives its own resident
+   session and reaches the daemon only through the same durable task,
+   message, and control interfaces every other client uses (`factoryctl`,
+   directly or via its own session's shell access to it) — it may choose and
+   delegate work, but it cannot bypass daemon-owned limits or reach SQLite
+   directly.
 
 ## First launch
 
-`factoryd` starts from an empty database. A human creates projects, agents, and
-tasks through `factoryctl` or the `factory-tui` board and explicitly assigns
-each v1 run.
-The daemon starts the worker through `factory-runner`, normalises structured
-provider events, and streams persisted state to disposable observers. A launch
-is proven only after a real provider command has run and an observer and daemon
-have both restarted without stopping or misidentifying it.
+`factoryd` starts from an empty database. A human creates a project, an agent,
+and a task through `factoryctl` or the `factory-tui` board and assigns the
+task to the agent; the daemon's dispatcher spawns that agent's resident
+session automatically if none is live, or delivers into it if one already is
+idle — there is no separate explicit "start" step in the common case. The
+daemon starts the session through `factory-runner`, drives its state entirely
+from the provider's own hook invocations, and streams persisted state to
+disposable observers. A launch is proven only after a real provider command
+has run and an observer and daemon have both restarted without stopping or
+misidentifying it.
 
 ## Deliberately unresolved
 
@@ -112,9 +109,18 @@ have both restarted without stopping or misidentifying it.
   is present.
 - Repository visibility is private during early operation; making it public is
   a separate product decision.
-- Pause remains deferred, but stop intent is now durable: `StopRun` signals
-  the exact live runner and, once the runner accepts it, persists
-  `stop_requested_at_ms` on the run. When that run's terminal event lands,
-  the daemon records `stopped` (not `failed`) and moves its task to
+- Stop intent is durable at both the run and the session level. `StopRun`
+  signals the exact live runner and, once accepted, persists
+  `stop_requested_at_ms` on the run; `StopSession` does the same for a
+  resident session's own process (and, since a run's process is now its
+  session's, also requests the run stop). When the terminal event lands, the
+  daemon records `stopped` (not `failed`) and moves the open task to
   `cancelled`; retry is an explicit requeue of a terminal task, including one
-  stopped this way.
+  stopped this way. Pause (`agent pause`/`resume`) durably holds an agent's
+  queue — no new session spawns, no delivery into an idle one — without
+  touching a session already live.
+- Codex's `resume` is per-agent, not per-session: a fresh session always
+  launches without `--resume` because nothing yet threads the Codex-reported
+  thread ID (learned from its own `SessionStart` hook payload) back into
+  `sessions.provider_session_id`. Claude's resume is unaffected, since the
+  daemon assigns its own session UUID up front rather than learning it back.

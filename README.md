@@ -64,7 +64,8 @@ cargo run -p factoryctl -- agent inbox --project PROJECT_ID --agent AGENT_ID
 cargo run -p factoryctl -- project get --project PROJECT_ID
 cargo run -p factoryctl -- project guidance set --project PROJECT_ID --file PROJECT.md
 cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
-cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
+cargo run -p factoryctl -- task assign --project PROJECT_ID --task TASK_ID --agent AGENT_ID
+cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID
 cargo run -p factoryctl -- task cancel --project PROJECT_ID --task TASK_ID
 cargo run -p factoryctl -- task update --project PROJECT_ID --task TASK_ID --title "Renamed"
 cargo run -p factoryctl -- task delete --project PROJECT_ID --task TASK_ID
@@ -89,9 +90,9 @@ inside its own session (they take no `--agent` flag — identity comes from
 the session's own environment, see "Provider hooks" below). Every
 `--project` may be omitted if `$DARK_FACTORY_PROJECT` is set, and `agent
 message --from` defaults to `$DARK_FACTORY_AGENT` when unset — both are set
-automatically inside a session's environment (once sessions are wired up;
-see below), so an agent coordinating via `factoryctl` does not need to
-repeat its own identity on every call.
+automatically inside every session's own environment, so an agent
+coordinating via `factoryctl` from its own shell does not need to repeat its
+own identity on every call.
 
 Every command, group, and subcommand accepts `--help`/`-h` and prints usage
 text to stdout without contacting the daemon (for example `factoryctl task
@@ -103,31 +104,38 @@ current terminal. Leave that terminal open while using the board; `Ctrl-C`
 closes the observer only. `factoryd` is a separate launchd service and
 survives board or CLI shutdown.
 
-Commands emit versioned JSON frames. `task start` returns `run_accepted` once
-the task reservation is durable; runner readiness and completion arrive as
-events. Both programs use
-`$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
+Commands emit versioned JSON frames. `task assign` returns once the queue
+assignment is durable; session spawn, delivery, and completion all arrive as
+events (`session list`/`task get` also reflect them directly). Both programs
+use `$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
 `$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
 Agent profiles carry a provider-scoped `model` and `permission_mode` (Claude:
-`default`/`acceptEdits`/`plan`; Codex: `on-request`/`never`; `permission_mode`
-is stored and shown but not yet consumed by launch). Standing guidance and
-memory are file-backed, not database columns; see "Guidance files" below.
-`agent message` and `agent inbox` use one private durable
-inbox; messages are delivered with the next explicit task start and never enter
-public events. List commands expose `--after` and `--limit` cursors. Event subscriptions emit
+`default`/`acceptEdits`/`plan`; Codex: `on-request`/`never`; consumed
+directly at session launch — `claude --permission-mode M` / `codex -c
+approval_policy="M"`). Standing guidance and memory are file-backed, not
+database columns; see "Guidance files" below. `agent message` and `agent
+inbox` use one private durable inbox; a message is delivered alongside the
+next task delivered into that agent's session (or on its own, opening no run
+episode, if no task is pending) and never enters public events. List
+commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
 
-By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
-`claude` through the sanitized launch environment, stores runner state under
-`$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
-`--codex`, `--claude`, `--runtime-root`, and `--max-active-runs` to set those
-explicitly. Claude runs are bounded to 20 turns and USD 5.00 in v1. Current
-model ids: Claude `claude-fable-5`, `claude-opus-5`, `claude-sonnet-5`,
-`claude-haiku-4-5-20251001` (the installed `claude` CLI also accepts the
-short aliases `fable`/`opus`/`sonnet`/`haiku`); Codex model ids follow
-whatever the installed `codex` CLI supports. `agent add --model` and `agent
-profile set --model` forward any non-empty bounded string to the provider
-for either one; the daemon does not maintain its own model allowlist.
+By default `factoryd` starts the sibling `factory-runner`, resolves `codex`
+and `claude` through the sanitized launch environment, stores session runtime
+state under `$DARK_FACTORY_HOME/runs`, and allows four concurrently active
+sessions. Use `--runner`, `--factoryctl`, `--codex`, `--claude`,
+`--runtime-root`, and `--max-active-runs` to set those explicitly. A resident
+session has no daemon-enforced turn or budget cap (that was a print-mode-only
+concept; resident sessions deliberately omit `--max-turns`/`--max-budget-usd`
+and run until the operator stops them or the provider process exits on its
+own). Current model ids: Claude `claude-fable-5`, `claude-opus-5`,
+`claude-sonnet-5`, `claude-haiku-4-5-20251001` (the installed `claude` CLI
+also accepts the short aliases `fable`/`opus`/`sonnet`/`haiku`); Codex model
+ids follow whatever the installed `codex` CLI supports. `agent add --model`
+and `agent profile set --model` forward any non-empty bounded string to the
+provider for either one (for the `shell` provider, `--model` is instead the
+command to run under `sh -lc`); the daemon does not maintain its own model
+allowlist.
 
 State is private by construction. Custom database and socket paths must each
 have an immediate parent directory owned by the current user with mode `0700`;
@@ -150,14 +158,15 @@ Every file is capped at 16 KB.
 $DARK_FACTORY_HOME/projects/<project_id>/PROJECT.md
 $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/instructions.md
 $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/memory.md
-$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/       (reserved, not yet created)
-$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json  (reserved, not yet created)
-$DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/               (reserved, not yet created)
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/
+$DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json
+$DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/
 ```
 
-The last three paths are reserved for later tracks (a per-agent `CODEX_HOME`,
-generated Claude Code hooks settings, and a per-agent git worktree); today
-`factory_core::paths` only computes them.
+The git worktree is provisioned immediately, on `agent add` (unless an
+explicit `--worktree` is given), and removed again on `agent delete`; the
+seeded `CODEX_HOME` and the generated Claude Code hooks settings file are
+each created lazily, on that agent's first session spawn.
 
 Task launch composes, in order, whichever of `PROJECT.md`, `instructions.md`,
 and `memory.md` are non-empty, then queued operator messages, then the task
@@ -169,9 +178,10 @@ them atomically (bounded, temp file plus rename).
 
 ## Terminal-mode runs and `attach`
 
-A run launched under a PTY (`factory-runner`'s terminal mode; not yet how the
-`claude`/`codex` adapters launch by default) retains its raw PTY output in
-`terminal.log` under the run's runtime directory, bounded at 64 MiB and
+Every resident session runs under a PTY (`factory-runner`'s terminal mode —
+how every `claude`/`codex`/`shell` session launches) and retains its raw PTY
+output in `terminal.log` under the session's runtime directory, bounded at
+64 MiB and
 rotated once to `terminal.log.1` on overflow — the tail is always kept, never
 the whole history. Unlike the public event log, `terminal.log` (and the
 runner's private `events.ndjson`) is never deleted when a run is acknowledged;
@@ -194,20 +204,82 @@ resizes. Press `Ctrl-]` to detach; the terminal is restored on detach, EOF, or
 an unexpected exit. This is CLI-only, separate from `factory-tui`'s own
 embedded agent panes.
 
+## Walkthrough: get an agent working
+
+Resident sessions are wired end to end: assigning a task to an agent spawns
+(or reuses) that agent's own long-lived, PTY-backed `claude`/`codex`/`shell`
+process automatically — there is no separate "start" step in the common
+case.
+
+```sh
+# Terminal 1: run the daemon in the foreground (or use launchd, see below)
+cargo run -p factoryd
+
+# Terminal 2: drive it
+cargo run -p factoryctl -- project add --id demo --name Demo --root "$PWD"
+cargo run -p factoryctl -- agent add --id worker-1 --project demo \
+    --role worker --provider claude
+cargo run -p factoryctl -- task add --id t1 --project demo \
+    --title "Fix the flaky test" --body "crates/foo/tests/bar.rs is racy; find and fix it"
+cargo run -p factoryctl -- task assign --project demo --task t1 --agent worker-1
+
+# watch it work
+cargo run -p factoryctl -- session list --project demo
+cargo run -p factoryctl -- task get --project demo --task t1
+cargo run -p factoryctl -- attach --project demo --agent worker-1   # Ctrl-] to detach
+```
+
+`agent add` with no `--worktree` provisions a real git worktree at
+`$DARK_FACTORY_HOME/projects/<project>/worktrees/<agent>` on branch
+`agent/<agent-id>` (requires the project root to be a git repository;
+otherwise the session runs directly in the project root). `task assign`
+alone is enough — the daemon's dispatcher notices the agent has pending
+work and an idle-or-absent session, and spawns or delivers into it without
+any further command. A second task assigned while the agent is mid-turn
+queues the same way and is delivered as soon as the current turn's `Stop`
+hook fires, into the *same* session — never a second process for one agent.
+
+An agent marks its own work done or blocked from inside its session (these
+take no `--agent`; identity comes from the session's own environment):
+
+```sh
+factoryctl task done --project demo --task t1 --result "Fixed the race; added a regression test."
+factoryctl task blocked --project demo --task t1 --reason "Needs a decision on retry semantics."
+```
+
+**The orchestrator ("god") is just another agent**, driven the same way —
+`--role orchestrator` instead of `worker`, and typically talking to
+`factoryctl` itself (agent add/task add/task assign/agent message) from
+inside its own session's shell, using the same identity-scoped commands any
+operator would:
+
+```sh
+cargo run -p factoryctl -- agent add --id god --project demo \
+    --role orchestrator --provider claude
+cargo run -p factoryctl -- agent message --project demo --to god \
+    --body "New priority: ship the auth fix before Friday."
+```
+
+**Restart-proof**: a resident session's provider process is a detached
+process tree, independent of `factoryd`. Killing and restarting the daemon
+(`kill -TERM <factoryd pid>`, then `cargo run -p factoryd` again on the
+same `$DARK_FACTORY_HOME`) does not touch it — `session list` shows the
+exact same session ID afterward, still idle or still mid-turn, and
+`attach` still reaches it and replays its retained terminal output from
+before the restart.
+
 ## Provider hooks and resident sessions
 
-Dark Factory's target lifecycle is one resident, interactive `claude`/`codex`
-process per agent (a PTY-backed *session*), inside which many tasks run as
-*episodes* — not a fresh non-interactive process per task. That session
-delivery/dispatch machinery is being built incrementally; this section
-documents the piece that exists now: how a resident session for either
-provider would be launched, and how it reports back.
+One resident, interactive `claude`/`codex`/`shell` process per agent (a
+PTY-backed *session*), inside which many tasks run as *episodes* — not a
+fresh non-interactive process per task. This section documents how a
+session for each provider is launched and how it reports back.
 
-`crates/factoryd/src/providers/{claude,codex}.rs` each implement a small
-`Provider` trait (`crates/factoryd/src/providers/mod.rs`,
+`crates/factoryd/src/providers/{claude,codex,shell}.rs` each implement a
+small `Provider` trait (`crates/factoryd/src/providers/mod.rs`,
 [`docs/providers.md`](docs/providers.md)) whose `spawn_spec` builds the
 exact interactive argv and any generated configuration a session needs —
-no API keys; both providers authenticate as subscription CLI apps:
+no API keys; both real providers authenticate as subscription CLI apps:
 
 - **Claude**: `claude --settings <agent-dir>/claude-settings.json
   (--session-id <uuid> | --resume <id>) [--model M] [--permission-mode M]`.
@@ -229,6 +301,27 @@ no API keys; both providers authenticate as subscription CLI apps:
   alone. `--dangerously-bypass-hook-trust` is unconditional: the hooks are
   100% daemon-authored into an isolated home the operator never hand-edits,
   which already is the vetting Codex's normal hook-trust prompt asks for.
+- **Shell** (`crates/factoryd/src/providers/shell.rs`): `sh -lc <model>`
+  (the agent's `model` string is the command to run, or a plain login shell
+  if unset) with `DARK_FACTORY_FACTORYCTL` set so a script can find
+  `factoryctl` without it being on `PATH`. No resume, no generated config —
+  the minimal reference `Provider` implementation, and what
+  `crates/factoryd/tests/sessions_e2e.rs` drives instead of a real provider
+  CLI (via `tests/fixtures/shell-agent.sh`, a POSIX-`sh` fixture that speaks
+  the exact hook/`task done`/`task blocked` protocol a real session would).
+
+Two quirks found running real `claude`/`codex` sessions manually, worth
+knowing before you script against either: both CLIs show a one-time,
+interactive "do you trust this directory?" prompt on a brand-new worktree
+(Claude accepts a bare Enter for its default choice; Codex needs the digit
+key, `1`, not just Enter) — expect the session to sit in `starting` until an
+operator (or `factoryctl attach`) answers it once per worktree. And Codex's
+own OS-level sandbox restricts its shell tool calls to the workspace
+directory by default, which blocks reaching `factoryctl`'s control socket
+and the agent's `memory.md` (both live under `$DARK_FACTORY_HOME`, outside
+the git worktree) — a Codex agent may need an explicit sandbox/writable-roots
+policy in its seeded `config.toml` before `task done`/`task blocked` and
+memory-file writes actually succeed, not just get attempted.
 
 Every hook fires `factoryctl hook --token-file PATH <Event>`: it reads the
 hook's JSON payload from stdin (bounded to 64 KiB), forwards it plus the
@@ -247,13 +340,9 @@ The per-session hook token is 32 random bytes, lowercase-hex-encoded to a
 `providers::hooks::write_hook_token`) — never on argv or in an environment
 variable, matching the existing runner sandboxing philosophy.
 
-None of this is wired into dispatch yet: `factoryd` does not currently call
-`spawn_spec` to launch a resident session, and the daemon's `provider_hook`,
-`task done`/`blocked`, `agent pause`/`resume`, and `session list`/`stop`
-handlers are present on the wire (`factoryctl` already has commands for all
-of them) but respond "not implemented" until that piece lands. See
-[docs/providers.md](docs/providers.md) for the provider boundary itself and
-how to add a new provider.
+See [docs/providers.md](docs/providers.md) for the provider boundary itself
+and how to add a new provider, and the walkthrough above for the exact
+`factoryctl` sequence that drives all of this end to end.
 
 ## The Minerva webhook endpoint
 

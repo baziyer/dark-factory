@@ -1,7 +1,14 @@
 # Adding a provider
 
 A "provider" is one supported coding-agent CLI: today, Claude Code
-(`claude`) and Codex (`codex`). Dark Factory runs each provider as one
+(`claude`), Codex (`codex`), and `shell` — a minimal reference
+implementation (`sh -lc <command>`, no resume, no generated config) that
+exercises the exact same `Provider` boundary as the real two, and is what
+`crates/factoryd/tests/sessions_e2e.rs` drives instead of a real provider
+CLI (see `tests/fixtures/shell-agent.sh`, a POSIX-`sh` fixture speaking the
+same hook/`task done`/`task blocked` protocol a real session would). Start
+there if you want a working example to copy before reading the rest of this
+file. Dark Factory runs each provider as one
 resident interactive process per agent, under a PTY, visible and typeable
 by the operator. Provider-specific code is deliberately small: everything
 that is the same for every provider (owning the PTY, `send_input`,
@@ -99,15 +106,23 @@ them into `factory_core::ProviderHookEvent` values (see
 
 ## Example/mock provider
 
-`crates/factory-runner/src/bin/fake-agent.rs` is a minimal scriptable stand-in
-for a real provider CLI (configurable exit code, stdout/stderr text and
-timing, stdin echo, and crash simulation via flags), used by the
-deterministic PTY/lifecycle tests instead of spawning the real `claude` or
-`codex` binaries. It is not itself a `Provider` implementation — it is what
-a `Provider`'s `spawn_spec` could point `InteractiveLaunch::program` at for
-a test double — but it is the reference for "what does the daemon need from
-any program it spawns as a session" if you are prototyping a new provider
-before writing its hook wiring.
+Two different test doubles exist at two different layers, easy to conflate:
+
+- `providers::shell::ShellProvider` (`crates/factoryd/src/providers/shell.rs`)
+  *is* a real `Provider` implementation — the minimal reference one, above.
+  Use it to exercise dispatch/delivery/hooks end to end without a real
+  provider CLI, the way `tests/sessions_e2e.rs` does.
+- `crates/factory-runner/src/bin/fake-agent.rs` is a minimal scriptable
+  stand-in for a real provider CLI's raw *process behavior* (configurable
+  exit code, stdout/stderr text and timing, stdin echo, and crash simulation
+  via flags), one layer below `Provider` entirely — used by
+  `factory-runner`'s own deterministic PTY/lifecycle tests, which know
+  nothing about hooks or the `Provider` trait. It is what a `Provider`'s
+  `spawn_spec` could point `InteractiveLaunch::program` at for a test
+  double, but it is not itself a `Provider` — it is the reference for "what
+  does the runner need from any program it spawns" if you are debugging
+  process-lifecycle behavior (PTY sizing, signal handling, exit codes)
+  rather than a provider's own hook wiring.
 
 ## What providers do *not* do
 
