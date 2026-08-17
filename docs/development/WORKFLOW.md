@@ -72,7 +72,7 @@ It applies, idempotently:
   fork needs approval".
 
 Where `checks` runs is a **policy, not a mechanism**: a pull request runs
-the workflow file it carries, so the `runs-on` expression at `ci.yml:33`
+the workflow file it carries, so the `runs-on` expression at `.github/workflows/ci.yml`
 only governs a PR that leaves it unmodified — a PR (or a manual run) that
 edits it can route itself elsewhere. Four routes, in increasing order of
 trust:
