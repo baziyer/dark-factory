@@ -641,5 +641,131 @@ mod provider_tests {
                 r#"{"projects": "not an object"}"#
             );
         }
+
+        /// Reproduces the exact bug in issue #35: a realistic
+        /// `~/.claude.json` with keys deliberately out of alphabetical
+        /// order at every level, an unrelated pre-existing project entry,
+        /// and a mix of value types (string, number, bool, null, array,
+        /// nested object) -- everything a BTreeMap-backed `Map` used to
+        /// silently re-sort on write before the workspace `serde_json`
+        /// dependency gained `preserve_order`.
+        ///
+        /// The fixture is a hand-written string literal, deliberately never
+        /// built from a `serde_json::Map` -- a `Map`'s own iteration order
+        /// depends on the very feature this test exists to pin down, so
+        /// generating the "before" bytes through one would make the
+        /// assertion trivially true under either build (self-referential:
+        /// whatever order the map produces on write is by definition the
+        /// order it reads back). Writing the fixture as literal text
+        /// instead makes it exactly what it claims to be -- a file already
+        /// on disk, ordered independently of this crate's `serde_json`
+        /// build -- matching how a real `~/.claude.json` gets there in
+        /// practice (written by Claude Code itself, a separate program).
+        /// The text already matches `serde_json::to_vec_pretty`'s own
+        /// canonical formatting (2-space indent, no trailing newline,
+        /// confirmed against this crate's writer directly), so re-parsing
+        /// and re-serializing an unchanged document reproduces it
+        /// byte-for-byte; `expected` is then the same text with exactly
+        /// the one new entry [`try_pretrust_worktree`] appends spliced in
+        /// at the position it appends it (end of `projects`), so the
+        /// comparison below is a true byte-for-byte check of the whole
+        /// file, not merely key order plus value equality.
+        #[test]
+        fn a_realistic_out_of_order_fixture_is_preserved_byte_for_byte_except_the_new_entry() {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join(".claude.json");
+
+            let fixture = [
+                r#"{"#,
+                r#"  "userID": "sentinel-user-id","#,
+                r#"  "numStartups": 12,"#,
+                r#"  "oauthAccount": {"#,
+                r#"    "emailAddress": "op@example.com","#,
+                r#"    "accountUuid": "b2c3d4e5-0000-0000-0000-000000000000""#,
+                r#"  },"#,
+                r#"  "hasCompletedOnboarding": true,"#,
+                r#"  "tipsHistory": {"#,
+                r#"    "new-user-warmup": 1,"#,
+                r#"    "trust-dialog": 3"#,
+                r#"  },"#,
+                r#"  "projects": {"#,
+                r#"    "/Users/op/other-repo": {"#,
+                r#"      "lastSessionId": "sentinel-other-session","#,
+                r#"      "hasTrustDialogAccepted": true,"#,
+                r#"      "allowedTools": ["#,
+                r#"        "Bash(git *)","#,
+                r#"        "Read""#,
+                r#"      ],"#,
+                r#"      "mcpServers": null,"#,
+                r#"      "exampleFilesGeneratedAt": null"#,
+                r#"    }"#,
+                r#"  },"#,
+                r#"  "firstStartTime": "2025-01-01T00:00:00.000Z","#,
+                r#"  "cachedChangelog": null"#,
+                r#"}"#,
+            ]
+            .join("\n");
+            std::fs::write(&path, &fixture).unwrap();
+
+            let worktree = PathBuf::from("/Users/op/dark-factory-worktrees/worker-9");
+            pretrust_worktree(&worktree, home.path());
+
+            let needle = [
+                r#"      "exampleFilesGeneratedAt": null"#,
+                r#"    }"#,
+                r#"  },"#,
+            ]
+            .join("\n");
+            let splice = [
+                r#"      "exampleFilesGeneratedAt": null"#,
+                r#"    },"#,
+                r#"    "/Users/op/dark-factory-worktrees/worker-9": {"#,
+                r#"      "hasTrustDialogAccepted": true"#,
+                r#"    }"#,
+                r#"  },"#,
+            ]
+            .join("\n");
+            assert_eq!(fixture.matches(&needle).count(), 1);
+            let expected = fixture.replacen(&needle, &splice, 1);
+
+            let actual = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                actual, expected,
+                "pre-trusting a new worktree must change nothing but the \
+                 new entry appended to \"projects\" -- not reorder or \
+                 reformat a single other byte of the file"
+            );
+        }
+
+        /// Atomicity (temp file + rename, same directory) and permission
+        /// preservation are shared, generic guarantees of
+        /// `hooks::write_file_with_mode` and already covered for it
+        /// directly (`hooks::tests::write_private_file_leaves_no_temp_file_behind`,
+        /// this module's own `preserves_the_files_existing_mode`). This
+        /// covers the same guarantee specifically through the
+        /// `pretrust_worktree` call path, where -- unlike that generic
+        /// test -- the rename target already exists and must be replaced,
+        /// not just created.
+        #[test]
+        fn pretrust_worktree_leaves_no_temp_file_behind_in_home() {
+            let home = tempfile::tempdir().unwrap();
+            write_fake_claude_json(home.path(), r#"{"projects": {}}"#);
+
+            pretrust_worktree(
+                &PathBuf::from("/Users/op/dark-factory-worktrees/worker-1"),
+                home.path(),
+            );
+
+            let entries: Vec<_> = std::fs::read_dir(home.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(
+                entries,
+                vec![".claude.json".to_owned()],
+                "no leftover temp file should remain in home: {entries:?}"
+            );
+        }
     }
 }
