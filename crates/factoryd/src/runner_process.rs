@@ -395,12 +395,29 @@ fn resolve_provider_environment(
     match environment {
         ProviderEnvironment::Inherited => Ok(None),
         ProviderEnvironment::CodexHome(home) => {
+            // Reject `.`/`..` navigation outright rather than trying to
+            // prove any particular occurrence is harmless (defense in
+            // depth against a path shaped to look like one directory while
+            // actually landing somewhere else): `home` must already be in
+            // lexically normal form. This is deliberately *not* the same
+            // check as "already equals its own canonicalized form" --
+            // found manually against a real session (this track's item 6
+            // check): a `home` under `$DARK_FACTORY_HOME=/tmp/...` legally
+            // and lexically normal, yet never byte-equal to its
+            // canonicalized form, because `/tmp` itself is a symlink to
+            // `/private/tmp` on macOS. That is an ancestor directory the
+            // operating system manages, not anything a provider or an
+            // attacker chose; rejecting it here made every Codex session
+            // spawn fail whenever the daemon's own state lived under such
+            // a path.
+            if has_dot_or_dot_dot_component(home) {
+                return Err(Error::InvalidProviderEnvironment);
+            }
             let metadata =
                 fs::symlink_metadata(home).map_err(|_| Error::InvalidProviderEnvironment)?;
             let canonical =
                 fs::canonicalize(home).map_err(|_| Error::InvalidProviderEnvironment)?;
-            if canonical != *home
-                || metadata.file_type().is_symlink()
+            if metadata.file_type().is_symlink()
                 || !is_owned_directory(&metadata, rustix::process::geteuid().as_raw())
             {
                 return Err(Error::InvalidProviderEnvironment);
@@ -408,6 +425,17 @@ fn resolve_provider_environment(
             Ok(Some(canonical))
         }
     }
+}
+
+/// Whether `path` has a literal `.` or `..` path component -- checked
+/// lexically, not by resolving anything on disk.
+fn has_dot_or_dot_dot_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    })
 }
 
 fn is_owned_directory(metadata: &fs::Metadata, expected_uid: u32) -> bool {
@@ -498,8 +526,9 @@ mod tests {
 
     use super::{
         CapturedEnvironment, Error, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
-        apply_runner_environment, is_owned_directory, resolve_executable,
-        spawn_runner_with_environment, spawn_runner_with_environment_and_timeout,
+        apply_runner_environment, has_dot_or_dot_dot_component, is_owned_directory,
+        resolve_executable, spawn_runner_with_environment,
+        spawn_runner_with_environment_and_timeout,
     };
 
     fn id<T>(value: &str) -> T
@@ -692,6 +721,59 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         let expected = format!("CODEX_HOME={}", home.display());
         assert!(provider_env.lines().any(|line| line == expected));
         assert!(!provider_env.contains("/ambient/codex-home-secret"));
+    }
+
+    /// Regression test (found manually against a real session, this
+    /// track's item 6 check): a `CodexHome` under an *ancestor* symlink
+    /// (not a symlink itself) must still be accepted, using its
+    /// canonicalized form -- `$DARK_FACTORY_HOME=/tmp/...` is exactly this
+    /// shape on macOS, where `/tmp` is itself a symlink to `/private/tmp`.
+    /// Every real Codex session spawn failed closed with "provider
+    /// environment is invalid" before this was fixed, because the home
+    /// path (though never touched by an attacker, always daemon-
+    /// constructed, and never itself a symlink) could never equal its own
+    /// canonicalized form while any ancestor was a symlink.
+    #[tokio::test]
+    async fn codex_home_under_a_symlinked_ancestor_directory_is_accepted_and_canonicalized() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let real_root = directory.path().join("real-root");
+        fs::create_dir(&real_root).unwrap();
+        let symlinked_root = directory.path().join("symlinked-root");
+        std::os::unix::fs::symlink(&real_root, &symlinked_root).unwrap();
+        let home_under_symlink = symlinked_root.join("codex-home");
+        fs::create_dir(&home_under_symlink).unwrap();
+        fs::set_permissions(&home_under_symlink, fs::Permissions::from_mode(0o755)).unwrap();
+        let canonical_home = fs::canonicalize(&home_under_symlink).unwrap();
+        assert_ne!(
+            canonical_home, home_under_symlink,
+            "the test setup itself must exercise a genuine ancestor-symlink mismatch"
+        );
+
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.provider_environment = ProviderEnvironment::CodexHome(home_under_symlink);
+
+        let mut child = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let provider_env = fs::read_to_string(directory.path().join("provider-env")).unwrap();
+        let expected = format!("CODEX_HOME={}", canonical_home.display());
+        assert!(provider_env.lines().any(|line| line == expected));
+    }
+
+    #[test]
+    fn dot_dot_components_are_detected_lexically() {
+        assert!(!has_dot_or_dot_dot_component(Path::new("/a/b/c")));
+        assert!(has_dot_or_dot_dot_component(Path::new("/a/../b")));
+        assert!(has_dot_or_dot_dot_component(Path::new("/a/b/..")));
+        // `Path::components()` normalizes away a mid-path `.` entirely
+        // (it is never observable as a `CurDir` component for an absolute
+        // path) -- inert either way, since `/a/./b` and `/a/b` already
+        // name the same directory with no symlink resolution involved.
+        assert!(!has_dot_or_dot_dot_component(Path::new("/a/./b")));
     }
 
     #[tokio::test]
