@@ -18,9 +18,8 @@ alongside the next task.
 
 This file lists direction and unfinished product work only. Known problems
 with the current baseline — including things that don't work yet and
-things that are simply undecided — live in
-[docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md), backlog-ready for GitHub
-issues.
+things that are simply undecided — are [GitHub issues labelled
+`known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue).
 
 ## Next: God command center
 
@@ -36,7 +35,7 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
 - Make the agent hierarchy (`parent_agent_id`) visible without duplicating
   the task board.
 - Demonstrate one real orchestrator delegating to real workers end to end
-  (see `docs/KNOWN-ISSUES.md`).
+  (#38).
 
 ## Next: intervention and operations
 
@@ -49,8 +48,8 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
   embedded in the `factory-tui` board (`factoryctl attach` is CLI-only today).
 - Add richer activity inspection and first-class blocked-question/document
   workflows.
-- Let `factory-tui` create projects and agents, and surface an agent's
-  inbox (see `docs/KNOWN-ISSUES.md`) — CLI-only today.
+- Let `factory-tui` create projects and agents (#30), and surface an
+  agent's inbox (#31) — CLI-only today.
 
 ## Later: work allocation
 

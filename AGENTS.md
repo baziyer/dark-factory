@@ -61,14 +61,15 @@ Read-only context unless a task explicitly asks you to edit them:
    caught the bug it fixes.
 7. **Run `./scripts/local-ci.sh` before finishing.** It is the
    authoritative gate (fmt, clippy at `-D warnings`, the full test suite,
-   `git diff --check`) — GitHub Actions is manual-only and does not protect
-   `main` by itself.
+   `git diff --check`). CI runs the same script on every pull request as
+   the `checks` status the `main` ruleset requires; a PR that isn't green
+   locally won't be green there either.
 8. **Small, coherent commits.** One logical change per commit; don't bundle
    unrelated cleanup into a feature commit.
 9. **Docs are load-bearing.** A change that alters behavior updates
-   `README.md`/`ARCHITECTURE.md`/`docs/KNOWN-ISSUES.md` in the same PR, not
-   later. A doc describing something that no longer exists is worse than no
-   doc.
+   `README.md`/`ARCHITECTURE.md`/`docs/` in the same PR, not later, and a
+   fix closes its GitHub issue (`Closes #N`) rather than leaving it open.
+   A doc describing something that no longer exists is worse than no doc.
 10. **Never touch the operator's live install from a task.** `~/.dark-factory`,
     the installed `launchd` job, and the running daemon behind them are the
     owner's real system. Use a temporary `$DARK_FACTORY_HOME` and `--socket`
@@ -85,6 +86,7 @@ Read-only context unless a task explicitly asks you to edit them:
 - New provider, integration, or theme: see [CONTRIBUTING.md](CONTRIBUTING.md)
   for the shortest path and [docs/providers.md](docs/providers.md) for the
   provider contract.
-- Known problems and their smallest fix: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md).
+- Known problems and their smallest fix: GitHub issues labelled
+  `known-issue` (see [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)).
 - Day-to-day workflow and the (unimplemented) release/update design:
   [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md).

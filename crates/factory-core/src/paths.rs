@@ -14,15 +14,15 @@
 //! $DARK_FACTORY_HOME/projects/<project_id>/PROJECT.md
 //! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/instructions.md
 //! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/memory.md
-//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/       (reserved, not yet created)
-//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json  (reserved, not yet created)
-//! $DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/               (reserved, not yet created)
+//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/
+//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json
+//! $DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/
 //! ```
 //!
-//! The `codex-home`, `claude-settings.json`, and `worktrees/<agent_id>`
-//! entries are reserved paths for later tracks (per-agent `CODEX_HOME`,
-//! generated Claude Code hooks settings, and a per-agent git worktree); this
-//! module only computes them today and creates none of them.
+//! This module only computes paths; who creates what is documented at each
+//! call site (`factoryd::guidance` for the Markdown files, the providers for
+//! `codex-home/` and `claude-settings.json` on first spawn, `factoryd`'s
+//! agent creation for the worktree).
 //!
 //! `ProjectId` and `AgentId` are already constrained to ASCII letters,
 //! digits, hyphens, and underscores, so they are always safe single path
@@ -110,9 +110,9 @@ pub fn agent_memory_path(home: &Path, project_id: &ProjectId, agent_id: &AgentId
     agent_dir(home, project_id, agent_id).join("memory.md")
 }
 
-/// Reserved path for a future per-agent git worktree, sibling to `agents/`:
-/// `<project_dir>/worktrees/<agent_id>`. Not created by this track; a later
-/// track owns provisioning it (path computation only).
+/// The agent's own git worktree, sibling to `agents/`:
+/// `<project_dir>/worktrees/<agent_id>` (provisioned by `factoryd` on
+/// `CreateAgent`, removed on `DeleteAgent`).
 #[must_use]
 pub fn agent_worktree_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentId) -> PathBuf {
     project_dir(home, project_id)
@@ -120,17 +120,16 @@ pub fn agent_worktree_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentI
         .join(agent_id.as_str())
 }
 
-/// Reserved path for a future per-agent `CODEX_HOME`:
-/// `<agent_dir>/codex-home`. Not created by this track (path computation
-/// only).
+/// The agent's seeded `CODEX_HOME`: `<agent_dir>/codex-home` (created by
+/// the Codex provider on that agent's first session spawn).
 #[must_use]
 pub fn agent_codex_home_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentId) -> PathBuf {
     agent_dir(home, project_id, agent_id).join("codex-home")
 }
 
-/// Reserved path for a future generated Claude Code hooks settings file:
-/// `<agent_dir>/claude-settings.json`. Not created by this track (path
-/// computation only).
+/// The generated Claude Code hooks settings file:
+/// `<agent_dir>/claude-settings.json` (written by the Claude provider per
+/// session spawn).
 #[must_use]
 pub fn agent_claude_settings_path(
     home: &Path,
@@ -170,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_future_paths_match_the_documented_sister_folder() {
+    fn provider_and_worktree_paths_match_the_documented_sister_folder() {
         let home = Path::new("/home/user/.dark-factory");
         assert_eq!(
             agent_worktree_dir(home, &project(), &agent()),
