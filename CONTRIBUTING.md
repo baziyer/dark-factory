@@ -35,8 +35,13 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
 
 - **A bug or a small gap**: [GitHub issues labelled
   `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue)
-  each have a symptom, evidence, a suggested smallest fix, and a size —
-  anything `size:S` is a reasonable first change.
+  each have a symptom, evidence (`file:line` or how it was observed), a
+  suggested smallest fix, and a `size:S|M|L` label (`decision` when the
+  maintainer has to choose, not code) — anything `size:S` is a reasonable
+  first change. Found a new one? Open an issue with the bug template and
+  label it `known-issue`; a fix closes it in the same PR (`Closes #N`).
+  (The initial batch, #24–#40, was imported from an earlier
+  `docs/KNOWN-ISSUES.md` at commit `cc221e1`.)
 - **A new provider**: see [docs/providers.md](docs/providers.md) — the
   whole contract is one `Provider` trait (`spawn_spec` + `capabilities`)
   in `crates/factoryd/src/providers/mod.rs`. `shell.rs` is the minimal

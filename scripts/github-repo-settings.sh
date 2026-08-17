@@ -7,7 +7,7 @@
 # and the script exits non-zero so the gap is visible.
 set -u
 
-repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || exit 1
 failed=0
 tmp=$(mktemp)
 trap 'rm -f "$tmp"' EXIT
@@ -36,10 +36,46 @@ step "merge settings (linear history: squash or rebase only; delete merged branc
 try gh repo edit "$repository" --enable-squash-merge --enable-rebase-merge \
     --enable-merge-commit=false --delete-branch-on-merge
 
-step "ruleset: main"
-ruleset=$(cat <<'JSON'
-{
-  "name": "main",
+# Two rulesets on main, because a bypass applies to every rule in ITS
+# ruleset: "main-protect" (no bypass for anyone, not even the admin) makes
+# the green `checks` run, linear history, and no force-push/deletion
+# unconditional; "main-review" carries the pull-request rule with a
+# Repository-admin (id 5) bypass in pull-request mode, since GitHub never
+# lets an author approve their own PR and this repository has one
+# maintainer. Everyone else needs the PR, the CODEOWNERS approval, resolved
+# threads, and a green `checks` from GitHub Actions (integration 15368)
+# against a head that is up to date with main. Nobody pushes to main.
+apply_ruleset() {
+    printf '%s' "$2" > "$tmp"
+    existing=$(gh api "repos/$repository/rulesets" --jq ".[] | select(.name==\"$1\") | .id" 2>/dev/null | head -1)
+    case "$existing" in *[!0-9]*) existing="" ;; esac   # an error body is not an id
+    if [ -n "$existing" ]; then
+        try gh api -X PUT "repos/$repository/rulesets/$existing" --input "$tmp" >/dev/null
+    else
+        try gh api -X POST "repos/$repository/rulesets" --input "$tmp" >/dev/null
+    fi
+}
+
+step "ruleset: main-protect (checks + linear history + no force-push/delete; no bypass)"
+apply_ruleset main-protect '{
+  "name": "main-protect",
+  "target": "branch",
+  "enforcement": "active",
+  "bypass_actors": [],
+  "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+  "rules": [
+    { "type": "deletion" },
+    { "type": "non_fast_forward" },
+    { "type": "required_linear_history" },
+    { "type": "required_status_checks", "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [ { "context": "checks", "integration_id": 15368 } ] } }
+  ]
+}'
+
+step "ruleset: main-review (pull request + CODEOWNERS approval; admin may bypass via a PR)"
+apply_ruleset main-review '{
+  "name": "main-review",
   "target": "branch",
   "enforcement": "active",
   "bypass_actors": [
@@ -47,34 +83,14 @@ ruleset=$(cat <<'JSON'
   ],
   "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
   "rules": [
-    { "type": "deletion" },
-    { "type": "non_fast_forward" },
-    { "type": "required_linear_history" },
     { "type": "pull_request", "parameters": {
         "required_approving_review_count": 1,
         "dismiss_stale_reviews_on_push": true,
         "require_code_owner_review": true,
         "require_last_push_approval": false,
-        "required_review_thread_resolution": true } },
-    { "type": "required_status_checks", "parameters": {
-        "strict_required_status_checks_policy": true,
-        "required_status_checks": [ { "context": "checks" } ] } }
+        "required_review_thread_resolution": true } }
   ]
-}
-JSON
-)
-# The bypass actor is the Repository admin role (id 5), pull-request mode:
-# the maintainer can merge a PR that lacks the (self-)approval GitHub never
-# lets an author give, but still cannot push to main directly, force-push,
-# or delete it. Everyone else needs the PR, the CODEOWNERS approval, and a
-# green `checks` run against the current head.
-printf '%s' "$ruleset" > "$tmp"
-if existing=$(gh api "repos/$repository/rulesets" --jq '.[] | select(.name=="main") | .id' 2>/dev/null) \
-    && [ -n "$existing" ]; then
-    try gh api -X PUT "repos/$repository/rulesets/$existing" --input "$tmp" >/dev/null
-else
-    try gh api -X POST "repos/$repository/rulesets" --input "$tmp" >/dev/null
-fi
+}'
 
 step "security: private vulnerability reporting, dependabot alerts, secret scanning + push protection"
 try gh api -X PUT "repos/$repository/private-vulnerability-reporting" >/dev/null
