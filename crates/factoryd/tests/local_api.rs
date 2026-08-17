@@ -99,6 +99,7 @@ fn execution_config(directory: &Path, socket: &Path) -> execution::Config {
         guidance_root: directory.to_path_buf(),
         socket_path: socket.to_path_buf(),
         max_active_runs: 1,
+        session_start_deadline: execution::SESSION_START_DEADLINE,
     }
 }
 

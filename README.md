@@ -214,6 +214,26 @@ which carries it into the launchd job (`factoryctl doctor` shows which home
 is in effect). Full mechanism, including per-provider argv and generated
 config: [docs/providers.md](docs/providers.md).
 
+Separately, a Codex session's `SessionStart` hook has been observed to
+simply never fire even though the provider itself started fine and sat
+fully idle ([known issue #24](https://github.com/baziyer/dark-factory/issues/24) —
+not yet root-caused). Because delivery only happens once `SessionStart`
+moves a session `starting` → `idle`, an affected session used to stay
+`starting` forever with no work ever delivered. A session `starting` for
+more than 120 seconds is now treated exactly like a failed spawn attempt:
+`factoryd` stops its runner, records it `failed` with a reason explaining
+what happened, and backs off and retries the spawn like any other broken
+launch — visible the same way (`factoryctl session list`, `factoryctl
+agent status`, the TUI's attention view), no new state or command to learn.
+If a session is genuinely just slow to initialize (a cold Codex start with
+many MCP servers) rather than actually stuck, an operator can unblock it by
+hand before the deadline by invoking its exact `SessionStart` hook command:
+find the session's token file at
+`$DARK_FACTORY_HOME/runs/<session-id>/hook.token` (`factoryctl session
+list` for the id) and run
+`factoryctl hook --token-file <that file> SessionStart` (payload `{}` on
+stdin) — every other hook then fires normally for the rest of the session.
+
 ## The Minerva webhook endpoint
 
 Webhooks are loopback-only and serve exactly one endpoint on the

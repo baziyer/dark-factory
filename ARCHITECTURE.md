@@ -34,7 +34,15 @@ catalogue.
    attempted, so a failure is always durably visible (`session list`/the
    TUI, an announcement, the error as `wait_reason`); a persistently broken
    spawn path retries with exponential per-agent backoff (5s doubling to a
-   5 minute cap), never busy-loops. Delivery into an idle session types
+   5 minute cap), never busy-loops. A session still `starting` past a fixed
+   deadline (120s, generous enough for a cold Codex start with many MCP
+   servers) is treated exactly like a failure by that same path -- the
+   daemon stops it, records it `failed`, and backs off -- rather than
+   staying `starting` forever if the provider's own `SessionStart` hook
+   never reaches the daemon (`execution.rs`'s `SESSION_START_DEADLINE`,
+   [known issue #24](https://github.com/baziyer/dark-factory/issues/24));
+   this also catches a session recovered `starting` after a daemon
+   restart. Delivery into an idle session types
    composed text into its PTY and waits for the provider's own
    `UserPromptSubmit` hook to acknowledge receipt before committing the
    delivery durably, synchronously, as part of handling that exact hook

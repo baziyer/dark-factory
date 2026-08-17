@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             guidance_root: config.guidance_root,
             socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
+            session_start_deadline: execution::SESSION_START_DEADLINE,
         },
         state.clone(),
     )?;
