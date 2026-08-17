@@ -79,12 +79,20 @@ Guided first install on this machine:
   1. create $DARK_FACTORY_HOME (default ~/.dark-factory) and its logs/ dir, mode 0700
   2. report whether claude, codex, and git resolve on PATH, and their versions
   3. install the binaries next to this factoryctl as $DARK_FACTORY_HOME/bin/<version>/
-     and point bin/current at them (an existing bin/<version> is never overwritten)
-  4. explain what Dark Factory writes outside its home and ask before continuing
+     and point bin/current at them (a bin/<version> holding a different build of the
+     same version is refused, never overwritten)
+  4. state what Dark Factory writes outside its home (the launchd job, worktree
+     pre-trust entries in ~/.claude.json, an agent/<id> branch per agent in each
+     project's repository) and ask before touching launchd
   5. render ~/Library/LaunchAgents/com.dark-factory.factoryd.plist with a PATH that
-     can find those CLIs, load it, and wait for the daemon to answer health
+     can find those CLIs, load it, and wait for the daemon to answer health with
+     this version
 
-Re-running is safe: an existing job keeps its extra daemon arguments.
+Re-running is safe: an existing job keeps its extra daemon arguments and
+environment (its PATH is repaired if a provider CLI moved), an installed
+version is not overwritten, and the daemon is restarted only when the job
+is (re)loaded. A daemon started by hand on the same socket is refused --
+stop it first -- so launchd's copy can't crash-loop behind it.
 
 Options:
   --yes                      Skip the consent prompt (needed when stdin is not a terminal)

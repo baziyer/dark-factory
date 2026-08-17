@@ -1,15 +1,18 @@
 //! The one piece of client-side state that survives a restart: which
-//! project was focused last (`p`, `[`/`]`, or `Enter` on a FORTRESS
-//! station), so the next `factory-tui` opens where the operator left off
-//! unless `--project` says otherwise. Lives at
-//! `$DARK_FACTORY_HOME/factory-tui.json`; nothing else reads it.
+//! project was focused last (whichever way it changed — `p`, `Enter` on a
+//! FORTRESS station, or `Tab`/`j`/`k`/`g`/`G` crossing into another
+//! project's agent), so the next `factory-tui` opens where the operator
+//! left off unless `--project` says otherwise. Lives at
+//! `$DARK_FACTORY_HOME/factory-tui.json`, so it belongs to that home's
+//! daemon; a board pointed at some other daemon with an explicit `--socket`
+//! neither reads nor writes it (see `main.rs`). Nothing else reads it.
 
 use std::{fs, path::PathBuf};
 
 use factory_core::ProjectId;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     focused_project: Option<ProjectId>,
