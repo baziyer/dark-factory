@@ -49,6 +49,16 @@ const SESSION_ENVIRONMENT_NAMES: [&str; 5] = [
 pub struct LaunchSpec {
     /// Trusted absolute path to the installed stable runner executable.
     pub runner_program: PathBuf,
+    /// Trusted absolute path to `factoryctl`. For a terminal-mode launch,
+    /// its directory is prepended to the provider process's `PATH` (see
+    /// [`apply_runner_environment`]) so a session's own bare `factoryctl`
+    /// invocations (the composed delivery text's "when finished, run:
+    /// `factoryctl task done ...`", or an operator typing it directly)
+    /// resolve regardless of the operator's shell configuration, matching
+    /// `docs/providers.md`'s "provider A1" resolution note. Unused for a
+    /// non-terminal launch (dead in practice: every resident session is
+    /// terminal-mode, `execution.rs`'s `spawn_session_for_agent`).
+    pub factoryctl_path: PathBuf,
     /// Provider executable path or name to resolve from the captured `PATH`.
     pub provider_program: PathBuf,
     /// Non-secret provider flags. These are observable in process metadata and
@@ -280,7 +290,12 @@ async fn spawn_runner_with_environment_and_timeout(
         } else {
             Stdio::piped()
         });
-    apply_runner_environment(&mut command, &environment, terminal.is_some());
+    apply_runner_environment(
+        &mut command,
+        &environment,
+        &spec.factoryctl_path,
+        terminal.is_some(),
+    );
     apply_provider_environment(&mut command, provider_environment.as_deref());
     for (name, value) in &spec.session_environment {
         command.env(name, value);
@@ -319,6 +334,7 @@ async fn spawn_runner_with_environment_and_timeout(
 fn apply_runner_environment(
     command: &mut Command,
     environment: &CapturedEnvironment,
+    factoryctl_path: &Path,
     terminal: bool,
 ) {
     command.env_clear();
@@ -330,10 +346,41 @@ fn apply_runner_environment(
         // and TERM=dumb (the non-interactive default below) would break
         // their rendering.
         command.env("TERM", "xterm-256color");
+        // A resident session's own `factoryctl` invocations (the composed
+        // delivery text's `factoryctl task done ...`, or an operator typing
+        // it directly) use a bare name, not the daemon's trusted absolute
+        // path -- that path is only threaded into *generated hook commands*
+        // (`providers::hooks::hook_command`), which the provider's hook
+        // subprocess invokes directly and so never needs `PATH` resolution
+        // for. Prepend `factoryctl`'s own directory to `PATH` so the bare
+        // name still resolves inside the session regardless of whether the
+        // operator's own shell configuration happens to put it there.
+        if let Some(directory) = factoryctl_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            command.env(
+                "PATH",
+                prepend_to_path(directory, environment.value("PATH")),
+            );
+        }
     } else {
         command.env("NO_COLOR", "1").env("TERM", "dumb");
     }
     command.env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// Prepends `directory` to a `PATH` value, keeping any existing entries
+/// after it so ambient tools (`git`, `sh`, ...) stay resolvable. Falls back
+/// to `directory` alone if joining somehow fails (an entry containing the
+/// platform's path-list separator, practically unreachable for a
+/// daemon-controlled directory).
+fn prepend_to_path(directory: &Path, existing: Option<&OsStr>) -> OsString {
+    let mut entries = vec![directory.to_path_buf()];
+    if let Some(existing) = existing {
+        entries.extend(env::split_paths(existing));
+    }
+    env::join_paths(entries).unwrap_or_else(|_| directory.as_os_str().to_owned())
 }
 
 fn apply_provider_environment(command: &mut Command, codex_home: Option<&Path>) {
@@ -533,6 +580,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
     fn spec(directory: &Path, task: Vec<u8>) -> LaunchSpec {
         LaunchSpec {
             runner_program: directory.join("runner-probe"),
+            factoryctl_path: directory.join("factoryctl-probe"),
             provider_program: PathBuf::from("provider-probe"),
             provider_arguments: vec![OsString::from("--safe-provider-flag")],
             provider_environment: ProviderEnvironment::Inherited,
@@ -574,7 +622,12 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             .env("LD_PRELOAD", "/secret/library.so")
             .stdout(Stdio::piped());
 
-        apply_runner_environment(&mut command, &captured, false);
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            false,
+        );
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         let output = String::from_utf8(output.stdout).unwrap();
@@ -718,6 +771,58 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             Error::InvalidSessionEnvironment { name } if name == "PATH"
         ));
         assert!(!directory.path().join("runner-argv").exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_mode_prepends_factoryctls_directory_to_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = environment(OsString::from("/usr/bin:/bin"), directory.path());
+        // `Command::new("env")` would resolve the bare name against this
+        // *test process's* own PATH (the exec-time lookup, unrelated to
+        // whatever `apply_runner_environment` is about to configure for the
+        // child) -- pre-resolve it the same way
+        // `environment_is_default_deny_with_fixed_overrides` does.
+        let env_program = resolve_executable(Path::new("env"), &captured, "test").unwrap();
+        let mut command = Command::new(env_program);
+        command.stdout(Stdio::piped());
+
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            true,
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "PATH=/opt/dark-factory/bin:/usr/bin:/bin"),
+            "{output}"
+        );
+        assert!(output.lines().any(|line| line == "TERM=xterm-256color"));
+    }
+
+    #[tokio::test]
+    async fn non_terminal_mode_leaves_path_unmodified_by_factoryctl() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = environment(OsString::from("/usr/bin:/bin"), directory.path());
+        let env_program = resolve_executable(Path::new("env"), &captured, "test").unwrap();
+        let mut command = Command::new(env_program);
+        command.stdout(Stdio::piped());
+
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            false,
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.lines().any(|line| line == "PATH=/usr/bin:/bin"));
+        assert!(!output.contains("/opt/dark-factory/bin"));
     }
 
     #[test]

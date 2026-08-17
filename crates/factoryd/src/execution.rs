@@ -501,7 +501,7 @@ async fn has_pending_work(
 
 fn select_provider(kind: Provider) -> Box<dyn providers::Provider + Send> {
     match kind {
-        Provider::ClaudeCode => Box::new(providers::claude::ClaudeProvider),
+        Provider::ClaudeCode => Box::new(providers::claude::ClaudeProvider::new()),
         Provider::Codex => Box::new(providers::codex::CodexProvider::new()),
         Provider::Shell => Box::new(providers::shell::ShellProvider),
     }
@@ -610,6 +610,7 @@ async fn spawn_session_for_agent(
 
     let launch_spec = LaunchSpec {
         runner_program: config.runner_program.clone(),
+        factoryctl_path: config.factoryctl_path.clone(),
         provider_program: launch.program,
         provider_arguments: launch
             .args
