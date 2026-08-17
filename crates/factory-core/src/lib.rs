@@ -8,8 +8,11 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod attention;
 pub mod local;
+pub mod paths;
 pub mod runner;
+pub mod status;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_ID_LEN: usize = 128;
@@ -97,14 +100,23 @@ macro_rules! id_type {
 id_type!(ProjectId);
 id_type!(TaskId);
 id_type!(AgentId);
+id_type!(MessageId);
 id_type!(RunId);
 id_type!(RunnerInstanceId);
+id_type!(SessionId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     ClaudeCode,
     Codex,
+    /// A plain POSIX shell, driven entirely by `factoryctl hook`/`task
+    /// done`/`task blocked` calls the launched command makes itself. The
+    /// minimal example provider (`crates/factoryd/src/providers/shell.rs`,
+    /// `crates/factoryd/tests/fixtures/shell-agent.sh`): no native hooks or
+    /// permission prompts to speak of, useful for deterministic lifecycle
+    /// tests and as a template for a new provider.
+    Shell,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -142,6 +154,92 @@ pub enum ObserverHealth {
     Unknown,
     Healthy,
     Degraded,
+}
+
+/// Lifecycle state of one resident interactive provider process (one per
+/// agent, PTY-backed, spanning many task-episodes).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Starting,
+    Idle,
+    Working,
+    WaitingForInput,
+    Stopped,
+    Failed,
+}
+
+impl SessionState {
+    #[must_use]
+    pub const fn is_live(self) -> bool {
+        !matches!(self, Self::Stopped | Self::Failed)
+    }
+}
+
+/// The provider hook event a `factoryctl hook` invocation was called for.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHookEvent {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PostToolUse,
+    Notification,
+    Stop,
+    SubagentStop,
+    SessionEnd,
+}
+
+impl ProviderHookEvent {
+    /// The exact event name Claude Code and Codex use in their own hook
+    /// wire protocols and configuration files (`SessionStart`,
+    /// `UserPromptSubmit`, ...) — independent of this enum's own
+    /// `snake_case` wire serialization used inside `LocalRequest::
+    /// ProviderHook`. This is what `factoryctl hook <Event>` accepts as its
+    /// positional argument and what generated provider hook commands are
+    /// invoked with.
+    #[must_use]
+    pub const fn provider_event_name(self) -> &'static str {
+        match self {
+            Self::SessionStart => "SessionStart",
+            Self::UserPromptSubmit => "UserPromptSubmit",
+            Self::PreToolUse => "PreToolUse",
+            Self::PostToolUse => "PostToolUse",
+            Self::Notification => "Notification",
+            Self::Stop => "Stop",
+            Self::SubagentStop => "SubagentStop",
+            Self::SessionEnd => "SessionEnd",
+        }
+    }
+
+    /// Parses the exact provider event name back into this enum. Inverse of
+    /// [`Self::provider_event_name`]. Returns `None` for anything else,
+    /// including this enum's own `snake_case` serialization.
+    #[must_use]
+    pub fn parse_provider_event_name(value: &str) -> Option<Self> {
+        Some(match value {
+            "SessionStart" => Self::SessionStart,
+            "UserPromptSubmit" => Self::UserPromptSubmit,
+            "PreToolUse" => Self::PreToolUse,
+            "PostToolUse" => Self::PostToolUse,
+            "Notification" => Self::Notification,
+            "Stop" => Self::Stop,
+            "SubagentStop" => Self::SubagentStop,
+            "SessionEnd" => Self::SessionEnd,
+            _ => return None,
+        })
+    }
+}
+
+/// Why a run (task-episode) was closed.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunClosedBy {
+    TaskDone,
+    TaskBlocked,
+    OperatorCancel,
+    OperatorStop,
+    SessionEnded,
 }
 
 /// A durable, privacy-safe category for a failed run.
@@ -191,8 +289,6 @@ pub struct TaskSnapshot {
     pub project_id: ProjectId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_task_id: Option<TaskId>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub depends_on: Vec<TaskId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_agent_id: Option<AgentId>,
     pub title: String,
@@ -209,6 +305,10 @@ pub struct TaskDetail {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// Why `factoryctl task blocked` was called, when `snapshot.status` is
+    /// [`TaskStatus::Blocked`]; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 /// A durable agent identity. Process-attempt state belongs to [`RunSnapshot`].
@@ -223,6 +323,16 @@ pub struct AgentSnapshot {
     /// The active attempt, or `None` when this agent is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<RunId>,
+    /// Durable operator hold: while `true`, the daemon does not deliver new
+    /// work into this agent's session.
+    #[serde(default)]
+    pub paused: bool,
+    /// The agent's current resident session, or `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<SessionId>,
+    /// Absolute path to the agent's git worktree, once created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -237,6 +347,10 @@ pub struct RunSnapshot {
     pub parent_run_id: Option<RunId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
+    /// The resident session this episode ran inside. `None` only for runs
+    /// that predate the sessions migration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
     pub status: RunStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
@@ -258,15 +372,89 @@ pub struct RunSnapshot {
     pub exit_signal: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<RunFailureReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<RunClosedBy>,
+}
+
+/// One resident interactive provider process for one agent. Many task
+/// episodes ([`RunSnapshot`]) happen inside one session's lifetime.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionSnapshot {
+    pub id: SessionId,
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub provider: Provider,
+    pub state: SessionState,
+    pub state_since_ms: i64,
+    pub worktree: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<RunId>,
+    /// Bounded free-text activity label (e.g. `"tool: Read"`), or `None`
+    /// while idle/starting/stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<String>,
+    /// Whether `activity` was inferred from a generic hook (`true`, shown
+    /// with a `~` by the TUI) rather than naming an exact tool (`false`).
+    #[serde(default)]
+    pub activity_inferred: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hook_event: Option<ProviderHookEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_hook_at_ms: Option<i64>,
+    /// Bounded operator-facing explanation of why the session is waiting,
+    /// e.g. "permission prompt", "delivery unacknowledged"; at most 512
+    /// bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait_reason: Option<String>,
+    #[serde(default)]
+    pub observer_health: ObserverHealth,
+    #[serde(default)]
+    pub observer_health_since_ms: i64,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum FactoryEvent {
-    ProjectChanged { project: ProjectSnapshot },
-    TaskChanged { task: TaskSnapshot },
-    AgentChanged { agent: AgentSnapshot },
-    RunChanged { run: RunSnapshot },
+    ProjectChanged {
+        project: ProjectSnapshot,
+    },
+    TaskChanged {
+        task: TaskSnapshot,
+    },
+    AgentChanged {
+        agent: AgentSnapshot,
+    },
+    RunChanged {
+        run: RunSnapshot,
+    },
+    SessionChanged {
+        session: SessionSnapshot,
+    },
+    /// A task was permanently removed. Unlike `TaskChanged`, there is no
+    /// surviving snapshot to publish.
+    TaskDeleted {
+        project_id: ProjectId,
+        task_id: TaskId,
+    },
+    /// An agent was permanently removed.
+    AgentDeleted {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    /// A project and everything scoped to it was permanently removed.
+    ProjectDeleted {
+        project_id: ProjectId,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -275,4 +463,48 @@ pub struct EventEnvelope {
     pub sequence: i64,
     pub occurred_at_ms: i64,
     pub event: FactoryEvent,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderHookEvent;
+
+    #[test]
+    fn provider_event_name_round_trips_every_variant() {
+        let events = [
+            ProviderHookEvent::SessionStart,
+            ProviderHookEvent::UserPromptSubmit,
+            ProviderHookEvent::PreToolUse,
+            ProviderHookEvent::PostToolUse,
+            ProviderHookEvent::Notification,
+            ProviderHookEvent::Stop,
+            ProviderHookEvent::SubagentStop,
+            ProviderHookEvent::SessionEnd,
+        ];
+        for event in events {
+            let name = event.provider_event_name();
+            assert_eq!(
+                ProviderHookEvent::parse_provider_event_name(name),
+                Some(event)
+            );
+        }
+    }
+
+    #[test]
+    fn provider_event_name_is_exact_pascal_case_not_this_enums_own_snake_case_wire_form() {
+        assert_eq!(
+            ProviderHookEvent::SessionStart.provider_event_name(),
+            "SessionStart"
+        );
+        assert_eq!(
+            ProviderHookEvent::SubagentStop.provider_event_name(),
+            "SubagentStop"
+        );
+        assert_eq!(
+            ProviderHookEvent::parse_provider_event_name("session_start"),
+            None
+        );
+        assert_eq!(ProviderHookEvent::parse_provider_event_name("stop"), None);
+        assert_eq!(ProviderHookEvent::parse_provider_event_name(""), None);
+    }
 }

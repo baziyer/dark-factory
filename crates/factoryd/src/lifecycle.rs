@@ -5,6 +5,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     os::unix::{
+        ffi::OsStrExt,
         fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
@@ -50,9 +51,12 @@ impl DaemonInstance {
             },
         )?;
 
+        let socket = canonical_child_path(socket, "socket")?;
+        check_socket_path_length(&socket)?;
+
         Ok(Self {
             database,
-            socket: canonical_child_path(socket, "socket")?,
+            socket,
             lock_path,
             _lock_file: lock_file,
         })
@@ -322,6 +326,39 @@ fn lock_path_for(database: &Path) -> PathBuf {
     let mut path = OsString::from(database.as_os_str());
     path.push(".lock");
     PathBuf::from(path)
+}
+
+/// The kernel's `sockaddr_un.sun_path` buffer is a fixed, small array --
+/// 104 bytes on macOS/BSD, 108 on Linux -- and must hold the path plus a
+/// trailing NUL; `bind()`/`connect()` fail with a cryptic `ENAMETOOLONG`
+/// (or silently truncate, on some platforms) well past the point an
+/// operator could connect the failure to their `--socket`/
+/// `$DARK_FACTORY_SOCKET` choice. This track's item 4: fail here, at
+/// startup, with a clear, actionable error instead. Checked after
+/// canonicalization (`canonical_child_path`, above) -- what actually gets
+/// passed to `bind()` -- not the possibly-shorter path the operator typed,
+/// since a relative path or an unresolved symlink component can only make
+/// the real path longer.
+#[cfg(target_os = "macos")]
+const MAX_SOCKET_PATH_BYTES: usize = 104;
+#[cfg(not(target_os = "macos"))]
+const MAX_SOCKET_PATH_BYTES: usize = 108;
+
+fn check_socket_path_length(socket: &Path) -> io::Result<()> {
+    // `< 1` for the trailing NUL `bind()`/`connect()` themselves append;
+    // `as_bytes()` (not `.to_string_lossy().len()`) counts the exact bytes
+    // that end up in `sun_path`, since a non-UTF-8 path is still valid on
+    // this platform.
+    let byte_length = socket.as_os_str().as_bytes().len();
+    if byte_length > MAX_SOCKET_PATH_BYTES.saturating_sub(1) {
+        return Err(invalid(format!(
+            "resolved socket path {} is {byte_length} bytes, over the platform's \
+             {MAX_SOCKET_PATH_BYTES}-byte limit for a Unix socket path; pass a shorter \
+             --socket PATH or set DARK_FACTORY_SOCKET to one",
+            socket.display()
+        )));
+    }
+    Ok(())
 }
 
 fn canonical_child_path(path: &Path, label: &str) -> io::Result<PathBuf> {

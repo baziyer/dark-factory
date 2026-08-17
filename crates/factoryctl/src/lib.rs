@@ -14,6 +14,8 @@ use factory_core::{
     local::{LocalRequest, RequestEnvelope, ServerFrame},
 };
 
+pub mod update;
+
 pub use factory_core::local::MAX_LOCAL_FRAME_BYTES as MAX_FRAME_BYTES;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -93,8 +95,20 @@ impl Client {
     }
 
     pub fn request(&self, request: LocalRequest) -> Result<ServerFrame, ClientError> {
-        let stream = self.connect(request)?;
-        stream.set_read_timeout(Some(REQUEST_TIMEOUT))?;
+        self.request_with_timeout(request, REQUEST_TIMEOUT)
+    }
+
+    /// Like [`Self::request`] but with an explicit read/write timeout
+    /// instead of the default 15 seconds — e.g. `factoryctl hook`'s 5-second
+    /// fail-open budget, so a slow or wedged daemon never blocks a live
+    /// provider hook invocation.
+    pub fn request_with_timeout(
+        &self,
+        request: LocalRequest,
+        timeout: Duration,
+    ) -> Result<ServerFrame, ClientError> {
+        let stream = self.connect_with_timeout(request, timeout)?;
+        stream.set_read_timeout(Some(timeout))?;
         let mut reader = BufReader::new(stream);
         let frame = read_frame(&mut reader)?.ok_or(ClientError::UnexpectedEof)?;
         validate_frame(&frame)?;
@@ -113,9 +127,30 @@ impl Client {
         })
     }
 
+    /// Opens a persistent connection for an `AttachTerminal` request and
+    /// returns every frame the daemon sends on it (retained-then-live
+    /// `ServerFrame::TerminalOutput` for the attached run, or an error
+    /// response). The connection stays open, unbounded by any read timeout,
+    /// until the returned iterator is dropped or the daemon closes it.
+    pub fn attach_terminal(&self, request: LocalRequest) -> Result<TerminalFrames, ClientError> {
+        let stream = self.connect(request)?;
+        Ok(TerminalFrames {
+            reader: BufReader::new(stream),
+            finished: false,
+        })
+    }
+
     fn connect(&self, request: LocalRequest) -> Result<UnixStream, ClientError> {
+        self.connect_with_timeout(request, REQUEST_TIMEOUT)
+    }
+
+    fn connect_with_timeout(
+        &self,
+        request: LocalRequest,
+        timeout: Duration,
+    ) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
-        stream.set_write_timeout(Some(REQUEST_TIMEOUT))?;
+        stream.set_write_timeout(Some(timeout))?;
         write_request(&mut stream, &RequestEnvelope::new(request))?;
         Ok(stream)
     }
@@ -152,6 +187,39 @@ impl Iterator for Subscription {
                 Some(Err(ClientError::Disconnected {
                     after_sequence: self.after_sequence,
                 }))
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+/// Frames from one `AttachTerminal` connection. See [`Client::attach_terminal`].
+pub struct TerminalFrames {
+    reader: BufReader<UnixStream>,
+    finished: bool,
+}
+
+impl Iterator for TerminalFrames {
+    type Item = Result<ServerFrame, ClientError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        match read_frame(&mut self.reader) {
+            Ok(Some(frame)) => match validate_frame(&frame) {
+                Ok(()) => Some(Ok(frame)),
+                Err(error) => {
+                    self.finished = true;
+                    Some(Err(error))
+                }
+            },
+            Ok(None) => {
+                self.finished = true;
+                None
             }
             Err(error) => {
                 self.finished = true;

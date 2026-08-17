@@ -1,6 +1,4 @@
-use std::{
-    env, error::Error, ffi::OsString, io, num::NonZeroU32, path::PathBuf, sync::Arc, time::Duration,
-};
+use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
@@ -12,20 +10,17 @@ use factoryd::{
 use tokio::{net::UnixListener, sync::watch, task::JoinHandle};
 
 const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
-const CLAUDE_MAX_TURNS: NonZeroU32 = NonZeroU32::new(20).unwrap();
-const CLAUDE_MAX_BUDGET_CENTS: NonZeroU32 = NonZeroU32::new(500).unwrap();
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
-const CONNECT_GRACE: Duration = Duration::from_secs(5);
-const BATCH_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Eq, PartialEq)]
 struct Config {
     database: PathBuf,
     socket: PathBuf,
     runner: PathBuf,
-    codex: PathBuf,
-    claude: PathBuf,
+    factoryctl: PathBuf,
     runtime_root: PathBuf,
+    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
+    /// `factory_core::paths`).
+    guidance_root: PathBuf,
     max_active_runs: usize,
     webhook_config: Option<PathBuf>,
 }
@@ -37,6 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .compact()
         .init();
     let config = parse_config()?;
+    preflight_sibling_binaries(&config)?;
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
@@ -61,18 +57,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         _ => return Err("invalid webhook configuration state".into()),
     };
     let webhooks_enabled = webhooks.is_some();
+    let webhooks_bind = webhooks.as_ref().map(WebhookServer::local_addr);
+    let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
             runner_program: config.runner,
-            codex_program: config.codex,
-            claude_program: config.claude,
-            claude_max_turns: CLAUDE_MAX_TURNS,
-            claude_max_budget_cents: CLAUDE_MAX_BUDGET_CENTS,
+            factoryctl_path: config.factoryctl,
             runtime_root: config.runtime_root,
+            guidance_root: config.guidance_root,
+            socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
-            startup_timeout: STARTUP_TIMEOUT,
-            connect_grace: CONNECT_GRACE,
-            batch_delay: BATCH_DELAY,
         },
         state.clone(),
     )?;
@@ -80,10 +74,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
         database = %instance.database_path().display(),
         socket = %instance.socket_path().display(),
         webhooks_enabled,
+        webhooks_bind = webhooks_bind.map(|bind| bind.to_string()),
         "factory daemon ready"
     );
+    if let Some(bind) = webhooks_bind {
+        tracing::info!(target: "factoryd.webhook", %bind, "webhooks enabled");
+    } else {
+        tracing::info!(
+            target: "factoryd.webhook",
+            "webhooks disabled: no --webhook-config and no $DARK_FACTORY_HOME/webhooks.json"
+        );
+    }
 
-    let control_planes = serve_control_planes(listener, state, execution.clone(), webhooks);
+    let control_planes =
+        serve_control_planes(listener, state, execution.clone(), guidance_root, webhooks);
     tokio::pin!(control_planes);
     let result = tokio::select! {
         result = &mut control_planes => {
@@ -119,10 +123,17 @@ async fn serve_control_planes(
     listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: PathBuf,
     webhooks: Option<WebhookServer>,
 ) -> io::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let local = serve(listener, state, execution, wait_for_stop(stop_rx.clone()));
+    let local = serve(
+        listener,
+        state,
+        execution,
+        guidance_root,
+        wait_for_stop(stop_rx.clone()),
+    );
     let web = serve_optional_webhooks(webhooks, stop_rx);
     tokio::pin!(local);
     tokio::pin!(web);
@@ -204,23 +215,42 @@ async fn stop_execution(
 fn parse_config() -> Result<Config, Box<dyn Error>> {
     let home = factory_home()?;
     let current_executable = env::current_exe()?;
-    let runner = current_executable
+    let sibling_dir = current_executable
         .parent()
-        .ok_or("factoryd executable has no parent directory")?
-        .join("factory-runner");
+        .ok_or("factoryd executable has no parent directory")?;
+    let runner = sibling_dir.join("factory-runner");
+    let factoryctl = sibling_dir.join("factoryctl");
+    let default_webhook_config = home.join("webhooks.json");
     let config = Config {
         database: home.join("factory.db"),
         socket: env::var_os("DARK_FACTORY_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("f.sock")),
         runner,
-        codex: PathBuf::from("codex"),
-        claude: PathBuf::from("claude"),
+        factoryctl,
         runtime_root: home.join("runs"),
+        guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
         webhook_config: None,
     };
-    parse_arguments(config, env::args_os().skip(1)).map_err(Into::into)
+    let mut config = parse_arguments(config, env::args_os().skip(1))?;
+    // Webhooks are on by default: if `$DARK_FACTORY_HOME/webhooks.json`
+    // exists, load it without requiring `--webhook-config`. An explicit
+    // `--webhook-config PATH` overrides this default.
+    config.webhook_config = resolve_webhook_config(
+        config.webhook_config,
+        default_webhook_config.clone(),
+        default_webhook_config.is_file(),
+    );
+    Ok(config)
+}
+
+fn resolve_webhook_config(
+    explicit: Option<PathBuf>,
+    default_path: PathBuf,
+    default_exists: bool,
+) -> Option<PathBuf> {
+    explicit.or_else(|| default_exists.then_some(default_path))
 }
 
 fn parse_arguments(
@@ -238,11 +268,8 @@ fn parse_arguments(
             Some("--runner") => {
                 config.runner = next_path(&mut arguments, "--runner")?;
             }
-            Some("--codex") => {
-                config.codex = next_path(&mut arguments, "--codex")?;
-            }
-            Some("--claude") => {
-                config.claude = next_path(&mut arguments, "--claude")?;
+            Some("--factoryctl") => {
+                config.factoryctl = next_path(&mut arguments, "--factoryctl")?;
             }
             Some("--runtime-root") => {
                 config.runtime_root = next_path(&mut arguments, "--runtime-root")?;
@@ -265,8 +292,12 @@ fn parse_arguments(
             }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--codex PATH] [--claude PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
                 );
+                std::process::exit(0);
+            }
+            Some("--version" | "-V") => {
+                println!("factoryd {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             _ => return Err(format!("unknown argument: {}", argument.to_string_lossy())),
@@ -287,27 +318,48 @@ fn next_path(
 }
 
 fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
-    if let Some(path) = env::var_os("DARK_FACTORY_HOME") {
-        return Ok(PathBuf::from(path));
+    Ok(factory_core::paths::dark_factory_home()?)
+}
+
+/// Refuses to start with a one-line actionable error if `factory-runner`
+/// or `factoryctl` do not resolve to an executable regular file (this
+/// track's item 2): `cargo run -p factoryd` only builds `factoryd`
+/// itself, not its sibling binaries (`README.md`'s "get an agent working"
+/// walkthrough), so the previous behavior -- start fine, then fail every
+/// session spawn silently, forever, with no trace outside the daemon's own
+/// log -- was exactly the operator footgun this track's item 1 also had to
+/// repair defenses around. This is a stricter, cheaper, startup-time
+/// version of the same check `runner_process::spawn_runner` runs on every
+/// individual spawn attempt (`checked_executable`, shared here rather than
+/// duplicated).
+fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
+    for (role, path) in [
+        ("runner", &config.runner),
+        ("factoryctl", &config.factoryctl),
+    ] {
+        if let Err(error) = factoryd::runner_process::checked_executable(path, role) {
+            return Err(format!(
+                "{error}; build the workspace: cargo build --workspace"
+            ));
+        }
     }
-    let home = env::var_os("HOME").ok_or("HOME or DARK_FACTORY_HOME must be set")?;
-    Ok(PathBuf::from(home).join(".dark-factory"))
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::PathBuf};
 
-    use super::{Config, parse_arguments};
+    use super::{Config, parse_arguments, resolve_webhook_config};
 
     fn config() -> Config {
         Config {
             database: PathBuf::from("/state/factory.db"),
             socket: PathBuf::from("/state/f.sock"),
             runner: PathBuf::from("/bin/factory-runner"),
-            codex: PathBuf::from("codex"),
-            claude: PathBuf::from("claude"),
+            factoryctl: PathBuf::from("/bin/factoryctl"),
             runtime_root: PathBuf::from("/state/runs"),
+            guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
             webhook_config: None,
         }
@@ -328,10 +380,8 @@ mod tests {
             args(&[
                 "--runner",
                 "/opt/dark-factory/factory-runner",
-                "--codex",
-                "/opt/codex",
-                "--claude",
-                "/opt/claude",
+                "--factoryctl",
+                "/opt/dark-factory/factoryctl",
                 "--runtime-root",
                 "/private/runs",
                 "--max-active-runs",
@@ -343,8 +393,10 @@ mod tests {
             parsed.runner,
             PathBuf::from("/opt/dark-factory/factory-runner")
         );
-        assert_eq!(parsed.codex, PathBuf::from("/opt/codex"));
-        assert_eq!(parsed.claude, PathBuf::from("/opt/claude"));
+        assert_eq!(
+            parsed.factoryctl,
+            PathBuf::from("/opt/dark-factory/factoryctl")
+        );
         assert_eq!(parsed.runtime_root, PathBuf::from("/private/runs"));
         assert_eq!(parsed.max_active_runs, 2);
         assert!(parsed.webhook_config.is_none());
@@ -381,5 +433,26 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(duplicate, "--webhook-config may only be provided once");
+    }
+
+    #[test]
+    fn webhooks_default_on_when_the_home_config_file_exists_but_defer_to_an_explicit_path() {
+        let default_path = PathBuf::from("/state/webhooks.json");
+        assert_eq!(
+            resolve_webhook_config(None, default_path.clone(), true),
+            Some(default_path.clone())
+        );
+        assert_eq!(
+            resolve_webhook_config(None, default_path.clone(), false),
+            None
+        );
+        assert_eq!(
+            resolve_webhook_config(
+                Some(PathBuf::from("/explicit/webhooks.json")),
+                default_path,
+                true
+            ),
+            Some(PathBuf::from("/explicit/webhooks.json"))
+        );
     }
 }

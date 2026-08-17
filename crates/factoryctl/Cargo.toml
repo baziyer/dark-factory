@@ -3,11 +3,17 @@ name = "factoryctl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
-eframe = { version = "=0.32.0", default-features = false, features = ["default_fonts", "glow"] }
 factory-core = { path = "../factory-core" }
+rustix.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+signal-hook = "0.3"
+thiserror.workspace = true
+tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "process", "rt", "time"] }
 uuid.workspace = true
 
 [dev-dependencies]

@@ -1,97 +1,226 @@
 # Dark Factory
 
-A small Rust supervisor for coding-agent processes, with a disposable native
-observer. The target is closer to systemd for Claude Code and Codex than a
-desktop agent simulation.
+**Turn your backlog into progress.**
 
-The first-launch system contains a SQLite-backed daemon, stable per-run process
-sidecars, concrete Claude Code and Codex adapters, a versioned private Unix
-socket, a machine-readable v1 CLI, and an event-driven native egui UI.
-Task reservation, provider-session ownership, runner replay, terminal outcome,
-and observer health are durable. Restarting the daemon, CLI, or UI does not stop
-an agent process.
+Dark Factory is a pure-Rust, terminal-first runtime for turning a software
+backlog into continuous agent progress. It is a persistent local runtime
+for Claude Code and Codex CLI sessions (other agent CLIs later); a durable
+queue, orchestrator, and process supervisor; a specialised terminal
+multiplexer for many coding agents at once; and a detachable Ratatui
+control surface (`factory-tui`) for watching and directing them. One
+operator runs many agents from one machine. MIT-licensed
+([LICENSE](LICENSE)), built for external contributions.
 
-Provider input is bounded and sent only over stdin. Runners receive a small
-default-deny environment; provider output is decoded into bounded structural
-state and is never copied wholesale into events, logs, or webhook responses.
-On success, only the provider's bounded final answer is stored as the task
-result for capability-scoped webhook polling and snapshots.
-An optional loopback HTTP listener hosts multiple configured webhook endpoints
-with distinct secrets and projects. Subscription headroom is collected without
-an agent/model turn, normalized into deterministic severity, and visible to the
-CLI, native UI, and webhooks.
+It is **not** an Electron/Tauri/browser app, not a clone of an office
+simulation, not a new coding model, not an agent pretending to be an
+employee, and not a general agent framework. No parsing of terminal escape
+sequences when a provider exposes structured output; no automatic
+scheduling before explicit local operation earns it; no plugin framework
+or public network listener.
 
-## Non-goals
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants that constrain
+every change, and [AGENTS.md](AGENTS.md) if you're an agent (or a human)
+about to make one.
 
-- embedding agent runtimes in the UI;
-- simulating an office or rendering continuous animation;
-- parsing terminal escape sequences when a provider exposes structured output;
-- automatic scheduling before explicit local operation earns it;
-- provider-specific terminals, office animation, or a browser runtime inside
-  the UI; the native UI exposes only bounded, local runner output for direct
-  inspection and an explicit stop request for the selected run;
-- a plugin framework or public network listener in the first launch.
+## How it works, in one screen
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the invariants that constrain each
-slice.
+`factoryd` is the sole owner of every agent process. Assigning a task to an
+agent spawns (or reuses) that agent's own long-lived, PTY-backed
+`claude`/`codex`/`shell` process through `factory-runner` — one **session**
+per agent, spanning many task **episodes**, not a fresh process per task.
+Closing or rebuilding `factory-tui` or `factoryctl` never touches that
+process; killing and restarting `factoryd` itself doesn't either, because
+`factory-runner` is a detached process tree the daemon reconnects to.
 
-## Development
+Session state is driven entirely by the provider's own **hooks** — never
+by guessing from terminal output. Claude Code and Codex each call
+`factoryctl hook --token-file PATH <Event>` at defined lifecycle points
+(session start, before/after a tool call, needing input, stopping); the
+daemon normalizes these into one shared state machine. An agent marks its
+own work **done** or **blocked** the same way, from inside its session:
+`factoryctl task done`/`task blocked` — no polling, no inferred completion.
+
+Every agent gets its own git worktree (`agent/<id>`, created on `agent
+add`, removed on `agent delete`), so concurrent agents never collide in
+one working tree. Standing instructions, memory, and project guidance live
+as plain Markdown files under `$DARK_FACTORY_HOME` (Munder-Difflin style)
+rather than opaque database columns — composed into what an agent reads at
+task delivery, editable by the operator or the agent itself. SQLite is the
+durable ledger for everything else: projects, agents, tasks, runs, events,
+messages.
+
+## Install
+
+Binary-only, macOS arm64 (fetch with `curl -L`, not a browser download —
+the binaries are unsigned, and a browser adds a quarantine flag Gatekeeper
+would then act on when launchd starts `factoryd`; if you did use one, `xattr
+-dr com.apple.quarantine <dir>` clears it):
 
 ```sh
-./scripts/local-ci.sh
+# latest.json names the newest release's asset for this platform
+curl -fsSL https://github.com/baziyer/dark-factory/releases/latest/download/latest.json
+curl -L -o dark-factory.tar.gz "<the assets.aarch64-apple-darwin.url it printed>"
+mkdir dark-factory && tar -xzf dark-factory.tar.gz -C dark-factory
+./dark-factory/factoryctl init
 ```
 
-The local gate is authoritative for this repository. GitHub
-Actions is manual-only so ordinary pushes and pull requests do not consume
-hosted-runner budget.
+(Those URLs answer once the repository is public; until then only a
+source build works.)
 
-## Local control plane
+From source: `cargo build --release --workspace &&
+target/release/factoryctl init`. Either way `init` creates
+`~/.dark-factory` (`0700`), copies the four binaries next to that
+`factoryctl` into `~/.dark-factory/bin/<version>/` and points `bin/current`
+at them, reports whether `claude`/`codex`/`git` resolve, states what it
+writes outside its home (the launchd job; per-worktree pre-trust entries in
+`~/.claude.json`; an `agent/<id>` branch per agent in each project's own
+repository) and asks before touching launchd, then loads the job and waits
+for the daemon. Put `~/.dark-factory/bin/current` on your `PATH`;
+`factoryctl doctor` checks everything read-only, one line per check.
 
-Start the daemon and use `factoryctl` from another shell:
+## Quickstart
 
 ```sh
-cargo run -p factoryd
-cargo run -p factoryctl -- health
-cargo run -p factoryctl -- project add --name dark-factory --root "$PWD"
-cargo run -p factoryctl -- project list
-cargo run -p factoryctl -- agent add --project PROJECT_ID --role orchestrator --provider codex
-cargo run -p factoryctl -- task add --project PROJECT_ID --title "First task" --body "Do the work"
-cargo run -p factoryctl -- task start --project PROJECT_ID --task TASK_ID --agent AGENT_ID --worktree "$PWD"
-cargo run -p factoryctl -- usage
-cargo run -p factoryctl -- events --follow
-cargo run -p factoryctl -- ui
+cargo build --workspace          # factoryd resolves factory-runner/factoryctl
+                                  # as siblings of its own executable, not
+                                  # compile-time deps -- build the workspace once
+
+cargo run -p factoryd &           # Terminal 1 (or `factoryctl init`, above)
+
+cargo run -p factoryctl -- project add --id demo --name Demo --root "$PWD"
+cargo run -p factoryctl -- agent add --id worker-1 --project demo \
+    --role worker --provider claude
+cargo run -p factoryctl -- task add --id t1 --project demo \
+    --title "Fix the flaky test" --body "crates/foo/tests/bar.rs is racy"
+cargo run -p factoryctl -- task assign --project demo --task t1 --agent worker-1
+
+cargo run -p factory-tui           # watch it, or:
+cargo run -p factoryctl -- attach --project demo --agent worker-1   # Ctrl-] to detach
 ```
 
-For the installed local release, use `./scripts/launch-ui.sh`. It checks the
-release binary and daemon first, then keeps the native UI attached to the
-current terminal. Leave that terminal open while using the UI; `Ctrl-C` closes
-the observer only. `factoryd` is a separate launchd service and survives UI or
-CLI shutdown.
+`task assign` alone is enough — the dispatcher notices the agent has
+pending work and spawns or delivers into its session without a separate
+"start" step. A second task assigned mid-turn queues and delivers as soon
+as the current turn's `Stop` hook fires, into the *same* session. The
+orchestrator ("god") is just another agent — `--role orchestrator` instead
+of `worker` — that drives `factoryctl` itself from inside its own session.
 
-Commands emit versioned JSON frames. `task start` returns `run_accepted` once
-the task reservation is durable; runner readiness and completion arrive as
-events. Both programs use
-`$DARK_FACTORY_SOCKET`, then `$DARK_FACTORY_HOME/f.sock`, then
-`$HOME/.dark-factory/f.sock`; `--socket PATH` has highest precedence.
-List commands expose `--after` and `--limit` cursors. Event subscriptions emit
-their durable replay boundary and a `caught_up` frame before live events.
+## The CLI at a glance
 
-By default `factoryd` starts the sibling `factory-runner`, resolves `codex` and
-`claude` through the sanitized launch environment, stores runner state under
-`$DARK_FACTORY_HOME/runs`, and allows four active runs. Use `--runner`,
-`--codex`, `--claude`, `--runtime-root`, and `--max-active-runs` to set those
-explicitly. Claude runs are bounded to 20 turns and USD 5.00 in v1.
+Every command, group, and subcommand takes `--help`/`-h` and prints usage
+without contacting the daemon — that's the authoritative reference for
+exact flags. `--project` falls back to `$DARK_FACTORY_PROJECT` when unset
+(set automatically inside a session's own environment), so an agent
+coordinating via `factoryctl` from its own shell doesn't repeat its own
+identity.
 
-State is private by construction. Custom database and socket paths must each
-have an immediate parent directory owned by the current user with mode `0700`;
-files and sockets use mode `0600`. The default state directory is created with
-those permissions automatically.
+| Group | Actions |
+|---|---|
+| `health`, `usage` | check the daemon; probe Codex subscription headroom on demand |
+| `status` | the whole fleet at one instant: per-project agents with session/run/queue/inbox, unassigned queues, live sessions vs. cap, and an attention list — one store read, one JSON frame |
+| `init`, `doctor`, `update`, `version` | guided install; read-only checks; check/install a newer release; print the version |
+| `project` | `add` `list` `delete` `get` `guidance set` |
+| `task` | `add` `list` `get` `start` `retry` `assign` `cancel` `update` `delete` `done` `blocked` |
+| `agent` | `add` `list` `delete` `get` `status` `profile set` `message` `inbox` `pause` `resume` |
+| `run` | `list` `stop` |
+| `session` | `list` `stop` |
+| `attach` | attach to a session's PTY by `--session` or `--agent` |
+| `hook` | forward one provider hook invocation (called by the provider, not an operator) |
+| `events` | read durable events, optionally `--follow` |
 
-## Generic webhook endpoints
+`task done`/`task blocked` take no `--agent`: identity comes from the
+session's own environment (`$DARK_FACTORY_AGENT`), so only the agent
+itself can close out its own work.
 
-Webhooks are optional and loopback-only. `factoryd --webhook-config PATH` loads
-one owner-only (`0600`) JSON file and all endpoint secrets before it advertises
-readiness. Endpoint IDs, secrets, and projects are unique.
+`factoryctl status` and `factoryctl agent status --agent X` are the
+status surface — `factory-tui` reads the same requests (the live-session
+cap in its status line comes from `status`), and the attention taxonomy
+both use lives in one place, `factory_core::attention`. `agent status`
+adds the agent's profile and its worktree's `git status` (branch, changed
+files, dirty).
+
+## The TUI
+
+`factory-tui` is the same control surface as the CLI, plus live
+inspection: FORTRESS (spatial fleet overview) → WORKSHOP (one project's
+tasks and agent hierarchy) → TERMINALS (tiled live PTYs) → FOCUS
+(full-screen PTY with scrollback).
+
+| Key | Action |
+|---|---|
+| `1`-`4` | switch view directly |
+| `Enter`, `Esc` | zoom in / out one level |
+| `h`/`j`/`k`/`l`, arrows | FORTRESS: move the cursor over stations (empty workshops included); elsewhere `←`/`h` back, `→`/`l` in, `j`/`k` move |
+| `Tab` | cycle agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP) |
+| `[`/`]` | FORTRESS: cycle the selected workshop |
+| `n` | new task |
+| `m` / `o` | message the selected agent / the orchestrator |
+| `p` | focus a project from a list (remembered for next time; `--project` overrides) |
+| `x` | stop the selected agent (2-press confirm) |
+| `g` / `G` | jump to (and `G`: focus) the next agent needing attention |
+| `!` | WORKSHOP: needs-attention-only filter |
+| `PgUp`/`PgDn` | FOCUS: scroll terminal scrollback |
+| `Ctrl-]` | TERMINALS/FOCUS: toggle key forwarding to the pane |
+| `q` | detach — never stops the factory |
+| `?` | help overlay |
+
+See [crates/factory-tui/README.md](crates/factory-tui/README.md) for how
+agent state and attention are derived from durable daemon state.
+
+## Where state lives
+
+`$DARK_FACTORY_HOME` (default `~/.dark-factory`; `--socket`/
+`$DARK_FACTORY_SOCKET` can point the socket elsewhere):
+
+```text
+$DARK_FACTORY_HOME/
+  factory.db, f.sock, runs/           # SQLite ledger, control socket, per-session runtime dirs
+  webhooks.json                       # optional; loaded automatically if present
+  logs/                               # the launchd job's stdout/stderr
+  bin/<version>/, bin/current         # installed releases; `current` is what launchd runs
+  update-check.json                   # cached result of the last release-manifest check
+  factory-tui.json                    # the board's last focused project
+  projects/<project_id>/PROJECT.md
+  projects/<project_id>/agents/<agent_id>/instructions.md
+  projects/<project_id>/agents/<agent_id>/memory.md
+  projects/<project_id>/agents/<agent_id>/codex-home/       # seeded on first spawn
+  projects/<project_id>/agents/<agent_id>/claude-settings.json
+  projects/<project_id>/worktrees/<agent_id>/
+```
+
+Custom database/socket paths must each have a `0700` parent directory
+owned by the current user; files and sockets use `0600`. The default state
+directory is created with those permissions automatically.
+
+## Unattended operation
+
+A brand-new agent's first session never blocks on either CLI's one-time
+"trust this directory?" prompt: Dark Factory pre-trusts the worktree it
+just created (for Claude, an entry in `~/.claude.json`; for Codex, a
+`trust_level` entry in the agent's seeded `config.toml`), because that
+worktree came from the daemon itself, never from an untrusted source.
+`factoryctl` is always resolvable inside a session (its directory is
+prepended to `PATH`) and pre-approved as a Bash command prefix in Claude's
+generated settings, so an agent's own progress report never stalls on a
+permission prompt nobody is there to answer. Codex's own sandbox can still
+block an agent's *own* `factoryctl task done`/`task blocked`/`agent
+message` call even though hooks always get through; a file-based outbox
+(drained by the next hook) covers that gap. Codex agents seed their
+per-agent `CODEX_HOME` from the Codex home the daemon's environment names
+(`$CODEX_HOME`, else your own `~/.codex`) — so a factory can run on a
+different Codex account than your shell: `CODEX_HOME=~/.codex-dogfood
+codex login` once, then `CODEX_HOME=~/.codex-dogfood factoryctl init`,
+which carries it into the launchd job (`factoryctl doctor` shows which home
+is in effect). Full mechanism, including per-provider argv and generated
+config: [docs/providers.md](docs/providers.md).
+
+## The Minerva webhook endpoint
+
+Webhooks are loopback-only and serve exactly one endpoint on the
+`legacy_v1` wire shape. The listener is **on by default**: if
+`$DARK_FACTORY_HOME/webhooks.json` exists, `factoryd` loads and starts it
+automatically (`--webhook-config PATH` overrides the location). The config
+file and its referenced secret file must both be owner-only (`0600`):
 
 ```json
 {
@@ -104,49 +233,54 @@ readiness. Endpoint IDs, secrets, and projects are unique.
       "secretFile": "/absolute/private/minerva.secret",
       "projectId": "factory",
       "orchestratorAgentId": "god"
-    },
-    {
-      "id": "another-client",
-      "wireProfile": "factory_v1",
-      "secretFile": "/absolute/private/another.secret",
-      "projectId": "another-project",
-      "orchestratorAgentId": "foreman"
     }
   ]
 }
 ```
 
-The endpoint ID is the route prefix. `legacy_v1` preserves the existing Minerva
-wire aliases and header names; `factory_v1` uses
-`x-dark-factory-webhook-secret` and `x-dark-factory-webhook-token` and omits
-legacy cost placeholders. Tunnel or device exposure remains external to the
-daemon.
+Tunnel or device exposure beyond loopback is external to the daemon (see
+`ARCHITECTURE.md`'s "Deliberately unresolved").
 
-## First-launch boundary and roadmap
+## Local service, releases, and updates
 
-V1 is intentionally explicit: create projects, agents, and tasks, then choose
-the agent and worktree for each start. The native UI provides the same control
-surface as the JSON CLI plus project/task/agent/run inspection, bounded local
-runner output and stop control, assignment-derived queues, observer health,
-subscription capacity, retry for terminal tasks, and recent durable events.
+`launchd/` keeps `factoryd` running as a login service; see
+[launchd/README.md](launchd/README.md). Once installed,
+`./scripts/launch-ui.sh` checks the release binaries and daemon health,
+then keeps `factory-tui` attached to the current terminal (`Ctrl-C` closes
+the observer only — `factoryd` keeps running). Subscription headroom has no
+background service — run `factoryctl usage` on demand instead.
 
-Deferred work is narrow and evidence-led:
+Tagged releases publish macOS arm64 binaries on GitHub Releases.
+`factoryctl update` reports whether a newer one exists (and `factory-tui`
+says so in its status line, checked at most hourly); `factoryctl update
+--install` downloads and verifies it into `$DARK_FACTORY_HOME/bin/<version>`,
+repoints `bin/current`, and reloads the launchd job — only the daemon
+restarts, every running session survives. Details, rollback, and the
+compatibility rules this relies on: [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md),
+"Release and update".
 
-- scheduling and dependency-driven allocation;
-- pause controls and durable stop intent;
-- a separate agent function axis (`design`, `execution`, `operations`) shown as
-  Studio, Workshop, and Control Room, without changing the authority roles
-  `orchestrator` and `worker`;
-- optional memorable display names drawn from scientists, philosophers,
-  engineers, and artists, never used as IDs or policy;
-- richer event/activity inspection and a first-class blocked-question/document
-  workflow for generic remote clients;
-- public-network webhook deployment and additional wire profiles.
+## Development
 
-## Local service
+```sh
+./scripts/local-ci.sh
+```
 
-Templates in `launchd/` run the daemon and subscription monitor locally; they do
-not use GitHub Actions. Render placeholders to absolute canonical paths, keep
-state/config/log directories at `0700`, and install rendered plists at `0600`.
-The monitor stores only normalized allowance headroom and fixed failure
-categories—never raw provider terminal output or dollar estimates.
+is the authoritative gate (fmt, clippy at `-D warnings`, the full test
+suite, `git diff --check`); CI runs the same script on every pull
+request. See
+[AGENTS.md](AGENTS.md) for the worktree/PR/review workflow,
+[CONTRIBUTING.md](CONTRIBUTING.md) for the shortest path to a useful
+change, and [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md)
+for day-to-day daemon development and the (unimplemented) release/update
+design.
+
+## More
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — invariants.
+- [docs/providers.md](docs/providers.md) — the provider boundary and how
+  to add one.
+- [GitHub issues labelled `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue)
+  — every known problem, with its smallest fix.
+- [SECURITY.md](SECURITY.md) — what the daemon promises, and how to report
+  a vulnerability privately.
+- [ROADMAP.md](ROADMAP.md) — unfinished product direction.

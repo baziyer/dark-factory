@@ -4,34 +4,34 @@ use std::{
     fs,
     future::Future,
     io::{self, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use factory_core::{
-    AgentId, AgentSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId, RunSnapshot,
-    TaskDetail, TaskId,
+    AgentId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId, SessionId,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
-        MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
-        SubscriptionFailureCategory as LocalSubscriptionFailureCategory,
-        SubscriptionLimitWindow as LocalSubscriptionLimitWindow,
-        SubscriptionProbeOutcome as LocalSubscriptionProbeOutcome,
-        SubscriptionProviderStatus as LocalSubscriptionProviderStatus,
-        SubscriptionSeverity as LocalSubscriptionSeverity,
-        SubscriptionUsageStatus as LocalSubscriptionUsageStatus,
+        AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
+        AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
+        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail,
+        RequestEnvelope, RunTerminal, ServerFrame,
     },
     runner::{
-        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerEvent,
+        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
         RunnerEventEnvelope,
     },
+    status,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
-    sync::{Semaphore, broadcast, watch},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take},
+    net::{
+        UnixListener, UnixStream,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::{Semaphore, broadcast, mpsc, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -41,16 +41,26 @@ pub use crate::daemon_state::DaemonState as ApiState;
 use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
+    guidance::{self, GuidanceError},
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        NewAgent, NewProject, NewTask, RunControlTarget, StoreError, SubscriptionFailureCategory,
-        SubscriptionLimitWindow, SubscriptionProbe, SubscriptionProbeOutcome, SubscriptionSeverity,
+        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, SessionControlTarget,
+        StoreError, UpdateAgentProfile,
     },
 };
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+const TERMINAL_FRAME_CHANNEL_CAPACITY: usize = 64;
+/// Mirrors the `tasks.result` CHECK bound (migration 0006).
+const MAX_TASK_RESULT_BYTES: usize = 131_072;
+/// Mirrors the `tasks.blocked_reason` CHECK bound (migration 0014).
+const MAX_BLOCKED_REASON_BYTES: usize = 4096;
+/// Mirrors the `sessions.activity`/`wait_reason` CHECK bound (migration 0014).
+const MAX_HOOK_FIELD_BYTES: usize = 512;
+
+type LimitedReader = Take<BufReader<OwnedReadHalf>>;
 
 #[derive(Debug)]
 enum ApiFailure {
@@ -84,14 +94,33 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "state page limit is outside the supported range".into(),
             ),
-            Self::Store(StoreError::InvalidSubscriptionProbe) => (
+            Self::Store(StoreError::InvalidAgentProfile) => (
                 ErrorCode::InvalidRequest,
-                "subscription probe is invalid".into(),
+                "agent profile is invalid or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidAgentMessage) => (
+                ErrorCode::InvalidRequest,
+                "agent message is invalid or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidTaskResult) => (
+                ErrorCode::InvalidRequest,
+                "task result exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidBlockedReason) => (
+                ErrorCode::InvalidRequest,
+                "task blocked reason is empty or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidHookToken) => (
+                ErrorCode::InvalidRequest,
+                "hook token is not recognized".into(),
             ),
             Self::Store(StoreError::AgentNotFound) => (
                 ErrorCode::NotFound,
                 "agent was not found in the project".into(),
             ),
+            Self::Store(StoreError::ProjectNotFound) => {
+                (ErrorCode::NotFound, "project was not found".into())
+            }
             Self::Store(StoreError::TaskNotFound) => (
                 ErrorCode::NotFound,
                 "task was not found in the project".into(),
@@ -100,9 +129,21 @@ impl ApiFailure {
                 ErrorCode::NotFound,
                 "run was not found in the project".into(),
             ),
+            Self::Store(StoreError::SessionNotFound) => (
+                ErrorCode::NotFound,
+                "session was not found in the project".into(),
+            ),
             Self::Store(StoreError::TaskNotQueued) => (
                 ErrorCode::Conflict,
                 "task is not queued in the project".into(),
+            ),
+            Self::Store(StoreError::TaskNotRunning) => (
+                ErrorCode::Conflict,
+                "task is not running in the project".into(),
+            ),
+            Self::Store(StoreError::TaskAssignmentMismatch) => (
+                ErrorCode::Conflict,
+                "task is not assigned to the requesting agent".into(),
             ),
             Self::Store(StoreError::TaskNotRetryable) => (
                 ErrorCode::Conflict,
@@ -114,16 +155,28 @@ impl ApiFailure {
             ),
             Self::Store(StoreError::AgentUnavailable) => (
                 ErrorCode::Conflict,
-                "agent already has an active run".into(),
+                "agent already has an open run or live session".into(),
             ),
-            Self::Store(StoreError::ParentRunLineageMismatch) => (
+            Self::Store(StoreError::SessionAlreadyLive) => (
                 ErrorCode::Conflict,
-                "parent run does not match the agent hierarchy".into(),
+                "agent already has a live session".into(),
             ),
-            Self::Store(StoreError::CapacityReached { .. }) => (
-                ErrorCode::Conflict,
-                "active execution capacity has been reached".into(),
-            ),
+            Self::Store(StoreError::SessionNotLive) => {
+                (ErrorCode::Conflict, "session is not live".into())
+            }
+            Self::Store(
+                error @ (StoreError::TaskNotCancellable
+                | StoreError::TaskNotEditable
+                | StoreError::TaskHasActiveRun
+                | StoreError::TaskHasSubtasks
+                | StoreError::TaskRunHasDependents
+                | StoreError::AgentHasActiveRun
+                | StoreError::AgentHasLiveSession
+                | StoreError::AgentHasChildren
+                | StoreError::AgentRunHasDependents
+                | StoreError::ProjectHasActiveRun
+                | StoreError::RunNotStoppable),
+            ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
             }
@@ -137,19 +190,26 @@ impl ApiFailure {
 impl From<execution::Error> for ApiFailure {
     fn from(error: execution::Error) -> Self {
         match error {
-            execution::Error::InvalidWorktree | execution::Error::NonUtf8Path => {
-                Self::Invalid("task worktree must be an existing UTF-8 directory".into())
-            }
-            execution::Error::StartBackpressure => {
-                Self::Conflict("too many execution starts are in progress".into())
+            execution::Error::NoLiveSession => Self::Conflict(
+                "agent has no live session yet; it will be spawned once it has queued work, or \
+                 try again shortly"
+                    .into(),
+            ),
+            execution::Error::SessionBusy => Self::Conflict(
+                "agent's live session is not idle; the task stays queued and will \
+                                 be delivered once it is"
+                    .into(),
+            ),
+            execution::Error::NoWorktree => {
+                Self::Invalid("agent has no worktree; create one first".into())
             }
             execution::Error::State(DaemonStateError::Store(
                 error @ (StoreError::AgentNotFound
-                | StoreError::AgentProviderMismatch
                 | StoreError::TaskNotQueued
+                | StoreError::TaskAssignmentMismatch
                 | StoreError::AgentUnavailable
-                | StoreError::ParentRunLineageMismatch
-                | StoreError::CapacityReached { .. }),
+                | StoreError::SessionNotFound
+                | StoreError::SessionNotLive),
             )) => Self::Store(error),
             _ => Self::Internal("execution manager could not accept the task".into()),
         }
@@ -160,11 +220,13 @@ pub async fn serve<F>(
     listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: PathBuf,
     shutdown: F,
 ) -> io::Result<()>
 where
     F: Future<Output = ()>,
 {
+    let guidance_root = Arc::new(guidance_root);
     tokio::pin!(shutdown);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -186,11 +248,12 @@ where
                 };
                 let state = state.clone();
                 let execution = execution.clone();
+                let guidance_root = Arc::clone(&guidance_root);
                 let shutdown = stop_rx.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, state, execution, shutdown).await
+                        handle_connection(stream, state, execution, guidance_root, shutdown).await
                     {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
@@ -217,6 +280,7 @@ async fn handle_connection(
     stream: UnixStream,
     state: ApiState,
     execution: execution::Handle,
+    guidance_root: Arc<PathBuf>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -244,34 +308,12 @@ async fn handle_connection(
     }
     payload.pop();
 
-    let envelope: RequestEnvelope = match serde_json::from_slice(&payload) {
-        Ok(envelope) => envelope,
-        Err(_) => {
-            return write_response(
-                &mut write,
-                LocalResponse::Error {
-                    code: ErrorCode::InvalidRequest,
-                    message: "request is not valid local protocol JSON".into(),
-                },
-            )
-            .await;
-        }
+    let request = match parse_envelope(&payload) {
+        Ok(request) => request,
+        Err(response) => return write_response(&mut write, *response).await,
     };
-    if envelope.protocol_version != PROTOCOL_VERSION {
-        return write_response(
-            &mut write,
-            LocalResponse::Error {
-                code: ErrorCode::UnsupportedProtocol,
-                message: format!(
-                    "protocol {} is unsupported; this daemon speaks {}",
-                    envelope.protocol_version, PROTOCOL_VERSION
-                ),
-            },
-        )
-        .await;
-    }
 
-    if let LocalRequest::Subscribe { after_sequence } = envelope.request {
+    if let LocalRequest::Subscribe { after_sequence } = request {
         if after_sequence < 0 {
             return write_response(
                 &mut write,
@@ -289,22 +331,314 @@ async fn handle_connection(
         };
     }
 
-    let response = handle_request(&state, &execution, envelope.request)
+    if let LocalRequest::AttachTerminal {
+        project_id,
+        session_id,
+        since_offset,
+    } = request
+    {
+        let session_shutdown = shutdown.clone();
+        return tokio::select! {
+            biased;
+            _ = shutdown.changed() => Ok(()),
+            result = terminal_attach_session(
+                limited,
+                write,
+                state.clone(),
+                session_shutdown,
+                project_id,
+                session_id,
+                since_offset,
+            ) => result,
+        };
+    }
+
+    let response = handle_request(&state, &execution, &guidance_root, request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
 }
 
+fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
+    let envelope: RequestEnvelope = serde_json::from_slice(payload).map_err(|_| {
+        Box::new(LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            message: "request is not valid local protocol JSON".into(),
+        })
+    })?;
+    if envelope.protocol_version != PROTOCOL_VERSION {
+        return Err(Box::new(LocalResponse::Error {
+            code: ErrorCode::UnsupportedProtocol,
+            message: format!(
+                "protocol {} is unsupported; this daemon speaks {}",
+                envelope.protocol_version, PROTOCOL_VERSION
+            ),
+        }));
+    }
+    Ok(envelope.request)
+}
+
+/// Persistent multiplexed connection for one or more `AttachTerminal`
+/// sessions: `ServerFrame::TerminalOutput` for every attached session
+/// (tagged by `session_id`) is interleaved onto the same connection. Only
+/// further `AttachTerminal` requests are accepted on it; anything else gets
+/// an error response. Detaching happens implicitly on client disconnect,
+/// which drops this function's `JoinSet` and aborts every attached
+/// forwarding task.
+#[allow(clippy::too_many_arguments)]
+async fn terminal_attach_session(
+    mut reader: LimitedReader,
+    mut write: OwnedWriteHalf,
+    state: ApiState,
+    mut shutdown: watch::Receiver<bool>,
+    project_id: ProjectId,
+    session_id: SessionId,
+    since_offset: u64,
+) -> io::Result<()> {
+    let (frame_tx, mut frame_rx) = mpsc::channel::<ServerFrame>(TERMINAL_FRAME_CHANNEL_CAPACITY);
+    let mut attaches = JoinSet::new();
+    spawn_terminal_attach(
+        &mut attaches,
+        state.clone(),
+        frame_tx.clone(),
+        project_id,
+        session_id,
+        since_offset,
+    );
+
+    let mut payload = Vec::new();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => return Ok(()),
+            frame = frame_rx.recv() => {
+                let Some(frame) = frame else { return Ok(()); };
+                write_frame(&mut write, &frame).await?;
+            }
+            Some(_) = attaches.join_next(), if !attaches.is_empty() => {}
+            result = read_next_line(&mut reader, &mut payload) => {
+                let Some(line) = result? else { return Ok(()); };
+                match parse_envelope(&line) {
+                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset }) => {
+                        spawn_terminal_attach(
+                            &mut attaches,
+                            state.clone(),
+                            frame_tx.clone(),
+                            project_id,
+                            session_id,
+                            since_offset,
+                        );
+                    }
+                    Ok(_) => {
+                        write_response(
+                            &mut write,
+                            LocalResponse::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: "only AttachTerminal is accepted on an attached \
+                                          terminal connection"
+                                    .into(),
+                            },
+                        )
+                        .await?;
+                    }
+                    Err(response) => write_response(&mut write, *response).await?,
+                }
+            }
+        }
+    }
+}
+
+fn spawn_terminal_attach(
+    attaches: &mut JoinSet<()>,
+    state: ApiState,
+    frame_tx: mpsc::Sender<ServerFrame>,
+    project_id: ProjectId,
+    session_id: SessionId,
+    since_offset: u64,
+) {
+    attaches.spawn(async move {
+        let lookup_project_id = project_id.clone();
+        let lookup_session_id = session_id.clone();
+        let target = match state
+            .with_store(move |store| {
+                store.session_control_target(&lookup_project_id, &lookup_session_id)
+            })
+            .await
+        {
+            Ok(target) => target,
+            Err(error) => {
+                let _ =
+                    send_terminal_error(&frame_tx, ApiFailure::from(error).into_response()).await;
+                return;
+            }
+        };
+        let control_run_id = match session_control_run_id(&session_id) {
+            Ok(run_id) => run_id,
+            Err(failure) => {
+                let _ = send_terminal_error(&frame_tx, failure.into_response()).await;
+                return;
+            }
+        };
+        let client = RunnerClient::new(
+            &target.runner_runtime,
+            control_run_id,
+            target.runner_instance_id,
+        );
+        let mut subscription = match client.attach_terminal(since_offset).await {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                let response = runner_control_failure(error, "attach terminal").into_response();
+                let _ = send_terminal_error(&frame_tx, response).await;
+                return;
+            }
+        };
+        loop {
+            match subscription.next_chunk().await {
+                Ok((offset, bytes)) => {
+                    let frame = ServerFrame::TerminalOutput {
+                        protocol_version: PROTOCOL_VERSION,
+                        session_id: session_id.clone(),
+                        offset,
+                        bytes,
+                    };
+                    if frame_tx.send(frame).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let response = runner_control_failure(error, "attach terminal").into_response();
+                    let _ = send_terminal_error(&frame_tx, response).await;
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn send_terminal_error(
+    frame_tx: &mpsc::Sender<ServerFrame>,
+    response: LocalResponse,
+) -> Result<(), mpsc::error::SendError<ServerFrame>> {
+    frame_tx
+        .send(ServerFrame::Response {
+            protocol_version: PROTOCOL_VERSION,
+            response,
+        })
+        .await
+}
+
+/// Reads one more newline-delimited frame from an already-open connection,
+/// resetting the per-frame size limit each time so a long-lived connection
+/// is not bounded by the *cumulative* bytes it has ever read.
+async fn read_next_line(
+    reader: &mut LimitedReader,
+    payload: &mut Vec<u8>,
+) -> io::Result<Option<Vec<u8>>> {
+    payload.clear();
+    reader.set_limit((MAX_LOCAL_FRAME_BYTES + 2) as u64);
+    let read = reader.read_until(b'\n', payload).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if payload.last() != Some(&b'\n') || payload.len() - 1 > MAX_LOCAL_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "request must be one newline-terminated JSON frame of at most 1 MiB",
+        ));
+    }
+    payload.pop();
+    Ok(Some(std::mem::take(payload)))
+}
+
 async fn handle_request(
     state: &ApiState,
     execution: &execution::Handle,
+    guidance_root: &Path,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
-        LocalRequest::Health => Ok(LocalResponse::Health),
+        LocalRequest::Health => Ok(LocalResponse::Health {
+            runner_path: execution.runner_program().to_string_lossy().into_owned(),
+            factoryctl_path: execution.factoryctl_path().to_string_lossy().into_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }),
+        LocalRequest::FleetStatus => {
+            let live_session_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
+            let (projects, live_sessions, generated_at_ms) = state
+                .with_store(move |store| {
+                    Ok((
+                        store.fleet_status()?,
+                        store.live_session_count()?,
+                        now_ms()?,
+                    ))
+                })
+                .await?;
+            let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
+            let at_capacity = live_sessions >= live_session_cap;
+            let mut attention = Vec::new();
+            let projects = projects
+                .into_iter()
+                .map(|rows| {
+                    let crate::store::ProjectStatusRows {
+                        project,
+                        agents,
+                        unassigned,
+                        blocked,
+                    } = rows;
+                    attention.extend(status::attention_items(
+                        &project.id,
+                        &agents,
+                        &blocked,
+                        at_capacity,
+                    ));
+                    status::ProjectStatus {
+                        project,
+                        agents,
+                        unassigned_queue_depth: u32::try_from(unassigned.len()).unwrap_or(u32::MAX),
+                        unassigned_queue: unassigned
+                            .into_iter()
+                            .take(status::MAX_QUEUE_PREVIEW)
+                            .collect(),
+                    }
+                })
+                .collect();
+            status::sort_attention(&mut attention);
+            Ok(LocalResponse::FleetStatus {
+                status: status::FleetStatus {
+                    generated_at_ms,
+                    live_session_cap,
+                    live_sessions,
+                    projects,
+                    attention,
+                },
+            })
+        }
+        LocalRequest::AgentStatus {
+            project_id,
+            agent_id,
+        } => {
+            let lookup_project_id = project_id.clone();
+            let lookup_agent_id = agent_id.clone();
+            let agent_status = state
+                .with_store(move |store| store.agent_status(&lookup_project_id, &lookup_agent_id))
+                .await?;
+            let detail =
+                agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?;
+            let worktree = match agent_status.agent.worktree.as_deref() {
+                Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
+                None => None,
+            };
+            Ok(LocalResponse::AgentStatus {
+                status: Box::new(status::AgentStatusDetail {
+                    status: agent_status,
+                    detail,
+                    worktree,
+                }),
+            })
+        }
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
             let root = canonical_root(root).await?;
+            let project_id = id.clone();
             let project = state
                 .commit_and_publish(move |store| {
                     let (project, event) =
@@ -312,6 +646,7 @@ async fn handle_request(
                     Ok((project, vec![event]))
                 })
                 .await?;
+            ensure_project_guidance(guidance_root, &project_id).await?;
             Ok(LocalResponse::ProjectCreated { project })
         }
         LocalRequest::ListProjects { after_id, limit } => {
@@ -319,7 +654,7 @@ async fn handle_request(
             let mut projects = state
                 .with_store(move |store| store.list_projects(after_id.as_ref(), limit + 1))
                 .await?;
-            let next_after_id = next_project_cursor(&mut projects, limit);
+            let next_after_id = next_cursor(&mut projects, limit, |project| project.id.clone());
             Ok(LocalResponse::Projects {
                 projects,
                 next_after_id,
@@ -363,10 +698,18 @@ async fn handle_request(
             parent_agent_id,
             role,
             provider,
+            model,
+            worktree,
         } => {
+            let worktree = match worktree {
+                Some(worktree) => Some(validate_agent_worktree(worktree).await?),
+                None => None,
+            };
+            let created_project_id = project_id.clone();
+            let created_agent_id = id.clone();
             let agent = state
                 .commit_and_publish(move |store| {
-                    let (agent, event) = store.create_agent(
+                    let (agent, event) = store.create_agent_with_model(
                         NewAgent {
                             id,
                             project_id,
@@ -374,11 +717,42 @@ async fn handle_request(
                             role,
                             provider,
                         },
+                        model,
                         now_ms()?,
                     )?;
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            let resolved_worktree = match worktree {
+                Some(worktree) => Some(worktree),
+                None => Some(
+                    provision_agent_worktree(
+                        state,
+                        guidance_root,
+                        &created_project_id,
+                        &created_agent_id,
+                    )
+                    .await?,
+                ),
+            };
+            let agent = if let Some(worktree) = resolved_worktree {
+                let worktree_project_id = created_project_id.clone();
+                let worktree_agent_id = created_agent_id.clone();
+                state
+                    .commit_and_publish(move |store| {
+                        let (agent, event) = store.set_agent_worktree(
+                            &worktree_project_id,
+                            &worktree_agent_id,
+                            worktree,
+                            now_ms()?,
+                        )?;
+                        Ok((agent, vec![event]))
+                    })
+                    .await?
+            } else {
+                agent
+            };
+            ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
             Ok(LocalResponse::AgentCreated { agent })
         }
         LocalRequest::ListAgents {
@@ -392,9 +766,130 @@ async fn handle_request(
                     store.list_agents(&project_id, after_id.as_ref(), limit + 1)
                 })
                 .await?;
-            let next_after_id = next_agent_cursor(&mut agents, limit);
+            let next_after_id = next_cursor(&mut agents, limit, |agent| agent.id.clone());
             Ok(LocalResponse::Agents {
                 agents,
+                next_after_id,
+            })
+        }
+        LocalRequest::GetAgent {
+            project_id,
+            agent_id,
+        } => Ok(LocalResponse::Agent {
+            agent: agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?,
+        }),
+        LocalRequest::UpdateAgentProfile {
+            project_id,
+            agent_id,
+            model,
+            permission_mode,
+            instructions,
+            memory,
+        } => {
+            let store_project_id = project_id.clone();
+            let store_agent_id = agent_id.clone();
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.update_agent_profile(
+                        &store_project_id,
+                        &store_agent_id,
+                        UpdateAgentProfile {
+                            model,
+                            permission_mode,
+                        },
+                        now_ms()?,
+                    )?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
+            write_guidance_file(agent_paths.instructions.clone(), instructions.clone()).await?;
+            write_guidance_file(agent_paths.memory.clone(), memory.clone()).await?;
+            Ok(LocalResponse::AgentProfileUpdated {
+                agent: local_agent_detail(agent, instructions, memory, agent_paths),
+            })
+        }
+        LocalRequest::GetProject { project_id } => {
+            let lookup_project_id = project_id.clone();
+            let project = state
+                .with_store(move |store| store.get_project(&lookup_project_id))
+                .await?;
+            let guidance_path =
+                factory_core::paths::project_guidance_path(guidance_root, &project_id);
+            let guidance = read_guidance_file(guidance_path.clone()).await?;
+            Ok(LocalResponse::Project {
+                project: local_project_detail(project, guidance, guidance_path),
+            })
+        }
+        LocalRequest::UpdateProjectGuidance { project_id, text } => {
+            if text.len() > guidance::MAX_GUIDANCE_FILE_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "project guidance must be at most {} bytes",
+                    guidance::MAX_GUIDANCE_FILE_BYTES
+                )));
+            }
+            let lookup_project_id = project_id.clone();
+            let project = state
+                .with_store(move |store| store.get_project(&lookup_project_id))
+                .await?;
+            let guidance_path =
+                factory_core::paths::project_guidance_path(guidance_root, &project_id);
+            write_guidance_file(guidance_path.clone(), text.clone()).await?;
+            Ok(LocalResponse::ProjectGuidanceUpdated {
+                project: local_project_detail(project, text, guidance_path),
+            })
+        }
+        LocalRequest::SendAgentMessage {
+            id,
+            project_id,
+            sender_agent_id,
+            recipient_agent_id,
+            body,
+        } => {
+            if body.len() > MAX_AGENT_MESSAGE_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "agent message must be at most {MAX_AGENT_MESSAGE_BYTES} bytes"
+                )));
+            }
+            let wake_project_id = project_id.clone();
+            let wake_agent_id = recipient_agent_id.clone();
+            let message = state
+                .commit_and_publish(move |store| {
+                    let message = store.send_agent_message(NewAgentMessage {
+                        id,
+                        project_id,
+                        sender_agent_id,
+                        recipient_agent_id,
+                        body,
+                        created_at_ms: now_ms()?,
+                    })?;
+                    Ok((message, Vec::new()))
+                })
+                .await?;
+            execution.wake(wake_project_id, wake_agent_id);
+            Ok(LocalResponse::AgentMessageSent {
+                message: local_agent_message(message),
+            })
+        }
+        LocalRequest::ListAgentMessages {
+            project_id,
+            agent_id,
+            after_id,
+            limit,
+        } => {
+            let limit = page_limit("agent message", limit, MAX_AGENT_PAGE_ITEMS)?;
+            let messages = state
+                .with_store(move |store| {
+                    store.list_agent_messages(&project_id, &agent_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let mut messages = messages
+                .into_iter()
+                .map(local_agent_message)
+                .collect::<Vec<_>>();
+            let next_after_id = next_cursor(&mut messages, limit, |message| message.id.clone());
+            Ok(LocalResponse::AgentMessages {
+                messages,
                 next_after_id,
             })
         }
@@ -405,6 +900,23 @@ async fn handle_request(
             parent_run_id,
             worktree,
         } => {
+            let worktree = match worktree {
+                Some(worktree) => worktree,
+                None => {
+                    let lookup_project_id = project_id.clone();
+                    let lookup_agent_id = agent_id.clone();
+                    let agent = state
+                        .with_store(move |store| {
+                            store.get_agent_detail(&lookup_project_id, &lookup_agent_id)
+                        })
+                        .await?;
+                    agent.snapshot.worktree.ok_or_else(|| {
+                        ApiFailure::Invalid(
+                            "agent has no worktree; pass one explicitly or set one first".into(),
+                        )
+                    })?
+                }
+            };
             let started = execution
                 .start_task(StartTask {
                     project_id,
@@ -429,7 +941,7 @@ async fn handle_request(
                     store.list_tasks(&project_id, after_id.as_ref(), limit + 1)
                 })
                 .await?;
-            let next_after_id = next_task_cursor(&mut tasks, limit);
+            let next_after_id = next_cursor(&mut tasks, limit, |task| task.snapshot.id.clone());
             Ok(LocalResponse::Tasks {
                 tasks,
                 next_after_id,
@@ -448,19 +960,115 @@ async fn handle_request(
             project_id,
             task_id,
         } => {
+            let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) = store.retry_task(&project_id, &task_id, now_ms()?)?;
                     Ok((task, vec![event]))
                 })
                 .await?;
+            if let Some(agent_id) = task.snapshot.assigned_agent_id.clone() {
+                execution.wake(wake_project_id, agent_id);
+            }
             Ok(LocalResponse::TaskRetried { task })
+        }
+        LocalRequest::CancelTask {
+            project_id,
+            task_id,
+        } => {
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) = store.cancel_task(&project_id, &task_id, now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskCancelled { task })
+        }
+        LocalRequest::UpdateTask {
+            project_id,
+            task_id,
+            title,
+            body,
+        } => {
+            if title.is_none() && body.is_none() {
+                return Err(ApiFailure::Invalid(
+                    "task update must include title or body".into(),
+                ));
+            }
+            let title = title
+                .map(|title| required_text("task title", title, 240))
+                .transpose()?;
+            if let Some(body) = body.as_ref() {
+                if body.len() > MAX_TASK_BODY_BYTES {
+                    return Err(ApiFailure::Invalid(format!(
+                        "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
+                    )));
+                }
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) =
+                        store.update_task(&project_id, &task_id, title, body, now_ms()?)?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskUpdated { task })
+        }
+        LocalRequest::DeleteTask {
+            project_id,
+            task_id,
+        } => {
+            let response_project_id = project_id.clone();
+            let response_task_id = task_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let event = store.delete_task(&project_id, &task_id, now_ms()?)?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::TaskDeleted {
+                project_id: response_project_id,
+                task_id: response_task_id,
+            })
+        }
+        LocalRequest::DeleteAgent {
+            project_id,
+            agent_id,
+        } => {
+            let response_project_id = project_id.clone();
+            let response_agent_id = agent_id.clone();
+            remove_agent_worktree_if_any(state, &response_project_id, &response_agent_id).await?;
+            state
+                .commit_and_publish(move |store| {
+                    let events = store.delete_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok(((), events))
+                })
+                .await?;
+            remove_agent_guidance(guidance_root, &response_project_id, &response_agent_id).await;
+            Ok(LocalResponse::AgentDeleted {
+                project_id: response_project_id,
+                agent_id: response_agent_id,
+            })
+        }
+        LocalRequest::DeleteProject { project_id } => {
+            let response_project_id = project_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let event = store.delete_project(&project_id, now_ms()?)?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            remove_project_guidance(guidance_root, &response_project_id).await;
+            Ok(LocalResponse::ProjectDeleted {
+                project_id: response_project_id,
+            })
         }
         LocalRequest::AssignTask {
             project_id,
             task_id,
             agent_id,
         } => {
+            let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) =
@@ -468,6 +1076,9 @@ async fn handle_request(
                     Ok((task, vec![event]))
                 })
                 .await?;
+            if let Some(agent_id) = task.snapshot.assigned_agent_id.clone() {
+                execution.wake(wake_project_id, agent_id);
+            }
             Ok(LocalResponse::TaskAssigned { task })
         }
         LocalRequest::GetRunTerminal { project_id, run_id } => {
@@ -490,19 +1101,330 @@ async fn handle_request(
                     "runner stop grace must be at most 60000 ms".into(),
                 ));
             }
+            let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
             let target = state
-                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
+                .with_store(move |store| {
+                    store.run_control_target(&lookup_project_id, &lookup_run_id)
+                })
                 .await?;
+            let control_run_id = run_id.clone();
             RunnerClient::new(
                 &target.runner_runtime,
-                run_id.clone(),
+                control_run_id,
                 target.runner_instance_id,
             )
             .stop(grace_ms)
             .await
-            .map_err(runner_control_failure)?;
+            .map_err(|error| runner_control_failure(error, "stop"))?;
+            let stop_project_id = project_id.clone();
+            let stop_run_id = run_id.clone();
+            let run = state
+                .commit_and_publish(move |store| {
+                    let (run, event) =
+                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
+                    Ok((run, vec![event]))
+                })
+                .await?;
+            // A run's process *is* its session's: `StopRun` kills the same
+            // runner `StopSession` would (above), so it must also record
+            // stop intent on the session, not just the run -- otherwise
+            // `end_session` (fired once the runner actually exits) cannot
+            // tell this apart from a crash and would wrongly close the
+            // episode `failed`/`session_ended` instead of
+            // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
+            if let Some(session_id) = run.session_id.clone() {
+                let session_project_id = project_id.clone();
+                let _ = state
+                    .commit_and_publish(move |store| {
+                        let (session, event) = store.request_session_stop(
+                            &session_project_id,
+                            &session_id,
+                            now_ms()?,
+                        )?;
+                        Ok((session, vec![event]))
+                    })
+                    .await;
+            }
             Ok(LocalResponse::RunStopped { run_id })
+        }
+        LocalRequest::CancelRun { project_id, run_id } => {
+            let response_run_id = run_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let closed = store.cancel_run(&project_id, &run_id, now_ms()?)?;
+                    Ok(((), closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::RunCancelled {
+                run_id: response_run_id,
+            })
+        }
+        LocalRequest::CompleteTask {
+            project_id,
+            task_id,
+            result,
+        } => {
+            if result.len() > MAX_TASK_RESULT_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
+                )));
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
+                    Ok((closed.task, closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::TaskCompleted { task })
+        }
+        LocalRequest::BlockTask {
+            project_id,
+            task_id,
+            reason,
+        } => {
+            if reason.is_empty() || reason.len() > MAX_BLOCKED_REASON_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
+                )));
+            }
+            let task = state
+                .commit_and_publish(move |store| {
+                    let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
+                    Ok((closed.task, closed.events))
+                })
+                .await?;
+            Ok(LocalResponse::TaskBlocked { task })
+        }
+        LocalRequest::PauseAgent {
+            project_id,
+            agent_id,
+        } => {
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.pause_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentPaused { agent })
+        }
+        LocalRequest::ResumeAgent {
+            project_id,
+            agent_id,
+        } => {
+            let wake_project_id = project_id.clone();
+            let wake_agent_id = agent_id.clone();
+            let agent = state
+                .commit_and_publish(move |store| {
+                    let (agent, event) = store.resume_agent(&project_id, &agent_id, now_ms()?)?;
+                    Ok((agent, vec![event]))
+                })
+                .await?;
+            execution.wake(wake_project_id, wake_agent_id);
+            Ok(LocalResponse::AgentResumed { agent })
+        }
+        LocalRequest::ListSessions {
+            project_id,
+            after_id,
+            limit,
+        } => {
+            let limit = session_page_limit(limit)?;
+            let mut sessions = state
+                .with_store(move |store| {
+                    store.list_sessions(&project_id, after_id.as_ref(), limit + 1)
+                })
+                .await?;
+            let next_after_id = next_cursor(&mut sessions, limit, |session| session.id.clone());
+            Ok(LocalResponse::Sessions {
+                sessions,
+                next_after_id,
+            })
+        }
+        LocalRequest::StopSession {
+            project_id,
+            session_id,
+            grace_ms,
+        } => {
+            if grace_ms > 60_000 {
+                return Err(ApiFailure::Invalid(
+                    "runner stop grace must be at most 60000 ms".into(),
+                ));
+            }
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
+            let target = state
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
+            let stop_project_id = project_id.clone();
+            let stop_session_id = session_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (session, event) = store.request_session_stop(
+                        &stop_project_id,
+                        &stop_session_id,
+                        now_ms()?,
+                    )?;
+                    Ok((session, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::SessionStopped { session_id })
+        }
+        LocalRequest::ProviderHook {
+            token,
+            event,
+            payload,
+        } => {
+            if token.is_empty() || token.len() > 4096 {
+                return Err(ApiFailure::Invalid("hook token is invalid".into()));
+            }
+            let lookup_token = token.clone();
+            let session = state
+                .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
+                .await?
+                .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
+            let project_id = session.project_id.clone();
+            let agent_id = session.agent_id.clone();
+            let session_id = session.id;
+            let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
+            let record_session_id = session_id.clone();
+            let updated_session = state
+                .commit_and_publish(move |store| {
+                    let (session, event_envelope) = store.record_hook_event(
+                        &record_session_id,
+                        event,
+                        activity,
+                        inferred,
+                        wait_reason,
+                        now_ms()?,
+                    )?;
+                    Ok((session, vec![event_envelope]))
+                })
+                .await?;
+            let reply = if matches!(
+                event,
+                ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
+            ) {
+                let stop_hook_active = payload
+                    .get("stop_hook_active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                execution::stop_hook_reply(state, guidance_root, &updated_session, stop_hook_active)
+                    .await?
+            } else {
+                serde_json::json!({})
+            };
+            if event == ProviderHookEvent::UserPromptSubmit {
+                // Commit any pending PTY-typed delivery *now*, before this
+                // hook request's own reply reaches the client -- closes a
+                // race a fast-reacting client can otherwise win against
+                // the dispatcher's own separate ack-detection/commit
+                // (`execution::commit_pending_delivery_on_prompt`'s own
+                // doc comment has the full story; this track's item 1).
+                execution::commit_pending_delivery_on_prompt(
+                    state,
+                    guidance_root,
+                    &updated_session,
+                )
+                .await?;
+            }
+            if event == ProviderHookEvent::SessionStart {
+                // Codex reports its own thread id back in this hook's
+                // payload (a Claude-shaped `session_id` field -- its
+                // `--session-id` is instead assigned by the daemon up
+                // front, so `Store::create_session` already set it there;
+                // see `TRACK5-DESIGN.md` §1 and `TRACK5D` item 5).
+                // Unconditional for every provider: `set_provider_session_id`
+                // is a no-op once a session already carries one, which
+                // Claude's and a resumed session's already do.
+                if let Some(provider_session_id) = payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let identify_session_id = session_id.clone();
+                    let identify_provider_session_id = provider_session_id.to_owned();
+                    state
+                        .commit_and_publish(move |store| {
+                            match store.set_provider_session_id(
+                                &identify_session_id,
+                                &identify_provider_session_id,
+                                now_ms()?,
+                            )? {
+                                Some((_, event)) => Ok(((), vec![event])),
+                                None => Ok(((), Vec::new())),
+                            }
+                        })
+                        .await?;
+                }
+                // Proof the CLI is up: an agent's very first delivery is
+                // PTY-typed (idle-session path), which needs this hook to
+                // have fired at least once before typing anything
+                // (TRACK5-DESIGN.md §3); anything queued before the session
+                // finished booting is picked up here rather than waiting
+                // for the 5 second safety tick.
+                execution.wake(project_id, agent_id);
+            }
+            Ok(LocalResponse::ProviderHookReply { reply })
+        }
+        LocalRequest::AttachTerminal { .. } => {
+            unreachable!("AttachTerminal is handled per connection")
+        }
+        LocalRequest::TerminalInput {
+            project_id,
+            session_id,
+            bytes,
+        } => {
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
+            let target = state
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .terminal_input(bytes)
+            .await
+            .map_err(|error| runner_control_failure(error, "terminal input"))?;
+            Ok(LocalResponse::TerminalInputAccepted { session_id })
+        }
+        LocalRequest::ResizeTerminal {
+            project_id,
+            session_id,
+            cols,
+            rows,
+        } => {
+            let lookup_project_id = project_id.clone();
+            let lookup_session_id = session_id.clone();
+            let target = state
+                .with_store(move |store| {
+                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .resize_terminal(cols, rows)
+            .await
+            .map_err(|error| runner_control_failure(error, "resize terminal"))?;
+            Ok(LocalResponse::TerminalResized { session_id })
         }
         LocalRequest::ListRuns {
             project_id,
@@ -513,7 +1435,7 @@ async fn handle_request(
             let mut runs = state
                 .with_store(move |store| store.list_runs(&project_id, after_id.as_ref(), limit + 1))
                 .await?;
-            let next_after_id = next_run_cursor(&mut runs, limit);
+            let next_after_id = next_cursor(&mut runs, limit, |run| run.id.clone());
             Ok(LocalResponse::Runs {
                 runs,
                 next_after_id,
@@ -537,150 +1459,390 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::EventHead { sequence })
         }
-        LocalRequest::SubscriptionUsage => {
-            let snapshot = state
-                .with_store(|store| store.subscription_usage_snapshot())
-                .await?;
-            Ok(LocalResponse::SubscriptionUsage {
-                usage: LocalSubscriptionUsageStatus {
-                    overall_severity: local_subscription_severity(snapshot.overall_severity),
-                    providers: snapshot
-                        .providers
-                        .into_iter()
-                        .map(|provider| LocalSubscriptionProviderStatus {
-                            provider: provider.provider,
-                            last_attempt_at_ms: provider.last_attempt_at_ms,
-                            last_success_at_ms: provider.last_success_at_ms,
-                            used_percent: provider.used_percent,
-                            limit_window: provider.limit_window.map(local_subscription_window),
-                            resets_at_ms: provider.resets_at_ms,
-                            exhausted: provider.exhausted,
-                            severity: local_subscription_severity(provider.severity),
-                            consecutive_failures: provider.consecutive_failures,
-                        })
-                        .collect(),
-                },
-            })
-        }
-        LocalRequest::RecordSubscriptionProbe {
-            project_id,
-            orchestrator_agent_id,
-            provider,
-            attempted_at_ms,
-            outcome,
-            notification_task_id,
-        } => {
-            let outcome = store_subscription_outcome(outcome);
-            let committed = state
-                .commit_and_publish(move |store| {
-                    let committed = store.record_subscription_probe(SubscriptionProbe {
-                        project_id,
-                        orchestrator_agent_id,
-                        provider,
-                        attempted_at_ms,
-                        outcome,
-                        notification_task_id,
-                    })?;
-                    let response = (
-                        committed.state.provider,
-                        local_subscription_severity(committed.state.severity),
-                        committed.state.consecutive_failures,
-                        committed.notification_created,
-                    );
-                    Ok((response, committed.events))
-                })
-                .await?;
-            Ok(LocalResponse::SubscriptionProbeRecorded {
-                provider: committed.0,
-                severity: committed.1,
-                consecutive_failures: committed.2,
-                notification_created: committed.3,
-            })
-        }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
     }
 }
 
-const fn store_subscription_outcome(
-    outcome: LocalSubscriptionProbeOutcome,
-) -> SubscriptionProbeOutcome {
-    match outcome {
-        LocalSubscriptionProbeOutcome::Observed {
-            used_percent,
-            limit_window,
-            resets_at_ms,
-            exhausted,
-        } => SubscriptionProbeOutcome::Observed {
-            used_percent,
-            limit_window: match limit_window {
-                LocalSubscriptionLimitWindow::Primary => SubscriptionLimitWindow::Primary,
-                LocalSubscriptionLimitWindow::Secondary => SubscriptionLimitWindow::Secondary,
-                LocalSubscriptionLimitWindow::CurrentSession => {
-                    SubscriptionLimitWindow::CurrentSession
-                }
-                LocalSubscriptionLimitWindow::CurrentWeek => SubscriptionLimitWindow::CurrentWeek,
-            },
-            resets_at_ms,
-            exhausted,
+/// Absolute guidance-file paths for one agent, computed from the daemon's
+/// state root; never touches the filesystem itself.
+struct AgentGuidancePaths {
+    instructions: PathBuf,
+    memory: PathBuf,
+    project_guidance: PathBuf,
+}
+
+impl AgentGuidancePaths {
+    fn new(guidance_root: &Path, project_id: &ProjectId, agent_id: &AgentId) -> Self {
+        Self {
+            instructions: factory_core::paths::agent_instructions_path(
+                guidance_root,
+                project_id,
+                agent_id,
+            ),
+            memory: factory_core::paths::agent_memory_path(guidance_root, project_id, agent_id),
+            project_guidance: factory_core::paths::project_guidance_path(guidance_root, project_id),
+        }
+    }
+}
+
+/// The agent's durable row plus its guidance files' current contents and
+/// paths — what `GetAgent` returns and `AgentStatus` embeds.
+async fn agent_detail_with_guidance(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<LocalAgentDetail, ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let lookup_agent_id = agent_id.clone();
+    let agent = state
+        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
+        .await?;
+    let agent_paths = AgentGuidancePaths::new(guidance_root, project_id, agent_id);
+    let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
+    let memory = read_guidance_file(agent_paths.memory.clone()).await?;
+    Ok(local_agent_detail(agent, instructions, memory, agent_paths))
+}
+
+fn local_agent_detail(
+    agent: crate::store::AgentDetail,
+    instructions: String,
+    memory: String,
+    paths: AgentGuidancePaths,
+) -> LocalAgentDetail {
+    LocalAgentDetail {
+        snapshot: agent.snapshot,
+        profile: LocalAgentProfile {
+            model: agent.profile.model,
+            permission_mode: agent.profile.permission_mode,
+            instructions,
+            memory,
+            updated_at_ms: agent.profile.updated_at_ms,
         },
-        LocalSubscriptionProbeOutcome::Failed { category } => SubscriptionProbeOutcome::Failed {
-            category: match category {
-                LocalSubscriptionFailureCategory::Timeout => SubscriptionFailureCategory::Timeout,
-                LocalSubscriptionFailureCategory::Protocol => SubscriptionFailureCategory::Protocol,
-                LocalSubscriptionFailureCategory::Process => SubscriptionFailureCategory::Process,
-                LocalSubscriptionFailureCategory::OutputLimit => {
-                    SubscriptionFailureCategory::OutputLimit
-                }
-                LocalSubscriptionFailureCategory::Unavailable => {
-                    SubscriptionFailureCategory::Unavailable
-                }
-            },
-        },
+        instructions_path: path_to_string(&paths.instructions),
+        memory_path: path_to_string(&paths.memory),
+        project_guidance_path: path_to_string(&paths.project_guidance),
     }
 }
 
-const fn local_subscription_severity(severity: SubscriptionSeverity) -> LocalSubscriptionSeverity {
-    match severity {
-        SubscriptionSeverity::Ok => LocalSubscriptionSeverity::Ok,
-        SubscriptionSeverity::Warning => LocalSubscriptionSeverity::Warning,
-        SubscriptionSeverity::Critical => LocalSubscriptionSeverity::Critical,
+fn local_project_detail(
+    project: ProjectSnapshot,
+    guidance: String,
+    guidance_path: PathBuf,
+) -> LocalProjectDetail {
+    LocalProjectDetail {
+        snapshot: project,
+        guidance,
+        guidance_path: path_to_string(&guidance_path),
     }
 }
 
-const fn local_subscription_window(
-    window: SubscriptionLimitWindow,
-) -> LocalSubscriptionLimitWindow {
-    match window {
-        SubscriptionLimitWindow::Primary => LocalSubscriptionLimitWindow::Primary,
-        SubscriptionLimitWindow::Secondary => LocalSubscriptionLimitWindow::Secondary,
-        SubscriptionLimitWindow::CurrentSession => LocalSubscriptionLimitWindow::CurrentSession,
-        SubscriptionLimitWindow::CurrentWeek => LocalSubscriptionLimitWindow::CurrentWeek,
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Reads a guidance file on the blocking pool, lazily creating it if absent.
+async fn read_guidance_file(path: PathBuf) -> Result<String, ApiFailure> {
+    tokio::task::spawn_blocking(move || guidance::read_or_create(&path))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Atomically overwrites a guidance file on the blocking pool.
+async fn write_guidance_file(path: PathBuf, text: String) -> Result<(), ApiFailure> {
+    tokio::task::spawn_blocking(move || guidance::write(&path, &text))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Idempotently creates a project's guidance directory and empty
+/// `PROJECT.md` on the blocking pool.
+async fn ensure_project_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+) -> Result<(), ApiFailure> {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    tokio::task::spawn_blocking(move || guidance::ensure_project(&home, &project_id))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Idempotently creates an agent's guidance directory, empty
+/// `instructions.md`, and empty `memory.md` on the blocking pool.
+async fn ensure_agent_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), ApiFailure> {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let agent_id = agent_id.clone();
+    tokio::task::spawn_blocking(move || guidance::ensure_agent(&home, &project_id, &agent_id))
+        .await
+        .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
+        .map_err(ApiFailure::from)
+}
+
+/// Resolves the worktree a newly created agent should get when `agent add`
+/// did not pass `--worktree` explicitly (D3, `TRACK5-WIRE.md`): a fresh
+/// `git worktree add -b agent/<agent_id>` under
+/// `agent_worktree_dir(guidance_root, project_id, agent_id)` from the
+/// project root's current `HEAD` when the project root is a git repo,
+/// else the project root itself. A `git worktree add` failure (a real one,
+/// not "branch already exists" -- `worktrees::add` already retries that)
+/// falls back to the project root rather than blocking agent creation
+/// entirely: a working root beats no agent at all.
+async fn provision_agent_worktree(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<String, ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&lookup_project_id))
+        .await?;
+    let project_root = PathBuf::from(&project.root);
+    if !crate::worktrees::is_git_repo(&project_root).await {
+        return Ok(project.root);
+    }
+    let worktree_dir = factory_core::paths::agent_worktree_dir(guidance_root, project_id, agent_id);
+    let branch = format!("agent/{}", agent_id.as_str());
+    match crate::worktrees::add(&project_root, &worktree_dir, &branch).await {
+        Ok(()) => Ok(path_to_string(&worktree_dir)),
+        Err(error) => {
+            tracing::warn!(
+                %error, %project_id, %agent_id,
+                "git worktree add failed; using the project root instead"
+            );
+            Ok(project.root)
+        }
     }
 }
 
-fn runner_control_failure(error: RunnerClientError) -> ApiFailure {
+/// Best-effort recursive removal of one agent's guidance directory, run
+/// after `DeleteAgent`'s transaction has already committed. The ledger row
+/// is gone either way, so a filesystem failure here is logged and otherwise
+/// ignored rather than surfaced to the caller.
+async fn remove_agent_guidance(guidance_root: &Path, project_id: &ProjectId, agent_id: &AgentId) {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let agent_id = agent_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || guidance::remove_agent(&home, &project_id, &agent_id))
+            .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to remove agent guidance directory after delete");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "guidance worker panicked while removing agent guidance directory");
+        }
+    }
+}
+
+/// Removes an agent's git worktree before `DeleteAgent`'s transaction
+/// commits (D3, `TRACK5-WIRE.md`): dirty refuses the whole request
+/// (`ApiFailure::Conflict`), matching the design's "unless dirty ->
+/// Conflict" -- the agent row and its worktree must not diverge. A missing
+/// worktree (already removed by hand) or one that equals the project root
+/// (the `provision_agent_worktree` fallback: not a git repo, or `git
+/// worktree add` itself failed at creation time -- nothing separate to
+/// remove either way) is a no-op. Any other git failure is logged and
+/// otherwise ignored: getting the agent row deleted matters more than a
+/// stray leftover directory the operator can clean up by hand.
+async fn remove_agent_worktree_if_any(
+    state: &ApiState,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let lookup_agent_id = agent_id.clone();
+    let agent = state
+        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
+        .await?;
+    let Some(worktree) = agent.snapshot.worktree else {
+        return Ok(());
+    };
+    let lookup_project_id = project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&lookup_project_id))
+        .await?;
+    let project_root = PathBuf::from(&project.root);
+    let worktree_path = PathBuf::from(&worktree);
+    if worktree_path == project_root || !worktree_path.exists() {
+        return Ok(());
+    }
+    match crate::worktrees::remove(&project_root, &worktree_path).await {
+        Ok(()) => Ok(()),
+        Err(crate::worktrees::WorktreeError::Dirty) => Err(ApiFailure::Conflict(
+            "agent worktree has modified or untracked files; commit, discard, or remove it \
+             manually with `git worktree remove --force` before deleting the agent"
+                .into(),
+        )),
+        Err(error) => {
+            tracing::warn!(
+                %error, %project_id, %agent_id,
+                "git worktree remove failed; deleting the agent anyway"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Best-effort recursive removal of one project's guidance directory, run
+/// after `DeleteProject`'s transaction has already committed. See
+/// [`remove_agent_guidance`] for why failures are only logged.
+async fn remove_project_guidance(guidance_root: &Path, project_id: &ProjectId) {
+    let home = guidance_root.to_path_buf();
+    let project_id = project_id.clone();
+    let result =
+        tokio::task::spawn_blocking(move || guidance::remove_project(&home, &project_id)).await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to remove project guidance directory after delete");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "guidance worker panicked while removing project guidance directory");
+        }
+    }
+}
+
+impl From<GuidanceError> for ApiFailure {
+    fn from(error: GuidanceError) -> Self {
+        match error {
+            GuidanceError::TooLarge { .. } | GuidanceError::InvalidText => {
+                Self::Invalid(error.to_string())
+            }
+            GuidanceError::NotUtf8 { .. }
+            | GuidanceError::Directory { .. }
+            | GuidanceError::File { .. } => Self::Internal(error.to_string()),
+        }
+    }
+}
+
+fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
+    LocalAgentMessage {
+        id: message.id,
+        project_id: message.project_id,
+        sender_agent_id: message.sender_agent_id,
+        recipient_agent_id: message.recipient_agent_id,
+        body: message.body,
+        created_at_ms: message.created_at_ms,
+        delivered_at_ms: message.delivered_at_ms,
+    }
+}
+
+/// Validates an operator-supplied agent worktree override (D3): must be an
+/// absolute, existing directory. Creating the git worktree itself is
+/// execution's job; this only records the path.
+async fn validate_agent_worktree(worktree: String) -> Result<String, ApiFailure> {
+    if !Path::new(&worktree).is_absolute() {
+        return Err(ApiFailure::Invalid(
+            "agent worktree must be an absolute path".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        if !Path::new(&worktree).is_dir() {
+            return Err(ApiFailure::Invalid(
+                "agent worktree must be an existing directory".into(),
+            ));
+        }
+        Ok(worktree)
+    })
+    .await
+    .map_err(|error| ApiFailure::Internal(format!("worktree check worker failed: {error}")))?
+}
+
+fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {
+    // `ListSessions.limit` is `Option<usize>` (every other `List*` request
+    // takes a required `u32`, defaulted client-side instead): a caller that
+    // omits it gets this default rather than the wire max.
+    const DEFAULT_SESSION_PAGE: usize = 100;
+    let limit = limit.unwrap_or(DEFAULT_SESSION_PAGE);
+    if !(1..=MAX_SESSION_PAGE_ITEMS as usize).contains(&limit) {
+        return Err(ApiFailure::Invalid(format!(
+            "session page limit must be between 1 and {MAX_SESSION_PAGE_ITEMS}"
+        )));
+    }
+    Ok(limit)
+}
+
+/// Computes the `record_hook_event` inputs for one hook event from its
+/// opaque JSON payload: `tool_name` for `PreToolUse`, `message` for
+/// `Notification`; every other event carries no payload-derived field.
+fn compute_hook_fields(
+    event: ProviderHookEvent,
+    payload: &serde_json::Value,
+) -> (Option<String>, bool, Option<String>) {
+    match event {
+        ProviderHookEvent::SessionStart | ProviderHookEvent::Stop => (None, false, None),
+        ProviderHookEvent::UserPromptSubmit | ProviderHookEvent::PostToolUse => {
+            (Some("thinking".into()), true, None)
+        }
+        ProviderHookEvent::PreToolUse => {
+            let tool_name = payload
+                .get("tool_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (
+                Some(bounded_hook_field(&format!("tool: {tool_name}"))),
+                false,
+                None,
+            )
+        }
+        ProviderHookEvent::Notification => {
+            let message = payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("waiting for input");
+            (None, false, Some(bounded_hook_field(message)))
+        }
+        ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => (None, false, None),
+    }
+}
+
+fn bounded_hook_field(value: &str) -> String {
+    if value.len() <= MAX_HOOK_FIELD_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_HOOK_FIELD_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {
     match error {
         RunnerClientError::RunnerRejected {
-            code: factory_core::runner::RunnerErrorCode::Conflict,
-        } => ApiFailure::Conflict("runner rejected the stop request".into()),
+            code: RunnerErrorCode::Conflict,
+        } => ApiFailure::Conflict(format!("runner rejected the {action} request")),
+        RunnerClientError::RunnerRejected {
+            code: RunnerErrorCode::InvalidRequest,
+        } => ApiFailure::Invalid(format!("runner rejected the {action} request")),
         RunnerClientError::InvalidStopGrace { found } => ApiFailure::Invalid(format!(
             "runner stop grace must be at most 60000 ms, got {found}"
         )),
-        _ => ApiFailure::Internal("runner control request failed".into()),
+        _ => ApiFailure::Internal(format!("runner {action} request failed")),
     }
 }
 
-fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerminal, ApiFailure> {
+fn read_run_terminal(
+    target: &SessionControlTarget,
+    run_id: RunId,
+) -> Result<RunTerminal, ApiFailure> {
     let spool_path = PathBuf::from(&target.runner_runtime).join("events.ndjson");
     let file = match fs::File::open(spool_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(RunTerminal {
-                run_id,
-                head_sequence: 0,
-                output: String::new(),
-                truncated: false,
-            });
+            return Err(ApiFailure::Store(StoreError::RunNotFound));
         }
         Err(_) => {
             return Err(ApiFailure::Internal(
@@ -716,10 +1878,14 @@ fn read_run_terminal(target: &RunControlTarget, run_id: RunId) -> Result<RunTerm
         let event: RunnerEventEnvelope = match serde_json::from_slice(line) {
             Ok(event) => event,
             Err(_) if !terminated && index + 1 == line_count => break,
+            // A malformed non-final line means a concurrent writer left a
+            // torn record behind (the spool is append-only, so this cannot
+            // be later "fixed" by more appends); degrade to a truncated
+            // read of whatever was durably complete before it rather than
+            // failing the whole request.
             Err(_) => {
-                return Err(ApiFailure::Internal(
-                    "runner terminal spool is invalid".into(),
-                ));
+                truncated = true;
+                break;
             }
         };
         if event.protocol_version != factory_core::runner::RUNNER_PROTOCOL_VERSION {
@@ -966,36 +2132,24 @@ fn page_limit(label: &str, limit: u32, maximum: u32) -> Result<usize, ApiFailure
     Ok(limit as usize)
 }
 
-fn next_project_cursor(projects: &mut Vec<ProjectSnapshot>, limit: usize) -> Option<ProjectId> {
-    if projects.len() <= limit {
+/// If `items` overflowed `limit` (the store always fetches one extra row to
+/// detect this), drop that extra row and return the cursor to resume from.
+fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> Id) -> Option<Id> {
+    if items.len() <= limit {
         return None;
     }
-    projects.pop();
-    projects.last().map(|project| project.id.clone())
+    items.pop();
+    items.last().map(id)
 }
 
-fn next_task_cursor(tasks: &mut Vec<TaskDetail>, limit: usize) -> Option<TaskId> {
-    if tasks.len() <= limit {
-        return None;
-    }
-    tasks.pop();
-    tasks.last().map(|task| task.snapshot.id.clone())
-}
-
-fn next_agent_cursor(agents: &mut Vec<AgentSnapshot>, limit: usize) -> Option<AgentId> {
-    if agents.len() <= limit {
-        return None;
-    }
-    agents.pop();
-    agents.last().map(|agent| agent.id.clone())
-}
-
-fn next_run_cursor(runs: &mut Vec<RunSnapshot>, limit: usize) -> Option<RunId> {
-    if runs.len() <= limit {
-        return None;
-    }
-    runs.pop();
-    runs.last().map(|run| run.id.clone())
+/// The runner protocol still keys control requests by `RunId` (see
+/// `factory_core::runner`); `SessionId` and `RunId` share the same
+/// charset/length validation, so a session's own id doubles as its
+/// runner-facing identity until that protocol grows a session concept of
+/// its own.
+fn session_control_run_id(session_id: &SessionId) -> Result<RunId, ApiFailure> {
+    RunId::try_from(session_id.as_str())
+        .map_err(|_| ApiFailure::Internal("session id is not runner-addressable".into()))
 }
 
 fn now_ms() -> Result<i64, StoreError> {

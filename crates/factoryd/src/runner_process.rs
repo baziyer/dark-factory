@@ -10,7 +10,10 @@ use std::{
     time::Duration,
 };
 
-use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
+use factory_core::{
+    RunId, RunnerInstanceId,
+    runner::{MAX_STARTUP_STDIN_BYTES, TerminalSize},
+};
 use tokio::{
     io::AsyncWriteExt,
     process::{Child, Command},
@@ -20,6 +23,32 @@ const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
     "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
 ];
 
+/// The only names a session's `session_environment` may set. Fixed for every
+/// provider (`DARK_FACTORY_AGENT`/`DARK_FACTORY_PROJECT`/`DARK_FACTORY_SOCKET`/
+/// `DARK_FACTORY_SESSION_TOKEN_FILE`, so an agent's own `factoryctl`
+/// invocations — `task done`, `agent message`, ... — pick up a sender
+/// identity, per TRACK5-WIRE.md) plus two additions: `DARK_FACTORY_AGENT_DIR`
+/// (this agent's guidance directory, already inside a Codex session's
+/// `writable_roots` — see `factory_core::paths::agent_dir` — so `factoryctl
+/// task done`/`task blocked`/`agent message` can fall back to writing a
+/// queued request there when the daemon socket itself is unreachable from
+/// inside a sandboxed provider; `docs/providers.md`'s "Sandboxed providers:
+/// the outbox") and `DARK_FACTORY_FACTORYCTL` (the shell provider's hook
+/// subprocess has no generated config file to embed a trusted `factoryctl`
+/// path in, unlike Claude's `--settings` file or Codex's seeded
+/// `config.toml`, so it needs this instead —
+/// `providers::shell::ShellProvider`). This is a closed list, not a
+/// passthrough: a provider constructing `LaunchSpec` cannot smuggle in an
+/// arbitrary environment variable.
+const SESSION_ENVIRONMENT_NAMES: [&str; 6] = [
+    "DARK_FACTORY_AGENT",
+    "DARK_FACTORY_PROJECT",
+    "DARK_FACTORY_SOCKET",
+    "DARK_FACTORY_SESSION_TOKEN_FILE",
+    "DARK_FACTORY_AGENT_DIR",
+    "DARK_FACTORY_FACTORYCTL",
+];
+
 /// Everything needed to launch one provider command under `factory-runner`.
 ///
 /// This deliberately has no `Debug` or `Clone` implementation because it owns
@@ -27,6 +56,16 @@ const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
 pub struct LaunchSpec {
     /// Trusted absolute path to the installed stable runner executable.
     pub runner_program: PathBuf,
+    /// Trusted absolute path to `factoryctl`. For a terminal-mode launch,
+    /// its directory is prepended to the provider process's `PATH` (see
+    /// [`apply_runner_environment`]) so a session's own bare `factoryctl`
+    /// invocations (the composed delivery text's "when finished, run:
+    /// `factoryctl task done ...`", or an operator typing it directly)
+    /// resolve regardless of the operator's shell configuration, matching
+    /// `docs/providers.md`'s "provider A1" resolution note. Unused for a
+    /// non-terminal launch (dead in practice: every resident session is
+    /// terminal-mode, `execution.rs`'s `spawn_session_for_agent`).
+    pub factoryctl_path: PathBuf,
     /// Provider executable path or name to resolve from the captured `PATH`.
     pub provider_program: PathBuf,
     /// Non-secret provider flags. These are observable in process metadata and
@@ -35,11 +74,20 @@ pub struct LaunchSpec {
     /// Closed provider-specific environment additions. Ambient values are
     /// never forwarded implicitly.
     pub provider_environment: ProviderEnvironment,
+    /// Fixed-name daemon-set additions on top of [`SAFE_ENVIRONMENT_NAMES`]
+    /// and `provider_environment`; every name must appear in
+    /// [`SESSION_ENVIRONMENT_NAMES`] or [`spawn_runner`] rejects the launch
+    /// before spawning anything.
+    pub session_environment: Vec<(String, String)>,
     pub run_id: RunId,
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
     pub startup_input: Vec<u8>,
+    /// When `Some`, the runner spawns the provider under a PTY of this size
+    /// instead of piped stdout/stderr, and `startup_input` is not sent (it
+    /// must be empty; interactive programs take input from the operator).
+    pub terminal: Option<TerminalSize>,
 }
 
 /// The only provider-specific environment additions allowed across the
@@ -63,6 +111,8 @@ pub enum Error {
         actual_bytes: usize,
         maximum_bytes: usize,
     },
+    #[error("terminal-mode launches must not carry startup input")]
+    TerminalModeWithStartupInput,
     #[error("runner executable path {program:?} must be absolute")]
     RunnerPathNotAbsolute { program: PathBuf },
     #[error("{role} executable {program:?} was not found")]
@@ -83,6 +133,8 @@ pub enum Error {
     StartupInputTimedOut,
     #[error("provider environment is invalid")]
     InvalidProviderEnvironment,
+    #[error("session environment variable {name:?} is not in the allowed set")]
+    InvalidSessionEnvironment { name: String },
 }
 
 struct StartupChild {
@@ -194,6 +246,14 @@ async fn spawn_runner_with_environment_and_timeout(
             maximum_bytes: MAX_STARTUP_STDIN_BYTES,
         });
     }
+    if spec.terminal.is_some() && !spec.startup_input.is_empty() {
+        return Err(Error::TerminalModeWithStartupInput);
+    }
+    for (name, _) in &spec.session_environment {
+        if !SESSION_ENVIRONMENT_NAMES.contains(&name.as_str()) {
+            return Err(Error::InvalidSessionEnvironment { name: name.clone() });
+        }
+    }
 
     if !spec.runner_program.is_absolute() {
         return Err(Error::RunnerPathNotAbsolute {
@@ -203,8 +263,17 @@ async fn spawn_runner_with_environment_and_timeout(
     let runner = checked_executable(&spec.runner_program, "runner")?;
     let provider = resolve_executable(&spec.provider_program, &environment, "provider")?;
     let provider_environment = resolve_provider_environment(&spec.provider_environment)?;
-    let input_length = spec.startup_input.len().to_string();
+    let terminal = spec.terminal;
     let mut command = Command::new(runner);
+    // The runner is its own process-group leader: a session must outlive
+    // whatever started the daemon. Without this, launchd's default
+    // behaviour on `bootout`/`kickstart -k` (and a terminal's Ctrl-C) kills
+    // every process in the daemon's group -- every runner and, with it,
+    // every session -- which `ARCHITECTURE.md` invariant 4 forbids. Verified
+    // on macOS: a same-group child dies with the job, a group leader of its
+    // own survives it (see docs/development/WORKFLOW.md, "Release and
+    // update", and `factoryd_process_group_kill_does_not_take_sessions`).
+    command.process_group(0);
     command
         .arg("--run-id")
         .arg(spec.run_id.as_str())
@@ -213,53 +282,121 @@ async fn spawn_runner_with_environment_and_timeout(
         .arg("--runtime-dir")
         .arg(spec.runtime_dir)
         .arg("--cwd")
-        .arg(spec.cwd)
-        .arg("--stdin-bytes")
-        .arg(input_length)
+        .arg(spec.cwd);
+    match terminal {
+        Some(size) => {
+            command
+                .arg("--terminal-cols")
+                .arg(size.cols.to_string())
+                .arg("--terminal-rows")
+                .arg(size.rows.to_string());
+        }
+        None => {
+            command
+                .arg("--stdin-bytes")
+                .arg(spec.startup_input.len().to_string());
+        }
+    }
+    command
         .arg("--")
         .arg(provider)
         .args(spec.provider_arguments)
-        .stdin(Stdio::piped());
-    apply_runner_environment(&mut command, &environment);
+        .stdin(if terminal.is_some() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        });
+    apply_runner_environment(
+        &mut command,
+        &environment,
+        &spec.factoryctl_path,
+        terminal.is_some(),
+    );
     apply_provider_environment(&mut command, provider_environment.as_deref());
+    for (name, value) in &spec.session_environment {
+        command.env(name, value);
+    }
 
     let mut child = StartupChild::new(command.spawn().map_err(Error::Spawn)?);
-    let mut stdin = child
-        .child_mut()
-        .stdin
-        .take()
-        .expect("factory-runner was configured with piped stdin");
-    let write_result = match startup_timeout {
-        Some(limit) => {
-            match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    drop(stdin);
-                    child.kill_and_reap().await;
-                    return Err(Error::StartupInputTimedOut);
+    if terminal.is_none() {
+        let mut stdin = child
+            .child_mut()
+            .stdin
+            .take()
+            .expect("factory-runner was configured with piped stdin");
+        let write_result = match startup_timeout {
+            Some(limit) => {
+                match tokio::time::timeout(limit, stdin.write_all(&spec.startup_input)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        drop(stdin);
+                        child.kill_and_reap().await;
+                        return Err(Error::StartupInputTimedOut);
+                    }
                 }
             }
+            None => stdin.write_all(&spec.startup_input).await,
+        };
+        if let Err(error) = write_result {
+            drop(stdin);
+            child.kill_and_reap().await;
+            return Err(Error::StartupInput(error));
         }
-        None => stdin.write_all(&spec.startup_input).await,
-    };
-    if let Err(error) = write_result {
         drop(stdin);
-        child.kill_and_reap().await;
-        return Err(Error::StartupInput(error));
     }
-    drop(stdin);
     Ok(child.into_child())
 }
 
-fn apply_runner_environment(command: &mut Command, environment: &CapturedEnvironment) {
+fn apply_runner_environment(
+    command: &mut Command,
+    environment: &CapturedEnvironment,
+    factoryctl_path: &Path,
+    terminal: bool,
+) {
     command.env_clear();
     for (name, value) in &environment.values {
         command.env(name, value);
     }
-    command
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .env("GIT_TERMINAL_PROMPT", "0");
+    if terminal {
+        // Interactive programs need a real terminal type; forcing color off
+        // and TERM=dumb (the non-interactive default below) would break
+        // their rendering.
+        command.env("TERM", "xterm-256color");
+        // A resident session's own `factoryctl` invocations (the composed
+        // delivery text's `factoryctl task done ...`, or an operator typing
+        // it directly) use a bare name, not the daemon's trusted absolute
+        // path -- that path is only threaded into *generated hook commands*
+        // (`providers::hooks::hook_command`), which the provider's hook
+        // subprocess invokes directly and so never needs `PATH` resolution
+        // for. Prepend `factoryctl`'s own directory to `PATH` so the bare
+        // name still resolves inside the session regardless of whether the
+        // operator's own shell configuration happens to put it there.
+        if let Some(directory) = factoryctl_path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+        {
+            command.env(
+                "PATH",
+                prepend_to_path(directory, environment.value("PATH")),
+            );
+        }
+    } else {
+        command.env("NO_COLOR", "1").env("TERM", "dumb");
+    }
+    command.env("GIT_TERMINAL_PROMPT", "0");
+}
+
+/// Prepends `directory` to a `PATH` value, keeping any existing entries
+/// after it so ambient tools (`git`, `sh`, ...) stay resolvable. Falls back
+/// to `directory` alone if joining somehow fails (an entry containing the
+/// platform's path-list separator, practically unreachable for a
+/// daemon-controlled directory).
+fn prepend_to_path(directory: &Path, existing: Option<&OsStr>) -> OsString {
+    let mut entries = vec![directory.to_path_buf()];
+    if let Some(existing) = existing {
+        entries.extend(env::split_paths(existing));
+    }
+    env::join_paths(entries).unwrap_or_else(|_| directory.as_os_str().to_owned())
 }
 
 fn apply_provider_environment(command: &mut Command, codex_home: Option<&Path>) {
@@ -274,12 +411,29 @@ fn resolve_provider_environment(
     match environment {
         ProviderEnvironment::Inherited => Ok(None),
         ProviderEnvironment::CodexHome(home) => {
+            // Reject `.`/`..` navigation outright rather than trying to
+            // prove any particular occurrence is harmless (defense in
+            // depth against a path shaped to look like one directory while
+            // actually landing somewhere else): `home` must already be in
+            // lexically normal form. This is deliberately *not* the same
+            // check as "already equals its own canonicalized form" --
+            // found manually against a real session (this track's item 6
+            // check): a `home` under `$DARK_FACTORY_HOME=/tmp/...` legally
+            // and lexically normal, yet never byte-equal to its
+            // canonicalized form, because `/tmp` itself is a symlink to
+            // `/private/tmp` on macOS. That is an ancestor directory the
+            // operating system manages, not anything a provider or an
+            // attacker chose; rejecting it here made every Codex session
+            // spawn fail whenever the daemon's own state lived under such
+            // a path.
+            if has_dot_or_dot_dot_component(home) {
+                return Err(Error::InvalidProviderEnvironment);
+            }
             let metadata =
                 fs::symlink_metadata(home).map_err(|_| Error::InvalidProviderEnvironment)?;
             let canonical =
                 fs::canonicalize(home).map_err(|_| Error::InvalidProviderEnvironment)?;
-            if canonical != *home
-                || metadata.file_type().is_symlink()
+            if metadata.file_type().is_symlink()
                 || !is_owned_directory(&metadata, rustix::process::geteuid().as_raw())
             {
                 return Err(Error::InvalidProviderEnvironment);
@@ -287,6 +441,17 @@ fn resolve_provider_environment(
             Ok(Some(canonical))
         }
     }
+}
+
+/// Whether `path` has a literal `.` or `..` path component -- checked
+/// lexically, not by resolving anything on disk.
+fn has_dot_or_dot_dot_component(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    })
 }
 
 fn is_owned_directory(metadata: &fs::Metadata, expected_uid: u32) -> bool {
@@ -330,7 +495,14 @@ fn resolve_executable(
     }
 }
 
-fn checked_executable(program: &Path, role: &'static str) -> Result<PathBuf, Error> {
+/// Confirms `program` (a trusted absolute path -- no `PATH` search, unlike
+/// [`resolve_executable`]) resolves to an executable regular file. `pub`
+/// (not just crate-visible) so `factoryd`'s own startup preflight
+/// (`main.rs`) can run the exact same check against `factory-runner`/
+/// `factoryctl` before claiming any daemon state, turning a would-be
+/// silent spawn failure at first task delivery into a refusal to start
+/// (this track's item 2).
+pub fn checked_executable(program: &Path, role: &'static str) -> Result<PathBuf, Error> {
     let canonical = match fs::canonicalize(program) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -376,9 +548,10 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        CapturedEnvironment, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
-        apply_runner_environment, is_owned_directory, resolve_executable,
-        spawn_runner_with_environment, spawn_runner_with_environment_and_timeout,
+        CapturedEnvironment, Error, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
+        apply_runner_environment, has_dot_or_dot_dot_component, is_owned_directory,
+        resolve_executable, spawn_runner_with_environment,
+        spawn_runner_with_environment_and_timeout,
     };
 
     fn id<T>(value: &str) -> T
@@ -459,14 +632,17 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
     fn spec(directory: &Path, task: Vec<u8>) -> LaunchSpec {
         LaunchSpec {
             runner_program: directory.join("runner-probe"),
+            factoryctl_path: directory.join("factoryctl-probe"),
             provider_program: PathBuf::from("provider-probe"),
             provider_arguments: vec![OsString::from("--safe-provider-flag")],
             provider_environment: ProviderEnvironment::Inherited,
+            session_environment: Vec::new(),
             run_id: id::<RunId>("run-safe-launch"),
             runner_instance_id: id::<RunnerInstanceId>("runner-safe-launch"),
             runtime_dir: directory.join("runtime"),
             cwd: directory.to_owned(),
             startup_input: task,
+            terminal: None,
         }
     }
 
@@ -498,7 +674,12 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             .env("LD_PRELOAD", "/secret/library.so")
             .stdout(Stdio::piped());
 
-        apply_runner_environment(&mut command, &captured);
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            false,
+        );
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         let output = String::from_utf8(output.stdout).unwrap();
@@ -565,6 +746,59 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(!provider_env.contains("/ambient/codex-home-secret"));
     }
 
+    /// Regression test (found manually against a real session, this
+    /// track's item 6 check): a `CodexHome` under an *ancestor* symlink
+    /// (not a symlink itself) must still be accepted, using its
+    /// canonicalized form -- `$DARK_FACTORY_HOME=/tmp/...` is exactly this
+    /// shape on macOS, where `/tmp` is itself a symlink to `/private/tmp`.
+    /// Every real Codex session spawn failed closed with "provider
+    /// environment is invalid" before this was fixed, because the home
+    /// path (though never touched by an attacker, always daemon-
+    /// constructed, and never itself a symlink) could never equal its own
+    /// canonicalized form while any ancestor was a symlink.
+    #[tokio::test]
+    async fn codex_home_under_a_symlinked_ancestor_directory_is_accepted_and_canonicalized() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let real_root = directory.path().join("real-root");
+        fs::create_dir(&real_root).unwrap();
+        let symlinked_root = directory.path().join("symlinked-root");
+        std::os::unix::fs::symlink(&real_root, &symlinked_root).unwrap();
+        let home_under_symlink = symlinked_root.join("codex-home");
+        fs::create_dir(&home_under_symlink).unwrap();
+        fs::set_permissions(&home_under_symlink, fs::Permissions::from_mode(0o755)).unwrap();
+        let canonical_home = fs::canonicalize(&home_under_symlink).unwrap();
+        assert_ne!(
+            canonical_home, home_under_symlink,
+            "the test setup itself must exercise a genuine ancestor-symlink mismatch"
+        );
+
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.provider_environment = ProviderEnvironment::CodexHome(home_under_symlink);
+
+        let mut child = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let provider_env = fs::read_to_string(directory.path().join("provider-env")).unwrap();
+        let expected = format!("CODEX_HOME={}", canonical_home.display());
+        assert!(provider_env.lines().any(|line| line == expected));
+    }
+
+    #[test]
+    fn dot_dot_components_are_detected_lexically() {
+        assert!(!has_dot_or_dot_dot_component(Path::new("/a/b/c")));
+        assert!(has_dot_or_dot_dot_component(Path::new("/a/../b")));
+        assert!(has_dot_or_dot_dot_component(Path::new("/a/b/..")));
+        // `Path::components()` normalizes away a mid-path `.` entirely
+        // (it is never observable as a `CurDir` component for an absolute
+        // path) -- inert either way, since `/a/./b` and `/a/b` already
+        // name the same directory with no symlink resolution involved.
+        assert!(!has_dot_or_dot_dot_component(Path::new("/a/./b")));
+    }
+
     #[tokio::test]
     async fn invalid_codex_home_fails_closed_before_spawn_and_is_redacted() {
         let directory = tempfile::tempdir().unwrap();
@@ -594,6 +828,113 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             assert!(!message.contains("PRIVATE_"));
             assert!(!directory.path().join("runner-argv").exists());
         }
+    }
+
+    #[tokio::test]
+    async fn session_environment_is_applied_on_top_of_the_safe_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.session_environment = vec![
+            ("DARK_FACTORY_AGENT".to_owned(), "curie".to_owned()),
+            (
+                "DARK_FACTORY_SESSION_TOKEN_FILE".to_owned(),
+                "/private/runs/session-1/hook.token".to_owned(),
+            ),
+            (
+                "DARK_FACTORY_AGENT_DIR".to_owned(),
+                "/private/projects/factory/agents/curie".to_owned(),
+            ),
+        ];
+
+        let mut child = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+
+        let provider_env = fs::read_to_string(directory.path().join("provider-env")).unwrap();
+        assert!(
+            provider_env
+                .lines()
+                .any(|line| line == "DARK_FACTORY_AGENT=curie")
+        );
+        assert!(provider_env.lines().any(|line| {
+            line == "DARK_FACTORY_SESSION_TOKEN_FILE=/private/runs/session-1/hook.token"
+        }));
+        assert!(provider_env.lines().any(|line| {
+            line == "DARK_FACTORY_AGENT_DIR=/private/projects/factory/agents/curie"
+        }));
+    }
+
+    #[tokio::test]
+    async fn session_environment_rejects_a_name_outside_the_fixed_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let captured = probe_environment(directory.path(), directory.path());
+        let mut launch = spec(directory.path(), Vec::new());
+        launch.session_environment = vec![("PATH".to_owned(), "/evil/bin".to_owned())];
+
+        let error = spawn_runner_with_environment(launch, captured)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidSessionEnvironment { name } if name == "PATH"
+        ));
+        assert!(!directory.path().join("runner-argv").exists());
+    }
+
+    #[tokio::test]
+    async fn terminal_mode_prepends_factoryctls_directory_to_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = environment(OsString::from("/usr/bin:/bin"), directory.path());
+        // `Command::new("env")` would resolve the bare name against this
+        // *test process's* own PATH (the exec-time lookup, unrelated to
+        // whatever `apply_runner_environment` is about to configure for the
+        // child) -- pre-resolve it the same way
+        // `environment_is_default_deny_with_fixed_overrides` does.
+        let env_program = resolve_executable(Path::new("env"), &captured, "test").unwrap();
+        let mut command = Command::new(env_program);
+        command.stdout(Stdio::piped());
+
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            true,
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "PATH=/opt/dark-factory/bin:/usr/bin:/bin"),
+            "{output}"
+        );
+        assert!(output.lines().any(|line| line == "TERM=xterm-256color"));
+    }
+
+    #[tokio::test]
+    async fn non_terminal_mode_leaves_path_unmodified_by_factoryctl() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = environment(OsString::from("/usr/bin:/bin"), directory.path());
+        let env_program = resolve_executable(Path::new("env"), &captured, "test").unwrap();
+        let mut command = Command::new(env_program);
+        command.stdout(Stdio::piped());
+
+        apply_runner_environment(
+            &mut command,
+            &captured,
+            Path::new("/opt/dark-factory/bin/factoryctl"),
+            false,
+        );
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.lines().any(|line| line == "PATH=/usr/bin:/bin"));
+        assert!(!output.contains("/opt/dark-factory/bin"));
     }
 
     #[test]

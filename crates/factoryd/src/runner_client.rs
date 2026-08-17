@@ -150,6 +150,49 @@ impl RunnerClient {
         }
     }
 
+    /// Opens a retained-then-live PTY output stream from a terminal-mode
+    /// run, starting at `since_offset`. Rejected with
+    /// [`RunnerErrorCode::InvalidRequest`] on a run that is not in terminal
+    /// mode.
+    pub async fn attach_terminal(
+        &self,
+        since_offset: u64,
+    ) -> Result<TerminalSubscription, RunnerClientError> {
+        let reader = self
+            .request(RunnerRequest::AttachTerminal { since_offset })
+            .await?;
+        Ok(TerminalSubscription { reader })
+    }
+
+    /// Writes operator input to a terminal-mode run's PTY. `bytes` is
+    /// already [`factory_core::runner::encode_terminal_bytes`]-encoded;
+    /// this is a pass-through so the daemon never needs to decode opaque
+    /// terminal bytes.
+    pub async fn terminal_input(&self, bytes: String) -> Result<(), RunnerClientError> {
+        let mut reader = self.request(RunnerRequest::TerminalInput { bytes }).await?;
+        let frame = read_control_frame(&mut reader, "terminal input").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::CommandAck { .. } => Ok(()),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
+        }
+    }
+
+    /// Resizes a terminal-mode run's PTY.
+    pub async fn resize_terminal(&self, cols: u16, rows: u16) -> Result<(), RunnerClientError> {
+        let mut reader = self
+            .request(RunnerRequest::ResizeTerminal { cols, rows })
+            .await?;
+        let frame = read_control_frame(&mut reader, "resize terminal").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::CommandAck { .. } => Ok(()),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
+        }
+    }
+
     async fn request(&self, request: RunnerRequest) -> Result<FrameReader, RunnerClientError> {
         let stream = timeout(CONTROL_TIMEOUT, UnixStream::connect(&self.socket))
             .await
@@ -206,6 +249,27 @@ impl fmt::Debug for RunnerStreamItem {
                 .debug_struct("CaughtUp")
                 .field("sequence", sequence)
                 .finish(),
+        }
+    }
+}
+
+/// Retained-then-live raw PTY output stream for one terminal-mode run.
+///
+/// `bytes` stays [`factory_core::runner::encode_terminal_bytes`]-encoded end
+/// to end: the daemon proxy forwards it opaquely without decoding.
+pub struct TerminalSubscription {
+    reader: FrameReader,
+}
+
+impl TerminalSubscription {
+    /// Returns the next chunk's byte-stream offset and base64-encoded bytes.
+    pub async fn next_chunk(&mut self) -> Result<(u64, String), RunnerClientError> {
+        let frame = self.reader.read_frame().await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::TerminalOutput { offset, bytes, .. } => Ok((offset, bytes)),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
         }
     }
 }
@@ -359,6 +423,9 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
         },
         RunnerFrame::CommandAck { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner event",
+        },
+        RunnerFrame::TerminalOutput { .. } => RunnerClientError::UnexpectedFrame {
+            expected: "runner command acknowledgement",
         },
     }
 }

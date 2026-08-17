@@ -1,10 +1,10 @@
-use std::{future::Future, num::NonZeroU32, os::unix::fs::PermissionsExt, path::Path};
+use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
     AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
     local::{
-        ErrorCode, LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES,
-        RequestEnvelope, ServerFrame,
+        ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
     },
 };
 use factoryd::{
@@ -71,11 +71,17 @@ where
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
 
     test(socket).await;
 
@@ -85,18 +91,14 @@ where
     execution_join.await.unwrap().unwrap();
 }
 
-fn execution_config(directory: &Path) -> execution::Config {
+fn execution_config(directory: &Path, socket: &Path) -> execution::Config {
     execution::Config {
-        runner_program: directory.join("missing-factory-runner"),
-        codex_program: directory.join("missing-codex"),
-        claude_program: directory.join("missing-claude"),
-        claude_max_turns: NonZeroU32::new(20).unwrap(),
-        claude_max_budget_cents: NonZeroU32::new(500).unwrap(),
+        runner_program: directory.join("factory-runner"),
+        factoryctl_path: directory.join("factoryctl"),
         runtime_root: directory.join("runs"),
+        guidance_root: directory.to_path_buf(),
+        socket_path: socket.to_path_buf(),
         max_active_runs: 1,
-        startup_timeout: std::time::Duration::from_secs(1),
-        connect_grace: std::time::Duration::from_secs(1),
-        batch_delay: std::time::Duration::from_millis(25),
     }
 }
 
@@ -111,7 +113,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
             health,
             ServerFrame::Response {
                 protocol_version: PROTOCOL_VERSION,
-                response: LocalResponse::Health
+                response: LocalResponse::Health { .. }
             }
         ));
 
@@ -377,7 +379,7 @@ async fn the_frame_limit_counts_json_but_not_the_newline_delimiter() {
         assert!(matches!(
             raw_request(&socket, &exact).await,
             ServerFrame::Response {
-                response: LocalResponse::Health,
+                response: LocalResponse::Health { .. },
                 ..
             }
         ));
@@ -405,11 +407,17 @@ async fn shutdown_closes_idle_connections_before_returning() {
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
     let _idle = UnixStream::connect(&socket).await.unwrap();
 
     shutdown_tx.send(()).unwrap();
@@ -443,11 +451,17 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
     }
     let state = ApiState::new(store);
     let (execution, execution_join) =
-        execution::spawn(execution_config(directory.path()), state.clone()).unwrap();
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server = tokio::spawn(serve(listener, state, execution.clone(), async {
-        let _ = shutdown_rx.await;
-    }));
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
     let mut observer = UnixStream::connect(&socket).await.unwrap();
     write_request(&mut observer, LocalRequest::Subscribe { after_sequence: 0 }).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -564,7 +578,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 &socket,
                 LocalRequest::EventsAfter {
                     sequence: 0,
-                    limit: 101,
+                    limit: MAX_EVENT_PAGE_ITEMS + 1,
                 },
             )
             .await,
@@ -717,6 +731,8 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     parent_agent_id: None,
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: None,
                 },
             )
             .await,
@@ -776,6 +792,823 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                 response: LocalResponse::TaskAssigned { ref task },
                 ..
             } if task.snapshot.assigned_agent_id.is_none()
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_agent_messages_round_trip_without_public_events() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("god"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Orchestrator,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+
+        let sent = request(
+            &socket,
+            LocalRequest::SendAgentMessage {
+                id: factory_core::MessageId::try_from("message-1").unwrap(),
+                project_id: project_id("factory"),
+                sender_agent_id: None,
+                recipient_agent_id: agent_id("god"),
+                body: "Please review the queue.".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            sent,
+            ServerFrame::Response {
+                response: LocalResponse::AgentMessageSent { ref message },
+                ..
+            } if message.delivered_at_ms.is_none()
+        ));
+
+        let listed = request(
+            &socket,
+            LocalRequest::ListAgentMessages {
+                project_id: project_id("factory"),
+                agent_id: agent_id("god"),
+                after_id: None,
+                limit: 10,
+            },
+        )
+        .await;
+        assert!(matches!(
+            listed,
+            ServerFrame::Response {
+                response: LocalResponse::AgentMessages { ref messages, .. },
+                ..
+            } if messages.len() == 1 && messages[0].body == "Please review the queue."
+        ));
+
+        assert_eq!(
+            request(&socket, LocalRequest::LatestEventSequence,).await,
+            ServerFrame::Response {
+                protocol_version: PROTOCOL_VERSION,
+                // ProjectChanged (1), AgentChanged from CreateAgent (2),
+                // AgentChanged again from provisioning its worktree (3) --
+                // SendAgentMessage publishes no public event.
+                response: LocalResponse::EventHead { sequence: 3 },
+            }
+        );
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_update_and_delete_are_local_control_operations() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Cancel me".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AssignTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    agent_id: Some(agent_id("curie")),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskAssigned { .. },
+                ..
+            }
+        ));
+
+        let cancelled = request(
+            &socket,
+            LocalRequest::CancelTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            cancelled,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCancelled { ref task },
+                ..
+            } if task.snapshot.status == factory_core::TaskStatus::Cancelled
+                && task.snapshot.assigned_agent_id == Some(agent_id("curie"))
+        ));
+
+        let cancel_again = request(
+            &socket,
+            LocalRequest::CancelTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            cancel_again,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::RetryTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskRetried { .. },
+                ..
+            }
+        ));
+
+        let no_fields = request(
+            &socket,
+            LocalRequest::UpdateTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                title: None,
+                body: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            no_fields,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let updated = request(
+            &socket,
+            LocalRequest::UpdateTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+                title: Some("Updated title".into()),
+                body: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            updated,
+            ServerFrame::Response {
+                response: LocalResponse::TaskUpdated { ref task },
+                ..
+            } if task.snapshot.title == "Updated title"
+        ));
+
+        let fetched = request(
+            &socket,
+            LocalRequest::GetTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            fetched,
+            ServerFrame::Response {
+                response: LocalResponse::Task { ref task },
+                ..
+            } if task.snapshot.title == "Updated title"
+        ));
+
+        let deleted = request(
+            &socket,
+            LocalRequest::DeleteTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            deleted,
+            ServerFrame::Response {
+                response: LocalResponse::TaskDeleted { ref project_id, ref task_id },
+                ..
+            } if *project_id == self::project_id("factory") && *task_id == self::task_id("task-1")
+        ));
+
+        let missing = request(
+            &socket,
+            LocalRequest::GetTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task-1"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            missing,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let guidance_root = socket.parent().unwrap();
+        let agent_guidance_dir = factory_core::paths::agent_dir(
+            guidance_root,
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        assert!(
+            agent_guidance_dir.is_dir(),
+            "agent guidance directory should exist before delete"
+        );
+
+        let agent_deleted = request(
+            &socket,
+            LocalRequest::DeleteAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            agent_deleted,
+            ServerFrame::Response {
+                response: LocalResponse::AgentDeleted { .. },
+                ..
+            }
+        ));
+        assert!(
+            !agent_guidance_dir.exists(),
+            "agent guidance directory should be removed after delete"
+        );
+
+        let project_guidance_dir =
+            factory_core::paths::project_dir(guidance_root, &project_id("factory"));
+        assert!(
+            project_guidance_dir.is_dir(),
+            "project guidance directory should exist before delete"
+        );
+
+        let project_deleted = request(
+            &socket,
+            LocalRequest::DeleteProject {
+                project_id: project_id("factory"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            project_deleted,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectDeleted { .. },
+                ..
+            }
+        ));
+        assert!(
+            !project_guidance_dir.exists(),
+            "project guidance directory should be removed after delete"
+        );
+    })
+    .await;
+}
+
+/// `CreateAgent.worktree` validates an operator override (D3): rejects a
+/// non-existent path, accepts and durably records an existing one.
+/// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the
+/// project root here isn't a git repo, that falls back to the project root
+/// itself rather than a real `git worktree add` -- every agent ends up with
+/// *some* recorded worktree either way, so `StartTask.worktree: None` always
+/// has something to default to. Every session-shaped request now has real
+/// behavior: `PauseAgent`/`ResumeAgent`/`ListSessions` succeed; requests
+/// naming a session/run/task-episode that doesn't exist yet surface the
+/// real `NotFound`/`Conflict`; an unrecognized hook token is rejected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_shaped_requests_now_have_real_behavior() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        // CreateProject durably stores a canonicalized root
+        // (`canonical_root`); compare against that below rather than this
+        // possibly-symlinked raw path (e.g. macOS's `/tmp` -> `/private/tmp`).
+        let project_root = std::fs::canonicalize(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+
+        // A worktree override that doesn't exist on disk is rejected.
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Codex,
+                    model: None,
+                    worktree: Some("/nonexistent/curie-worktree".into()),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // An existing absolute directory is accepted and durably recorded.
+        let worktree = project_root.to_string_lossy().into_owned();
+        let created = request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: Some(worktree.clone()),
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentCreated { agent },
+            ..
+        } = created
+        else {
+            panic!("expected AgentCreated, got {created:?}");
+        };
+        assert_eq!(agent.worktree, Some(worktree));
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateTask {
+                    id: task_id("task-1"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Uses the agent's worktree".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ));
+
+        // Creating a worker with no --worktree in a non-git-repo project
+        // auto-provisions the project root itself as its worktree (5C) --
+        // there is no longer such a thing as an agent with *no* recorded
+        // worktree once CreateAgent has run.
+        let auto_provisioned = request(
+            &socket,
+            LocalRequest::CreateAgent {
+                id: agent_id("auto-worktree"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: None,
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentCreated { agent },
+            ..
+        } = auto_provisioned
+        else {
+            panic!("expected AgentCreated, got {auto_provisioned:?}");
+        };
+        assert_eq!(
+            agent.worktree,
+            Some(project_root.to_string_lossy().into_owned())
+        );
+
+        // StartTask against curie (which has a worktree) fails cleanly with
+        // no live session yet -- spawning one requires pending queued work
+        // and a valid provider/runner binary, neither of which this fixture
+        // (a fake runner/factoryctl path, no real `codex`) provides.
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::StartTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    agent_id: agent_id("curie"),
+                    parent_run_id: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        // PauseAgent/ResumeAgent are real, durable control operations.
+        let paused = request(
+            &socket,
+            LocalRequest::PauseAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentPaused { agent },
+            ..
+        } = paused
+        else {
+            panic!("expected AgentPaused, got {paused:?}");
+        };
+        assert!(agent.paused);
+
+        let resumed = request(
+            &socket,
+            LocalRequest::ResumeAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await;
+        let ServerFrame::Response {
+            response: LocalResponse::AgentResumed { agent },
+            ..
+        } = resumed
+        else {
+            panic!("expected AgentResumed, got {resumed:?}");
+        };
+        assert!(!agent.paused);
+
+        // ListSessions succeeds with an empty page: nothing has spawned one
+        // yet.
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ListSessions {
+                    project_id: project_id("factory"),
+                    after_id: None,
+                    limit: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Sessions { sessions, next_after_id: None },
+                ..
+            } if sessions.is_empty()
+        ));
+
+        // Requests naming a run/task-episode/session that doesn't exist yet
+        // surface the real not-found/conflict, not a blanket "unsupported".
+        let run_id = factory_core::RunId::try_from("run-1").unwrap();
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CancelRun {
+                    project_id: project_id("factory"),
+                    run_id,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CompleteTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    result: "done".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::BlockTask {
+                    project_id: project_id("factory"),
+                    task_id: task_id("task-1"),
+                    reason: "blocked".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::StopSession {
+                    project_id: project_id("factory"),
+                    session_id,
+                    grace_ms: 0,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ProviderHook {
+                    token: "unrecognized-token".into(),
+                    event: factory_core::ProviderHookEvent::Stop,
+                    payload: serde_json::json!({}),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_and_agent_status_are_one_consistent_read() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        for request_body in [
+            LocalRequest::CreateProject {
+                id: project_id("factory"),
+                name: "Factory".to_owned(),
+                root: project_root.to_string_lossy().into_owned(),
+            },
+            LocalRequest::CreateAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: None,
+            },
+            // Paused first, so assigning work never spawns a session: the
+            // status below is deterministic (and this test can't race the
+            // dispatcher the way #42 describes).
+            LocalRequest::PauseAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+            LocalRequest::CreateTask {
+                id: task_id("t-assigned"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "assigned".to_owned(),
+                body: "b".to_owned(),
+                priority: 0,
+            },
+            LocalRequest::CreateTask {
+                id: task_id("t-loose"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "unassigned".to_owned(),
+                body: "b".to_owned(),
+                priority: 0,
+            },
+            LocalRequest::AssignTask {
+                project_id: project_id("factory"),
+                task_id: task_id("t-assigned"),
+                agent_id: Some(agent_id("curie")),
+            },
+        ] {
+            let frame = request(&socket, request_body).await;
+            assert!(
+                !matches!(
+                    frame,
+                    ServerFrame::Response {
+                        response: LocalResponse::Error { .. },
+                        ..
+                    }
+                ),
+                "{frame:?}"
+            );
+        }
+
+        let ServerFrame::Response {
+            response: LocalResponse::FleetStatus { status },
+            ..
+        } = request(&socket, LocalRequest::FleetStatus).await
+        else {
+            panic!("expected a fleet status");
+        };
+        assert_eq!(
+            status.live_session_cap, 1,
+            "execution_config's max_active_runs"
+        );
+        assert_eq!(status.live_sessions, 0);
+        assert_eq!(status.projects.len(), 1);
+        let project = &status.projects[0];
+        assert_eq!(project.project.id, project_id("factory"));
+        assert_eq!(project.unassigned_queue_depth, 1);
+        assert_eq!(project.unassigned_queue[0].id, task_id("t-loose"));
+        assert_eq!(project.agents.len(), 1);
+        let curie = &project.agents[0];
+        assert_eq!(curie.agent.id, agent_id("curie"));
+        assert!(curie.agent.paused);
+        assert!(curie.session.is_none());
+        assert!(curie.current_run.is_none());
+        assert_eq!(curie.queue_depth, 1);
+        assert_eq!(curie.queue[0].id, task_id("t-assigned"));
+        assert_eq!(curie.inbox_pending, 0);
+        assert_eq!(curie.attention, factory_core::attention::Attention::Routine);
+        assert!(
+            curie.attention_inferred,
+            "no session: inferred from (no) run"
+        );
+        assert_eq!(status.attention.len(), 1);
+        let item = &status.attention[0];
+        assert_eq!(
+            item.kind,
+            factory_core::status::AttentionKind::PausedWithWork
+        );
+        assert_eq!(item.agent_id, Some(agent_id("curie")));
+        assert_eq!(item.task_id, Some(task_id("t-assigned")));
+
+        let ServerFrame::Response {
+            response: LocalResponse::AgentStatus { status: detail },
+            ..
+        } = request(
+            &socket,
+            LocalRequest::AgentStatus {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await
+        else {
+            panic!("expected an agent status");
+        };
+        assert_eq!(detail.status, *curie, "the same picture the fleet view had");
+        assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert!(detail.detail.instructions_path.ends_with("instructions.md"));
+        // The project root is not a git repository, so the agent runs in the
+        // root itself; the status says so instead of pretending a clean tree.
+        let worktree = detail.worktree.expect("the agent has a working directory");
+        assert!(worktree.error.is_some(), "{worktree:?}");
+        assert!(!worktree.dirty);
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AgentStatus {
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("nobody"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
         ));
     })
     .await;

@@ -1,0 +1,85 @@
+name: Release
+
+# A semver tag (`v0.1.0`) pushed by a maintainer builds the macOS arm64
+# binaries and publishes them, a SHA256SUMS file, and the `latest.json`
+# manifest as a GitHub Release. `factoryctl update` reads that manifest at
+# https://github.com/baziyer/dark-factory/releases/latest/download/latest.json;
+# see docs/development/WORKFLOW.md, "Release and update".
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: release
+    # Only maintainers can push tags, so this is a trusted ref (same boundary
+    # as CI's same-repository jobs): the persistent Mac, warm cache, real
+    # macOS arm64.
+    runs-on: dark-factory-mac
+    timeout-minutes: 60
+    env:
+      TAG: ${{ github.ref_name }}
+      TARGET: aarch64-apple-darwin
+    steps:
+      # No actions/checkout: codeload.github.com (which serves an action's
+      # tarball) can 429 independently of git itself, so this job never
+      # depends on that download — a plain `git fetch` talks straight to
+      # GitHub's git server instead. See ci.yml for the full rationale;
+      # this is the same step.
+      #
+      # This runner's workspace persists between jobs (it is shared with
+      # ci.yml's `checks` job), and a prior job can leave more than stray
+      # files behind if it was ever killed mid-checkout: a
+      # `.git/index.lock`, a half-written pack, a stale shallow boundary.
+      # `rm -rf .git && git init` before every fetch throws all of that
+      # away in one move instead of trying to detect and repair each kind
+      # of leftover state, then `git checkout --force --detach` lands on
+      # the target commit and `git clean -ffdx` removes anything else a
+      # prior job left in the working tree. That clean never touches the
+      # cargo cache: CARGO_TARGET_DIR lives outside this workspace (see
+      # docs/development/WORKFLOW.md, "The self-hosted runner").
+      #
+      # For a tag push, $GITHUB_SHA is the commit the tag points at; GitHub
+      # serves `git fetch` by arbitrary commit SHA (verified against this
+      # repository). The repo is public, so the fetch is unauthenticated
+      # and nothing is written to .git/config that could leak a credential.
+      - name: Check out $GITHUB_SHA
+        run: |
+          set -euxo pipefail
+          rm -rf .git
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          git clean -ffdx
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+
+      - name: Check that the tag matches the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$TAG" ]; then
+            echo "tag $TAG does not match Cargo.toml workspace version $version" >&2
+            exit 1
+          fi
+
+      - name: Build release binaries
+        run: cargo +1.85.0 build --locked --release --workspace
+
+      - name: Package
+        run: ./scripts/package-release.sh "$TAG" "$TARGET" "${CARGO_TARGET_DIR:-target}/release" dist "$GITHUB_REPOSITORY"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A tag with a pre-release suffix (v0.2.0-rc.1) is published as a
+        # pre-release, so `releases/latest` -- and every `factoryctl update`
+        # -- keeps pointing at the newest full release.
+        run: |
+          prerelease=
+          case "$TAG" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes $prerelease dist/*

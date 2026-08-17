@@ -1,22 +1,74 @@
 name: CI
 
 on:
+  pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 jobs:
+  # One job, one required status check ("checks"). It runs the exact same
+  # gate as `./scripts/local-ci.sh` — nothing is re-implemented here.
+  #
+  # Where it runs is chosen by this expression, which is a policy, not a
+  # mechanism: a pull request runs the workflow file from ITS OWN merge
+  # ref, so a fork can edit `runs-on` here. Same-repository refs (the
+  # owner's and collaborators' branches, and every push to main) run on
+  # the persistent self-hosted Mac (`dark-factory-mac`: warm cargo cache,
+  # real macOS, no hosted minutes). A pull request from a fork runs on an
+  # ephemeral hosted macOS runner — and every fork's workflow run needs the
+  # maintainer's approval first (`scripts/github-repo-settings.sh` sets
+  # that policy). Read `.github/workflows/` in a fork's diff before
+  # approving it: that is the boundary. See docs/development/WORKFLOW.md.
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'macos-latest' || 'dark-factory-mac' }}
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
-      - name: Install Rust 1.85
-        run: rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt
-      - name: Format
-        run: cargo +1.85.0 fmt --all -- --check
-      - name: Lint
-        run: cargo +1.85.0 clippy --locked --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo +1.85.0 test --locked --workspace
+      # No actions/checkout: codeload.github.com (which serves an action's
+      # tarball) can 429 independently of git itself and has, for over an
+      # hour at a time, on this runner — with no code checked out and
+      # nothing to retry. A plain `git fetch` talks straight to GitHub's
+      # git server instead, so this job never depends on that download.
+      #
+      # This runner's workspace persists between jobs, and the
+      # `cancel-in-progress` concurrency group above can SIGTERM a job
+      # mid-checkout (an ordinary fixup push while the previous push's
+      # `checks` is still running), so a prior job can leave more than
+      # stray files behind: a `.git/index.lock`, a half-written pack, a
+      # stale shallow boundary. `rm -rf .git && git init` before every
+      # fetch throws all of that away in one move instead of trying to
+      # detect and repair each kind of leftover state, then `git checkout
+      # --force --detach` lands on the target commit and `git clean -ffdx`
+      # removes anything else a prior job left in the working tree. That
+      # clean never touches the cargo cache: CARGO_TARGET_DIR lives outside
+      # this workspace (see docs/development/WORKFLOW.md, "The self-hosted
+      # runner").
+      #
+      # $GITHUB_SHA is the PR's merge commit for `pull_request` events and
+      # the pushed commit for `push`/`workflow_dispatch`; GitHub serves
+      # `git fetch` by arbitrary commit SHA either way, including a PR's
+      # hidden merge-commit ref (verified against this repository). The
+      # repo is public, so the fetch is unauthenticated and nothing is
+      # written to .git/config that could leak a credential.
+      - name: Check out $GITHUB_SHA
+        run: |
+          set -euxo pipefail
+          rm -rf .git
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          git clean -ffdx
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.85.0 --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Run the gate
+        run: ./scripts/local-ci.sh

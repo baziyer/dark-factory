@@ -1,7 +1,6 @@
 //! Bounded, loopback-only authenticated webhook integrations.
 
 use std::{
-    collections::{HashMap, HashSet},
     fmt,
     fs::OpenOptions,
     future::Future,
@@ -35,10 +34,9 @@ use tokio::net::TcpListener;
 use crate::{
     daemon_state::{DaemonState, DaemonStateError},
     store::{
-        NewWebhookTask, OperationalTaskStatus, StoreError, SubscriptionLimitWindow,
-        SubscriptionProviderState, SubscriptionSeverity, SubscriptionUsageSnapshot, WebhookAnswer,
-        WebhookDocument, WebhookOpenQuestion, WebhookSnapshot, WebhookSnapshotAgent,
-        WebhookSnapshotTask, WebhookTaskPoll,
+        NewWebhookTask, OperationalTaskStatus, StoreError, WebhookAnswer, WebhookDocument,
+        WebhookOpenQuestion, WebhookSnapshot, WebhookSnapshotAgent, WebhookSnapshotTask,
+        WebhookTaskPoll,
     },
 };
 
@@ -51,12 +49,9 @@ const MAX_FROM_CHARS: usize = 240;
 const MAX_DOCUMENT_BYTES: usize = 128 * 1024;
 const ENDPOINT_RATE_LIMIT: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
-const GENERIC_SECRET_HEADER: &str = "x-dark-factory-webhook-secret";
-const GENERIC_TOKEN_HEADER: &str = "x-dark-factory-webhook-token";
 const LEGACY_SECRET_HEADER: &str = "x-md-webhook-secret";
 const LEGACY_TOKEN_HEADER: &str = "x-md-webhook-token";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
-const MAX_ENDPOINTS: usize = 32;
 
 #[derive(Deserialize)]
 struct CreateInput {
@@ -113,33 +108,6 @@ struct OperationalSnapshot {
     counts: OperationalCounts,
     tasks: Vec<OperationalTask>,
     agents: Vec<OperationalAgent>,
-    subscription_usage: OperationalSubscriptionUsage,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OperationalSubscriptionUsage {
-    severity: &'static str,
-    providers: Vec<OperationalSubscriptionProvider>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OperationalSubscriptionProvider {
-    provider: String,
-    severity: &'static str,
-    last_attempt_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_success_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    used_percent: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit_window: Option<&'static str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    resets_at: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    exhausted: Option<bool>,
-    consecutive_failures: u32,
 }
 
 #[derive(Serialize)]
@@ -158,7 +126,6 @@ struct OperationalTask {
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     assignee: Option<String>,
-    depends_on: Vec<String>,
     priority: i32,
     created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -220,22 +187,21 @@ impl fmt::Debug for WebhookSecret {
 
 impl WebhookSecret {
     fn matches(&self, provided: &[u8]) -> bool {
-        constant_time_eq(&self.0, provided)
+        crate::store::constant_time_eq(&self.0, provided)
     }
 }
 
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum WireProfile {
-    LegacyV1,
-    FactoryV1,
-}
+/// Only one wire profile remains: the `legacy_v1` shape Minerva speaks. The
+/// `wireProfile` config key is still required and still validated, so an
+/// operator's existing `webhooks.json` keeps loading unchanged; any other
+/// value is rejected as invalid configuration.
+const SUPPORTED_WIRE_PROFILE: &str = "legacy_v1";
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawEndpointConfig {
     id: String,
-    wire_profile: WireProfile,
+    wire_profile: String,
     secret_file: PathBuf,
     project_id: ProjectId,
     orchestrator_agent_id: AgentId,
@@ -251,16 +217,16 @@ struct RawWebhookConfig {
 
 struct WebhookEndpoint {
     id: String,
-    wire_profile: WireProfile,
     secret: Arc<WebhookSecret>,
     project_id: ProjectId,
     orchestrator_agent_id: AgentId,
 }
 
-/// Fully validated, privacy-sensitive webhook listener configuration.
+/// Fully validated, privacy-sensitive webhook listener configuration. Exactly
+/// one endpoint is supported.
 pub struct WebhookHttpConfig {
     bind: SocketAddr,
-    endpoints: Vec<WebhookEndpoint>,
+    endpoint: WebhookEndpoint,
 }
 
 /// A fully validated and already-bound webhook listener awaiting supervision.
@@ -372,7 +338,7 @@ impl WebhookHttpMetrics {
 #[derive(Clone)]
 struct HttpState {
     daemon: DaemonState,
-    endpoints: Arc<HashMap<String, WebhookEndpoint>>,
+    endpoint: Arc<WebhookEndpoint>,
     limiter: Arc<Mutex<RateLimits>>,
     metrics: Arc<WebhookHttpMetrics>,
 }
@@ -380,7 +346,6 @@ struct HttpState {
 #[derive(Clone)]
 struct RequestEndpoint {
     id: String,
-    wire_profile: WireProfile,
     secret: Arc<WebhookSecret>,
     project_id: ProjectId,
     orchestrator_agent_id: AgentId,
@@ -390,7 +355,6 @@ impl From<&WebhookEndpoint> for RequestEndpoint {
     fn from(endpoint: &WebhookEndpoint) -> Self {
         Self {
             id: endpoint.id.clone(),
-            wire_profile: endpoint.wire_profile,
             secret: Arc::clone(&endpoint.secret),
             project_id: endpoint.project_id.clone(),
             orchestrator_agent_id: endpoint.orchestrator_agent_id.clone(),
@@ -398,12 +362,14 @@ impl From<&WebhookEndpoint> for RequestEndpoint {
     }
 }
 
-struct FixedWindow {
+/// A single global fixed-window limiter. There is exactly one loopback-only
+/// endpoint, so per-endpoint budgeting adds nothing.
+struct RateLimits {
     started: Instant,
     count: u64,
 }
 
-impl Default for FixedWindow {
+impl Default for RateLimits {
     fn default() -> Self {
         Self {
             started: Instant::now(),
@@ -412,33 +378,14 @@ impl Default for FixedWindow {
     }
 }
 
-impl FixedWindow {
-    fn allow(&mut self, now: Instant, limit: u64) -> bool {
+impl RateLimits {
+    fn allow(&mut self, now: Instant) -> bool {
         if now.duration_since(self.started) >= RATE_WINDOW {
             self.started = now;
             self.count = 0;
         }
         self.count = self.count.saturating_add(1);
-        self.count <= limit
-    }
-}
-
-#[derive(Default)]
-struct RateLimits {
-    endpoints: HashMap<String, FixedWindow>,
-    unknown: FixedWindow,
-}
-
-impl RateLimits {
-    fn allow(&mut self, now: Instant, endpoint_id: Option<&str>) -> bool {
-        match endpoint_id {
-            Some(endpoint_id) => self
-                .endpoints
-                .entry(endpoint_id.to_owned())
-                .or_default()
-                .allow(now, ENDPOINT_RATE_LIMIT),
-            None => self.unknown.allow(now, ENDPOINT_RATE_LIMIT),
-        }
+        self.count <= ENDPOINT_RATE_LIMIT
     }
 }
 
@@ -534,49 +481,35 @@ pub fn load_webhook_config(path: &Path) -> Result<WebhookHttpConfig, WebhookHttp
     let bytes = load_private_file(path, MAX_CONFIG_BYTES)?;
     let raw: RawWebhookConfig =
         serde_json::from_slice(&bytes).map_err(|_| WebhookHttpError::InvalidConfig)?;
-    if raw.version != 1
-        || raw.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST)
-        || raw.endpoints.is_empty()
-        || raw.endpoints.len() > MAX_ENDPOINTS
+    if raw.version != 1 || raw.bind.ip() != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+        return Err(WebhookHttpError::InvalidConfig);
+    }
+    let [endpoint] = <[RawEndpointConfig; 1]>::try_from(raw.endpoints)
+        .map_err(|_| WebhookHttpError::InvalidConfig)?;
+    if !valid_endpoint_id(&endpoint.id)
+        || endpoint.wire_profile != SUPPORTED_WIRE_PROFILE
+        || !endpoint.secret_file.is_absolute()
     {
         return Err(WebhookHttpError::InvalidConfig);
     }
-    let mut ids = HashSet::new();
-    let mut projects = HashSet::new();
-    let mut secrets = HashSet::new();
-    let mut endpoints = Vec::with_capacity(raw.endpoints.len());
-    for endpoint in raw.endpoints {
-        if !valid_endpoint_id(&endpoint.id)
-            || !ids.insert(endpoint.id.clone())
-            || !projects.insert(endpoint.project_id.clone())
-            || !endpoint.secret_file.is_absolute()
-        {
-            return Err(WebhookHttpError::InvalidConfig);
-        }
-        let configured_metadata = std::fs::symlink_metadata(&endpoint.secret_file)
-            .map_err(|_| WebhookHttpError::SecretOpen)?;
-        if configured_metadata.file_type().is_symlink() {
-            return Err(WebhookHttpError::SecretFileType);
-        }
-        let canonical = endpoint
-            .secret_file
-            .canonicalize()
-            .map_err(|_| WebhookHttpError::SecretOpen)?;
-        let secret = load_webhook_secret(&canonical)?;
-        if !secrets.insert(secret.0.to_vec()) {
-            return Err(WebhookHttpError::InvalidConfig);
-        }
-        endpoints.push(WebhookEndpoint {
+    let configured_metadata = std::fs::symlink_metadata(&endpoint.secret_file)
+        .map_err(|_| WebhookHttpError::SecretOpen)?;
+    if configured_metadata.file_type().is_symlink() {
+        return Err(WebhookHttpError::SecretFileType);
+    }
+    let canonical = endpoint
+        .secret_file
+        .canonicalize()
+        .map_err(|_| WebhookHttpError::SecretOpen)?;
+    let secret = load_webhook_secret(&canonical)?;
+    Ok(WebhookHttpConfig {
+        bind: raw.bind,
+        endpoint: WebhookEndpoint {
             id: endpoint.id,
-            wire_profile: endpoint.wire_profile,
             secret: Arc::new(secret),
             project_id: endpoint.project_id,
             orchestrator_agent_id: endpoint.orchestrator_agent_id,
-        });
-    }
-    Ok(WebhookHttpConfig {
-        bind: raw.bind,
-        endpoints,
+        },
     })
 }
 
@@ -586,25 +519,17 @@ pub async fn webhook_router(
     config: WebhookHttpConfig,
     metrics: Arc<WebhookHttpMetrics>,
 ) -> Result<Router, WebhookHttpError> {
-    for endpoint in &config.endpoints {
-        let project_id = endpoint.project_id.clone();
-        let orchestrator_agent_id = endpoint.orchestrator_agent_id.clone();
-        daemon
-            .with_store(move |store| {
-                store.webhook_snapshot(&project_id, &orchestrator_agent_id, unix_time_ms())
-            })
-            .await
-            .map_err(|_| WebhookHttpError::InvalidConfig)?;
-    }
+    let project_id = config.endpoint.project_id.clone();
+    let orchestrator_agent_id = config.endpoint.orchestrator_agent_id.clone();
+    daemon
+        .with_store(move |store| {
+            store.webhook_snapshot(&project_id, &orchestrator_agent_id, unix_time_ms())
+        })
+        .await
+        .map_err(|_| WebhookHttpError::InvalidConfig)?;
     let state = HttpState {
         daemon,
-        endpoints: Arc::new(
-            config
-                .endpoints
-                .into_iter()
-                .map(|endpoint| (endpoint.id.clone(), endpoint))
-                .collect(),
-        ),
+        endpoint: Arc::new(config.endpoint),
         limiter: Arc::new(Mutex::new(RateLimits::default())),
         metrics,
     };
@@ -650,26 +575,11 @@ pub async fn bind_webhooks(
     })
 }
 
-fn constant_time_eq(expected: &[u8], provided: &[u8]) -> bool {
-    if expected.len() != provided.len() {
-        return false;
-    }
-    let mut difference = 0_u8;
-    for (&left, &right) in expected.iter().zip(provided) {
-        difference |= left ^ right;
-    }
-    std::hint::black_box(difference) == 0
-}
-
-fn rate_limited(state: &HttpState, route: Route, requested_endpoint: &str) -> Option<Response> {
-    let endpoint = state
-        .endpoints
-        .contains_key(requested_endpoint)
-        .then_some(requested_endpoint);
+fn rate_limited(state: &HttpState, route: Route) -> Option<Response> {
     let allowed = state
         .limiter
         .lock()
-        .map(|mut limiter| limiter.allow(Instant::now(), endpoint))
+        .map(|mut limiter| limiter.allow(Instant::now()))
         .unwrap_or(false);
     if allowed {
         return None;
@@ -692,26 +602,12 @@ fn rate_limited(state: &HttpState, route: Route, requested_endpoint: &str) -> Op
 }
 
 fn endpoint(state: &HttpState, id: &str) -> Option<RequestEndpoint> {
-    state.endpoints.get(id).map(RequestEndpoint::from)
-}
-
-const fn secret_header(profile: WireProfile) -> &'static str {
-    match profile {
-        WireProfile::LegacyV1 => LEGACY_SECRET_HEADER,
-        WireProfile::FactoryV1 => GENERIC_SECRET_HEADER,
-    }
-}
-
-const fn token_header(profile: WireProfile) -> &'static str {
-    match profile {
-        WireProfile::LegacyV1 => LEGACY_TOKEN_HEADER,
-        WireProfile::FactoryV1 => GENERIC_TOKEN_HEADER,
-    }
+    (state.endpoint.id == id).then(|| RequestEndpoint::from(state.endpoint.as_ref()))
 }
 
 fn authenticate(endpoint: &RequestEndpoint, headers: &HeaderMap) -> bool {
     headers
-        .get(secret_header(endpoint.wire_profile))
+        .get(LEGACY_SECRET_HEADER)
         .is_some_and(|provided| endpoint.secret.matches(provided.as_bytes()))
 }
 
@@ -879,7 +775,7 @@ fn provider_label<T: Serialize>(value: Option<T>) -> Option<String> {
         })
 }
 
-fn operational_snapshot(snapshot: WebhookSnapshot, profile: WireProfile) -> OperationalSnapshot {
+fn operational_snapshot(snapshot: WebhookSnapshot) -> OperationalSnapshot {
     OperationalSnapshot {
         generated_at: rfc3339_millis(snapshot.generated_at_ms),
         counts: OperationalCounts {
@@ -889,58 +785,7 @@ fn operational_snapshot(snapshot: WebhookSnapshot, profile: WireProfile) -> Oper
             done: u64::try_from(snapshot.counts.done).unwrap_or(0),
         },
         tasks: snapshot.tasks.into_iter().map(operational_task).collect(),
-        agents: snapshot
-            .agents
-            .into_iter()
-            .map(|agent| operational_agent(agent, profile))
-            .collect(),
-        subscription_usage: operational_subscription_usage(snapshot.subscription_usage),
-    }
-}
-
-fn operational_subscription_usage(
-    usage: SubscriptionUsageSnapshot,
-) -> OperationalSubscriptionUsage {
-    OperationalSubscriptionUsage {
-        severity: subscription_severity_label(usage.overall_severity),
-        providers: usage
-            .providers
-            .into_iter()
-            .map(operational_subscription_provider)
-            .collect(),
-    }
-}
-
-fn operational_subscription_provider(
-    state: SubscriptionProviderState,
-) -> OperationalSubscriptionProvider {
-    OperationalSubscriptionProvider {
-        provider: provider_label(Some(state.provider)).unwrap_or_else(|| "unknown".to_owned()),
-        severity: subscription_severity_label(state.severity),
-        last_attempt_at: rfc3339_millis(state.last_attempt_at_ms),
-        last_success_at: state.last_success_at_ms.map(rfc3339_millis),
-        used_percent: state.used_percent,
-        limit_window: state.limit_window.map(subscription_window_label),
-        resets_at: state.resets_at_ms.map(rfc3339_millis),
-        exhausted: state.exhausted,
-        consecutive_failures: state.consecutive_failures,
-    }
-}
-
-const fn subscription_severity_label(severity: SubscriptionSeverity) -> &'static str {
-    match severity {
-        SubscriptionSeverity::Ok => "ok",
-        SubscriptionSeverity::Warning => "warning",
-        SubscriptionSeverity::Critical => "critical",
-    }
-}
-
-const fn subscription_window_label(window: SubscriptionLimitWindow) -> &'static str {
-    match window {
-        SubscriptionLimitWindow::Primary => "primary",
-        SubscriptionLimitWindow::Secondary => "secondary",
-        SubscriptionLimitWindow::CurrentSession => "currentSession",
-        SubscriptionLimitWindow::CurrentWeek => "currentWeek",
+        agents: snapshot.agents.into_iter().map(operational_agent).collect(),
     }
 }
 
@@ -950,11 +795,6 @@ fn operational_task(task: WebhookSnapshotTask) -> OperationalTask {
         title: task.title,
         status: task_status_name(task.status),
         assignee: task.assignee,
-        depends_on: task
-            .depends_on
-            .into_iter()
-            .map(|id| id.to_string())
-            .collect(),
         priority: task.priority,
         created_at: rfc3339_millis(task.created_at_ms),
         started_at: task.started_at_ms.map(rfc3339_millis),
@@ -980,7 +820,7 @@ fn operational_question(question: WebhookOpenQuestion) -> OperationalQuestion {
     }
 }
 
-fn operational_agent(agent: WebhookSnapshotAgent, profile: WireProfile) -> OperationalAgent {
+fn operational_agent(agent: WebhookSnapshotAgent) -> OperationalAgent {
     let breaker = match agent.observer_health {
         ObserverHealth::Degraded => "degraded".to_owned(),
         ObserverHealth::Healthy => "healthy".to_owned(),
@@ -992,10 +832,10 @@ fn operational_agent(agent: WebhookSnapshotAgent, profile: WireProfile) -> Opera
         role: agent.role,
         provider: provider_label(agent.provider),
         is_orchestrator: agent.is_orchestrator,
-        is_god: matches!(profile, WireProfile::LegacyV1).then_some(agent.is_orchestrator),
-        breaker: matches!(profile, WireProfile::LegacyV1).then_some(breaker),
-        tokens: matches!(profile, WireProfile::LegacyV1).then_some(0),
-        usd: matches!(profile, WireProfile::LegacyV1).then_some(0.0),
+        is_god: Some(agent.is_orchestrator),
+        breaker: Some(breaker),
+        tokens: Some(0),
+        usd: Some(0.0),
         last_active_sec_ago: agent
             .last_active_sec_ago
             .and_then(|seconds| u64::try_from(seconds).ok()),
@@ -1127,7 +967,7 @@ async fn create_task(
     request: Request<Body>,
 ) -> Response {
     let route = Route::Create;
-    if let Some(response) = rate_limited(&state, route, &endpoint_id) {
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
     let started = Instant::now();
@@ -1223,7 +1063,7 @@ async fn poll_task(
     headers: HeaderMap,
 ) -> Response {
     let route = Route::Poll;
-    if let Some(response) = rate_limited(&state, route, &endpoint_id) {
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
     let Some(endpoint) = endpoint(&state, &endpoint_id) else {
@@ -1233,7 +1073,7 @@ async fn poll_task(
         );
     };
     let Some(token) = headers
-        .get(token_header(endpoint.wire_profile))
+        .get(LEGACY_TOKEN_HEADER)
         .and_then(|header| header.to_str().ok())
         .map(str::trim)
         .filter(|token| !token.is_empty())
@@ -1277,7 +1117,7 @@ async fn read_snapshot(
     headers: HeaderMap,
 ) -> Response {
     let route = Route::Snapshot;
-    if let Some(response) = rate_limited(&state, route, &endpoint_id) {
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
     let started = Instant::now();
@@ -1289,7 +1129,6 @@ async fn read_snapshot(
     }
     let project_id = endpoint.project_id;
     let orchestrator_agent_id = endpoint.orchestrator_agent_id;
-    let wire_profile = endpoint.wire_profile;
     let now_ms = unix_time_ms();
     let snapshot = state
         .daemon
@@ -1299,8 +1138,7 @@ async fn read_snapshot(
         .await;
     match snapshot {
         Ok(snapshot) => {
-            let response =
-                json!({ "ok": true, "snapshot": operational_snapshot(snapshot, wire_profile) });
+            let response = json!({ "ok": true, "snapshot": operational_snapshot(snapshot) });
             if serde_json::to_vec(&response).is_ok_and(|encoded| encoded.len() <= MAX_BODY_BYTES) {
                 authenticated_response(&state, route, started, StatusCode::OK, "read", response)
             } else {
@@ -1335,7 +1173,7 @@ async fn answer_question(
     request: Request<Body>,
 ) -> Response {
     let route = Route::Answer;
-    if let Some(response) = rate_limited(&state, route, &endpoint_id) {
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
     let started = Instant::now();
@@ -1435,7 +1273,7 @@ async fn read_document(
     request: Request<Body>,
 ) -> Response {
     let route = Route::Document;
-    if let Some(response) = rate_limited(&state, route, &endpoint_id) {
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
     let started = Instant::now();
@@ -1528,7 +1366,7 @@ fn internal_error(
 }
 
 async fn unknown_route(State(state): State<HttpState>) -> Response {
-    if let Some(response) = rate_limited(&state, Route::Unknown, "") {
+    if let Some(response) = rate_limited(&state, Route::Unknown) {
         return response;
     }
     json_response(
@@ -1538,7 +1376,7 @@ async fn unknown_route(State(state): State<HttpState>) -> Response {
 }
 
 async fn method_not_allowed(State(state): State<HttpState>) -> Response {
-    if let Some(response) = rate_limited(&state, Route::Unknown, "") {
+    if let Some(response) = rate_limited(&state, Route::Unknown) {
         return response;
     }
     StatusCode::METHOD_NOT_ALLOWED.into_response()
