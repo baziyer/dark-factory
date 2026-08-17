@@ -627,7 +627,8 @@ async fn handle_request(
                 .with_store(move |store| store.agent_status(&lookup_project_id, &lookup_agent_id))
                 .await?;
             let detail =
-                agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?;
+                agent_detail_with_guidance(state, execution, guidance_root, &project_id, &agent_id)
+                    .await?;
             let worktree = match agent_status.agent.worktree.as_deref() {
                 Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
                 None => None,
@@ -712,52 +713,49 @@ async fn handle_request(
             };
             let created_project_id = project_id.clone();
             let created_agent_id = id.clone();
-            let agent = state
-                .commit_and_publish(move |store| {
-                    let (agent, event) = store.create_agent_with_model(
-                        NewAgent {
-                            id,
-                            project_id,
-                            parent_agent_id,
-                            role,
-                            provider,
-                        },
-                        model,
-                        now_ms()?,
-                    )?;
-                    Ok((agent, vec![event]))
-                })
-                .await?;
-            let resolved_worktree = match worktree {
-                Some(worktree) => Some(worktree),
-                None => Some(
-                    provision_agent_worktree(
-                        state,
-                        guidance_root,
-                        &created_project_id,
-                        &created_agent_id,
-                    )
-                    .await?,
-                ),
-            };
-            let agent = if let Some(worktree) = resolved_worktree {
-                let worktree_project_id = created_project_id.clone();
-                let worktree_agent_id = created_agent_id.clone();
-                state
-                    .commit_and_publish(move |store| {
-                        let (agent, event) = store.set_agent_worktree(
-                            &worktree_project_id,
-                            &worktree_agent_id,
-                            worktree,
-                            now_ms()?,
-                        )?;
-                        Ok((agent, vec![event]))
-                    })
-                    .await?
-            } else {
-                agent
-            };
-            ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
+            // Deletion invariant (ARCHITECTURE.md #9, PR #50 review finding
+            // 3): declines outright -- rather than silently skipping like
+            // the dispatcher does -- if this project or this exact agent
+            // id is currently being deleted. Checked and recorded in
+            // flight atomically with `DeleteProject`/`DeleteAgent`'s own
+            // mark under the same lock, so a delete already draining can
+            // never miss this create's writes (`provision_agent_worktree`,
+            // `ensure_agent_guidance`, below): the new agent's worktree
+            // and guidance directory are exactly what a `DeleteProject`
+            // running concurrently would otherwise `rm -rf` right out from
+            // under this request. The agent-id check also covers the
+            // narrower case of reusing an id an in-flight `DeleteAgent`
+            // hasn't finished removing files for yet.
+            if !execution.try_begin_project_write(&created_project_id) {
+                return Err(ApiFailure::Conflict(
+                    "project is being deleted; cannot create an agent under it".into(),
+                ));
+            }
+            if !execution.try_begin_agent_write(&created_agent_id) {
+                execution.end_project_write(&created_project_id);
+                return Err(ApiFailure::Conflict(
+                    "an agent with this id is currently being deleted; wait for the delete to \
+                     finish"
+                        .into(),
+                ));
+            }
+            let create_result = create_agent_locked(
+                state,
+                guidance_root,
+                NewAgent {
+                    id,
+                    project_id,
+                    parent_agent_id,
+                    role,
+                    provider,
+                },
+                model,
+                worktree,
+            )
+            .await;
+            execution.end_agent_write(&created_agent_id);
+            execution.end_project_write(&created_project_id);
+            let agent = create_result?;
             Ok(LocalResponse::AgentCreated { agent })
         }
         LocalRequest::ListAgents {
@@ -781,7 +779,14 @@ async fn handle_request(
             project_id,
             agent_id,
         } => Ok(LocalResponse::Agent {
-            agent: agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?,
+            agent: agent_detail_with_guidance(
+                state,
+                execution,
+                guidance_root,
+                &project_id,
+                &agent_id,
+            )
+            .await?,
         }),
         LocalRequest::UpdateAgentProfile {
             project_id,
@@ -808,8 +813,18 @@ async fn handle_request(
                 })
                 .await?;
             let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
-            write_guidance_file(agent_paths.instructions.clone(), instructions.clone()).await?;
-            write_guidance_file(agent_paths.memory.clone(), memory.clone()).await?;
+            // Deletion invariant (ARCHITECTURE.md #9, PR #50 review finding
+            // 5): these writes would otherwise recreate an agent's
+            // guidance files out from under a concurrent `DeleteAgent`'s
+            // removal.
+            if !execution.try_begin_agent_write(&agent_id) {
+                return Err(ApiFailure::Conflict("agent is being deleted".into()));
+            }
+            let write_result =
+                write_agent_guidance_files(&agent_paths, instructions.clone(), memory.clone())
+                    .await;
+            execution.end_agent_write(&agent_id);
+            write_result?;
             Ok(LocalResponse::AgentProfileUpdated {
                 agent: local_agent_detail(agent, instructions, memory, agent_paths),
             })
@@ -1042,11 +1057,14 @@ async fn handle_request(
         } => {
             let response_project_id = project_id.clone();
             let response_agent_id = agent_id.clone();
-            // Deletion invariant (ARCHITECTURE.md): from this call on, the
-            // execution manager's dispatcher will not begin a new spawn
-            // preparation for this agent, and this call has waited out any
-            // preparation already in flight -- so nothing can still be
-            // writing into its guidance directory below.
+            // Deletion invariant (ARCHITECTURE.md #9): from this call on,
+            // no gated writer -- the dispatcher's spawn preparation, an
+            // idle session's delivery, or a handler using
+            // `try_begin_agent_write` (`GetAgent`/`AgentStatus`,
+            // `UpdateAgentProfile`) -- can begin a new write for this
+            // agent, and this call has waited out any write already in
+            // flight, so nothing can still be writing into its guidance
+            // directory below.
             execution.begin_delete(&agent_id).await?;
             let result = delete_agent_locked(state, guidance_root, project_id, agent_id).await;
             execution.end_delete(&response_agent_id);
@@ -1058,9 +1076,15 @@ async fn handle_request(
         }
         LocalRequest::DeleteProject { project_id } => {
             let response_project_id = project_id.clone();
-            // Same invariant as `DeleteAgent`, applied to every agent the
-            // project currently has before the project's own guidance tree
-            // (which contains all of theirs) goes.
+            // Deletion invariant (ARCHITECTURE.md #9): mark the project
+            // first, so no `CreateAgent` can start writing a new agent's
+            // worktree/guidance tree under it (PR #50 review finding 3 --
+            // the one writer the per-agent marks below can never already
+            // cover, since a brand new agent doesn't exist yet for this
+            // loop to have marked); then mark and drain every agent the
+            // project currently has, same as `DeleteAgent`, before any
+            // files go.
+            execution.begin_delete_project(&project_id).await?;
             let agent_ids = list_all_agent_ids(state, &project_id).await?;
             let mut begun = Vec::with_capacity(agent_ids.len());
             let mut begin_error = None;
@@ -1080,6 +1104,7 @@ async fn handle_request(
             for agent_id in &begun {
                 execution.end_delete(agent_id);
             }
+            execution.end_delete_project(&response_project_id);
             result?;
             Ok(LocalResponse::ProjectDeleted {
                 project_id: response_project_id,
@@ -1511,6 +1536,7 @@ impl AgentGuidancePaths {
 /// paths — what `GetAgent` returns and `AgentStatus` embeds.
 async fn agent_detail_with_guidance(
     state: &ApiState,
+    execution: &execution::Handle,
     guidance_root: &Path,
     project_id: &ProjectId,
     agent_id: &AgentId,
@@ -1520,10 +1546,27 @@ async fn agent_detail_with_guidance(
     let agent = state
         .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
         .await?;
+    // Deletion invariant (ARCHITECTURE.md #9, PR #50 review finding 5):
+    // `read_guidance_file` below lazily recreates this agent's guidance
+    // files (`guidance::read_or_create`) if they're missing -- gated the
+    // same way spawn preparation is (same per-agent lock), so a
+    // concurrent `DeleteAgent`'s drain can never miss this read.
+    if !execution.try_begin_agent_write(agent_id) {
+        return Err(ApiFailure::Conflict("agent is being deleted".into()));
+    }
     let agent_paths = AgentGuidancePaths::new(guidance_root, project_id, agent_id);
-    let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
-    let memory = read_guidance_file(agent_paths.memory.clone()).await?;
+    let guidance = read_agent_guidance_files(&agent_paths).await;
+    execution.end_agent_write(agent_id);
+    let (instructions, memory) = guidance?;
     Ok(local_agent_detail(agent, instructions, memory, agent_paths))
+}
+
+async fn read_agent_guidance_files(
+    paths: &AgentGuidancePaths,
+) -> Result<(String, String), ApiFailure> {
+    let instructions = read_guidance_file(paths.instructions.clone()).await?;
+    let memory = read_guidance_file(paths.memory.clone()).await?;
+    Ok((instructions, memory))
 }
 
 fn local_agent_detail(
@@ -1579,6 +1622,16 @@ async fn write_guidance_file(path: PathBuf, text: String) -> Result<(), ApiFailu
         .map_err(ApiFailure::from)
 }
 
+async fn write_agent_guidance_files(
+    paths: &AgentGuidancePaths,
+    instructions: String,
+    memory: String,
+) -> Result<(), ApiFailure> {
+    write_guidance_file(paths.instructions.clone(), instructions).await?;
+    write_guidance_file(paths.memory.clone(), memory).await?;
+    Ok(())
+}
+
 /// Idempotently creates a project's guidance directory and empty
 /// `PROJECT.md` on the blocking pool.
 async fn ensure_project_guidance(
@@ -1595,6 +1648,53 @@ async fn ensure_project_guidance(
 
 /// Idempotently creates an agent's guidance directory, empty
 /// `instructions.md`, and empty `memory.md` on the blocking pool.
+/// Runs `CreateAgent`'s database and file work, called only after
+/// `execution.try_begin_project_write`/`try_begin_agent_write` have
+/// confirmed neither the project nor this exact agent id is currently
+/// being deleted (ARCHITECTURE.md invariant 9, PR #50 review finding 3).
+async fn create_agent_locked(
+    state: &ApiState,
+    guidance_root: &Path,
+    new_agent: NewAgent,
+    model: Option<String>,
+    worktree: Option<String>,
+) -> Result<factory_core::AgentSnapshot, ApiFailure> {
+    let created_project_id = new_agent.project_id.clone();
+    let created_agent_id = new_agent.id.clone();
+    let agent = state
+        .commit_and_publish(move |store| {
+            let (agent, event) = store.create_agent_with_model(new_agent, model, now_ms()?)?;
+            Ok((agent, vec![event]))
+        })
+        .await?;
+    let resolved_worktree = match worktree {
+        Some(worktree) => Some(worktree),
+        None => Some(
+            provision_agent_worktree(state, guidance_root, &created_project_id, &created_agent_id)
+                .await?,
+        ),
+    };
+    let agent = if let Some(worktree) = resolved_worktree {
+        let worktree_project_id = created_project_id.clone();
+        let worktree_agent_id = created_agent_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let (agent, event) = store.set_agent_worktree(
+                    &worktree_project_id,
+                    &worktree_agent_id,
+                    worktree,
+                    now_ms()?,
+                )?;
+                Ok((agent, vec![event]))
+            })
+            .await?
+    } else {
+        agent
+    };
+    ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
+    Ok(agent)
+}
+
 async fn ensure_agent_guidance(
     guidance_root: &Path,
     project_id: &ProjectId,
@@ -1649,8 +1749,28 @@ async fn provision_agent_worktree(
 /// Runs the file/database work of `DeleteAgent`, called only after
 /// `execution.begin_delete` has confirmed no spawn preparation can still be
 /// mid-write into this agent's guidance directory (ARCHITECTURE.md's
-/// deletion invariant): removes the git worktree, deletes the ledger row,
-/// then removes the guidance directory.
+/// deletion invariant): removes the git worktree and the guidance
+/// directory, *then* deletes the ledger row (PR #50 review, should-fix 4).
+/// Owned files go first so a failure here (a permission problem, an
+/// unexpected file -- not the race this task closes, since the drain
+/// already ran) leaves the row intact and the request retryable, rather
+/// than a ledger entry that's gone while its files linger with no
+/// `DeleteAgent` left to target them. This mirrors the ordering
+/// `remove_agent_worktree_if_any` already used before this change, one
+/// level up.
+///
+/// Residual, pre-existing edge case this ordering does not add and does
+/// not fix: if the agent has a genuinely live session (not just an
+/// in-flight preparation the drain above already waited out), the store
+/// transaction below still correctly refuses with `AgentHasLiveSession`
+/// -- but its worktree and guidance directory have already been removed
+/// by then, out from under that live session. That was already true for
+/// the worktree before this PR; extending the same ordering to guidance
+/// keeps behavior consistent rather than introducing a second, opposite
+/// inconsistency, but does not close it. A full fix (a cheap live-session
+/// precheck, or deferring file removal until the transaction's own
+/// precondition is confirmed) is a follow-up, not folded into this PR to
+/// keep its diff to what #42 and this review need.
 async fn delete_agent_locked(
     state: &ApiState,
     guidance_root: &Path,
@@ -1658,15 +1778,14 @@ async fn delete_agent_locked(
     agent_id: AgentId,
 ) -> Result<(), ApiFailure> {
     remove_agent_worktree_if_any(state, &project_id, &agent_id).await?;
-    let delete_project_id = project_id.clone();
-    let delete_agent_id = agent_id.clone();
+    remove_agent_guidance(guidance_root, &project_id, &agent_id).await?;
     state
         .commit_and_publish(move |store| {
-            let events = store.delete_agent(&delete_project_id, &delete_agent_id, now_ms()?)?;
+            let events = store.delete_agent(&project_id, &agent_id, now_ms()?)?;
             Ok(((), events))
         })
         .await?;
-    remove_agent_guidance(guidance_root, &project_id, &agent_id).await
+    Ok(())
 }
 
 /// Recursively removes one agent's guidance directory, run after
@@ -1745,24 +1864,26 @@ async fn remove_agent_worktree_if_any(
     }
 }
 
-/// Runs the file/database work of `DeleteProject`, called only after every
-/// one of the project's agents has been through `execution.begin_delete`
-/// (its caller's loop): deletes the ledger row, then removes the project's
-/// whole guidance directory tree (which contains every one of those
-/// agents').
+/// Runs the file/database work of `DeleteProject`, called only after
+/// `execution.begin_delete_project` and every one of the project's agents
+/// has been through `execution.begin_delete` (its caller's loop): removes
+/// the project's whole guidance directory tree (which contains every one
+/// of those agents'), *then* deletes the ledger row. Same reordering and
+/// same residual live-session caveat as [`delete_agent_locked`], one level
+/// up (PR #50 review, should-fix 4).
 async fn delete_project_locked(
     state: &ApiState,
     guidance_root: &Path,
     project_id: ProjectId,
 ) -> Result<(), ApiFailure> {
-    let delete_project_id = project_id.clone();
+    remove_project_guidance(guidance_root, &project_id).await?;
     state
         .commit_and_publish(move |store| {
-            let event = store.delete_project(&delete_project_id, now_ms()?)?;
+            let event = store.delete_project(&project_id, now_ms()?)?;
             Ok(((), vec![event]))
         })
         .await?;
-    remove_project_guidance(guidance_root, &project_id).await
+    Ok(())
 }
 
 /// Recursively removes one project's guidance directory, run after
@@ -1786,14 +1907,27 @@ async fn remove_project_guidance(
     }
 }
 
-/// Every agent id currently in `project_id`, paged like `ListAgents`.
+/// The store's generic state-page cap (`store::MAX_STATE_PAGE`, not
+/// exported) is not much larger than the wire's advertised
+/// `MAX_AGENT_PAGE_ITEMS`: asking for `MAX_AGENT_PAGE_ITEMS + 1` (the
+/// look-ahead-by-one this function used to use, matching `ListAgents`'
+/// own paging) lands exactly on that cap today, one bump away from
+/// `InvalidStateLimit` turning every `DeleteProject` into an error. Same
+/// mismatch `execution::reconcile_all`'s own `RECONCILE_PAGE` already
+/// documents and works around with a page size well under the cap (PR #50
+/// review, nit 7) -- this does the same rather than relying on the exact
+/// coincidence.
+const DELETE_PROJECT_AGENT_PAGE: usize = 100;
+
+/// Every agent id currently in `project_id`, paged like `ListAgents` but
+/// at [`DELETE_PROJECT_AGENT_PAGE`], not the wire's larger ceiling.
 /// `DeleteProject` uses this to mark each of the project's agents deleting
 /// (`execution::Handle::begin_delete`) before removing any files.
 async fn list_all_agent_ids(
     state: &ApiState,
     project_id: &ProjectId,
 ) -> Result<Vec<AgentId>, ApiFailure> {
-    let page = MAX_AGENT_PAGE_ITEMS as usize;
+    let page = DELETE_PROJECT_AGENT_PAGE;
     let mut ids = Vec::new();
     let mut after_id = None;
     loop {
@@ -1821,6 +1955,7 @@ impl From<GuidanceError> for ApiFailure {
             }
             GuidanceError::NotUtf8 { .. }
             | GuidanceError::Directory { .. }
+            | GuidanceError::Remove { .. }
             | GuidanceError::File { .. } => Self::Internal(error.to_string()),
         }
     }

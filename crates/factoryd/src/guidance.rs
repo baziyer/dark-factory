@@ -32,6 +32,8 @@ pub const MAX_GUIDANCE_FILE_BYTES: usize = 16 * 1024;
 pub enum GuidanceError {
     #[error("cannot prepare guidance directory {path}: {source}")]
     Directory { path: PathBuf, source: io::Error },
+    #[error("cannot remove guidance directory {path}: {source}")]
+    Remove { path: PathBuf, source: io::Error },
     #[error("cannot prepare guidance file {path}: {source}")]
     File { path: PathBuf, source: io::Error },
     #[error("guidance file {path} exceeds {MAX_GUIDANCE_FILE_BYTES} bytes")]
@@ -61,9 +63,12 @@ pub fn ensure_agent(
 
 /// Recursively removes one agent's guidance directory (`instructions.md`,
 /// `memory.md`, `codex-home/`, `claude-settings.json`, and the outbox
-/// under it), if present. A missing directory is not an error: callers use
-/// this best-effort after the owning `DeleteAgent` transaction has already
-/// committed, so the ledger row is gone either way.
+/// under it), if present. A missing directory is not an error. Callers
+/// (`local_api::delete_agent_locked`) run this *before* the owning
+/// `DeleteAgent` transaction, under `execution::Handle::begin_delete`'s
+/// guarantee that no concurrent writer can be recreating files here, and
+/// surface a failure as the request's own error rather than logging and
+/// proceeding (AGENTS.md rule 3) -- this is no longer best-effort.
 pub fn remove_agent(
     home: &Path,
     project_id: &ProjectId,
@@ -73,9 +78,8 @@ pub fn remove_agent(
 }
 
 /// Recursively removes one project's guidance directory (`PROJECT.md` and
-/// every agent directory under it), if present. Best-effort, for the same
-/// reason as [`remove_agent`]: called after `DeleteProject` has already
-/// committed.
+/// every agent directory under it), if present. See [`remove_agent`] for
+/// ordering and error-handling: the same applies here, one level up.
 pub fn remove_project(home: &Path, project_id: &ProjectId) -> Result<(), GuidanceError> {
     remove_dir(&paths::project_dir(home, project_id))
 }
@@ -84,7 +88,7 @@ fn remove_dir(path: &Path) -> Result<(), GuidanceError> {
     match fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(GuidanceError::Directory {
+        Err(source) => Err(GuidanceError::Remove {
             path: path.to_path_buf(),
             source,
         }),
