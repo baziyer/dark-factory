@@ -138,10 +138,11 @@ pub struct Board {
     /// TERMINALS/FOCUS's pane) — "one selection cursor follows through" per the repomon reference
     /// this design adopts (`REFS-HERDR-REPOMON.md`).
     pub selected_agent: Option<AgentId>,
-    /// FORTRESS-only: `[`/`]` cycle this independently of `selected_agent`, over workshops
-    /// (projects) themselves rather than the agents inside them — the only way to reach a
-    /// project with zero agents, which `selected_agent`'s cursor can never land on since it has
-    /// no candidates there (see `Board::cycle_selected_workshop` and `zoom_in`'s doc comments).
+    /// FORTRESS-only: `[`/`]` (and the spatial cursor landing on an empty workshop) set this
+    /// independently of `selected_agent`, over workshops (projects) themselves rather than the
+    /// agents inside them — how a project with zero agents is reached, since `selected_agent`'s
+    /// cursor has no candidates there (see `Board::cycle_selected_workshop`,
+    /// `move_fortress_cursor`, and `zoom_in`'s doc comments).
     /// Mutually exclusive with `selected_agent` in practice (each cursor clears the other) so
     /// FORTRESS never shows two different "selections" onscreen at once.
     pub selected_workshop: Option<ProjectId>,
@@ -427,17 +428,22 @@ impl Board {
         ))
     }
 
-    /// Same precedence rule as [`Board::agent_state`], for the [`Attention`] taxonomy instead.
+    /// The agent's newest session by start time, live or ended.
+    #[must_use]
+    pub fn latest_session_for(&self, agent_id: &AgentId) -> Option<&SessionSnapshot> {
+        self.sessions
+            .values()
+            .filter(|session| &session.agent_id == agent_id)
+            .max_by_key(|session| (session.started_at_ms, session.id.clone()))
+    }
+
+    /// The [`Attention`] taxonomy's precedence rule, shared with `factoryctl status`
+    /// (`factory_core::attention::agent_attention`).
     #[must_use]
     pub fn agent_attention(&self, agent: &AgentSnapshot) -> Rated<Attention> {
-        if let Some(session) = self.session_for(agent) {
-            return Rated::observed(attention::session_attention(session.state));
-        }
-        Rated::inferred(
-            self.latest_run_for(&agent.id)
-                .map_or(Attention::Routine, |run| {
-                    attention::run_attention(run.status)
-                }),
+        attention::agent_attention(
+            self.latest_session_for(&agent.id),
+            self.latest_run_for(&agent.id),
         )
     }
 

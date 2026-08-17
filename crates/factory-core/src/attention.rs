@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunStatus, SessionState, TaskStatus};
+use crate::{RunSnapshot, RunStatus, SessionSnapshot, SessionState, TaskStatus};
 
 /// How urgently something wants the operator's attention, ranked low to high. `Ord`/`PartialOrd`
 /// follow declaration order, so `a.max(b)` and sorting by this enum directly implement "float
@@ -93,6 +93,31 @@ pub const fn task_attention(status: TaskStatus) -> Attention {
         TaskStatus::Blocked => Attention::NeedsInput,
         TaskStatus::Succeeded => Attention::Completed,
         TaskStatus::Queued | TaskStatus::Running | TaskStatus::Cancelled => Attention::Routine,
+    }
+}
+
+/// The one precedence rule for an agent's attention, used by `factoryd`'s
+/// status responses and by `factory-tui`'s badges alike: a live session's
+/// hook-driven state wins (observed); with no live session, a most recent
+/// session that ended in failure still counts as failed (observed) until a
+/// new session starts; otherwise the most recent run's status is the best
+/// guess (inferred), `Routine` when the agent has never run.
+/// `latest_session` is the agent's newest session, live or ended.
+#[must_use]
+pub fn agent_attention(
+    latest_session: Option<&SessionSnapshot>,
+    latest_run: Option<&RunSnapshot>,
+) -> Rated<Attention> {
+    match latest_session {
+        Some(session) if session.ended_at_ms.is_none() => {
+            Rated::observed(session_attention(session.state))
+        }
+        Some(session) if session.state == SessionState::Failed => {
+            Rated::observed(Attention::Failed)
+        }
+        _ => {
+            Rated::inferred(latest_run.map_or(Attention::Routine, |run| run_attention(run.status)))
+        }
     }
 }
 

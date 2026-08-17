@@ -98,34 +98,67 @@ pub async fn remove(project_root: &Path, worktree_dir: &Path) -> Result<(), Work
     Err(WorktreeError::Git(stderr.into_owned()))
 }
 
-/// `git status --porcelain=v1 --branch` of `worktree_dir`, summarized for
-/// `factoryctl agent status`: the branch name and how many entries are
-/// modified, staged, or untracked.
-pub async fn status(worktree_dir: &Path) -> Result<WorktreeStatus, WorktreeError> {
-    let output = run_git(worktree_dir, &["status", "--porcelain=v1", "--branch"]).await?;
+/// `git status --porcelain=v1 --branch --no-optional-locks` of
+/// `worktree_dir`, summarized for `factoryctl agent status`: the branch
+/// (`None` on a detached `HEAD`) and how many entries are modified, staged,
+/// or untracked. `--no-optional-locks` keeps this read from taking
+/// `index.lock` under a live agent's own `git`. A failure (the directory is
+/// gone, not a repository, ...) is reported in the summary's `error`, never
+/// as a clean tree.
+pub async fn status(worktree_dir: &Path) -> WorktreeStatus {
+    let path = worktree_dir.to_string_lossy().into_owned();
+    let failed = |error: String| WorktreeStatus {
+        path: path.clone(),
+        branch: None,
+        changed_files: 0,
+        dirty: false,
+        error: Some(error),
+    };
+    let output = match run_git(
+        worktree_dir,
+        &[
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--branch",
+        ],
+    )
+    .await
+    {
+        Ok(output) => output,
+        Err(error) => return failed(format!("could not run git: {error}")),
+    };
     if !output.status.success() {
-        return Err(WorktreeError::Git(
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        ));
+        return failed(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut branch = None;
     let mut changed_files = 0u32;
     for line in text.lines() {
         if let Some(header) = line.strip_prefix("## ") {
-            // `main...origin/main [ahead 1]` or `HEAD (no branch)`.
+            // `main...origin/main [ahead 1]`, `HEAD (no branch)`, or
+            // `No commits yet on main`.
             let name = header.split("...").next().unwrap_or(header).trim();
-            branch = Some(name.to_owned());
+            branch = if name.starts_with("HEAD") {
+                None
+            } else {
+                Some(
+                    name.strip_prefix("No commits yet on ")
+                        .unwrap_or(name)
+                        .to_owned(),
+                )
+            };
         } else if !line.is_empty() {
             changed_files += 1;
         }
     }
-    Ok(WorktreeStatus {
-        path: worktree_dir.to_string_lossy().into_owned(),
+    WorktreeStatus {
+        path,
         branch,
         changed_files,
         dirty: changed_files > 0,
-    })
+        error: None,
+    }
 }
 
 async fn run_git(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -199,19 +232,29 @@ mod tests {
             .await
             .unwrap();
 
-        let clean = status(&worktree_dir).await.unwrap();
+        let clean = status(&worktree_dir).await;
         assert_eq!(clean.branch.as_deref(), Some("agent/curie"));
         assert_eq!(clean.changed_files, 0);
         assert!(!clean.dirty);
+        assert_eq!(clean.error, None);
 
         std::fs::write(worktree_dir.join("README.md"), "changed\n").unwrap();
         std::fs::write(worktree_dir.join("new.txt"), "untracked\n").unwrap();
-        let dirty = status(&worktree_dir).await.unwrap();
+        let dirty = status(&worktree_dir).await;
         assert_eq!(dirty.changed_files, 2);
         assert!(dirty.dirty);
         assert_eq!(dirty.path, worktree_dir.to_string_lossy());
 
-        assert!(status(&repo.path().join("missing")).await.is_err());
+        // Detached HEAD: no branch, still a status.
+        git(&worktree_dir, &["checkout", "--detach"]).await;
+        assert_eq!(status(&worktree_dir).await.branch, None);
+
+        // A missing directory or a plain directory reports the failure, not a clean tree.
+        let missing = status(&repo.path().join("missing")).await;
+        assert!(missing.error.is_some());
+        assert!(!missing.dirty);
+        let plain = tempfile::tempdir().unwrap();
+        assert!(status(plain.path()).await.error.is_some());
     }
 
     #[tokio::test]

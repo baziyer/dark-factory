@@ -307,19 +307,20 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
         {
             return;
         }
-        if let Ok(LocalResponse::FleetStatus { status }) =
-            request_response(&client, LocalRequest::FleetStatus)
-        {
-            if tx.send(NetMsg::FleetStatus(status)).is_err() {
-                return;
-            }
-        }
-
         let mut delay = MIN_BACKOFF;
         loop {
             match client.subscribe(after_sequence) {
                 Ok(subscription) => {
                     let _ = tx.send(NetMsg::ConnectionLive);
+                    // The cap is per daemon process: re-read it on every (re)connect, so a
+                    // daemon restarted with a different --max-active-runs is reflected.
+                    if let Ok(LocalResponse::FleetStatus { status }) =
+                        request_response(&client, LocalRequest::FleetStatus)
+                    {
+                        if tx.send(NetMsg::FleetStatus(status)).is_err() {
+                            return;
+                        }
+                    }
                     let mut failure = "event stream ended".to_owned();
                     for frame in subscription {
                         match frame {
