@@ -31,9 +31,14 @@ operator from their own agents. Concretely:
   `codex` session is your CLI, authenticated the way your shell's is, in a
   git worktree the daemon created. Whatever that CLI can do on your machine,
   a session can ask it to do. Codex runs under its `workspace-write`
-  sandbox; Claude Code keeps its native permission prompts, with only
-  `Bash(factoryctl *)` pre-approved (see `README.md`, "Unattended
-  operation"). An agent's own `permission_mode` widens or narrows that.
+  sandbox with network access on (needed for `git push`/`gh pr create` and
+  the daemon's own control socket, which seatbelt has no "just localhost"
+  exception for) and `approval_policy = "never"` plus a pre-seeded
+  `factoryctl` prefix rule so it never stalls on a native prompt nobody is
+  attached to answer; Claude Code keeps its native permission prompts, with
+  only `Bash(factoryctl *)` pre-approved (see `README.md`, "Unattended
+  operation"). An agent's own `permission_mode` widens or narrows that. See
+  `docs/providers.md` for the full write-up and rationale.
 - **Hooks are authenticated; the rest is your user.** A provider's hook
   invocations identify their session by a per-session random token in a
   `0600` file (never on argv or in the environment). An agent's own `task

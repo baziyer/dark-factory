@@ -203,10 +203,15 @@ worktree came from the daemon itself, never from an untrusted source.
 `factoryctl` is always resolvable inside a session (its directory is
 prepended to `PATH`) and pre-approved as a Bash command prefix in Claude's
 generated settings, so an agent's own progress report never stalls on a
-permission prompt nobody is there to answer. Codex's own sandbox can still
-block an agent's *own* `factoryctl task done`/`task blocked`/`agent
-message` call even though hooks always get through; a file-based outbox
-(drained by the next hook) covers that gap. Codex agents seed their
+permission prompt nobody is there to answer. Codex agents get the
+equivalent treatment: `approval_policy = "never"` (an operator can override
+it per agent) plus a pre-seeded `CODEX_HOME/rules/default.rules` prefix
+rule for `factoryctl`, and `network_access = true` in the sandbox so the
+daemon's own control socket (and a worker's `git push`/`gh pr create`) are
+actually reachable, not just unblocked from asking. A file-based outbox
+(drained by the next hook) is still the fallback for an agent's own
+`factoryctl task done`/`task blocked`/`agent message` call if the daemon is
+ever unreachable for some other reason. Codex agents seed their
 per-agent `CODEX_HOME` from the Codex home the daemon's environment names
 (`$CODEX_HOME`, else your own `~/.codex`) — so a factory can run on a
 different Codex account than your shell: `CODEX_HOME=~/.codex-dogfood

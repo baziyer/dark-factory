@@ -250,6 +250,75 @@ No config on the Dark Factory side can fix this — it is Codex's own
 session-lifecycle timing, not a hooks-table or trust-state shape a
 generated `config.toml` controls.
 
+## Codex: unattended approvals — `approval_policy`, network access, and a pre-seeded `factoryctl` rule
+
+Left at Codex's own default, every agent stops on a native "Would you like
+to run the following command?" prompt with nobody attached to answer it: a
+real dogfood run's orchestrator (`god`) stopped on its very first
+`factoryctl agent add`, and every later `factoryctl` call — even a bare
+`sleep 30` — prompted again until the operator interactively chose "don't
+ask again for commands that start with `factoryctl`". A worker would hit
+the identical wall at its first `git push`/`gh pr create`. Two independent
+gates were involved, and both had to change:
+
+- **`approval_policy`** is now always passed explicitly —
+  `-c approval_policy="never"` — instead of only when an agent's own
+  profile sets a `permission_mode` (which left every agent silently on
+  Codex's own un-set `on-request`). `on-request` and `never` were both
+  considered for the default: `on-request` needs every command a role
+  might run — `factoryctl`, `git`, `cargo`, `gh`, even `sleep` — allow-
+  listed by hand as each new one is hit, an ever-growing, brittle
+  treadmill that is the exact opposite of unattended operation. `never`
+  was chosen for both the orchestrator and worker roles — a real per-role
+  evaluation that reached the same answer for both, not an oversight, since
+  both need to run unattended and neither's actual capability is gated by
+  this flag (see the next point). An operator can still override it per
+  agent with `agent profile set --permission-mode <on-request|never>`,
+  which always wins over the default.
+- **What actually gates capability is unchanged and still on**: Codex's
+  `workspace-write` sandbox. `approval_policy` only controls whether Codex
+  *asks* before running a sandboxed or escalation-requiring command, not
+  what the sandbox itself permits — flipping it to `never` removes an
+  interactive question nobody is there to answer, it does not widen what a
+  session can do. `SECURITY.md`'s own boundary already says as much: "Its
+  security boundary is the operating-system user it runs as; it does not
+  try to protect the operator from their own agents. ... An agent's own
+  `permission_mode` widens or narrows that." One consequence is worth
+  knowing: under `never`, Codex cannot *ask* to escalate a command out of
+  the sandbox at all (confirmed in the 0.147 binary: an internal check
+  refuses "escalated permissions if the approval policy is [never]") — so
+  anything that needs to reach outside `workspace-write`'s own limits must
+  already be granted directly in the sandbox itself, which is exactly what
+  the next point does for the one thing every agent needs past the
+  sandbox's previous default.
+- **`network_access` is now `true`** in `[sandbox_workspace_write]`
+  (previously `false`). Confirmed live that `false` denies even a *local*
+  Unix-socket connect — seatbelt has no "just localhost" exception — which
+  blocked not only a worker's `git push`/`gh pr create` but the
+  orchestrator's own everyday `factoryctl agent add`/`task add`/`task
+  assign`/`session list` calls (only `task done`/`task blocked`/`agent
+  message` have the outbox fallback below; nothing else does). This is a
+  real widening — general outbound network access, not just the daemon's
+  own socket — accepted under `SECURITY.md`'s documented threat model, not
+  a gap in it. The alternative tried and rejected was a provider-wide
+  `danger-full-access` bypass instead of a narrower `network_access` flip:
+  it traded this hang for a worse one, since `codex_apps`'s own built-in
+  MCP server hangs indefinitely at startup under it.
+- **A `factoryctl` prefix rule is now pre-seeded.** `CodexProvider` writes
+  `CODEX_HOME/rules/default.rules` once, at first seed (never overwritten
+  on a later spawn, matching `config.toml`'s own seed-once contract — an
+  operator's or Codex's own later additions to the file are preserved):
+  ```
+  prefix_rule(pattern=["factoryctl"], decision="allow")
+  ```
+  the exact shape (confirmed against a real dogfood agent's own
+  operator-approved `rules/default.rules`) Codex itself writes once an
+  operator chooses "don't ask again" by hand. Seeding it up front means no
+  agent ever has to hit that prompt once before reaching the same state —
+  and it keeps `factoryctl` working unattended even for an agent an
+  operator has explicitly overridden back to `approval_policy = "on-
+  request"`, which does still consult rules.
+
 ## Sandboxed providers: the outbox
 
 A provider's *hooks* (`SessionStart`/`UserPromptSubmit`/.../`Stop`) always

@@ -66,6 +66,42 @@ sandbox_mode = \"workspace-write\"";
 const MINIMAL_CONFIG_TOML: &str =
     "# Dark Factory generated Codex home (no ~/.codex/config.toml was found to copy).\n";
 
+/// Codex's own default when `spawn_spec` passes no `approval_policy` at all
+/// is `on-request`: a native prompt for every shell command that is not
+/// already sandbox-permitted -- with nobody attached to answer it in an
+/// unattended factory (this track's dogfood run: `god`'s very first
+/// `factoryctl agent add` stopped on it, and every later `factoryctl` call,
+/// even a bare `sleep 30`, prompted again until the operator chose "don't
+/// ask again for commands that start with `factoryctl`"). `spawn_spec`
+/// passes this explicitly instead, for both the orchestrator and worker
+/// roles -- a real per-role evaluation that happens to reach the same
+/// answer for both, not an oversight: both need unattended operation, and
+/// Codex's `workspace-write` sandbox (`SANDBOX_MODE_COMMENT_AND_LINE`) plus
+/// this track's `network_access = true` (`config_block_toml`) remain the
+/// actual gate on what a session can reach, unaffected by
+/// `approval_policy` -- flipping it to `never` removes an interactive
+/// question nobody is there to answer, not a security boundary
+/// (`SECURITY.md`: "Its security boundary is the operating-system user it
+/// runs as; it does not try to protect the operator from their own
+/// agents"). An operator can still override this per agent with `agent
+/// profile set --permission-mode <on-request|never>`
+/// (`ctx.permission_mode`), which always wins over this default. See
+/// `docs/providers.md` for the full write-up.
+const DEFAULT_APPROVAL_POLICY: &str = "never";
+
+/// Pre-approves this agent's own `factoryctl` calls the same way Codex's
+/// own interactive "don't ask again for commands that start with
+/// `factoryctl`" choice does -- confirmed against a real dogfood session's
+/// own operator-approved `CODEX_HOME/rules/default.rules`, which Codex
+/// wrote in exactly this shape once the operator chose it by hand (see
+/// `docs/providers.md`). Seeding it up front means a fresh agent's very
+/// first `factoryctl` call never blocks on a prompt nobody is attached to
+/// answer, under either `approval_policy` value: `never` does not consult
+/// rules at all (nothing is ever asked), but `on-request` does, so an
+/// operator who overrides an agent back to `on-request` still gets an
+/// unattended `factoryctl`.
+const FACTORYCTL_PREFIX_RULE: &str = "prefix_rule(pattern=[\"factoryctl\"], decision=\"allow\")\n";
+
 /// Top-level tables never copied from the operator's real `~/.codex/
 /// config.toml` into a fresh per-agent seed (this track's item 7):
 ///
@@ -143,8 +179,9 @@ fn table_header_top_level_key(line: &str) -> Option<String> {
 }
 
 /// Interactive-session [`Provider`] for Codex. Launches `codex
-/// --dangerously-bypass-hook-trust [--model M] [-c
-/// approval_policy="<permission_mode>"] [resume <thread-id>]` with
+/// --dangerously-bypass-hook-trust [--model M] -c
+/// approval_policy="<permission_mode or DEFAULT_APPROVAL_POLICY>" [resume
+/// <thread-id>]` with
 /// `CODEX_HOME` pointed at this agent's own seeded home (per orchestrator
 /// amendment A2, `TRACK5-DESIGN.md`: per *agent*, not per session, so
 /// `codex resume` can find its own prior rollout file across a stop and
@@ -210,10 +247,16 @@ impl Provider for CodexProvider {
             args.push("--model".to_owned());
             args.push(model.clone());
         }
-        if let Some(permission_mode) = &ctx.permission_mode {
-            args.push("-c".to_owned());
-            args.push(format!("approval_policy=\"{permission_mode}\""));
-        }
+        // Always explicit -- never Codex's own un-set `on-request` default
+        // -- so an unattended agent never silently inherits a native
+        // approval prompt nobody is there to answer. See
+        // `DEFAULT_APPROVAL_POLICY`'s own doc comment.
+        let approval_policy = ctx
+            .permission_mode
+            .as_deref()
+            .unwrap_or(DEFAULT_APPROVAL_POLICY);
+        args.push("-c".to_owned());
+        args.push(format!("approval_policy=\"{approval_policy}\""));
         if let Some(thread_id) = &ctx.resume {
             validate_thread_id(thread_id).map_err(|_| ProviderError::ResumeIdNotUuid {
                 value: thread_id.clone(),
@@ -246,11 +289,17 @@ impl Provider for CodexProvider {
 /// first time it is used: copies `source_home/config.toml` if present
 /// (filtered down to what a factory worker needs by
 /// [`filter_operator_config_for_seed`] -- see [`DROPPED_SEED_TABLES`]),
-/// else writes [`MINIMAL_CONFIG_TOML`]; symlinks `source_home/auth.json`
-/// if present, re-pointing a link the daemon made when the seed home
-/// changed. Existing files are never overwritten — `config.toml` is a
-/// one-time seed, not a sync; only the `auth.json` link follows the seed
-/// home. The hooks block is
+/// else writes [`MINIMAL_CONFIG_TOML`]; writes [`FACTORYCTL_PREFIX_RULE`]
+/// into `rules/default.rules`, the exact file (and shape) Codex itself
+/// writes there once an operator interactively chooses "don't ask again
+/// for commands that start with `factoryctl`" -- seeding it up front means
+/// no agent ever has to hit that prompt once, unattended, before reaching
+/// the same state; symlinks `source_home/auth.json` if present,
+/// re-pointing a link the daemon made when the seed home changed. Existing
+/// files are never overwritten — `config.toml` and `rules/default.rules`
+/// are one-time seeds, not a sync (an operator's or Codex's own later
+/// additions to either are never clobbered by a later spawn); only the
+/// `auth.json` link follows the seed home. The hooks block is
 /// refreshed separately, every spawn, by [`rewrite_hooks_block`].
 fn seed_codex_home_once(
     codex_home: &Path,
@@ -274,6 +323,16 @@ fn seed_codex_home_once(
                 source,
             }
         })?;
+    }
+
+    let rules_path = codex_home.join("rules").join("default.rules");
+    if !rules_path.exists() {
+        hooks::write_private_file(&rules_path, FACTORYCTL_PREFIX_RULE.as_bytes()).map_err(
+            |source| ProviderError::Seed {
+                path: rules_path.clone(),
+                source,
+            },
+        )?;
     }
 
     if let Some(source_home) = source_home {
@@ -341,11 +400,24 @@ fn rewrite_hooks_block(
 /// root-table key -- see [`SANDBOX_MODE_COMMENT_AND_LINE`]'s own doc
 /// comment for why it cannot simply live inside the marker block below)
 /// plus a `CONFIG_BEGIN_MARKER`/`CONFIG_END_MARKER` block holding
-/// `[sandbox_workspace_write]` (`writable_roots`/`network_access`, so the
-/// sandbox that gates a session's own spawned tool calls can still reach
-/// this agent's guidance directory and the daemon's control socket -- a
-/// Unix socket connect needs write access to the socket path under the
-/// seatbelt sandbox) and `[projects."<worktree>"]` (`trust_level =
+/// `[sandbox_workspace_write]` (`writable_roots` so the sandbox that gates
+/// a session's own spawned tool calls can still reach this agent's
+/// guidance directory and the daemon's control socket's directory;
+/// `network_access = true`, this track's change from the previous `false`
+/// -- confirmed live that `false` denies even the *local* Unix-socket
+/// connect the daemon's own control socket needs (seatbelt has no notion
+/// of "just localhost"), which blocked not only a worker's `git push`/`gh
+/// pr create` but the orchestrator's own non-outbox-covered `factoryctl`
+/// calls (`agent add`/`task add`/`task assign`/`session list`; only `task
+/// done`/`task blocked`/`agent message` have the outbox fallback,
+/// `docs/providers.md`). This is a real widening -- general outbound
+/// network access, not just the daemon's socket -- accepted per
+/// `SECURITY.md`'s own boundary ("the operating-system user it runs as";
+/// "an agent's own `permission_mode` widens or narrows that"), not a gap:
+/// the alternative tried and rejected was a provider-wide
+/// `danger-full-access` bypass, which traded this hang for a worse one
+/// (`codex_apps`'s own MCP server hangs indefinitely at startup under it,
+/// `docs/providers.md`)) and `[projects."<worktree>"]` (`trust_level =
 /// "trusted"`, so the very first Codex session in a fresh Dark Factory
 /// worktree never blocks on Codex's own trust prompt, matching
 /// `ClaudeProvider::pretrust_worktree`). Called on every spawn, after
@@ -409,7 +481,7 @@ fn config_block_toml(agent_dir: &Path, socket_directory: &Path, worktree: &Path)
         toml_string(&agent_dir.to_string_lossy()),
         toml_string(&socket_directory.to_string_lossy()),
     ));
-    block.push_str("network_access = false\n");
+    block.push_str("network_access = true\n");
     block.push('\n');
     block.push_str(&format!(
         "[projects.{}]\n",
@@ -621,7 +693,13 @@ mod provider_tests {
         assert_eq!(launch.program, PathBuf::from("codex"));
         assert_eq!(
             launch.args,
-            vec!["--dangerously-bypass-hook-trust".to_owned()]
+            vec![
+                "--dangerously-bypass-hook-trust".to_owned(),
+                "-c".to_owned(),
+                "approval_policy=\"never\"".to_owned(),
+            ],
+            "an agent with no explicit permission_mode must still get an \
+             explicit approval_policy, never Codex's own on-request default"
         );
         let codex_home = directory.path().join("agent-dir").join("codex-home");
         assert_eq!(
@@ -655,6 +733,27 @@ mod provider_tests {
                 "resume".to_owned(),
                 "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn an_explicit_permission_mode_overrides_the_never_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = context(directory.path());
+        ctx.permission_mode = Some("on-request".to_owned());
+        let launch = CodexProvider::with_source_home(directory.path().join("no-real-home"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        assert_eq!(
+            launch.args,
+            vec![
+                "--dangerously-bypass-hook-trust".to_owned(),
+                "-c".to_owned(),
+                "approval_policy=\"on-request\"".to_owned(),
+            ],
+            "an operator's own agent profile permission_mode always wins over \
+             DEFAULT_APPROVAL_POLICY"
         );
     }
 
@@ -696,6 +795,66 @@ mod provider_tests {
 
         let metadata = fs::metadata(config_path.parent().unwrap()).unwrap();
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    /// Q2's pre-seeded approval: a fresh agent's very first `factoryctl`
+    /// call must never block on the same prompt tonight's dogfood run hit
+    /// (`god`'s first `agent add`) -- confirmed against a real dogfood
+    /// session's own operator-approved `CODEX_HOME/rules/default.rules`,
+    /// which is exactly this shape once Codex itself writes it.
+    #[test]
+    fn seeds_a_default_rules_file_pre_approving_factoryctl() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        CodexProvider::with_source_home(directory.path().join("missing"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let rules_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("rules")
+            .join("default.rules");
+        let contents = fs::read_to_string(&rules_path).unwrap();
+        assert_eq!(contents, FACTORYCTL_PREFIX_RULE);
+
+        let metadata = fs::metadata(&rules_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let dir_metadata = fs::metadata(rules_path.parent().unwrap()).unwrap();
+        assert_eq!(dir_metadata.permissions().mode() & 0o777, 0o700);
+    }
+
+    /// Mirrors `copies_the_real_config_once_and_keeps_the_auth_link_on_the_seed_home`'s
+    /// own "a real user edit is preserved" proof, for the rules file: once
+    /// seeded, a later addition -- an operator's own interactive approval
+    /// of some other command, or Codex's own rewrite of the file -- is
+    /// never clobbered by a later spawn re-seeding.
+    #[test]
+    fn a_later_addition_to_the_seeded_rules_file_is_never_clobbered() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        let provider = CodexProvider::with_source_home(directory.path().join("missing"));
+        provider.spawn_spec(&ctx).unwrap();
+
+        let rules_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("rules")
+            .join("default.rules");
+        fs::write(
+            &rules_path,
+            format!(
+                "{FACTORYCTL_PREFIX_RULE}prefix_rule(pattern=[\"sleep\", \"30\"], decision=\"allow\")\n"
+            ),
+        )
+        .unwrap();
+
+        provider.spawn_spec(&ctx).unwrap();
+        let contents = fs::read_to_string(&rules_path).unwrap();
+        assert!(contents.contains("sleep"));
+        assert!(contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()));
     }
 
     #[test]
@@ -876,7 +1035,7 @@ mod provider_tests {
             "# --- dark-factory config BEGIN ---\n\
              [sandbox_workspace_write]\n\
              writable_roots = [\"/abs/agent-dir\", \"/abs\"]\n\
-             network_access = false\n\
+             network_access = true\n\
              \n\
              [projects.\"/abs/worktrees/worker-1\"]\n\
              trust_level = \"trusted\"\n\
@@ -921,7 +1080,13 @@ mod provider_tests {
                 &canonicalize_or_given(ctx.socket_path.parent().unwrap()).to_string_lossy()
             ),
         )));
-        assert!(contents.contains("network_access = false"));
+        assert!(
+            contents.contains("network_access = true"),
+            "workers must reach the network for git push/gh pr create and \
+             the orchestrator's own non-outbox-covered factoryctl calls \
+             need the daemon's control socket -- see config_block_toml's \
+             own doc comment"
+        );
         assert!(contents.contains(&format!(
             "[projects.{}]",
             toml_string(&canonicalize_or_given(&ctx.worktree).to_string_lossy())
