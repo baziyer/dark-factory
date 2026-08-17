@@ -1243,6 +1243,78 @@ fn spawn_failure_is_visible_backs_off_and_recovers_with_a_single_delivery() {
     daemon.stop();
 }
 
+// --- (j) TRACK5F: a sandboxed provider's `task done` falls back to the
+//     file outbox, drained by the very next hook -----------------------
+
+#[test]
+fn task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_hook() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+
+    // `DARK_FACTORY_FORCE_OUTBOX=1`, prefixed onto the fixture's own
+    // command (not baked into `shell-agent.sh` itself, nor into the
+    // daemon's fixed `SESSION_ENVIRONMENT_NAMES` allowlist -- this is a
+    // test-only override, see `outbox.rs`'s `FORCE_OUTBOX_ENV`), makes
+    // every outbox-eligible `factoryctl` call the fixture makes (here,
+    // `task done`) skip its direct daemon attempt and queue to
+    // `$DARK_FACTORY_AGENT_DIR/outbox/` instead -- the same fallback path
+    // a genuinely sandboxed provider's blocked socket connect would
+    // trigger, without this test needing to actually break the socket.
+    let command = format!("DARK_FACTORY_FORCE_OUTBOX=1 {}", shell_agent_path());
+    create_shell_agent_with_command(&client, "curie", command);
+
+    create_task(
+        &client,
+        "task-1",
+        "Queue via the outbox",
+        "prove the fallback",
+    );
+    assign_task(&client, "task-1", "curie");
+
+    // `shell-agent.sh` discards `task done`'s output and swallows its
+    // exit code (`|| true`): if queuing or the drain were broken, this
+    // task would simply stay `running` forever rather than fail loudly.
+    // Reaching `Succeeded` with the exact composed result is only
+    // possible if the queued `CompleteTask` request was durably carried
+    // to the daemon by the very next `factoryctl hook` call
+    // (`shell-agent.sh`'s own `Stop` hook, immediately following `task
+    // done` in `process_turn`) -- proving `outbox::drain` ran before that
+    // hook was sent, not after.
+    let task = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    assert_eq!(
+        task.result.as_deref(),
+        Some("done: Task task-1: Queue via the outbox (task:task-1)")
+    );
+
+    let runs = list_runs(&client);
+    let run = runs
+        .iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-1"))
+        .expect("run for task-1");
+    assert_eq!(run.status, factory_core::RunStatus::Succeeded);
+    assert_eq!(run.closed_by, Some(factory_core::RunClosedBy::TaskDone));
+
+    // The queued request's file is gone: `drain` deletes on success, not
+    // just on read.
+    let outbox = factory_core::paths::agent_dir(
+        home.path(),
+        &project_id(),
+        &AgentId::try_from("curie").unwrap(),
+    )
+    .join("outbox");
+    let remaining = std::fs::read_dir(&outbox)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(
+        remaining, 0,
+        "the drained outbox file must be deleted, found {outbox:?} non-empty"
+    );
+
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
+
 // --- attach helpers ----------------------------------------------------
 
 /// Reads up to `max_frames` frames from an `AttachTerminal` connection in
