@@ -33,11 +33,17 @@ target/debug/factoryctl --socket "$DARK_FACTORY_HOME/f.sock" health
 A resident session's provider process is a detached process tree,
 independent of `factoryd` (`ARCHITECTURE.md`'s invariant 4): killing and
 restarting *this* development daemon on the *same* temp
-`$DARK_FACTORY_HOME` reconnects to whatever it left running. This is also
-how upgrading the **live** daemon works today, manually: build the new
-binaries, then `launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd`
+`$DARK_FACTORY_HOME` reconnects to whatever it left running. Upgrading the
+**live** daemon is `factoryctl update --install` (below), or by hand: build
+the new binaries and `launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd`
 — the daemon restarts, runners survive, and `factory-tui`'s reconnect/backoff
-means the board just picks the same sessions back up.
+means the board just picks the same sessions back up. **One-time caveat for
+an install that predates the process-group fix** (a job loaded from the old
+template, running a daemon older than 39955d2): the *loaded* job has no
+`AbandonProcessGroup` and its runners share the daemon's process group, so
+the first `kickstart -k`/`bootout`/`update --install` after upgrading takes
+any live session with it — do that first restart while no session is live.
+Every restart after it (new daemon, new job) keeps sessions.
 
 ## CI and GitHub
 
