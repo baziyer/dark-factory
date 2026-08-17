@@ -120,6 +120,19 @@ const MAX_WAIT_REASON_BYTES: usize = 512;
 /// exists only so tests can shorten it; production always uses this
 /// constant (`main.rs`).
 pub const SESSION_START_DEADLINE: Duration = Duration::from_secs(120);
+/// After this many *consecutive* [`SESSION_START_DEADLINE`] expiries in a
+/// row for the same agent, [`enforce_start_deadline`] pauses the agent
+/// (`Store::pause_agent`) instead of respawning again -- adversarial
+/// review of #24 (finding 4): a hookless provider spawns successfully
+/// every time, so an ordinary spawn failure's backoff never gets anything
+/// to escalate to on its own, and left alone this cycles forever at
+/// [`SESSION_START_DEADLINE`]'s cadence, killing and relaunching a real
+/// provider process every ~2 minutes. 3 is one generous benefit of the
+/// doubt -- a provider that is merely slow to initialize losing the
+/// `SessionStart` race twice running is unlikely -- before treating it as
+/// persistently broken; `factoryctl agent resume` is the documented way
+/// back in and resets the streak (`Handle::resume_backoff`).
+const MAX_CONSECUTIVE_START_DEADLINES: u32 = 3;
 const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
 (DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
@@ -491,6 +504,17 @@ impl Handle {
         self.project_gate.end_preparation(project_id);
     }
 
+    /// Clears `agent_id`'s spawn backoff and start-deadline streak (issue
+    /// #24 finding 4): called by `ResumeAgent` (`local_api.rs`) right
+    /// alongside `Store::resume_agent`, so an operator resuming an agent
+    /// the dispatcher paused after [`MAX_CONSECUTIVE_START_DEADLINES`]
+    /// gets a clean slate rather than being paused again on its very next
+    /// deadline (which, without this, would still count toward the old
+    /// streak).
+    pub fn resume_backoff(&self, agent_id: &AgentId) {
+        self.backoff.record_success(agent_id);
+    }
+
     /// Stops the dispatcher. Live sessions are untouched: closing/crashing
     /// the daemon must not stop agents (`HANDOFF.md`).
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -564,6 +588,13 @@ pub fn spawn(
 /// close. Splitting them so neither operation can touch the other's data
 /// makes that class of bug structurally impossible rather than merely
 /// fixed once.
+/// Timing state is in-memory only: a daemon restart forgets
+/// every agent's delay, `consecutive_failures`, and
+/// `consecutive_start_deadlines` and starts them fresh at
+/// [`SPAWN_BACKOFF_INITIAL`]/zero -- acceptable (a restart is already a
+/// deliberate, infrequent, operator-visible event, not a hot path this
+/// needs to survive) and simpler than persisting transient retry-pacing
+/// state durably alongside the actual session/task ledger.
 struct SpawnBackoff {
     timing: Mutex<HashMap<AgentId, BackoffTiming>>,
     /// The delete-gating half of this struct (ARCHITECTURE.md invariant
@@ -578,6 +609,15 @@ struct BackoffTiming {
     next_attempt_at: Instant,
     delay: Duration,
     consecutive_failures: u32,
+    /// How many of `consecutive_failures` in a row, most recently, were a
+    /// [`SESSION_START_DEADLINE`] expiry specifically (issue #24 finding
+    /// 4) rather than any other kind of spawn failure -- cleared by
+    /// [`SpawnBackoff::record_success`] exactly like everything else in
+    /// this entry, so an unrelated ordinary spawn failure in between two
+    /// deadline expiries also resets the streak (it is not "3 deadline
+    /// failures ever", it is "3 in a row with nothing else, including a
+    /// success, in between").
+    consecutive_start_deadlines: u32,
 }
 
 impl Default for BackoffTiming {
@@ -586,6 +626,7 @@ impl Default for BackoffTiming {
             next_attempt_at: Instant::now(),
             delay: Duration::ZERO,
             consecutive_failures: 0,
+            consecutive_start_deadlines: 0,
         }
     }
 }
@@ -631,14 +672,11 @@ impl SpawnBackoff {
             .is_none_or(|entry| Instant::now() >= entry.next_attempt_at)
     }
 
-    /// Doubles (capped) `agent_id`'s delay and returns `(new_delay,
-    /// consecutive_failures)` so the caller can log both.
-    fn record_failure(&self, agent_id: &AgentId) -> (Duration, u32) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = timing.entry(agent_id.clone()).or_default();
+    /// Doubles (capped) `entry`'s delay, bumps `consecutive_failures`, and
+    /// returns `(new_delay, consecutive_failures)` -- the part
+    /// [`SpawnBackoff::record_failure`] and
+    /// [`SpawnBackoff::record_start_deadline_failure`] share.
+    fn bump(entry: &mut BackoffTiming) -> (Duration, u32) {
         entry.delay = if entry.delay.is_zero() {
             SPAWN_BACKOFF_INITIAL
         } else {
@@ -649,12 +687,50 @@ impl SpawnBackoff {
         (entry.delay, entry.consecutive_failures)
     }
 
-    /// Clears `agent_id`'s backoff timer after a successful spawn. Only
-    /// ever touches [`SpawnBackoff::timing`] -- never `gate` (PR #50
-    /// review finding 1): a concurrent [`Handle::begin_delete`] may have
-    /// marked this exact agent deleting while this spawn was still in
-    /// flight, and this call must not erase that mark or the in-flight
-    /// write count backing it.
+    /// Doubles (capped) `agent_id`'s delay and returns `(new_delay,
+    /// consecutive_failures)` so the caller can log both.
+    fn record_failure(&self, agent_id: &AgentId) -> (Duration, u32) {
+        let mut timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = timing.entry(agent_id.clone()).or_default();
+        Self::bump(entry)
+    }
+
+    /// [`SpawnBackoff::record_failure`], but for a [`SESSION_START_DEADLINE`]
+    /// expiry specifically (issue #24 finding 4): shares the exact same
+    /// exponential delay/`consecutive_failures` curve as any other spawn
+    /// failure (so this still escalates through the documented 5s ->
+    /// 5 minute backoff instead of restarting at 5s every ~2 minutes), and
+    /// additionally tracks the deadline-specific streak
+    /// [`MAX_CONSECUTIVE_START_DEADLINES`] acts on. Returns `(new_delay,
+    /// consecutive_failures, consecutive_start_deadlines)`.
+    fn record_start_deadline_failure(&self, agent_id: &AgentId) -> (Duration, u32, u32) {
+        let mut timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = timing.entry(agent_id.clone()).or_default();
+        let (delay, consecutive_failures) = Self::bump(entry);
+        entry.consecutive_start_deadlines += 1;
+        (
+            delay,
+            consecutive_failures,
+            entry.consecutive_start_deadlines,
+        )
+    }
+
+    /// Clears `agent_id`'s backoff bookkeeping entirely: delay,
+    /// `consecutive_failures`, and `consecutive_start_deadlines` all reset
+    /// to a clean slate. Two callers, both a deliberate "start over": a
+    /// spawn actually reaching `idle` (`dispatch_agent`'s `Idle` arm --
+    /// issue #24 finding 4's redefinition of "success", since a spawn
+    /// merely returning `Ok` never gave a hookless provider's repeated
+    /// deadline failures anywhere to escalate to), and an operator
+    /// explicitly resuming a paused agent (`Handle::resume_backoff`) --
+    /// the resume *is* the retry decision. Only touches timing, never the
+    /// separate deletion gate introduced by #50.
     fn record_success(&self, agent_id: &AgentId) {
         let mut timing = self
             .timing
@@ -970,8 +1046,11 @@ async fn dispatch_agent(
                             spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
                                 .await;
                         backoff.end_preparation(agent_id);
+                        // A successful process spawn is not yet a usable
+                        // session; retain timing until SessionStart moves
+                        // it past `starting`.
                         match spawn_result {
-                            Ok(_) => backoff.record_success(agent_id),
+                            Ok(_) => {}
                             Err(error) => {
                                 let (retry_in, attempt) = backoff.record_failure(agent_id);
                                 tracing::warn!(
@@ -990,6 +1069,7 @@ async fn dispatch_agent(
             Ok(())
         }
         Some(session) if session.state == SessionState::Idle => {
+            backoff.record_success(agent_id);
             deliver_pending(
                 config,
                 state,
@@ -1038,12 +1118,67 @@ async fn enforce_start_deadline(
         return Ok(());
     }
 
+    // Adversarial review of #24, finding 6: a `StopSession` already in
+    // flight against this still-`starting` session resolves through the
+    // ordinary stop-completion path (`supervise_child` observing the
+    // runner's real exit, `end_session`/`end_session_now`) with its own
+    // real exit status and no reason text -- never through here, and
+    // never with this deadline's reason attached to what the operator
+    // asked to be a plain `stopped`, not a `failed`. Nothing to back off
+    // or respawn either: nobody asked this agent to be respawned.
+    if session.stop_requested_at_ms.is_some() {
+        return Ok(());
+    }
+
     let session_id = session.id.clone();
+    // Adversarial review of #24, findings 1 and 2: commit the `failed`
+    // transition *first*, guarded so it only ever applies while the
+    // session is still exactly `starting` (`Store::fail_starting_session`,
+    // `WHERE state = 'starting'` inside its own transaction -- not
+    // `SessionState::is_live()`, which would also accept a session whose
+    // own `SessionStart` hook won the race and already moved it to
+    // `idle`/`working` in between this function's `await` points). Only a
+    // successful, guarded commit goes on to best-effort stop the runner,
+    // record the backoff failure, and wake the dispatcher; a lost guard
+    // (the hook won) makes this entire call a no-op, and -- unlike the
+    // previous stop-then-fail order -- a `supervise_child` racing the
+    // runner's own exit can never beat this commit to `SessionNotLive`
+    // and silently swallow the reason/backoff/wake the operator depends
+    // on to see why the session failed and that a retry is coming.
+    let reason = format!(
+        "SessionStart hook not received within {}s (the provider started but its hooks did not \
+         reach factoryd)",
+        config.session_start_deadline.as_secs()
+    );
+    let fail_session_id = session_id.clone();
+    let outcome = state
+        .commit_and_publish(move |store| {
+            match store.fail_starting_session(&fail_session_id, reason, now)? {
+                Some((_snapshot, events)) => Ok((true, events)),
+                None => Ok((false, Vec::new())),
+            }
+        })
+        .await?;
+    if !outcome {
+        // Lost the guard: the session's own `SessionStart` hook (or some
+        // other transition) already moved it out of `starting` before
+        // this committed. It is exactly as healthy as its own state now
+        // says -- nothing here to stop, back off, or wake for.
+        return Ok(());
+    }
+
     // Stop the runner (best-effort, reusing the same control path
     // `local_api.rs`'s `StopSession` handler uses): if the control socket
-    // is already unreachable there is nothing left to stop, and the
-    // session is still recorded `failed` below regardless -- this must
+    // is already unreachable there is nothing left to stop -- the session
+    // is already durably recorded `failed` above regardless, so this can
     // never be the reason a stuck session stays visible as `starting`.
+    // Adversarial review of #24, finding 7: a failed stop here can leave
+    // the old provider process alive, holding the worktree, while the
+    // backoff retry below launches a new runner into the same worktree --
+    // the same orphan class issue #26 already covers, just reachable as a
+    // steady-state path now instead of only across a daemon restart; no
+    // reaper for it here, `tracing::error!` (not `warn!`) so it is not
+    // mistaken for the routine, expected case.
     let target_project_id = project_id.clone();
     let target_session_id = session_id.clone();
     match state
@@ -1062,52 +1197,94 @@ async fn enforce_start_deadline(
                 .stop(0)
                 .await
                 {
-                    tracing::warn!(
+                    tracing::error!(
                         %error,
                         %project_id,
                         %agent_id,
                         %session_id,
-                        "could not stop a session past its start deadline; recording it failed anyway"
+                        "could not stop a session past its start deadline; its provider process \
+                         may still be running and holding the worktree"
                     );
                 }
             }
         }
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 %error,
                 %project_id,
                 %agent_id,
                 %session_id,
-                "could not resolve a session past its start deadline's control target; recording it failed anyway"
+                "could not resolve a session past its start deadline's control target; its \
+                 provider process may still be running and holding the worktree"
             );
         }
     }
 
-    let reason = format!(
-        "SessionStart hook not received within {}s (the provider started but its hooks did not \
-         reach factoryd); recover by hand with `factoryctl hook --token-file <session token file> \
-         SessionStart` -- see README's \"Unattended operation\"",
-        config.session_start_deadline.as_secs()
-    );
-    let fail_session_id = session_id.clone();
-    state
-        .commit_and_publish(move |store| {
-            let (snapshot, events) =
-                store.end_session_with_reason(&fail_session_id, None, None, Some(reason), now)?;
-            Ok((snapshot, events))
-        })
-        .await?;
+    // Adversarial review of #24, finding 4: this still drives the exact
+    // same exponential delay/`consecutive_failures` an ordinary spawn
+    // failure does (5s doubling to a 5 minute cap, `SpawnBackoff::bump`),
+    // but also tracks how many of this agent's consecutive failures were
+    // a start-deadline expiry specifically, so a hookless provider -- one
+    // whose spawn always succeeds, only its hook never arrives -- has
+    // somewhere to escalate to instead of cycling forever at this
+    // deadline's own ~2 minute cadence.
+    let (retry_in, attempt, consecutive_start_deadlines) =
+        backoff.record_start_deadline_failure(agent_id);
 
-    // Same events/log line a failed spawn attempt already emits
-    // (`dispatch_agent`'s own `None` branch, above): the next attempt is
-    // backed off, and the dispatcher is woken so it respawns once that
-    // backoff elapses rather than waiting a full extra safety tick.
-    let (retry_in, attempt) = backoff.record_failure(agent_id);
+    if consecutive_start_deadlines >= MAX_CONSECUTIVE_START_DEADLINES {
+        // Pause instead of respawning: the session just committed above
+        // stays `failed` with its own reason, which is already enough for
+        // `factory-core::attention::agent_attention` to report this agent
+        // as observed `Failed` and for `factoryctl status`/`agent
+        // status`/the TUI to route the operator to it -- no new state, no
+        // new code path there. `factoryctl agent resume` is the
+        // documented way back in and resets this streak
+        // (`Handle::resume_backoff`). Deliberately no `send_wake`: a
+        // paused agent's own `dispatch_agent` call returns immediately
+        // (its very first check), so there is nothing for a wake to do
+        // until the operator resumes it.
+        let pause_project_id = project_id.clone();
+        let pause_agent_id = agent_id.clone();
+        match state
+            .commit_and_publish(move |store| {
+                let (agent, event) = store.pause_agent(&pause_project_id, &pause_agent_id, now)?;
+                Ok((agent, vec![event]))
+            })
+            .await
+        {
+            Ok(_) => {
+                tracing::warn!(
+                    %project_id,
+                    %agent_id,
+                    %session_id,
+                    consecutive_start_deadlines,
+                    "session start deadline exceeded too many times in a row; pausing the agent \
+                     instead of respawning (factoryctl agent resume to retry)"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %project_id,
+                    %agent_id,
+                    "could not pause an agent after repeated session start deadlines"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // Same shape of event/log line an ordinary spawn failure already
+    // emits (`dispatch_agent`'s own `None` branch, above): the next
+    // attempt is backed off, and the dispatcher is woken so it respawns
+    // once that backoff elapses rather than waiting a full extra safety
+    // tick.
     tracing::warn!(
         %project_id,
         %agent_id,
         %session_id,
         attempt,
+        consecutive_start_deadlines,
         retry_in_secs = retry_in.as_secs(),
         "session start deadline exceeded; recorded failed and backing off"
     );
@@ -2841,6 +3018,92 @@ mod tests {
             backoff.try_begin_preparation(&parent_id),
             "clearing the mark must restore normal CreateAgent behavior for the parent id"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_agent_never_touches_a_stop_requested_starting_session_past_its_deadline() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("stuck").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    provider_session_id: None,
+                    worktree: worktree.clone(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: directory
+                        .path()
+                        .join("runs")
+                        .join("session-1")
+                        .to_string_lossy()
+                        .into_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .request_session_stop(&project_id, &session_id, 1_500)
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let cfg = config(directory.path());
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let backoff = SpawnBackoff::new();
+        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
+            .await
+            .unwrap();
+
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        let session = sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .unwrap();
+        assert_eq!(session.state, SessionState::Starting);
+        assert!(session.ended_at_ms.is_none());
+        assert!(session.wait_reason.is_none());
+        assert!(backoff.ready(&agent_id));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
