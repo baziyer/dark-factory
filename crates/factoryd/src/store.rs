@@ -2638,6 +2638,23 @@ impl Store {
         })
     }
 
+    /// Read-only: would `delete_agent(project_id, agent_id, _)` succeed right
+    /// now? Lets a caller refuse a delete request before removing any files
+    /// (`local_api::delete_agent_locked`), so a refusal has no side effects.
+    /// Not transactional by itself -- callers that need this check to still
+    /// hold once they act on it rely on the execution manager's deletion
+    /// gate (`execution::Handle::begin_delete`) to keep a *new* session from
+    /// appearing in between, the same way `delete_agent`'s own transaction
+    /// does the authoritative final check.
+    pub fn check_agent_deletable(&self, project_id: &ProjectId, agent_id: &AgentId) -> Result<()> {
+        check_agent_deletable(&self.connection, project_id, agent_id)
+    }
+
+    /// See [`Store::check_agent_deletable`]: same reasoning, one level up.
+    pub fn check_project_deletable(&self, project_id: &ProjectId) -> Result<()> {
+        check_project_deletable(&self.connection, project_id)
+    }
+
     /// Deletes an agent that has no open run, no live session, no child
     /// agents, and no run that is itself the parent of another run. Its
     /// terminal runs and sessions are deleted too; tasks still assigned to
@@ -2651,37 +2668,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let agent = load_agent(&transaction, agent_id)?
-            .filter(|agent| agent.snapshot.project_id == *project_id)
-            .ok_or(StoreError::AgentNotFound)?;
-        if agent.snapshot.current_run_id.is_some() {
-            return Err(StoreError::AgentHasActiveRun);
-        }
-        if agent.snapshot.current_session_id.is_some() {
-            return Err(StoreError::AgentHasLiveSession);
-        }
-        let has_children: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM agents WHERE parent_agent_id = ?1 AND project_id = ?2
-             )",
-            params![agent_id.as_str(), project_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if has_children {
-            return Err(StoreError::AgentHasChildren);
-        }
-        let has_dependent_runs: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM runs child
-                JOIN runs parent ON parent.id = child.parent_run_id
-                WHERE parent.agent_id = ?1
-             )",
-            params![agent_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if has_dependent_runs {
-            return Err(StoreError::AgentRunHasDependents);
-        }
+        check_agent_deletable(&transaction, project_id, agent_id)?;
 
         transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
         let mut events = Vec::new();
@@ -2777,27 +2764,7 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let exists: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
-            params![project_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(StoreError::ProjectNotFound);
-        }
-        let has_active_run: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM runs
-                WHERE project_id = ?1 AND status NOT IN ('succeeded', 'failed', 'stopped')
-                UNION ALL
-                SELECT 1 FROM sessions WHERE project_id = ?1 AND ended_at_ms IS NULL
-             )",
-            params![project_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if has_active_run {
-            return Err(StoreError::ProjectHasActiveRun);
-        }
+        check_project_deletable(&transaction, project_id)?;
 
         transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
         transaction.execute(
@@ -3679,6 +3646,80 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+/// The same precondition checks `delete_agent` performs, factored out so a
+/// caller can verify a delete would succeed *before* touching any files
+/// (`local_api::delete_agent_locked`'s file-then-row ordering needs this to
+/// keep a refusal side-effect-free -- PR #50 re-review, new blocking
+/// finding). Read-only: takes `&Connection` so it works unchanged whether
+/// called directly (a plain read, `Store::check_agent_deletable`) or from
+/// inside `delete_agent`'s own transaction (`Transaction` derefs to
+/// `Connection`) -- the checks live in exactly one place either way.
+fn check_agent_deletable(
+    connection: &Connection,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<()> {
+    let agent = load_agent(connection, agent_id)?
+        .filter(|agent| agent.snapshot.project_id == *project_id)
+        .ok_or(StoreError::AgentNotFound)?;
+    if agent.snapshot.current_run_id.is_some() {
+        return Err(StoreError::AgentHasActiveRun);
+    }
+    if agent.snapshot.current_session_id.is_some() {
+        return Err(StoreError::AgentHasLiveSession);
+    }
+    let has_children: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM agents WHERE parent_agent_id = ?1 AND project_id = ?2
+         )",
+        params![agent_id.as_str(), project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_children {
+        return Err(StoreError::AgentHasChildren);
+    }
+    let has_dependent_runs: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM runs child
+            JOIN runs parent ON parent.id = child.parent_run_id
+            WHERE parent.agent_id = ?1
+         )",
+        params![agent_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_dependent_runs {
+        return Err(StoreError::AgentRunHasDependents);
+    }
+    Ok(())
+}
+
+/// See [`check_agent_deletable`]: same reasoning, one level up, factored
+/// out of `delete_project`.
+fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM projects WHERE id = ?1)",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StoreError::ProjectNotFound);
+    }
+    let has_active_run: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM runs
+            WHERE project_id = ?1 AND status NOT IN ('succeeded', 'failed', 'stopped')
+            UNION ALL
+            SELECT 1 FROM sessions WHERE project_id = ?1 AND ended_at_ms IS NULL
+         )",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_active_run {
+        return Err(StoreError::ProjectHasActiveRun);
+    }
+    Ok(())
 }
 
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
