@@ -5,3 +5,6 @@
 *.db-wal
 /.worktrees/
 /.claude/worktrees/
+
+# Internal notes (dogfood logs, handoffs, design scratch): local only, never published.
+docs/internal/
