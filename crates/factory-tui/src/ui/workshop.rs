@@ -30,12 +30,15 @@ fn agent_state_style(state: AgentState) -> Style {
     }
 }
 
-fn task_glyph(status: TaskStatus) -> char {
+/// `theme.complete` is the only status glyph that varies by theme (`--theme plain`'s whole point
+/// is no non-ASCII glyph escapes it — see `theme.rs`'s `glyph_tables_are_complete_and_ascii_for_
+/// plain`); the rest are already plain ASCII in both themes, so they stay literal here.
+fn task_glyph(status: TaskStatus, theme: &crate::theme::Theme) -> char {
     match status {
         TaskStatus::Queued => '#',
         TaskStatus::Running => '>',
         TaskStatus::Blocked => '?',
-        TaskStatus::Succeeded => '\u{2713}',
+        TaskStatus::Succeeded => theme.complete,
         TaskStatus::Failed => '!',
         TaskStatus::Cancelled => 'x',
     }
@@ -97,7 +100,7 @@ fn render_tasks(
     project_name: &str,
 ) {
     let tasks = board.visible_tasks(project_id);
-    let items: Vec<ListItem> = tasks
+    let mut items: Vec<ListItem> = tasks
         .iter()
         .map(|task| {
             let status = task.snapshot.status;
@@ -108,14 +111,18 @@ fn render_tasks(
                 .map_or_else(|| "-".to_owned(), |id| id.as_str().to_owned());
             let line = Line::from(vec![
                 Span::styled(
-                    format!("{} ", task_glyph(status)),
+                    format!("{} ", task_glyph(status, &board.theme)),
                     Style::default().fg(task_color(status)),
                 ),
                 Span::raw(pad(
                     &format!("#{}", truncate(task.snapshot.id.as_str(), 9)),
                     11,
                 )),
+                // A literal separator space, not folded into `pad`'s width: a title exactly at
+                // (or past) the pad width would otherwise glue directly onto the arrow that
+                // follows (`pad` only pads when it has room to).
                 Span::raw(pad(&task.snapshot.title, 18)),
+                Span::raw(" "),
                 Span::styled(
                     format!("\u{2192} {assignee}"),
                     Style::default().fg(Color::Gray),
@@ -124,6 +131,17 @@ fn render_tasks(
             ListItem::new(line)
         })
         .collect();
+    if items.is_empty() {
+        let hint = if board.attention_filter && !board.tasks_in(project_id).is_empty() {
+            "no tasks need attention — press ! to clear the filter"
+        } else {
+            "no tasks yet — press n to add one"
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
 
     let focused = board.workshop_focus == WorkshopPane::Tasks;
     let filter_badge = if board.attention_filter { " [!]" } else { "" };
@@ -168,7 +186,7 @@ fn wait_or_activity_text(
 
 fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &ProjectId) {
     let tree = board.visible_agent_tree(project_id);
-    let items: Vec<ListItem> = tree
+    let mut items: Vec<ListItem> = tree
         .iter()
         .map(|(agent_id, depth)| {
             let indent = "  ".repeat(usize::from(*depth));
@@ -192,7 +210,10 @@ fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
             let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(format!("{glyph} "), agent_state_style(rated_state.value)),
+                // Same guaranteed separator as the tasks list above: a 12-char-or-longer agent
+                // id must not glue onto the state label that follows.
                 Span::raw(pad(agent_id.as_str(), 12)),
+                Span::raw(" "),
                 Span::styled(
                     pad(rated_state.value.label(), 9),
                     agent_state_style(rated_state.value),
@@ -209,6 +230,17 @@ fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
             ListItem::new(Line::from(spans))
         })
         .collect();
+    if items.is_empty() {
+        let hint = if board.attention_filter && !board.agent_tree(project_id).is_empty() {
+            "no agents need attention — press ! to clear the filter"
+        } else {
+            "no agents in this project yet — create one with factoryctl agent add"
+        };
+        items.push(ListItem::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))));
+    }
 
     let focused = board.workshop_focus == WorkshopPane::Agents;
     let filter_badge = if board.attention_filter { " [!]" } else { "" };

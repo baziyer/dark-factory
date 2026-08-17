@@ -384,9 +384,26 @@ impl Board {
             }
             View::Workshop => self.zoom_in_workshop(),
             View::Terminals => {
-                if self.terminal_targets().is_empty() {
+                let targets = self.terminal_targets();
+                if targets.is_empty() {
                     self.set_status("no live sessions to zoom into", StatusLevel::Error);
                     return Intent::Redraw;
+                }
+                // `selected_agent` only tracks a TERMINALS pane once `Tab`/`j`/`k` has cycled to
+                // it (see `cycle_selected_agent`) — jumping straight here via `3`/`Enter` without
+                // ever cycling would otherwise leave it pointing nowhere (or at an agent whose
+                // pane isn't even one of these tiles) and FOCUS would show "no agent selected"
+                // despite a pane clearly being on screen. Default to the first visible tile.
+                let already_visible = self.selected_agent.as_ref().is_some_and(|id| {
+                    targets.iter().any(|session_id| {
+                        self.agent_for_pane_session(session_id)
+                            .is_some_and(|a| &a.id == id)
+                    })
+                });
+                if !already_visible {
+                    self.selected_agent = self
+                        .agent_for_pane_session(&targets[0])
+                        .map(|agent| agent.id.clone());
                 }
                 self.view = View::Focus;
                 self.pane_forwarding = true;
@@ -415,10 +432,22 @@ impl Board {
                 Intent::Redraw
             }
             WorkshopPane::Agents => {
-                if self.selected_agent.is_none() {
-                    self.set_status("no agent selected", StatusLevel::Error);
+                // Same default-to-first fallback as the `Tasks` arm above: landing on this pane
+                // (e.g. via `2` then `Tab`, never `j`/`k`) shouldn't dead-end zoom-in just
+                // because nothing has been explicitly selected yet.
+                let agent_id = self.selected_agent.clone().or_else(|| {
+                    self.focused_project.as_ref().and_then(|project_id| {
+                        self.visible_agent_tree(project_id)
+                            .into_iter()
+                            .map(|(id, _)| id)
+                            .next()
+                    })
+                });
+                let Some(agent_id) = agent_id else {
+                    self.set_status("no agents yet", StatusLevel::Error);
                     return Intent::Redraw;
-                }
+                };
+                self.selected_agent = Some(agent_id);
                 self.view = View::Terminals;
                 self.pane_forwarding = true;
                 Intent::Redraw
@@ -1230,6 +1259,20 @@ mod tests {
         assert_eq!(board.view, View::Terminals);
     }
 
+    /// Landing on WORKSHOP's agents pane without ever pressing `j`/`k` (e.g. `2` then `Tab`)
+    /// leaves `selected_agent` unset — `Enter` should still zoom in on the first agent rather
+    /// than dead-ending with a "no agent selected" status.
+    #[test]
+    fn workshop_enter_on_agents_pane_with_no_prior_selection_defaults_to_the_first_agent() {
+        let mut board = board_in_workshop();
+        board.workshop_focus = WorkshopPane::Agents;
+        assert_eq!(board.selected_agent, None);
+        let intent = board.handle_key(key(KeyCode::Enter));
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Terminals);
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
+    }
+
     #[test]
     fn workshop_esc_zooms_out_to_fortress() {
         let mut board = board_in_workshop();
@@ -1331,6 +1374,46 @@ mod tests {
         let intent = board.handle_key(key(KeyCode::Char('1')));
         assert!(matches!(intent, Intent::Redraw));
         assert_eq!(board.view, View::Fortress);
+    }
+
+    /// Jumping straight to TERMINALS (`3`) and zooming in (`Enter`) without ever cycling a pane
+    /// via `Tab`/`j`/`k` used to leave `selected_agent` unset, so FOCUS rendered "no agent
+    /// selected" even though a pane was plainly on screen (`terminal_targets` non-empty). `Enter`
+    /// should default to the first visible pane instead.
+    #[test]
+    fn terminals_zoom_in_with_no_prior_selection_defaults_to_the_first_pane() {
+        let mut board = board_in_workshop();
+        board.view = View::Terminals;
+        board.dev_local_pty = true;
+        board.pane_forwarding = false;
+        assert_eq!(board.selected_agent, None);
+
+        let intent = board.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Focus);
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
+        assert!(
+            board.focus_target().is_some(),
+            "FOCUS should have a pane to attach, not \"no agent selected\""
+        );
+    }
+
+    /// A `selected_agent` left over from a *different* project's TERMINALS pane (e.g. after
+    /// switching the focused project) is not one of this project's visible panes, so it should
+    /// be replaced by the first visible one rather than zooming FOCUS onto a pane that isn't
+    /// even on screen.
+    #[test]
+    fn terminals_zoom_in_replaces_a_selection_not_among_the_visible_panes() {
+        let mut board = board_in_workshop();
+        board.view = View::Terminals;
+        board.dev_local_pty = true;
+        board.pane_forwarding = false;
+        board.selected_agent = Some(AgentId::try_from("someone-else").unwrap());
+
+        board.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
     }
 
     #[test]
