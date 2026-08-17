@@ -207,20 +207,25 @@ Add `$DARK_FACTORY_HOME/bin/current` to your shell `PATH` to run the
 installed `factoryctl`/`factory-tui`; `launchd/README.md` covers the job
 itself.
 
-### Operator install/doctor — design
+### Operator install and doctor
 
-`factoryctl init` and `factoryctl doctor` (not implemented yet): `init`
-creates `$DARK_FACTORY_HOME`, installs the running build's sibling
-binaries as `bin/<version>` + `current`, checks `claude`/`codex`/`git`,
-renders the launchd job with a `PATH` that can find them, and loads it.
-`doctor` runs the same checks read-only (plus socket reachability, daemon
-vs. binary version, `0700`/`0600` permissions, stale agent worktrees) and
-prints one pass/fail line per check, exiting non-zero if anything fails.
+`factoryctl init` is the guided install (README, "Install"): home
+directory, this build's binaries as `bin/<version>` + `current`, a probe of
+`claude`/`codex`/`git`, an explicit consent step for the writes outside
+the home, then the launchd job rendered with a `PATH` that can find those
+CLIs, loaded, and the daemon awaited. `factoryctl doctor [--json]` runs
+the same probes read-only plus the daemon (reachable? same version as the
+binaries?), the launchd job (installed, loaded, `PATH` covers the
+providers?), `~/.claude.json` for worktree pre-trust, every project's root
+and stale worktree directories, and the cached update check; one line per
+check, exit 1 on any failure. `init` and `doctor` share those probes and
+`update --install` shares `init`'s launchd step, so the three commands
+cannot disagree about what a healthy install looks like.
 
 ## Task list for whoever picks this up
 
 - [x] GitHub Actions release workflow (tag → build → attach binaries + manifest)
 - [x] `factoryctl update` (check-only) and `factory-tui` status-line signal
 - [x] `factoryctl update --install` (download, verify, repoint, reload, restart)
-- [ ] `factoryctl init` and `factoryctl doctor`
+- [x] `factoryctl init` and `factoryctl doctor`
 - [ ] Homebrew tap, npm wrapper (after the above is proven)
