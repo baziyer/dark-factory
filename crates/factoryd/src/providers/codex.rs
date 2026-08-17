@@ -94,12 +94,27 @@ const DEFAULT_APPROVAL_POLICY: &str = "never";
 /// `factoryctl`" choice does -- confirmed against a real dogfood session's
 /// own operator-approved `CODEX_HOME/rules/default.rules`, which Codex
 /// wrote in exactly this shape once the operator chose it by hand (see
-/// `docs/providers.md`). Seeding it up front means a fresh agent's very
-/// first `factoryctl` call never blocks on a prompt nobody is attached to
-/// answer, under either `approval_policy` value: `never` does not consult
-/// rules at all (nothing is ever asked), but `on-request` does, so an
-/// operator who overrides an agent back to `on-request` still gets an
-/// unattended `factoryctl`.
+/// `docs/providers.md`).
+///
+/// **Inert under [`DEFAULT_APPROVAL_POLICY`].** Confirmed from the
+/// installed `codex-cli 0.147.0` binary's own strings: `prefix_rule`'s
+/// `allow` decision is only ever consulted under `approval_policy =
+/// "on-request"` ("you cannot request additional permissions unless the
+/// approval policy is OnRequest") -- under this provider's shipped
+/// default, `never`, nothing ever asks, so nothing ever reads this file's
+/// `allow` rules either. It is seeded anyway so an operator who overrides
+/// one agent back to `on-request` (`agent profile set --permission-mode
+/// on-request`) does not also have to rediscover and re-approve
+/// `factoryctl` by hand. When it *is* consulted, be precise about what it
+/// grants: the same binary's strings describe `prefix_rule` as valid "only
+/// with `sandbox_permissions: \"require_escalated\"`", i.e. this rule
+/// pre-approves **unsandboxed** execution of any command whose parsed
+/// prefix is `factoryctl` -- every subcommand, not just the task/agent
+/// verbs a session's own delivery composes, including `factoryctl update`
+/// (replaces the installed binaries) and `factoryctl init` (rewrites the
+/// launchd job). Codex's own exec-policy checks (`forbid` rules, and its
+/// built-in "blocked by policy" denials) are unaffected either way --
+/// `approval_policy` and rules only ever gate the `allow` side.
 const FACTORYCTL_PREFIX_RULE: &str = "prefix_rule(pattern=[\"factoryctl\"], decision=\"allow\")\n";
 
 /// Top-level tables never copied from the operator's real `~/.codex/
@@ -241,6 +256,7 @@ impl Provider for CodexProvider {
         seed_codex_home_once(&codex_home, self.source_home.as_deref())?;
         rewrite_hooks_block(&codex_home, &ctx.factoryctl_path, &ctx.hook_token_path)?;
         rewrite_config_block(&codex_home, &ctx.agent_dir, &ctx.socket_path, &ctx.worktree)?;
+        ensure_factoryctl_rule_present(&codex_home)?;
 
         let mut args = vec!["--dangerously-bypass-hook-trust".to_owned()];
         if let Some(model) = &ctx.model {
@@ -289,18 +305,19 @@ impl Provider for CodexProvider {
 /// first time it is used: copies `source_home/config.toml` if present
 /// (filtered down to what a factory worker needs by
 /// [`filter_operator_config_for_seed`] -- see [`DROPPED_SEED_TABLES`]),
-/// else writes [`MINIMAL_CONFIG_TOML`]; writes [`FACTORYCTL_PREFIX_RULE`]
-/// into `rules/default.rules`, the exact file (and shape) Codex itself
-/// writes there once an operator interactively chooses "don't ask again
-/// for commands that start with `factoryctl`" -- seeding it up front means
-/// no agent ever has to hit that prompt once, unattended, before reaching
-/// the same state; symlinks `source_home/auth.json` if present,
+/// else writes [`MINIMAL_CONFIG_TOML`]; copies every `source_home/rules/
+/// *.rules` file present (an operator's own approval *and* `forbid` rules
+/// -- see [`seed_rules_directory`]'s own doc comment for why these are
+/// copied, unlike `config.toml`'s `mcp_servers`/`projects`/`hooks`, which
+/// are deliberately dropped); symlinks `source_home/auth.json` if present,
 /// re-pointing a link the daemon made when the seed home changed. Existing
-/// files are never overwritten — `config.toml` and `rules/default.rules`
-/// are one-time seeds, not a sync (an operator's or Codex's own later
-/// additions to either are never clobbered by a later spawn); only the
-/// `auth.json` link follows the seed home. The hooks block is
-/// refreshed separately, every spawn, by [`rewrite_hooks_block`].
+/// files are never overwritten by this function — `config.toml` and each
+/// copied `rules/*.rules` file are one-time seeds, not a sync (an
+/// operator's or Codex's own later additions to either are never clobbered
+/// by a later spawn); only the `auth.json` link follows the seed home. The
+/// hooks block, the `factoryctl` rule ([`ensure_factoryctl_rule_present`]),
+/// and the sandbox/trust config block are all refreshed separately, every
+/// spawn, by their own dedicated `rewrite_*`/`ensure_*` functions.
 fn seed_codex_home_once(
     codex_home: &Path,
     source_home: Option<&Path>,
@@ -325,15 +342,7 @@ fn seed_codex_home_once(
         })?;
     }
 
-    let rules_path = codex_home.join("rules").join("default.rules");
-    if !rules_path.exists() {
-        hooks::write_private_file(&rules_path, FACTORYCTL_PREFIX_RULE.as_bytes()).map_err(
-            |source| ProviderError::Seed {
-                path: rules_path.clone(),
-                source,
-            },
-        )?;
-    }
+    seed_rules_directory(codex_home, source_home)?;
 
     if let Some(source_home) = source_home {
         let auth_path = codex_home.join("auth.json");
@@ -364,6 +373,84 @@ fn seed_codex_home_once(
         }
     }
     Ok(())
+}
+
+/// One-time seed (per file, like `config.toml`) of `codex_home/rules/`
+/// from `source_home/rules/*.rules`, if any exist: an operator who has
+/// hardened their own `~/.codex` with approval and `forbid` rules
+/// otherwise loses every one of them in every factory agent, silently,
+/// since `rules/` -- unlike `config.toml` -- was never read from the
+/// source home at all before this. Unlike `config.toml`'s allow-listed
+/// tables, nothing here is filtered: a `forbid` rule an operator wrote for
+/// their own machine has no `mcp_servers`/`projects`/`hooks`-shaped reason
+/// to be dropped for a factory worker. Each destination file is written
+/// only if it does not already exist, so a later spawn never clobbers an
+/// operator's or Codex's own edit to an already-seeded file.
+fn seed_rules_directory(
+    codex_home: &Path,
+    source_home: Option<&Path>,
+) -> Result<(), ProviderError> {
+    let Some(source_home) = source_home else {
+        return Ok(());
+    };
+    let source_rules_dir = source_home.join("rules");
+    let Ok(entries) = fs::read_dir(&source_rules_dir) else {
+        return Ok(());
+    };
+    let rules_dir = codex_home.join("rules");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("rules") {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let destination = rules_dir.join(name);
+        if destination.exists() {
+            continue;
+        }
+        let Ok(contents) = fs::read(&path) else {
+            continue;
+        };
+        hooks::write_private_file(&destination, &contents).map_err(|source| {
+            ProviderError::Seed {
+                path: destination.clone(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Idempotently ensures `codex_home/rules/default.rules` contains
+/// [`FACTORYCTL_PREFIX_RULE`], appending it if an existing file -- copied
+/// from the operator by [`seed_rules_directory`], or one Codex itself
+/// wrote after an earlier manual approval, or simply absent -- does not
+/// already have it. Unlike the seed-once copy above, this runs on *every*
+/// spawn: an agent whose `rules/default.rules` already existed before this
+/// line shipped (this track's own dogfood fleet had exactly one such
+/// agent) would otherwise never receive it, since seeding only ever
+/// touches a file that does not yet exist. Never removes anything already
+/// in the file -- an operator's own `forbid` rules, or another `prefix_rule`
+/// Codex wrote, are left exactly as they were.
+fn ensure_factoryctl_rule_present(codex_home: &Path) -> Result<(), ProviderError> {
+    let rules_path = codex_home.join("rules").join("default.rules");
+    let existing = fs::read_to_string(&rules_path).unwrap_or_default();
+    if existing.contains(FACTORYCTL_PREFIX_RULE.trim_end()) {
+        return Ok(());
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    updated.push_str(FACTORYCTL_PREFIX_RULE);
+    hooks::write_private_file(&rules_path, updated.as_bytes()).map_err(|source| {
+        ProviderError::Seed {
+            path: rules_path,
+            source,
+        }
+    })
 }
 
 /// Idempotently rewrites the daemon-owned hooks block in `codex_home`'s
@@ -855,6 +942,95 @@ mod provider_tests {
         let contents = fs::read_to_string(&rules_path).unwrap();
         assert!(contents.contains("sleep"));
         assert!(contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()));
+    }
+
+    /// Adversarial review finding 4: a real dogfood agent
+    /// (`first-floor-worker-2`) already had `rules/default.rules` -- from
+    /// Codex itself approving some other command -- without the
+    /// `factoryctl` rule, so the old seed-once-if-missing logic would never
+    /// have given it one. `ensure_factoryctl_rule_present` runs every
+    /// spawn, not just at seed time, so the very next spawn appends it
+    /// without disturbing what was already there.
+    #[test]
+    fn an_existing_rules_file_missing_the_factoryctl_rule_gets_it_appended_on_the_next_spawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        let rules_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("rules")
+            .join("default.rules");
+        fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        fs::write(
+            &rules_path,
+            "prefix_rule(pattern=[\"./scripts/local-ci.sh\"], decision=\"allow\")\n",
+        )
+        .unwrap();
+
+        CodexProvider::with_source_home(directory.path().join("missing"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let contents = fs::read_to_string(&rules_path).unwrap();
+        assert!(
+            contents.contains("./scripts/local-ci.sh"),
+            "the agent's own already-approved rule must survive"
+        );
+        assert!(
+            contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()),
+            "an existing agent must retroactively get the factoryctl rule too"
+        );
+    }
+
+    /// Adversarial review finding 6: an operator's own `rules/*.rules`
+    /// files -- including `forbid` rules they wrote to harden their own
+    /// `~/.codex` -- must be carried into a fresh agent's seeded home, not
+    /// silently dropped the way `config.toml`'s `mcp_servers`/`projects`/
+    /// `hooks` tables deliberately are.
+    #[test]
+    fn operator_rules_files_including_forbid_rules_are_copied_into_the_seeded_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let real_home = directory.path().join("real-codex-home");
+        let real_rules_dir = real_home.join("rules");
+        fs::create_dir_all(&real_rules_dir).unwrap();
+        fs::write(
+            real_rules_dir.join("default.rules"),
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"allow\")\n",
+        )
+        .unwrap();
+        fs::write(
+            real_rules_dir.join("hardening.rules"),
+            "forbid_rule(pattern=[\"rm\", \"-rf\", \"/\"])\n",
+        )
+        .unwrap();
+        // Not a `.rules` file -- must be ignored, matching `config.toml`'s
+        // own allow-list precision rather than a raw directory copy.
+        fs::write(real_rules_dir.join("notes.txt"), "not a rules file\n").unwrap();
+
+        let ctx = context(directory.path());
+        CodexProvider::with_source_home(real_home)
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let seeded_rules_dir = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("rules");
+        let default_contents = fs::read_to_string(seeded_rules_dir.join("default.rules")).unwrap();
+        assert!(default_contents.contains("git"));
+        assert!(
+            default_contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()),
+            "the operator's own default.rules must still gain the factoryctl rule"
+        );
+        let hardening_contents =
+            fs::read_to_string(seeded_rules_dir.join("hardening.rules")).unwrap();
+        assert!(
+            hardening_contents.contains("forbid_rule"),
+            "an operator's own forbid rules must be preserved, not dropped"
+        );
+        assert!(!seeded_rules_dir.join("notes.txt").exists());
     }
 
     #[test]
