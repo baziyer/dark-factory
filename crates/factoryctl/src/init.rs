@@ -77,8 +77,15 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     // has one, else this shell's, else the operator's own ~/.codex.
     let plist = launchd::plist_path(&user_home);
     let existing = launchd::read_existing(&plist)?;
-    let seed_home =
-        probes::codex_seed_home(existing.as_ref().map(|job| &job.environment), &user_home);
+    // The same precedence launchd::apply uses: this shell's CODEX_HOME wins,
+    // else the job's, else ~/.codex.
+    let carried = launchd::carried_environment();
+    let seed_home = carried
+        .get("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            probes::codex_seed_home(existing.as_ref().map(|job| &job.environment), &user_home)
+        });
     println!(
         "codex home for agents: {} ({}; run init with CODEX_HOME=<other home> to use another account)",
         seed_home.display(),
@@ -175,6 +182,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         &plist,
         existing.as_ref(),
         &probes::provider_directories(),
+        &carried,
     )?;
     println!(
         "launchd: {} loaded{}",

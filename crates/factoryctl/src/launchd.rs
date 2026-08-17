@@ -31,11 +31,27 @@ pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Enough to find Homebrew/system tools; the provider CLIs' own directories
 /// are prepended by [`merged_path`].
 pub const BASE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-/// Daemon settings that live in the job's environment and are taken from
-/// the environment `factoryctl init`/`update --install` run in when set
-/// there (an existing job's value is kept otherwise). `CODEX_HOME` is which
-/// Codex account agents seed their credentials from.
-pub const CARRIED_ENVIRONMENT: [&str; 1] = ["CODEX_HOME"];
+/// Daemon settings that live in the job's environment and that
+/// `factoryctl init` takes from the environment it runs in when set there
+/// (an existing job's value is kept otherwise; `update --install` never
+/// changes them). `CODEX_HOME` is which Codex account agents seed their
+/// credentials from.
+pub const INIT_CARRIED_ENVIRONMENT: [&str; 1] = ["CODEX_HOME"];
+
+/// The subset of this process's environment that [`INIT_CARRIED_ENVIRONMENT`]
+/// names and that is set (non-empty).
+#[must_use]
+pub fn carried_environment() -> BTreeMap<String, String> {
+    INIT_CARRIED_ENVIRONMENT
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| ((*key).to_owned(), value))
+        })
+        .collect()
+}
 const BOOTSTRAP_ATTEMPTS: u32 = 6;
 const BOOTSTRAP_RETRY: Duration = Duration::from_millis(500);
 
@@ -258,15 +274,16 @@ pub fn apply(
     plist: &Path,
     existing: Option<&ExistingJob>,
     provider_directories: &[(&str, PathBuf)],
+    extra_environment: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let mut environment = existing
         .map(|job| job.environment.clone())
         .unwrap_or_default();
-    for key in CARRIED_ENVIRONMENT {
-        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
-            environment.insert(key.to_owned(), value.to_string_lossy().into_owned());
-        }
-    }
+    environment.extend(
+        extra_environment
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone())),
+    );
     let path = merged_path(
         environment.get("PATH").map(String::as_str),
         provider_directories,

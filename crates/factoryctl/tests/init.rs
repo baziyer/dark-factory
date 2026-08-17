@@ -30,14 +30,28 @@ fn staged_factoryctl(root: &Path) -> PathBuf {
 }
 
 fn run(factoryctl: &Path, root: &Path, args: &[&str]) -> (i32, String, String) {
-    let output = Command::new(factoryctl)
+    run_with_env(factoryctl, root, args, &[])
+}
+
+fn run_with_env(
+    factoryctl: &Path,
+    root: &Path,
+    args: &[&str],
+    extra: &[(&str, &Path)],
+) -> (i32, String, String) {
+    let mut command = Command::new(factoryctl);
+    command
         .args(args)
         .env("DARK_FACTORY_HOME", root.join("home"))
         .env("HOME", root.join("user-home"))
         .env("DARK_FACTORY_UPDATE_URL", "http://127.0.0.1:9/never")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run factoryctl");
+        // The developer's shell may point CODEX_HOME at another account.
+        .env_remove("CODEX_HOME")
+        .stdin(Stdio::null());
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    let output = command.output().expect("run factoryctl");
     (
         output.status.code().unwrap_or(-1),
         String::from_utf8(output.stdout).unwrap(),
@@ -167,10 +181,32 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
     assert_eq!(status("launchd"), "warn");
     assert_eq!(status("git"), "ok");
     assert_eq!(status("claude.json"), "warn");
-    assert_eq!(
-        status("codex-seed"),
-        "warn",
-        "the throwaway HOME has no ~/.codex/auth.json"
-    );
+    // Only meaningful where codex is installed (the check is `ok`, n/a, otherwise).
+    let codex_installed = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("codex").is_file()));
+    if codex_installed {
+        assert_eq!(
+            status("codex-seed"),
+            "warn",
+            "the throwaway HOME has no ~/.codex/auth.json"
+        );
+        // A CODEX_HOME with credentials is reported as the home in effect.
+        let dogfood = root.path().join("codex-dogfood");
+        fs::create_dir_all(&dogfood).unwrap();
+        fs::write(dogfood.join("auth.json"), "{}").unwrap();
+        let (_, stdout, _) = run_with_env(
+            &factoryctl,
+            root.path(),
+            &["init", "--yes", "--no-launchd"],
+            &[("CODEX_HOME", &dogfood)],
+        );
+        assert!(
+            stdout.contains(&format!(
+                "codex home for agents: {} (auth.json present",
+                dogfood.display()
+            )),
+            "{stdout}"
+        );
+    }
     assert_eq!(status("update"), "warn");
 }
