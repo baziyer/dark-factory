@@ -1,0 +1,38 @@
+name: Bug report
+description: Something the daemon, CLI, TUI, or a provider session does wrong
+labels: ["bug"]
+body:
+  - type: textarea
+    id: symptom
+    attributes:
+      label: Symptom
+      description: What happened, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest `factoryctl` sequence (or TUI keys) that shows it. Use a throwaway `$DARK_FACTORY_HOME`, never your live one.
+      render: sh
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence
+      description: "`factoryctl health` output, the relevant `session list`/`task get`/`events` frames, daemon log lines. Do not paste provider transcripts, `terminal.log`, hook tokens, or anything from `~/.claude.json` / `CODEX_HOME`."
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "e.g. 74ab888, or the release tag"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider involved
+      options: ["claude", "codex", "shell", "none / not provider-specific"]
+    validations:
+      required: true

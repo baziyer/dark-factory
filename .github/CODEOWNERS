@@ -1,0 +1,3 @@
+# Every path needs a review from the repository owner before it merges to
+# main (enforced by the main branch ruleset, see scripts/github-repo-settings.sh).
+* @baziyer
