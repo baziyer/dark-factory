@@ -17,22 +17,24 @@ jobs:
   # One job, one required status check ("checks"). It runs the exact same
   # gate as `./scripts/local-ci.sh` — nothing is re-implemented here.
   #
-  # Same-repository refs (the owner's and collaborators' branches, and every
-  # push to main) run on the persistent self-hosted Mac (`dark-factory-mac`,
-  # see docs/development/WORKFLOW.md): warm cargo cache, real macOS, no
-  # hosted minutes. A pull request from a fork executes untrusted code, so it
-  # runs on an ephemeral hosted macOS runner instead and never reaches that
-  # machine — the same boundary the owner's other repositories use.
+  # Where it runs is chosen by this expression, which is a policy, not a
+  # mechanism: a pull request runs the workflow file from ITS OWN merge
+  # ref, so a fork can edit `runs-on` here. Same-repository refs (the
+  # owner's and collaborators' branches, and every push to main) run on
+  # the persistent self-hosted Mac (`dark-factory-mac`: warm cargo cache,
+  # real macOS, no hosted minutes). A pull request from a fork runs on an
+  # ephemeral hosted macOS runner — and every fork's workflow run needs the
+  # maintainer's approval first (`scripts/github-repo-settings.sh` sets
+  # that policy). Read `.github/workflows/` in a fork's diff before
+  # approving it: that is the boundary. See docs/development/WORKFLOW.md.
   checks:
-    name: checks
     runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'macos-latest' || 'dark-factory-mac' }}
     timeout-minutes: 45
     steps:
       # Pinned to a commit because this job may execute on a persistent
       # machine as its login user.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 1
           persist-credentials: false
 
       - name: Install the pinned toolchain

@@ -34,20 +34,28 @@ operator from their own agents. Concretely:
   sandbox; Claude Code keeps its native permission prompts, with only
   `Bash(factoryctl *)` pre-approved (see `README.md`, "Unattended
   operation"). An agent's own `permission_mode` widens or narrows that.
-- **A session can only speak for itself.** Provider hooks and an agent's own
-  `task done`/`task blocked`/`agent message` calls identify the session by
-  a per-session random token in a `0600` file (never on argv or in the
-  environment); the daemon spawns runners with a fixed non-secret
-  environment allowlist, not its own ambient environment.
+- **Hooks are authenticated; the rest is your user.** A provider's hook
+  invocations identify their session by a per-session random token in a
+  `0600` file (never on argv or in the environment). An agent's own `task
+  done`/`task blocked`/`agent message` calls, and every operator command,
+  are plain local-API requests: whoever can open the socket — any process
+  running as you, including every session — can make them, naming any
+  agent. Per-session authentication of those calls is planned (roles and
+  a review queue), not present. The daemon spawns runners with a fixed
+  non-secret environment allowlist, not its own ambient environment.
 - **Bounded inputs everywhere.** Guidance files, hook payloads, local-API
   frames, retained terminal logs, and webhook bodies all have hard size
   caps; raw provider output never enters public events, webhook responses,
   or tracing.
-- **The daemon writes only into what it owns** — `$DARK_FACTORY_HOME`, plus
-  two documented, minimal edits to provider state: a worktree pre-trust
-  entry in `~/.claude.json` (only if it already exists and parses) and a
+- **The daemon writes only into what it owns** — `$DARK_FACTORY_HOME` —
+  plus three documented, minimal writes elsewhere: a worktree pre-trust
+  entry in `~/.claude.json` (only if it already exists and parses); a
   filtered copy of your `~/.codex/config.toml` into a per-agent
-  `CODEX_HOME` (with `auth.json` symlinked, never copied).
+  `CODEX_HOME` (with `auth.json` symlinked, never copied); and, in each
+  project's own git repository, `git worktree add -b agent/<id>` per agent
+  (a branch and `.git/worktrees/<id>` metadata; removed with the agent). A
+  project whose root is not a git repository has its sessions run directly
+  in that root.
 
 ## Out of scope
 
@@ -61,7 +69,11 @@ operator from their own agents. Concretely:
 
 `.github/workflows/ci.yml` runs pull requests from this repository's own
 branches on the maintainer's persistent Mac and pull requests from forks on
-an ephemeral hosted runner; a change to that boundary is a security change
-and gets reviewed as one. AGENTS.md's adversarial review explicitly
-includes "security: nothing widens what an agent session, a webhook caller,
-or an untrusted PR can reach".
+an ephemeral hosted runner. That split is decided by the workflow file the
+pull request itself carries, so it is a policy, not a mechanism: every
+workflow run from a fork needs the maintainer's approval, and the
+maintainer reads `.github/workflows/` in the fork's diff before granting
+it. A change to that boundary is a security change and gets reviewed as
+one. AGENTS.md's adversarial review explicitly includes "security: nothing
+widens what an agent session, a webhook caller, or an untrusted PR can
+reach".

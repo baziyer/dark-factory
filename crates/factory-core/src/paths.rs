@@ -19,10 +19,10 @@
 //! $DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/
 //! ```
 //!
-//! This module only computes paths; who creates what is documented at each
-//! call site (`factoryd::guidance` for the Markdown files, the providers for
-//! `codex-home/` and `claude-settings.json` on first spawn, `factoryd`'s
-//! agent creation for the worktree).
+//! This module only computes paths. `factoryd::guidance` creates the
+//! Markdown files, `factoryd`'s agent creation provisions the worktree, and
+//! the providers create `codex-home/` (once, on the agent's first spawn) and
+//! `claude-settings.json` (per session spawn) directly under `agent_dir`.
 //!
 //! `ProjectId` and `AgentId` are already constrained to ASCII letters,
 //! digits, hyphens, and underscores, so they are always safe single path
@@ -120,25 +120,6 @@ pub fn agent_worktree_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentI
         .join(agent_id.as_str())
 }
 
-/// The agent's seeded `CODEX_HOME`: `<agent_dir>/codex-home` (created by
-/// the Codex provider on that agent's first session spawn).
-#[must_use]
-pub fn agent_codex_home_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentId) -> PathBuf {
-    agent_dir(home, project_id, agent_id).join("codex-home")
-}
-
-/// The generated Claude Code hooks settings file:
-/// `<agent_dir>/claude-settings.json` (written by the Claude provider per
-/// session spawn).
-#[must_use]
-pub fn agent_claude_settings_path(
-    home: &Path,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> PathBuf {
-    agent_dir(home, project_id, agent_id).join("claude-settings.json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,19 +150,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_and_worktree_paths_match_the_documented_sister_folder() {
+    fn worktree_path_matches_the_documented_sister_folder() {
         let home = Path::new("/home/user/.dark-factory");
         assert_eq!(
             agent_worktree_dir(home, &project(), &agent()),
             Path::new("/home/user/.dark-factory/projects/factory/worktrees/god")
-        );
-        assert_eq!(
-            agent_codex_home_dir(home, &project(), &agent()),
-            Path::new("/home/user/.dark-factory/projects/factory/agents/god/codex-home")
-        );
-        assert_eq!(
-            agent_claude_settings_path(home, &project(), &agent()),
-            Path::new("/home/user/.dark-factory/projects/factory/agents/god/claude-settings.json")
         );
     }
 

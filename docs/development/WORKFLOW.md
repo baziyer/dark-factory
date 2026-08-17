@@ -42,32 +42,50 @@ means the board just picks the same sessions back up.
 ## CI and GitHub
 
 `.github/workflows/ci.yml` runs `./scripts/local-ci.sh` — nothing else —
-as one job, `checks`, on every pull request and every push to `main`. The
-`main` ruleset requires that check green against the current head, a
-pull request with one CODEOWNERS approval, linear history, and forbids
-force-pushes and deletion; the repository admin can bypass the review
-requirement (GitHub never lets an author approve their own PR) but only
-through a pull request, never by pushing to `main`. Merge methods are
-squash or rebase; merged branches are deleted.
+as one job, `checks`, on every pull request and every push to `main`.
 
-Where the job runs is a security boundary, not a cost setting:
+**Going public is one step**: flip the repository, then immediately run
+`scripts/github-repo-settings.sh` — the rulesets, the security features,
+and the fork-approval policy below all 403/422 on a private free-plan
+repository, so until that script has run clean none of this is enforced.
+It applies, idempotently:
+
+- labels (`known-issue`, `area:*`, `size:*`, `decision`, `security`) and
+  merge settings (squash or rebase only, merged branches deleted);
+- ruleset `main-protect`, with no bypass for anyone: a green `checks` run
+  from GitHub Actions against a head that is up to date with `main`,
+  linear history, no force-push, no deletion;
+- ruleset `main-review`: a pull request with one CODEOWNERS approval and
+  every thread resolved. The repository admin may bypass *this* ruleset,
+  and only through a pull request — GitHub never lets an author approve
+  their own PR and this repository has one maintainer — so the maintainer
+  can merge their own reviewed PR, but never without green `checks`, and
+  nobody pushes to `main`;
+- private vulnerability reporting, Dependabot alerts, secret scanning with
+  push protection, and "every workflow run from an outside contributor's
+  fork needs approval".
+
+Where `checks` runs is a **policy, not a mechanism**: a pull request runs
+the workflow file it carries, so the `runs-on` expression only governs an
+unmodified workflow.
 
 - **Same-repository refs** (branches only collaborators can push, and
   `main` itself) run on the maintainer's persistent Mac, the self-hosted
   runner `dark-factory-mac` — warm cargo cache, real macOS, no hosted
   minutes.
-- **Pull requests from forks** execute untrusted code, so they run on an
-  ephemeral hosted macOS runner and never reach that machine. Workflows
-  from an outside contributor's fork additionally need maintainer approval
-  before they run at all.
+- **Pull requests from forks** run on an ephemeral hosted macOS runner —
+  *if* their workflow file is unmodified. Every fork's workflow run waits
+  for the maintainer's approval; a fork PR that edits `runs-on` in
+  `.github/workflows/ci.yml` would run on the Mac the moment that approval
+  is given. So the boundary is the maintainer reading `.github/workflows/`
+  in a fork's diff before approving it — GitHub's own guidance is that
+  self-hosted runners and public repositories don't mix for exactly this
+  reason. If that discipline ever feels thin, switching `runs-on` to
+  `macos-latest` for all pull requests is a one-line change (hosted
+  minutes are free for public repositories).
 
-`scripts/github-repo-settings.sh` applies all of the above (labels, merge
-settings, the ruleset, private vulnerability reporting, secret scanning
-and push protection, the fork-approval policy) and is idempotent — re-run
-it after changing anything there. Known problems are GitHub issues
-labelled `known-issue` (`docs/KNOWN-ISSUES.md` is only a pointer);
-`scripts/import-issues.sh` turns a `###`-sectioned triage document into
-labelled issues if a batch ever needs importing again.
+Known problems are GitHub issues labelled `known-issue`, see
+`CONTRIBUTING.md`.
 
 ### The self-hosted runner
 
