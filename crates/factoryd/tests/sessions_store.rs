@@ -91,11 +91,14 @@ fn fixture() -> Store {
 // --- Migration -------------------------------------------------------
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
-/// one legacy *open* run, then opens it through the real `Store::open` and
-/// asserts: the schema lands on 14, the legacy open run is force-closed
-/// (not left dangling), and `PRAGMA foreign_key_check` is clean.
+/// one legacy *open* run, then opens it through the real `Store::open` --
+/// which always migrates to the current `SCHEMA_VERSION`, 15 as of 0015's
+/// `last_hook_event` CHECK widening for `permission_request` -- and
+/// asserts: the legacy open run is force-closed by 0014 (not left
+/// dangling), and `PRAGMA foreign_key_check` is clean after the full
+/// chain including 0015's own `sessions` rebuild.
 #[test]
-fn migration_0014_force_closes_a_legacy_open_run_and_reaches_schema_14() {
+fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("legacy.db");
     {
@@ -187,7 +190,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_schema_14() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
@@ -222,6 +225,113 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_schema_14() {
     store
         .create_session(new_session("run-2", "factory", "curie"), 5)
         .unwrap();
+}
+
+/// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s
+/// original `sessions` shape) with one pre-existing session row whose
+/// `last_hook_event` is a value 0014 already allowed (`'stop'`), then
+/// opens it through the real `Store::open` -- which runs 0015's `sessions`
+/// rebuild -- and asserts the widened `last_hook_event` CHECK now also
+/// accepts `'permission_request'` without a constraint violation. A SQL
+/// CHECK typo here is exactly the kind of bug Rust's own type checking
+/// cannot catch (`ProviderHookEvent::PermissionRequest` would compile and
+/// round-trip fine even if the CHECK list omitted the string it maps to).
+#[test]
+fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("pre015.db");
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA journal_mode = WAL;")
+            .unwrap();
+        for migration in [
+            include_str!("../migrations/0001_state_and_events.sql"),
+            include_str!("../migrations/0002_execution_ledger.sql"),
+            include_str!("../migrations/0003_runner_reconciliation.sql"),
+            include_str!("../migrations/0004_observer_health.sql"),
+            include_str!("../migrations/0005_provider_session_context.sql"),
+            include_str!("../migrations/0006_webhooks.sql"),
+            include_str!("../migrations/0007_subscription_usage.sql"),
+            include_str!("../migrations/0008_subscription_windows.sql"),
+            include_str!("../migrations/0009_agent_profiles.sql"),
+            include_str!("../migrations/0010_agent_messages.sql"),
+            include_str!("../migrations/0011_run_stop_intent.sql"),
+            include_str!("../migrations/0012_drop_subscription_usage_and_task_dependencies.sql"),
+            include_str!("../migrations/0013_agent_profile_files.sql"),
+            include_str!("../migrations/0014_sessions.sql"),
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 14).unwrap();
+
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES ('factory', 'Factory', '/work/factory', 1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, project_id, parent_agent_id, role, provider, created_at_ms, updated_at_ms
+                 ) VALUES ('curie', 'factory', NULL, 'worker', 'shell', 2, 2)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    id, project_id, agent_id, provider, worktree, hook_token, state,
+                    state_since_ms, runner_instance_id, runner_runtime,
+                    runner_protocol_version, last_hook_event, last_hook_at_ms,
+                    started_at_ms, updated_at_ms
+                 ) VALUES (
+                    'session-legacy', 'factory', 'curie', 'shell', '/work/factory',
+                    ?1, 'idle',
+                    3, 'instance-legacy', '/private/runners/session-legacy', 1, 'stop', 3, 3, 3
+                 )",
+                [&"a".repeat(64)],
+            )
+            .unwrap();
+    }
+
+    // Opening through the real store runs the 0015 migration.
+    let mut store = Store::open(&database).unwrap();
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 15);
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .unwrap();
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0, "migration 0015 left a foreign key violation");
+
+    // The widened CHECK now accepts `permission_request` for a session
+    // that survived the rebuild from before 0015 existed.
+    let (session, _) = store
+        .record_hook_event(
+            &session_id("session-legacy"),
+            ProviderHookEvent::PermissionRequest,
+            None,
+            false,
+            Some("provider approval prompt: shell".into()),
+            4,
+        )
+        .unwrap();
+    assert_eq!(session.state, SessionState::WaitingForInput);
+    assert_eq!(
+        session.wait_reason.as_deref(),
+        Some("provider approval prompt: shell")
+    );
 }
 
 // --- Sessions: one live per agent, control target -----------------------
@@ -490,6 +600,48 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
         .unwrap();
     assert_eq!(session.state, SessionState::WaitingForInput);
     assert_eq!(session.wait_reason.as_deref(), Some("permission prompt"));
+}
+
+#[test]
+fn permission_request_moves_to_waiting_for_input_and_pre_tool_use_returns_it_to_working() {
+    // Codex 0.147's own approval-prompt hook (docs/dogfood/2026-08-17.md,
+    // "a session blocked on a provider approval prompt still shows
+    // `working`"): projects the same way `Notification` already does
+    // above, and the next `PreToolUse` (the tool call the operator just
+    // approved actually starting) clears it back to `Working`, exactly
+    // like it already does after any other wait state.
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let (session, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::PermissionRequest,
+            None,
+            false,
+            Some("provider approval prompt: shell".into()),
+            6,
+        )
+        .unwrap();
+    assert_eq!(session.state, SessionState::WaitingForInput);
+    assert_eq!(
+        session.wait_reason.as_deref(),
+        Some("provider approval prompt: shell")
+    );
+
+    let (session, _) = store
+        .record_hook_event(
+            &snapshot.id,
+            ProviderHookEvent::PreToolUse,
+            Some("tool: shell".into()),
+            false,
+            None,
+            7,
+        )
+        .unwrap();
+    assert_eq!(session.state, SessionState::Working);
+    assert_eq!(session.wait_reason, None);
 }
 
 #[test]

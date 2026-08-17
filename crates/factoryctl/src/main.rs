@@ -655,8 +655,8 @@ typed by an operator.
 Required:
   --token-file PATH        This session's private hook token file
   <Event>                     One of: SessionStart, UserPromptSubmit,
-                               PreToolUse, PostToolUse, Notification, Stop,
-                               SubagentStop, SessionEnd
+                               PreToolUse, PermissionRequest, PostToolUse,
+                               Notification, Stop, SubagentStop, SessionEnd
 
 Options:
   -h, --help                    Show this help";

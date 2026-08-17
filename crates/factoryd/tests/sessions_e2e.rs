@@ -1522,6 +1522,131 @@ fn a_refused_delete_project_leaves_every_file_intact() {
     daemon.stop();
 }
 
+// --- (k) This track: Codex's `PermissionRequest` hook (added 0.147.0)
+//     moves a session to `waiting_for_input` with a wait reason, is never
+//     answered (the daemon only observes), and the next `PreToolUse`
+//     (the tool call the operator just approved actually starting)
+//     returns it to `working` -- docs/dogfood/2026-08-17.md, "a session
+//     blocked on a provider approval prompt still shows `working`" -------
+
+/// Runs the real `factoryctl` binary exactly as a provider's own hook
+/// subprocess would (`hook --token-file PATH <Event>`, JSON payload on
+/// stdin), and returns its stdout verbatim -- proving the CLI itself
+/// accepts `PermissionRequest` as a positional event argument, not just
+/// that `ProviderHookEvent::parse_provider_event_name` does internally.
+/// `--socket` is required and explicit: a generated hook command always
+/// embeds `factoryctl`'s own trusted path, never a bare name relying on
+/// `$DARK_FACTORY_SOCKET`/`$DARK_FACTORY_HOME` (`docs/providers.md`'s
+/// Provider A1), and this spawned process inherits this *test's own*
+/// environment, which has neither set -- without `--socket` it would
+/// silently resolve to `$HOME/.dark-factory/f.sock`, the operator's real
+/// running daemon, never this test's private one.
+fn run_hook_cli(socket: &Path, token_path: &Path, event: &str, payload: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new(factoryctl_path())
+        .arg("--socket")
+        .arg(socket)
+        .arg("hook")
+        .arg("--token-file")
+        .arg(token_path)
+        .arg(event)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "factoryctl hook exited non-zero");
+    String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn permission_request_hook_reports_waiting_for_input_and_is_never_answered() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+
+    // `printf '{}' |` matters, not just decoration: with no stdin piped in
+    // at all, `factoryctl hook`'s bounded stdin read blocks forever on the
+    // inherited PTY (which never reaches EOF), so the hook request is
+    // never even sent -- the session would sit in `starting` forever
+    // instead of reaching `idle`. Likewise, some pending work is required
+    // to trigger the initial spawn at all, so this reads and acknowledges
+    // (`UserPromptSubmit`) exactly the delivered task's first line, then
+    // `Stop`s -- otherwise the dispatcher's own unacknowledged-delivery
+    // watchdog would land the session on `waiting_for_input` with its own
+    // wait reason (`"delivery unacknowledged"`) before this test ever
+    // gets to drive `PermissionRequest` by hand, racing the assertion
+    // below. What that first delivered line actually says is irrelevant
+    // (never read again after this). `h()` shortens the repeated
+    // `factoryctl hook --token-file ...` invocation: `agent_profiles.model`
+    // (this command runs as, verbatim) is bounded at 256 bytes.
+    let command = "h(){ \"$DARK_FACTORY_FACTORYCTL\" hook --token-file \"$DARK_FACTORY_SESSION_TOKEN_FILE\" \"$1\"; }; \
+printf '{}' | h SessionStart >/dev/null; read l; \
+printf '{}' | h UserPromptSubmit >/dev/null; printf '{}' | h Stop >/dev/null; \
+while :; do sleep 3600; done"
+        .to_owned();
+    create_shell_agent_with_command(&client, "curie", command);
+    create_task(&client, "task-1", "Trigger a spawn", "irrelevant body");
+    assign_task(&client, "task-1", "curie");
+
+    let session = wait_for_session_state(&client, "curie", SessionState::Idle);
+    let hook_token_path = home
+        .path()
+        .join("runs")
+        .join(session.id.as_str())
+        .join("hook.token");
+
+    // The exact `permission-request.command.input` shape confirmed against
+    // the real Codex 0.147.0 binary's own embedded JSON schema (`strings`
+    // on `hooks/src/events/permission_request.rs`'s compiled output):
+    // `tool_name`/`tool_input`/`cwd`/`model`/`permission_mode`/
+    // `session_id`/`transcript_path`/`turn_id`/`hook_event_name` are all
+    // required.
+    let payload = r#"{"hook_event_name":"PermissionRequest","cwd":"/work/factory",
+        "model":"gpt-5-codex","permission_mode":"on-request","session_id":"s1",
+        "tool_name":"shell","tool_input":{},"transcript_path":null,"turn_id":"t1"}"#;
+    let reply = run_hook_cli(
+        &daemon.socket,
+        &hook_token_path,
+        "PermissionRequest",
+        payload,
+    );
+    // The daemon only ever observes: its reply is always `{}`, never a
+    // `decision` -- Codex's own `permission-request.command.output`
+    // schema would otherwise let this reply auto-answer the prompt
+    // (`behavior: allow`/`deny`), which Dark Factory must never do.
+    assert_eq!(reply.trim(), "{}");
+
+    let waiting = wait_for_session_state(&client, "curie", SessionState::WaitingForInput);
+    assert_eq!(waiting.id, session.id);
+    assert_eq!(
+        waiting.wait_reason.as_deref(),
+        Some("provider approval prompt: shell")
+    );
+
+    let reply = run_hook_cli(
+        &daemon.socket,
+        &hook_token_path,
+        "PreToolUse",
+        r#"{"tool_name":"shell"}"#,
+    );
+    assert_eq!(reply.trim(), "{}");
+
+    let working = wait_for_session_state(&client, "curie", SessionState::Working);
+    assert_eq!(working.id, session.id);
+    assert_eq!(working.wait_reason, None);
+
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
+
 // --- attach helpers ----------------------------------------------------
 
 /// Reads up to `max_frames` frames from an `AttachTerminal` connection in

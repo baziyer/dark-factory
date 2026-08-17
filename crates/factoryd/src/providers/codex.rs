@@ -539,22 +539,46 @@ fn insert_root_level_line(document: &str, line: &str) -> String {
     result
 }
 
+/// Codex-only hook events, wired in addition to [`hooks::HOOK_EVENTS`]
+/// (which both providers share): `PermissionRequest` is a Codex 0.147.0
+/// addition with no Claude Code equivalent name (Claude's permission
+/// prompts already surface through the shared `Notification` event) -- see
+/// `ProviderHookEvent`'s own doc comment for the observe-only contract
+/// this relies on.
+const CODEX_ONLY_HOOK_EVENTS: [factory_core::ProviderHookEvent; 1] =
+    [factory_core::ProviderHookEvent::PermissionRequest];
+
 fn hooks_block_toml(factoryctl_path: &Path, hook_token_path: &Path) -> String {
     let mut block = String::new();
     block.push_str(HOOKS_BEGIN_MARKER);
     block.push('\n');
-    for event in hooks::HOOK_EVENTS {
-        let name = event.provider_event_name();
-        let command = hooks::hook_command(factoryctl_path, hook_token_path, event);
-        block.push_str(&format!("[[hooks.{name}]]\n"));
-        block.push_str(&format!("[[hooks.{name}.hooks]]\n"));
-        block.push_str("type = \"command\"\n");
-        block.push_str(&format!("command = \"{}\"\n", toml_escape(&command)));
-        block.push_str("timeout = 30\n\n");
+    for event in hooks::HOOK_EVENTS.into_iter().chain(CODEX_ONLY_HOOK_EVENTS) {
+        push_hook_entry(&mut block, factoryctl_path, hook_token_path, event);
     }
     block.push_str(HOOKS_END_MARKER);
     block.push('\n');
     block
+}
+
+/// Appends one `[[hooks.<Event>]]` entry, same shape for every event
+/// (Codex-only or shared): a single `type = "command"` handler invoking
+/// `factoryctl hook`, 30 second timeout. Codex clamps only `SessionEnd`'s
+/// timeout (to 3s, confirmed by its own `clamping SessionEnd hook timeout
+/// to <n>s` log line); every other event, `PermissionRequest` included,
+/// keeps the configured value.
+fn push_hook_entry(
+    block: &mut String,
+    factoryctl_path: &Path,
+    hook_token_path: &Path,
+    event: factory_core::ProviderHookEvent,
+) {
+    let name = event.provider_event_name();
+    let command = hooks::hook_command(factoryctl_path, hook_token_path, event);
+    block.push_str(&format!("[[hooks.{name}]]\n"));
+    block.push_str(&format!("[[hooks.{name}.hooks]]\n"));
+    block.push_str("type = \"command\"\n");
+    block.push_str(&format!("command = \"{}\"\n", toml_escape(&command)));
+    block.push_str("timeout = 30\n\n");
 }
 
 fn toml_escape(value: &str) -> String {
@@ -754,6 +778,7 @@ mod provider_tests {
         assert_eq!(contents.matches(HOOKS_BEGIN_MARKER).count(), 1);
         assert_eq!(contents.matches(HOOKS_END_MARKER).count(), 1);
         assert_eq!(contents.matches("[[hooks.Stop]]").count(), 1);
+        assert_eq!(contents.matches("[[hooks.PermissionRequest]]").count(), 1);
     }
 
     #[test]
@@ -766,6 +791,26 @@ mod provider_tests {
         assert!(block.trim_end().ends_with(HOOKS_END_MARKER));
         assert!(block.contains(
             "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Stop\"\ntimeout = 30\n"
+        ));
+    }
+
+    /// `PermissionRequest` (this track's fix for
+    /// docs/dogfood/2026-08-17.md's "a session blocked on a provider
+    /// approval prompt still shows `working`") is Codex-only -- wired in
+    /// addition to `hooks::HOOK_EVENTS`, not a member of it (Claude Code
+    /// has no equivalent event name; see `ProviderHookEvent`'s doc
+    /// comment) -- so this asserts it separately from the shared-shape
+    /// test above, same command/timeout shape, un-clamped 30s timeout
+    /// (only `SessionEnd` is clamped, to 3s, confirmed against the real
+    /// Codex 0.147.0 binary's own log line).
+    #[test]
+    fn hooks_block_toml_includes_the_codex_only_permission_request_event() {
+        let block = hooks_block_toml(
+            Path::new("/abs/factoryctl"),
+            Path::new("/abs/runs/session-1/hook.token"),
+        );
+        assert!(block.contains(
+            "[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]\ntype = \"command\"\ncommand = \"'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PermissionRequest\"\ntimeout = 30\n"
         ));
     }
 
