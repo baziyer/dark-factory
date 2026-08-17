@@ -314,6 +314,7 @@ dependencies = [
  "factoryctl",
  "portable-pty",
  "ratatui",
+ "serde",
  "serde_json",
  "tui-term",
  "uuid",

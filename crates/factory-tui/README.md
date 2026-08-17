@@ -11,6 +11,8 @@ dashboard.
 cargo run -p factory-tui
 cargo run -p factory-tui -- --socket /path/to/f.sock
 cargo run -p factory-tui -- --project my-project     # focus this project on startup
+                                                      # (default: the one focused last time,
+                                                      #  saved in $DARK_FACTORY_HOME/factory-tui.json)
 cargo run -p factory-tui -- --theme plain             # ASCII glyphs, no hue-based color
 cargo run -p factory-tui -- --dev-local-pty           # TERMINALS/FOCUS attach a local shell
                                                         # instead of a live daemon session
