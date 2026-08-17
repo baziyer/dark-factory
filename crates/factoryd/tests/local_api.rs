@@ -1587,10 +1587,11 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(detail.status, *curie, "the same picture the fleet view had");
         assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
         assert!(detail.detail.instructions_path.ends_with("instructions.md"));
-        assert!(
-            detail.worktree.is_none(),
-            "the project root is not a git repo, so the agent runs in the root and has no worktree"
-        );
+        // The project root is not a git repository, so the agent runs in the
+        // root itself; the status says so instead of pretending a clean tree.
+        let worktree = detail.worktree.expect("the agent has a working directory");
+        assert!(worktree.error.is_some(), "{worktree:?}");
+        assert!(!worktree.dirty);
 
         assert!(matches!(
             request(

@@ -5,7 +5,7 @@ use factory_core::{
     PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunClosedBy,
     RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId, SessionSnapshot,
     SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
-    attention::{Attention, run_attention, session_attention},
+    attention::agent_attention,
     status::{AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -2978,7 +2978,7 @@ impl Store {
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
             let unassigned = self.queued_tasks(&project.id, None)?;
-            let blocked = self.tasks_with_status(&project.id, "blocked")?;
+            let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
                 agents,
@@ -3009,15 +3009,11 @@ impl Store {
             params![project_id.as_str(), agent_id.as_str()],
             |row| row.get(0),
         )?;
-        let (attention, attention_inferred) = match &session {
-            Some(session) => (session_attention(session.state), false),
-            None => (
-                current_run
-                    .as_ref()
-                    .map_or(Attention::Routine, |run| run_attention(run.status)),
-                true,
-            ),
+        let latest_run = match &current_run {
+            Some(run) => Some(run.clone()),
+            None => self.latest_run_for_agent(project_id, agent_id)?,
         };
+        let rated = agent_attention(session.as_ref(), latest_run.as_ref());
         Ok(AgentStatus {
             agent,
             session,
@@ -3025,9 +3021,32 @@ impl Store {
             queue_depth: u32::try_from(queue.len()).unwrap_or(u32::MAX),
             queue: queue.into_iter().take(MAX_QUEUE_PREVIEW).collect(),
             inbox_pending: u32::try_from(inbox_pending).unwrap_or(u32::MAX),
-            attention,
-            attention_inferred,
+            attention: rated.value,
+            attention_inferred: rated.inferred,
         })
+    }
+
+    /// The agent's most recently started run, if any.
+    fn latest_run_for_agent(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<Option<RunSnapshot>> {
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM runs
+                 WHERE project_id = ?1 AND agent_id = ?2
+                 ORDER BY started_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![project_id.as_str(), agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        load_run(&self.connection, &parse_id(id, 0)?)
     }
 
     /// The agent's live session, else its most recently started one (so a
@@ -3076,16 +3095,16 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    fn tasks_with_status(&self, project_id: &ProjectId, status: &str) -> Result<Vec<TaskSnapshot>> {
+    /// Tasks an agent marked blocked, oldest update first.
+    fn blocked_tasks(&self, project_id: &ProjectId) -> Result<Vec<TaskSnapshot>> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
                     created_at_ms, updated_at_ms
              FROM tasks
-             WHERE project_id = ?1 AND status = ?2
+             WHERE project_id = ?1 AND status = 'blocked'
              ORDER BY updated_at_ms, id",
         )?;
-        let rows =
-            statement.query_map(params![project_id.as_str(), status], task_snapshot_from_row)?;
+        let rows = statement.query_map(params![project_id.as_str()], task_snapshot_from_row)?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 

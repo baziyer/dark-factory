@@ -276,7 +276,16 @@ const HELP_TEXT: &[&str] = &[
 ];
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let rect = centered_rect(area, 66, u16::try_from(HELP_TEXT.len()).unwrap_or(14) + 3);
+    let widest = HELP_TEXT
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(60);
+    let rect = centered_rect(
+        area,
+        u16::try_from(widest + 4).unwrap_or(u16::MAX),
+        u16::try_from(HELP_TEXT.len()).unwrap_or(14) + 3,
+    );
     frame.render_widget(Clear, rect);
     let inner = ui::bordered(
         frame,

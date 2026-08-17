@@ -601,11 +601,7 @@ async fn handle_request(
                     }
                 })
                 .collect();
-            attention.sort_by(|a, b| {
-                b.level
-                    .cmp(&a.level)
-                    .then_with(|| a.since_ms.cmp(&b.since_ms))
-            });
+            status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
                 status: status::FleetStatus {
                     generated_at_ms,
@@ -622,25 +618,19 @@ async fn handle_request(
         } => {
             let lookup_project_id = project_id.clone();
             let lookup_agent_id = agent_id.clone();
-            let (agent_status, agent) = state
-                .with_store(move |store| {
-                    Ok((
-                        store.agent_status(&lookup_project_id, &lookup_agent_id)?,
-                        store.get_agent_detail(&lookup_project_id, &lookup_agent_id)?,
-                    ))
-                })
+            let agent_status = state
+                .with_store(move |store| store.agent_status(&lookup_project_id, &lookup_agent_id))
                 .await?;
-            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
-            let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
-            let memory = read_guidance_file(agent_paths.memory.clone()).await?;
+            let detail =
+                agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?;
             let worktree = match agent_status.agent.worktree.as_deref() {
-                Some(path) => crate::worktrees::status(Path::new(path)).await.ok(),
+                Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
                 None => None,
             };
             Ok(LocalResponse::AgentStatus {
                 status: Box::new(status::AgentStatusDetail {
                     status: agent_status,
-                    detail: local_agent_detail(agent, instructions, memory, agent_paths),
+                    detail,
                     worktree,
                 }),
             })
@@ -785,21 +775,9 @@ async fn handle_request(
         LocalRequest::GetAgent {
             project_id,
             agent_id,
-        } => {
-            let lookup_project_id = project_id.clone();
-            let lookup_agent_id = agent_id.clone();
-            let agent = state
-                .with_store(move |store| {
-                    store.get_agent_detail(&lookup_project_id, &lookup_agent_id)
-                })
-                .await?;
-            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
-            let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
-            let memory = read_guidance_file(agent_paths.memory.clone()).await?;
-            Ok(LocalResponse::Agent {
-                agent: local_agent_detail(agent, instructions, memory, agent_paths),
-            })
-        }
+        } => Ok(LocalResponse::Agent {
+            agent: agent_detail_with_guidance(state, guidance_root, &project_id, &agent_id).await?,
+        }),
         LocalRequest::UpdateAgentProfile {
             project_id,
             agent_id,
@@ -1505,6 +1483,25 @@ impl AgentGuidancePaths {
             project_guidance: factory_core::paths::project_guidance_path(guidance_root, project_id),
         }
     }
+}
+
+/// The agent's durable row plus its guidance files' current contents and
+/// paths — what `GetAgent` returns and `AgentStatus` embeds.
+async fn agent_detail_with_guidance(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<LocalAgentDetail, ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let lookup_agent_id = agent_id.clone();
+    let agent = state
+        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
+        .await?;
+    let agent_paths = AgentGuidancePaths::new(guidance_root, project_id, agent_id);
+    let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
+    let memory = read_guidance_file(agent_paths.memory.clone()).await?;
+    Ok(local_agent_detail(agent, instructions, memory, agent_paths))
 }
 
 fn local_agent_detail(

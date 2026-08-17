@@ -4,10 +4,13 @@
 //! reads the same responses; it never computes a status the CLI can't
 //! show.
 //!
-//! Bounded by construction: only live sessions, current runs, and queued
-//! work appear here (the full task/run/session ledgers stay behind the
-//! paginated `List*` requests), and per-agent queues are truncated to
-//! [`MAX_QUEUE_PREVIEW`] items with the true depth alongside.
+//! Bounded in what it carries — live/most-recent sessions, current runs,
+//! queued and blocked tasks (the full task/run/session ledgers stay behind
+//! the paginated `List*` requests), per-agent queue previews truncated to
+//! [`MAX_QUEUE_PREVIEW`] with the true depth alongside — but not paginated:
+//! unassigned queues and blocked tasks are listed in full, so a factory with
+//! thousands of open tasks would push one frame past
+//! `MAX_LOCAL_FRAME_BYTES`; that is where pagination would go.
 
 use serde::{Deserialize, Serialize};
 
@@ -77,14 +80,20 @@ pub struct AgentStatusDetail {
 }
 
 /// `git status --porcelain --branch` of an agent's worktree, summarized.
+/// Present whenever the agent has a worktree; if `git` could not report on
+/// it (deleted directory, not a repository, ...) `error` says why and the
+/// counts are zero — never silently "clean".
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorktreeStatus {
     pub path: String,
+    /// `None` on a detached `HEAD`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     /// Modified, staged, or untracked entries.
     pub changed_files: u32,
     pub dirty: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,7 +131,7 @@ pub struct AttentionItem {
 
 /// Derives the attention list for one project's agents and blocked tasks.
 /// Pure over snapshots so `factoryd` (for `factoryctl status`) and any
-/// client can agree on it; sorted most urgent first, then oldest first.
+/// client can agree on it. Unsorted; see [`sort_attention`].
 #[must_use]
 pub fn attention_items(
     project_id: &ProjectId,
@@ -173,13 +182,16 @@ pub fn attention_items(
                     agent_id: Some(agent.id.clone()),
                     task_id: status.queue.first().map(|task| task.id.clone()),
                     session_id: None,
-                    since_ms: agent.updated_at_ms,
+                    since_ms: status
+                        .queue
+                        .first()
+                        .map_or(agent.updated_at_ms, |task| task.created_at_ms),
                     detail: format!(
                         "paused with {} queued task(s); `factoryctl agent resume`",
                         status.queue_depth
                     ),
                 });
-            } else if status.session.is_none() && at_capacity {
+            } else if agent.current_session_id.is_none() && at_capacity {
                 items.push(AttentionItem {
                     kind: AttentionKind::WaitingForCapacity,
                     level: Attention::Routine,
@@ -213,12 +225,17 @@ pub fn attention_items(
             });
         }
     }
+    items
+}
+
+/// Most urgent first, then oldest first — the order `factoryctl status`
+/// prints and the board would triage in.
+pub fn sort_attention(items: &mut [AttentionItem]) {
     items.sort_by(|a, b| {
         b.level
             .cmp(&a.level)
             .then_with(|| a.since_ms.cmp(&b.since_ms))
     });
-    items
 }
 
 #[cfg(test)]
@@ -327,12 +344,13 @@ mod tests {
             ),
         ];
         let blocked = vec![task("t3", TaskStatus::Blocked, 20)];
-        let items = attention_items(&project, &agents, &blocked, true);
+        let mut items = attention_items(&project, &agents, &blocked, true);
+        sort_attention(&mut items);
         let kinds: Vec<AttentionKind> = items.iter().map(|item| item.kind).collect();
         assert_eq!(
             kinds,
             [
-                AttentionKind::PausedWithWork, // NeedsInput, since 2 (agent.updated_at_ms)
+                AttentionKind::PausedWithWork, // NeedsInput, since 0 (t1's created_at_ms)
                 AttentionKind::TaskBlocked,    // NeedsInput, since 20
                 AttentionKind::NeedsInput,     // NeedsInput, since 30
                 AttentionKind::SessionFailed,  // Failed, since 10
@@ -345,6 +363,33 @@ mod tests {
                 .iter()
                 .all(|item| item.kind != AttentionKind::WaitingForCapacity)
         );
+    }
+
+    #[test]
+    fn waiting_for_capacity_means_no_live_session_not_no_session_ever() {
+        // An agent whose latest session ENDED still has no live session: with
+        // queued work at the cap it is waiting for capacity. One whose
+        // session is live is not, whatever its state.
+        let project = ProjectId::try_from("p").unwrap();
+        let mut ended = session(SessionState::Stopped, 5);
+        ended.ended_at_ms = Some(6);
+        let waiting = status(
+            agent("a", false),
+            Some(ended),
+            vec![task("t1", TaskStatus::Queued, 7)],
+        );
+        let mut live_agent = agent("b", false);
+        live_agent.current_session_id = Some(SessionId::try_from("s1").unwrap());
+        let live = status(
+            live_agent,
+            Some(session(SessionState::Idle, 8)),
+            vec![task("t2", TaskStatus::Queued, 9)],
+        );
+        let kinds: Vec<AttentionKind> = attention_items(&project, &[waiting, live], &[], true)
+            .iter()
+            .map(|item| item.kind)
+            .collect();
+        assert_eq!(kinds, [AttentionKind::WaitingForCapacity]);
     }
 
     #[test]
