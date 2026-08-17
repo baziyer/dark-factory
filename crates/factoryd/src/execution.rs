@@ -196,6 +196,10 @@ pub enum Error {
     CorruptExecution,
     #[error("generated id is invalid")]
     InvalidId,
+    #[error(
+        "timed out waiting for an in-flight session spawn to finish before deleting this agent"
+    )]
+    DeleteDrainTimeout,
 }
 
 /// One agent to reconsider for delivery: spawn a session if it has none and
@@ -219,6 +223,15 @@ pub struct Handle {
     config: Arc<Config>,
     wake_tx: mpsc::Sender<WakeAgent>,
     shutdown: watch::Sender<bool>,
+    /// Shared with [`run_dispatcher`]'s own [`SpawnBackoff`] (this task's
+    /// mechanism, ARCHITECTURE.md's delete invariant): lets
+    /// [`Handle::begin_delete`]/[`Handle::end_delete`], called from
+    /// `local_api.rs`'s `DeleteAgent`/`DeleteProject` handlers, mark an
+    /// agent so [`dispatch_agent`] never begins a new spawn preparation for
+    /// it, and wait for one already in flight to finish -- the same style
+    /// of seam `local_api.rs` already uses for [`stop_hook_reply`] and
+    /// [`Handle::wake`].
+    backoff: Arc<SpawnBackoff>,
 }
 
 impl Handle {
@@ -343,6 +356,44 @@ impl Handle {
         send_wake(&self.wake_tx, project_id, agent_id);
     }
 
+    /// Begins deletion of `agent_id` (this task's mechanism for
+    /// ARCHITECTURE.md's "once deletion begins, no component may create new
+    /// state under that identity" invariant): marks the agent so
+    /// [`dispatch_agent`] declines to begin any new spawn preparation for
+    /// it (composing guidance, writing the provider's generated config),
+    /// then waits up to [`DELETE_DRAIN_TIMEOUT`] for a preparation already
+    /// in flight to finish, so a caller that gets `Ok` back knows no
+    /// further writes into the agent's guidance directory can start before
+    /// [`Handle::end_delete`] is called. On timeout, clears its own mark
+    /// (so the agent is not left permanently undispatchable by a delete
+    /// that never completed) and returns [`Error::DeleteDrainTimeout`] --
+    /// the caller must surface that as its own error, not log and proceed
+    /// (AGENTS.md rule 3).
+    pub async fn begin_delete(&self, agent_id: &AgentId) -> Result<(), Error> {
+        self.backoff.begin_delete(agent_id);
+        if self
+            .backoff
+            .wait_for_drain(agent_id, DELETE_DRAIN_TIMEOUT)
+            .await
+        {
+            Ok(())
+        } else {
+            self.backoff.end_delete(agent_id);
+            Err(Error::DeleteDrainTimeout)
+        }
+    }
+
+    /// Ends a deletion begun by [`Handle::begin_delete`]: clears the mark
+    /// and any stale backoff data so an agent later created with the same
+    /// id dispatches normally. Must be called exactly once after every
+    /// `begin_delete` that returned `Ok`, regardless of whether the delete
+    /// itself went on to succeed (the row may still exist, e.g. a
+    /// `DeleteAgent` refused because a spawn that finished draining left it
+    /// with a live session).
+    pub fn end_delete(&self, agent_id: &AgentId) {
+        self.backoff.end_delete(agent_id);
+    }
+
     /// Stops the dispatcher. Live sessions are untouched: closing/crashing
     /// the daemon must not stop agents (`HANDOFF.md`).
     pub async fn shutdown(&self) -> Result<(), Error> {
@@ -365,15 +416,21 @@ pub fn spawn(
     let config = Arc::new(config);
     let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // Shared with `Handle` (see its `backoff` field's doc comment) so
+    // `DeleteAgent`/`DeleteProject` can mark an agent as deleting and wait
+    // for the dispatcher to drain any in-flight spawn preparation for it.
+    let backoff = Arc::new(SpawnBackoff::new());
     let dispatcher_config = Arc::clone(&config);
     let dispatcher_state = state.clone();
     let dispatcher_wake_tx = wake_tx.clone();
+    let dispatcher_backoff = Arc::clone(&backoff);
     let join = runtime.spawn(run_dispatcher(
         dispatcher_config,
         dispatcher_state,
         dispatcher_wake_tx,
         wake_rx,
         shutdown_rx,
+        dispatcher_backoff,
     ));
     Ok((
         Handle {
@@ -381,18 +438,23 @@ pub fn spawn(
             config,
             wake_tx,
             shutdown: shutdown_tx,
+            backoff,
         },
         join,
     ))
 }
 
 /// Per-agent exponential backoff for session-spawn attempts (this track's
-/// item 1). Without this, a persistently broken spawn path -- the concrete
-/// repro that motivated it: `--runner` pointed at a missing
-/// `factory-runner` -- retried on every dispatcher wake/tick, unboundedly
-/// often. Doubles from [`SPAWN_BACKOFF_INITIAL`] up to
-/// [`SPAWN_BACKOFF_MAX`] per agent on each consecutive failure; a
-/// successful spawn clears it. Never pruned, same reasoning as
+/// item 1), and -- this task's addition -- the same per-agent lock's home
+/// for deletion's "no new state under a deleting identity" invariant
+/// (ARCHITECTURE.md): `deleting` and `preparing` below. Without the
+/// backoff, a persistently broken spawn path -- the concrete repro that
+/// motivated it: `--runner` pointed at a missing `factory-runner` --
+/// retried on every dispatcher wake/tick, unboundedly often. Doubles from
+/// [`SPAWN_BACKOFF_INITIAL`] up to [`SPAWN_BACKOFF_MAX`] per agent on each
+/// consecutive failure; a successful spawn clears it. Entries persist until
+/// a delete explicitly clears them (`end_delete`) or a spawn succeeds
+/// (`record_success`) -- otherwise never pruned, same reasoning as
 /// `DaemonState::delivery_slots`.
 struct SpawnBackoff {
     state: Mutex<HashMap<AgentId, BackoffEntry>>,
@@ -402,10 +464,44 @@ struct BackoffEntry {
     next_attempt_at: Instant,
     delay: Duration,
     consecutive_failures: u32,
+    /// Set by [`SpawnBackoff::begin_delete`]: `dispatch_agent` must not
+    /// begin (`try_begin_preparation` returns `false`) a new spawn
+    /// preparation for this agent while set.
+    deleting: bool,
+    /// Count of spawn preparations for this agent currently between
+    /// `try_begin_preparation` returning `true` and the matching
+    /// `end_preparation` -- `wait_for_drain` blocks until this reaches
+    /// zero, so deletion never removes files a preparation might still be
+    /// writing.
+    preparing: u32,
+}
+
+impl Default for BackoffEntry {
+    fn default() -> Self {
+        Self {
+            next_attempt_at: Instant::now(),
+            delay: Duration::ZERO,
+            consecutive_failures: 0,
+            deleting: false,
+            preparing: 0,
+        }
+    }
 }
 
 const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
 const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Bounds how long [`Handle::begin_delete`] waits for an in-flight spawn
+/// preparation to finish before giving up: a preparation is a handful of
+/// synchronous file writes (seed/rewrite the provider's generated config),
+/// not a network call, so a few seconds is generous headroom while still
+/// keeping a stuck delete request bounded rather than hanging indefinitely.
+const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Poll granularity for [`SpawnBackoff::wait_for_drain`]. Polling (rather
+/// than a `Notify`) is the simplest correct option here: preparation
+/// windows are short, deletes are rare, and this reuses the same
+/// lock-and-check shape as the rest of `SpawnBackoff` instead of adding a
+/// second synchronization primitive.
+const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
 
 impl SpawnBackoff {
     fn new() -> Self {
@@ -433,11 +529,7 @@ impl SpawnBackoff {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state.entry(agent_id.clone()).or_insert(BackoffEntry {
-            next_attempt_at: Instant::now(),
-            delay: Duration::ZERO,
-            consecutive_failures: 0,
-        });
+        let entry = state.entry(agent_id.clone()).or_default();
         entry.delay = if entry.delay.is_zero() {
             SPAWN_BACKOFF_INITIAL
         } else {
@@ -455,6 +547,91 @@ impl SpawnBackoff {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.remove(agent_id);
     }
+
+    /// Atomically checks that `agent_id` is not currently being deleted
+    /// and, if so, records one spawn preparation for it in flight;
+    /// declines (returns `false`) if a delete is in progress. Checked and
+    /// incremented under the same lock as [`SpawnBackoff::begin_delete`]
+    /// and [`SpawnBackoff::wait_for_drain`], so a fresh preparation and a
+    /// delete beginning can never race past each other: whichever runs
+    /// first under the lock determines the outcome.
+    fn try_begin_preparation(&self, agent_id: &AgentId) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(agent_id.clone()).or_default();
+        if entry.deleting {
+            return false;
+        }
+        entry.preparing += 1;
+        true
+    }
+
+    /// Ends one spawn preparation recorded by
+    /// [`SpawnBackoff::try_begin_preparation`], whether it succeeded or
+    /// failed -- lets a concurrent [`SpawnBackoff::wait_for_drain`] proceed
+    /// once every preparation for `agent_id` has ended.
+    fn end_preparation(&self, agent_id: &AgentId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.get_mut(agent_id) {
+            entry.preparing = entry.preparing.saturating_sub(1);
+        }
+    }
+
+    /// Marks `agent_id` as being deleted and clears any pending backoff
+    /// timer for it (this task's mechanism): from this call on,
+    /// `try_begin_preparation` declines new spawn preparations for it.
+    /// Idempotent.
+    fn begin_delete(&self, agent_id: &AgentId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(agent_id.clone()).or_default();
+        entry.deleting = true;
+        entry.delay = Duration::ZERO;
+        entry.consecutive_failures = 0;
+        entry.next_attempt_at = Instant::now();
+    }
+
+    /// Clears every trace of `agent_id` (deleting mark, in-flight
+    /// preparation count, and backoff timer) so an agent later created
+    /// with the same id starts clean.
+    fn end_delete(&self, agent_id: &AgentId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.remove(agent_id);
+    }
+
+    /// Polls (bounded by `budget`) until `agent_id` has no spawn
+    /// preparation in flight; returns `false` on timeout. See
+    /// [`DELETE_DRAIN_POLL`] for why polling rather than a `Notify`.
+    async fn wait_for_drain(&self, agent_id: &AgentId, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            let drained = {
+                let state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.get(agent_id).is_none_or(|entry| entry.preparing == 0)
+            };
+            if drained {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            sleep_until((now + DELETE_DRAIN_POLL).min(deadline)).await;
+        }
+    }
 }
 
 async fn run_dispatcher(
@@ -463,10 +640,10 @@ async fn run_dispatcher(
     wake_tx: mpsc::Sender<WakeAgent>,
     mut wake_rx: mpsc::Receiver<WakeAgent>,
     mut shutdown_rx: watch::Receiver<bool>,
+    backoff: Arc<SpawnBackoff>,
 ) -> Result<(), Error> {
     recover_sessions(&state, &wake_tx, &shutdown_rx).await;
 
-    let backoff = SpawnBackoff::new();
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -605,20 +782,33 @@ async fn dispatch_agent(
                 if backoff.ready(agent_id)
                     && !at_concurrency_limit(config, state, project_id, agent_id).await?
                 {
-                    match spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
-                        .await
-                    {
-                        Ok(_) => backoff.record_success(agent_id),
-                        Err(error) => {
-                            let (retry_in, attempt) = backoff.record_failure(agent_id);
-                            tracing::warn!(
-                                %error,
-                                %project_id,
-                                %agent_id,
-                                attempt,
-                                retry_in_secs = retry_in.as_secs(),
-                                "session spawn failed; backing off"
-                            );
+                    // Deletion (this task's mechanism, ARCHITECTURE.md):
+                    // `try_begin_preparation` declines under the same lock
+                    // `Handle::begin_delete` uses, so a `DeleteAgent`/
+                    // `DeleteProject` already marking this agent and a
+                    // fresh preparation can never both proceed -- whichever
+                    // wins the lock first decides. A decline here is
+                    // silent, matching `backoff.ready`'s: the delete
+                    // request draining this agent is what actually reports
+                    // the outcome to its caller.
+                    if backoff.try_begin_preparation(agent_id) {
+                        let spawn_result =
+                            spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
+                                .await;
+                        backoff.end_preparation(agent_id);
+                        match spawn_result {
+                            Ok(_) => backoff.record_success(agent_id),
+                            Err(error) => {
+                                let (retry_in, attempt) = backoff.record_failure(agent_id);
+                                tracing::warn!(
+                                    %error,
+                                    %project_id,
+                                    %agent_id,
+                                    attempt,
+                                    retry_in_secs = retry_in.as_secs(),
+                                    "session spawn failed; backing off"
+                                );
+                            }
                         }
                     }
                 }
@@ -2031,6 +2221,152 @@ mod tests {
                 .await
                 .unwrap(),
             "ending occupant's session must free the slot immediately"
+        );
+    }
+
+    /// Deletion's ordering half of this task's mechanism (ARCHITECTURE.md's
+    /// "once deletion begins, no component may create new state under that
+    /// identity"): once `SpawnBackoff::begin_delete` has marked an agent,
+    /// `dispatch_agent` must not create a session row for it at all -- not
+    /// attempt-then-fail, not attempt-then-succeed -- exactly the same
+    /// "not attempted" assertion `dispatch_agent_defers_spawn_at_the_concurrency_limit`
+    /// makes for the concurrency limit, above. Deterministic: no timing,
+    /// just direct state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_agent_declines_to_prepare_for_a_deleting_agent() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: TaskId::try_from("task-1").unwrap(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Do the thing".to_owned(),
+                    body: "Do the thing.".to_owned(),
+                    priority: 0,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id,
+                &TaskId::try_from("task-1").unwrap(),
+                Some(&agent_id),
+                1_000,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let cfg = config(directory.path());
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let backoff = SpawnBackoff::new();
+
+        // Simulates `Handle::begin_delete`'s first step: mark the agent
+        // deleting before anything else runs.
+        backoff.begin_delete(&agent_id);
+        assert!(
+            !backoff.try_begin_preparation(&agent_id),
+            "a deleting agent must never begin a new spawn preparation"
+        );
+
+        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
+            .await
+            .unwrap();
+
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        assert!(
+            sessions.is_empty(),
+            "a deleting agent must not get a session row at all -- not attempted, not failed"
+        );
+
+        // Clearing the mark (`Handle::end_delete`'s job) restores normal
+        // dispatch for a future agent with the same id.
+        backoff.end_delete(&agent_id);
+        assert!(
+            backoff.try_begin_preparation(&agent_id),
+            "clearing the mark must restore normal dispatch"
+        );
+    }
+
+    /// Deletion's waiting half: [`SpawnBackoff::wait_for_drain`] must not
+    /// observe an agent as drained while a preparation `try_begin_preparation`
+    /// already admitted is still in flight, and must unblock as soon as
+    /// [`SpawnBackoff::end_preparation`] ends it. Uses a paused clock
+    /// (`start_paused`) rather than a real sleep-and-hope: `SpawnBackoff`
+    /// times entirely through `tokio::time::Instant`, so advancing the
+    /// virtual clock is what actually drives `wait_for_drain`'s poll loop,
+    /// making the "still waiting" assertion below deterministic rather than
+    /// a timing guess.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_drain_blocks_until_the_in_flight_preparation_ends() {
+        let backoff = Arc::new(SpawnBackoff::new());
+        let agent_id = AgentId::try_from("curie").unwrap();
+
+        assert!(
+            backoff.try_begin_preparation(&agent_id),
+            "simulates the dispatcher having just begun a spawn preparation"
+        );
+
+        let waiter_backoff = Arc::clone(&backoff);
+        let waiter_agent_id = agent_id.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_backoff.begin_delete(&waiter_agent_id);
+            waiter_backoff
+                .wait_for_drain(&waiter_agent_id, Duration::from_secs(5))
+                .await
+        });
+
+        // Let the waiter run up to its first `sleep_until` and register on
+        // the (paused) clock; it cannot possibly have observed a drain yet
+        // because time has not moved and `end_preparation` has not been
+        // called.
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "must still be waiting on the in-flight preparation"
+        );
+
+        backoff.end_preparation(&agent_id);
+        // Advances past one poll tick so `wait_for_drain`'s loop wakes,
+        // re-checks, and observes the drain.
+        tokio::time::advance(DELETE_DRAIN_POLL).await;
+        assert!(
+            waiter.await.unwrap(),
+            "must observe the drain once the preparation ends, well within its budget"
         );
     }
 
