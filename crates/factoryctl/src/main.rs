@@ -15,6 +15,8 @@ use factoryctl::Client;
 use uuid::Uuid;
 
 mod attach;
+mod doctor;
+mod init;
 mod install;
 mod launchd;
 mod outbox;
@@ -35,16 +37,18 @@ const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|usage|update|version|project|task|agent|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
 
 Commands:
   health                                      Check the daemon
-  usage                                       Probe Codex subscription usage on demand
+  init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
+  doctor [--json]                             Read-only checks of the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
   version                                     Print this factoryctl's version
+  usage                                       Probe Codex subscription usage on demand
   project add|list|delete|get|guidance        Manage projects and their guidance file
   task add|list|get|start|retry|assign|cancel|update|delete|done|blocked
                                                Manage and run tasks
@@ -69,6 +73,36 @@ Options:
 const HEALTH_HELP: &str = "usage: factoryctl health
 
 Check that the daemon is reachable and responding.";
+const INIT_HELP: &str = "usage: factoryctl init [--yes] [--no-launchd]
+
+Guided first install on this machine:
+  1. create $DARK_FACTORY_HOME (default ~/.dark-factory) and its logs/ dir, mode 0700
+  2. report whether claude, codex, and git resolve on PATH, and their versions
+  3. install the binaries next to this factoryctl as $DARK_FACTORY_HOME/bin/<version>/
+     and point bin/current at them (an existing bin/<version> is never overwritten)
+  4. explain what Dark Factory writes outside its home and ask before continuing
+  5. render ~/Library/LaunchAgents/com.dark-factory.factoryd.plist with a PATH that
+     can find those CLIs, load it, and wait for the daemon to answer health
+
+Re-running is safe: an existing job keeps its extra daemon arguments.
+
+Options:
+  --yes                      Skip the consent prompt (needed when stdin is not a terminal)
+  --no-launchd               Install and activate the binaries only
+  -h, --help                 Show this help";
+const DOCTOR_HELP: &str = "usage: factoryctl doctor [--json]
+
+Read-only checks, one line each: the home directory and its permissions,
+the installed release under bin/, the daemon (reachable? same version as
+this factoryctl?), the launchd job (installed, loaded, PATH covers claude/
+codex?), claude/codex/git on PATH with versions, ~/.claude.json (worktree
+pre-trust), every project's root and stale worktree directories, and
+whether a newer release exists (cached, at most one fetch per hour).
+Exits 1 if any check fails; warnings don't change the exit code.
+
+Options:
+  --json                     One JSON object instead of text lines
+  -h, --help                 Show this help";
 const UPDATE_HELP: &str = "usage: factoryctl update [--install]
 
 Fetch the newest release's manifest and report whether it is newer than
@@ -616,6 +650,13 @@ enum CliCommand {
     Update {
         install: bool,
     },
+    Init {
+        yes: bool,
+        no_launchd: bool,
+    },
+    Doctor {
+        json: bool,
+    },
     ProjectAdd {
         id: Option<String>,
         name: String,
@@ -815,6 +856,12 @@ fn run() -> Result<i32, String> {
     )?;
     if let CliCommand::Update { install } = command {
         return update_command::run(&update_command::Options { install }, &socket);
+    }
+    if let CliCommand::Init { yes, no_launchd } = command {
+        return init::run(&init::Options { yes, no_launchd }, &socket);
+    }
+    if let CliCommand::Doctor { json } = command {
+        return doctor::run(&doctor::Options { json }, &socket);
     }
     let client = Client::new(socket);
     if let CliCommand::Attach {
@@ -1121,6 +1168,23 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         "version" | "--version" | "-V" => {
             require_empty(&args)?;
             Ok((socket, CliCommand::Version))
+        }
+        "init" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(INIT_HELP)));
+            }
+            let yes = take_flag(&mut args, "--yes")?;
+            let no_launchd = take_flag(&mut args, "--no-launchd")?;
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Init { yes, no_launchd }))
+        }
+        "doctor" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(DOCTOR_HELP)));
+            }
+            let json = take_flag(&mut args, "--json")?;
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Doctor { json }))
         }
         "update" => {
             if wants_help(&args) {
@@ -1683,9 +1747,11 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
-        CliCommand::Usage | CliCommand::Version | CliCommand::Update { .. } => {
-            Err("handled before local requests".into())
-        }
+        CliCommand::Usage
+        | CliCommand::Version
+        | CliCommand::Update { .. }
+        | CliCommand::Init { .. }
+        | CliCommand::Doctor { .. } => Err("handled before local requests".into()),
         CliCommand::ProjectAdd { id, name, root } => Ok(LocalRequest::CreateProject {
             id: id
                 .map(|id| parse_id(id, "project"))
@@ -2199,6 +2265,20 @@ mod tests {
             CliCommand::Version
         );
         assert!(request_for(CliCommand::Update { install: false }).is_err());
+        assert_eq!(
+            parse_args(args(&["init", "--yes", "--no-launchd"]))
+                .unwrap()
+                .1,
+            CliCommand::Init {
+                yes: true,
+                no_launchd: true
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["doctor", "--json"])).unwrap().1,
+            CliCommand::Doctor { json: true }
+        );
+        assert!(parse_args(args(&["doctor", "--yes"])).is_err());
     }
 
     #[test]
@@ -2214,6 +2294,14 @@ mod tests {
         assert_eq!(
             parse_args(args(&["update", "--help"])).unwrap().1,
             CliCommand::Help(UPDATE_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["init", "--help"])).unwrap().1,
+            CliCommand::Help(INIT_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["doctor", "--help"])).unwrap().1,
+            CliCommand::Help(DOCTOR_HELP)
         );
         assert_eq!(
             parse_args(args(&["events", "--help"])).unwrap().1,

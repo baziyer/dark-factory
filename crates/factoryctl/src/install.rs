@@ -120,6 +120,26 @@ pub fn install_release(
     .inspect(|installed| log(&format!("installed {}", installed.display())))
 }
 
+/// Copies the four binaries from `source` (typically the directory the
+/// running `factoryctl` lives in — a `cargo build --release` target dir or
+/// an unpacked release) into `bin/<version>`. Refuses to overwrite.
+pub fn install_from_dir(home: &Path, source: &Path, version: &str) -> Result<PathBuf, String> {
+    verify_binaries(source)?;
+    if version_dir(home, version).exists() {
+        return Err(format!(
+            "{} already exists",
+            version_dir(home, version).display()
+        ));
+    }
+    stage(home, version, |staging| {
+        for name in BINARIES {
+            fs::copy(source.join(name), staging.join(name))
+                .map_err(|error| format!("copying {name} from {}: {error}", source.display()))?;
+        }
+        Ok(())
+    })
+}
+
 /// Runs `fill` against a fresh `bin/.staging-<version>`, verifies the four
 /// binaries are there and executable, and renames it to `bin/<version>`.
 /// Any error (or a missing binary) removes the staging directory.
@@ -222,6 +242,22 @@ mod tests {
             Some("0.1.0"),
             "failed activate leaves current alone"
         );
+    }
+
+    #[test]
+    fn install_from_dir_stages_verifies_and_refuses_overwrite() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("src");
+        fake_binaries(&source);
+        let installed = install_from_dir(home.path(), &source, "0.3.0").unwrap();
+        assert_eq!(installed, version_dir(home.path(), "0.3.0"));
+        verify_binaries(&installed).unwrap();
+        assert!(install_from_dir(home.path(), &source, "0.3.0").is_err());
+        // An incomplete source never produces a version directory or leaves staging behind.
+        fs::remove_file(source.join("factory-tui")).unwrap();
+        assert!(install_from_dir(home.path(), &source, "0.4.0").is_err());
+        assert!(!version_dir(home.path(), "0.4.0").exists());
+        assert!(!bin_dir(home.path()).join(".staging-0.4.0").exists());
     }
 
     #[test]

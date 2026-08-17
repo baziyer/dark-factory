@@ -3,14 +3,20 @@
 
 use std::{
     fs,
+    io::Read,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
 use factoryctl::Client;
+
+use crate::launchd;
+
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The provider CLIs a factory can run, and `git`, which worktrees need.
 pub const PROBED_PROGRAMS: [&str; 3] = ["claude", "codex", "git"];
@@ -39,6 +45,59 @@ pub fn provider_directories() -> Vec<(&'static str, PathBuf)> {
                 .map(|directory| (*program, directory))
         })
         .collect()
+}
+
+/// `<program> --version`, first line, within [`VERSION_PROBE_TIMEOUT`];
+/// `None` if it fails, hangs, or prints nothing.
+#[must_use]
+pub fn probe_version(program: &Path) -> Option<String> {
+    let mut child = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.take(4096).read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let text = reader.join().ok()?;
+    let line = text.lines().next()?.trim();
+    (status.is_some_and(|status| status.success()) && !line.is_empty()).then(|| line.to_owned())
+}
+
+/// Whether launchd has the job loaded for this user.
+#[must_use]
+pub fn launchd_loaded() -> bool {
+    Command::new("launchctl")
+        .args([
+            "print",
+            &format!(
+                "gui/{}/{}",
+                rustix::process::getuid().as_raw(),
+                launchd::LABEL
+            ),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Polls `health` at `socket` until a daemon answers — with `version`
