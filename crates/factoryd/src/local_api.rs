@@ -23,6 +23,7 @@ use factory_core::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
         RunnerEventEnvelope,
     },
+    status,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take},
@@ -560,6 +561,90 @@ async fn handle_request(
             factoryctl_path: execution.factoryctl_path().to_string_lossy().into_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
         }),
+        LocalRequest::FleetStatus => {
+            let live_session_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
+            let (projects, live_sessions, generated_at_ms) = state
+                .with_store(move |store| {
+                    Ok((
+                        store.fleet_status()?,
+                        store.live_session_count()?,
+                        now_ms()?,
+                    ))
+                })
+                .await?;
+            let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
+            let at_capacity = live_sessions >= live_session_cap;
+            let mut attention = Vec::new();
+            let projects = projects
+                .into_iter()
+                .map(|rows| {
+                    let crate::store::ProjectStatusRows {
+                        project,
+                        agents,
+                        unassigned,
+                        blocked,
+                    } = rows;
+                    attention.extend(status::attention_items(
+                        &project.id,
+                        &agents,
+                        &blocked,
+                        at_capacity,
+                    ));
+                    status::ProjectStatus {
+                        project,
+                        agents,
+                        unassigned_queue_depth: u32::try_from(unassigned.len()).unwrap_or(u32::MAX),
+                        unassigned_queue: unassigned
+                            .into_iter()
+                            .take(status::MAX_QUEUE_PREVIEW)
+                            .collect(),
+                    }
+                })
+                .collect();
+            attention.sort_by(|a, b| {
+                b.level
+                    .cmp(&a.level)
+                    .then_with(|| a.since_ms.cmp(&b.since_ms))
+            });
+            Ok(LocalResponse::FleetStatus {
+                status: status::FleetStatus {
+                    generated_at_ms,
+                    live_session_cap,
+                    live_sessions,
+                    projects,
+                    attention,
+                },
+            })
+        }
+        LocalRequest::AgentStatus {
+            project_id,
+            agent_id,
+        } => {
+            let lookup_project_id = project_id.clone();
+            let lookup_agent_id = agent_id.clone();
+            let (agent_status, agent) = state
+                .with_store(move |store| {
+                    Ok((
+                        store.agent_status(&lookup_project_id, &lookup_agent_id)?,
+                        store.get_agent_detail(&lookup_project_id, &lookup_agent_id)?,
+                    ))
+                })
+                .await?;
+            let agent_paths = AgentGuidancePaths::new(guidance_root, &project_id, &agent_id);
+            let instructions = read_guidance_file(agent_paths.instructions.clone()).await?;
+            let memory = read_guidance_file(agent_paths.memory.clone()).await?;
+            let worktree = match agent_status.agent.worktree.as_deref() {
+                Some(path) => crate::worktrees::status(Path::new(path)).await.ok(),
+                None => None,
+            };
+            Ok(LocalResponse::AgentStatus {
+                status: Box::new(status::AgentStatusDetail {
+                    status: agent_status,
+                    detail: local_agent_detail(agent, instructions, memory, agent_paths),
+                    worktree,
+                }),
+            })
+        }
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
             let root = canonical_root(root).await?;

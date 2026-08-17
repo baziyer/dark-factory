@@ -772,3 +772,37 @@ fn health_version_is_additive_so_a_new_client_reads_an_old_daemon() {
     .unwrap();
     assert_eq!(value["data"]["version"], "0.1.0");
 }
+
+#[test]
+fn status_requests_have_stable_shapes() {
+    let fleet = serde_json::to_value(LocalRequest::FleetStatus).unwrap();
+    assert_eq!(fleet["type"], "fleet_status");
+    let agent = serde_json::to_value(LocalRequest::AgentStatus {
+        project_id: project_id("project-1"),
+        agent_id: agent_id("agent-1"),
+    })
+    .unwrap();
+    assert_eq!(agent["type"], "agent_status");
+    assert_eq!(agent["data"]["project_id"], "project-1");
+    assert_eq!(agent["data"]["agent_id"], "agent-1");
+
+    let status = factory_core::status::FleetStatus {
+        generated_at_ms: 7,
+        live_session_cap: 4,
+        live_sessions: 1,
+        projects: Vec::new(),
+        attention: Vec::new(),
+    };
+    let value = serde_json::to_value(LocalResponse::FleetStatus {
+        status: status.clone(),
+    })
+    .unwrap();
+    assert_eq!(value["type"], "fleet_status");
+    assert_eq!(value["data"]["status"]["live_session_cap"], 4);
+    assert_eq!(value["data"]["status"]["live_sessions"], 1);
+    assert_eq!(value["data"]["status"]["projects"], serde_json::json!([]));
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(value).unwrap(),
+        LocalResponse::FleetStatus { status }
+    );
+}

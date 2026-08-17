@@ -21,6 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, ServerFrame};
+use factory_core::status::FleetStatus;
 use factory_core::{
     AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, SessionSnapshot,
     TaskDetail, TaskId,
@@ -98,6 +99,10 @@ pub enum NetMsg {
     },
     /// The result of the hourly release-manifest check (`spawn_update_check`).
     UpdateCheck(UpdateCheck),
+    /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — fetched once
+    /// after the bootstrap snapshot for the fields the board doesn't otherwise learn (today: the
+    /// live-session cap; live counts and attention are then kept from events).
+    FleetStatus(FleetStatus),
 }
 
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
@@ -301,6 +306,13 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
             .is_err()
         {
             return;
+        }
+        if let Ok(LocalResponse::FleetStatus { status }) =
+            request_response(&client, LocalRequest::FleetStatus)
+        {
+            if tx.send(NetMsg::FleetStatus(status)).is_err() {
+                return;
+            }
         }
 
         let mut delay = MIN_BACKOFF;

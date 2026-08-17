@@ -5,12 +5,24 @@ use factory_core::{
     PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunClosedBy,
     RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId, SessionSnapshot,
     SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    attention::{Attention, run_attention, session_attention},
+    status::{AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+/// One project's rows for `factory_core::status::FleetStatus`: the project,
+/// its agents' statuses, its unassigned queue, and its blocked tasks (see
+/// [`Store::fleet_status`]).
+pub struct ProjectStatusRows {
+    pub project: ProjectSnapshot,
+    pub agents: Vec<AgentStatus>,
+    pub unassigned: Vec<TaskSnapshot>,
+    pub blocked: Vec<TaskSnapshot>,
+}
 
 const SCHEMA_VERSION: i64 = 14;
 const MAX_EVENT_PAGE: usize = 10_000;
@@ -2928,6 +2940,155 @@ impl Store {
             .collect()
     }
 
+    /// Every project's live picture in one read: agents with their live
+    /// (or, failing that, most recent) session, current run, queued tasks,
+    /// and undelivered inbox count; per-project unassigned queue; the
+    /// project's blocked tasks (for the attention list). One connection,
+    /// so every field is from the same instant. See
+    /// `factory_core::status`.
+    pub fn fleet_status(&self) -> Result<Vec<ProjectStatusRows>> {
+        let mut projects = self.connection.prepare(
+            "SELECT id, name, root, created_at_ms, updated_at_ms
+             FROM projects ORDER BY created_at_ms, id",
+        )?;
+        let projects = projects
+            .query_map([], |row| {
+                Ok(ProjectSnapshot {
+                    id: parse_id(row.get(0)?, 0)?,
+                    name: row.get(1)?,
+                    root: row.get(2)?,
+                    created_at_ms: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(projects.len());
+        for project in projects {
+            let mut ids = self.connection.prepare(
+                "SELECT id FROM agents WHERE project_id = ?1 ORDER BY created_at_ms, id",
+            )?;
+            let agent_ids = ids
+                .query_map(params![project.id.as_str()], |row| {
+                    parse_id::<AgentId>(row.get(0)?, 0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(ids);
+            let agents = agent_ids
+                .iter()
+                .map(|agent_id| self.agent_status(&project.id, agent_id))
+                .collect::<Result<Vec<_>>>()?;
+            let unassigned = self.queued_tasks(&project.id, None)?;
+            let blocked = self.tasks_with_status(&project.id, "blocked")?;
+            out.push(ProjectStatusRows {
+                project,
+                agents,
+                unassigned,
+                blocked,
+            });
+        }
+        Ok(out)
+    }
+
+    /// One agent's live picture (see [`Store::fleet_status`]).
+    pub fn agent_status(&self, project_id: &ProjectId, agent_id: &AgentId) -> Result<AgentStatus> {
+        let agent = load_agent(&self.connection, agent_id)?
+            .filter(|agent| agent.snapshot.project_id == *project_id)
+            .ok_or(StoreError::AgentNotFound)?
+            .snapshot;
+        let session = self
+            .latest_session_for_agent(project_id, agent_id)?
+            .map(|session| session.snapshot());
+        let current_run = match &agent.current_run_id {
+            Some(run_id) => load_run(&self.connection, run_id)?,
+            None => None,
+        };
+        let queue = self.queued_tasks(project_id, Some(agent_id))?;
+        let inbox_pending: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM agent_messages
+             WHERE project_id = ?1 AND recipient_agent_id = ?2 AND delivered_at_ms IS NULL",
+            params![project_id.as_str(), agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let (attention, attention_inferred) = match &session {
+            Some(session) => (session_attention(session.state), false),
+            None => (
+                current_run
+                    .as_ref()
+                    .map_or(Attention::Routine, |run| run_attention(run.status)),
+                true,
+            ),
+        };
+        Ok(AgentStatus {
+            agent,
+            session,
+            current_run,
+            queue_depth: u32::try_from(queue.len()).unwrap_or(u32::MAX),
+            queue: queue.into_iter().take(MAX_QUEUE_PREVIEW).collect(),
+            inbox_pending: u32::try_from(inbox_pending).unwrap_or(u32::MAX),
+            attention,
+            attention_inferred,
+        })
+    }
+
+    /// The agent's live session, else its most recently started one (so a
+    /// failure stays visible after the session ended), else `None`.
+    fn latest_session_for_agent(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<Option<SessionRow>> {
+        let id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT id FROM sessions
+                 WHERE project_id = ?1 AND agent_id = ?2
+                 ORDER BY (ended_at_ms IS NULL) DESC, started_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![project_id.as_str(), agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        load_session(&self.connection, &parse_id(id, 0)?)
+    }
+
+    /// Queued tasks assigned to `agent_id` (or unassigned when `None`),
+    /// oldest first -- the same order the dispatcher delivers them.
+    fn queued_tasks(
+        &self,
+        project_id: &ProjectId,
+        agent_id: Option<&AgentId>,
+    ) -> Result<Vec<TaskSnapshot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
+                    created_at_ms, updated_at_ms
+             FROM tasks
+             WHERE project_id = ?1 AND status = 'queued'
+               AND ((?2 IS NULL AND assigned_agent_id IS NULL) OR assigned_agent_id = ?2)
+             ORDER BY created_at_ms, id",
+        )?;
+        let rows = statement.query_map(
+            params![project_id.as_str(), agent_id.map(AgentId::as_str)],
+            task_snapshot_from_row,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn tasks_with_status(&self, project_id: &ProjectId, status: &str) -> Result<Vec<TaskSnapshot>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
+                    created_at_ms, updated_at_ms
+             FROM tasks
+             WHERE project_id = ?1 AND status = ?2
+             ORDER BY updated_at_ms, id",
+        )?;
+        let rows =
+            statement.query_map(params![project_id.as_str(), status], task_snapshot_from_row)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn get_agent_detail(
         &self,
         project_id: &ProjectId,
@@ -4074,6 +4235,26 @@ where
     T::Error: std::error::Error + Send + Sync + 'static,
 {
     value.map(|value| parse_id(value, column)).transpose()
+}
+
+/// Maps `SELECT id, project_id, parent_task_id, assigned_agent_id, title,
+/// status, priority, created_at_ms, updated_at_ms FROM tasks` onto a
+/// [`TaskSnapshot`].
+fn task_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnapshot> {
+    let parent_id: Option<String> = row.get(2)?;
+    let assigned_id: Option<String> = row.get(3)?;
+    let status: String = row.get(5)?;
+    Ok(TaskSnapshot {
+        id: parse_id(row.get(0)?, 0)?,
+        project_id: parse_id(row.get(1)?, 1)?,
+        parent_task_id: parse_optional_id(parent_id, 2)?,
+        assigned_agent_id: parse_optional_id(assigned_id, 3)?,
+        title: row.get(4)?,
+        status: parse_task_status(&status, 5)?,
+        priority: row.get(6)?,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
 }
 
 fn parse_task_status(value: &str, column: usize) -> rusqlite::Result<TaskStatus> {

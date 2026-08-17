@@ -1,20 +1,23 @@
-//! The shared attention taxonomy (`REFS-HERDR-REPOMON.md`'s "Attention triage": "one shared
-//! taxonomy" feeding sort order, badges, and jump-to-next — adopted here instead of a boolean
-//! "needs help" flag so fortress badges, announcement ordering, `g`/`G`, and WORKSHOP's `!`
-//! filter can never quietly disagree about what counts as urgent).
+//! The one attention taxonomy: what counts as urgent, ranked. `factoryd`
+//! uses it to build `factoryctl status`'s attention list and `factory-tui`
+//! uses it for fortress badges, announcement ordering, `g`/`G`, and
+//! WORKSHOP's `!` filter — the same enum and the same mappings, so the CLI
+//! and the board can never quietly disagree about what needs an operator.
 //!
-//! Per the design brief §5: "Session state wins over run-status inference when a session exists
-//! (hooks supersede inference)". [`AgentAttention`] and [`agent_attention`] are the one place that
-//! precedence is decided; every other module calls this instead of comparing `SessionState`/
-//! `RunStatus` itself.
+//! Session state wins over run-status inference when a session exists
+//! (hooks supersede inference); [`Rated`] carries which one a value came
+//! from.
 
-use factory_core::{RunStatus, SessionState, TaskStatus};
+use serde::{Deserialize, Serialize};
+
+use crate::{RunStatus, SessionState, TaskStatus};
 
 /// How urgently something wants the operator's attention, ranked low to high. `Ord`/`PartialOrd`
 /// follow declaration order, so `a.max(b)` and sorting by this enum directly implement "float
 /// above routine" without a separate `priority()` lookup table to keep in sync — declaration
 /// order *is* the ranking, which is also why every variant is documented with its rank in mind.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Attention {
     /// Nothing to see: idle, working normally, queued, or otherwise unremarkable.
     Routine,

@@ -10,10 +10,10 @@ use ratatui::widgets::{ListItem, ListState, Paragraph, Wrap};
 
 use factory_core::{AgentRole, ProjectId, TaskStatus};
 
-use crate::model::attention::Attention;
 use crate::model::state::{self, AgentState};
 use crate::model::{Board, WorkshopPane, provider_letter};
 use crate::ui::{self, pad, truncate};
+use factory_core::attention::Attention;
 
 /// Same width as the pre-Track-6c board's unit-list sparkline — see `model::state::ActivitySeries`.
 const SPARKLINE_WIDTH: usize = 8;
@@ -281,7 +281,7 @@ fn task_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static>
     else {
         return vec![Line::from("(no task selected)")];
     };
-    let attention = crate::model::attention::task_attention(task.snapshot.status);
+    let attention = factory_core::attention::task_attention(task.snapshot.status);
     let mut lines = vec![
         Line::from(Span::styled(
             task.snapshot.title.clone(),

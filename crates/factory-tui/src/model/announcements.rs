@@ -5,7 +5,7 @@
 
 use factory_core::{EventEnvelope, FactoryEvent, RunStatus, SessionState, TaskStatus};
 
-use super::attention::{Attention, run_attention, session_attention, task_attention};
+use factory_core::attention::{Attention, run_attention, session_attention, task_attention};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Announcement {

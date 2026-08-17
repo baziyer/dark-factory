@@ -493,5 +493,6 @@ fn apply_net_msg(
         NetMsg::UpdateCheck(check) => {
             board.update_available = check.available().map(|manifest| manifest.version.clone());
         }
+        NetMsg::FleetStatus(status) => board.live_session_cap = Some(status.live_session_cap),
     }
 }

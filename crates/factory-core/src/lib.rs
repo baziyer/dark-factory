@@ -8,9 +8,11 @@ use std::{error::Error, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+pub mod attention;
 pub mod local;
 pub mod paths;
 pub mod runner;
+pub mod status;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 const MAX_ID_LEN: usize = 128;

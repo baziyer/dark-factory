@@ -22,7 +22,6 @@
 //! answer was inferred from run/task lifecycle state rather than observed from a session's hooks.
 
 pub mod announcements;
-pub mod attention;
 mod keymap;
 pub mod state;
 
@@ -35,7 +34,7 @@ use factory_core::{
 };
 
 pub use announcements::Announcement;
-pub use attention::{Attention, Rated};
+pub use factory_core::attention::{self, Attention, Rated};
 pub use keymap::{
     Intent, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState, TASK_MENU_ITEMS,
     TaskMenuState, View, WorkshopPane,
@@ -100,6 +99,9 @@ pub struct Board {
     /// A newer release's version, once the hourly manifest check has found one
     /// (`net::spawn_update_check`); shown in the status line.
     pub update_available: Option<String>,
+    /// `factoryd --max-active-runs`, learned from `FleetStatus` after bootstrap; the status line
+    /// shows live sessions against it.
+    pub live_session_cap: Option<u32>,
 
     /// Every project on the daemon, in whatever order the last snapshot/event delivered them —
     /// use [`Board::projects_sorted`] for creation order.
@@ -167,6 +169,7 @@ impl Board {
             connection: Connection::Connecting,
             connection_detail: None,
             update_available: None,
+            live_session_cap: None,
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
@@ -641,6 +644,15 @@ impl Board {
     pub fn set_live(&mut self) {
         self.connection = Connection::Live;
         self.connection_detail = None;
+    }
+
+    /// Sessions that have not ended, fleet-wide — what the daemon's live-session cap counts.
+    #[must_use]
+    pub fn live_session_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| session.ended_at_ms.is_none())
+            .count()
     }
 
     /// Replaces the entire fleet snapshot (every project's projects/agents/tasks/runs/sessions).

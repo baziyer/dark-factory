@@ -110,6 +110,16 @@ impl RequestEnvelope {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalRequest {
     Health,
+    /// The whole daemon at one instant (`factoryctl status`): every
+    /// project's agents with their sessions, runs, and queues, plus the
+    /// attention list and the live-session cap. See [`crate::status`].
+    FleetStatus,
+    /// One agent's live picture plus its profile and worktree git state
+    /// (`factoryctl agent status`).
+    AgentStatus {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
     CreateProject {
         id: ProjectId,
         name: String,
@@ -380,6 +390,12 @@ pub enum LocalResponse {
         factoryctl_path: String,
         #[serde(default)]
         version: String,
+    },
+    FleetStatus {
+        status: crate::status::FleetStatus,
+    },
+    AgentStatus {
+        status: Box<crate::status::AgentStatusDetail>,
     },
     ProjectCreated {
         project: ProjectSnapshot,

@@ -50,8 +50,25 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
         Span::raw(" "),
         view_badge(board.view),
         Span::raw(" "),
-        Span::styled(board.status_line_text(), Style::default().fg(text_color)),
     ];
+    if let Some(cap) = board.live_session_cap {
+        let live = board.live_session_count();
+        spans.push(Span::styled(
+            format!(" {live}/{cap} live "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(if live >= cap as usize {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                }),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        board.status_line_text(),
+        Style::default().fg(text_color),
+    ));
     if board.connection == Connection::Retrying {
         if let Some(detail) = &board.connection_detail {
             spans.push(Span::styled(
