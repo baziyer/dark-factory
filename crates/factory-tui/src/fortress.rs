@@ -434,33 +434,8 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use factory_core::{AgentId, ProjectId};
-
-    fn project(id: &str, created_at_ms: i64) -> ProjectSnapshot {
-        ProjectSnapshot {
-            id: ProjectId::try_from(id).unwrap(),
-            name: id.to_owned(),
-            root: "/work".into(),
-            created_at_ms,
-            updated_at_ms: created_at_ms,
-        }
-    }
-
-    fn agent(id: &str, project: &str, role: AgentRole, parent: Option<&str>) -> AgentSnapshot {
-        AgentSnapshot {
-            id: AgentId::try_from(id).unwrap(),
-            project_id: ProjectId::try_from(project).unwrap(),
-            parent_agent_id: parent.map(|p| AgentId::try_from(p).unwrap()),
-            role,
-            provider: Provider::ClaudeCode,
-            current_run_id: None,
-            paused: false,
-            current_session_id: None,
-            worktree: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
-    }
+    use crate::test_fixtures::{agent, project};
+    use factory_core::ProjectId;
 
     #[test]
     fn same_input_produces_identical_layout() {

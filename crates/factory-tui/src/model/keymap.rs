@@ -1033,64 +1033,11 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 mod tests {
     use super::*;
     use crate::model::state::AgentState;
-    use factory_core::{
-        AgentRole, AgentSnapshot, ObserverHealth, ProjectSnapshot, Provider, RunSnapshot,
-        RunStatus, TaskDetail, TaskSnapshot, TaskStatus,
-    };
+    use crate::test_fixtures::{agent, project, task};
+    use factory_core::{AgentRole, ObserverHealth, RunSnapshot, RunStatus, TaskStatus};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn project(id: &str, created_at_ms: i64) -> ProjectSnapshot {
-        ProjectSnapshot {
-            id: ProjectId::try_from(id).unwrap(),
-            name: id.to_owned(),
-            root: "/work".into(),
-            created_at_ms,
-            updated_at_ms: created_at_ms,
-        }
-    }
-
-    fn agent(id: &str, project: &str, role: AgentRole, parent: Option<&str>) -> AgentSnapshot {
-        AgentSnapshot {
-            id: AgentId::try_from(id).unwrap(),
-            project_id: ProjectId::try_from(project).unwrap(),
-            parent_agent_id: parent.map(|p| AgentId::try_from(p).unwrap()),
-            role,
-            provider: Provider::ClaudeCode,
-            current_run_id: None,
-            paused: false,
-            current_session_id: None,
-            worktree: None,
-            created_at_ms: 0,
-            updated_at_ms: 0,
-        }
-    }
-
-    fn task(
-        id: &str,
-        project: &str,
-        status: TaskStatus,
-        assigned: Option<&str>,
-        created_at_ms: i64,
-    ) -> TaskDetail {
-        TaskDetail {
-            snapshot: TaskSnapshot {
-                id: TaskId::try_from(id).unwrap(),
-                project_id: ProjectId::try_from(project).unwrap(),
-                parent_task_id: None,
-                assigned_agent_id: assigned.map(|a| AgentId::try_from(a).unwrap()),
-                title: id.to_owned(),
-                status,
-                priority: 0,
-                created_at_ms,
-                updated_at_ms: created_at_ms,
-            },
-            body: String::new(),
-            result: None,
-            blocked_reason: None,
-        }
     }
 
     fn board_with_one_project() -> Board {

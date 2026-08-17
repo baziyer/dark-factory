@@ -15,6 +15,8 @@ mod model;
 mod net;
 mod pane;
 mod query;
+#[cfg(test)]
+mod test_fixtures;
 mod theme;
 mod ui;
 
