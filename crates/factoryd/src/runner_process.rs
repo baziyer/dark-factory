@@ -27,18 +27,25 @@ const SAFE_ENVIRONMENT_NAMES: [&str; 9] = [
 /// provider (`DARK_FACTORY_AGENT`/`DARK_FACTORY_PROJECT`/`DARK_FACTORY_SOCKET`/
 /// `DARK_FACTORY_SESSION_TOKEN_FILE`, so an agent's own `factoryctl`
 /// invocations — `task done`, `agent message`, ... — pick up a sender
-/// identity, per TRACK5-WIRE.md) plus one provider-specific addition: the
-/// shell provider's hook subprocess has no generated config file to embed a
-/// trusted `factoryctl` path in (unlike Claude's `--settings` file or
-/// Codex's seeded `config.toml`), so it needs `DARK_FACTORY_FACTORYCTL` in
-/// its environment instead (`providers::shell::ShellProvider`). This is a
-/// closed list, not a passthrough: a provider constructing `LaunchSpec`
-/// cannot smuggle in an arbitrary environment variable.
-const SESSION_ENVIRONMENT_NAMES: [&str; 5] = [
+/// identity, per TRACK5-WIRE.md) plus two additions: `DARK_FACTORY_AGENT_DIR`
+/// (this agent's guidance directory, already inside a Codex session's
+/// `writable_roots` — see `factory_core::paths::agent_dir` — so `factoryctl
+/// task done`/`task blocked`/`agent message` can fall back to writing a
+/// queued request there when the daemon socket itself is unreachable from
+/// inside a sandboxed provider; `docs/providers.md`'s "Sandboxed providers:
+/// the outbox") and `DARK_FACTORY_FACTORYCTL` (the shell provider's hook
+/// subprocess has no generated config file to embed a trusted `factoryctl`
+/// path in, unlike Claude's `--settings` file or Codex's seeded
+/// `config.toml`, so it needs this instead —
+/// `providers::shell::ShellProvider`). This is a closed list, not a
+/// passthrough: a provider constructing `LaunchSpec` cannot smuggle in an
+/// arbitrary environment variable.
+const SESSION_ENVIRONMENT_NAMES: [&str; 6] = [
     "DARK_FACTORY_AGENT",
     "DARK_FACTORY_PROJECT",
     "DARK_FACTORY_SOCKET",
     "DARK_FACTORY_SESSION_TOKEN_FILE",
+    "DARK_FACTORY_AGENT_DIR",
     "DARK_FACTORY_FACTORYCTL",
 ];
 
@@ -826,6 +833,10 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
                 "DARK_FACTORY_SESSION_TOKEN_FILE".to_owned(),
                 "/private/runs/session-1/hook.token".to_owned(),
             ),
+            (
+                "DARK_FACTORY_AGENT_DIR".to_owned(),
+                "/private/projects/factory/agents/curie".to_owned(),
+            ),
         ];
 
         let mut child = spawn_runner_with_environment(launch, captured)
@@ -841,6 +852,9 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         );
         assert!(provider_env.lines().any(|line| {
             line == "DARK_FACTORY_SESSION_TOKEN_FILE=/private/runs/session-1/hook.token"
+        }));
+        assert!(provider_env.lines().any(|line| {
+            line == "DARK_FACTORY_AGENT_DIR=/private/projects/factory/agents/curie"
         }));
     }
 

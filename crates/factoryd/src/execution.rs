@@ -730,6 +730,10 @@ async fn spawn_session_for_agent(
             "DARK_FACTORY_SESSION_TOKEN_FILE".to_owned(),
             hook_token_path.to_string_lossy().into_owned(),
         ),
+        (
+            "DARK_FACTORY_AGENT_DIR".to_owned(),
+            ctx.agent_dir.to_string_lossy().into_owned(),
+        ),
     ];
     session_environment.extend(extra_env);
     let provider_environment = codex_home

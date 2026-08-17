@@ -1,4 +1,9 @@
-use std::{env, io::Write, path::PathBuf, process};
+use std::{
+    env,
+    io::Write,
+    path::{Path, PathBuf},
+    process,
+};
 
 use factory_core::local::{
     LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
@@ -10,7 +15,19 @@ use factoryctl::Client;
 use uuid::Uuid;
 
 mod attach;
+mod outbox;
 mod usage;
+
+/// A session's own guidance directory, exported in every session's
+/// environment (`runner_process::SESSION_ENVIRONMENT_NAMES`) — see
+/// `docs/providers.md`'s "Sandboxed providers: the outbox".
+const AGENT_DIR_ENV: &str = "DARK_FACTORY_AGENT_DIR";
+/// Set to `1` to force the outbox fallback even when the daemon socket is
+/// reachable -- exists purely so a test can exercise the sandboxed-connect-
+/// failure path deterministically, without needing to actually break the
+/// socket's permissions. Checked only by the outbox-eligible commands
+/// (`task done`/`task blocked`/`agent message`).
+const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
 
 use attach::AttachTarget;
 
@@ -811,11 +828,86 @@ fn run() -> Result<i32, String> {
         return Ok(if is_error(&frame) { 2 } else { 0 });
     }
 
-    let frame = client
-        .request(request_for(command)?)
-        .map_err(|error| error.to_string())?;
+    let request = request_for(command)?;
+    if is_outboxable(&request) {
+        return run_outboxable(&client, request, &mut output);
+    }
+    let frame = client.request(request).map_err(|error| error.to_string())?;
     write_frame(&mut output, &frame)?;
     Ok(if is_error(&frame) { 2 } else { 0 })
+}
+
+/// The agent-facing mutations a session's own `factoryctl` calls make on
+/// itself -- `task done`, `task blocked`, `agent message` -- are the only
+/// commands that fall back to the file outbox (`outbox` module) when the
+/// daemon socket can't be reached. Every other command fails exactly as it
+/// always has: silently papering over an unreachable daemon for, say,
+/// `project add` would just hide a real operator-facing failure behind a
+/// misleading "queued" message nothing is ever going to deliver from an
+/// operator's own shell.
+fn is_outboxable(request: &LocalRequest) -> bool {
+    matches!(
+        request,
+        LocalRequest::CompleteTask { .. }
+            | LocalRequest::BlockTask { .. }
+            | LocalRequest::SendAgentMessage { .. }
+    )
+}
+
+/// Sends one outbox-eligible request, falling back to `outbox::queue` on a
+/// connect/send failure (or unconditionally when `DARK_FACTORY_FORCE_OUTBOX`
+/// is set, so a test can exercise the fallback without breaking the socket
+/// itself). See the `outbox` module and `docs/providers.md`'s "Sandboxed
+/// providers: the outbox".
+///
+/// When `$DARK_FACTORY_AGENT_DIR` is unset, this behaves exactly as it did
+/// before the outbox existed: a connect failure surfaces its original
+/// error, and (the only way to reach this without ever attempting the
+/// daemon) forcing the outbox with no agent directory to queue into is
+/// reported explicitly rather than silently doing nothing.
+fn run_outboxable(
+    client: &Client,
+    request: LocalRequest,
+    output: &mut impl Write,
+) -> Result<i32, String> {
+    let force_outbox = env::var(FORCE_OUTBOX_ENV).ok().as_deref() == Some("1");
+    if !force_outbox {
+        match client.request(request.clone()) {
+            Ok(frame) => {
+                write_frame(output, &frame)?;
+                return Ok(if is_error(&frame) { 2 } else { 0 });
+            }
+            Err(error) => {
+                return match env::var(AGENT_DIR_ENV) {
+                    Ok(agent_dir) => queue_to_outbox(&agent_dir, request, output),
+                    Err(_) => Err(error.to_string()),
+                };
+            }
+        }
+    }
+    match env::var(AGENT_DIR_ENV) {
+        Ok(agent_dir) => queue_to_outbox(&agent_dir, request, output),
+        Err(_) => Err(format!(
+            "{FORCE_OUTBOX_ENV} is set but {AGENT_DIR_ENV} is not; nowhere to queue the request"
+        )),
+    }
+}
+
+fn queue_to_outbox(
+    agent_dir: &str,
+    request: LocalRequest,
+    output: &mut impl Write,
+) -> Result<i32, String> {
+    let agent_dir = PathBuf::from(agent_dir);
+    let path = outbox::queue(&agent_dir, &request).map_err(|error| error.to_string())?;
+    let relative = path.strip_prefix(&agent_dir).unwrap_or(path.as_path());
+    writeln!(
+        output,
+        "queued: {} (delivered on the next hook)",
+        relative.display()
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(0)
 }
 
 /// Executes `factoryctl hook`: forwards one provider hook payload to the
@@ -824,7 +916,17 @@ fn run() -> Result<i32, String> {
 /// stdin, unreachable/slow/erroring daemon) it prints `{}` and always
 /// returns 0, because a stuck or erroring hook must never abort the
 /// operator's live provider session.
+///
+/// Before sending the hook itself, drains `$DARK_FACTORY_AGENT_DIR/outbox/`
+/// (a no-op when the variable is unset or the directory doesn't exist) —
+/// see the `outbox` module and `docs/providers.md`'s "Sandboxed providers:
+/// the outbox". This runs on every hook event, not just `Stop`, so a
+/// queued request is carried at the very next opportunity rather than
+/// waiting specifically for the end of a turn.
 fn run_hook(client: &Client, token_file: &str, event: ProviderHookEvent) -> i32 {
+    if let Ok(agent_dir) = env::var(AGENT_DIR_ENV) {
+        outbox::drain(client, Path::new(&agent_dir));
+    }
     let reply = hook_reply(client, token_file, event).unwrap_or_else(|| serde_json::json!({}));
     println!("{reply}");
     0
