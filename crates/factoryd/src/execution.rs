@@ -78,6 +78,17 @@ const CONNECT_GRACE: Duration = Duration::from_secs(5);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// Bounds `supervise_recovered`'s reconnect loop (this track's item 9):
+/// without this, a recovered session whose runner is permanently
+/// unreachable (its process is actually gone, but the runtime
+/// directory/socket did not classify as cleanly `Missing` -- e.g. the
+/// socket file lingers but nothing answers) retried forever at
+/// [`MAX_RECOVERY_RETRY_DELAY`], staying `starting`/whatever state it was
+/// recovered in visible forever, never durably `failed`. 10 attempts is
+/// comfortably past the point [`next_retry_delay`]'s doubling has already
+/// capped the delay at 30s (attempt 8), so this adds only ~1 extra minute
+/// of genuine retrying beyond that plateau before giving up.
+const MAX_RECOVERY_ATTEMPTS: u32 = 10;
 /// Never spawned under a startup-input deadline (terminal-mode launches
 /// carry no startup input to time out on); kept only because
 /// `runner_process::spawn_runner` requires a value.
@@ -1451,15 +1462,28 @@ async fn recover_sessions(
         let state = state.clone();
         let wake_tx = wake_tx.clone();
         let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(supervise_recovered(state, wake_tx, recovered, shutdown_rx));
+        tokio::spawn(supervise_recovered(
+            state,
+            wake_tx,
+            recovered,
+            shutdown_rx,
+            MAX_RECOVERY_ATTEMPTS,
+        ));
     }
 }
 
+/// `max_attempts` is [`MAX_RECOVERY_ATTEMPTS`] in production
+/// (`recover_sessions`, above); a parameter (not the bare constant) purely
+/// so this track's own test can drive the give-up path without waiting
+/// through the real constant's ~10 attempts (each gated by
+/// [`CONNECT_GRACE`], itself not test-configurable -- see that test's own
+/// comment).
 async fn supervise_recovered(
     state: DaemonState,
     wake_tx: mpsc::Sender<WakeAgent>,
     recovered: RecoverableSession,
     mut shutdown_rx: watch::Receiver<bool>,
+    max_attempts: u32,
 ) {
     let runtime_dir = PathBuf::from(&recovered.runner_runtime);
     let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
@@ -1471,6 +1495,7 @@ async fn supervise_recovered(
         recovered.runner_instance_id.clone(),
     );
     let mut retry_delay = RECOVERY_RETRY_DELAY;
+    let mut attempt: u32 = 0;
     loop {
         if shutdown_requested(&shutdown_rx) {
             return;
@@ -1480,7 +1505,16 @@ async fn supervise_recovered(
         {
             Ok(attach) => attach,
             Err(error) => {
+                // Same reasoning as `Attach::Unreachable`/`ExitOutcome::
+                // Reconnect` below (this track's item 9): a protocol error
+                // or a corrupt-looking runtime directory is not
+                // recoverable by retrying, but leaving the session
+                // dangling forever in whatever state it was recovered in
+                // is exactly the bug this track closes. Durably fail it
+                // (`unverifiable`, like every other "gave up" exit in this
+                // function) instead of just logging and abandoning it.
                 tracing::warn!(%error, session_id = %recovered.session_id, "recovery attach failed");
+                end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
                 return;
             }
         };
@@ -1492,6 +1526,16 @@ async fn supervise_recovered(
                 return;
             }
             Attach::Unreachable => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    tracing::warn!(
+                        session_id = %recovered.session_id,
+                        attempt,
+                        "recovered session's runner stayed unreachable; giving up"
+                    );
+                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                    return;
+                }
                 tokio::select! {
                     _ = wait_for_shutdown(&mut shutdown_rx) => return,
                     () = sleep_until(Instant::now() + retry_delay) => {}
@@ -1517,6 +1561,16 @@ async fn supervise_recovered(
             }
             ExitOutcome::Shutdown => return,
             ExitOutcome::Reconnect => {
+                attempt += 1;
+                if attempt >= max_attempts {
+                    tracing::warn!(
+                        session_id = %recovered.session_id,
+                        attempt,
+                        "recovered session's runner connection kept dropping; giving up"
+                    );
+                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                    return;
+                }
                 tokio::select! {
                     _ = wait_for_shutdown(&mut shutdown_rx) => return,
                     () = sleep_until(Instant::now() + retry_delay) => {}
@@ -1796,6 +1850,112 @@ mod tests {
         assert!(matches!(result, Err(Error::NoLiveSession)));
         handle.shutdown().await.unwrap();
         join.await.unwrap().unwrap();
+    }
+
+    /// This track's item 9: a recovered session's runner that never
+    /// becomes reachable again (a stale `control.sock` -- bound once,
+    /// then its listener dropped without unlinking the file, exactly
+    /// what a runner process's own OS-level teardown can leave behind if
+    /// it never gets the chance to run its normal cleanup) must not stay
+    /// dangling in whatever state it was recovered in forever; it must
+    /// durably fail. Drives `supervise_recovered` directly with
+    /// `max_attempts: 1` so this test only waits through one
+    /// `CONNECT_GRACE` window (~5s) instead of production's real
+    /// `MAX_RECOVERY_ATTEMPTS` -- see `supervise_recovered`'s own doc
+    /// comment for why that parameter exists at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recovered_session_whose_runner_stays_unreachable_is_durably_failed_not_left_dangling()
+     {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let runtime_dir = directory.path().join("runs").join("session-1");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&runtime_dir)
+            .unwrap();
+        let socket_path = runtime_dir.join("control.sock");
+        {
+            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+            drop(listener);
+        }
+
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    provider_session_id: None,
+                    worktree: worktree.clone(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: runner_instance_id.clone(),
+                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let recovered = crate::store::RecoverableSession {
+            session_id: session_id.clone(),
+            provider: Provider::Shell,
+            provider_session_id: None,
+            worktree,
+            runner_instance_id,
+            runner_runtime: runtime_dir.to_string_lossy().into_owned(),
+            runner_protocol_version: 1,
+            observer_health: factory_core::ObserverHealth::Unknown,
+        };
+
+        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
+
+        let sessions = state
+            .with_store(move |store| store.list_sessions(&project_id, None, 10))
+            .await
+            .unwrap();
+        let session = sessions
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .expect("the recovered session must still exist");
+        assert_eq!(session.state, SessionState::Failed);
+        assert!(!session.state.is_live());
     }
 
     #[test]
