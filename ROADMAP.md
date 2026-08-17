@@ -63,29 +63,6 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
 These were made pragmatically while landing sessions/dispatch/delivery and
 should be revisited, not silently relied on:
 
-- **Codex resume is per-agent only, not wired at all**: a fresh Codex session
-  never passes `resume <thread-id>`, because nothing yet threads the thread
-  ID Codex reports on its own `SessionStart` hook payload back into
-  `sessions.provider_session_id` (`Store::record_hook_event` only accepts
-  bounded/derived fields today, not the raw payload). Claude is unaffected —
-  it resumes off a daemon-assigned UUID it never has to learn back. See
-  CONTRIBUTING.md's "good first issues".
-- **Codex's own sandbox can block task completion**: Codex's default
-  shell-tool sandbox restricts execution to the workspace directory, which
-  blocks reaching `factoryctl`'s control socket and an agent's `memory.md`
-  (both under `$DARK_FACTORY_HOME`, outside the git worktree) — found running
-  a real Codex session manually. A Codex agent may need an explicit
-  sandbox/writable-roots policy written into its seeded `config.toml` before
-  `task done`/`task blocked` and memory-file writes reliably succeed, not
-  just get attempted by the model.
-- **Claude's permission modes don't cover Bash**: `acceptEdits` auto-approves
-  file edits but still interactively prompts for every distinct Bash
-  invocation (including `factoryctl task done` itself) with no "don't ask
-  again" persisted across turns — real friction for unattended dogfooding,
-  found in the same manual check. The three modes this system exposes
-  (`default`/`acceptEdits`/`plan`) do not include a full-bypass option;
-  whether to add one (and how to gate it) is a security-relevant product
-  decision, not just a wiring gap.
 - **A composed delivery's submitting `\r` must be a separate PTY write**,
   not concatenated onto the text: real Claude Code's paste-vs-keystroke
   heuristic otherwise absorbs it as just another inserted newline rather
@@ -102,6 +79,30 @@ should be revisited, not silently relied on:
   harness killing the daemon right after `StopSession` returns, say) will
   still orphan the runner process. `crates/factoryd/tests/sessions_e2e.rs`'s
   `cleanup_session`/`Daemon::drop` document the pattern to follow.
+- **An operator's own MCP server config can stall a Codex session
+  indefinitely in `starting`**, unrelated to `sandbox_mode`/
+  `writable_roots`: found running a real Codex session manually against an
+  operator's real, MCP-server-heavy `~/.codex/config.toml`
+  (`CodexProvider` seeds a fresh per-agent `CODEX_HOME` by copying it
+  forward). One `[mcp_servers.*]` entry needing to write somewhere outside
+  the seeded sandbox's `writable_roots` (or simply slow/unresponsive, for
+  a remote-URL server) hangs rather than erroring, and Codex's own startup
+  sequence never reaches `SessionStart` until every configured MCP server
+  either starts or times out on its own. No code fix from this track
+  covers this — it is a property of whatever the *operator's* config
+  defines, which Dark Factory intentionally does not touch beyond the
+  trust/sandbox marker blocks. Worth a `factoryctl session`-visible
+  timeout or a documented "seed from a minimal MCP-free config" option if
+  this proves common in practice.
+- **A daemon restart can recover a session that never leaves `starting`**:
+  found in the same manual check, on a session whose underlying process
+  had already exited before the restart (a `StopSession` that was still
+  in flight) — `session list` kept reporting it as live with no runner
+  process behind it, at least briefly, rather than the recovery path
+  (`execution.rs`'s `supervise_recovered`) resolving it. Not chased down
+  further within this track's scope; worth a dedicated regression test
+  for "recover a session mid-stop across a restart" if it reproduces
+  reliably.
 
 ## Product boundaries
 

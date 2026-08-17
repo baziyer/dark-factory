@@ -88,7 +88,44 @@ them into `factory_core::ProviderHookEvent` values (see
    - If your CLI can resume a prior session, use `ctx.resume` (`Some` when
      continuing that agent's last known provider-session identity) and
      validate whatever identity format your CLI requires before trusting
-     it into argv.
+     it into argv. If your CLI reports its own session/thread identity back
+     through a hook payload rather than accepting one you assign up front
+     (Codex's `SessionStart` `session_id` field is the shipped example),
+     that is a `local_api.rs`/`store.rs` concern, not this trait's — see
+     `Store::set_provider_session_id`.
+   - **Provider A1** — a session's own `factoryctl` calls (an agent's own
+     `task done`/`task blocked`, or an operator typing one directly) use a
+     bare `factoryctl`, not `ctx.factoryctl_path`: that trusted absolute
+     path is only for *generated hook commands*, which a provider's hook
+     subprocess invokes directly and so never needs `PATH` resolution for.
+     The session runner already prepends `factoryctl`'s own directory to
+     `PATH` for every terminal-mode launch
+     (`runner_process::apply_runner_environment`) — nothing a new provider
+     needs to do itself, but worth knowing if you see an agent's own
+     `factoryctl` calls fail to resolve: check that the launch actually
+     went through the terminal-mode path, not a bare-name lookup against
+     the operator's own shell configuration.
+   - If your CLI shows an interactive one-time "trust this directory"
+     prompt (both shipped providers do), pre-trust `ctx.worktree` before
+     spawning — it is a git worktree Dark Factory itself created for this
+     agent, never handed to it by an untrusted source, so the prompt can
+     never be answered by anyone but the daemon. See
+     `ClaudeProvider::pretrust_worktree`'s doc comment for the two hard
+     parts found running this manually: canonicalize the worktree path
+     first (symlinks resolved) — the CLI checks trust against its own
+     resolved `cwd`, and a key written from the raw path silently never
+     matches; and never create or overwrite the CLI's own trust-state file
+     if it does not already exist and parse as valid JSON, since that file
+     is real user state Dark Factory does not own.
+   - If your CLI has its own default-deny permission/approval prompt for
+     shell commands (Claude's native Bash approval, matched here), and the
+     product's posture for it is "the native prompt is the human-in-the-
+     loop gate" (`TRACK5-DESIGN.md` §5 — do not pass a blanket bypass
+     flag), pre-approve *only* the composed delivery's own `factoryctl`
+     calls in whatever narrow, CLI-native allowlist mechanism exists (see
+     `claude_settings_json`'s `permissions.allow`) — otherwise an agent's
+     own progress report never gets past its first Bash prompt when nobody
+     is attached to answer it.
 4. In `capabilities()`, return `hooks: true` if you wired hooks up,
    `resume: true` if step 3's resume path is real, and the permission-mode
    strings your CLI actually accepts (validated end to end, not just

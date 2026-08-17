@@ -330,18 +330,86 @@ no API keys; both real providers authenticate as subscription CLI apps:
   CLI (via `tests/fixtures/shell-agent.sh`, a POSIX-`sh` fixture that speaks
   the exact hook/`task done`/`task blocked` protocol a real session would).
 
-Two quirks found running real `claude`/`codex` sessions manually, worth
-knowing before you script against either: both CLIs show a one-time,
-interactive "do you trust this directory?" prompt on a brand-new worktree
-(Claude accepts a bare Enter for its default choice; Codex needs the digit
-key, `1`, not just Enter) — expect the session to sit in `starting` until an
-operator (or `factoryctl attach`) answers it once per worktree. And Codex's
-own OS-level sandbox restricts its shell tool calls to the workspace
-directory by default, which blocks reaching `factoryctl`'s control socket
-and the agent's `memory.md` (both live under `$DARK_FACTORY_HOME`, outside
-the git worktree) — a Codex agent may need an explicit sandbox/writable-roots
-policy in its seeded `config.toml` before `task done`/`task blocked` and
-memory-file writes actually succeed, not just get attempted.
+### Unattended operation
+
+Dark Factory pre-trusts the worktrees it creates for its own agents, so a
+brand-new agent's very first session never blocks on either CLI's one-time
+"do you trust this directory?" prompt — that worktree came from the daemon
+itself, never from an untrusted source:
+
+- **Claude**: before spawning, `ClaudeProvider::pretrust_worktree` sets
+  `projects[<canonical worktree path>].hasTrustDialogAccepted = true` in the
+  operator's real `~/.claude.json`, preserving every other key and field and
+  writing atomically. It is a no-op (logged as a warning, nothing written) if
+  `~/.claude.json` does not exist or does not parse as JSON — Dark Factory
+  never creates or overwrites a file it cannot first read and understand.
+- **Codex**: the per-agent seeded `config.toml` also carries
+  `[projects."<canonical worktree path>"] trust_level = "trusted"`,
+  rewritten idempotently in a `# --- dark-factory config BEGIN/END ---`
+  marker block alongside the hooks block.
+
+Both use the worktree's *canonicalized* path (symlinks resolved), not
+whatever string happens to be stored as the agent's worktree — found running
+a real Claude session manually with `$DARK_FACTORY_HOME` under `/tmp`,
+itself a symlink to `/private/tmp` on macOS: Claude resolves symlinks in its
+own `cwd` before checking trust, so a key written from the raw path silently
+never matched and the prompt still appeared (confirmed both ways: the
+prompt showed with the raw path, and disappeared once the key used the
+canonicalized one). Codex's `trust_level` entry is canonicalized the same
+way, proactively, for the same reason, though a real Codex session never
+got far enough to independently confirm the prompt would otherwise have
+appeared (see the sandbox caveat below).
+
+Two more unattended-dogfood fixes, alongside pre-trust:
+
+- **`factoryctl` is always resolvable inside a session.** The composed
+  delivery text tells an agent to run a plain `factoryctl task done ...` /
+  `factoryctl task blocked ...`, and the generated `claude-settings.json`
+  also pre-approves it: `"permissions": {"allow": ["Bash(factoryctl *)"]}`
+  (the exact command-prefix rule shape Claude Code's own
+  `permissions.allow` uses, `Bash(<prefix> *)`, not `Bash(<prefix>:*)`) —
+  otherwise every single `Bash` call, including the one a session makes to
+  report its own progress, stops on Claude's native permission prompt.
+  For a terminal-mode session, `factoryctl`'s own directory is also
+  prepended to `PATH` (`runner_process::apply_runner_environment`), so the
+  bare name resolves regardless of the operator's shell configuration.
+- **Codex's own sandbox can otherwise block the control socket and the
+  guidance files.** The seeded `config.toml` sets `sandbox_mode =
+  "workspace-write"` (a root-table key, kept out of any `[table]` so it is
+  never silently swallowed into the operator's own trailing
+  `[projects."..."]` entries) and, in the same marker block as the trust
+  entry, `[sandbox_workspace_write] writable_roots = [<agent's guidance
+  directory>, <directory containing $DARK_FACTORY_SOCKET>]`, `network_access
+  = false` — a Unix socket connect needs write access to the socket path
+  under the seatbelt sandbox. What manual testing against a real Codex
+  session on a real operator's `~/.codex/config.toml` (which this provider
+  copies forward) could and could not confirm: this `sandbox_mode`/
+  `writable_roots`/`network_access` combination does not block Codex's own
+  model-list/plugin-directory network calls (those happen outside the
+  sandbox, before any tool call is spawned), and the generated config still
+  parses under `codex --strict-config doctor` even against a config with
+  its own trailing `[projects...]` tables and a pre-existing `sandbox_mode`
+  of its own. What it could *not* confirm within this track's budget: a
+  real Codex session reaching `SessionStart` and completing `task done` end
+  to end on this particular machine, whose personal `~/.codex/config.toml`
+  configures several `[mcp_servers.*]` entries plus a built-in "apps"
+  directory check — the session repeatedly stalled in `starting` at
+  "Starting MCP servers", before Codex's own hooks ever fire, even after
+  disabling the user-configurable MCP servers one at a time. Whether that
+  stall is caused by `writable_roots` (an MCP server subprocess needing to
+  write somewhere outside it) or is unrelated (a slow/unresponsive
+  remote-URL server, or the built-in "apps" check, neither of which is
+  user-configurable) was not conclusively isolated. If a Codex agent sits
+  in `starting`, check its seeded `config.toml`'s `[mcp_servers.*]` entries
+  before assuming the sandbox itself is at fault, and see ROADMAP.md's
+  unresolved decisions for the open question this leaves.
+
+Codex also reports its own thread id back on its first `SessionStart` hook
+(a Claude-shaped `session_id` field); the daemon persists it
+(`Store::set_provider_session_id`) so a later session for the same agent
+resumes with `codex resume <thread-id>` instead of always starting fresh —
+mirrors Claude, whose `--session-id` the daemon assigns itself up front and
+so never has to learn back.
 
 Every hook fires `factoryctl hook --token-file PATH <Event>`: it reads the
 hook's JSON payload from stdin (bounded to 64 KiB), forwards it plus the
