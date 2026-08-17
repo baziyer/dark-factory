@@ -245,12 +245,26 @@ fn rewrite_hooks_block(
 /// per session, so this keeps them current without disturbing whatever
 /// else the operator's real `config.toml` carried forward from the
 /// one-time seed.
+///
+/// Every path is canonicalized (symlinks resolved) before use, falling
+/// back to the given path unchanged if canonicalization fails -- found
+/// manually against a real session (this track's item 6 check): both
+/// Codex's own trust check and its seatbelt sandbox's path matching
+/// operate on resolved paths, so a `$DARK_FACTORY_HOME` under a symlink
+/// (`/tmp` -> `/private/tmp` on macOS, the concrete case this was found
+/// against) would otherwise silently write entries that never match.
 fn rewrite_config_block(
     codex_home: &Path,
     agent_dir: &Path,
     socket_path: &Path,
     worktree: &Path,
 ) -> Result<(), ProviderError> {
+    let agent_dir = canonicalize_or_given(agent_dir);
+    let worktree = canonicalize_or_given(worktree);
+    let socket_directory = socket_path
+        .parent()
+        .map_or_else(|| canonicalize_or_given(socket_path), canonicalize_or_given);
+
     let config_path = codex_home.join("config.toml");
     let existing = fs::read_to_string(&config_path).map_err(|source| ProviderError::Seed {
         path: config_path.clone(),
@@ -264,7 +278,7 @@ fn rewrite_config_block(
             .trim_end()
             .to_owned();
     rewritten.push_str("\n\n");
-    rewritten.push_str(&config_block_toml(agent_dir, socket_path, worktree));
+    rewritten.push_str(&config_block_toml(&agent_dir, &socket_directory, &worktree));
     hooks::write_private_file(&config_path, rewritten.as_bytes()).map_err(|source| {
         ProviderError::Seed {
             path: config_path.clone(),
@@ -273,8 +287,11 @@ fn rewrite_config_block(
     })
 }
 
-fn config_block_toml(agent_dir: &Path, socket_path: &Path, worktree: &Path) -> String {
-    let socket_directory = socket_path.parent().unwrap_or(socket_path);
+fn canonicalize_or_given(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+}
+
+fn config_block_toml(agent_dir: &Path, socket_directory: &Path, worktree: &Path) -> String {
     let mut block = String::new();
     block.push_str(CONFIG_BEGIN_MARKER);
     block.push('\n');
@@ -348,27 +365,43 @@ fn first_table_header_offset(document: &str) -> Option<usize> {
 }
 
 /// Removes every root-table `sandbox_mode = ...` assignment from
-/// `document`'s prefix before its first table header, if any -- so
-/// [`rewrite_sandbox_mode_line`] re-inserting Dark Factory's own value can
-/// never produce a duplicate-key TOML document, regardless of what the
-/// operator's own copied-forward `config.toml` already set it to (this
-/// machine's real `~/.codex/config.toml` already has one). A `sandbox_mode`
-/// key nested inside some other table (not a real Codex config shape today)
-/// is out of scope and left untouched.
+/// `document`'s prefix before its first table header, if any, *and* every
+/// line that is exactly one of [`SANDBOX_MODE_COMMENT_AND_LINE`]'s own two
+/// explanatory comment lines -- so [`insert_root_level_line`] re-inserting
+/// Dark Factory's own value can never produce a duplicate-key TOML document
+/// (regardless of what the operator's own copied-forward `config.toml`
+/// already set it to -- this machine's real `~/.codex/config.toml` already
+/// has one), and, critically, never leaves its *own* two comment lines
+/// behind to accumulate one more copy on every single spawn. Found the hard
+/// way running this manually (this track's item 6 check): the first version
+/// of this function only matched the `key = value` line itself, not the
+/// comment above it, so `rewrite_config_block` silently grew its own
+/// `config.toml` by two duplicate comment lines on every spawn -- 73 copies
+/// after a handful of manual session restarts, before this was caught. A
+/// `sandbox_mode` key nested inside some other table (not a real Codex
+/// config shape today) is out of scope and left untouched.
 fn strip_root_level_sandbox_mode(document: &str) -> String {
     let boundary = first_table_header_offset(document).unwrap_or(document.len());
     let (root, rest) = document.split_at(boundary);
     let filtered_root: String = root
         .lines()
-        .filter(|line| {
-            line.trim_start()
-                .split_once('=')
-                .map(|(key, _)| key.trim() != "sandbox_mode")
-                .unwrap_or(true)
-        })
+        .filter(|line| !is_sandbox_mode_key_or_its_own_comment(line))
         .map(|line| format!("{line}\n"))
         .collect();
     format!("{filtered_root}{rest}")
+}
+
+fn is_sandbox_mode_key_or_its_own_comment(line: &str) -> bool {
+    let trimmed = line.trim();
+    if SANDBOX_MODE_COMMENT_AND_LINE
+        .lines()
+        .any(|constant_line| constant_line.trim() == trimmed)
+    {
+        return true;
+    }
+    line.trim_start()
+        .split_once('=')
+        .is_some_and(|(key, _)| key.trim() == "sandbox_mode")
 }
 
 /// Inserts `line` as a root-table entry: immediately before `document`'s
@@ -651,7 +684,7 @@ mod provider_tests {
     fn config_block_toml_has_the_exact_designed_shape() {
         let block = config_block_toml(
             Path::new("/abs/agent-dir"),
-            Path::new("/abs/f.sock"),
+            Path::new("/abs"),
             Path::new("/abs/worktrees/worker-1"),
         );
         assert_eq!(
@@ -688,15 +721,26 @@ mod provider_tests {
             1
         );
         assert!(contents.contains("[sandbox_workspace_write]"));
+        // Every path is canonicalized before being written (symlinks
+        // resolved -- see `rewrite_config_block`'s own doc comment for
+        // why, found manually against a real session where
+        // `$DARK_FACTORY_HOME` was under `/tmp`, itself a symlink to
+        // `/private/tmp` on macOS): compare against the same
+        // canonicalize-or-fall-back-to-given resolution the production
+        // code applies, not the raw `SpawnContext` paths, which a tempdir
+        // root under `/var/folders/...` (itself commonly a symlink to
+        // `/private/var/folders/...` on macOS) would otherwise mismatch.
         assert!(contents.contains(&format!(
             "writable_roots = [{}, {}]",
-            toml_string(&ctx.agent_dir.to_string_lossy()),
-            toml_string(&ctx.socket_path.parent().unwrap().to_string_lossy()),
+            toml_string(&canonicalize_or_given(&ctx.agent_dir).to_string_lossy()),
+            toml_string(
+                &canonicalize_or_given(ctx.socket_path.parent().unwrap()).to_string_lossy()
+            ),
         )));
         assert!(contents.contains("network_access = false"));
         assert!(contents.contains(&format!(
             "[projects.{}]",
-            toml_string(&ctx.worktree.to_string_lossy())
+            toml_string(&canonicalize_or_given(&ctx.worktree).to_string_lossy())
         )));
         assert!(contents.contains("trust_level = \"trusted\""));
         // sandbox_mode is a root-table key, positioned before every
@@ -727,6 +771,19 @@ mod provider_tests {
         assert_eq!(contents.matches("sandbox_mode = ").count(), 1);
         assert_eq!(contents.matches("[sandbox_workspace_write]").count(), 1);
         assert_eq!(contents.matches("trust_level = \"trusted\"").count(), 1);
+        // Regression: the first version of this rewrite only deduplicated
+        // the `sandbox_mode = ...` line itself, not the two explanatory
+        // comment lines above it -- those accumulated one more copy on
+        // every spawn (73 copies after a handful of manual session
+        // restarts, this track's item 6 check). Assert on the comment
+        // text directly, not just the structural TOML content, since that
+        // is exactly what the original bug's blind spot was.
+        assert_eq!(
+            contents
+                .matches("dark-factory sandbox_mode override")
+                .count(),
+            1
+        );
     }
 
     #[test]

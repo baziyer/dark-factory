@@ -160,6 +160,18 @@ impl Provider for ClaudeProvider {
 /// alongside dozens of other per-project fields (`allowedTools`,
 /// `lastSessionId`, ...) this must not disturb.
 ///
+/// `worktree` is canonicalized (symlinks resolved) before use as the key --
+/// found manually against a real session (this track's item 6 check, not
+/// hypothetical): Claude Code itself resolves symlinks in its own working
+/// directory before checking trust (observed as `/private/tmp/...` in a
+/// session's retained terminal output when `$DARK_FACTORY_HOME` was
+/// `/tmp/...`, `/tmp` being a symlink to `/private/tmp` on macOS), so a
+/// key written from the raw, un-resolved path silently never matches and
+/// the trust prompt still appears. Falls back to the given path unchanged
+/// if canonicalization fails (the directory should always exist by spawn
+/// time, since a worktree is provisioned before any session is spawned for
+/// it, but this must not turn a filesystem hiccup into a spawn failure).
+///
 /// Best-effort and read-mostly, by design: if `home/.claude.json` does not
 /// exist, is not readable, or does not parse as a JSON object, this logs a
 /// warning and returns without writing anything at all -- it never creates
@@ -175,10 +187,12 @@ impl Provider for ClaudeProvider {
 /// function only ever edits a file that already exists at whatever mode
 /// the operator's own Claude Code installation created it at.
 pub fn pretrust_worktree(worktree: &Path, home: &Path) {
+    let canonical_worktree =
+        std::fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_owned());
     let path = home.join(".claude.json");
-    if let Err(reason) = try_pretrust_worktree(worktree, &path) {
+    if let Err(reason) = try_pretrust_worktree(&canonical_worktree, &path) {
         tracing::warn!(
-            worktree = %worktree.display(),
+            worktree = %canonical_worktree.display(),
             path = %path.display(),
             %reason,
             "could not pre-trust worktree in ~/.claude.json"
@@ -549,6 +563,35 @@ mod provider_tests {
 
             let metadata = std::fs::metadata(&path).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        }
+
+        #[test]
+        fn a_symlinked_worktree_is_trusted_under_its_resolved_real_path() {
+            // Found manually against a real session (this track's item 6
+            // check): Claude Code itself resolves symlinks in its cwd
+            // before checking trust, so the key must be the canonical
+            // path, not whatever string the daemon happened to pass in
+            // (e.g. `$DARK_FACTORY_HOME` under `/tmp`, itself a symlink to
+            // `/private/tmp` on macOS).
+            let home = tempfile::tempdir().unwrap();
+            write_fake_claude_json(home.path(), r#"{"projects": {}}"#);
+            let real_worktree = home.path().join("real-worktree");
+            std::fs::create_dir(&real_worktree).unwrap();
+            let symlinked_worktree = home.path().join("worktree-symlink");
+            std::os::unix::fs::symlink(&real_worktree, &symlinked_worktree).unwrap();
+
+            pretrust_worktree(&symlinked_worktree, home.path());
+
+            let document = read_claude_json(home.path());
+            let canonical = std::fs::canonicalize(&real_worktree).unwrap();
+            let projects = document["projects"].as_object().unwrap();
+            assert_eq!(
+                projects[&canonical.to_string_lossy().into_owned()]["hasTrustDialogAccepted"],
+                true
+            );
+            // Never the un-resolved symlink path -- that key would not
+            // match what Claude Code itself checks.
+            assert!(!projects.contains_key(&symlinked_worktree.to_string_lossy().into_owned()));
         }
 
         #[test]
