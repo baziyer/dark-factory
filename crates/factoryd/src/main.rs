@@ -296,6 +296,10 @@ fn parse_arguments(
                 );
                 std::process::exit(0);
             }
+            Some("--version" | "-V") => {
+                println!("factoryd {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             _ => return Err(format!("unknown argument: {}", argument.to_string_lossy())),
         }
     }

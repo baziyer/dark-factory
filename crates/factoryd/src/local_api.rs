@@ -558,6 +558,7 @@ async fn handle_request(
         LocalRequest::Health => Ok(LocalResponse::Health {
             runner_path: execution.runner_program().to_string_lossy().into_owned(),
             factoryctl_path: execution.factoryctl_path().to_string_lossy().into_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
         }),
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
