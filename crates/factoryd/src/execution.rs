@@ -1554,6 +1554,10 @@ async fn spawn_session_for_agent(
         }
     };
 
+    if agent.snapshot.provider == Provider::Codex {
+        synthesize_codex_session_start(state, wake_tx, project_id, agent_id, &session_id).await;
+    }
+
     tokio::spawn(supervise_child(
         state.clone(),
         wake_tx.clone(),
@@ -1564,6 +1568,73 @@ async fn spawn_session_for_agent(
         child,
     ));
     Ok(snapshot)
+}
+
+/// Codex 0.147 does not fire its own `SessionStart` hook at TUI/process
+/// startup, even with `source: "startup"` and
+/// `--dangerously-bypass-hook-trust` passed: confirmed live (2 of 2 real
+/// dogfood sessions sat in `starting` indefinitely, unblocked only by an
+/// operator manually posting the session's own `SessionStart` hook by
+/// hand) and empirically (a throwaway `CODEX_HOME` with only a
+/// `SessionStart` hook produced zero invocations while idling at Codex's
+/// own ready-to-type prompt; the identical hook fired exactly once, tagged
+/// `"source":"startup"`, only once a prompt was actually submitted -- see
+/// `docs/providers.md`). Codex defers session/thread creation, and
+/// therefore hook dispatch, to the first turn, not process launch.
+///
+/// That collides with this dispatcher's own invariant: nothing is ever
+/// PTY-typed into a session that is not already `Idle`
+/// (`Handle::start_task`, `dispatch_agent`), and a session only reaches
+/// `Idle` via a `SessionStart` hook (`Store::record_hook_event`). Left
+/// alone, a fresh Codex session deadlocks forever -- Codex waits for a
+/// typed prompt to begin the turn that would fire `SessionStart`; the
+/// daemon waits for `SessionStart` before typing anything.
+///
+/// This synthesizes that exact transition automatically, immediately once
+/// the provider process is confirmed spawned: the same
+/// `record_hook_event(SessionStart)` call a real hook POST would make, run
+/// directly against the store instead of arriving over the control socket.
+/// It does not read or wait on any terminal output -- PTY input is
+/// kernel-buffered, so composing and typing a delivery before Codex's own
+/// read loop starts is safe, exactly as safe as the operator's manual nudge
+/// already proved live. If Codex's own real (once-delayed)
+/// `SessionStart(source=startup)` arrives later anyway -- e.g. after the
+/// first turn it caused -- it is a harmless no-op here:
+/// `record_hook_event`'s `SessionStart` arm only transitions a session that
+/// is still `Starting`, and `local_api.rs`'s `set_provider_session_id` call
+/// is already idempotent once a provider session id is set.
+///
+/// Best-effort like [`Handle::wake`]: a store error here leaves the session
+/// `starting` (recoverable the moment a real hook -- or another wake --
+/// eventually lands) rather than unwinding an already-running provider
+/// process that cannot be un-spawned.
+async fn synthesize_codex_session_start(
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+) {
+    let Ok(hook_at_ms) = now_ms() else {
+        return;
+    };
+    let hook_session_id = session_id.clone();
+    let result = state
+        .commit_and_publish(move |store| {
+            let (_, event) = store.record_hook_event(
+                &hook_session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                hook_at_ms,
+            )?;
+            Ok(((), vec![event]))
+        })
+        .await;
+    if result.is_ok() {
+        send_wake(wake_tx, project_id.clone(), agent_id.clone());
+    }
 }
 
 fn split_provider_environment(

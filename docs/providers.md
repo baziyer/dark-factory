@@ -185,6 +185,71 @@ seeded home (or Codex's own writes back into it) is never clobbered by a
 later filter pass. See `operator_config_is_filtered_to_the_documented_allow_list_at_seed`
 in `codex.rs`'s test module for the fixture-driven proof.
 
+## Codex: `SessionStart` never fires at TUI startup, so the daemon synthesizes it
+
+Codex 0.147's TUI does not dispatch the `SessionStart` hook — not even with
+`source: "startup"`, and not because of hook trust/review (see below) — at
+process launch. It defers session/thread creation, and therefore hook
+dispatch, to the first turn: confirmed live (2 of 2 real dogfood sessions
+sat in `starting` indefinitely, 2 and 1 minutes observed, unblocked only by
+an operator manually posting the session's own `SessionStart` hook by
+hand — `printf '{}' | factoryctl hook --token-file
+$DARK_FACTORY_HOME/runs/<session>/hook.token SessionStart`) and empirically
+(a throwaway `CODEX_HOME` with only a `SessionStart` hook produced zero
+invocations across a much longer unbounded idle window while sitting at
+Codex's own ready-to-type prompt; the identical hook fired exactly once,
+tagged `"source":"startup"`, only once a prompt was actually submitted —
+its command ran and its payload was captured, proving the hook's own
+plumbing works, just not at the time its own `source` value claims). A real
+dogfood rollout's own `session_meta`/`task_started` pair (the earliest
+evidence Codex has an actual session object at all) appear together several
+minutes after process launch, exactly at the moment delivery finally
+happened — never at launch.
+
+Ruled out along the way, with evidence: **hook trust/review** —
+`--dangerously-bypass-hook-trust` is confirmed to skip Codex's own startup
+review modal entirely (its own banner reads `` `--dangerously-bypass-hook-
+trust` is enabled. Enabled hooks may run without review for this
+invocation.``; no `[hooks.state]` entries are ever written for a bypassed
+session, and no review modal (`tui/src/startup_hooks_review.rs`'s own
+"Hooks need review"/"Trust all and continue" flow) ever rendered in either
+experiment) — hooks besides `SessionStart` fire completely normally once a
+turn is underway, so trust is not the blocker. **Config format** —
+`config.toml`'s `[[hooks.SessionStart]]` shape is confirmed to work at all
+(the same hook fired, tagged `startup`, once a turn began), so a
+`.codex/hooks.json`-style file would not change the timing, only the
+source. **A `matcher`** — nothing in the working config uses one, and nothing
+in Codex's own source strings ties `SessionStart`'s dispatch timing to it.
+
+This collides with an invariant `crates/factoryd/src/execution.rs`'s
+dispatcher already has: nothing is ever PTY-typed into a session that is
+not already `idle` (`Handle::start_task`, the dispatcher tick), and a
+session only reaches `idle` via a `SessionStart` hook
+(`Store::record_hook_event`). Left to Codex alone, every fresh Codex
+session deadlocks forever — Codex waits for a typed prompt to begin the
+turn that would fire `SessionStart`; the daemon waits for `SessionStart`
+before typing anything.
+
+The fix (`synthesize_codex_session_start`, `execution.rs`) is the smallest
+daemon-side handshake that does not read any terminal output: once a
+Codex agent's provider process is confirmed spawned, the daemon calls the
+exact same `record_hook_event(SessionStart)` a real hook POST would make,
+directly against the store, and wakes the dispatcher — automating exactly
+what the operator's manual nudge did live, with the identical proven-safe
+result (every later hook fires normally afterward). Writing to the PTY
+before Codex's own read loop starts is safe regardless of timing: PTY
+input is kernel-buffered, not read-loop-gated. If Codex's own real (once-
+delayed) `SessionStart(source=startup)` arrives later anyway — which it
+does, after the first turn it caused — it is a harmless no-op:
+`record_hook_event`'s `SessionStart` arm only transitions a session still
+`starting`, and `set_provider_session_id` (`local_api.rs`) is already
+idempotent once a provider session id is set. This is Codex-only
+(`agent.snapshot.provider == Provider::Codex`); no other provider needs it.
+
+No config on the Dark Factory side can fix this — it is Codex's own
+session-lifecycle timing, not a hooks-table or trust-state shape a
+generated `config.toml` controls.
+
 ## Sandboxed providers: the outbox
 
 A provider's *hooks* (`SessionStart`/`UserPromptSubmit`/.../`Stop`) always
