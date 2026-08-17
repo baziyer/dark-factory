@@ -579,3 +579,87 @@ async fn cancelling_next_item_preserves_an_already_consumed_partial_frame() {
     drop(subscription);
     server.await.unwrap();
 }
+
+fn raw_unknown_event(sequence: i64) -> Vec<u8> {
+    let json = serde_json::json!({
+        "type": "event",
+        "data": {
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "event": {
+                "protocol_version": RUNNER_PROTOCOL_VERSION,
+                "sequence": sequence,
+                "occurred_at_ms": 1_000 + sequence,
+                "event": {"type": "some_future_event_a_newer_runner_added"}
+            }
+        }
+    });
+    let mut bytes = serde_json::to_vec(&json).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+/// Adversarial re-review, round 2, finding A: the consumer-side half of the
+/// wire proof `factory-core/tests/runner_protocol.rs`'s
+/// `a_dataless_unrecognized_future_event_type_deserializes_to_unknown_not_a_parse_failure`
+/// covers in isolation. An event this build's `RunnerEvent` enum has no
+/// name for -- standing in for a future variant a newer runner sends to
+/// this (older) daemon -- must not abandon the control stream: it
+/// deserializes to `RunnerEvent::Unknown` and the very next frame, a real
+/// `Exited`, must still be delivered normally. Before the `Unknown`
+/// catch-all existed, the unrecognized frame failed `read_frame` outright
+/// (`RunnerClientError::InvalidJson`) and `next_item` never got far enough
+/// to see the `Exited` event at all -- which is exactly the shape that let
+/// `wait_for_runner_exit`/`consume_until_exit` (`crates/factoryd/src/
+/// execution.rs`) return before `client.acknowledge_exit(...)`, orphaning
+/// the runner (issue #26's shape).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_break_a_later_exit()
+{
+    let fake = fake_runner(vec![vec![
+        encoded(hello(2, Some(2))),
+        raw_unknown_event(1),
+        encoded(event(
+            2,
+            RunnerEvent::Exited {
+                exit_code: Some(0),
+                signal: None,
+            },
+        )),
+    ]])
+    .await;
+
+    let mut subscription = client(&fake.runtime_dir).subscribe().await.unwrap();
+    let first = subscription.next_item().await.unwrap();
+    assert!(
+        matches!(
+            first,
+            RunnerStreamItem::Event(RunnerEventEnvelope {
+                sequence: 1,
+                event: RunnerEvent::Unknown,
+                ..
+            })
+        ),
+        "expected an Unknown event at sequence 1, got {first:?}"
+    );
+
+    let second = subscription.next_item().await.unwrap();
+    assert!(
+        matches!(
+            second,
+            RunnerStreamItem::Event(RunnerEventEnvelope {
+                sequence: 2,
+                event: RunnerEvent::Exited {
+                    exit_code: Some(0),
+                    signal: None,
+                },
+                ..
+            })
+        ),
+        "the real Exited event immediately after an unrecognized one must \
+         still parse and be reachable -- not abandoning the stream is the \
+         whole point, got {second:?}"
+    );
+
+    drop(subscription);
+    assert_subscribe_request(fake).await;
+}

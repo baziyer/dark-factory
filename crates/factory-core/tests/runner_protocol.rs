@@ -165,6 +165,12 @@ fn event_frames_freeze_started_output_and_exited_shapes() {
             }),
         ),
         (
+            RunnerEvent::TerminalRawTimedOut,
+            serde_json::json!({
+                "type": "terminal_raw_timed_out"
+            }),
+        ),
+        (
             RunnerEvent::Exited {
                 exit_code: Some(0),
                 signal: None,
@@ -209,6 +215,112 @@ fn event_frames_freeze_started_output_and_exited_shapes() {
         assert_eq!(frame.protocol_version(), RUNNER_PROTOCOL_VERSION);
         assert_eq!(serde_json::from_value::<RunnerFrame>(value).unwrap(), frame);
     }
+}
+
+/// Adversarial re-review, round 2, finding A: proves the compatibility
+/// claim `RunnerEvent::Unknown`'s own doc comment makes is actually true
+/// for a dataless event (exactly `TerminalRaw`'s own shape, the only kind
+/// of future variant this catch-all fully protects against -- see
+/// `RunnerEvent::Unknown`'s own doc comment for the narrower, honest
+/// version of this guarantee). A `type` this build's enum does not have a
+/// name for -- standing in for a future variant a newer runner sends to an
+/// older daemon -- must deserialize into `Unknown`, not fail the frame,
+/// and a normal `Exited` event immediately after it must still parse and
+/// carry its own real data: an unrecognized event must never desync or
+/// poison the rest of the stream, which is the exact failure this
+/// catch-all exists to close (a daemon that abandoned the connection on
+/// the unrecognized frame would never reach this `Exited` event at all,
+/// orphaning the runner -- `crates/factoryd/tests/runner_client.rs`'s
+/// `an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_break_a_later_exit`
+/// covers that consumer-side half end to end).
+#[test]
+fn a_dataless_unrecognized_future_event_type_deserializes_to_unknown_not_a_parse_failure() {
+    let unknown_event_json = serde_json::json!({
+        "type": "some_future_event_a_newer_runner_added"
+    });
+    let event: RunnerEvent = serde_json::from_value(unknown_event_json).unwrap();
+    assert_eq!(event, RunnerEvent::Unknown);
+
+    // The same shape, wrapped in a full envelope and frame exactly as it
+    // would arrive on the wire, still parses -- proving the catch-all
+    // works through the same `tag`/`content` adjacently tagged shape
+    // every other variant uses, not just in isolation.
+    let unknown_frame_json = serde_json::json!({
+        "type": "event",
+        "data": {
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "event": {
+                "protocol_version": RUNNER_PROTOCOL_VERSION,
+                "sequence": 7,
+                "occurred_at_ms": 1_723_000_000_000_i64,
+                "event": {"type": "some_future_event_a_newer_runner_added"}
+            }
+        }
+    });
+    let frame: RunnerFrame = serde_json::from_value(unknown_frame_json).unwrap();
+    assert_eq!(
+        frame,
+        RunnerFrame::Event {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            event: RunnerEventEnvelope {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                sequence: 7,
+                occurred_at_ms: 1_723_000_000_000,
+                event: RunnerEvent::Unknown,
+            },
+        }
+    );
+
+    // And a real `Exited` frame immediately after an unknown one parses
+    // exactly as if the unknown frame had never been there.
+    let exited_frame_json = serde_json::json!({
+        "type": "event",
+        "data": {
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "event": {
+                "protocol_version": RUNNER_PROTOCOL_VERSION,
+                "sequence": 8,
+                "occurred_at_ms": 1_723_000_000_001_i64,
+                "event": {"type": "exited", "data": {"exit_code": 0, "signal": null}}
+            }
+        }
+    });
+    let frame: RunnerFrame = serde_json::from_value(exited_frame_json).unwrap();
+    assert!(matches!(
+        frame,
+        RunnerFrame::Event {
+            event: RunnerEventEnvelope {
+                sequence: 8,
+                event: RunnerEvent::Exited {
+                    exit_code: Some(0),
+                    signal: None,
+                },
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+/// The honest boundary of `RunnerEvent::Unknown`'s own doc comment: a
+/// future variant whose payload carries `data` is *not* caught by
+/// `#[serde(other)]` on a unit variant -- serde requires that attribute on
+/// a unit variant, which can only ever match an absent or `null` payload.
+/// This is a regression guard on the documented limitation itself, not a
+/// gap being papered over: if this test ever starts failing (a future
+/// serde version relaxes the unit-variant requirement, say), the doc
+/// comment's caveat needs revisiting, not just this assertion.
+#[test]
+fn an_unrecognized_future_event_type_carrying_data_still_fails_a_documented_limitation() {
+    let unknown_event_with_data_json = serde_json::json!({
+        "type": "some_future_event_with_a_payload",
+        "data": {"whatever": "a newer build put here"}
+    });
+    assert!(
+        serde_json::from_value::<RunnerEvent>(unknown_event_with_data_json).is_err(),
+        "a data-bearing unknown variant is not caught by #[serde(other)] on a unit \
+         variant -- see RunnerEvent::Unknown's own doc comment"
+    );
 }
 
 #[test]
