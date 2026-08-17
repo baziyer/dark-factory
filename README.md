@@ -51,19 +51,28 @@ messages.
 
 ## Install
 
-Binary-only, macOS arm64: download the latest
-`dark-factory-<tag>-aarch64-apple-darwin.tar.gz` from
-[GitHub Releases](https://github.com/baziyer/dark-factory/releases), unpack
-it anywhere, and run its `factoryctl init`. From source: `cargo build
---release --workspace && target/release/factoryctl init`. Either way `init`
-creates `~/.dark-factory` (`0700`), copies the four binaries next to that
+Binary-only, macOS arm64 (fetch with `curl -L`, not a browser download —
+the binaries are unsigned, and a browser adds a quarantine flag Gatekeeper
+would then act on when launchd starts `factoryd`; if you did use one, `xattr
+-dr com.apple.quarantine <dir>` clears it):
+
+```sh
+curl -L -o dark-factory.tar.gz \
+  https://github.com/baziyer/dark-factory/releases/latest/download/dark-factory-<tag>-aarch64-apple-darwin.tar.gz
+mkdir dark-factory && tar -xzf dark-factory.tar.gz -C dark-factory
+./dark-factory/factoryctl init
+```
+
+From source: `cargo build --release --workspace &&
+target/release/factoryctl init`. Either way `init` creates
+`~/.dark-factory` (`0700`), copies the four binaries next to that
 `factoryctl` into `~/.dark-factory/bin/<version>/` and points `bin/current`
-at them, reports whether `claude`/`codex`/`git` resolve, explains the two
-things it writes outside its home (the launchd job, and per-worktree
-pre-trust entries in `~/.claude.json`) and asks before continuing, then
-loads the launchd job and waits for the daemon. Put
-`~/.dark-factory/bin/current` on your `PATH`; `factoryctl doctor` checks
-everything read-only, one line per check.
+at them, reports whether `claude`/`codex`/`git` resolve, states what it
+writes outside its home (the launchd job; per-worktree pre-trust entries in
+`~/.claude.json`; an `agent/<id>` branch per agent in each project's own
+repository) and asks before touching launchd, then loads the job and waits
+for the daemon. Put `~/.dark-factory/bin/current` on your `PATH`;
+`factoryctl doctor` checks everything read-only, one line per check.
 
 ## Quickstart
 

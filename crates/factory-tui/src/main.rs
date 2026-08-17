@@ -177,8 +177,15 @@ fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<NetMsg>();
     net::spawn_fleet_session(client.clone(), tx.clone());
-    // `--project` wins; otherwise open on whatever was focused last time.
-    let initial_project = cli_project.or_else(client_state::load_focused_project);
+    // `--project` wins; otherwise open on whatever was focused last time — but only for the
+    // daemon `$DARK_FACTORY_HOME` names: an explicit `--socket` may be a scratch daemon, whose
+    // projects must not overwrite (or be seeded from) the real home's remembered focus.
+    let remember_focus = config.socket.is_none();
+    let initial_project = cli_project.or_else(|| {
+        remember_focus
+            .then(client_state::load_focused_project)
+            .flatten()
+    });
 
     let mut board = Board::new(config.dev_local_pty, now_ms(), config.theme);
     let mut panes: PaneMap = HashMap::new();
@@ -191,6 +198,7 @@ fn main() -> anyhow::Result<()> {
         &tx,
         &rx,
         initial_project,
+        remember_focus,
         &mut panes,
         config.debug_log.as_deref(),
     )?;
@@ -211,6 +219,7 @@ fn run(
     tx: &mpsc::Sender<NetMsg>,
     rx: &mpsc::Receiver<NetMsg>,
     initial_project: Option<factory_core::ProjectId>,
+    remember_focus: bool,
     panes: &mut PaneMap,
     debug_log: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
@@ -271,7 +280,7 @@ fn run(
             }
         }
 
-        if board.focused_project != remembered_project {
+        if remember_focus && board.focused_project != remembered_project {
             remembered_project.clone_from(&board.focused_project);
             if let Some(project_id) = &remembered_project {
                 client_state::save_focused_project(project_id);

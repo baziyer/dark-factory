@@ -210,17 +210,24 @@ itself.
 ### Operator install and doctor
 
 `factoryctl init` is the guided install (README, "Install"): home
-directory, this build's binaries as `bin/<version>` + `current`, a probe of
-`claude`/`codex`/`git`, an explicit consent step for the writes outside
-the home, then the launchd job rendered with a `PATH` that can find those
-CLIs, loaded, and the daemon awaited. `factoryctl doctor [--json]` runs
-the same probes read-only plus the daemon (reachable? same version as the
-binaries?), the launchd job (installed, loaded, `PATH` covers the
+directory (a symlink is refused, as the daemon refuses it), this build's
+binaries as `bin/<version>` + `current` (a different build under the same
+version is refused, never overwritten), a probe of `claude`/`codex`/`git`,
+the disclosure of what is written outside the home and a consent step
+before launchd is touched, a refusal to race a hand-started daemon on the
+same socket, then the launchd job rendered with a `PATH` that can find
+those CLIs (an existing job keeps its arguments and environment and gets
+its `PATH` repaired), loaded, and the daemon awaited *with this version*.
+`factoryctl doctor [--json]` runs the same probes read-only plus the daemon
+(reachable? same version as the binaries?), the launchd job (installed,
+loaded, `PATH` — launchd's default when the job sets none — covers the
 providers?), `~/.claude.json` for worktree pre-trust, every project's root
-and stale worktree directories, and the cached update check; one line per
-check, exit 1 on any failure. `init` and `doctor` share those probes and
-`update --install` shares `init`'s launchd step, so the three commands
-cannot disagree about what a healthy install looks like.
+and stale worktree directories, and the cached update check (which may
+fetch, at most hourly); one line per check, exit 1 on any failure. `init`,
+`doctor`, and `update --install` share one set of probes
+(`crates/factoryctl/src/probes.rs`) and one launchd path
+(`launchd::apply`), so they cannot disagree about what a healthy install
+looks like.
 
 ## Task list for whoever picks this up
 
