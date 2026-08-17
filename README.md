@@ -49,6 +49,22 @@ task delivery, editable by the operator or the agent itself. SQLite is the
 durable ledger for everything else: projects, agents, tasks, runs, events,
 messages.
 
+## Install
+
+Binary-only, macOS arm64: download the latest
+`dark-factory-<tag>-aarch64-apple-darwin.tar.gz` from
+[GitHub Releases](https://github.com/baziyer/dark-factory/releases), unpack
+it anywhere, and run its `factoryctl init`. From source: `cargo build
+--release --workspace && target/release/factoryctl init`. Either way `init`
+creates `~/.dark-factory` (`0700`), copies the four binaries next to that
+`factoryctl` into `~/.dark-factory/bin/<version>/` and points `bin/current`
+at them, reports whether `claude`/`codex`/`git` resolve, explains the two
+things it writes outside its home (the launchd job, and per-worktree
+pre-trust entries in `~/.claude.json`) and asks before continuing, then
+loads the launchd job and waits for the daemon. Put
+`~/.dark-factory/bin/current` on your `PATH`; `factoryctl doctor` checks
+everything read-only, one line per check.
+
 ## Quickstart
 
 ```sh
@@ -56,7 +72,7 @@ cargo build --workspace          # factoryd resolves factory-runner/factoryctl
                                   # as siblings of its own executable, not
                                   # compile-time deps -- build the workspace once
 
-cargo run -p factoryd &           # Terminal 1 (or install the launchd service, below)
+cargo run -p factoryd &           # Terminal 1 (or `factoryctl init`, above)
 
 cargo run -p factoryctl -- project add --id demo --name Demo --root "$PWD"
 cargo run -p factoryctl -- agent add --id worker-1 --project demo \
@@ -88,6 +104,7 @@ identity.
 | Group | Actions |
 |---|---|
 | `health`, `usage` | check the daemon; probe Codex subscription headroom on demand |
+| `init`, `doctor`, `update`, `version` | guided install; read-only checks; check/install a newer release; print the version |
 | `project` | `add` `list` `delete` `get` `guidance set` |
 | `task` | `add` `list` `get` `start` `retry` `assign` `cancel` `update` `delete` `done` `blocked` |
 | `agent` | `add` `list` `delete` `get` `profile set` `message` `inbox` `pause` `resume` |
@@ -116,6 +133,7 @@ tasks and agent hierarchy) → TERMINALS (tiled live PTYs) → FOCUS
 | `[`/`]` | FORTRESS: cycle the selected workshop |
 | `n` | new task |
 | `m` / `o` | message the selected agent / the orchestrator |
+| `p` | focus a project from a list (remembered for next time; `--project` overrides) |
 | `x` | stop the selected agent (2-press confirm) |
 | `g` / `G` | jump to (and `G`: focus) the next agent needing attention |
 | `!` | WORKSHOP: needs-attention-only filter |
@@ -139,6 +157,7 @@ $DARK_FACTORY_HOME/
   logs/                               # the launchd job's stdout/stderr
   bin/<version>/, bin/current         # installed releases; `current` is what launchd runs
   update-check.json                   # cached result of the last release-manifest check
+  factory-tui.json                    # the board's last focused project
   projects/<project_id>/PROJECT.md
   projects/<project_id>/agents/<agent_id>/instructions.md
   projects/<project_id>/agents/<agent_id>/memory.md

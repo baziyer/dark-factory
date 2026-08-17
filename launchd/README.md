@@ -26,12 +26,12 @@ dirname "$(command -v claude)"
 dirname "$(command -v codex)"
 ```
 
-`factoryctl update --install` rewrites and reloads an existing job from
-this exact template (and `factoryctl init`, once it exists, creates it). To
-create one by hand, render the three placeholders — `__PROGRAM_ARGUMENTS__`
-(one `<string>` per argument, the first being the absolute path to
-`factoryd`; the daemon finds `factory-runner`/`factoryctl` as its own
-siblings and every path under `$DARK_FACTORY_HOME` by default),
+`factoryctl init` creates this job and `factoryctl update --install`
+rewrites and reloads an existing one, both from this exact template. To
+create one by hand instead, render the three placeholders —
+`__PROGRAM_ARGUMENTS__` (one `<string>` per argument, the first being the
+absolute path to `factoryd`; the daemon finds `factory-runner`/`factoryctl`
+as its own siblings and every path under `$DARK_FACTORY_HOME` by default),
 `__ENVIRONMENT__` (`<key>`/`<string>` pairs; at least `PATH` and
 `DARK_FACTORY_HOME`), and `__DARK_FACTORY_HOME__` — then install the result
 in `~/Library/LaunchAgents`:

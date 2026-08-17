@@ -71,10 +71,10 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
 
 ## Later: distribution
 
-- Releases, `factoryctl update [--install]`, and the in-terminal update
-  signal exist (see [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md));
-  `factoryctl init`/`doctor` are next, then a Homebrew tap and an npm
-  wrapper over the same release assets.
+- Releases, `factoryctl update [--install]`, `factoryctl init`/`doctor`,
+  and the in-terminal update signal exist (see
+  [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md)); next a
+  Homebrew tap and an npm wrapper over the same release assets.
 
 ## Product boundaries
 
