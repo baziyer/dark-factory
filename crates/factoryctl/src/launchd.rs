@@ -2,8 +2,8 @@
 //! `launchd/com.dark-factory.factoryd.plist.template` (embedded here so a
 //! binary-only install never needs the repository).
 //!
-//! `factoryctl update --install` (and, once it exists, `factoryctl init`)
-//! own this file through [`apply`]: read whatever job is there, keep its
+//! `factoryctl init` and `factoryctl update --install` own this file
+//! through [`apply`]: read whatever job is there, keep its
 //! extra daemon arguments and environment, make sure its `PATH` can find
 //! the provider CLIs, point it at `bin/current/factoryd`, write it at
 //! `0600`, and reload it. A reload restarts only the daemon — every

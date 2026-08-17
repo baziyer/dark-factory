@@ -57,11 +57,15 @@ would then act on when launchd starts `factoryd`; if you did use one, `xattr
 -dr com.apple.quarantine <dir>` clears it):
 
 ```sh
-curl -L -o dark-factory.tar.gz \
-  https://github.com/baziyer/dark-factory/releases/latest/download/dark-factory-<tag>-aarch64-apple-darwin.tar.gz
+# latest.json names the newest release's asset for this platform
+curl -fsSL https://github.com/baziyer/dark-factory/releases/latest/download/latest.json
+curl -L -o dark-factory.tar.gz "<the assets.aarch64-apple-darwin.url it printed>"
 mkdir dark-factory && tar -xzf dark-factory.tar.gz -C dark-factory
 ./dark-factory/factoryctl init
 ```
+
+(Those URLs answer once the repository is public; until then only a
+source build works.)
 
 From source: `cargo build --release --workspace &&
 target/release/factoryctl init`. Either way `init` creates
