@@ -17,8 +17,6 @@ struct Config {
     socket: PathBuf,
     runner: PathBuf,
     factoryctl: PathBuf,
-    codex: PathBuf,
-    claude: PathBuf,
     runtime_root: PathBuf,
     /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
     /// `factory_core::paths`).
@@ -230,8 +228,6 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
             .unwrap_or_else(|| home.join("f.sock")),
         runner,
         factoryctl,
-        codex: PathBuf::from("codex"),
-        claude: PathBuf::from("claude"),
         runtime_root: home.join("runs"),
         guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
@@ -275,12 +271,6 @@ fn parse_arguments(
             Some("--factoryctl") => {
                 config.factoryctl = next_path(&mut arguments, "--factoryctl")?;
             }
-            Some("--codex") => {
-                config.codex = next_path(&mut arguments, "--codex")?;
-            }
-            Some("--claude") => {
-                config.claude = next_path(&mut arguments, "--claude")?;
-            }
             Some("--runtime-root") => {
                 config.runtime_root = next_path(&mut arguments, "--runtime-root")?;
             }
@@ -302,7 +292,7 @@ fn parse_arguments(
             }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--codex PATH] [--claude PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
                 );
                 std::process::exit(0);
             }
@@ -364,8 +354,6 @@ mod tests {
             socket: PathBuf::from("/state/f.sock"),
             runner: PathBuf::from("/bin/factory-runner"),
             factoryctl: PathBuf::from("/bin/factoryctl"),
-            codex: PathBuf::from("codex"),
-            claude: PathBuf::from("claude"),
             runtime_root: PathBuf::from("/state/runs"),
             guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
@@ -390,10 +378,6 @@ mod tests {
                 "/opt/dark-factory/factory-runner",
                 "--factoryctl",
                 "/opt/dark-factory/factoryctl",
-                "--codex",
-                "/opt/codex",
-                "--claude",
-                "/opt/claude",
                 "--runtime-root",
                 "/private/runs",
                 "--max-active-runs",
@@ -409,8 +393,6 @@ mod tests {
             parsed.factoryctl,
             PathBuf::from("/opt/dark-factory/factoryctl")
         );
-        assert_eq!(parsed.codex, PathBuf::from("/opt/codex"));
-        assert_eq!(parsed.claude, PathBuf::from("/opt/claude"));
         assert_eq!(parsed.runtime_root, PathBuf::from("/private/runs"));
         assert_eq!(parsed.max_active_runs, 2);
         assert!(parsed.webhook_config.is_none());
