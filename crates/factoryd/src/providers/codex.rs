@@ -383,12 +383,15 @@ fn first_table_header_offset(document: &str) -> Option<usize> {
 fn strip_root_level_sandbox_mode(document: &str) -> String {
     let boundary = first_table_header_offset(document).unwrap_or(document.len());
     let (root, rest) = document.split_at(boundary);
-    let filtered_root: String = root
-        .lines()
-        .filter(|line| !is_sandbox_mode_key_or_its_own_comment(line))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    format!("{filtered_root}{rest}")
+    let mut filtered_root = String::with_capacity(root.len());
+    for line in root.lines() {
+        if !is_sandbox_mode_key_or_its_own_comment(line) {
+            filtered_root.push_str(line);
+            filtered_root.push('\n');
+        }
+    }
+    filtered_root.push_str(rest);
+    filtered_root
 }
 
 fn is_sandbox_mode_key_or_its_own_comment(line: &str) -> bool {
