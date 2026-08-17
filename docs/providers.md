@@ -175,6 +175,72 @@ seeded home (or Codex's own writes back into it) is never clobbered by a
 later filter pass. See `operator_config_is_filtered_to_the_documented_allow_list_at_seed`
 in `codex.rs`'s test module for the fixture-driven proof.
 
+## Sandboxed providers: the outbox
+
+A provider's *hooks* (`SessionStart`/`UserPromptSubmit`/.../`Stop`) always
+reach the daemon: they are daemon-authored commands the provider itself
+invokes directly, outside any sandbox the provider applies to the agent's
+own tool calls. But an agent's *own* `factoryctl task done`/`task
+blocked`/`agent message` call — the one a composed delivery's instructions
+ask it to run once it finishes its work — is just another shell-command
+tool call as far as the provider is concerned, and can be sandboxed right
+along with everything else. Confirmed on one real Codex session
+(`workspace-write`, ROADMAP.md's now-resolved unresolved decision): the
+Unix-socket connect to the daemon's control socket failed with `Operation
+not permitted (os error 1)` even though the socket's own directory is
+inside `writable_roots` — the task stayed `running` forever, silently,
+since the agent's own transcript was the only place the failure showed up.
+
+Rather than chase a narrower sandbox exception (or a provider-specific
+`danger-full-access`-style bypass — tried, and traded one hang for a worse
+one: Codex's own built-in `codex_apps` MCP server hangs indefinitely at
+startup under it, see ROADMAP.md), Dark Factory borrows Munder Difflin's
+file-based agent outbox: an agent writes its intended mutation as a file in
+its own directory, and the harness carries it the rest of the way.
+Concretely:
+
+- Every session's environment includes `DARK_FACTORY_AGENT_DIR` (this
+  agent's guidance directory, `factory_core::paths::agent_dir` — already
+  inside a Codex session's `writable_roots`, see the section above), a
+  fixed addition to `runner_process::SESSION_ENVIRONMENT_NAMES` like every
+  other `DARK_FACTORY_*` identity variable.
+- `factoryctl task done`/`task blocked`/`agent message` — the three
+  agent-facing mutations, not every command — fall back to writing the
+  intended request as JSON to `$DARK_FACTORY_AGENT_DIR/outbox/<unix
+  ms>-<8 hex>.json` (`crates/factoryctl/src/outbox.rs`) on any connect/send
+  failure to the daemon socket, printing `queued: outbox/<name> (delivered
+  on the next hook)` and exiting `0` rather than failing the agent's tool
+  call outright.
+- `factoryctl hook` — which always runs unsandboxed — drains that
+  directory before every hook request it sends, not just `Stop`: it sends
+  each queued request to the daemon in submission order, deleting the file
+  on success or on a daemon-side rejection (poison-pill avoidance; logged
+  to stderr), and stopping the drain (leaving the rest queued) on the
+  first transport failure, so an unreachable daemon is not retried file by
+  file for nothing. Bounded to 100 files and ~3 seconds of wall-clock time
+  so a large or wedged outbox can never make a hook invocation itself
+  stall the operator's live provider session — separate from and on top of
+  `factoryctl hook`'s own 5-second fail-open budget.
+
+Only these three commands fall back this way. Every other `factoryctl`
+command — the operator's own `project add`, `task assign`, and so on —
+fails exactly as it always has on an unreachable daemon: silently queuing
+an operator-facing command that nothing but a session's own hooks will
+ever drain would just hide a real failure behind a misleading "queued"
+message.
+
+The daemon's own dispatcher tick does **not** also drain outboxes — the
+hook is the only carrier. A session's `Stop` hook always fires at the end
+of a turn (and every other hook fires more often than that), so the next
+opportunity to drain is never far away; giving the dispatcher a second,
+redundant drain path would be YAGNI.
+
+If you are adding a new provider that runs its own tool calls under a
+sandbox, wire your hooks so `factoryctl hook` still gets invoked
+unsandboxed (matching Claude and Codex), and nothing else is required —
+the outbox fallback is generic across providers, keyed only on
+`DARK_FACTORY_AGENT_DIR` being set in the session environment.
+
 ## Example/mock provider
 
 Two different test doubles exist at two different layers, easy to conflate:

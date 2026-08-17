@@ -393,28 +393,54 @@ Two more unattended-dogfood fixes, alongside pre-trust:
   entry, `[sandbox_workspace_write] writable_roots = [<agent's guidance
   directory>, <directory containing $DARK_FACTORY_SOCKET>]`, `network_access
   = false` — a Unix socket connect needs write access to the socket path
-  under the seatbelt sandbox. What manual testing against a real Codex
-  session on a real operator's `~/.codex/config.toml` (which this provider
-  copies forward) could and could not confirm: this `sandbox_mode`/
-  `writable_roots`/`network_access` combination does not block Codex's own
-  model-list/plugin-directory network calls (those happen outside the
-  sandbox, before any tool call is spawned), and the generated config still
-  parses under `codex --strict-config doctor` even against a config with
-  its own trailing `[projects...]` tables and a pre-existing `sandbox_mode`
-  of its own. What it could *not* confirm within this track's budget: a
-  real Codex session reaching `SessionStart` and completing `task done` end
-  to end on this particular machine, whose personal `~/.codex/config.toml`
-  configures several `[mcp_servers.*]` entries plus a built-in "apps"
-  directory check — the session repeatedly stalled in `starting` at
-  "Starting MCP servers", before Codex's own hooks ever fire, even after
-  disabling the user-configurable MCP servers one at a time. Whether that
-  stall is caused by `writable_roots` (an MCP server subprocess needing to
-  write somewhere outside it) or is unrelated (a slow/unresponsive
-  remote-URL server, or the built-in "apps" check, neither of which is
-  user-configurable) was not conclusively isolated. If a Codex agent sits
-  in `starting`, check its seeded `config.toml`'s `[mcp_servers.*]` entries
-  before assuming the sandbox itself is at fault, and see ROADMAP.md's
-  unresolved decisions for the open question this leaves.
+  under the seatbelt sandbox. Manual testing against a real Codex session
+  confirmed this `sandbox_mode`/`writable_roots`/`network_access`
+  combination does not block Codex's own model-list/plugin-directory
+  network calls (those happen outside the sandbox, before any tool call is
+  spawned), and the generated config still parses under `codex
+  --strict-config doctor` even against a config with its own trailing
+  `[projects...]` tables and a pre-existing `sandbox_mode` of its own. An
+  earlier version of this section also reported a real Codex session
+  stalling in `starting` at "Starting MCP servers" before its hooks ever
+  fired; that is resolved (`CodexProvider`'s seeded `CODEX_HOME` copies the
+  operator's `config.toml` filtered down to what a factory worker needs,
+  dropping `[mcp_servers.*]` — see `docs/providers.md`'s "Codex:
+  `CODEX_HOME` seeding is filtered, not a raw copy").
+- **Codex's own sandbox can still block the *agent's own* `factoryctl task
+  done`/`task blocked`/`agent message` call**, even though every hook keeps
+  reaching the daemon reliably: confirmed on a real Codex session under
+  `workspace-write`, the agent's own shell-tool call to `factoryctl task
+  done` returned `Operation not permitted (os error 1)` even though the
+  socket's directory is inside `writable_roots` — the task stayed
+  `running` forever, silently, since only the agent's own transcript saw
+  the failure. `sandbox_mode = "danger-full-access"` does not cleanly fix
+  this either: it removes the sandbox restriction but makes Codex's own
+  built-in `codex_apps` MCP server hang indefinitely at startup instead
+  (reproduced twice; see ROADMAP.md). Fixed with a Munder-Difflin-shaped
+  file outbox instead of chasing a narrower sandbox exception: every
+  session's environment also carries `DARK_FACTORY_AGENT_DIR` (this
+  agent's guidance directory, already inside `writable_roots`), and `task
+  done`/`task blocked`/`agent message` fall back to writing their intended
+  request as a file there on any daemon-socket connect/send failure; the
+  very next `factoryctl hook` call (which always runs unsandboxed) drains
+  it before sending the hook itself. See `docs/providers.md`'s "Sandboxed
+  providers: the outbox" for the full mechanism and
+  `crates/factoryd/tests/sessions_e2e.rs`'s
+  `task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_hook`
+  for the deterministic (shell-provider) proof. Re-verified on one real
+  Codex session (temp home, `--provider codex`, a real task creating a
+  file): the session's own `factoryctl task done` call printed `queued:
+  outbox/1786941849516-d3c2e36e.json (delivered on the next hook)` into
+  its own transcript — proof the direct daemon connect failed under the
+  sandbox, since `DARK_FACTORY_FORCE_OUTBOX` was never set for this real
+  session — the very next `Stop` hook drained it, the run closed
+  `closed_by=task_done`, and `factoryctl task list` showed the task
+  `succeeded` with the agent's own result text. Unrelated to the outbox
+  fix itself: this same session's `SessionStart` hook did not fire on its
+  own (see ROADMAP.md's unresolved decisions) and had to be POSTed
+  manually once to unblock the state machine before any of the above
+  could happen — every hook after that, including the ones the outbox
+  fix depends on, fired reliably.
 
 Codex also reports its own thread id back on its first `SessionStart` hook
 (a Claude-shaped `session_id` field); the daemon persists it

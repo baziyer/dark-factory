@@ -79,31 +79,59 @@ should be revisited, not silently relied on:
   harness killing the daemon right after `StopSession` returns, say) will
   still orphan the runner process. `crates/factoryd/tests/sessions_e2e.rs`'s
   `cleanup_session`/`Daemon::drop` document the pattern to follow.
+- **A real Codex interactive session's `SessionStart` hook did not fire on
+  its own** (Track 5F, verifying the file-outbox fix below): after launch,
+  the TUI rendered its prompt and sat fully idle — 0% CPU, no hook-related
+  log entries in Codex's own `logs_*.sqlite` — for several minutes with
+  `SessionStart` never invoked, so the daemon's session stayed `starting`
+  forever (PTY-typed delivery only happens once `SessionStart` moves a
+  session to `idle`; `execution.rs`). Manually POSTing the exact
+  `SessionStart` hook command from the seeded `config.toml` unblocked it
+  immediately: the session went `idle`, the composed delivery was typed
+  in, and every other hook (`UserPromptSubmit`/`PreToolUse`/
+  `PostToolUse`/`Stop`) then fired reliably on its own for the rest of the
+  session. Not chased further (out of Track 5F's scope — the outbox fixes
+  the *separate* sandboxed-`task-done` problem below, and needed a working
+  session to verify against, so this was worked around manually rather
+  than debugged); worth investigating whether this is specific to a
+  heavily-customized personal `~/.codex/config.toml` (many plugins/
+  marketplaces syncing at startup) or a more general timing issue in how
+  Codex's own hook subsystem initializes relative to the TUI becoming
+  interactive.
+
+Resolved since (Track 5F — file outbox):
+
 - **A Codex agent's own `factoryctl` tool calls (not the daemon's hooks)
   can fail under the `workspace-write` sandbox**: verified on one real
-  Codex session (temp home, this track's item 7 check). Hooks
-  (`SessionStart`/`UserPromptSubmit`/.../`Stop`, all daemon-authored
-  commands Codex itself invokes) reached the daemon reliably every time —
-  the resident-session/hook architecture is solid. But when the *agent*
-  decided to run `factoryctl task done ...` as its own shell-command tool
-  call (exactly what a composed delivery's instructions ask it to do),
-  Codex's own sandboxed tool execution returned `Operation not permitted
-  (os error 1)` even though the socket's directory is inside
-  `writable_roots`; the task stayed `running` forever, silently, since the
-  agent had no way to tell it failed beyond its own transcript.
-  `sandbox_mode = "danger-full-access"` (this track's documented fallback
-  to try) does not cleanly fix it either in this environment: it removes
-  the sandbox restriction but makes Codex's own built-in `codex_apps` MCP
-  server hang indefinitely at startup instead of failing fast the way it
-  does under `workspace-write` (reproduced twice, once resuming a prior
-  session and once on a brand new agent, so it is not a `--resume`
-  artifact). Shipped default stays `workspace-write` (fails fast and
-  deterministically, and every other real-Codex behavior confirmed sound)
-  rather than a change that trades one hang for another. Needs either a
-  narrower sandbox exception (specifically for connecting to the daemon's
-  own control socket, not a blanket `network_access`/`danger-full-access`
-  toggle) or an upstream Codex fix for `codex_apps`' own timeout behavior;
-  out of this track's scope to chase further.
+  Codex session (temp home). Hooks (`SessionStart`/`UserPromptSubmit`/
+  .../`Stop`, all daemon-authored commands Codex itself invokes) reached
+  the daemon reliably — the resident-session/hook architecture is solid.
+  But when the *agent* decided to run `factoryctl task done ...` as its
+  own shell-command tool call (exactly what a composed delivery's
+  instructions ask it to do), Codex's own sandboxed tool execution
+  returned `Operation not permitted (os error 1)` even though the
+  socket's directory is inside `writable_roots`; the task stayed
+  `running` forever, silently, since the agent had no way to tell it
+  failed beyond its own transcript. `sandbox_mode = "danger-full-access"`
+  does not cleanly fix it either: it removes the sandbox restriction but
+  makes Codex's own built-in `codex_apps` MCP server hang indefinitely at
+  startup instead of failing fast the way it does under `workspace-write`
+  (reproduced twice). Fixed with a file outbox instead of a narrower
+  sandbox exception (which would need either Codex-side cooperation or an
+  upstream fix for `codex_apps`' own timeout behavior, neither available
+  here): `task done`/`task blocked`/`agent message` fall back to writing
+  their intended request to `$DARK_FACTORY_AGENT_DIR/outbox/` on a
+  connect/send failure, drained by the very next `factoryctl hook` call
+  (always unsandboxed) before it sends the hook itself — see
+  `docs/providers.md`'s "Sandboxed providers: the outbox" and
+  `crates/factoryctl/src/outbox.rs`. Re-verified end to end on one real
+  Codex session (temp home, `--provider codex`, a real task): the
+  session's own `factoryctl task done` printed `queued:
+  outbox/1786941849516-d3c2e36e.json (delivered on the next hook)` to its
+  transcript (proof the direct daemon connect failed under the sandbox —
+  no `DARK_FACTORY_FORCE_OUTBOX` was set for this real session), the run
+  closed `closed_by=task_done`, and `task list` showed the task
+  `succeeded` with the agent's real result text.
 
 Resolved since (Track 5E — daemon follow-ups):
 
