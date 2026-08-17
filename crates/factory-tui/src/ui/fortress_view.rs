@@ -67,6 +67,7 @@ fn render_floor(frame: &mut Frame, area: Rect, board: &Board) {
         board,
         &board.theme,
         board.selected_agent.as_ref(),
+        board.selected_workshop.as_ref(),
     );
 
     let (_, needed_height) = fortress::layout_extent(&workshops);

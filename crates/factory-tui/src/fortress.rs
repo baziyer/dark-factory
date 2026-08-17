@@ -241,8 +241,16 @@ fn set_text(buf: &mut Buffer, area: Rect, x: u16, y: u16, text: &str, style: Sty
     }
 }
 
+/// Shortest hint text that still reads as meaningful once truncated to a workshop's content
+/// width — see the empty-workshop branch in [`render_workshop`]. Below this many columns the
+/// hint is skipped entirely rather than shown as an unreadable fragment.
+const MIN_EMPTY_HINT_WIDTH: u16 = 6;
+const EMPTY_WORKSHOP_HINT: &str = "factoryctl agent add …";
+
 /// Draws one workshop's border, title, station glyphs (with route connectors and attention
-/// badges), and its in-tray/capacity row — writing every cell directly into `buf`.
+/// badges), and its in-tray/capacity row — writing every cell directly into `buf`. `is_selected`
+/// highlights the workshop's own border (FORTRESS's `[`/`]` cursor, `Board::selected_workshop` —
+/// independent of `selected`, the per-agent glyph highlight).
 fn render_workshop(
     buf: &mut Buffer,
     origin: Rect,
@@ -250,6 +258,7 @@ fn render_workshop(
     board: &Board,
     theme: &Theme,
     selected: Option<&AgentId>,
+    is_selected_workshop: bool,
 ) {
     let rect = Rect {
         x: origin.x + layout.rect.x,
@@ -263,11 +272,20 @@ fn render_workshop(
         return; // fully or partially off the visible area; nothing to draw
     }
 
-    let border_style = Style::default().fg(if theme.use_color {
-        Color::DarkGray
+    let border_style = if is_selected_workshop {
+        let style = Style::default().add_modifier(Modifier::BOLD);
+        if theme.use_color {
+            style.fg(Color::Cyan)
+        } else {
+            style
+        }
     } else {
-        Color::Reset
-    });
+        Style::default().fg(if theme.use_color {
+            Color::DarkGray
+        } else {
+            Color::Reset
+        })
+    };
     // Borders (box-drawing even in plain theme: these are UI chrome, not part of the glyph
     // vocabulary the design brief pins to ASCII).
     for x in rect.x..rect.x + rect.width {
@@ -310,6 +328,20 @@ fn render_workshop(
     let content_y = rect.y + 1;
     let tray_y = rect.y + 2;
     let content_x0 = rect.x + 1;
+
+    if layout.stations.is_empty() && rect.width.saturating_sub(2) >= MIN_EMPTY_HINT_WIDTH {
+        // No agents yet in this workshop, and reachable only via `selected_workshop` (see
+        // `Board::zoom_in`) since `selected_agent`'s cursor has nothing here to land on — point
+        // at the CLI command that fixes that, truncated (`set_text` clips) to whatever fits.
+        set_text(
+            buf,
+            rect,
+            content_x0,
+            content_y,
+            EMPTY_WORKSHOP_HINT,
+            Style::default().fg(Color::DarkGray),
+        );
+    }
 
     for station in &layout.stations {
         let x = content_x0 + station.offset;
@@ -383,9 +415,19 @@ pub fn render(
     board: &Board,
     theme: &Theme,
     selected: Option<&AgentId>,
+    selected_workshop: Option<&ProjectId>,
 ) {
     for workshop in workshops {
-        render_workshop(buf, area, workshop, board, theme, selected);
+        let is_selected_workshop = selected_workshop == Some(&workshop.project_id);
+        render_workshop(
+            buf,
+            area,
+            workshop,
+            board,
+            theme,
+            selected,
+            is_selected_workshop,
+        );
     }
 }
 
@@ -514,5 +556,70 @@ mod tests {
         assert_eq!(layout.len(), 1);
         assert_eq!(layout[0].rect.width, MIN_WORKSHOP_WIDTH);
         assert!(layout[0].stations.is_empty());
+    }
+
+    // -- render: selected-workshop border + empty-workshop hint -----------------------------
+
+    #[test]
+    fn selected_workshop_gets_a_highlighted_border() {
+        let projects = vec![project("a", 0), project("b", 1)];
+        let layout = compute_workshops(&projects, &[], 200);
+        let board = crate::model::Board::new(false, 0, crate::theme::FORTRESS);
+        let area = Rect::new(0, 0, 40, WORKSHOP_HEIGHT);
+        let mut buf = Buffer::empty(area);
+        let selected = ProjectId::try_from("b").unwrap();
+
+        render(
+            &mut buf,
+            area,
+            &layout,
+            &board,
+            &crate::theme::FORTRESS,
+            None,
+            Some(&selected),
+        );
+
+        let a_top_left = buf.cell((layout[0].rect.x, layout[0].rect.y)).unwrap();
+        let b_top_left = buf.cell((layout[1].rect.x, layout[1].rect.y)).unwrap();
+        assert_eq!(a_top_left.symbol(), "┌");
+        assert_eq!(b_top_left.symbol(), "┌");
+        assert_ne!(
+            a_top_left.fg, b_top_left.fg,
+            "only the selected workshop's border should be highlighted"
+        );
+        assert_eq!(b_top_left.fg, Color::Cyan);
+    }
+
+    #[test]
+    fn empty_workshop_shows_the_agent_add_hint_when_theres_room() {
+        let projects = vec![project("a", 0)];
+        let layout = compute_workshops(&projects, &[], 200);
+        assert!(layout[0].stations.is_empty());
+        let board = crate::model::Board::new(false, 0, crate::theme::FORTRESS);
+        let area = Rect::new(0, 0, 40, WORKSHOP_HEIGHT);
+        let mut buf = Buffer::empty(area);
+
+        render(
+            &mut buf,
+            area,
+            &layout,
+            &board,
+            &crate::theme::FORTRESS,
+            None,
+            None,
+        );
+
+        let content_row: String = (layout[0].rect.x + 1..layout[0].rect.x + layout[0].rect.width)
+            .map(|x| {
+                buf.cell((x, layout[0].rect.y + 1))
+                    .unwrap()
+                    .symbol()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            content_row.trim().starts_with("factoryctl"),
+            "expected a truncated CLI hint, got {content_row:?}"
+        );
     }
 }

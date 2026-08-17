@@ -67,6 +67,7 @@ FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4)
 | `Esc`, `←`, `h` | zoom out one level |
 | `Tab` | cycle agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP) |
 | `j`/`k`, `↓`/`↑` | move |
+| `[`/`]` | FORTRESS only: cycle the selected *workshop* itself (independent of the agent cursor) — the only way to reach a project with zero agents, since `Tab`'s agent cursor has no candidates there |
 | `n` | new task (title; `Tab`/`Enter` to a second line for the body) — needs a focused project |
 | `m` | message the selected agent |
 | `o` | message the orchestrator (if several in scope, opens a picker — `Tab`/`j`/`k` to choose) |
@@ -79,11 +80,19 @@ FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4)
 | `?` | help overlay |
 
 `Enter`'s meaning is contextual, per view: in FORTRESS it zooms into the selected agent's
-project's WORKSHOP; in WORKSHOP it opens the task action menu (tasks pane) or zooms into
+project's WORKSHOP (or, if a *workshop* is selected via `[`/`]` instead of an agent, that
+project's WORKSHOP directly — the only way in for a project with zero agents, where `n` can then
+add its first task); in WORKSHOP it opens the task action menu (tasks pane) or zooms into
 TERMINALS (agents pane); in TERMINALS it zooms into FOCUS on the selected pane. In WORKSHOP,
 `Enter` on a task opens a small action menu — **assign · cancel · retry · delete · edit title ·
 start** — the only place those live; `start` is what used to be a top-level `s` key
 ("deliver now").
+
+FORTRESS's `[`/`]` and `Tab`/`j`/`k` are two independent selection cursors — `Tab`/`j`/`k` moves
+the per-agent glyph highlight (and clears the workshop border highlight), `[`/`]` moves the
+workshop border highlight (and clears the agent highlight) — so only one kind of selection is
+ever shown onscreen at once. An empty workshop shows a truncated `factoryctl agent add …` hint
+inside its box if there's room.
 
 Everything above is one `Action` enum and one `keymap()` function
 (`model/keymap.rs`) — the meaning of a key never depends on which view is active, only what

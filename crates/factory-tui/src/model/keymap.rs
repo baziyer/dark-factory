@@ -88,6 +88,10 @@ pub enum Action {
     MoveNext,
     /// `k`/`↑`.
     MovePrev,
+    /// `]`: FORTRESS-only, cycles `selected_workshop` forward. See its field doc comment.
+    NextWorkshop,
+    /// `[`: FORTRESS-only, cycles `selected_workshop` backward.
+    PrevWorkshop,
     NewTask,
     MessageAgent,
     MessageOrchestrator,
@@ -123,6 +127,8 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Tab => Some(Action::Tab),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveNext),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::MovePrev),
+        KeyCode::Char(']') => Some(Action::NextWorkshop),
+        KeyCode::Char('[') => Some(Action::PrevWorkshop),
         KeyCode::Char('n') => Some(Action::NewTask),
         KeyCode::Char('m') => Some(Action::MessageAgent),
         KeyCode::Char('o') => Some(Action::MessageOrchestrator),
@@ -330,6 +336,8 @@ impl Board {
             Action::Tab => self.handle_tab(),
             Action::MoveNext => self.handle_move(true),
             Action::MovePrev => self.handle_move(false),
+            Action::NextWorkshop => self.cycle_selected_workshop(true),
+            Action::PrevWorkshop => self.cycle_selected_workshop(false),
             Action::NewTask => self.begin_new_task(),
             Action::MessageAgent => self.begin_message_agent(),
             Action::MessageOrchestrator => self.begin_message_orchestrator(),
@@ -365,6 +373,16 @@ impl Board {
     fn zoom_in(&mut self) -> Intent {
         match self.view {
             View::Fortress => {
+                // An explicitly selected workshop (`[`/`]`) wins over the agent cursor even if
+                // it has no agents yet — the whole point of `selected_workshop` (see its field
+                // doc comment): it's the only way to reach an empty project's WORKSHOP, where
+                // `n` can then add its first task.
+                if let Some(project_id) = self.selected_workshop.clone() {
+                    self.focused_project = Some(project_id);
+                    self.workshop_focus = WorkshopPane::Tasks;
+                    self.view = View::Workshop;
+                    return Intent::Redraw;
+                }
                 let target = self
                     .selected_agent
                     .clone()
@@ -502,6 +520,23 @@ impl Board {
             self.focused_project = Some(agent.project_id.clone());
         }
         self.selected_agent = Some(next);
+        self.selected_workshop = None;
+        Intent::Redraw
+    }
+
+    /// `[`/`]`: cycles `selected_workshop` through every project in FORTRESS order, independent
+    /// of `selected_agent` (see that field's doc comment). A no-op outside FORTRESS, same pattern
+    /// as `!`/`PgUp`/`PgDn` elsewhere in this file.
+    fn cycle_selected_workshop(&mut self, forward: bool) -> Intent {
+        if self.view != View::Fortress {
+            return Intent::None;
+        }
+        let ids: Vec<ProjectId> = self.projects_sorted().into_iter().map(|p| p.id).collect();
+        let Some(next) = step(&ids, self.selected_workshop.as_ref(), forward) else {
+            return Intent::Redraw;
+        };
+        self.selected_workshop = Some(next);
+        self.selected_agent = None;
         Intent::Redraw
     }
 
@@ -657,6 +692,7 @@ impl Board {
             self.focused_project = Some(agent.project_id.clone());
         }
         self.selected_agent = Some(next);
+        self.selected_workshop = None;
         if also_focus {
             self.view = View::Focus;
             self.pane_forwarding = true;
@@ -1093,6 +1129,8 @@ mod tests {
             (KeyCode::Down, Action::MoveNext),
             (KeyCode::Char('k'), Action::MovePrev),
             (KeyCode::Up, Action::MovePrev),
+            (KeyCode::Char(']'), Action::NextWorkshop),
+            (KeyCode::Char('['), Action::PrevWorkshop),
             (KeyCode::Char('n'), Action::NewTask),
             (KeyCode::Char('m'), Action::MessageAgent),
             (KeyCode::Char('o'), Action::MessageOrchestrator),
@@ -1146,6 +1184,105 @@ mod tests {
         let mut board = board_with_one_project();
         board.handle_key(key(KeyCode::Esc));
         assert_eq!(board.view, View::Fortress);
+    }
+
+    /// A second project with zero agents — `Tab`'s agent cursor (`agents_in_fortress_order`) has
+    /// no candidate there at all, which is exactly the "can't reach it by keyboard" bug `[`/`]`
+    /// fixes.
+    fn board_with_an_empty_second_project() -> Board {
+        let mut board = Board::new(false, 0, crate::theme::FORTRESS);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0), project("empty", 1)],
+            vec![
+                agent("orch", "proj", AgentRole::Orchestrator, None),
+                agent("alice", "proj", AgentRole::Worker, None),
+            ],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        board
+    }
+
+    #[test]
+    fn fortress_brackets_cycle_selected_workshop_independent_of_agent_cursor() {
+        let mut board = board_with_an_empty_second_project();
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+
+        board.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(board.selected_workshop.as_ref().unwrap().as_str(), "proj");
+        assert_eq!(
+            board.selected_agent, None,
+            "picking a workshop clears the agent cursor - only one selection shows at once"
+        );
+
+        board.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(board.selected_workshop.as_ref().unwrap().as_str(), "empty");
+
+        board.handle_key(key(KeyCode::Char('[')));
+        assert_eq!(board.selected_workshop.as_ref().unwrap().as_str(), "proj");
+    }
+
+    #[test]
+    fn fortress_agent_cursor_clears_the_workshop_cursor() {
+        let mut board = board_with_an_empty_second_project();
+        board.selected_workshop = Some(ProjectId::try_from("empty").unwrap());
+
+        board.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(board.selected_workshop, None);
+        assert!(board.selected_agent.is_some());
+    }
+
+    #[test]
+    fn workshop_bracket_keys_are_a_no_op() {
+        let mut board = board_with_an_empty_second_project();
+        board.view = View::Workshop;
+        let intent = board.handle_key(key(KeyCode::Char(']')));
+        assert!(matches!(intent, Intent::None));
+        assert_eq!(board.selected_workshop, None);
+    }
+
+    #[test]
+    fn fortress_zoom_in_on_an_empty_selected_workshop_opens_its_workshop_view() {
+        let mut board = board_with_an_empty_second_project();
+        board.selected_workshop = Some(ProjectId::try_from("empty").unwrap());
+
+        let intent = board.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Workshop);
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "empty");
+        assert!(
+            !board.status_line_is_error(),
+            "should not hit the \"no agents yet\" error path"
+        );
+    }
+
+    #[test]
+    fn new_task_works_after_zooming_into_an_empty_workshop() {
+        let mut board = board_with_an_empty_second_project();
+        board.selected_workshop = Some(ProjectId::try_from("empty").unwrap());
+        board.handle_key(key(KeyCode::Enter));
+        assert_eq!(board.view, View::Workshop);
+
+        board.handle_key(key(KeyCode::Char('n')));
+        assert!(matches!(board.mode, Mode::Prompt(_)));
+        for ch in "first task".chars() {
+            board.handle_key(key(KeyCode::Char(ch)));
+        }
+        board.handle_key(key(KeyCode::Enter)); // advance to the body field
+        let intent = board.handle_key(key(KeyCode::Enter)); // submit with an empty body
+
+        match intent {
+            Intent::Send(LocalRequest::CreateTask {
+                project_id, title, ..
+            }) => {
+                assert_eq!(project_id.as_str(), "empty");
+                assert_eq!(title, "first task");
+            }
+            other => panic!("expected CreateTask, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1427,6 +1564,29 @@ mod tests {
         board.view = View::Focus;
         let intent = board.handle_key(key(KeyCode::PageUp));
         assert!(matches!(intent, Intent::ScrollFocus { up: true }));
+    }
+
+    /// The handoff's "up one level" ladder, one `Esc` at a time: FOCUS → TERMINALS → WORKSHOP →
+    /// FORTRESS. Only reachable while `pane_forwarding` is off (`Ctrl-]`) in TERMINALS/FOCUS —
+    /// with it on (the default), `Esc` goes to the live pane instead, by design.
+    #[test]
+    fn esc_steps_up_one_level_at_a_time_through_every_view() {
+        let mut board = board_in_workshop();
+        board.pane_forwarding = false;
+
+        board.view = View::Focus;
+        board.handle_key(key(KeyCode::Esc));
+        assert_eq!(board.view, View::Terminals);
+
+        board.handle_key(key(KeyCode::Esc));
+        assert_eq!(board.view, View::Workshop);
+
+        board.handle_key(key(KeyCode::Esc));
+        assert_eq!(board.view, View::Fortress);
+
+        // FORTRESS is the top of the ladder: Esc is a no-op from there.
+        board.handle_key(key(KeyCode::Esc));
+        assert_eq!(board.view, View::Fortress);
     }
 
     #[test]

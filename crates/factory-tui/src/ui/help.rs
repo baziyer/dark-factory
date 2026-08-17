@@ -238,6 +238,7 @@ const HELP_TEXT: &[&str] = &[
     "Enter/→/l  zoom in       Esc/←/h  zoom out",
     "Tab        cycle agents (Fortress/Terminals/Focus) or panes (Workshop)",
     "j/k, ↑/↓   move",
+    "[ / ]      Fortress: cycle selected workshop (reaches a project with no agents yet)",
     "n          new task (needs a focused project)",
     "m          message the selected agent",
     "o          message the orchestrator (picks by Tab if more than one)",
