@@ -6,12 +6,12 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use factory_core::{
@@ -29,9 +29,36 @@ const INSTANCE_ID: &str = "instance-terminal-1";
 
 struct RunningTerminalRunner {
     child: Option<Child>,
-    stderr: Option<std::process::ChildStderr>,
     runtime: PathBuf,
     _directory: tempfile::TempDir,
+}
+
+// TEMPORARY: investigation instrumentation for #55, removed before the real
+// fix lands. See runner.rs's identical helpers for why this goes through a
+// background thread (bypasses libtest's per-test capture) instead of a plain
+// eprintln!.
+fn forward_stderr(pid: u32, stderr: std::process::ChildStderr) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => eprintln!("[runner pid={pid} stderr] {line}"),
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+fn trace(message: impl Into<String>) {
+    let message = message.into();
+    let _ = thread::spawn(move || eprintln!("[test-trace {}] {message}", now_ms())).join();
 }
 
 impl RunningTerminalRunner {
@@ -60,12 +87,14 @@ impl RunningTerminalRunner {
             .spawn()
             .unwrap();
         let mut runner = Self {
-            stderr: None,
             child: Some(child),
             runtime,
             _directory: directory,
         };
-        runner.stderr = runner.child.as_mut().unwrap().stderr.take();
+        let pid = runner.child.as_ref().unwrap().id();
+        if let Some(stderr) = runner.child.as_mut().unwrap().stderr.take() {
+            forward_stderr(pid, stderr);
+        }
         runner.wait_until_ready();
         runner
     }
@@ -89,11 +118,9 @@ impl RunningTerminalRunner {
                 return;
             }
             if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = self.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                panic!("runner exited before ready: {status}; stderr: {stderr:?}");
+                panic!(
+                    "runner exited before ready: {status}; see forwarded [runner stderr] lines above"
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
@@ -101,7 +128,12 @@ impl RunningTerminalRunner {
     }
 
     fn wait_for_terminal_spool(&self) {
-        let deadline = Instant::now() + Duration::from_secs(8);
+        let runner_pid = self.child.as_ref().unwrap().id();
+        let started = Instant::now();
+        trace(format!(
+            "wait_for_terminal_spool start runner_pid={runner_pid}"
+        ));
+        let deadline = started + Duration::from_secs(8);
         while Instant::now() < deadline {
             let spool = fs::read_to_string(self.spool()).unwrap_or_default();
             if spool.lines().any(|line| {
@@ -112,11 +144,30 @@ impl RunningTerminalRunner {
                     )
                 })
             }) {
+                trace(format!(
+                    "wait_for_terminal_spool observed terminal event after {:?}",
+                    started.elapsed()
+                ));
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        panic!("runner never recorded a terminal lifecycle event");
+        // TEMPORARY: investigation instrumentation for #55, removed before
+        // the real fix lands.
+        let elapsed = started.elapsed();
+        let spool = fs::read_to_string(self.spool()).unwrap_or_default();
+        let ps = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,stat,command"])
+            .output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_else(|error| format!("<ps failed: {error}>"));
+        trace(format!(
+            "wait_for_terminal_spool TIMED OUT runner_pid={runner_pid} elapsed={elapsed:?}"
+        ));
+        eprintln!(
+            "[wait_for_terminal_spool timeout] runner_pid={runner_pid} elapsed={elapsed:?}\nspool contents:\n{spool}\nfull ps -eo pid,ppid,pgid,stat,command:\n{ps}"
+        );
+        panic!("runner never recorded a terminal lifecycle event (elapsed={elapsed:?})");
     }
 
     fn terminal_sequence(&self) -> i64 {
@@ -396,12 +447,14 @@ fn attach_terminal_and_terminal_input_are_rejected_on_a_non_terminal_run() {
         .spawn()
         .unwrap();
     let mut runner = RunningTerminalRunner {
-        stderr: None,
         child: Some(child),
         runtime,
         _directory: directory,
     };
-    runner.stderr = runner.child.as_mut().unwrap().stderr.take();
+    let pid = runner.child.as_ref().unwrap().id();
+    if let Some(stderr) = runner.child.as_mut().unwrap().stderr.take() {
+        forward_stderr(pid, stderr);
+    }
     runner.wait_until_ready();
 
     let mut stream = connect(&runner.socket());

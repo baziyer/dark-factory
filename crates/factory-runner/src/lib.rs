@@ -1766,6 +1766,7 @@ async fn supervise_terminal(
     let status = loop {
         tokio::select! {
             result = &mut exit_rx => {
+                stop_trace(pid, "waitpid thread returned in primary loop (terminal mode)");
                 let waited = result
                     .map_err(|_| Error::Task("pty wait thread disappeared".into()))??;
                 let Some((_, status)) = waited else {
@@ -1777,12 +1778,16 @@ async fn supervise_terminal(
             }
             chunk = output_rx.recv(), if reader_open => match chunk {
                 Some(bytes) => terminal_log.append(bytes).await?,
-                None => reader_open = false,
+                None => {
+                    stop_trace(pid, "pty reader thread hit EOF (master read returned 0)");
+                    reader_open = false;
+                }
             },
             command = stops.recv() => {
                 let Some(command) = command else {
                     continue;
                 };
+                stop_trace(pid, &format!("stop received grace_ms={} (terminal mode)", command.grace.as_millis()));
                 if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
@@ -1798,6 +1803,7 @@ async fn supervise_terminal(
                 begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                stop_trace(pid, "primary grace elapsed, sending SIGKILL to group (terminal mode)");
                 signal_process_group(pid, Signal::KILL)?;
                 kill_deadline = None;
             }
@@ -1818,11 +1824,21 @@ async fn supervise_terminal(
     };
     let status = wait_status_to_exit(status);
 
-    if process_group_exists(pid)? {
+    let group_exists = process_group_exists(pid)?;
+    stop_trace(
+        pid,
+        &format!("post-wait process_group_exists={group_exists} (terminal mode)"),
+    );
+    if group_exists {
         begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+        stop_trace(
+            pid,
+            "second-stage group_termination armed (DEFAULT_GROUP_GRACE, terminal mode)",
+        );
         loop {
             tokio::select! {
                 () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
+                    stop_trace(pid, "second-stage grace elapsed, sending SIGKILL to group (terminal mode)");
                     signal_process_group(pid, Signal::KILL)?;
                     break;
                 }
@@ -1839,9 +1855,14 @@ async fn supervise_terminal(
                 }
             }
         }
+        stop_trace(pid, "second-stage loop exited (terminal mode)");
     }
 
     if reader_open {
+        stop_trace(
+            pid,
+            "starting bounded PTY output drain, waiting for reader EOF",
+        );
         let drain_result = timeout(POST_KILL_DRAIN_TIMEOUT, async {
             while let Some(bytes) = output_rx.recv().await {
                 terminal_log.append(bytes).await?;
@@ -1849,6 +1870,10 @@ async fn supervise_terminal(
             Ok::<(), Error>(())
         })
         .await;
+        stop_trace(
+            pid,
+            &format!("PTY output drain finished ok={}", drain_result.is_ok()),
+        );
         match drain_result {
             Ok(result) => result?,
             Err(_) => {
@@ -1867,6 +1892,7 @@ async fn supervise_terminal(
         true,
     )
     .await?;
+    stop_trace(pid, "Exited event persisted to spool (terminal mode)");
     process_group.disarm();
     if runner_signalled {
         Ok(SupervisionOutcome::RunnerSignalled)
