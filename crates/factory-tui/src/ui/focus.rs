@@ -9,12 +9,13 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use tui_term::widget::PseudoTerminal;
 
 use crate::model::Board;
 use crate::pane::PaneMap;
+use crate::ui;
 
 pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
     let Some(session_id) = board.focus_target() else {
@@ -54,10 +55,7 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
         " {}{command}{marker} — [{mode_hint}]{scroll_hint} ",
         pane.title
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(title);
+    let block = ui::block(title).border_style(Style::default().fg(color));
     let inner = block.inner(area);
     if inner.width > 0 && inner.height > 0 {
         let _ = pane.resize(inner.height, inner.width);
@@ -93,16 +91,11 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
 }
 
 fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board, message: &str) {
-    let block = Block::default().borders(Borders::ALL).title(" focus ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = ui::bordered(frame, area, ui::block(" focus "));
     let text = if board.focused_project.is_none() {
-        "no project focused — press Enter on an agent in FORTRESS first".to_owned()
+        "no project focused — press Enter on an agent in FORTRESS first"
     } else {
-        message.to_owned()
+        message
     };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-        inner,
-    );
+    ui::dim(frame, inner, text);
 }

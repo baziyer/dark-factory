@@ -6,14 +6,14 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
 
 use factory_core::{AgentRole, ProjectId, TaskStatus};
 
 use crate::model::attention::Attention;
 use crate::model::state::{self, AgentState};
 use crate::model::{Board, WorkshopPane, provider_letter};
-use crate::ui::{pad, truncate};
+use crate::ui::{self, pad, truncate};
 
 /// Same width as the pre-Track-6c board's unit-list sparkline — see `model::state::ActivitySeries`.
 const SPARKLINE_WIDTH: usize = 8;
@@ -82,13 +82,11 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board) {
 }
 
 fn render_no_project(frame: &mut Frame, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title(" workshop ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(
-        Paragraph::new("no project focused — press Enter on an agent in FORTRESS to zoom in")
-            .style(Style::default().fg(Color::DarkGray)),
+    let inner = ui::bordered(frame, area, ui::block(" workshop "));
+    ui::dim(
+        frame,
         inner,
+        "no project focused — press Enter on an agent in FORTRESS to zoom in",
     );
 }
 
@@ -146,10 +144,7 @@ fn render_tasks(
     let focused = board.workshop_focus == WorkshopPane::Tasks;
     let filter_badge = if board.attention_filter { " [!]" } else { "" };
     let title = format!(" {project_name} — tasks{filter_badge} ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(panel_style(focused))
-        .title(title);
+    let block = ui::block(title).border_style(panel_style(focused));
     let list = List::new(items)
         .block(block)
         .highlight_symbol("> ")
@@ -244,10 +239,7 @@ fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
 
     let focused = board.workshop_focus == WorkshopPane::Agents;
     let filter_badge = if board.attention_filter { " [!]" } else { "" };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(panel_style(focused))
-        .title(format!(" agents{filter_badge} "));
+    let block = ui::block(format!(" agents{filter_badge} ")).border_style(panel_style(focused));
     let list = List::new(items)
         .block(block)
         .highlight_symbol("> ")
@@ -274,9 +266,7 @@ fn panel_style(focused: bool) -> Style {
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, board: &Board, project_id: &ProjectId) {
-    let block = Block::default().borders(Borders::ALL).title(" detail ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = ui::bordered(frame, area, ui::block(" detail "));
     if inner.width == 0 || inner.height == 0 {
         return;
     }

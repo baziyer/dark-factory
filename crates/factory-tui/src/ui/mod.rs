@@ -11,6 +11,8 @@ mod workshop;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Style};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::model::{Board, Mode, View};
 use crate::pane::PaneMap;
@@ -79,4 +81,29 @@ pub(super) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// A bordered, titled block — every panel and overlay in `ui/` starts from this rather than
+/// repeating `Block::default().borders(Borders::ALL).title(..)` at each call site. Chain
+/// `.border_style(..)` on the result for a panel that needs a non-default border color (a focus
+/// or attention highlight); plain panels can use the default as-is.
+pub(super) fn block(title: impl Into<String>) -> Block<'static> {
+    Block::default().borders(Borders::ALL).title(title.into())
+}
+
+/// Renders `block` into `area` and returns its inner content rect — the `let inner = ..;
+/// frame.render_widget(block, area);` pair repeated across every panel that draws its own content
+/// (as opposed to handing the block straight to a `List`/`PseudoTerminal` via `.block(..)`).
+pub(super) fn bordered(frame: &mut Frame, area: Rect, block: Block<'static>) -> Rect {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    inner
+}
+
+/// Renders dim placeholder text (an empty-state hint, "attaching…", etc.) into `area`.
+pub(super) fn dim(frame: &mut Frame, area: Rect, text: impl Into<String>) {
+    frame.render_widget(
+        Paragraph::new(text.into()).style(Style::default().fg(Color::DarkGray)),
+        area,
+    );
 }

@@ -5,13 +5,13 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
 
 use crate::model::{
     Board, Connection, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
     TASK_MENU_ITEMS, TaskMenuState, View,
 };
-use crate::ui::centered_rect;
+use crate::ui::{self, centered_rect};
 
 fn connection_badge(board: &Board) -> Span<'static> {
     match board.connection {
@@ -89,12 +89,11 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
     };
     let rect = centered_rect(area, 56, 5);
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
-        .title(title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = ui::bordered(
+        frame,
+        rect,
+        ui::block(title).border_style(Style::default().fg(Color::Red)),
+    );
     let text = vec![
         Line::from(prompt_line),
         Line::from(""),
@@ -113,12 +112,11 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
     let height = u16::try_from(prompt.labels.len()).unwrap_or(1) + 4;
     let rect = centered_rect(area, 60, height);
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = ui::bordered(
+        frame,
+        rect,
+        ui::block(title).border_style(Style::default().fg(Color::Cyan)),
+    );
 
     let mut lines: Vec<Line> = Vec::new();
     for (index, label) in prompt.labels.iter().enumerate() {
@@ -184,10 +182,7 @@ fn render_picker(frame: &mut Frame, area: Rect, board: &Board, picker: &PickerSt
 
     let rect = centered_rect(area, 50, (items.len() as u16 + 3).clamp(4, area.height));
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = ui::block(title).border_style(Style::default().fg(Color::Cyan));
 
     if items.is_empty() {
         let inner = block.inner(rect);
@@ -220,10 +215,7 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
         u16::try_from(TASK_MENU_ITEMS.len()).unwrap_or(6) + 3,
     );
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = ui::block(title).border_style(Style::default().fg(Color::Cyan));
     let list = List::new(items)
         .block(block)
         .highlight_symbol("> ")
@@ -254,12 +246,11 @@ const HELP_TEXT: &[&str] = &[
 fn render_help(frame: &mut Frame, area: Rect) {
     let rect = centered_rect(area, 66, u16::try_from(HELP_TEXT.len()).unwrap_or(14) + 3);
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" keys ");
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
+    let inner = ui::bordered(
+        frame,
+        rect,
+        ui::block(" keys ").border_style(Style::default().fg(Color::Cyan)),
+    );
     let lines: Vec<Line> = HELP_TEXT.iter().map(|line| Line::from(*line)).collect();
     frame.render_widget(Paragraph::new(lines), inner);
 }

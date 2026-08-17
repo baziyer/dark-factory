@@ -110,115 +110,98 @@ fn next_backoff(delay: Duration) -> Duration {
     delay.checked_mul(2).unwrap_or(MAX_BACKOFF).min(MAX_BACKOFF)
 }
 
-fn load_projects(client: &Client) -> Result<Vec<ProjectSnapshot>, String> {
+/// Drains every page of a `List*` request whose response carries `(items, next_after_id)`.
+/// `build` constructs the request for a given cursor (starting from `None`); `extract` pulls the
+/// items/cursor pair out of the response, or maps anything else to an error — see `load_sessions`
+/// for how a "not implemented" `LocalResponse::Error` is tolerated as "empty" from within
+/// `extract` rather than needing a separate flag here.
+fn paginate<T, A>(
+    client: &Client,
+    mut build: impl FnMut(Option<A>) -> LocalRequest,
+    extract: impl Fn(LocalResponse) -> Result<(Vec<T>, Option<A>), String>,
+) -> Result<Vec<T>, String> {
     let mut all = Vec::new();
     let mut after = None;
     loop {
-        match request_response(
-            client,
-            LocalRequest::ListProjects {
-                after_id: after,
-                limit: SAFE_STATE_PAGE_SIZE,
-            },
-        )? {
+        let (items, next_after_id) = extract(request_response(client, build(after))?)?;
+        let done = next_after_id.is_none() || items.is_empty();
+        after = next_after_id;
+        all.extend(items);
+        if done {
+            return Ok(all);
+        }
+    }
+}
+
+fn load_projects(client: &Client) -> Result<Vec<ProjectSnapshot>, String> {
+    paginate(
+        client,
+        |after_id| LocalRequest::ListProjects {
+            after_id,
+            limit: SAFE_STATE_PAGE_SIZE,
+        },
+        |response| match response {
             LocalResponse::Projects {
                 projects,
                 next_after_id,
-            } => {
-                let done = next_after_id.is_none() || projects.is_empty();
-                after = next_after_id;
-                all.extend(projects);
-                if done {
-                    return Ok(all);
-                }
-            }
-            other => return Err(format!("unexpected response to ListProjects: {other:?}")),
-        }
-    }
+            } => Ok((projects, next_after_id)),
+            other => Err(format!("unexpected response to ListProjects: {other:?}")),
+        },
+    )
 }
 
 fn load_agents(client: &Client, project_id: &ProjectId) -> Result<Vec<AgentSnapshot>, String> {
-    let mut all = Vec::new();
-    let mut after = None;
-    loop {
-        match request_response(
-            client,
-            LocalRequest::ListAgents {
-                project_id: project_id.clone(),
-                after_id: after,
-                limit: SAFE_STATE_PAGE_SIZE,
-            },
-        )? {
+    paginate(
+        client,
+        |after_id| LocalRequest::ListAgents {
+            project_id: project_id.clone(),
+            after_id,
+            limit: SAFE_STATE_PAGE_SIZE,
+        },
+        |response| match response {
             LocalResponse::Agents {
                 agents,
                 next_after_id,
-            } => {
-                let done = next_after_id.is_none() || agents.is_empty();
-                after = next_after_id;
-                all.extend(agents);
-                if done {
-                    return Ok(all);
-                }
-            }
-            other => return Err(format!("unexpected response to ListAgents: {other:?}")),
-        }
-    }
+            } => Ok((agents, next_after_id)),
+            other => Err(format!("unexpected response to ListAgents: {other:?}")),
+        },
+    )
 }
 
 fn load_tasks(client: &Client, project_id: &ProjectId) -> Result<Vec<TaskDetail>, String> {
-    let mut all = Vec::new();
-    let mut after = None;
-    loop {
-        match request_response(
-            client,
-            LocalRequest::ListTasks {
-                project_id: project_id.clone(),
-                after_id: after,
-                limit: MAX_TASK_PAGE_ITEMS,
-            },
-        )? {
+    paginate(
+        client,
+        |after_id| LocalRequest::ListTasks {
+            project_id: project_id.clone(),
+            after_id,
+            limit: MAX_TASK_PAGE_ITEMS,
+        },
+        |response| match response {
             LocalResponse::Tasks {
                 tasks,
                 next_after_id,
-            } => {
-                let done = next_after_id.is_none() || tasks.is_empty();
-                after = next_after_id;
-                all.extend(tasks);
-                if done {
-                    return Ok(all);
-                }
-            }
-            other => return Err(format!("unexpected response to ListTasks: {other:?}")),
-        }
-    }
+            } => Ok((tasks, next_after_id)),
+            other => Err(format!("unexpected response to ListTasks: {other:?}")),
+        },
+    )
 }
 
 fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>, String> {
-    let mut all = Vec::new();
-    let mut after = None;
-    loop {
-        match request_response(
-            client,
-            LocalRequest::ListRuns {
-                project_id: project_id.clone(),
-                after_id: after,
-                limit: SAFE_STATE_PAGE_SIZE,
-            },
-        )? {
+    paginate(
+        client,
+        |after_id| LocalRequest::ListRuns {
+            project_id: project_id.clone(),
+            after_id,
+            limit: SAFE_STATE_PAGE_SIZE,
+        },
+        |response| match response {
             LocalResponse::Runs {
                 runs,
                 next_after_id,
-            } => {
-                let done = next_after_id.is_none() || runs.is_empty();
-                after = next_after_id;
-                all.extend(runs);
-                if done {
-                    return Ok(all);
-                }
-            }
-            other => return Err(format!("unexpected response to ListRuns: {other:?}")),
-        }
-    }
+            } => Ok((runs, next_after_id)),
+            other => Err(format!("unexpected response to ListRuns: {other:?}")),
+        },
+    )
 }
 
 /// Loads a project's sessions, tolerating a daemon that doesn't implement `ListSessions` yet: any
@@ -226,33 +209,22 @@ fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>
 /// error — a daemon that can't list sessions for some other reason shouldn't block the rest of
 /// the board coming up either) is treated as "no sessions", not a load failure.
 fn load_sessions(client: &Client, project_id: &ProjectId) -> Result<Vec<SessionSnapshot>, String> {
-    let mut all = Vec::new();
-    let mut after = None;
-    loop {
-        let response = request_response(
-            client,
-            LocalRequest::ListSessions {
-                project_id: project_id.clone(),
-                after_id: after,
-                limit: Some(SAFE_STATE_PAGE_SIZE as usize),
-            },
-        )?;
-        match response {
+    paginate(
+        client,
+        |after_id| LocalRequest::ListSessions {
+            project_id: project_id.clone(),
+            after_id,
+            limit: Some(SAFE_STATE_PAGE_SIZE as usize),
+        },
+        |response| match response {
             LocalResponse::Sessions {
                 sessions,
                 next_after_id,
-            } => {
-                let done = next_after_id.is_none() || sessions.is_empty();
-                after = next_after_id;
-                all.extend(sessions);
-                if done {
-                    return Ok(all);
-                }
-            }
-            LocalResponse::Error { .. } => return Ok(all),
-            other => return Err(format!("unexpected response to ListSessions: {other:?}")),
-        }
-    }
+            } => Ok((sessions, next_after_id)),
+            LocalResponse::Error { .. } => Ok((Vec::new(), None)),
+            other => Err(format!("unexpected response to ListSessions: {other:?}")),
+        },
+    )
 }
 
 fn load_event_sequence(client: &Client) -> Result<i64, String> {

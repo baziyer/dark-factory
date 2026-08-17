@@ -5,11 +5,11 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::fortress;
 use crate::model::Board;
-use crate::ui::announcements;
+use crate::ui::{self, announcements};
 
 const MIN_HEIGHT_FOR_FLOOR: u16 = 24;
 const MIN_WIDTH_FOR_FLOOR: u16 = 80;
@@ -37,9 +37,7 @@ fn render_floor(frame: &mut Frame, area: Rect, board: &Board) {
         " fortress — {project_count} project{} ",
         if project_count == 1 { "" } else { "s" }
     );
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = ui::bordered(frame, area, ui::block(title));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -50,10 +48,7 @@ fn render_floor(frame: &mut Frame, area: Rect, board: &Board) {
         } else {
             "connecting…"
         };
-        frame.render_widget(
-            Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
+        ui::dim(frame, inner, message);
         return;
     }
 

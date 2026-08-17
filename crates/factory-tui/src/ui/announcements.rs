@@ -6,10 +6,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use crate::model::attention::Attention;
 use crate::model::{Board, announcements::ranked};
+use crate::ui;
 
 fn attention_style(attention: Attention) -> Style {
     match attention {
@@ -29,18 +30,13 @@ pub fn render(frame: &mut Frame, area: Rect, board: &Board) {
     } else {
         format!("announcements ({count}, catching up…)")
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = ui::bordered(frame, area, ui::block(title));
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
     if board.announcements.is_empty() {
-        frame.render_widget(
-            Paragraph::new("(nothing yet)").style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
+        ui::dim(frame, inner, "(nothing yet)");
         return;
     }
 

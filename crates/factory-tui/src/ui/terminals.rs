@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 
 use factory_core::SessionId;
 
@@ -14,6 +14,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::model::Board;
 use crate::pane::PaneMap;
+use crate::ui;
 
 /// Splits `area` into `n` (1-4) tiles: 1 = full; 2 = side by side; 3 = one full-width pane on top
 /// of two half-width panes; 4 = a 2x2 grid. `n == 0` returns no rects. `n > 4` is treated as 4 (a
@@ -79,18 +80,13 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
 }
 
 fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board) {
-    let block = Block::default().borders(Borders::ALL).title(" terminals ");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let inner = ui::bordered(frame, area, ui::block(" terminals "));
     let message = if board.focused_project.is_none() {
         "no project focused — press Enter on an agent in FORTRESS first"
     } else {
         "no live sessions in this project yet (pending session support landing — see README)"
     };
-    frame.render_widget(
-        Paragraph::new(message).style(Style::default().fg(Color::DarkGray)),
-        inner,
-    );
+    ui::dim(frame, inner, message);
 }
 
 fn render_pane_tile(
@@ -105,15 +101,8 @@ fn render_pane_tile(
         let agent_label = board
             .agent_for_pane_session(session_id)
             .map_or_else(|| session_id.to_string(), |agent| agent.id.to_string());
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {agent_label} "));
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-        frame.render_widget(
-            Paragraph::new("attaching…").style(Style::default().fg(Color::DarkGray)),
-            inner,
-        );
+        let inner = ui::bordered(frame, rect, ui::block(format!(" {agent_label} ")));
+        ui::dim(frame, inner, "attaching…");
         return;
     };
 
@@ -129,10 +118,7 @@ fn render_pane_tile(
         Color::DarkGray
     };
     let title = format!(" {}{command}{marker} ", pane.title);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(title);
+    let block = ui::block(title).border_style(Style::default().fg(color));
     let inner = block.inner(rect);
     if inner.width > 0 && inner.height > 0 {
         let _ = pane.resize(inner.height, inner.width);
