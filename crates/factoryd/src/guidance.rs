@@ -60,7 +60,7 @@ pub fn ensure_agent(
 }
 
 /// Recursively removes one agent's guidance directory (`instructions.md`,
-/// `memory.md`, and the reserved worktree/codex-home/claude-settings paths
+/// `memory.md`, `codex-home/`, `claude-settings.json`, and the outbox
 /// under it), if present. A missing directory is not an error: callers use
 /// this best-effort after the owning `DeleteAgent` transaction has already
 /// committed, so the ledger row is gone either way.

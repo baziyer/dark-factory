@@ -7,8 +7,9 @@
 2. Build and iterate: `cargo build --workspace`.
 3. Before opening a PR: `./scripts/local-ci.sh` (fmt, clippy at
    `-D warnings`, the full test suite, `git diff --check`) — this is the
-   authoritative gate; GitHub Actions is manual-only.
-4. Push the branch, open a PR.
+   authoritative gate; CI runs the exact same script (see "CI and GitHub"
+   below).
+4. Push the branch, open a PR (the template carries the review checklist).
 5. **Adversarial review before merge**: a second agent or person reads the
    diff cold and tries to break it — correctness, missed simplification,
    security — and posts findings on the PR. The author addresses each one
@@ -37,6 +38,73 @@ how upgrading the **live** daemon works today, manually: build the new
 binaries, then `launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd`
 — the daemon restarts, runners survive, and `factory-tui`'s reconnect/backoff
 means the board just picks the same sessions back up.
+
+## CI and GitHub
+
+`.github/workflows/ci.yml` runs `./scripts/local-ci.sh` — nothing else —
+as one job, `checks`, on every pull request and every push to `main`. The
+`main` ruleset requires that check green against the current head, a
+pull request with one CODEOWNERS approval, linear history, and forbids
+force-pushes and deletion; the repository admin can bypass the review
+requirement (GitHub never lets an author approve their own PR) but only
+through a pull request, never by pushing to `main`. Merge methods are
+squash or rebase; merged branches are deleted.
+
+Where the job runs is a security boundary, not a cost setting:
+
+- **Same-repository refs** (branches only collaborators can push, and
+  `main` itself) run on the maintainer's persistent Mac, the self-hosted
+  runner `dark-factory-mac` — warm cargo cache, real macOS, no hosted
+  minutes.
+- **Pull requests from forks** execute untrusted code, so they run on an
+  ephemeral hosted macOS runner and never reach that machine. Workflows
+  from an outside contributor's fork additionally need maintainer approval
+  before they run at all.
+
+`scripts/github-repo-settings.sh` applies all of the above (labels, merge
+settings, the ruleset, private vulnerability reporting, secret scanning
+and push protection, the fork-approval policy) and is idempotent — re-run
+it after changing anything there. Known problems are GitHub issues
+labelled `known-issue` (`docs/KNOWN-ISSUES.md` is only a pointer);
+`scripts/import-issues.sh` turns a `###`-sectioned triage document into
+labelled issues if a batch ever needs importing again.
+
+### The self-hosted runner
+
+`~/actions-runner-dark-factory-repo` on the maintainer's Mac, registered
+to this repository as `dark-factory-mac` (label `dark-factory-mac`),
+installed as the launchd service
+`actions.runner.baziyer-dark-factory.dark-factory-mac`. It is not in
+version control; to rebuild it on a new machine:
+
+```sh
+V=$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
+mkdir -p ~/actions-runner-dark-factory-repo && cd ~/actions-runner-dark-factory-repo
+curl -fsSL -o runner.tar.gz "https://github.com/actions/runner/releases/download/v${V}/actions-runner-osx-arm64-${V}.tar.gz"
+tar xzf runner.tar.gz && rm runner.tar.gz
+./config.sh --unattended --url https://github.com/baziyer/dark-factory \
+  --token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/registration-token --jq .token)" \
+  --name dark-factory-mac --labels dark-factory-mac --work _work
+```
+
+Then write `.env` next to it — a launchd service gets no shell profile, so
+every line is load-bearing (absolute paths; the runner does not expand
+`$HOME`):
+
+```
+PATH=/Users/<you>/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
+LANG=en_GB.UTF-8
+CARGO_TARGET_DIR=/Users/<you>/actions-runner-dark-factory-repo/_cargo-target
+```
+
+(`RUSTUP_HOME` is deliberately shared with the login user: `local-ci.sh`
+pins `cargo +1.85.0` explicitly and never changes the default toolchain,
+so sharing keeps it warm without repinning anything. `CARGO_TARGET_DIR`
+lives outside `_work` because `actions/checkout` runs `git clean -ffdx`
+each job.) Finally `./svc.sh install && ./svc.sh start`, and confirm it is
+`online` with `gh api repos/baziyer/dark-factory/actions/runners`. To
+remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
+--token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/remove-token --jq .token)"`.
 
 ## Release and update design — not implemented
 

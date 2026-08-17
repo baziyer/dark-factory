@@ -52,8 +52,8 @@ catalogue.
    exact terminal sequence it durably logged (`AcknowledgeExit`) — the
    daemon does this itself immediately, whether the exit was an operator
    `StopSession` or the provider exiting on its own; skipping that
-   acknowledgement orphans the runner process (see `docs/KNOWN-ISSUES.md`
-   for the test-harness risk this creates). One git worktree per agent
+   acknowledgement orphans the runner process (#26 records the
+   test-harness risk this creates). One git worktree per agent
    (`agent/<id>`, provisioned on `CreateAgent`, removed on `DeleteAgent`)
    keeps concurrent agents from colliding in the same working tree; an
    operator may override it with an explicit `--worktree`.

@@ -208,7 +208,8 @@ keeps running). Subscription headroom has no background service — run
 ```
 
 is the authoritative gate (fmt, clippy at `-D warnings`, the full test
-suite, `git diff --check`); GitHub Actions is manual-only. See
+suite, `git diff --check`); CI runs the same script on every pull
+request. See
 [AGENTS.md](AGENTS.md) for the worktree/PR/review workflow,
 [CONTRIBUTING.md](CONTRIBUTING.md) for the shortest path to a useful
 change, and [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md)
@@ -220,6 +221,8 @@ design.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — invariants.
 - [docs/providers.md](docs/providers.md) — the provider boundary and how
   to add one.
-- [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md) — every known problem,
-  backlog-ready.
+- [GitHub issues labelled `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue)
+  — every known problem, with its smallest fix.
+- [SECURITY.md](SECURITY.md) — what the daemon promises, and how to report
+  a vulnerability privately.
 - [ROADMAP.md](ROADMAP.md) — unfinished product direction.

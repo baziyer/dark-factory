@@ -16,8 +16,8 @@ cargo build --workspace
 `local-ci.sh` is the authoritative gate (`cargo +1.85.0 fmt --check`,
 `clippy --all-targets --all-features -D warnings` across the whole
 workspace, every test with `--test-threads=1`, and `git diff --check`).
-GitHub Actions is manual-only, so this local run is what actually protects
-`main`.
+CI runs the same script on every pull request (the `checks` status
+`main` requires), so a local pass is what makes a PR mergeable.
 
 A few workspace-wide rules the gate enforces, worth knowing up front:
 
@@ -33,9 +33,10 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
 
 ## Where to start
 
-- **A bug or a small gap**: [docs/KNOWN-ISSUES.md](docs/KNOWN-ISSUES.md)
-  lists every known problem with a symptom, evidence, a suggested smallest
-  fix, and a size — anything tagged `S` is a reasonable first change.
+- **A bug or a small gap**: [GitHub issues labelled
+  `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue)
+  each have a symptom, evidence, a suggested smallest fix, and a size —
+  anything `size:S` is a reasonable first change.
 - **A new provider**: see [docs/providers.md](docs/providers.md) — the
   whole contract is one `Provider` trait (`spawn_spec` + `capabilities`)
   in `crates/factoryd/src/providers/mod.rs`. `shell.rs` is the minimal

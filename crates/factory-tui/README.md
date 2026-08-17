@@ -14,7 +14,7 @@ cargo run -p factory-tui -- --project my-project     # focus this project on sta
 cargo run -p factory-tui -- --theme plain             # ASCII glyphs, no hue-based color
 cargo run -p factory-tui -- --dev-local-pty           # TERMINALS/FOCUS attach a local shell
                                                         # instead of a live daemon session
-                                                        # (offline pane testing; see KNOWN-ISSUES)
+                                                        # (offline pane testing; keep or drop: #33)
 ```
 
 Socket resolution matches `factoryctl` exactly: `--socket`, then `$DARK_FACTORY_SOCKET`, then
