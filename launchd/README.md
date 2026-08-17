@@ -5,9 +5,9 @@
 `--webhook-config PATH`) before announcing readiness. This job does not use
 GitHub Actions.
 
-Before loading it, create the state and `__LOG_DIRECTORY__` directories owned
-by the current user with mode `0700`; keep the rendered webhook config,
-secrets, and plist at mode `0600`.
+Before loading it, create `$DARK_FACTORY_HOME` and its `logs/` directory
+owned by the current user with mode `0700`; keep the rendered webhook
+config, secrets, and plist at mode `0600`.
 
 ## Render and install
 
@@ -26,35 +26,37 @@ dirname "$(command -v claude)"
 dirname "$(command -v codex)"
 ```
 
-Render every placeholder to an absolute, canonical path, then install the
-result in the user's `~/Library/LaunchAgents`:
+The normal way to get this job is `factoryctl update --install` (and, once
+it exists, `factoryctl init`): they render this exact template, write it at
+`0600`, and reload it. To do it by hand instead, render the three
+placeholders — `__PROGRAM_ARGUMENTS__` (one `<string>` per argument, the
+first being the absolute path to `factoryd`; the daemon finds
+`factory-runner`/`factoryctl` as its own siblings and every path under
+`$DARK_FACTORY_HOME` by default), `__DARK_FACTORY_HOME__`, and `__PATH__` —
+then install the result in `~/Library/LaunchAgents`:
 
 ```sh
+factoryd="$HOME/.dark-factory/bin/current/factoryd"   # or wherever it lives
 sed \
-  -e "s#__FACTORYD__#$HOME/.local/bin/factoryd#g" \
-  -e "s#__DATABASE__#$HOME/.dark-factory/factory.db#g" \
-  -e "s#__SOCKET__#$HOME/.dark-factory/f.sock#g" \
-  -e "s#__FACTORY_RUNNER__#$HOME/.local/bin/factory-runner#g" \
-  -e "s#__FACTORYCTL__#$HOME/.local/bin/factoryctl#g" \
-  -e "s#__RUNTIME_ROOT__#$HOME/.dark-factory/runs#g" \
-  -e "s#__WEBHOOK_CONFIG__#$HOME/.dark-factory/webhooks.json#g" \
-  -e "s#__WORKING_DIRECTORY__#$HOME/.dark-factory#g" \
-  -e "s#__LOG_DIRECTORY__#$HOME/.dark-factory/logs#g" \
+  -e "s#__PROGRAM_ARGUMENTS__#        <string>$factoryd</string>#g" \
+  -e "s#__DARK_FACTORY_HOME__#$HOME/.dark-factory#g" \
   -e "s#__PATH__#$(dirname "$(command -v claude)"):$(dirname "$(command -v codex)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin#g" \
   launchd/com.dark-factory.factoryd.plist.template \
   > ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
 chmod 0600 ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
+mkdir -p ~/.dark-factory/logs && chmod 0700 ~/.dark-factory ~/.dark-factory/logs
 
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
 launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd
 ```
 
-Adjust the substituted paths to wherever `factoryd`/`factory-runner`/
-`factoryctl` and `$DARK_FACTORY_HOME` actually live on this machine; the
-values above are only an example. `--max-active-runs` (default 4, enforced
-by the dispatcher as a hard cap on live sessions) is not templated here --
-append `--max-active-runs N` to `ProgramArguments` yourself if the default
-needs overriding.
+`--max-active-runs` (default 4, enforced by the dispatcher as a hard cap on
+live sessions) and any other `factoryd` flag go into `ProgramArguments` as
+further `<string>` elements; `factoryctl update --install` carries them
+over when it rewrites the job (only `--runner`/`--factoryctl` are dropped,
+since they must point at the newly activated binaries). A rewritten job
+must be `bootout`/`bootstrap`ed, not just `kickstart`ed — launchd caches
+`ProgramArguments`.
 
 Subscription headroom has no background service or log: run `factoryctl
 usage` on demand in a terminal instead.

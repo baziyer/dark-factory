@@ -71,9 +71,10 @@ scoped automatically via `$DARK_FACTORY_PROJECT`/`$DARK_FACTORY_AGENT` — so
 
 ## Later: distribution
 
-- Design in [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md)
-  (not implemented): a hosted release manifest, `factoryctl update`, and an
-  in-terminal update signal, ahead of npm/Homebrew packaging.
+- Releases, `factoryctl update [--install]`, and the in-terminal update
+  signal exist (see [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md));
+  `factoryctl init`/`doctor` are next, then a Homebrew tap and an npm
+  wrapper over the same release assets.
 
 ## Product boundaries
 
