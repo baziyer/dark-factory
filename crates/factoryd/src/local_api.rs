@@ -555,7 +555,10 @@ async fn handle_request(
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
-        LocalRequest::Health => Ok(LocalResponse::Health),
+        LocalRequest::Health => Ok(LocalResponse::Health {
+            runner_path: execution.runner_program().to_string_lossy().into_owned(),
+            factoryctl_path: execution.factoryctl_path().to_string_lossy().into_owned(),
+        }),
         LocalRequest::CreateProject { id, name, root } => {
             let name = required_text("project name", name, 160)?;
             let root = canonical_root(root).await?;

@@ -121,10 +121,16 @@ commands expose `--after` and `--limit` cursors. Event subscriptions emit
 their durable replay boundary and a `caught_up` frame before live events.
 
 By default `factoryd` starts the sibling `factory-runner`, resolves `codex`
-and `claude` through the sanitized launch environment, stores session runtime
-state under `$DARK_FACTORY_HOME/runs`, and allows four concurrently active
-sessions. Use `--runner`, `--factoryctl`, `--codex`, `--claude`,
-`--runtime-root`, and `--max-active-runs` to set those explicitly. A resident
+and `claude` by bare name through each session's sanitized `PATH` (no
+`--codex`/`--claude` override -- there is nothing daemon-side to configure
+per provider binary; a provider process is resolved the same way an
+operator's own shell would resolve it), stores session runtime state under
+`$DARK_FACTORY_HOME/runs`, and allows four concurrently active sessions.
+Use `--runner`, `--factoryctl`, `--runtime-root`, and `--max-active-runs`
+to set those explicitly; `factoryd` refuses to start if `--runner`/
+`--factoryctl` do not resolve to an executable file (build the workspace
+first: `cargo build --workspace`), and `health` reports both resolved
+paths. A resident
 session has no daemon-enforced turn or budget cap (that was a print-mode-only
 concept; resident sessions deliberately omit `--max-turns`/`--max-budget-usd`
 and run until the operator stops them or the provider process exits on its

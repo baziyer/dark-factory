@@ -91,7 +91,10 @@ fn health_prints_exactly_one_machine_readable_server_frame() {
             &mut stream,
             &ServerFrame::Response {
                 protocol_version: PROTOCOL_VERSION,
-                response: LocalResponse::Health,
+                response: LocalResponse::Health {
+                    runner_path: "/opt/factory-runner".to_owned(),
+                    factoryctl_path: "/opt/factoryctl".to_owned(),
+                },
             },
         )
         .unwrap();
@@ -112,7 +115,7 @@ fn health_prints_exactly_one_machine_readable_server_frame() {
     assert!(matches!(
         serde_json::from_slice::<ServerFrame>(&output.stdout).unwrap(),
         ServerFrame::Response {
-            response: LocalResponse::Health,
+            response: LocalResponse::Health { .. },
             ..
         }
     ));
@@ -474,7 +477,13 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
         // The request having reached the daemon with the env-resolved
         // project ID, matched above, is what this test is checking; the
         // response contents are irrelevant, so a minimal frame is enough.
-        write_response(&mut stream, LocalResponse::Health);
+        write_response(
+            &mut stream,
+            LocalResponse::Health {
+                runner_path: "/opt/factory-runner".to_owned(),
+                factoryctl_path: "/opt/factoryctl".to_owned(),
+            },
+        );
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
@@ -516,7 +525,13 @@ fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable(
         );
         assert_eq!(recipient_agent_id, AgentId::try_from("god").unwrap());
         assert_eq!(body, "status update");
-        write_response(&mut stream, LocalResponse::Health);
+        write_response(
+            &mut stream,
+            LocalResponse::Health {
+                runner_path: "/opt/factory-runner".to_owned(),
+                factoryctl_path: "/opt/factoryctl".to_owned(),
+            },
+        );
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))

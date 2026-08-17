@@ -29,7 +29,10 @@ fn request_writes_one_json_line_and_reads_one_versioned_frame() {
 
         let frame = ServerFrame::Response {
             protocol_version: PROTOCOL_VERSION,
-            response: LocalResponse::Health,
+            response: LocalResponse::Health {
+                runner_path: "/opt/factory-runner".to_owned(),
+                factoryctl_path: "/opt/factoryctl".to_owned(),
+            },
         };
         serde_json::to_writer(&mut stream, &frame).unwrap();
         stream.write_all(b"\n").unwrap();
@@ -40,7 +43,10 @@ fn request_writes_one_json_line_and_reads_one_versioned_frame() {
         frame,
         ServerFrame::Response {
             protocol_version: PROTOCOL_VERSION,
-            response: LocalResponse::Health,
+            response: LocalResponse::Health {
+                runner_path: "/opt/factory-runner".to_owned(),
+                factoryctl_path: "/opt/factoryctl".to_owned(),
+            },
         }
     );
     server.join().unwrap();

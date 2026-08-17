@@ -34,6 +34,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .compact()
         .init();
     let config = parse_config()?;
+    preflight_sibling_binaries(&config)?;
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
@@ -324,6 +325,31 @@ fn next_path(
 
 fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(factory_core::paths::dark_factory_home()?)
+}
+
+/// Refuses to start with a one-line actionable error if `factory-runner`
+/// or `factoryctl` do not resolve to an executable regular file (this
+/// track's item 2): `cargo run -p factoryd` only builds `factoryd`
+/// itself, not its sibling binaries (`README.md`'s "get an agent working"
+/// walkthrough), so the previous behavior -- start fine, then fail every
+/// session spawn silently, forever, with no trace outside the daemon's own
+/// log -- was exactly the operator footgun this track's item 1 also had to
+/// repair defenses around. This is a stricter, cheaper, startup-time
+/// version of the same check `runner_process::spawn_runner` runs on every
+/// individual spawn attempt (`checked_executable`, shared here rather than
+/// duplicated).
+fn preflight_sibling_binaries(config: &Config) -> Result<(), String> {
+    for (role, path) in [
+        ("runner", &config.runner),
+        ("factoryctl", &config.factoryctl),
+    ] {
+        if let Err(error) = factoryd::runner_process::checked_executable(path, role) {
+            return Err(format!(
+                "{error}; build the workspace: cargo build --workspace"
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

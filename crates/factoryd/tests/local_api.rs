@@ -113,7 +113,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
             health,
             ServerFrame::Response {
                 protocol_version: PROTOCOL_VERSION,
-                response: LocalResponse::Health
+                response: LocalResponse::Health { .. }
             }
         ));
 
@@ -379,7 +379,7 @@ async fn the_frame_limit_counts_json_but_not_the_newline_delimiter() {
         assert!(matches!(
             raw_request(&socket, &exact).await,
             ServerFrame::Response {
-                response: LocalResponse::Health,
+                response: LocalResponse::Health { .. },
                 ..
             }
         ));

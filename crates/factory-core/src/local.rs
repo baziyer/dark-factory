@@ -367,7 +367,15 @@ pub enum ErrorCode {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalResponse {
-    Health,
+    /// The resolved, canonical paths `factoryd` is actually using for its
+    /// two sibling binaries -- both already confirmed executable at
+    /// startup by the daemon's own preflight (see `factoryd::main`'s
+    /// `preflight_sibling_binaries`), so a healthy response is always a
+    /// guarantee, not just a snapshot of configuration.
+    Health {
+        runner_path: String,
+        factoryctl_path: String,
+    },
     ProjectCreated {
         project: ProjectSnapshot,
     },

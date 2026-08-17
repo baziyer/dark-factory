@@ -479,7 +479,14 @@ fn resolve_executable(
     }
 }
 
-fn checked_executable(program: &Path, role: &'static str) -> Result<PathBuf, Error> {
+/// Confirms `program` (a trusted absolute path -- no `PATH` search, unlike
+/// [`resolve_executable`]) resolves to an executable regular file. `pub`
+/// (not just crate-visible) so `factoryd`'s own startup preflight
+/// (`main.rs`) can run the exact same check against `factory-runner`/
+/// `factoryctl` before claiming any daemon state, turning a would-be
+/// silent spawn failure at first task delivery into a refusal to start
+/// (this track's item 2).
+pub fn checked_executable(program: &Path, role: &'static str) -> Result<PathBuf, Error> {
     let canonical = match fs::canonicalize(program) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

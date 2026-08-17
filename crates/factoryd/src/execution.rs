@@ -193,6 +193,23 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// The trusted, already-preflight-checked (`main.rs`'s
+    /// `preflight_sibling_binaries`) path to `factory-runner`. Exposed for
+    /// `LocalRequest::Health` (`local_api.rs`) so `factoryctl health`
+    /// reports exactly what the daemon is actually using, not just its
+    /// own configuration.
+    #[must_use]
+    pub fn runner_program(&self) -> &Path {
+        &self.config.runner_program
+    }
+
+    /// The trusted, already-preflight-checked path to `factoryctl`. See
+    /// [`Handle::runner_program`].
+    #[must_use]
+    pub fn factoryctl_path(&self) -> &Path {
+        &self.config.factoryctl_path
+    }
+
     /// Opens a task-episode inside the agent's live, idle session right
     /// now (bypassing FIFO order -- the operator asked for this exact
     /// task), then makes a best-effort attempt to type its instructions in
