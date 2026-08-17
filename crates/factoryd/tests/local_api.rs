@@ -1457,6 +1457,140 @@ async fn a_failed_guidance_removal_leaves_the_agent_retryable_not_half_deleted()
     .await;
 }
 
+/// Regression test for PR #50's re-review, new blocking finding: a
+/// *refused* `DeleteAgent` must not destroy the agent's guidance files.
+/// `delete_agent_locked`'s reordering (should-fix 4: files before the DB
+/// row, so a removal failure is retryable) meant every one of
+/// `store.delete_agent`'s own preconditions -- which live inside its
+/// transaction, the very last step -- started running *after* the files
+/// were already gone. Reproduces the review's exact repro: a parent agent
+/// with a child cannot be deleted (`AgentHasChildren`), which used to be
+/// exactly the moment its `instructions.md` got wiped anyway.
+/// `delete_agent_locked` now calls `store.check_agent_deletable` first, so
+/// this refusal costs no files at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_delete_agent_leaves_every_file_intact() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("boss"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Shell,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateAgent {
+                    id: agent_id("minion"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: Some(agent_id("boss")),
+                    role: factory_core::AgentRole::Worker,
+                    provider: factory_core::Provider::Shell,
+                    model: None,
+                    worktree: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentCreated { .. },
+                ..
+            }
+        ));
+
+        const MARKER: &str = "PLEASE DO NOT LOSE THIS";
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::UpdateAgentProfile {
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("boss"),
+                    model: None,
+                    permission_mode: None,
+                    instructions: MARKER.into(),
+                    memory: String::new(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentProfileUpdated { .. },
+                ..
+            }
+        ));
+
+        let deleted = request(
+            &socket,
+            LocalRequest::DeleteAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("boss"),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                deleted,
+                ServerFrame::Response {
+                    response: LocalResponse::Error {
+                        code: ErrorCode::Conflict,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "a parent agent must be refused, not deleted, got {deleted:?}"
+        );
+
+        let fetched = request(
+            &socket,
+            LocalRequest::GetAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("boss"),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                &fetched,
+                ServerFrame::Response {
+                    response: LocalResponse::Agent { agent },
+                    ..
+                } if agent.profile.instructions == MARKER
+            ),
+            "instructions.md must survive a refused delete untouched, got {fetched:?}"
+        );
+    })
+    .await;
+}
+
 /// `CreateAgent.worktree` validates an operator override (D3): rejects a
 /// non-existent path, accepts and durably records an existing one.
 /// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the

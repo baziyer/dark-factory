@@ -1366,8 +1366,29 @@ async fn handle_request(
                     .get("stop_hook_active")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
-                execution::stop_hook_reply(state, guidance_root, &updated_session, stop_hook_active)
-                    .await?
+                // Deletion invariant (ARCHITECTURE.md #9, PR #50 re-review
+                // correction): `stop_hook_reply` calls `compose_delivery`,
+                // which can lazily recreate this agent's guidance files
+                // the same way `deliver_pending`'s does -- gated the same
+                // way, at this call site, since `execution` and `agent_id`
+                // are already in scope here. A decline replies `{}`,
+                // matching `stop_hook_active`'s own silent reply just
+                // above: this is a live provider process's own hook call,
+                // not an operator request it can retry, so nothing here
+                // surfaces as an error into it.
+                if execution.try_begin_agent_write(&agent_id) {
+                    let result = execution::stop_hook_reply(
+                        state,
+                        guidance_root,
+                        &updated_session,
+                        stop_hook_active,
+                    )
+                    .await;
+                    execution.end_agent_write(&agent_id);
+                    result?
+                } else {
+                    serde_json::json!({})
+                }
             } else {
                 serde_json::json!({})
             };
@@ -1378,12 +1399,19 @@ async fn handle_request(
                 // the dispatcher's own separate ack-detection/commit
                 // (`execution::commit_pending_delivery_on_prompt`'s own
                 // doc comment has the full story; this track's item 1).
-                execution::commit_pending_delivery_on_prompt(
-                    state,
-                    guidance_root,
-                    &updated_session,
-                )
-                .await?;
+                // Same deletion gate as the stop-hook reply above, and the
+                // same silent-decline reasoning: `compose_delivery` inside
+                // it can lazily recreate guidance files too.
+                if execution.try_begin_agent_write(&agent_id) {
+                    let result = execution::commit_pending_delivery_on_prompt(
+                        state,
+                        guidance_root,
+                        &updated_session,
+                    )
+                    .await;
+                    execution.end_agent_write(&agent_id);
+                    result?;
+                }
             }
             if event == ProviderHookEvent::SessionStart {
                 // Codex reports its own thread id back in this hook's
@@ -1749,34 +1777,37 @@ async fn provision_agent_worktree(
 /// Runs the file/database work of `DeleteAgent`, called only after
 /// `execution.begin_delete` has confirmed no spawn preparation can still be
 /// mid-write into this agent's guidance directory (ARCHITECTURE.md's
-/// deletion invariant): removes the git worktree and the guidance
-/// directory, *then* deletes the ledger row (PR #50 review, should-fix 4).
-/// Owned files go first so a failure here (a permission problem, an
-/// unexpected file -- not the race this task closes, since the drain
-/// already ran) leaves the row intact and the request retryable, rather
-/// than a ledger entry that's gone while its files linger with no
-/// `DeleteAgent` left to target them. This mirrors the ordering
-/// `remove_agent_worktree_if_any` already used before this change, one
-/// level up.
+/// deletion invariant): checks `store.check_agent_deletable` first, then
+/// removes the git worktree and the guidance directory, *then* deletes the
+/// ledger row (PR #50 re-review's blocking finding).
 ///
-/// Residual, pre-existing edge case this ordering does not add and does
-/// not fix: if the agent has a genuinely live session (not just an
-/// in-flight preparation the drain above already waited out), the store
-/// transaction below still correctly refuses with `AgentHasLiveSession`
-/// -- but its worktree and guidance directory have already been removed
-/// by then, out from under that live session. That was already true for
-/// the worktree before this PR; extending the same ordering to guidance
-/// keeps behavior consistent rather than introducing a second, opposite
-/// inconsistency, but does not close it. A full fix (a cheap live-session
-/// precheck, or deferring file removal until the transaction's own
-/// precondition is confirmed) is a follow-up, not folded into this PR to
-/// keep its diff to what #42 and this review need.
+/// The precheck exists because a refusal must be completely side-effect
+/// free: `store.delete_agent`'s own preconditions (`AgentHasActiveRun`,
+/// `AgentHasLiveSession`, `AgentHasChildren`, `AgentRunHasDependents`) live
+/// *inside* its transaction, which only runs after the files below are
+/// already gone -- so without this check, the single most ordinary operator
+/// mistake ("delete a busy or parent agent") answered `Conflict` while
+/// silently destroying `instructions.md`/`memory.md`, a data-loss
+/// regression a re-review caught and reproduced through the public API
+/// (`UpdateAgentProfile` writes distinctive instructions, `DeleteAgent` on
+/// a parent answers `AgentHasChildren`, `instructions.md` is gone). The
+/// precheck is sound run here, right after `execution.begin_delete`'s
+/// drain and before any file is touched: the deletion gate already rules
+/// out a *new* session appearing between this read and the removals below,
+/// which is the only way `check_agent_deletable`'s answer could go stale
+/// before `delete_agent`'s own transaction re-confirms it as the
+/// authoritative last word.
 async fn delete_agent_locked(
     state: &ApiState,
     guidance_root: &Path,
     project_id: ProjectId,
     agent_id: AgentId,
 ) -> Result<(), ApiFailure> {
+    let check_project_id = project_id.clone();
+    let check_agent_id = agent_id.clone();
+    state
+        .with_store(move |store| store.check_agent_deletable(&check_project_id, &check_agent_id))
+        .await?;
     remove_agent_worktree_if_any(state, &project_id, &agent_id).await?;
     remove_agent_guidance(guidance_root, &project_id, &agent_id).await?;
     state
@@ -1866,16 +1897,21 @@ async fn remove_agent_worktree_if_any(
 
 /// Runs the file/database work of `DeleteProject`, called only after
 /// `execution.begin_delete_project` and every one of the project's agents
-/// has been through `execution.begin_delete` (its caller's loop): removes
-/// the project's whole guidance directory tree (which contains every one
-/// of those agents'), *then* deletes the ledger row. Same reordering and
-/// same residual live-session caveat as [`delete_agent_locked`], one level
-/// up (PR #50 review, should-fix 4).
+/// has been through `execution.begin_delete` (its caller's loop): checks
+/// `store.check_project_deletable` first (same reasoning as
+/// [`delete_agent_locked`]'s precheck -- `ProjectHasActiveRun` must refuse
+/// before `projects/<p>/`, which holds every one of the project's agents'
+/// worktrees, is removed, not after), then removes the project's whole
+/// guidance directory tree, *then* deletes the ledger row.
 async fn delete_project_locked(
     state: &ApiState,
     guidance_root: &Path,
     project_id: ProjectId,
 ) -> Result<(), ApiFailure> {
+    let check_project_id = project_id.clone();
+    state
+        .with_store(move |store| store.check_project_deletable(&check_project_id))
+        .await?;
     remove_project_guidance(guidance_root, &project_id).await?;
     state
         .commit_and_publish(move |store| {

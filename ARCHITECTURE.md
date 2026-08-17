@@ -98,17 +98,31 @@ catalogue.
    and a fresh write can never race past each other. `DeleteAgent`/
    `DeleteProject` set the mark first, then wait (bounded, 5s) for
    `preparing` to reach zero; every gated writer below participates by
-   wrapping its write in the same check-in/check-out pair. Once a delete's
-   wait returns, it removes the identity's owned files, *then* its database
-   row (files first, so a removal failure — unrelated to this race, e.g. a
-   permission problem — leaves the row intact and the request retryable,
-   rather than a ledger entry with no request left able to target its
-   leftover files); a removal that still fails is the request's own error,
-   never a log line and a swallowed failure.
+   wrapping its write in the same check-in/check-out pair. Once the wait
+   returns, the delete re-checks — read-only, no side effects yet — that
+   its own database precondition would actually pass right now
+   (`Store::check_agent_deletable`/`check_project_deletable`: no active
+   run, no live session, no children, no dependent runs; the identity's
+   deletion mark already rules out a *new* one appearing before the
+   database delete's own transaction re-confirms it as the authoritative
+   last word), so an agent or project that in fact cannot be deleted is
+   refused before any file is touched, not after. Only then does it remove
+   the identity's owned files, *then* its database row (files first, so a
+   removal failure — unrelated to this race, e.g. a permission problem —
+   leaves the row intact and the request retryable, rather than a ledger
+   entry with no request left able to target its leftover files); a
+   removal that still fails is the request's own error, never a log line
+   and a swallowed failure.
    - Agent-scoped (`AgentId` gate, embedded in `SpawnBackoff`): gates the
      dispatcher's spawn preparation (composing guidance, writing a
      provider's generated config), an idle session's delivery composition
-     (`compose_text`'s `guidance::read_or_create`), and the local-API
+     (`deliver_pending`), a `Stop`/`SubagentStop` hook's delivery reply
+     (`stop_hook_reply`) and a `UserPromptSubmit` hook's pending-delivery
+     commit (`commit_pending_delivery_on_prompt`) — both reached directly
+     from the local control API's `ProviderHook` handler, not through the
+     dispatcher, and both declining silently (matching the hook contract:
+     a live provider process's own hook call is not a request it can
+     retry) rather than surfacing an error into the provider — and the
      handlers that read-or-lazily-create or overwrite an agent's guidance
      files outside the dispatcher (`GetAgent`/`AgentStatus`,
      `UpdateAgentProfile`).
@@ -117,14 +131,6 @@ catalogue.
      agent id — the one writer a `DeleteProject` already in progress can
      never have covered through the agent-scoped gate above, since that id
      didn't exist yet for it to mark.
-   - Known gap, not gated: a `Stop`/`SubagentStop` hook reply
-     (`stop_hook_reply`, reached directly from the local control API's
-     `ProviderHook` handler, not through the dispatcher) composes a
-     delivery the same way the dispatcher's idle-session path does, but
-     without access to the execution manager's gate from that call chain.
-     Reaching it requires a live session to end its episode exactly while
-     a delete is draining — narrow, and left as a follow-up rather than
-     threading the gate through the hook-reply path in this change.
 
 ## First launch
 
