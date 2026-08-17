@@ -40,8 +40,10 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
   maintainer has to choose, not code) — anything `size:S` is a reasonable
   first change. Found a new one? Open an issue with the bug template and
   label it `known-issue`; a fix closes it in the same PR (`Closes #N`).
-  (The initial batch, #24–#40, was imported from an earlier
-  `docs/KNOWN-ISSUES.md` at commit `cc221e1`.)
+  Batches found during a dogfood run are triaged first in a local,
+  gitignored note under `docs/internal/` and turned into issues with
+  `scripts/import-issues.sh <note.md>` (one issue per `###` section; #24–#40
+  and #59–#76 came in that way).
 - **A new provider**: see [docs/providers.md](docs/providers.md) — the
   whole contract is one `Provider` trait (`spawn_spec` + `capabilities`)
   in `crates/factoryd/src/providers/mod.rs`. `shell.rs` is the minimal
