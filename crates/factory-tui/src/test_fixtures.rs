@@ -5,7 +5,8 @@
 
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, ObserverHealth, ProjectId, ProjectSnapshot, Provider, RunId,
-    RunSnapshot, RunStatus, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    RunSnapshot, RunStatus, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    TaskSnapshot, TaskStatus,
 };
 
 pub(crate) fn project(id: &str, created_at_ms: i64) -> ProjectSnapshot {
@@ -36,6 +37,37 @@ pub(crate) fn agent(
         worktree: None,
         created_at_ms: 0,
         updated_at_ms: 0,
+    }
+}
+
+pub(crate) fn session(
+    id: &str,
+    agent_id: &str,
+    project: &str,
+    state: SessionState,
+) -> SessionSnapshot {
+    SessionSnapshot {
+        id: SessionId::try_from(id).unwrap(),
+        project_id: ProjectId::try_from(project).unwrap(),
+        agent_id: AgentId::try_from(agent_id).unwrap(),
+        provider: Provider::ClaudeCode,
+        state,
+        state_since_ms: 0,
+        worktree: "/work".into(),
+        provider_session_id: None,
+        current_run_id: None,
+        activity: None,
+        activity_inferred: false,
+        last_hook_event: None,
+        last_hook_at_ms: None,
+        wait_reason: None,
+        observer_health: ObserverHealth::Unknown,
+        observer_health_since_ms: 0,
+        started_at_ms: 0,
+        updated_at_ms: 0,
+        ended_at_ms: None,
+        exit_code: None,
+        exit_signal: None,
     }
 }
 

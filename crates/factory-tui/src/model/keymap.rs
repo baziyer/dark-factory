@@ -698,7 +698,7 @@ impl Board {
     }
 
     fn begin_message_agent(&mut self) -> Intent {
-        let Some(agent_id) = self.selected_agent.clone() else {
+        let Some(agent_id) = self.pane_target_agent() else {
             self.set_status("no agent selected", StatusLevel::Error);
             return Intent::Redraw;
         };
@@ -765,7 +765,7 @@ impl Board {
     }
 
     fn begin_stop_selected(&mut self) -> Intent {
-        let Some(agent_id) = self.selected_agent.clone() else {
+        let Some(agent_id) = self.pane_target_agent() else {
             self.set_status("no agent selected", StatusLevel::Error);
             return Intent::Redraw;
         };
@@ -1160,8 +1160,8 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 mod tests {
     use super::*;
     use crate::model::state::AgentState;
-    use crate::test_fixtures::{agent, project, run, task};
-    use factory_core::{AgentRole, RunStatus, TaskStatus};
+    use crate::test_fixtures::{agent, project, run, session, task};
+    use factory_core::{AgentRole, RunStatus, SessionState, TaskStatus};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1812,6 +1812,98 @@ mod tests {
             board.terminals_focused_pane(),
             Some(SessionId::try_from("dev-alice").unwrap())
         );
+    }
+
+    fn board_with_alice_selected_but_only_orch_live() -> Board {
+        let mut board = board_in_workshop();
+        let orch_id = AgentId::try_from("orch").unwrap();
+        let mut orch = board.agents.get(&orch_id).unwrap().clone();
+        orch.current_session_id = Some(SessionId::try_from("sess-orch").unwrap());
+        board.agents.insert(orch_id, orch);
+        board.sessions.insert(
+            SessionId::try_from("sess-orch").unwrap(),
+            session("sess-orch", "orch", "proj", SessionState::Working),
+        );
+        board.view = View::Terminals;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board
+    }
+
+    #[test]
+    fn typing_label_follows_the_pane_fallback_not_the_pane_less_selected_agent() {
+        let mut board = board_with_alice_selected_but_only_orch_live();
+        board.pane_mode = PaneMode::Typing;
+        assert_eq!(
+            board.terminals_focused_pane(),
+            Some(SessionId::try_from("sess-orch").unwrap()),
+            "sanity: the pane fallback should have landed on orch"
+        );
+
+        let text = board.help_text();
+        assert!(
+            text.contains("orch"),
+            "label should follow the fallback: {text}"
+        );
+        assert!(
+            !text.contains("alice"),
+            "label must not name the pane-less selected agent: {text}"
+        );
+    }
+
+    #[test]
+    fn typing_status_line_never_advertises_forwarded_keys() {
+        let mut board = board_with_alice_selected_but_only_orch_live();
+        board.pane_mode = PaneMode::Typing;
+
+        let text = board.help_text();
+        assert!(
+            !text.contains("1-4"),
+            "1-4 is forwarded while typing: {text}"
+        );
+        assert!(
+            !text.contains("q detach"),
+            "q is forwarded while typing: {text}"
+        );
+        assert!(
+            text.contains("Ctrl-]"),
+            "the one key that actually escapes typing must still be listed: {text}"
+        );
+
+        // And it's not just the hint text lying - the keys really are forwarded, not dispatched.
+        let intent = board.handle_key(key(KeyCode::Char('1')));
+        assert!(matches!(intent, Intent::ForwardKey(_)));
+        assert_eq!(
+            board.view,
+            View::Terminals,
+            "1 must not have switched views"
+        );
+    }
+
+    #[test]
+    fn m_and_x_target_the_pane_fallback_not_the_pane_less_selected_agent() {
+        let mut board = board_with_alice_selected_but_only_orch_live();
+        board.pane_mode = PaneMode::Board;
+
+        board.handle_key(key(KeyCode::Char('m')));
+        match &board.mode {
+            Mode::Prompt(prompt) => assert_eq!(
+                prompt.kind,
+                PromptKind::MessageAgent(AgentId::try_from("orch").unwrap()),
+                "m must message the agent whose pane is focused, not the pane-less selection"
+            ),
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        board.mode = Mode::Normal;
+
+        board.handle_key(key(KeyCode::Char('x')));
+        match &board.mode {
+            Mode::Confirm(PendingAction::StopSession { session_id, .. }) => assert_eq!(
+                session_id,
+                &SessionId::try_from("sess-orch").unwrap(),
+                "x must stop the focused agent's session"
+            ),
+            other => panic!("expected stop-session confirmation, got {other:?}"),
+        }
     }
 
     #[test]
