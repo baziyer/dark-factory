@@ -16,7 +16,7 @@
 
 use std::{
     ffi::OsString,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
 };
 
@@ -394,8 +394,21 @@ fn seed_rules_directory(
         return Ok(());
     };
     let source_rules_dir = source_home.join("rules");
-    let Ok(entries) = fs::read_dir(&source_rules_dir) else {
-        return Ok(());
+    // `NotFound` is the expected common case -- most operators have no
+    // `~/.codex/rules/` at all (same fallback shape as `config.toml`'s own
+    // "no ~/.codex/config.toml was found"). Any other error (e.g. the
+    // directory exists but is unreadable) is surfaced rather than treated
+    // identically to "nothing to copy" (review round 2 finding D, same
+    // reasoning as `ensure_factoryctl_rule_present`'s own fix below).
+    let entries = match fs::read_dir(&source_rules_dir) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ProviderError::Seed {
+                path: source_rules_dir,
+                source,
+            });
+        }
     };
     let rules_dir = codex_home.join("rules");
     for entry in entries.flatten() {
@@ -410,9 +423,17 @@ fn seed_rules_directory(
         if destination.exists() {
             continue;
         }
-        let Ok(contents) = fs::read(&path) else {
-            continue;
-        };
+        // A real read failure here (permission denied, a race where the
+        // file disappeared after `read_dir` listed it) must not be
+        // treated as "nothing to copy" and silently skipped: an
+        // operator's own forbid rule failing to reach a fresh agent, with
+        // no error anywhere, is exactly the silent-fallback AGENTS.md
+        // rule 3 forbids -- fail the spawn instead, like every other
+        // write in this file.
+        let contents = fs::read(&path).map_err(|source| ProviderError::Seed {
+            path: path.clone(),
+            source,
+        })?;
         hooks::write_private_file(&destination, &contents).map_err(|source| {
             ProviderError::Seed {
                 path: destination.clone(),
@@ -434,10 +455,39 @@ fn seed_rules_directory(
 /// touches a file that does not yet exist. Never removes anything already
 /// in the file -- an operator's own `forbid` rules, or another `prefix_rule`
 /// Codex wrote, are left exactly as they were.
+///
+/// Skips the append if the file already mentions `factoryctl` *at all*,
+/// not just this exact `allow` line (review round 2 finding E): an
+/// operator whose copied-forward rules already carry, say,
+/// `prefix_rule(pattern=["factoryctl"], decision="forbid")` must not get
+/// an `allow` appended right next to it -- which decision Codex's own
+/// conflict resolution would then apply between the two is not established
+/// here, so the safer default is to leave an operator's own existing
+/// decision about `factoryctl` alone entirely rather than add a second,
+/// possibly contradictory one.
+///
+/// A missing file is the legitimate empty case (`ErrorKind::NotFound`,
+/// e.g. no operator source home at all) and starts from an empty string;
+/// any *other* read failure (permission denied, non-UTF-8 content, a
+/// transient I/O error) must not be treated the same way -- review round 2
+/// finding D: this runs on a file `seed_rules_directory` may have just
+/// copied an operator's own `forbid` rules into, and folding a real read
+/// failure into "empty file" would overwrite them with a file containing
+/// only the `factoryctl` rule, silently destroying them. Fails the spawn
+/// instead, like every other write in this module.
 fn ensure_factoryctl_rule_present(codex_home: &Path) -> Result<(), ProviderError> {
     let rules_path = codex_home.join("rules").join("default.rules");
-    let existing = fs::read_to_string(&rules_path).unwrap_or_default();
-    if existing.contains(FACTORYCTL_PREFIX_RULE.trim_end()) {
+    let existing = match fs::read_to_string(&rules_path) {
+        Ok(contents) => contents,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(source) => {
+            return Err(ProviderError::Seed {
+                path: rules_path,
+                source,
+            });
+        }
+    };
+    if existing.contains("factoryctl") {
         return Ok(());
     }
     let mut updated = existing;
@@ -980,6 +1030,35 @@ mod provider_tests {
         assert!(
             contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()),
             "an existing agent must retroactively get the factoryctl rule too"
+        );
+    }
+
+    /// Adversarial review round 2, finding E: an operator's own explicit
+    /// `factoryctl` decision -- even a `forbid` -- must never get a second,
+    /// possibly contradictory `allow` appended next to it.
+    #[test]
+    fn an_existing_factoryctl_forbid_rule_never_gets_an_allow_appended_next_to_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        let rules_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("rules")
+            .join("default.rules");
+        fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
+        let forbid_rule = "prefix_rule(pattern=[\"factoryctl\"], decision=\"forbid\")\n";
+        fs::write(&rules_path, forbid_rule).unwrap();
+
+        CodexProvider::with_source_home(directory.path().join("missing"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let contents = fs::read_to_string(&rules_path).unwrap();
+        assert_eq!(
+            contents, forbid_rule,
+            "an operator's own factoryctl decision must be left completely alone, \
+             not have an allow appended next to it"
         );
     }
 
