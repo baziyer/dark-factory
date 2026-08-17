@@ -492,3 +492,137 @@ fn queued_and_idle_capacity_counts() {
     // Both alice and bob are idle (no run/session); orchestrator is excluded from capacity.
     assert_eq!(b.idle_capacity_count(&project_id), 2);
 }
+
+// -- task detail (lazy GetTask fetch) ------------------------------------------------------
+
+#[test]
+fn task_detail_needs_fetch_is_true_for_a_never_fetched_task() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        Vec::new(),
+        vec![task("t1", "a", TaskStatus::Queued, None, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(b.task_detail_needs_fetch(&TaskId::try_from("t1").unwrap()));
+}
+
+#[test]
+fn task_detail_needs_fetch_is_false_for_an_unknown_task() {
+    let b = board();
+    assert!(!b.task_detail_needs_fetch(&TaskId::try_from("nonexistent").unwrap()));
+}
+
+#[test]
+fn begin_task_detail_fetch_marks_pending_and_dedupes_in_flight_requests() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        Vec::new(),
+        vec![task("t1", "a", TaskStatus::Queued, None, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let id = TaskId::try_from("t1").unwrap();
+
+    let project_id = b.begin_task_detail_fetch(&id);
+    assert_eq!(project_id.map(|p| p.to_string()), Some("a".to_owned()));
+    assert!(b.is_task_detail_pending(&id));
+
+    // A second call before the response lands is a no-op - one already in flight.
+    assert_eq!(b.begin_task_detail_fetch(&id), None);
+}
+
+#[test]
+fn apply_task_detail_result_merges_detail_and_marks_it_synced() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        Vec::new(),
+        vec![task("t1", "a", TaskStatus::Queued, None, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let id = TaskId::try_from("t1").unwrap();
+    assert!(b.begin_task_detail_fetch(&id).is_some());
+
+    let mut fetched = task("t1", "a", TaskStatus::Queued, None, 0);
+    fetched.body = "do the thing".to_owned();
+    fetched.result = Some("done".to_owned());
+    b.apply_task_detail_result(id.clone(), Ok(LocalResponse::Task { task: fetched }));
+
+    assert!(!b.is_task_detail_pending(&id));
+    assert!(!b.task_detail_needs_fetch(&id));
+    let cached = b.tasks.get(&id).unwrap();
+    assert_eq!(cached.body, "do the thing");
+    assert_eq!(cached.result.as_deref(), Some("done"));
+}
+
+/// The bug this track fixes: `TaskChanged` only ever carries the durable snapshot (see
+/// `apply_event`'s doc comment), so a task that completes after its detail was already fetched
+/// once needs a *fresh* fetch to pick up its `result` - `updated_at_ms` moving past what was
+/// last synced is exactly the signal `task_detail_needs_fetch` watches for.
+#[test]
+fn a_task_changed_event_past_the_synced_version_requires_a_fresh_fetch() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        Vec::new(),
+        vec![task("t1", "a", TaskStatus::Queued, None, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let id = TaskId::try_from("t1").unwrap();
+    assert!(b.begin_task_detail_fetch(&id).is_some());
+    let mut fetched = task("t1", "a", TaskStatus::Queued, None, 0);
+    fetched.body = "hello".to_owned();
+    b.apply_task_detail_result(id.clone(), Ok(LocalResponse::Task { task: fetched }));
+    assert!(!b.task_detail_needs_fetch(&id));
+
+    let mut newer = task("t1", "a", TaskStatus::Succeeded, None, 0).snapshot;
+    newer.updated_at_ms = 1;
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1,
+        event: FactoryEvent::TaskChanged { task: newer },
+    });
+
+    assert_eq!(
+        b.tasks.get(&id).unwrap().body,
+        "hello",
+        "old detail preserved meanwhile - see apply_event's TaskChanged arm"
+    );
+    assert!(
+        b.task_detail_needs_fetch(&id),
+        "should read as stale once the snapshot moved past the last synced version"
+    );
+}
+
+#[test]
+fn apply_task_detail_result_clears_pending_on_failure_so_it_can_retry() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        Vec::new(),
+        vec![task("t1", "a", TaskStatus::Queued, None, 0)],
+        Vec::new(),
+        Vec::new(),
+    );
+    let id = TaskId::try_from("t1").unwrap();
+    assert!(b.begin_task_detail_fetch(&id).is_some());
+    assert!(b.is_task_detail_pending(&id));
+
+    b.apply_task_detail_result(id.clone(), Err("timed out".to_owned()));
+
+    assert!(!b.is_task_detail_pending(&id));
+    assert!(
+        b.task_detail_needs_fetch(&id),
+        "still needs a fetch - the first one failed"
+    );
+    assert!(
+        b.begin_task_detail_fetch(&id).is_some(),
+        "a failed fetch must be retryable, not stuck pending forever"
+    );
+}

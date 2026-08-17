@@ -48,7 +48,12 @@ FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4)
 - **WORKSHOP** — one focused project: its task queue (status glyphs, assignee), its agent
   hierarchy as an indented tree (orchestrator → workers → sub-agents, with state, a braille
   activity sparkline, and wait-reason/activity text), and a detail pane for whichever item is
-  selected (task body/result, or an agent's session state/last hook/worktree).
+  selected (task body/result, or an agent's session state/last hook/worktree). A task's body/
+  result/blocked-reason aren't in the fleet-wide snapshot or `TaskChanged` events (those carry
+  only the durable snapshot — see `model::mod::apply_event`'s `TaskChanged` arm), so the detail
+  pane lazily fetches them with `GetTask` the first time a task becomes selected (and again
+  whenever its snapshot changes after that, e.g. on completion), showing `(loading…)` meanwhile —
+  `Board::begin_task_detail_fetch`/`main.rs::sync_task_detail`.
 - **TERMINALS** — tiled live PTYs of the focused project's live sessions, 2-4 panes
   (`ui/terminals.rs::pane_rects`).
 - **FOCUS** — one pane, full-screen, with scrollback (`PgUp`/`PgDn`).

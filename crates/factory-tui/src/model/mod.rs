@@ -26,7 +26,7 @@ pub mod attention;
 mod keymap;
 pub mod state;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use factory_core::local::{ErrorCode, LocalResponse};
 use factory_core::{
@@ -109,6 +109,17 @@ pub struct Board {
     pub runs: BTreeMap<RunId, RunSnapshot>,
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
 
+    /// `updated_at_ms` of the task snapshot as of the last successful full-detail fetch
+    /// (`GetTask`, or any other response that happens to carry a fresh `TaskDetail` — see
+    /// `merge_response`), per task. `TaskChanged` events only ever carry the durable snapshot
+    /// (see `apply_event`'s doc comment), so this is what lets [`Board::task_detail_needs_fetch`]
+    /// tell "never fetched" and "fetched, but a newer snapshot has since arrived" apart from
+    /// "fetched and still current".
+    detail_synced_at: BTreeMap<TaskId, i64>,
+    /// Tasks with a `GetTask` request currently in flight, so `main.rs` doesn't fire a duplicate
+    /// one every loop tick while waiting on the first (see `begin_task_detail_fetch`).
+    pending_detail: HashSet<TaskId>,
+
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
 
@@ -117,6 +128,13 @@ pub struct Board {
     /// TERMINALS/FOCUS's pane) — "one selection cursor follows through" per the repomon reference
     /// this design adopts (`REFS-HERDR-REPOMON.md`).
     pub selected_agent: Option<AgentId>,
+    /// FORTRESS-only: `[`/`]` cycle this independently of `selected_agent`, over workshops
+    /// (projects) themselves rather than the agents inside them — the only way to reach a
+    /// project with zero agents, which `selected_agent`'s cursor can never land on since it has
+    /// no candidates there (see `Board::cycle_selected_workshop` and `zoom_in`'s doc comments).
+    /// Mutually exclusive with `selected_agent` in practice (each cursor clears the other) so
+    /// FORTRESS never shows two different "selections" onscreen at once.
+    pub selected_workshop: Option<ProjectId>,
     /// WORKSHOP's task-list cursor.
     pub selected_task: Option<TaskId>,
     /// WORKSHOP's `Tab`-toggled pane focus (tasks vs. the agent tree).
@@ -151,10 +169,13 @@ impl Board {
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
             sessions: BTreeMap::new(),
+            detail_synced_at: BTreeMap::new(),
+            pending_detail: HashSet::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
             view: View::Fortress,
             selected_agent: None,
+            selected_workshop: None,
             selected_task: None,
             workshop_focus: WorkshopPane::Tasks,
             attention_filter: false,
@@ -266,6 +287,83 @@ impl Board {
         all.into_iter()
             .filter(|task| attention::task_attention(task.snapshot.status).needs_operator())
             .collect()
+    }
+
+    // -- derived views: task detail (lazy `GetTask` fetch) ----------------------------------
+
+    /// Whether `task_id`'s cached [`TaskDetail`] (`body`/`result`/`blocked_reason`) is missing or
+    /// possibly stale, and therefore worth a `GetTask` round-trip: `FactoryEvent::TaskChanged`
+    /// only ever carries the durable snapshot (see `apply_event`'s doc comment), so a task
+    /// created — or changed, e.g. completed and gained a `result` — after this client started
+    /// watching has an up-to-date `snapshot` but a `body`/`result` frozen at whatever it was the
+    /// last time (if ever) `GetTask` actually ran for it. `false` for a task id the board doesn't
+    /// know about at all (nothing to fetch a project id for).
+    #[must_use]
+    pub fn task_detail_needs_fetch(&self, task_id: &TaskId) -> bool {
+        let Some(task) = self.tasks.get(task_id) else {
+            return false;
+        };
+        self.detail_synced_at
+            .get(task_id)
+            .is_none_or(|&synced_at| synced_at < task.snapshot.updated_at_ms)
+    }
+
+    /// Whether `task_id`'s hasn't been fully loaded yet and a `GetTask` fetch is in flight for it
+    /// — WORKSHOP's detail pane shows "(loading…)" in this state rather than "(no body)".
+    #[must_use]
+    pub fn is_task_detail_pending(&self, task_id: &TaskId) -> bool {
+        self.pending_detail.contains(task_id)
+    }
+
+    /// If `task_id`'s detail needs fetching ([`Board::task_detail_needs_fetch`]) and no fetch for
+    /// it is already in flight, marks one in flight and returns the project id to fetch it from.
+    /// Idempotent: calling again before the response lands (`apply_task_detail_result`) returns
+    /// `None`, so `main.rs` can call this unconditionally on every loop tick — e.g. whenever
+    /// WORKSHOP's selected task changes, or a `TaskChanged` event bumps the selected task's
+    /// `updated_at_ms` — without flooding the daemon with duplicate requests per task id.
+    #[must_use = "a Some(project_id) means pending_detail was just marked — the caller must \
+                  actually send the GetTask request or it will never be retried"]
+    pub fn begin_task_detail_fetch(&mut self, task_id: &TaskId) -> Option<ProjectId> {
+        if self.pending_detail.contains(task_id) || !self.task_detail_needs_fetch(task_id) {
+            return None;
+        }
+        let project_id = self.tasks.get(task_id)?.snapshot.project_id.clone();
+        self.pending_detail.insert(task_id.clone());
+        Some(project_id)
+    }
+
+    /// Folds a background `GetTask` fetch's result back into board state (see
+    /// `net::spawn_task_detail_request`). Kept separate from `apply_response`'s generic
+    /// `NetMsg::OperationResult` path because a failed fetch needs `pending_detail` cleared for
+    /// the *specific* task it was for, which a generic `LocalResponse::Error` (no request-echo)
+    /// can't tell us.
+    pub fn apply_task_detail_result(
+        &mut self,
+        task_id: TaskId,
+        result: Result<LocalResponse, String>,
+    ) {
+        self.pending_detail.remove(&task_id);
+        match result {
+            Ok(LocalResponse::Task { task }) => {
+                self.detail_synced_at
+                    .insert(task.snapshot.id.clone(), task.snapshot.updated_at_ms);
+                self.tasks.insert(task.snapshot.id.clone(), task);
+            }
+            Ok(LocalResponse::Error { code, message }) => {
+                self.set_status(
+                    format!("{}: {message}", error_code_word(code)),
+                    StatusLevel::Error,
+                );
+            }
+            Ok(_) => {} // unexpected response shape for `GetTask`; nothing to fold in
+            Err(error) => {
+                self.set_status(
+                    format!("couldn't load task#{task_id} detail: {error}"),
+                    StatusLevel::Error,
+                );
+            }
+        }
+        self.clamp_selection();
     }
 
     #[must_use]
@@ -677,6 +775,8 @@ impl Board {
         match response {
             LocalResponse::TaskCreated { task } => {
                 let id = task.snapshot.id.clone();
+                self.detail_synced_at
+                    .insert(id.clone(), task.snapshot.updated_at_ms);
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 format!("created task#{id}")
             }
@@ -689,6 +789,12 @@ impl Board {
             | LocalResponse::TaskBlocked { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
+                // Every one of these carries a fresh, full `TaskDetail` (body/result/
+                // blocked_reason all current as of this response), so mark it synced too - not
+                // just the `GetTask` path - to avoid a redundant fetch on the next render.
+                self.detail_synced_at
+                    .insert(id.clone(), task.snapshot.updated_at_ms);
+                self.pending_detail.remove(&id);
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
@@ -743,11 +849,20 @@ impl Board {
                 self.selected_agent = None;
             }
         }
+        if let Some(id) = &self.selected_workshop {
+            if !self.projects.iter().any(|p| &p.id == id) {
+                self.selected_workshop = None;
+            }
+        }
         if let Some(id) = &self.selected_task {
             if !self.tasks.contains_key(id) {
                 self.selected_task = None;
             }
         }
+        // Deleted tasks shouldn't leak into these two indefinitely.
+        self.detail_synced_at
+            .retain(|id, _| self.tasks.contains_key(id));
+        self.pending_detail.retain(|id| self.tasks.contains_key(id));
     }
 }
 

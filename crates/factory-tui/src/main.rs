@@ -250,6 +250,7 @@ fn run(
         if sync_panes(board, panes, socket, debug_log) {
             needs_redraw = true;
         }
+        sync_task_detail(board, client, tx);
         for pane in panes.values() {
             if pane.dirty() {
                 needs_redraw = true;
@@ -334,6 +335,24 @@ fn sync_panes(
     }
 
     changed
+}
+
+/// Issues a `GetTask` fetch for WORKSHOP's currently selected task if its cached detail is
+/// missing or stale (`Board::begin_task_detail_fetch`) — the fix for task detail showing empty
+/// for a task created (or completed) after this client started (`TaskChanged` events only ever
+/// carry the durable snapshot, not `body`/`result`). Cheap to call every loop iteration like
+/// `sync_panes`: a couple of map lookups when nothing needs fetching, and `begin_task_detail_fetch`
+/// itself dedupes so a request already in flight is never fired twice.
+fn sync_task_detail(board: &mut Board, client: &Client, tx: &mpsc::Sender<NetMsg>) {
+    if board.view != model::View::Workshop {
+        return;
+    }
+    let Some(task_id) = board.selected_task.clone() else {
+        return;
+    };
+    if let Some(project_id) = board.begin_task_detail_fetch(&task_id) {
+        net::spawn_task_detail_request(client.clone(), tx.clone(), project_id, task_id);
+    }
 }
 
 /// Which pane currently owns the keyboard: the focused TERMINALS tile, or FOCUS's one pane.
@@ -432,5 +451,8 @@ fn apply_net_msg(
         NetMsg::Event(event) => board.apply_event(event),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
+        NetMsg::TaskDetailResult { task_id, result } => {
+            board.apply_task_detail_result(task_id, result);
+        }
     }
 }

@@ -314,7 +314,14 @@ fn task_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static>
         Line::from(""),
     ];
     if task.body.is_empty() {
-        lines.push(Line::from("(no body)"));
+        if board.is_task_detail_pending(&task.snapshot.id) {
+            lines.push(Line::from(Span::styled(
+                "(loading…)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            lines.push(Line::from("(no body)"));
+        }
     } else {
         lines.push(Line::from(task.body.clone()));
     }
@@ -328,8 +335,18 @@ fn task_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static>
     }
     if attention == Attention::NeedsInput {
         lines.push(Line::from(""));
+        let reason = task.blocked_reason.as_deref().map_or_else(
+            || {
+                if board.is_task_detail_pending(&task.snapshot.id) {
+                    "blocked — (loading reason…)".to_owned()
+                } else {
+                    "blocked — no reason given".to_owned()
+                }
+            },
+            |reason| format!("blocked — {reason}"),
+        );
         lines.push(Line::from(Span::styled(
-            "blocked — reason not yet surfaced on the wire (pending 5A/5C's blocked_reason field)",
+            reason,
             Style::default().fg(Color::Yellow),
         )));
     }
