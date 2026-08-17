@@ -603,45 +603,55 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
 }
 
 #[test]
-fn permission_request_moves_to_waiting_for_input_and_pre_tool_use_returns_it_to_working() {
+fn permission_request_wait_ends_on_the_next_activity_hook() {
     // Codex 0.147's own approval-prompt hook (docs/dogfood/2026-08-17.md,
     // "a session blocked on a provider approval prompt still shows
     // `working`"): projects the same way `Notification` already does
-    // above, and the next `PreToolUse` (the tool call the operator just
-    // approved actually starting) clears it back to `Working`, exactly
-    // like it already does after any other wait state.
+    // above. Any subsequent activity hook clears it back to `Working`,
+    // whether that is the approved tool starting or finishing, or the
+    // operator submitting another prompt.
     let mut store = fixture();
     let (snapshot, _) = store
         .create_session(new_session("s1", "factory", "curie"), 5)
         .unwrap();
-    let (session, _) = store
-        .record_hook_event(
-            &snapshot.id,
-            ProviderHookEvent::PermissionRequest,
-            None,
-            false,
-            Some("provider approval prompt: shell".into()),
-            6,
-        )
-        .unwrap();
-    assert_eq!(session.state, SessionState::WaitingForInput);
-    assert_eq!(
-        session.wait_reason.as_deref(),
-        Some("provider approval prompt: shell")
-    );
+    for (offset, activity_event) in [
+        ProviderHookEvent::PreToolUse,
+        ProviderHookEvent::PostToolUse,
+        ProviderHookEvent::UserPromptSubmit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = 6 + i64::try_from(offset).unwrap() * 2;
+        let (session, _) = store
+            .record_hook_event(
+                &snapshot.id,
+                ProviderHookEvent::PermissionRequest,
+                None,
+                false,
+                Some("provider approval prompt: shell".into()),
+                now,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::WaitingForInput);
+        assert_eq!(
+            session.wait_reason.as_deref(),
+            Some("provider approval prompt: shell")
+        );
 
-    let (session, _) = store
-        .record_hook_event(
-            &snapshot.id,
-            ProviderHookEvent::PreToolUse,
-            Some("tool: shell".into()),
-            false,
-            None,
-            7,
-        )
-        .unwrap();
-    assert_eq!(session.state, SessionState::Working);
-    assert_eq!(session.wait_reason, None);
+        let (session, _) = store
+            .record_hook_event(
+                &snapshot.id,
+                activity_event,
+                Some("activity resumed".into()),
+                false,
+                None,
+                now + 1,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::Working);
+        assert_eq!(session.wait_reason, None);
+    }
 }
 
 #[test]
