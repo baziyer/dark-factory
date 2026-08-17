@@ -128,6 +128,26 @@ deleted in favor of always testing against a throwaway `factoryd` (see
 `docs/development/WORKFLOW.md`).
 **Size**: S (decision, not a bug).
 
+### Terminal rendering gaps in the `tui-term`/`vt100` pane widget
+**Symptom**: `factory-tui`'s embedded terminal panes (TERMINALS/FOCUS) are
+faithful for the common case (colors, box drawing, cursor, alt-screen,
+resize/reflow all verified against real `claude`/`codex`) but have known
+gaps: no mouse forwarding (`claude` requests SGR mouse tracking; we
+receive but discard `crossterm::event::Event::Mouse`), no Kitty keyboard
+protocol passthrough, no scrollback view (only the live screen renders —
+`vt100::Parser` keeps 10,000 lines of scrollback that nothing exposes), no
+synchronized-output (mode 2026) awareness, and OSC 10/11 answers are a
+fixed guess rather than the real outer terminal's palette.
+**Evidence**: this was the verdict of the pre-build fidelity spike,
+formerly `crates/factory-tui/SPIKE.md` (deleted as part of this docs
+pass — this entry preserves its "GO recommendation" table). Idle CPU/RSS
+was 0.0-0.1% / ~4MB in that testing.
+**Suggested fix**: prioritize mouse forwarding first if dogfooding needs
+mouse-driven interaction with `claude`'s composer (small effort, same
+shape as `crates/factory-tui/src/keys.rs`); the rest are cosmetic/
+completeness gaps, not blockers.
+**Size**: S (mouse) to M (Kitty keyboard, scrollback) per gap.
+
 ## Security and state files
 
 ### Pre-trusting a worktree reorders every key in `~/.claude.json`
