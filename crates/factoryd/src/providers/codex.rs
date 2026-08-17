@@ -247,8 +247,10 @@ impl Provider for CodexProvider {
 /// (filtered down to what a factory worker needs by
 /// [`filter_operator_config_for_seed`] -- see [`DROPPED_SEED_TABLES`]),
 /// else writes [`MINIMAL_CONFIG_TOML`]; symlinks `source_home/auth.json`
-/// if present and not already linked. Existing files are never
-/// overwritten — this is a one-time seed, not a sync. The hooks block is
+/// if present, re-pointing a link the daemon made when the seed home
+/// changed. Existing files are never overwritten — `config.toml` is a
+/// one-time seed, not a sync; only the `auth.json` link follows the seed
+/// home. The hooks block is
 /// refreshed separately, every spawn, by [`rewrite_hooks_block`].
 fn seed_codex_home_once(
     codex_home: &Path,
@@ -673,7 +675,7 @@ mod provider_tests {
     }
 
     #[test]
-    fn copies_the_real_config_and_symlinks_auth_json_on_first_seed_only() {
+    fn copies_the_real_config_once_and_keeps_the_auth_link_on_the_seed_home() {
         let directory = tempfile::tempdir().unwrap();
         let real_home = directory.path().join("real-codex-home");
         fs::create_dir_all(&real_home).unwrap();
@@ -704,6 +706,34 @@ mod provider_tests {
         let after_second_spawn = fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(after_second_spawn.contains("model_reasoning_effort = \"xhigh\""));
         assert_eq!(after_second_spawn.matches(HOOKS_BEGIN_MARKER).count(), 1);
+
+        // A different seed home (another Codex account) re-points the auth
+        // link on the next spawn; the seeded config.toml is left alone.
+        let other_home = directory.path().join("other-codex-home");
+        fs::create_dir_all(&other_home).unwrap();
+        fs::write(other_home.join("auth.json"), "{\"token\":\"other\"}").unwrap();
+        CodexProvider::with_source_home(other_home.clone())
+            .spawn_spec(&ctx)
+            .unwrap();
+        assert_eq!(
+            fs::read_link(codex_home.join("auth.json")).unwrap(),
+            other_home.join("auth.json")
+        );
+        assert!(
+            fs::read_to_string(codex_home.join("config.toml"))
+                .unwrap()
+                .contains("model_reasoning_effort = \"xhigh\"")
+        );
+        // A regular auth.json an operator placed is never touched.
+        fs::remove_file(codex_home.join("auth.json")).unwrap();
+        fs::write(codex_home.join("auth.json"), "{\"token\":\"mine\"}").unwrap();
+        provider.spawn_spec(&ctx).unwrap();
+        assert!(
+            fs::symlink_metadata(codex_home.join("auth.json"))
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
     }
 
     #[test]

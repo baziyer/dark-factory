@@ -190,23 +190,23 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
             "warn",
             "the throwaway HOME has no ~/.codex/auth.json"
         );
-        // A CODEX_HOME with credentials is reported as the home in effect.
-        let dogfood = root.path().join("codex-dogfood");
-        fs::create_dir_all(&dogfood).unwrap();
-        fs::write(dogfood.join("auth.json"), "{}").unwrap();
-        let (_, stdout, _) = run_with_env(
-            &factoryctl,
-            root.path(),
-            &["init", "--yes", "--no-launchd"],
-            &[("CODEX_HOME", &dogfood)],
-        );
-        assert!(
-            stdout.contains(&format!(
-                "codex home for agents: {} (auth.json present",
-                dogfood.display()
-            )),
-            "{stdout}"
-        );
     }
+    // A CODEX_HOME with credentials is reported as the home in effect.
+    let dogfood = root.path().join("codex-dogfood");
+    fs::create_dir_all(&dogfood).unwrap();
+    fs::write(dogfood.join("auth.json"), "{}").unwrap();
+    let (_, stdout, _) = run_with_env(
+        &factoryctl,
+        root.path(),
+        &["init", "--yes", "--no-launchd"],
+        &[("CODEX_HOME", &dogfood)],
+    );
+    assert!(
+        stdout.contains(&format!(
+            "codex home for agents: {} (auth.json present",
+            dogfood.display()
+        )),
+        "{stdout}"
+    );
     assert_eq!(status("update"), "warn");
 }
