@@ -3,34 +3,8 @@
 //! next to `keymap()` in `keymap.rs`.
 
 use super::*;
-use crate::test_fixtures::{agent, project, run, task};
-use factory_core::{ObserverHealth, Provider, RunStatus, SessionSnapshot, SessionState};
-
-fn session(id: &str, agent_id: &str, project: &str, state: SessionState) -> SessionSnapshot {
-    SessionSnapshot {
-        id: SessionId::try_from(id).unwrap(),
-        project_id: ProjectId::try_from(project).unwrap(),
-        agent_id: AgentId::try_from(agent_id).unwrap(),
-        provider: Provider::ClaudeCode,
-        state,
-        state_since_ms: 0,
-        worktree: "/work".into(),
-        provider_session_id: None,
-        current_run_id: None,
-        activity: None,
-        activity_inferred: false,
-        last_hook_event: None,
-        last_hook_at_ms: None,
-        wait_reason: None,
-        observer_health: ObserverHealth::Unknown,
-        observer_health_since_ms: 0,
-        started_at_ms: 0,
-        updated_at_ms: 0,
-        ended_at_ms: None,
-        exit_code: None,
-        exit_signal: None,
-    }
-}
+use crate::test_fixtures::{agent, project, run, session, task};
+use factory_core::{RunStatus, SessionState};
 
 fn board() -> Board {
     Board::new(false, 0, crate::theme::FORTRESS)
@@ -637,5 +611,36 @@ fn apply_task_detail_result_clears_pending_on_failure_so_it_can_retry() {
     assert!(
         b.begin_task_detail_fetch(&id).is_some(),
         "a failed fetch must be retryable, not stuck pending forever"
+    );
+}
+
+// -- status line: bounded status message -----------------------------------------------------
+
+#[test]
+fn a_long_status_message_is_truncated_and_the_hint_stays_intact() {
+    let mut b = board();
+    let long_error = "x".repeat(500);
+
+    b.note_error(long_error.clone());
+
+    let status_text = b.status.as_ref().unwrap().text.clone();
+    assert!(
+        status_text.chars().count() <= STATUS_TEXT_MAX_CHARS,
+        "stored status text must be bounded, got {} chars",
+        status_text.chars().count()
+    );
+    assert_ne!(
+        status_text, long_error,
+        "the message must actually be cut, not just short-circuit on `<=`"
+    );
+
+    let line = b.status_line_text();
+    assert!(
+        line.contains(&b.help_text()),
+        "the full hint must still be present alongside a long status message: {line}"
+    );
+    assert!(
+        line.chars().count() < long_error.chars().count(),
+        "the combined line must be far shorter than the original 500-char message: {line}"
     );
 }

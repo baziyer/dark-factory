@@ -48,6 +48,8 @@ use crate::theme::Theme;
 pub const ANNOUNCEMENT_CAPACITY: usize = 500;
 /// A status/error line is shown in place of the key-help footer for this long after being set.
 const STATUS_STICKY_MS: i64 = 6_000;
+/// Maximum length of a sticky status/error message in the non-wrapping footer.
+const STATUS_TEXT_MAX_CHARS: usize = 64;
 /// TERMINALS tiles at most this many panes at once (design brief: "2-4 panes").
 pub const MAX_TERMINAL_PANES: usize = 4;
 
@@ -563,6 +565,18 @@ impl Board {
             .or_else(|| self.terminal_targets().into_iter().next())
     }
 
+    /// The agent targeted by the focused pane, falling back to the selection outside TERMINALS.
+    #[must_use]
+    pub fn pane_target_agent(&self) -> Option<AgentId> {
+        match self.view {
+            View::Terminals => self
+                .terminals_focused_pane()
+                .and_then(|session_id| self.agent_for_pane_session(&session_id))
+                .map(|agent| agent.id.clone()),
+            View::Focus | View::Fortress | View::Workshop => self.selected_agent.clone(),
+        }
+    }
+
     /// Whether the current view has a live pane keys could actually be forwarded to right now.
     /// `PaneMode::Typing` only ever forwards when this is true — an empty TERMINALS/FOCUS screen
     /// (no live session at all) always leaves every key acting on the board, never silently
@@ -592,7 +606,7 @@ impl Board {
 
     fn set_status(&mut self, text: impl Into<String>, level: StatusLevel) {
         self.status = Some(StatusMessage {
-            text: text.into(),
+            text: truncate_status(&text.into(), STATUS_TEXT_MAX_CHARS),
             level,
             at_ms: self.now_ms,
         });
@@ -607,15 +621,14 @@ impl Board {
 
     /// The text the bottom status/help line should show right now: the key-help reminder for the
     /// current mode/view *always* renders, so the operator never loses the "what keys work"
-    /// reference — a recent status/error message, while still "sticky", is prepended alongside
-    /// it rather than replacing it (the fix for hints vanishing for several seconds after
-    /// cancelling a prompt).
+    /// reference. A recent status/error follows the hint, so the non-wrapping renderer clips the
+    /// bounded status rather than the controls on narrow terminals.
     #[must_use]
     pub fn status_line_text(&self) -> String {
         let hint = self.help_text();
         match &self.status {
             Some(status) if self.now_ms - status.at_ms < STATUS_STICKY_MS => {
-                format!("{}   {hint}", status.text)
+                format!("{hint}   {}", status.text)
             }
             _ => hint,
         }
@@ -656,10 +669,9 @@ impl Board {
         if matches!(self.view, View::Terminals | View::Focus) {
             if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
                 let target = self
-                    .selected_agent
-                    .as_ref()
-                    .map_or_else(|| "pane".to_owned(), std::string::ToString::to_string);
-                return format!("TYPING \u{2192} {target}   Ctrl-] board   1-4 views   q detach");
+                    .pane_target_agent()
+                    .map_or_else(|| "pane".to_owned(), |id| id.to_string());
+                return format!("TYPING \u{2192} {target}   Ctrl-] board");
             }
             return "BOARD  i type  Tab/j/k switch pane  Enter/l zoom  Esc/h back  \
                      1-4 views  ? help  q detach"
@@ -965,6 +977,15 @@ fn event_agent(event: &FactoryEvent) -> Option<&AgentId> {
         FactoryEvent::TaskDeleted { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => None,
+    }
+}
+
+fn truncate_status(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        let head: String = text.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}\u{2026}")
     }
 }
 
