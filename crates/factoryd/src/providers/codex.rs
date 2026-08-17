@@ -38,6 +38,30 @@ pub const PERMISSION_MODES: [&str; 2] = ["on-request", "never"];
 
 const HOOKS_BEGIN_MARKER: &str = "# --- dark-factory hooks BEGIN ---";
 const HOOKS_END_MARKER: &str = "# --- dark-factory hooks END ---";
+/// Trust and sandbox settings, in a marker block separate from
+/// [`HOOKS_BEGIN_MARKER`]/[`HOOKS_END_MARKER`] (not because either could
+/// not hold both, but because they are independent concerns changed by
+/// independent code paths -- keeping them apart means a future change to
+/// one never risks fumbling the other's exact regenerated shape).
+const CONFIG_BEGIN_MARKER: &str = "# --- dark-factory config BEGIN ---";
+const CONFIG_END_MARKER: &str = "# --- dark-factory config END ---";
+/// `sandbox_mode` is a root-table key, not something that can live inside
+/// either marker block above: both blocks are appended at the end of the
+/// file, after any `[table]` headers the operator's own copied-forward
+/// config.toml already had (Codex's own project trust entries, in
+/// particular -- confirmed against this machine's real `~/.codex/
+/// config.toml`, which ends with dozens of `[projects."..."]` tables). A
+/// bare `key = value` line appended after those would silently become a
+/// member of the *last* table in the file instead of the root table Codex
+/// actually reads `sandbox_mode` from. [`insert_root_level_line`] instead
+/// inserts this immediately before the first `[table]` header anywhere in
+/// the document (or at the very end, if there is none), which is always a
+/// valid root-table position regardless of what the source file looked
+/// like.
+const SANDBOX_MODE_COMMENT_AND_LINE: &str = "\
+# --- dark-factory sandbox_mode override (kept as a plain root-table key,
+# not inside the config block below -- see CodexProvider's own comment) ---
+sandbox_mode = \"workspace-write\"";
 const MINIMAL_CONFIG_TOML: &str =
     "# Dark Factory generated Codex home (no ~/.codex/config.toml was found to copy).\n";
 
@@ -92,6 +116,7 @@ impl Provider for CodexProvider {
         let codex_home = ctx.agent_dir.join("codex-home");
         seed_codex_home_once(&codex_home, self.source_home.as_deref())?;
         rewrite_hooks_block(&codex_home, &ctx.factoryctl_path, &ctx.hook_token_path)?;
+        rewrite_config_block(&codex_home, &ctx.agent_dir, &ctx.socket_path, &ctx.worktree)?;
 
         let mut args = vec!["--dangerously-bypass-hook-trust".to_owned()];
         if let Some(model) = &ctx.model {
@@ -203,24 +228,171 @@ fn rewrite_hooks_block(
     })
 }
 
+/// Idempotently rewrites the daemon-owned sandbox/trust configuration in
+/// `codex_home`'s `config.toml`: `sandbox_mode = "workspace-write"` (a
+/// root-table key -- see [`SANDBOX_MODE_COMMENT_AND_LINE`]'s own doc
+/// comment for why it cannot simply live inside the marker block below)
+/// plus a `CONFIG_BEGIN_MARKER`/`CONFIG_END_MARKER` block holding
+/// `[sandbox_workspace_write]` (`writable_roots`/`network_access`, so the
+/// sandbox that gates a session's own spawned tool calls can still reach
+/// this agent's guidance directory and the daemon's control socket -- a
+/// Unix socket connect needs write access to the socket path under the
+/// seatbelt sandbox) and `[projects."<worktree>"]` (`trust_level =
+/// "trusted"`, so the very first Codex session in a fresh Dark Factory
+/// worktree never blocks on Codex's own trust prompt, matching
+/// `ClaudeProvider::pretrust_worktree`). Called on every spawn, after
+/// [`rewrite_hooks_block`]: the worktree/agent-dir/socket path can change
+/// per session, so this keeps them current without disturbing whatever
+/// else the operator's real `config.toml` carried forward from the
+/// one-time seed.
+fn rewrite_config_block(
+    codex_home: &Path,
+    agent_dir: &Path,
+    socket_path: &Path,
+    worktree: &Path,
+) -> Result<(), ProviderError> {
+    let config_path = codex_home.join("config.toml");
+    let existing = fs::read_to_string(&config_path).map_err(|source| ProviderError::Seed {
+        path: config_path.clone(),
+        source,
+    })?;
+    let without_config_block =
+        strip_marked_block(&existing, CONFIG_BEGIN_MARKER, CONFIG_END_MARKER);
+    let without_sandbox_mode = strip_root_level_sandbox_mode(&without_config_block);
+    let mut rewritten =
+        insert_root_level_line(&without_sandbox_mode, SANDBOX_MODE_COMMENT_AND_LINE)
+            .trim_end()
+            .to_owned();
+    rewritten.push_str("\n\n");
+    rewritten.push_str(&config_block_toml(agent_dir, socket_path, worktree));
+    hooks::write_private_file(&config_path, rewritten.as_bytes()).map_err(|source| {
+        ProviderError::Seed {
+            path: config_path.clone(),
+            source,
+        }
+    })
+}
+
+fn config_block_toml(agent_dir: &Path, socket_path: &Path, worktree: &Path) -> String {
+    let socket_directory = socket_path.parent().unwrap_or(socket_path);
+    let mut block = String::new();
+    block.push_str(CONFIG_BEGIN_MARKER);
+    block.push('\n');
+    block.push_str("[sandbox_workspace_write]\n");
+    block.push_str(&format!(
+        "writable_roots = [{}, {}]\n",
+        toml_string(&agent_dir.to_string_lossy()),
+        toml_string(&socket_directory.to_string_lossy()),
+    ));
+    block.push_str("network_access = false\n");
+    block.push('\n');
+    block.push_str(&format!(
+        "[projects.{}]\n",
+        toml_string(&worktree.to_string_lossy())
+    ));
+    block.push_str("trust_level = \"trusted\"\n");
+    block.push_str(CONFIG_END_MARKER);
+    block.push('\n');
+    block
+}
+
+fn toml_string(value: &str) -> String {
+    format!("\"{}\"", toml_escape(value))
+}
+
 /// Removes a previously written daemon hooks block (markers inclusive), if
 /// present, leaving the rest of the file untouched (trailing whitespace
 /// trimmed). Not a general TOML parser: it operates on the exact marker
 /// lines [`hooks_block_toml`] writes.
 fn strip_hooks_block(config: &str) -> String {
-    let Some(begin) = config.find(HOOKS_BEGIN_MARKER) else {
-        return config.trim_end().to_owned();
+    strip_marked_block(config, HOOKS_BEGIN_MARKER, HOOKS_END_MARKER)
+}
+
+/// Removes a previously written `begin_marker`/`end_marker`-delimited block
+/// (markers inclusive), if present, leaving the rest of the document
+/// untouched (trailing whitespace trimmed). Shared by [`strip_hooks_block`]
+/// and [`rewrite_config_block`]'s own `CONFIG_BEGIN_MARKER`/
+/// `CONFIG_END_MARKER` block. Not a general TOML parser: it operates purely
+/// on the exact marker lines this module writes.
+fn strip_marked_block(document: &str, begin_marker: &str, end_marker: &str) -> String {
+    let Some(begin) = document.find(begin_marker) else {
+        return document.trim_end().to_owned();
     };
-    let before = &config[..begin];
-    let after_marker = &config[begin..];
-    let after = after_marker
-        .find(HOOKS_END_MARKER)
-        .map_or("", |end_offset| {
-            &after_marker[end_offset + HOOKS_END_MARKER.len()..]
-        });
+    let before = &document[..begin];
+    let after_marker = &document[begin..];
+    let after = after_marker.find(end_marker).map_or("", |end_offset| {
+        &after_marker[end_offset + end_marker.len()..]
+    });
     format!("{}{}", before.trim_end(), after)
         .trim_end()
         .to_owned()
+}
+
+/// The byte offset of the first `[table]`/`[[array-of-tables]]` header
+/// line in `document` -- the boundary between TOML's implicit root table
+/// and its first explicit section -- or `None` if the document has no
+/// table header at all (every key is still a root-table key in that case).
+/// A heuristic line scan, not a general TOML parser (same tradeoff
+/// [`strip_marked_block`] already makes): a table-header-shaped line
+/// inside a multi-line string value would be misread as a real boundary,
+/// which real `config.toml` files in practice do not contain.
+fn first_table_header_offset(document: &str) -> Option<usize> {
+    let mut offset = 0;
+    for line in document.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Removes every root-table `sandbox_mode = ...` assignment from
+/// `document`'s prefix before its first table header, if any -- so
+/// [`rewrite_sandbox_mode_line`] re-inserting Dark Factory's own value can
+/// never produce a duplicate-key TOML document, regardless of what the
+/// operator's own copied-forward `config.toml` already set it to (this
+/// machine's real `~/.codex/config.toml` already has one). A `sandbox_mode`
+/// key nested inside some other table (not a real Codex config shape today)
+/// is out of scope and left untouched.
+fn strip_root_level_sandbox_mode(document: &str) -> String {
+    let boundary = first_table_header_offset(document).unwrap_or(document.len());
+    let (root, rest) = document.split_at(boundary);
+    let filtered_root: String = root
+        .lines()
+        .filter(|line| {
+            line.trim_start()
+                .split_once('=')
+                .map(|(key, _)| key.trim() != "sandbox_mode")
+                .unwrap_or(true)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    format!("{filtered_root}{rest}")
+}
+
+/// Inserts `line` as a root-table entry: immediately before `document`'s
+/// first `[table]` header, or at the end if it has none. Appending after
+/// an existing table header would silently make `line` a member of that
+/// table instead of the root table -- see [`SANDBOX_MODE_COMMENT_AND_LINE`]'s
+/// own doc comment for why that matters here.
+fn insert_root_level_line(document: &str, line: &str) -> String {
+    let boundary = first_table_header_offset(document).unwrap_or(document.len());
+    let (root, rest) = document.split_at(boundary);
+    let root = root.trim_end();
+    let mut result = String::new();
+    if !root.is_empty() {
+        result.push_str(root);
+        result.push('\n');
+    }
+    result.push_str(line);
+    result.push('\n');
+    let rest = rest.trim_start_matches('\n');
+    if !rest.is_empty() {
+        result.push('\n');
+        result.push_str(rest);
+    }
+    result
 }
 
 fn hooks_block_toml(factoryctl_path: &Path, hook_token_path: &Path) -> String {
@@ -456,6 +628,166 @@ mod provider_tests {
             .unwrap();
         let codex_home = directory.path().join("agent-dir").join("codex-home");
 
+        let output = std::process::Command::new("codex")
+            .env("CODEX_HOME", &codex_home)
+            .args(["--strict-config", "doctor", "--json"])
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            report["checks"]["config.load"]["details"]["config.toml parse"],
+            "ok"
+        );
+    }
+
+    fn codex_is_installed() -> bool {
+        std::process::Command::new("codex")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[test]
+    fn config_block_toml_has_the_exact_designed_shape() {
+        let block = config_block_toml(
+            Path::new("/abs/agent-dir"),
+            Path::new("/abs/f.sock"),
+            Path::new("/abs/worktrees/worker-1"),
+        );
+        assert_eq!(
+            block,
+            "# --- dark-factory config BEGIN ---\n\
+             [sandbox_workspace_write]\n\
+             writable_roots = [\"/abs/agent-dir\", \"/abs\"]\n\
+             network_access = false\n\
+             \n\
+             [projects.\"/abs/worktrees/worker-1\"]\n\
+             trust_level = \"trusted\"\n\
+             # --- dark-factory config END ---\n"
+        );
+    }
+
+    #[test]
+    fn spawn_spec_sets_sandbox_mode_writable_roots_and_project_trust() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        CodexProvider::with_source_home(directory.path().join("missing"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        let config_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("config.toml");
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            contents
+                .matches("sandbox_mode = \"workspace-write\"")
+                .count(),
+            1
+        );
+        assert!(contents.contains("[sandbox_workspace_write]"));
+        assert!(contents.contains(&format!(
+            "writable_roots = [{}, {}]",
+            toml_string(&ctx.agent_dir.to_string_lossy()),
+            toml_string(&ctx.socket_path.parent().unwrap().to_string_lossy()),
+        )));
+        assert!(contents.contains("network_access = false"));
+        assert!(contents.contains(&format!(
+            "[projects.{}]",
+            toml_string(&ctx.worktree.to_string_lossy())
+        )));
+        assert!(contents.contains("trust_level = \"trusted\""));
+        // sandbox_mode is a root-table key, positioned before every
+        // `[table]` header this file has (both ours and, in this fresh
+        // minimal-seed case, there are no others).
+        let sandbox_mode_offset = contents.find("sandbox_mode = ").unwrap();
+        let first_table_offset = contents.find('[').unwrap();
+        assert!(sandbox_mode_offset < first_table_offset);
+    }
+
+    #[test]
+    fn config_block_is_rewritten_idempotently_across_spawns() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = context(directory.path());
+        let provider = CodexProvider::with_source_home(directory.path().join("missing"));
+        provider.spawn_spec(&ctx).unwrap();
+        provider.spawn_spec(&ctx).unwrap();
+        provider.spawn_spec(&ctx).unwrap();
+
+        let config_path = directory
+            .path()
+            .join("agent-dir")
+            .join("codex-home")
+            .join("config.toml");
+        let contents = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(contents.matches(CONFIG_BEGIN_MARKER).count(), 1);
+        assert_eq!(contents.matches(CONFIG_END_MARKER).count(), 1);
+        assert_eq!(contents.matches("sandbox_mode = ").count(), 1);
+        assert_eq!(contents.matches("[sandbox_workspace_write]").count(), 1);
+        assert_eq!(contents.matches("trust_level = \"trusted\"").count(), 1);
+    }
+
+    #[test]
+    fn a_real_configs_own_sandbox_mode_is_replaced_not_duplicated_and_its_trailing_project_tables_survive()
+     {
+        // The exact shape this track's manual check found on a real
+        // machine's `~/.codex/config.toml`: root-level scalars (including
+        // the operator's own `sandbox_mode`), then dozens of trailing
+        // `[projects."..."]` tables. Appending Dark Factory's own
+        // `sandbox_mode` line naively after those tables would silently
+        // make it a member of the *last* `[projects...]` table instead of
+        // the root table -- this proves it does not.
+        let directory = tempfile::tempdir().unwrap();
+        let real_home = directory.path().join("real-codex-home");
+        fs::create_dir_all(&real_home).unwrap();
+        fs::write(
+            real_home.join("config.toml"),
+            "model = \"gpt-5.6\"\n\
+             sandbox_mode = \"read-only\"\n\
+             approval_policy = \"on-request\"\n\
+             \n\
+             [projects.\"/Users/op/other-repo\"]\n\
+             trust_level = \"trusted\"\n\
+             \n\
+             [projects.\"/Users/op/another-repo\"]\n\
+             trust_level = \"trusted\"\n",
+        )
+        .unwrap();
+
+        let ctx = context(directory.path());
+        let provider = CodexProvider::with_source_home(real_home);
+        provider.spawn_spec(&ctx).unwrap();
+
+        let codex_home = directory.path().join("agent-dir").join("codex-home");
+        let contents = fs::read_to_string(codex_home.join("config.toml")).unwrap();
+
+        // Exactly one `sandbox_mode` assignment -- ours, not the
+        // operator's (a comment in our own generated line also mentions
+        // "sandbox_mode" by name, so this counts real assignments, not
+        // every substring occurrence).
+        assert_eq!(contents.matches("sandbox_mode = \"").count(), 1);
+        assert!(contents.contains("sandbox_mode = \"workspace-write\""));
+        assert!(!contents.contains("\"read-only\""));
+        // The operator's own settings and both pre-existing project trust
+        // entries round-trip untouched.
+        assert!(contents.contains("model = \"gpt-5.6\""));
+        assert!(contents.contains("approval_policy = \"on-request\""));
+        assert!(contents.contains("[projects.\"/Users/op/other-repo\"]"));
+        assert!(contents.contains("[projects.\"/Users/op/another-repo\"]"));
+        // This agent's own worktree gains a trust entry too.
+        assert!(contents.contains(&format!(
+            "[projects.{}]",
+            toml_string(&ctx.worktree.to_string_lossy())
+        )));
+
+        if !codex_is_installed() {
+            eprintln!(
+                "skipping real codex doctor check: codex is not installed in this environment"
+            );
+            return;
+        }
         let output = std::process::Command::new("codex")
             .env("CODEX_HOME", &codex_home)
             .args(["--strict-config", "doctor", "--json"])
