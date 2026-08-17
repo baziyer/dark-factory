@@ -18,17 +18,19 @@ jobs:
   # gate as `./scripts/local-ci.sh` — nothing is re-implemented here.
   #
   # Where it runs is chosen by this expression, which is a policy, not a
-  # mechanism: a pull request runs the workflow file from ITS OWN merge
-  # ref, so a fork can edit `runs-on` here. Same-repository refs (the
-  # owner's and collaborators' branches, and every push to main) run on
-  # the persistent self-hosted Mac (`dark-factory-mac`: warm cargo cache,
-  # real macOS, no hosted minutes). A pull request from a fork runs on an
-  # ephemeral hosted macOS runner — and every fork's workflow run needs the
-  # maintainer's approval first (`scripts/github-repo-settings.sh` sets
-  # that policy). Read `.github/workflows/` in a fork's diff before
-  # approving it: that is the boundary. See docs/development/WORKFLOW.md.
+  # mechanism: a pull request runs the workflow file from ITS OWN branch,
+  # so a PR (same-repository or a fork) can edit `runs-on` here — that is
+  # why every `pull_request` event, regardless of whose branch it's on,
+  # runs on an ephemeral hosted macOS runner rather than the persistent
+  # self-hosted Mac (`dark-factory-mac`). PR code — nobody's has been
+  # reviewed yet — never executes on the operator's own machine; only
+  # `push` to `main` (already merged, already reviewed) and a maintainer's
+  # tag push in release.yml do, both trusted refs a PR diff can't reach.
+  # Every fork's workflow run additionally needs the maintainer's approval
+  # first (`scripts/github-repo-settings.sh` sets that policy). See
+  # docs/development/WORKFLOW.md, "CI and GitHub".
   checks:
-    runs-on: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && 'macos-latest' || 'dark-factory-mac' }}
+    runs-on: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'dark-factory-mac' }}
     timeout-minutes: 45
     steps:
       # No actions/checkout: codeload.github.com (which serves an action's
