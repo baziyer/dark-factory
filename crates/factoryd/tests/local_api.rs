@@ -1162,6 +1162,166 @@ async fn cancel_update_and_delete_are_local_control_operations() {
     .await;
 }
 
+/// Regression test for #42: `DeleteAgent` used to remove an agent's
+/// guidance directory with a best-effort `fs::remove_dir_all` that could
+/// race the dispatcher's own spawn *preparation* (composing guidance,
+/// writing the provider's generated config) for that exact agent, since
+/// preparation runs before any session row -- and therefore before
+/// `delete_agent`'s "no live session" precondition -- exists. Under CI load
+/// that made removal fail with "directory not empty", logged and swallowed
+/// rather than surfaced (PR #41, run 32025418170).
+///
+/// `execution::Handle::begin_delete`/`end_delete` (this fix's mechanism,
+/// ARCHITECTURE.md's deletion invariant) close the race structurally: once
+/// `begin_delete` returns, no further spawn preparation for that agent can
+/// start, and any preparation already running has fully finished
+/// (including its own failure cleanup) before `begin_delete` returns. That
+/// means this test's assertions hold unconditionally on every iteration
+/// regardless of whether this particular run actually overlapped a spawn
+/// attempt -- not "usually passes". What makes this a real regression
+/// guard rather than a tautology: it drives the exact repro from #42
+/// (`AssignTask` to a Codex agent whose `runner_program` does not exist, so
+/// the dispatcher immediately attempts and fails a spawn) back-to-back
+/// across many fresh agents with zero delay before `DeleteAgent`, which is
+/// what made the original bug reproducible at all -- reverting the fix
+/// makes at least one of these iterations very likely to fail, though not
+/// deterministically so (true determinism -- proving the exact ordering
+/// without depending on scheduling luck -- is `execution.rs`'s own
+/// `dispatch_agent_declines_to_prepare_for_a_deleting_agent` and
+/// `wait_for_drain_blocks_until_the_in_flight_preparation_ends` unit tests,
+/// which drive `SpawnBackoff` directly under a paused clock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        let project_root = std::fs::canonicalize(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+
+        let guidance_root = socket.parent().unwrap();
+
+        for iteration in 0..20u32 {
+            let racer = agent_id(&format!("racer-{iteration}"));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::CreateAgent {
+                        id: racer.clone(),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: factory_core::AgentRole::Worker,
+                        provider: factory_core::Provider::Codex,
+                        model: None,
+                        worktree: None,
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::AgentCreated { .. },
+                    ..
+                }
+            ));
+
+            let racer_task = task_id(&format!("task-{iteration}"));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::CreateTask {
+                        id: racer_task.clone(),
+                        project_id: project_id("factory"),
+                        parent_task_id: None,
+                        title: "Race me".into(),
+                        body: "body".into(),
+                        priority: 0,
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::TaskCreated { .. },
+                    ..
+                }
+            ));
+
+            // Triggers the dispatcher's spawn attempt for `racer`: its
+            // `runner_program` doesn't exist (`execution_config`), so the
+            // attempt durably fails, but not before Codex's `spawn_spec`
+            // writes into the agent's guidance directory -- #42's exact
+            // repro.
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::AssignTask {
+                        project_id: project_id("factory"),
+                        task_id: racer_task,
+                        agent_id: Some(racer.clone()),
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::TaskAssigned { .. },
+                    ..
+                }
+            ));
+
+            let racer_guidance_dir =
+                factory_core::paths::agent_dir(guidance_root, &project_id("factory"), &racer);
+
+            // No delay here on purpose: issuing `DeleteAgent` as close to
+            // `AssignTask` returning as possible is what gives this
+            // iteration the best chance of actually overlapping the
+            // dispatcher's in-flight spawn preparation.
+            let deleted = request(
+                &socket,
+                LocalRequest::DeleteAgent {
+                    project_id: project_id("factory"),
+                    agent_id: racer.clone(),
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    deleted,
+                    ServerFrame::Response {
+                        response: LocalResponse::AgentDeleted { .. },
+                        ..
+                    }
+                ),
+                "iteration {iteration}: delete must succeed even racing a spawn attempt, got \
+                 {deleted:?}"
+            );
+            assert!(
+                !racer_guidance_dir.exists(),
+                "iteration {iteration}: guidance directory must be gone immediately after delete"
+            );
+
+            // The fix means nothing can recreate these files after
+            // `DeleteAgent` has returned -- not just that they happened to
+            // be gone at that instant -- so re-check well past any
+            // plausible straggling preparation.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                !racer_guidance_dir.exists(),
+                "iteration {iteration}: guidance directory must stay gone"
+            );
+        }
+    })
+    .await;
+}
+
 /// `CreateAgent.worktree` validates an operator override (D3): rejects a
 /// non-existent path, accepts and durably records an existing one.
 /// `CreateAgent` with no `--worktree` auto-provisions one (5C): since the

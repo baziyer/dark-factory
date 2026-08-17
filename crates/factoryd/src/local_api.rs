@@ -203,6 +203,11 @@ impl From<execution::Error> for ApiFailure {
             execution::Error::NoWorktree => {
                 Self::Invalid("agent has no worktree; create one first".into())
             }
+            execution::Error::DeleteDrainTimeout => Self::Conflict(
+                "an in-flight session spawn did not finish before the delete's drain timeout; \
+                 try the delete again"
+                    .into(),
+            ),
             execution::Error::State(DaemonStateError::Store(
                 error @ (StoreError::AgentNotFound
                 | StoreError::TaskNotQueued
@@ -1037,14 +1042,15 @@ async fn handle_request(
         } => {
             let response_project_id = project_id.clone();
             let response_agent_id = agent_id.clone();
-            remove_agent_worktree_if_any(state, &response_project_id, &response_agent_id).await?;
-            state
-                .commit_and_publish(move |store| {
-                    let events = store.delete_agent(&project_id, &agent_id, now_ms()?)?;
-                    Ok(((), events))
-                })
-                .await?;
-            remove_agent_guidance(guidance_root, &response_project_id, &response_agent_id).await;
+            // Deletion invariant (ARCHITECTURE.md): from this call on, the
+            // execution manager's dispatcher will not begin a new spawn
+            // preparation for this agent, and this call has waited out any
+            // preparation already in flight -- so nothing can still be
+            // writing into its guidance directory below.
+            execution.begin_delete(&agent_id).await?;
+            let result = delete_agent_locked(state, guidance_root, project_id, agent_id).await;
+            execution.end_delete(&response_agent_id);
+            result?;
             Ok(LocalResponse::AgentDeleted {
                 project_id: response_project_id,
                 agent_id: response_agent_id,
@@ -1052,13 +1058,29 @@ async fn handle_request(
         }
         LocalRequest::DeleteProject { project_id } => {
             let response_project_id = project_id.clone();
-            state
-                .commit_and_publish(move |store| {
-                    let event = store.delete_project(&project_id, now_ms()?)?;
-                    Ok(((), vec![event]))
-                })
-                .await?;
-            remove_project_guidance(guidance_root, &response_project_id).await;
+            // Same invariant as `DeleteAgent`, applied to every agent the
+            // project currently has before the project's own guidance tree
+            // (which contains all of theirs) goes.
+            let agent_ids = list_all_agent_ids(state, &project_id).await?;
+            let mut begun = Vec::with_capacity(agent_ids.len());
+            let mut begin_error = None;
+            for agent_id in &agent_ids {
+                match execution.begin_delete(agent_id).await {
+                    Ok(()) => begun.push(agent_id.clone()),
+                    Err(error) => {
+                        begin_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            let result = match begin_error {
+                Some(error) => Err(ApiFailure::from(error)),
+                None => delete_project_locked(state, guidance_root, project_id).await,
+            };
+            for agent_id in &begun {
+                execution.end_delete(agent_id);
+            }
+            result?;
             Ok(LocalResponse::ProjectDeleted {
                 project_id: response_project_id,
             })
@@ -1624,11 +1646,41 @@ async fn provision_agent_worktree(
     }
 }
 
-/// Best-effort recursive removal of one agent's guidance directory, run
-/// after `DeleteAgent`'s transaction has already committed. The ledger row
-/// is gone either way, so a filesystem failure here is logged and otherwise
-/// ignored rather than surfaced to the caller.
-async fn remove_agent_guidance(guidance_root: &Path, project_id: &ProjectId, agent_id: &AgentId) {
+/// Runs the file/database work of `DeleteAgent`, called only after
+/// `execution.begin_delete` has confirmed no spawn preparation can still be
+/// mid-write into this agent's guidance directory (ARCHITECTURE.md's
+/// deletion invariant): removes the git worktree, deletes the ledger row,
+/// then removes the guidance directory.
+async fn delete_agent_locked(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Result<(), ApiFailure> {
+    remove_agent_worktree_if_any(state, &project_id, &agent_id).await?;
+    let delete_project_id = project_id.clone();
+    let delete_agent_id = agent_id.clone();
+    state
+        .commit_and_publish(move |store| {
+            let events = store.delete_agent(&delete_project_id, &delete_agent_id, now_ms()?)?;
+            Ok(((), events))
+        })
+        .await?;
+    remove_agent_guidance(guidance_root, &project_id, &agent_id).await
+}
+
+/// Recursively removes one agent's guidance directory, run after
+/// `DeleteAgent`'s transaction has already committed. The ledger row is
+/// gone either way, but a filesystem failure here is now still reported as
+/// the request's own error (AGENTS.md rule 3: no silent fallback) rather
+/// than merely logged -- `execution.begin_delete` having already drained
+/// any in-flight preparation means a failure here is a real problem (a
+/// permission issue, an unexpected file), not the race this task closes.
+async fn remove_agent_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<(), ApiFailure> {
     let home = guidance_root.to_path_buf();
     let project_id = project_id.clone();
     let agent_id = agent_id.clone();
@@ -1636,13 +1688,11 @@ async fn remove_agent_guidance(guidance_root: &Path, project_id: &ProjectId, age
         tokio::task::spawn_blocking(move || guidance::remove_agent(&home, &project_id, &agent_id))
             .await;
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "failed to remove agent guidance directory after delete");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "guidance worker panicked while removing agent guidance directory");
-        }
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(ApiFailure::Internal(format!(
+            "guidance worker panicked while removing agent guidance directory: {error}"
+        ))),
     }
 }
 
@@ -1695,21 +1745,70 @@ async fn remove_agent_worktree_if_any(
     }
 }
 
-/// Best-effort recursive removal of one project's guidance directory, run
-/// after `DeleteProject`'s transaction has already committed. See
-/// [`remove_agent_guidance`] for why failures are only logged.
-async fn remove_project_guidance(guidance_root: &Path, project_id: &ProjectId) {
+/// Runs the file/database work of `DeleteProject`, called only after every
+/// one of the project's agents has been through `execution.begin_delete`
+/// (its caller's loop): deletes the ledger row, then removes the project's
+/// whole guidance directory tree (which contains every one of those
+/// agents').
+async fn delete_project_locked(
+    state: &ApiState,
+    guidance_root: &Path,
+    project_id: ProjectId,
+) -> Result<(), ApiFailure> {
+    let delete_project_id = project_id.clone();
+    state
+        .commit_and_publish(move |store| {
+            let event = store.delete_project(&delete_project_id, now_ms()?)?;
+            Ok(((), vec![event]))
+        })
+        .await?;
+    remove_project_guidance(guidance_root, &project_id).await
+}
+
+/// Recursively removes one project's guidance directory, run after
+/// `DeleteProject`'s transaction has already committed. See
+/// [`remove_agent_guidance`] for why a failure here is now the request's
+/// own error rather than merely logged.
+async fn remove_project_guidance(
+    guidance_root: &Path,
+    project_id: &ProjectId,
+) -> Result<(), ApiFailure> {
     let home = guidance_root.to_path_buf();
     let project_id = project_id.clone();
     let result =
         tokio::task::spawn_blocking(move || guidance::remove_project(&home, &project_id)).await;
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(%error, "failed to remove project guidance directory after delete");
-        }
-        Err(error) => {
-            tracing::warn!(%error, "guidance worker panicked while removing project guidance directory");
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(ApiFailure::Internal(format!(
+            "guidance worker panicked while removing project guidance directory: {error}"
+        ))),
+    }
+}
+
+/// Every agent id currently in `project_id`, paged like `ListAgents`.
+/// `DeleteProject` uses this to mark each of the project's agents deleting
+/// (`execution::Handle::begin_delete`) before removing any files.
+async fn list_all_agent_ids(
+    state: &ApiState,
+    project_id: &ProjectId,
+) -> Result<Vec<AgentId>, ApiFailure> {
+    let page = MAX_AGENT_PAGE_ITEMS as usize;
+    let mut ids = Vec::new();
+    let mut after_id = None;
+    loop {
+        let lookup_after_id = after_id.clone();
+        let lookup_project_id = project_id.clone();
+        let mut agents = state
+            .with_store(move |store| {
+                store.list_agents(&lookup_project_id, lookup_after_id.as_ref(), page + 1)
+            })
+            .await?;
+        let next_after_id = next_cursor(&mut agents, page, |agent| agent.id.clone());
+        ids.extend(agents.into_iter().map(|agent| agent.id));
+        match next_after_id {
+            Some(cursor) => after_id = Some(cursor),
+            None => return Ok(ids),
         }
     }
 }

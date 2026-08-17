@@ -89,6 +89,17 @@ catalogue.
    directly or via its own session's shell access to it) — it may choose and
    delegate work, but it cannot bypass daemon-owned limits or reach SQLite
    directly.
+9. Once deletion of an agent or project begins, no component may create new
+   state under that identity. `DeleteAgent`/`DeleteProject` mark the
+   identity deleting under the execution manager's own dispatch lock before
+   touching anything else, so the dispatcher's next look at that agent
+   declines to begin a new spawn preparation (composing guidance, writing a
+   provider's generated config) for it; the request then waits, bounded,
+   for a preparation already in flight to finish, and only then deletes the
+   database rows and the identity's owned files, in that order. A file
+   removal that still fails after that wait is the request's own error, not
+   a log line and a swallowed failure — deletion never reports success
+   while files it was supposed to remove still exist.
 
 ## First launch
 
