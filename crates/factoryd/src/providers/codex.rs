@@ -277,7 +277,23 @@ fn seed_codex_home_once(
     if let Some(source_home) = source_home {
         let auth_path = codex_home.join("auth.json");
         let source_auth = source_home.join("auth.json");
-        if fs::symlink_metadata(&auth_path).is_err() && source_auth.exists() {
+        // The credentials link follows the daemon's seed home: create it if
+        // missing, re-point it if it is a link to somewhere else (the seed
+        // home changed -- a different Codex account). A regular file, which
+        // only an operator could have put there, is never touched.
+        let existing_link = fs::read_link(&auth_path).ok();
+        let is_regular_file =
+            fs::symlink_metadata(&auth_path).is_ok_and(|m| !m.file_type().is_symlink());
+        if source_auth.exists()
+            && !is_regular_file
+            && existing_link.as_deref() != Some(source_auth.as_path())
+        {
+            if existing_link.is_some() {
+                fs::remove_file(&auth_path).map_err(|source| ProviderError::Seed {
+                    path: auth_path.clone(),
+                    source,
+                })?;
+            }
             std::os::unix::fs::symlink(&source_auth, &auth_path).map_err(|source| {
                 ProviderError::Seed {
                     path: auth_path.clone(),

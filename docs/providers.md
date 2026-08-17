@@ -152,9 +152,12 @@ runs on a different Codex account than the operator's shell: log it in once
 (`CODEX_HOME=~/.codex-dogfood codex login`) and give the daemon that
 `CODEX_HOME` (`CODEX_HOME=~/.codex-dogfood factoryctl init` carries it into
 the launchd job; `factoryctl doctor` reports which home is in effect and
-whether it holds an `auth.json`). Copying `config.toml` whole was the
-original design and it is filtered, not verbatim, because: Copying it whole was the original design and stalled every
-session at "Starting MCP servers" on a real machine: the operator's own
+whether it holds an `auth.json`). Switching the daemon's `CODEX_HOME`
+later re-points every agent's `auth.json` link on its next spawn (a link
+the daemon made; a real file is never touched); the seeded `config.toml`
+stays. Copying `config.toml` whole was the original design and it is
+filtered, not verbatim, because copying it whole stalled every session at
+"Starting MCP servers" on a real machine: the operator's own
 `config.toml` brings along `[mcp_servers.*]` (Codex launches every one of
 them before a session becomes usable, several of which expect an
 interactive terminal/browser/local dev server that plainly is not there

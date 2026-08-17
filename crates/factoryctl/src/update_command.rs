@@ -104,6 +104,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         &plist,
         Some(&existing),
         &probes::provider_directories(),
+        &std::collections::BTreeMap::new(),
     ) {
         let outcome = match &previous_version {
             Some(previous) if install::activate(&home, previous).is_ok() => {

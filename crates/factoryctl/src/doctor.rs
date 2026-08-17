@@ -338,6 +338,9 @@ fn check_codex_seed(user_home: Option<&Path>) -> Check {
     let Some(user_home) = user_home else {
         return Check::warn("codex-seed", "HOME is not set");
     };
+    if probes::locate_on_path("codex").is_none() {
+        return Check::ok("codex-seed", "codex is not installed; nothing to seed");
+    }
     let job = launchd::read_existing(&launchd::plist_path(user_home))
         .ok()
         .flatten();
