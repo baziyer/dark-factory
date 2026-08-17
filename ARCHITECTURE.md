@@ -29,19 +29,34 @@ This file records constraints, not an aspirational component catalogue.
    SESSION_TOKEN_FILE/FACTORYCTL` — the provider's only way to reach
    `factoryctl` and identify itself), and creates a private socket and
    bounded, retained `terminal.log` before spawning one process group under
-   the PTY. Runners prove both a run ID and a random runner-instance ID and
-   never adopt or signal from PID coincidence alone. Delivery into an idle
-   session types composed text into its PTY and waits for the provider's own
-   hook to acknowledge receipt (a `UserPromptSubmit`) before committing the
-   delivery durably; a session that is already `working`/`waiting_for_input`
-   is instead delivered into via its `Stop`/`SubagentStop` hook's block-reply
-   contract, so a second task can land without interrupting a live turn.
-   `factoryd`'s own restart never stops a session: `factory-runner` is a
-   detached process tree, and a fresh daemon recovers by reconnecting to its
-   control socket and replaying its retained spool from sequence zero (a
-   session with no live connection at all, endpoint proven absent, is the
-   only case recorded as ended). A supervised program's *own* process is not
-   free to exit the instant it terminates, either: `factory-runner`
+   the PTY. A `starting` session row exists before that process spawn is
+   even attempted, so a spawn failure is always durably visible (`session
+   list`/the TUI, an announcement and the error as `wait_reason`) rather
+   than only in the daemon's own log; a persistently broken spawn path
+   retries with exponential per-agent backoff (5s doubling to a 5 minute
+   cap), never busy-loops. Runners prove both a run ID and a random
+   runner-instance ID and never adopt or signal from PID coincidence alone.
+   Delivery into an idle session types composed text into its PTY and waits
+   for the provider's own hook to acknowledge receipt (a
+   `UserPromptSubmit`) before committing the delivery durably — committed
+   synchronously as part of handling that exact hook request, before its
+   reply reaches the provider process, so a fast-reacting provider can never
+   observe the ack before the episode it names is actually open; a session
+   that is already `working`/`waiting_for_input` is instead delivered into
+   via its `Stop`/`SubagentStop` hook's block-reply contract, so a second
+   task can land without interrupting a live turn. A single pending-delivery
+   slot per agent keeps two independent delivery attempts (the dispatcher's
+   own PTY-typed path racing a `Stop`/`SubagentStop` hook reply for the same
+   agent) from ever composing and delivering the same task or messages
+   twice. `factoryd`'s own restart never stops a session: `factory-runner`
+   is a detached process tree, and a fresh daemon recovers by reconnecting
+   to its control socket and replaying its retained spool from sequence
+   zero; a session with no live connection at all (endpoint proven absent),
+   or whose endpoint never becomes reachable again within a bounded number
+   of reconnect attempts, is recorded `failed`/`unverifiable` rather than
+   left dangling in whatever state it was recovered in. A supervised
+   program's *own* process is not free to exit the instant it terminates,
+   either: `factory-runner`
    deliberately holds the control socket open, retaining `terminal.log`,
    until a client acknowledges the exact terminal sequence it durably
    logged (`AcknowledgeExit`) — the daemon does this itself, immediately,

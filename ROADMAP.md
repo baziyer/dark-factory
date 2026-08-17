@@ -79,30 +79,29 @@ should be revisited, not silently relied on:
   harness killing the daemon right after `StopSession` returns, say) will
   still orphan the runner process. `crates/factoryd/tests/sessions_e2e.rs`'s
   `cleanup_session`/`Daemon::drop` document the pattern to follow.
-- **An operator's own MCP server config can stall a Codex session
-  indefinitely in `starting`**, unrelated to `sandbox_mode`/
-  `writable_roots`: found running a real Codex session manually against an
-  operator's real, MCP-server-heavy `~/.codex/config.toml`
-  (`CodexProvider` seeds a fresh per-agent `CODEX_HOME` by copying it
-  forward). One `[mcp_servers.*]` entry needing to write somewhere outside
-  the seeded sandbox's `writable_roots` (or simply slow/unresponsive, for
-  a remote-URL server) hangs rather than erroring, and Codex's own startup
-  sequence never reaches `SessionStart` until every configured MCP server
-  either starts or times out on its own. No code fix from this track
-  covers this — it is a property of whatever the *operator's* config
-  defines, which Dark Factory intentionally does not touch beyond the
-  trust/sandbox marker blocks. Worth a `factoryctl session`-visible
-  timeout or a documented "seed from a minimal MCP-free config" option if
-  this proves common in practice.
-- **A daemon restart can recover a session that never leaves `starting`**:
-  found in the same manual check, on a session whose underlying process
-  had already exited before the restart (a `StopSession` that was still
-  in flight) — `session list` kept reporting it as live with no runner
-  process behind it, at least briefly, rather than the recovery path
-  (`execution.rs`'s `supervise_recovered`) resolving it. Not chased down
-  further within this track's scope; worth a dedicated regression test
-  for "recover a session mid-stop across a restart" if it reproduces
-  reliably.
+Resolved since (Track 5E — daemon follow-ups):
+
+- **An operator's own MCP server config stalling a Codex session
+  indefinitely in `starting`** ("Starting MCP servers", found running a
+  real Codex session manually against an operator's real, MCP-server-heavy
+  `~/.codex/config.toml`) is fixed at the source: `CodexProvider`'s
+  one-time seed of a fresh per-agent `CODEX_HOME` now copies the operator's
+  `config.toml` filtered down to what a factory worker needs, explicitly
+  dropping `[mcp_servers.*]` (along with `[projects.*]` and
+  `[hooks.*]`/`[hooks.state]` — see `docs/providers.md`'s "Codex:
+  `CODEX_HOME` seeding is filtered, not a raw copy") — there is nothing
+  left to launch, hang, or time out. Verified against one real Codex
+  session on a temp home (this track's report has the exact `task list`
+  result and which `permission_mode`/sandbox setting worked).
+- **A daemon restart recovering a session that never leaves `starting`**
+  (a session whose underlying process had already exited, or whose runner
+  had become permanently unreachable) now durably fails instead of
+  dangling forever: `execution.rs`'s `supervise_recovered` bounds its
+  reconnect retries (`MAX_RECOVERY_ATTEMPTS`) and durably ends the session
+  `failed`/`unverifiable` once exhausted, covering both a cleanly-absent
+  runtime directory (already handled) and a runtime directory/socket that
+  looks structurally present but never actually answers (previously
+  retried forever).
 
 ## Product boundaries
 
