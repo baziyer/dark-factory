@@ -1,0 +1,21 @@
+name: Feature request
+description: A capability Dark Factory should have
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you're trying to do
+      description: The operator or agent workflow this unblocks, not the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed shape
+      description: "CLI first: what `factoryctl` request would this be? The TUI must call the same request path (AGENTS.md rule 5)."
+  - type: textarea
+    id: smaller
+    attributes:
+      label: What this lets us delete or simplify
+      description: Every change should leave the codebase smaller or simpler (AGENTS.md rule 3). If it only adds, say why that's still right.
