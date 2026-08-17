@@ -8,9 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::model::attention::Attention;
 use crate::model::{Board, announcements::ranked};
 use crate::ui;
+use factory_core::attention::Attention;
 
 fn attention_style(attention: Attention) -> Style {
     match attention {

@@ -22,12 +22,16 @@ cargo run -p factory-tui -- --dev-local-pty           # TERMINALS/FOCUS attach a
 Socket resolution matches `factoryctl` exactly: `--socket`, then `$DARK_FACTORY_SOCKET`, then
 `$DARK_FACTORY_HOME/f.sock`, then `$HOME/.dark-factory/f.sock`. If the daemon isn't reachable, the
 status line shows `RETRYING` with the connection error and keeps retrying with backoff (capped at
-5s) — it never crashes or blocks the UI.
+5s) — it never crashes or blocks the UI. Once live, the status line also shows `n/cap live`
+(sessions that haven't ended against `factoryd --max-active-runs`, the cap coming from the same
+`FleetStatus` request `factoryctl status` makes; yellow when at the cap) and, at most hourly,
+`update vX available` (see README's "Local service, releases, and updates").
 
 This board loads **every** project's agents/tasks/runs/sessions at once (FORTRESS is fleet-wide)
 and *focuses* one project at a time for WORKSHOP/TERMINALS/FOCUS — `--project` sets that initial
-focus; otherwise the oldest project (by creation order) is focused by default, and `Enter` on an
-agent in FORTRESS re-focuses whichever project that agent belongs to.
+focus; otherwise the project focused last time (saved in `$DARK_FACTORY_HOME/factory-tui.json`),
+else the oldest by creation order; `p` opens a picker, and `Enter` on an agent in FORTRESS
+re-focuses whichever project that agent belongs to.
 
 ## The four views
 

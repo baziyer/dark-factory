@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use factory_core::status::WorktreeStatus;
 use tokio::process::Command;
 
 #[derive(Debug, thiserror::Error)]
@@ -97,6 +98,36 @@ pub async fn remove(project_root: &Path, worktree_dir: &Path) -> Result<(), Work
     Err(WorktreeError::Git(stderr.into_owned()))
 }
 
+/// `git status --porcelain=v1 --branch` of `worktree_dir`, summarized for
+/// `factoryctl agent status`: the branch name and how many entries are
+/// modified, staged, or untracked.
+pub async fn status(worktree_dir: &Path) -> Result<WorktreeStatus, WorktreeError> {
+    let output = run_git(worktree_dir, &["status", "--porcelain=v1", "--branch"]).await?;
+    if !output.status.success() {
+        return Err(WorktreeError::Git(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut branch = None;
+    let mut changed_files = 0u32;
+    for line in text.lines() {
+        if let Some(header) = line.strip_prefix("## ") {
+            // `main...origin/main [ahead 1]` or `HEAD (no branch)`.
+            let name = header.split("...").next().unwrap_or(header).trim();
+            branch = Some(name.to_owned());
+        } else if !line.is_empty() {
+            changed_files += 1;
+        }
+    }
+    Ok(WorktreeStatus {
+        path: worktree_dir.to_string_lossy().into_owned(),
+        branch,
+        changed_files,
+        dirty: changed_files > 0,
+    })
+}
+
 async fn run_git(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new("git")
         .arg("-C")
@@ -157,6 +188,30 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "agent/curie"
         );
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_branch_and_counts_changed_files() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_dir = repo.path().join("worktrees").join("curie");
+        add(repo.path(), &worktree_dir, "agent/curie")
+            .await
+            .unwrap();
+
+        let clean = status(&worktree_dir).await.unwrap();
+        assert_eq!(clean.branch.as_deref(), Some("agent/curie"));
+        assert_eq!(clean.changed_files, 0);
+        assert!(!clean.dirty);
+
+        std::fs::write(worktree_dir.join("README.md"), "changed\n").unwrap();
+        std::fs::write(worktree_dir.join("new.txt"), "untracked\n").unwrap();
+        let dirty = status(&worktree_dir).await.unwrap();
+        assert_eq!(dirty.changed_files, 2);
+        assert!(dirty.dirty);
+        assert_eq!(dirty.path, worktree_dir.to_string_lossy());
+
+        assert!(status(&repo.path().join("missing")).await.is_err());
     }
 
     #[tokio::test]

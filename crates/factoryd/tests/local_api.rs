@@ -1467,3 +1467,148 @@ async fn session_shaped_requests_now_have_real_behavior() {
     })
     .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fleet_and_agent_status_are_one_consistent_read() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("project");
+        std::fs::create_dir(&project_root).unwrap();
+        for request_body in [
+            LocalRequest::CreateProject {
+                id: project_id("factory"),
+                name: "Factory".to_owned(),
+                root: project_root.to_string_lossy().into_owned(),
+            },
+            LocalRequest::CreateAgent {
+                id: agent_id("curie"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Codex,
+                model: None,
+                worktree: None,
+            },
+            // Paused first, so assigning work never spawns a session: the
+            // status below is deterministic (and this test can't race the
+            // dispatcher the way #42 describes).
+            LocalRequest::PauseAgent {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+            LocalRequest::CreateTask {
+                id: task_id("t-assigned"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "assigned".to_owned(),
+                body: "b".to_owned(),
+                priority: 0,
+            },
+            LocalRequest::CreateTask {
+                id: task_id("t-loose"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "unassigned".to_owned(),
+                body: "b".to_owned(),
+                priority: 0,
+            },
+            LocalRequest::AssignTask {
+                project_id: project_id("factory"),
+                task_id: task_id("t-assigned"),
+                agent_id: Some(agent_id("curie")),
+            },
+        ] {
+            let frame = request(&socket, request_body).await;
+            assert!(
+                !matches!(
+                    frame,
+                    ServerFrame::Response {
+                        response: LocalResponse::Error { .. },
+                        ..
+                    }
+                ),
+                "{frame:?}"
+            );
+        }
+
+        let ServerFrame::Response {
+            response: LocalResponse::FleetStatus { status },
+            ..
+        } = request(&socket, LocalRequest::FleetStatus).await
+        else {
+            panic!("expected a fleet status");
+        };
+        assert_eq!(
+            status.live_session_cap, 1,
+            "execution_config's max_active_runs"
+        );
+        assert_eq!(status.live_sessions, 0);
+        assert_eq!(status.projects.len(), 1);
+        let project = &status.projects[0];
+        assert_eq!(project.project.id, project_id("factory"));
+        assert_eq!(project.unassigned_queue_depth, 1);
+        assert_eq!(project.unassigned_queue[0].id, task_id("t-loose"));
+        assert_eq!(project.agents.len(), 1);
+        let curie = &project.agents[0];
+        assert_eq!(curie.agent.id, agent_id("curie"));
+        assert!(curie.agent.paused);
+        assert!(curie.session.is_none());
+        assert!(curie.current_run.is_none());
+        assert_eq!(curie.queue_depth, 1);
+        assert_eq!(curie.queue[0].id, task_id("t-assigned"));
+        assert_eq!(curie.inbox_pending, 0);
+        assert_eq!(curie.attention, factory_core::attention::Attention::Routine);
+        assert!(
+            curie.attention_inferred,
+            "no session: inferred from (no) run"
+        );
+        assert_eq!(status.attention.len(), 1);
+        let item = &status.attention[0];
+        assert_eq!(
+            item.kind,
+            factory_core::status::AttentionKind::PausedWithWork
+        );
+        assert_eq!(item.agent_id, Some(agent_id("curie")));
+        assert_eq!(item.task_id, Some(task_id("t-assigned")));
+
+        let ServerFrame::Response {
+            response: LocalResponse::AgentStatus { status: detail },
+            ..
+        } = request(
+            &socket,
+            LocalRequest::AgentStatus {
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+            },
+        )
+        .await
+        else {
+            panic!("expected an agent status");
+        };
+        assert_eq!(detail.status, *curie, "the same picture the fleet view had");
+        assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert!(detail.detail.instructions_path.ends_with("instructions.md"));
+        assert!(
+            detail.worktree.is_none(),
+            "the project root is not a git repo, so the agent runs in the root and has no worktree"
+        );
+
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AgentStatus {
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("nobody"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::NotFound,
+                    ..
+                },
+                ..
+            }
+        ));
+    })
+    .await;
+}

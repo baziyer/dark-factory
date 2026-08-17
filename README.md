@@ -117,10 +117,11 @@ identity.
 | Group | Actions |
 |---|---|
 | `health`, `usage` | check the daemon; probe Codex subscription headroom on demand |
+| `status` | the whole fleet at one instant: per-project agents with session/run/queue/inbox, unassigned queues, live sessions vs. cap, and an attention list — one store read, one JSON frame |
 | `init`, `doctor`, `update`, `version` | guided install; read-only checks; check/install a newer release; print the version |
 | `project` | `add` `list` `delete` `get` `guidance set` |
 | `task` | `add` `list` `get` `start` `retry` `assign` `cancel` `update` `delete` `done` `blocked` |
-| `agent` | `add` `list` `delete` `get` `profile set` `message` `inbox` `pause` `resume` |
+| `agent` | `add` `list` `delete` `get` `status` `profile set` `message` `inbox` `pause` `resume` |
 | `run` | `list` `stop` |
 | `session` | `list` `stop` |
 | `attach` | attach to a session's PTY by `--session` or `--agent` |
@@ -130,6 +131,13 @@ identity.
 `task done`/`task blocked` take no `--agent`: identity comes from the
 session's own environment (`$DARK_FACTORY_AGENT`), so only the agent
 itself can close out its own work.
+
+`factoryctl status` and `factoryctl agent status --agent X` are the
+status surface — `factory-tui` reads the same requests (the live-session
+cap in its status line comes from `status`), and the attention taxonomy
+both use lives in one place, `factory_core::attention`. `agent status`
+adds the agent's profile and its worktree's `git status` (branch, changed
+files, dirty).
 
 ## The TUI
 

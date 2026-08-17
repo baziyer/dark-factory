@@ -16,10 +16,10 @@ use ratatui::style::{Color, Modifier, Style};
 
 use factory_core::{AgentId, AgentRole, AgentSnapshot, ProjectId, ProjectSnapshot, Provider};
 
-use crate::model::attention::Attention;
 use crate::model::state::AgentState;
 use crate::model::{Board, RouteKind};
 use crate::theme::Theme;
+use factory_core::attention::Attention;
 
 /// Width, in cells, of one station "slot": the glyph itself plus one cell reserved for a route
 /// connector immediately to its left (unused — left blank — for the first station and for

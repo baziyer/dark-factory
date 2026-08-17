@@ -239,6 +239,12 @@ impl Handle {
         &self.config.factoryctl_path
     }
 
+    /// The daemon-wide live-session cap (`factoryd --max-active-runs`).
+    #[must_use]
+    pub fn max_active_runs(&self) -> usize {
+        self.config.max_active_runs
+    }
+
     /// Opens a task-episode inside the agent's live, idle session right
     /// now (bypassing FIFO order -- the operator asked for this exact
     /// task), then makes a best-effort attempt to type its instructions in

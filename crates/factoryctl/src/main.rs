@@ -37,13 +37,14 @@ const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
 
 Commands:
   health                                      Check the daemon
+  status                                      The whole fleet at one instant: sessions, queues, attention, live-session cap
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Read-only checks of the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
@@ -73,6 +74,16 @@ Options:
 const HEALTH_HELP: &str = "usage: factoryctl health
 
 Check that the daemon is reachable and responding.";
+const STATUS_HELP: &str = "usage: factoryctl status
+
+One JSON frame with the whole daemon at one instant, built in one store
+read: every project's agents with their live (or most recent) session,
+current run, queued tasks (oldest first, first 10 listed, full depth
+alongside), and undelivered inbox count; each project's unassigned queue;
+the daemon's live-session cap and how many sessions are live; and an
+attention list (sessions waiting for input or failed, blocked tasks,
+paused agents with work, agents waiting for capacity), most urgent first.
+factory-tui reads the same request. For history, use the list commands.";
 const INIT_HELP: &str = "usage: factoryctl init [--yes] [--no-launchd]
 
 Guided first install on this machine:
@@ -378,7 +389,7 @@ Options:
   -h, --help              Show this help";
 
 const AGENT_HELP: &str =
-    "usage: factoryctl agent <add|list|delete|get|profile|message|inbox|pause|resume> [options]
+    "usage: factoryctl agent <add|list|delete|get|status|profile|message|inbox|pause|resume> [options]
 
 Manage agents within a project and their durable messages.
 
@@ -387,6 +398,7 @@ Actions:
   list      List agents in a project
   delete    Delete an agent that has no open run
   get       Fetch one agent, including its guidance file paths
+  status    One agent's live picture: session, run, last hook, queue, inbox, worktree git state
   profile   Manage an agent's model, permission mode, and guidance files
   message   Send a durable message from one agent to another
   inbox     List an agent's durable messages
@@ -439,6 +451,21 @@ Required:
 
 Options:
   -h, --help              Show this help";
+const AGENT_STATUS_HELP: &str = "usage: factoryctl agent status --project ID --agent ID
+
+One agent at one instant: its snapshot and profile (as `agent get`), its
+live session -- or the most recent ended one, so a failure stays visible --
+with state, activity, last hook event and time, and wait reason; its current
+run; the queued tasks assigned to it (oldest first, first 10 listed, full
+depth alongside); undelivered inbox messages; its attention level (and
+whether that was read from the session or inferred from the run); and, when
+it has a worktree, `git status` summarized (branch, changed files, dirty).
+
+Required:
+  --project ID           Project the agent belongs to
+  --agent ID             Agent to inspect
+Options:
+  -h, --help             Show this help";
 const AGENT_GET_HELP: &str = "usage: factoryctl agent get --project ID --agent ID
 
 Fetch one agent, including the absolute paths of its `instructions.md` and
@@ -653,6 +680,7 @@ const HOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 enum CliCommand {
     Help(&'static str),
     Health,
+    Status,
     Usage,
     Version,
     Update {
@@ -761,6 +789,10 @@ enum CliCommand {
         limit: u32,
     },
     AgentGet {
+        project_id: String,
+        agent_id: String,
+    },
+    AgentStatus {
         project_id: String,
         agent_id: String,
     },
@@ -1173,6 +1205,13 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             require_empty(&args)?;
             Ok((socket, CliCommand::Health))
         }
+        "status" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(STATUS_HELP)));
+            }
+            require_empty(&args)?;
+            Ok((socket, CliCommand::Status))
+        }
         "version" | "--version" | "-V" => {
             require_empty(&args)?;
             Ok((socket, CliCommand::Version))
@@ -1549,6 +1588,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             "list" => AGENT_LIST_HELP,
             "delete" => AGENT_DELETE_HELP,
             "get" => AGENT_GET_HELP,
+            "status" => AGENT_STATUS_HELP,
             "profile" => AGENT_PROFILE_HELP,
             "message" => AGENT_MESSAGE_HELP,
             "inbox" => AGENT_INBOX_HELP,
@@ -1602,6 +1642,15 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             let agent_id = required_option(&mut args, "--agent")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentGet {
+                project_id,
+                agent_id,
+            })
+        }
+        "status" => {
+            let project_id = required_project(&mut args)?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            require_empty(&args)?;
+            Ok(CliCommand::AgentStatus {
                 project_id,
                 agent_id,
             })
@@ -1755,6 +1804,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
+        CliCommand::Status => Ok(LocalRequest::FleetStatus),
         CliCommand::Usage
         | CliCommand::Version
         | CliCommand::Update { .. }
@@ -1934,6 +1984,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id,
             agent_id,
         } => Ok(LocalRequest::GetAgent {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+        }),
+        CliCommand::AgentStatus {
+            project_id,
+            agent_id,
+        } => Ok(LocalRequest::AgentStatus {
             project_id: parse_id(project_id, "project")?,
             agent_id: parse_id(agent_id, "agent")?,
         }),
@@ -2300,6 +2357,10 @@ mod tests {
             CliCommand::Help(USAGE_HELP)
         );
         assert_eq!(
+            parse_args(args(&["status", "--help"])).unwrap().1,
+            CliCommand::Help(STATUS_HELP)
+        );
+        assert_eq!(
             parse_args(args(&["update", "--help"])).unwrap().1,
             CliCommand::Help(UPDATE_HELP)
         );
@@ -2392,6 +2453,7 @@ mod tests {
             ("list", AGENT_LIST_HELP),
             ("delete", AGENT_DELETE_HELP),
             ("get", AGENT_GET_HELP),
+            ("status", AGENT_STATUS_HELP),
             ("profile", AGENT_PROFILE_HELP),
             ("message", AGENT_MESSAGE_HELP),
             ("inbox", AGENT_INBOX_HELP),
@@ -2654,6 +2716,30 @@ mod tests {
             request_for(request).unwrap(),
             LocalRequest::GetProject { project_id } if project_id == "factory".try_into().unwrap()
         ));
+    }
+
+    #[test]
+    fn status_and_agent_status_map_to_the_status_requests() {
+        assert_eq!(
+            request_for(parse_args(args(&["status"])).unwrap().1).unwrap(),
+            LocalRequest::FleetStatus
+        );
+        assert!(parse_args(args(&["status", "--json"])).is_err());
+        let (_, command) = parse_args(args(&[
+            "agent",
+            "status",
+            "--project",
+            "factory",
+            "--agent",
+            "god",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            request_for(command).unwrap(),
+            LocalRequest::AgentStatus { project_id, agent_id }
+                if project_id == "factory".try_into().unwrap() && agent_id == "god".try_into().unwrap()
+        ));
+        assert!(parse_args(args(&["agent", "status", "--project", "factory"])).is_err());
     }
 
     #[test]
