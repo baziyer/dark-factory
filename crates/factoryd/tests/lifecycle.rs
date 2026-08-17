@@ -91,6 +91,44 @@ fn claim_rejects_insecure_or_symlinked_parents_without_changing_them() {
 }
 
 #[test]
+fn claim_rejects_a_socket_path_over_the_platform_sockaddr_un_limit() {
+    // macOS/BSD's `sockaddr_un.sun_path` is 104 bytes including the
+    // trailing NUL the kernel appends; a resolved path this long would
+    // otherwise fail deep inside `bind()` with a cryptic `ENAMETOOLONG`
+    // (or worse, silently truncate on some platforms) well past the
+    // point an operator could connect the failure to their `--socket`/
+    // `DARK_FACTORY_SOCKET` choice (this track's item 4).
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    private_directory(&state);
+    let control = directory.path().join("control");
+    private_directory(&control);
+    let long_name = format!("{}.sock", "a".repeat(200));
+    let socket = control.join(long_name);
+
+    let error = DaemonInstance::claim(&state.join("factory.db"), &socket).unwrap_err();
+    assert!(
+        error.to_string().contains("byte limit"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !socket.exists(),
+        "an over-long socket path must never be bound"
+    );
+}
+
+#[test]
+fn claim_accepts_a_socket_path_comfortably_under_the_platform_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = directory.path().join("state");
+    private_directory(&state);
+    let control = directory.path().join("control");
+    private_directory(&control);
+
+    DaemonInstance::claim(&state.join("factory.db"), &control.join("short.sock")).unwrap();
+}
+
+#[test]
 fn claim_rejects_a_database_or_lock_file_that_is_not_private_and_regular() {
     let directory = tempfile::tempdir().unwrap();
     let state = directory.path().join("state");
