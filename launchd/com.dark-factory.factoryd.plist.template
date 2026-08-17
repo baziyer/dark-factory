@@ -22,6 +22,12 @@
         <string>__WEBHOOK_CONFIG__</string>
     </array>
 
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
     <key>WorkingDirectory</key>
     <string>__WORKING_DIRECTORY__</string>
     <key>RunAtLoad</key>
