@@ -253,6 +253,52 @@ async fn pause_agent(socket: &Path, agent_id: &str) {
     .await;
 }
 
+/// The documented way back in after the dispatcher pauses an agent on its
+/// own (issue #24 finding 4's escalation, after
+/// `MAX_CONSECUTIVE_START_DEADLINES` consecutive deadline failures) --
+/// also resets its spawn backoff/start-deadline streak
+/// (`execution::Handle::resume_backoff`, wired into this exact request in
+/// `local_api.rs`).
+async fn resume_agent(socket: &Path, agent_id: &str) {
+    let response = request(
+        socket,
+        LocalRequest::ResumeAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from(agent_id).unwrap(),
+        },
+    )
+    .await;
+    assert!(
+        matches!(
+            response,
+            ServerFrame::Response {
+                response: LocalResponse::AgentResumed { .. },
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+}
+
+async fn agent_paused(socket: &Path, agent_id: &str) -> bool {
+    let response = request(
+        socket,
+        LocalRequest::GetAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from(agent_id).unwrap(),
+        },
+    )
+    .await;
+    let ServerFrame::Response {
+        response: LocalResponse::Agent { agent },
+        ..
+    } = response
+    else {
+        panic!("expected Agent, got {response:?}");
+    };
+    agent.snapshot.paused
+}
+
 async fn sessions_for_agent(socket: &Path, agent_id: &str) -> Vec<SessionSnapshot> {
     let response = request(
         socket,
@@ -409,6 +455,15 @@ async fn a_starting_session_past_its_deadline_fails_and_is_retried() {
     create_task(&socket, "task-1", "Do it", "do it").await;
     assign_task(&socket, "task-1", "stuck").await;
 
+    // Whatever state the first observed session is already in by the time
+    // this first succeeds (almost always `starting`, since the poll below
+    // checks immediately, before ever sleeping) is not asserted on: a
+    // badly loaded box could in principle stall long enough for even the
+    // real 5 second safety tick to have already caught the (shortened)
+    // deadline before this first observation lands, and the rest of this
+    // test drives toward `failed` regardless of which state it starts
+    // from -- asserting `Starting` here would make that a spurious
+    // failure instead of the harmless race it actually is.
     let first = wait_for(Duration::from_secs(10), || async {
         sessions_for_agent(&socket, "stuck")
             .await
@@ -416,17 +471,18 @@ async fn a_starting_session_past_its_deadline_fails_and_is_retried() {
             .next()
     })
     .await;
-    assert_eq!(first.state, SessionState::Starting);
     let runtime_dir = harness.runtime_dir(first.id.as_str());
-    wait_until(Duration::from_secs(5), || runner_alive(&runtime_dir)).await;
+    if first.state == SessionState::Starting {
+        wait_until(Duration::from_secs(5), || runner_alive(&runtime_dir)).await;
+    }
 
-    // Past the (shortened) deadline in real wall-clock time: a wake nudges
-    // `dispatch_agent` to notice right away instead of waiting on the real
-    // 5 second safety tick.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    harness.wake("stuck");
-
+    // Past the (shortened) deadline in real wall-clock time: nudge
+    // periodically (a harmless no-op both before the deadline is due and
+    // once it has already been caught by the real safety tick) instead of
+    // a single fixed sleep-then-wake, so this never depends on winning a
+    // race against that tick either.
     let failed = wait_for(Duration::from_secs(10), || async {
+        harness.wake("stuck");
         sessions_for_agent(&socket, "stuck")
             .await
             .into_iter()
@@ -495,11 +551,16 @@ async fn a_session_that_already_sent_session_start_is_left_alone() {
     create_task(&socket, "task-1", "Do it", "do it").await;
     assign_task(&socket, "task-1", "curie").await;
 
+    // `is_live() && != Starting`, not just `!= Starting`: the latter would
+    // also match `Failed`/`Stopped`, so a regression that let the deadline
+    // fail this session before its `SessionStart` hook won the race would
+    // silently satisfy this wait and only surface later, at the `is_live()`
+    // assert below -- further from the actual point of the mistake.
     let started = wait_for(Duration::from_secs(15), || async {
         sessions_for_agent(&socket, "curie")
             .await
             .into_iter()
-            .find(|session| session.state != SessionState::Starting)
+            .find(|session| session.state.is_live() && session.state != SessionState::Starting)
     })
     .await;
     let session_id = started.id.clone();
@@ -518,8 +579,111 @@ async fn a_session_that_already_sent_session_start_is_left_alone() {
         "session unexpectedly ended: {after:?}"
     );
 
+    // If the PTY-typed delivery triggered by `assign_task` hasn't
+    // committed yet, `task-1` is still queued, so stopping this session
+    // would wake the dispatcher into spawning a fresh one right as this
+    // test tears down (`Handle::shutdown` only signals the dispatcher, it
+    // does not stop runners) -- issue #26's orphan risk again, same fix as
+    // test 1: pause first so there is nothing left to respawn into.
+    pause_agent(&socket, "curie").await;
     let runtime_dir = harness.runtime_dir(session_id.as_str());
     stop_session(&socket, session_id).await;
     wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
+    harness.stop().await;
+}
+
+/// Issue #24 finding 4's escalation: a hookless provider (`sleep 300`,
+/// same fixture as the first test) always spawns successfully, so an
+/// ordinary spawn failure's backoff alone never caps the fail/backoff/
+/// retry cycle. After `MAX_CONSECUTIVE_START_DEADLINES` (3) consecutive
+/// deadline expiries in a row, the dispatcher must pause the agent instead
+/// of spawning a fourth session, and `factoryctl agent resume` must be
+/// the way back in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() {
+    let harness = Harness::start(Duration::from_millis(120)).await;
+    let socket = harness.socket.clone();
+    create_project(&socket, &harness.home.path().join("repo")).await;
+    create_shell_agent(
+        &socket,
+        "stuck",
+        &harness.home.path().join("worktree-stuck"),
+        "sleep 300".to_owned(),
+    )
+    .await;
+    create_task(&socket, "task-1", "Do it", "do it").await;
+    assign_task(&socket, "task-1", "stuck").await;
+
+    // Drive three full spawn -> deadline -> failed cycles. Each iteration
+    // waits for a session id not seen before (robust to whichever of the
+    // dispatcher's own wake or this loop's nudges actually lands the
+    // respawn) and then for that exact session to fail.
+    let mut seen: Vec<SessionId> = Vec::new();
+    for _ in 0..3 {
+        let spawned = wait_for(Duration::from_secs(30), || async {
+            harness.wake("stuck");
+            sessions_for_agent(&socket, "stuck")
+                .await
+                .into_iter()
+                .find(|session| !seen.contains(&session.id))
+        })
+        .await;
+        seen.push(spawned.id.clone());
+
+        wait_for(Duration::from_secs(10), || async {
+            harness.wake("stuck");
+            sessions_for_agent(&socket, "stuck")
+                .await
+                .into_iter()
+                .find(|session| session.id == spawned.id && session.state == SessionState::Failed)
+        })
+        .await;
+    }
+
+    // No fourth session: give the dispatcher a healthy window, nudging it
+    // repeatedly, so a missing fourth session is "paused, not just hasn't
+    // happened yet".
+    for _ in 0..15 {
+        harness.wake("stuck");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let sessions = sessions_for_agent(&socket, "stuck").await;
+    assert_eq!(
+        sessions.len(),
+        3,
+        "no fourth session must be spawned once the agent is paused"
+    );
+    assert!(
+        agent_paused(&socket, "stuck").await,
+        "agent must be paused after 3 consecutive start-deadline failures"
+    );
+    // The third session's own `failed` reason is still exactly what an
+    // operator sees (`factoryctl status`/`agent status`/the TUI's
+    // attention view) -- no new state, nothing extra to check here.
+
+    resume_agent(&socket, "stuck").await;
+    let fourth = wait_for(Duration::from_secs(10), || async {
+        harness.wake("stuck");
+        sessions_for_agent(&socket, "stuck")
+            .await
+            .into_iter()
+            .find(|session| !seen.contains(&session.id))
+    })
+    .await;
+    assert!(
+        !seen.contains(&fourth.id),
+        "resume must actually spawn a new session, not reuse a paused-over one"
+    );
+
+    // Cleanup: pause again so nothing keeps respawning `sleep 300` behind
+    // this test, then stop whatever is currently live (issue #26).
+    pause_agent(&socket, "stuck").await;
+    for session in sessions_for_agent(&socket, "stuck").await {
+        if session.state.is_live() {
+            let runtime_dir = harness.runtime_dir(session.id.as_str());
+            stop_session(&socket, session.id.clone()).await;
+            wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
+        }
+    }
     harness.stop().await;
 }
