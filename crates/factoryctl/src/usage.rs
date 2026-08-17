@@ -91,7 +91,7 @@ struct CodexCollectorConfig {
 /// `{"ok":true,"provider":"codex","usedPercent":42,"limitWindow":"primary","resetsAtMs":1234,"exhausted":false}`
 /// or on failure: `{"ok":false,"provider":"codex","category":"timeout"}`.
 pub fn run() -> i32 {
-    let outcome = match locate_on_path("codex") {
+    let outcome = match crate::probes::locate_on_path("codex") {
         Some(codex_program) => {
             let config = CodexCollectorConfig {
                 codex_program,
@@ -152,15 +152,6 @@ fn print_failure(error: CollectorError) {
         "{}",
         json!({ "ok": false, "provider": "codex", "category": error.category() })
     );
-}
-
-fn locate_on_path(program: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path).find_map(|directory| {
-        let candidate = directory.join(program);
-        let metadata = fs::metadata(&candidate).ok()?;
-        (metadata.is_file() && metadata.mode() & 0o111 != 0).then_some(candidate)
-    })
 }
 
 async fn collect_codex(config: CodexCollectorConfig) -> Result<NormalizedUsage, CollectorError> {

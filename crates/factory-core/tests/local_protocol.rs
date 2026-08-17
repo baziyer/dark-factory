@@ -749,3 +749,26 @@ fn session_lifecycle_requests_have_small_versioned_local_shapes() {
         serde_json::json!({"type": "session_stopped", "data": {"session_id": "session-1"}})
     );
 }
+
+#[test]
+fn health_version_is_additive_so_a_new_client_reads_an_old_daemon() {
+    let old_daemon = serde_json::json!({
+        "type": "health",
+        "data": { "runner_path": "/r", "factoryctl_path": "/c" }
+    });
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(old_daemon).unwrap(),
+        LocalResponse::Health {
+            runner_path: "/r".to_owned(),
+            factoryctl_path: "/c".to_owned(),
+            version: String::new(),
+        }
+    );
+    let value = serde_json::to_value(LocalResponse::Health {
+        runner_path: "/r".to_owned(),
+        factoryctl_path: "/c".to_owned(),
+        version: "0.1.0".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(value["data"]["version"], "0.1.0");
+}

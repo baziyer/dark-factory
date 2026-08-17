@@ -18,6 +18,7 @@ mod attach;
 mod install;
 mod launchd;
 mod outbox;
+mod probes;
 mod update_command;
 mod usage;
 
@@ -79,10 +80,18 @@ With --install: download that release for this platform, verify its SHA-256
 against the manifest, unpack it into $DARK_FACTORY_HOME/bin/<version>/, and
 repoint $DARK_FACTORY_HOME/bin/current at it. If this user's launchd job
 (~/Library/LaunchAgents/com.dark-factory.factoryd.plist) exists it is
-rewritten to run from bin/current and reloaded -- only the daemon restarts;
-every running session survives. Without a launchd job, restart the daemon
-yourself afterwards. Nothing is deleted: to roll back, repoint bin/current
-at the previous version directory and restart the daemon.
+rewritten to run from bin/current (keeping its other arguments and
+environment; PATH gains the provider CLIs' directories if missing) and
+reloaded -- only the daemon restarts; every running session survives. The
+job must already run with this $DARK_FACTORY_HOME (a scratch home is
+refused rather than moving the job). Without a launchd job, restart the
+daemon yourself afterwards. Nothing is deleted: a failed reload rolls
+bin/current back; to roll back by hand, repoint bin/current at the
+previous version directory and restart the daemon.
+
+Exit status: 0 when up to date, or when the new daemon answers health with
+the new version; 1 when the manifest can't be fetched (private repository,
+offline) or the restarted daemon doesn't answer in time.
 
 Options:
   --install                  Download, verify, install, and activate the newer release

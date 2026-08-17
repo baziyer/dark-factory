@@ -10,93 +10,159 @@
 //! touched (`ARCHITECTURE.md`, invariant 4). Without a launchd job the
 //! binaries are installed and activated and the operator restarts the daemon
 //! however they run it.
+//!
+//! Order matters: every read-only check (manifest, existing job, its home)
+//! runs before anything on disk changes; `bin/current` is only repointed
+//! once the new version is complete; and if the job cannot be reloaded,
+//! `bin/current` goes back to what it was. Exit 0 only when the daemon that
+//! answers afterwards is the new version.
 
 use std::{
     env,
     path::{Path, PathBuf},
-    thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
-use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
-use factoryctl::{
-    Client,
-    update::{self, UpdateCheck},
-};
+use factoryctl::update::{self, UpdateCheck};
 use serde_json::json;
 
-use crate::{install, launchd};
+use crate::{install, launchd, probes};
 
-const HEALTH_WAIT: Duration = Duration::from_secs(20);
+const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Options {
     pub install: bool,
 }
 
 pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
-    let home = factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
-    let check = update::check(&home, &update::manifest_url(), now_ms(), true);
+    let home =
+        absolute(factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?);
+    let check = update::check(&home, &update::manifest_url(), update::now_ms(), true);
     let available = check.available().cloned();
 
     if !options.install {
         println!("{}", check_json(&check));
-        return Ok(if check.latest.is_none() && check.error.is_some() {
-            1
-        } else {
-            0
-        });
+        return Ok(check_exit_code(&check));
     }
-
     let Some(manifest) = available else {
         let mut report = check_json(&check);
         report["installed"] = json!(false);
         println!("{report}");
-        return Ok(if check.latest.is_none() && check.error.is_some() {
-            1
-        } else {
-            0
-        });
+        return Ok(check_exit_code(&check));
     };
 
+    // Read-only preflight, before anything changes on disk.
+    let user_home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or("HOME is not set")?;
+    let plist = launchd::plist_path(&user_home);
+    let existing = launchd::read_existing(&plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, &home, &user_home)?;
+    }
     let mut log = |line: &str| eprintln!("update: {line}");
-    let installed = if install::version_dir(&home, &manifest.version).exists() {
+    let previous_version = install::current_version(&home);
+    if previous_version.as_deref() == Some(manifest.version.as_str())
+        && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version)).is_ok()
+    {
         log(&format!(
-            "bin/{} already present; activating it",
+            "{} is already installed and running",
             manifest.version
         ));
-        install::version_dir(&home, &manifest.version)
-    } else {
-        install::install_release(&home, &manifest, &mut log)?
-    };
+        println!(
+            "{}",
+            json!({
+                "installed": manifest.version,
+                "current": install::current_link(&home),
+                "launchd": "unchanged",
+                "health": { "ok": true, "version": manifest.version },
+            })
+        );
+        return Ok(0);
+    }
+
+    let installed = install::install_release(&home, &manifest, &mut log)?;
     install::activate(&home, &manifest.version)?;
     log(&format!("bin/current -> {}", manifest.version));
 
-    let launchd_state = match reload_launchd(&home)? {
-        Some(plist) => {
-            log(&format!("rewrote and reloaded {}", plist.display()));
-            "reloaded"
-        }
-        None => {
-            log("no launchd job installed; restart the daemon yourself to run the new version");
-            "not_installed"
-        }
+    let Some(existing) = existing else {
+        log("no launchd job installed; restart the daemon yourself to run the new version");
+        println!(
+            "{}",
+            json!({
+                "installed": manifest.version,
+                "bin": installed,
+                "current": install::current_link(&home),
+                "launchd": "not_installed",
+            })
+        );
+        return Ok(0);
     };
-    let health = if launchd_state == "reloaded" {
-        wait_for_health(socket)
+
+    if let Err(error) = launchd::apply(
+        &home,
+        &plist,
+        Some(&existing),
+        &probes::provider_directories(),
+    ) {
+        let outcome = match &previous_version {
+            Some(previous) if install::activate(&home, previous).is_ok() => {
+                format!("bin/current rolled back to {previous}")
+            }
+            Some(previous) => format!("bin/current could NOT be rolled back to {previous}"),
+            None => format!(
+                "bin/current stays at {} (there was no previous version)",
+                manifest.version
+            ),
+        };
+        return Err(format!("{error}; {outcome}"));
+    }
+    log(&format!("rewrote and reloaded {}", plist.display()));
+    match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
+        Ok(version) => {
+            println!(
+                "{}",
+                json!({
+                    "installed": manifest.version,
+                    "bin": installed,
+                    "current": install::current_link(&home),
+                    "launchd": "reloaded",
+                    "health": { "ok": true, "version": version },
+                })
+            );
+            Ok(0)
+        }
+        Err(error) => {
+            println!(
+                "{}",
+                json!({
+                    "installed": manifest.version,
+                    "bin": installed,
+                    "current": install::current_link(&home),
+                    "launchd": "reloaded",
+                    "health": { "ok": false, "error": error },
+                })
+            );
+            eprintln!(
+                "update: the new daemon did not answer within {}s ({error}); see {}/logs/factoryd.stderr.log, \
+                 or roll back with `ln -sfn {} {}` and `launchctl kickstart -k gui/$(id -u)/{}`",
+                HEALTH_WAIT.as_secs(),
+                home.display(),
+                previous_version.as_deref().unwrap_or("<previous-version>"),
+                install::current_link(&home).display(),
+                launchd::LABEL
+            );
+            Ok(1)
+        }
+    }
+}
+
+fn check_exit_code(check: &UpdateCheck) -> i32 {
+    if check.latest.is_none() && check.error.is_some() {
+        1
     } else {
-        json!({ "ok": false, "error": "daemon not restarted" })
-    };
-    println!(
-        "{}",
-        json!({
-            "installed": manifest.version,
-            "bin": installed,
-            "current": install::current_link(&home),
-            "launchd": launchd_state,
-            "health": health,
-        })
-    );
-    Ok(0)
+        0
+    }
 }
 
 fn check_json(check: &UpdateCheck) -> serde_json::Value {
@@ -118,53 +184,12 @@ fn check_json(check: &UpdateCheck) -> serde_json::Value {
     report
 }
 
-/// Rewrites the launchd job to run `<home>/bin/current/factoryd` (keeping
-/// whatever other arguments and `PATH` it already had) and reloads it.
-/// Returns the plist path, or `None` when no job is installed.
-fn reload_launchd(home: &Path) -> Result<Option<PathBuf>, String> {
-    let user_home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME is not set")?;
-    let plist = launchd::plist_path(&user_home);
-    let Some(existing) = launchd::read_existing(&plist)? else {
-        return Ok(None);
-    };
-    let factoryd = install::current_link(home).join("factoryd");
-    let rendered = launchd::render(
-        home,
-        &factoryd,
-        &launchd::carried_arguments(&existing.program_arguments),
-        existing.path_env.as_deref().unwrap_or(launchd::BASE_PATH),
-    );
-    launchd::install(&plist, &rendered, home)?;
-    launchd::reload(rustix::process::getuid().as_raw(), &plist)?;
-    Ok(Some(plist))
-}
-
-fn wait_for_health(socket: &Path) -> serde_json::Value {
-    let client = Client::new(socket);
-    let deadline = Instant::now() + HEALTH_WAIT;
-    loop {
-        let last_error =
-            match client.request_with_timeout(LocalRequest::Health, Duration::from_secs(2)) {
-                Ok(ServerFrame::Response {
-                    response: LocalResponse::Health { version, .. },
-                    ..
-                }) => return json!({ "ok": true, "version": version }),
-                Ok(_) => "unexpected reply to health".to_owned(),
-                Err(error) => error.to_string(),
-            };
-        if Instant::now() >= deadline {
-            return json!({ "ok": false, "error": last_error });
-        }
-        thread::sleep(Duration::from_millis(500));
+/// A relative `$DARK_FACTORY_HOME` would otherwise render relative paths
+/// into the launchd job.
+fn absolute(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0)
 }

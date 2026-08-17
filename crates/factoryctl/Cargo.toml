@@ -9,7 +9,7 @@ factory-core = { path = "../factory-core" }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 signal-hook = "0.3"
 thiserror.workspace = true
 tokio = { version = "1.53.1", default-features = false, features = ["io-util", "macros", "process", "rt", "time"] }

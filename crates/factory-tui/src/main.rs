@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -141,11 +141,7 @@ fn restore_terminal() {
 }
 
 fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(0)
+    factoryctl::update::now_ms()
 }
 
 fn main() -> anyhow::Result<()> {

@@ -12,10 +12,7 @@ __PROGRAM_ARGUMENTS__
 
     <key>EnvironmentVariables</key>
     <dict>
-        <key>PATH</key>
-        <string>__PATH__</string>
-        <key>DARK_FACTORY_HOME</key>
-        <string>__DARK_FACTORY_HOME__</string>
+__ENVIRONMENT__
     </dict>
 
     <key>WorkingDirectory</key>

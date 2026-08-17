@@ -1010,10 +1010,7 @@ fn factoryd_process_group_kill_does_not_take_sessions() {
     // `AbandonProcessGroup`. This is the restart test's scenario with the
     // group-wide signal instead of a pid-targeted one.
     let home = private_tempdir();
-    let project = setup_project_with(
-        Daemon::start_in_own_process_group(home.path()),
-        home.path(),
-    );
+    let project = setup_project_with(Daemon::start_in_own_process_group(home.path()), home.path());
     let client = project.daemon.client();
     create_shell_agent(&client, "curie");
     create_task(&client, "task-1", "First", "before the group kill");
@@ -1036,14 +1033,21 @@ fn factoryd_process_group_kill_does_not_take_sessions() {
     let client = daemon.client();
 
     let sessions = list_sessions(&client);
-    assert_eq!(sessions.len(), 1, "the session must neither be lost nor duplicated");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the session must neither be lost nor duplicated"
+    );
     assert_eq!(sessions[0].id, session_before.id);
     assert_eq!(sessions[0].state, SessionState::Idle);
 
     create_task(&client, "task-2", "Second", "after the group kill");
     assign_task(&client, "task-2", "curie");
     wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
-    assert_eq!(session_by_agent(&client, "curie").unwrap().id, session_before.id);
+    assert_eq!(
+        session_by_agent(&client, "curie").unwrap().id,
+        session_before.id
+    );
     cleanup_session(&client, "curie");
     daemon.stop();
 }
