@@ -13,6 +13,10 @@
 //! already-running session's hooks reference `bin/current/factoryctl` by
 //! that symlinked path (the daemon hands its own sibling path to the
 //! providers uncanonicalized), so they follow the repoint too.
+//!
+//! A version directory only ever appears complete: everything is staged
+//! under `bin/.staging-<version>` and renamed into place once all four
+//! binaries checked out; any failure removes the staging directory.
 
 use std::{
     fs, io,
@@ -21,9 +25,8 @@ use std::{
     process::Command,
 };
 
-use sha2::{Digest, Sha256};
-
 use factoryctl::update::{self, Manifest};
+use sha2::{Digest, Sha256};
 
 /// Every binary a release ships and an install must contain.
 pub const BINARIES: [&str; 4] = ["factoryd", "factory-runner", "factoryctl", "factory-tui"];
@@ -48,10 +51,18 @@ pub fn current_link(home: &Path) -> PathBuf {
     bin_dir(home).join("current")
 }
 
+/// The version `bin/current` points at, if the link exists.
+#[must_use]
+pub fn current_version(home: &Path) -> Option<String> {
+    let target = fs::read_link(current_link(home)).ok()?;
+    let name = target.file_name()?.to_str()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// Downloads this platform's asset from `manifest`, verifies its SHA-256,
-/// unpacks it into `bin/<version>` (via a temporary sibling directory that
-/// is renamed into place only once everything checked out), and returns
-/// that directory. Refuses to overwrite an existing `bin/<version>`.
+/// unpacks it into `bin/<version>`, and returns that directory. A complete
+/// `bin/<version>` already on disk is reused as is (nothing is downloaded);
+/// an incomplete one is an error naming it, never silently overwritten.
 pub fn install_release(
     home: &Path,
     manifest: &Manifest,
@@ -64,54 +75,79 @@ pub fn install_release(
         .ok_or_else(|| format!("release {} has no asset for {key}", manifest.version))?;
     let destination = version_dir(home, &manifest.version);
     if destination.exists() {
-        return Err(format!(
-            "{} already exists; activate it with `factoryctl update --install` again after removing it, or leave it",
-            destination.display()
-        ));
+        verify_binaries(&destination).map_err(|error| {
+            format!(
+                "{error}; remove {} to download it again",
+                destination.display()
+            )
+        })?;
+        log(&format!("{} already present", destination.display()));
+        return Ok(destination);
     }
-    let staging = bin_dir(home).join(format!(".staging-{}", manifest.version));
+    stage(home, &manifest.version, |staging| {
+        let archive = staging.join("release.tar.gz");
+        log(&format!("downloading {}", asset.url));
+        update::curl_to_file(&asset.url, &archive, MAX_ARCHIVE_BYTES)?;
+        let size = fs::metadata(&archive)
+            .map_err(|error| error.to_string())?
+            .len();
+        if size > MAX_ARCHIVE_BYTES {
+            return Err(format!(
+                "{} is {size} bytes, over the {MAX_ARCHIVE_BYTES} limit",
+                asset.url
+            ));
+        }
+        let digest = sha256_file(&archive)?;
+        if !digest.eq_ignore_ascii_case(asset.sha256.trim()) {
+            return Err(format!(
+                "checksum mismatch for {}: manifest says {}, download is {digest}",
+                asset.url, asset.sha256
+            ));
+        }
+        log(&format!("verified sha256 {digest}"));
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(staging)
+            .status()
+            .map_err(|error| format!("could not run tar: {error}"))?;
+        if !status.success() {
+            return Err(format!("unpacking {} failed ({status})", archive.display()));
+        }
+        fs::remove_file(&archive).map_err(|error| error.to_string())
+    })
+    .inspect(|installed| log(&format!("installed {}", installed.display())))
+}
+
+/// Runs `fill` against a fresh `bin/.staging-<version>`, verifies the four
+/// binaries are there and executable, and renames it to `bin/<version>`.
+/// Any error (or a missing binary) removes the staging directory.
+fn stage(
+    home: &Path,
+    version: &str,
+    fill: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    let destination = version_dir(home, version);
+    let staging = bin_dir(home).join(format!(".staging-{version}"));
     let _ = fs::remove_dir_all(&staging);
     create_private_dir(&bin_dir(home))?;
     create_private_dir(&staging)?;
-    let archive = staging.join("release.tar.gz");
-
-    log(&format!("downloading {}", asset.url));
-    update::curl_to_file(&asset.url, &archive, MAX_ARCHIVE_BYTES)?;
-    let digest = sha256_file(&archive)?;
-    if !digest.eq_ignore_ascii_case(asset.sha256.trim()) {
+    let result = fill(&staging)
+        .and_then(|()| verify_binaries(&staging))
+        .and_then(|()| {
+            fs::rename(&staging, &destination).map_err(|error| {
+                format!(
+                    "could not move {} into place at {}: {error}",
+                    staging.display(),
+                    destination.display()
+                )
+            })
+        });
+    if result.is_err() {
         let _ = fs::remove_dir_all(&staging);
-        return Err(format!(
-            "checksum mismatch for {}: manifest says {}, download is {digest}",
-            asset.url, asset.sha256
-        ));
     }
-    log(&format!("verified sha256 {digest}"));
-
-    let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&archive)
-        .arg("-C")
-        .arg(&staging)
-        .status()
-        .map_err(|error| format!("could not run tar: {error}"))?;
-    if !status.success() {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(format!("unpacking {} failed ({status})", archive.display()));
-    }
-    fs::remove_file(&archive).map_err(|error| error.to_string())?;
-    if let Err(error) = verify_binaries(&staging) {
-        let _ = fs::remove_dir_all(&staging);
-        return Err(error);
-    }
-    fs::rename(&staging, &destination).map_err(|error| {
-        format!(
-            "could not move {} into place at {}: {error}",
-            staging.display(),
-            destination.display()
-        )
-    })?;
-    log(&format!("installed {}", destination.display()));
-    Ok(destination)
+    result.map(|()| destination)
 }
 
 /// Repoints `bin/current` at `bin/<version>` atomically (a fresh symlink
@@ -141,7 +177,8 @@ pub fn verify_binaries(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn create_private_dir(path: &Path) -> Result<(), String> {
+/// Creates `path` (and parents) as a `0700` directory.
+pub fn create_private_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path)
         .map_err(|error| format!("could not create {}: {error}", path.display()))?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
@@ -173,27 +210,22 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fake_binaries(&version_dir(home.path(), "0.1.0"));
         fake_binaries(&version_dir(home.path(), "0.2.0"));
+        assert_eq!(current_version(home.path()), None);
         activate(home.path(), "0.2.0").unwrap();
-        assert_eq!(
-            fs::read_link(current_link(home.path())).unwrap(),
-            Path::new("0.2.0")
-        );
+        assert_eq!(current_version(home.path()).as_deref(), Some("0.2.0"));
         assert!(current_link(home.path()).join("factoryd").exists());
         activate(home.path(), "0.1.0").unwrap();
-        assert_eq!(
-            fs::read_link(current_link(home.path())).unwrap(),
-            Path::new("0.1.0")
-        );
+        assert_eq!(current_version(home.path()).as_deref(), Some("0.1.0"));
         assert!(activate(home.path(), "9.9.9").is_err());
         assert_eq!(
-            fs::read_link(current_link(home.path())).unwrap(),
-            Path::new("0.1.0"),
+            current_version(home.path()).as_deref(),
+            Some("0.1.0"),
             "failed activate leaves current alone"
         );
     }
 
     #[test]
-    fn install_release_verifies_the_checksum_and_unpacks() {
+    fn install_release_verifies_the_checksum_unpacks_and_reuses_a_complete_dir() {
         let home = tempfile::tempdir().unwrap();
         let source = home.path().join("src");
         fake_binaries(&source);
@@ -210,7 +242,6 @@ mod tests {
         let sha = sha256_file(&archive).unwrap();
         let manifest = |sha256: &str| Manifest {
             version: "0.3.0".to_owned(),
-            tag: "v0.3.0".to_owned(),
             assets: [(
                 update::platform_key().to_owned(),
                 update::Asset {
@@ -221,7 +252,8 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let mut log = |_: &str| {};
+        let lines = std::cell::RefCell::new(Vec::new());
+        let mut log = |line: &str| lines.borrow_mut().push(line.to_owned());
         let error = install_release(home.path(), &manifest("00"), &mut log).unwrap_err();
         assert!(error.contains("checksum mismatch"), "{error}");
         assert!(!version_dir(home.path(), "0.3.0").exists());
@@ -229,9 +261,37 @@ mod tests {
             !bin_dir(home.path()).join(".staging-0.3.0").exists(),
             "staging cleaned up"
         );
+        // A download that fails outright cleans up too.
+        let mut unreachable = manifest(&sha);
+        unreachable
+            .assets
+            .get_mut(update::platform_key())
+            .unwrap()
+            .url = "http://127.0.0.1:9/never.tar.gz".to_owned();
+        assert!(install_release(home.path(), &unreachable, &mut log).is_err());
+        assert!(!bin_dir(home.path()).join(".staging-0.3.0").exists());
+
         let installed = install_release(home.path(), &manifest(&sha), &mut log).unwrap();
         assert_eq!(installed, version_dir(home.path(), "0.3.0"));
         verify_binaries(&installed).unwrap();
         assert!(!installed.join("release.tar.gz").exists());
+        // Second time: reused, not downloaded (a now-unreachable URL proves it).
+        assert_eq!(
+            install_release(home.path(), &unreachable, &mut log).unwrap(),
+            installed
+        );
+        assert!(
+            lines
+                .borrow()
+                .iter()
+                .any(|line| line.contains("already present"))
+        );
+        // A tampered version directory is refused, not "reused".
+        fs::remove_file(installed.join("factory-tui")).unwrap();
+        assert!(
+            install_release(home.path(), &manifest(&sha), &mut log)
+                .unwrap_err()
+                .contains("remove")
+        );
     }
 }

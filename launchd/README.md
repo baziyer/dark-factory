@@ -26,21 +26,23 @@ dirname "$(command -v claude)"
 dirname "$(command -v codex)"
 ```
 
-The normal way to get this job is `factoryctl update --install` (and, once
-it exists, `factoryctl init`): they render this exact template, write it at
-`0600`, and reload it. To do it by hand instead, render the three
-placeholders — `__PROGRAM_ARGUMENTS__` (one `<string>` per argument, the
-first being the absolute path to `factoryd`; the daemon finds
-`factory-runner`/`factoryctl` as its own siblings and every path under
-`$DARK_FACTORY_HOME` by default), `__DARK_FACTORY_HOME__`, and `__PATH__` —
-then install the result in `~/Library/LaunchAgents`:
+`factoryctl update --install` rewrites and reloads an existing job from
+this exact template (and `factoryctl init`, once it exists, creates it). To
+create one by hand, render the three placeholders — `__PROGRAM_ARGUMENTS__`
+(one `<string>` per argument, the first being the absolute path to
+`factoryd`; the daemon finds `factory-runner`/`factoryctl` as its own
+siblings and every path under `$DARK_FACTORY_HOME` by default),
+`__ENVIRONMENT__` (`<key>`/`<string>` pairs; at least `PATH` and
+`DARK_FACTORY_HOME`), and `__DARK_FACTORY_HOME__` — then install the result
+in `~/Library/LaunchAgents`:
 
 ```sh
 factoryd="$HOME/.dark-factory/bin/current/factoryd"   # or wherever it lives
+path="$(dirname "$(command -v claude)"):$(dirname "$(command -v codex)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 sed \
   -e "s#__PROGRAM_ARGUMENTS__#        <string>$factoryd</string>#g" \
+  -e "s#__ENVIRONMENT__#        <key>PATH</key><string>$path</string><key>DARK_FACTORY_HOME</key><string>$HOME/.dark-factory</string>#g" \
   -e "s#__DARK_FACTORY_HOME__#$HOME/.dark-factory#g" \
-  -e "s#__PATH__#$(dirname "$(command -v claude)"):$(dirname "$(command -v codex)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin#g" \
   launchd/com.dark-factory.factoryd.plist.template \
   > ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
 chmod 0600 ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
@@ -52,11 +54,14 @@ launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd
 
 `--max-active-runs` (default 4, enforced by the dispatcher as a hard cap on
 live sessions) and any other `factoryd` flag go into `ProgramArguments` as
-further `<string>` elements; `factoryctl update --install` carries them
-over when it rewrites the job (only `--runner`/`--factoryctl` are dropped,
-since they must point at the newly activated binaries). A rewritten job
-must be `bootout`/`bootstrap`ed, not just `kickstart`ed — launchd caches
-`ProgramArguments`.
+further `<string>` elements; `factoryctl update --install` carries them and
+the environment over when it rewrites the job (only `--runner`/
+`--factoryctl` are dropped, since they must point at the newly activated
+binaries, and `PATH` gains the provider CLIs' directories if it lacks
+them). A rewritten job must be `bootout`/`bootstrap`ed, not just
+`kickstart`ed — launchd caches `ProgramArguments`. The template sets
+`AbandonProcessGroup`: without it launchd would kill every runner — every
+session — with the daemon on `bootout`/`kickstart -k`.
 
 Subscription headroom has no background service or log: run `factoryctl
 usage` on demand in a terminal instead.

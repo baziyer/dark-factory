@@ -36,11 +36,11 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 
-/// One release, as published by the release workflow.
+/// One release, as published by the release workflow (its `latest.json`
+/// also carries a `tag`, which nothing here needs).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Manifest {
     pub version: String,
-    pub tag: String,
     /// Keyed by Rust target triple, e.g. `aarch64-apple-darwin`.
     pub assets: BTreeMap<String, Asset>,
 }
@@ -77,7 +77,7 @@ impl UpdateCheck {
 
 /// `<home>/update-check.json`.
 #[must_use]
-pub fn cache_path(home: &Path) -> PathBuf {
+fn cache_path(home: &Path) -> PathBuf {
     home.join("update-check.json")
 }
 
@@ -90,21 +90,15 @@ pub fn manifest_url() -> String {
         .unwrap_or_else(|| MANIFEST_URL.to_owned())
 }
 
-/// The asset key for the running binary's platform.
+/// The asset key for the running binary's platform. Only macOS arm64 is
+/// released today (`.github/workflows/release.yml`); any other build
+/// simply never sees an available update.
 #[must_use]
 pub const fn platform_key() -> &'static str {
-    // Only macOS arm64 is released today (`.github/workflows/release.yml`);
-    // any other build simply never sees an available update.
     if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         "aarch64-apple-darwin"
-    } else if cfg!(all(target_arch = "x86_64", target_os = "macos")) {
-        "x86_64-apple-darwin"
-    } else if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
-        "x86_64-unknown-linux-gnu"
-    } else if cfg!(all(target_arch = "aarch64", target_os = "linux")) {
-        "aarch64-unknown-linux-gnu"
     } else {
-        "unknown"
+        "unsupported"
     }
 }
 
@@ -148,8 +142,7 @@ pub fn check(home: &Path, url: &str, now_ms: i64, force: bool) -> UpdateCheck {
 }
 
 /// Reads and parses the cache; anything unreadable or malformed is `None`.
-#[must_use]
-pub fn read_cache(home: &Path) -> Option<UpdateCheck> {
+fn read_cache(home: &Path) -> Option<UpdateCheck> {
     let bytes = fs::read(cache_path(home)).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -162,7 +155,7 @@ fn write_cache(home: &Path, check: &UpdateCheck) -> io::Result<()> {
 }
 
 /// Downloads and parses the manifest at `url` with `curl`.
-pub fn fetch_manifest(url: &str) -> Result<Manifest, String> {
+fn fetch_manifest(url: &str) -> Result<Manifest, String> {
     let bytes = curl(url, MAX_MANIFEST_BYTES)?;
     serde_json::from_slice(&bytes).map_err(|error| format!("manifest is not valid: {error}"))
 }
@@ -170,7 +163,7 @@ pub fn fetch_manifest(url: &str) -> Result<Manifest, String> {
 /// Fetches `url` to memory with `curl`, bounded to `max_bytes`. Follows
 /// redirects (GitHub's `releases/latest/download/...` is one), fails on
 /// HTTP errors, and never prompts.
-pub fn curl(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+fn curl(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
     let output = Command::new("curl")
         .args([
             "--fail",
@@ -228,6 +221,16 @@ pub fn curl_to_file(url: &str, destination: &Path, max_bytes: u64) -> Result<(),
     Ok(())
 }
 
+/// Milliseconds since the Unix epoch, for cache stamps and status frames.
+#[must_use]
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
 /// Semantic-version comparison: `candidate` is newer than `current` when its
 /// `MAJOR.MINOR.PATCH` is greater, or equal with `current` a pre-release and
 /// `candidate` not (`0.2.0` > `0.2.0-rc.1`). Anything unparseable is never
@@ -283,7 +286,6 @@ mod tests {
     fn available_requires_a_newer_version_for_this_platform() {
         let manifest = |version: &str, key: &str| Manifest {
             version: version.to_owned(),
-            tag: format!("v{version}"),
             assets: [(
                 key.to_owned(),
                 Asset {

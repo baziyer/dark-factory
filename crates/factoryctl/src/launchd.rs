@@ -2,25 +2,37 @@
 //! `launchd/com.dark-factory.factoryd.plist.template` (embedded here so a
 //! binary-only install never needs the repository).
 //!
-//! `factoryctl update --install` (and `factoryctl init`) own this file: they
-//! render it, write it at `0600` under `~/Library/LaunchAgents`, and reload
-//! it. A reload restarts only the daemon — every session's runner is a
-//! detached process tree the new daemon reconnects to (`ARCHITECTURE.md`,
-//! invariant 4).
+//! `factoryctl update --install` (and, once it exists, `factoryctl init`)
+//! own this file through [`apply`]: read whatever job is there, keep its
+//! extra daemon arguments and environment, make sure its `PATH` can find
+//! the provider CLIs, point it at `bin/current/factoryd`, write it at
+//! `0600`, and reload it. A reload restarts only the daemon — every
+//! session's runner is a detached process tree the new daemon reconnects
+//! to (`ARCHITECTURE.md`, invariant 4; the template's `AbandonProcessGroup`
+//! and the runner's own process group are what make that true under
+//! launchd).
 
 use std::{
+    collections::BTreeMap,
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
+
+use crate::install;
 
 pub const LABEL: &str = "com.dark-factory.factoryd";
 const TEMPLATE: &str = include_str!("../../../launchd/com.dark-factory.factoryd.plist.template");
-/// What a rendered job's `PATH` gets when nothing better is known: enough
-/// to find Homebrew/system tools; `claude`/`codex` directories are added by
-/// the caller from wherever they resolve right now.
+/// What launchd gives a job that sets no `PATH` of its own.
+pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// Enough to find Homebrew/system tools; the provider CLIs' own directories
+/// are prepended by [`merged_path`].
 pub const BASE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const BOOTSTRAP_ATTEMPTS: u32 = 6;
+const BOOTSTRAP_RETRY: Duration = Duration::from_millis(500);
 
 /// `~/Library/LaunchAgents/com.dark-factory.factoryd.plist`.
 #[must_use]
@@ -31,12 +43,34 @@ pub fn plist_path(user_home: &Path) -> PathBuf {
         .join(format!("{LABEL}.plist"))
 }
 
-/// What an existing job runs and with which `PATH`, read back through
+/// What an existing job runs and with which environment, read back through
 /// `plutil` so no plist parsing lives here.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ExistingJob {
     pub program_arguments: Vec<String>,
-    pub path_env: Option<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+impl ExistingJob {
+    /// The `$DARK_FACTORY_HOME` this job runs with: its own environment
+    /// variable, else — for a job rendered by hand from the old template,
+    /// which passed explicit paths — the directory of its `--database`,
+    /// else Dark Factory's default under `user_home`.
+    #[must_use]
+    pub fn home(&self, user_home: &Path) -> PathBuf {
+        if let Some(home) = self.environment.get("DARK_FACTORY_HOME") {
+            return PathBuf::from(home);
+        }
+        let mut arguments = self.program_arguments.iter();
+        while let Some(argument) = arguments.next() {
+            if argument == "--database" {
+                if let Some(parent) = arguments.next().and_then(|db| Path::new(db).parent()) {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+        user_home.join(".dark-factory")
+    }
 }
 
 pub fn read_existing(plist: &Path) -> Result<Option<ExistingJob>, String> {
@@ -67,28 +101,91 @@ pub fn read_existing(plist: &Path) -> Result<Option<ExistingJob>, String> {
                 .collect()
         })
         .unwrap_or_default();
-    let path_env = value["EnvironmentVariables"]["PATH"]
-        .as_str()
-        .map(str::to_owned);
+    let environment = value["EnvironmentVariables"]
+        .as_object()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Some(ExistingJob {
         program_arguments,
-        path_env,
+        environment,
     }))
 }
 
-/// Renders the job: `factoryd` (an absolute path, normally
-/// `<home>/bin/current/factoryd`) plus `extra_arguments`, with `PATH` and
-/// `DARK_FACTORY_HOME` in its environment and logs under `<home>/logs`.
+/// A `PATH` for the job: `existing` (or, when the job had none, launchd's
+/// default plus [`BASE_PATH`]) with every directory in `required` — the
+/// provider CLIs' directories, see [`crate::probes::provider_directories`]
+/// — prepended if it isn't already there. Re-rendering a job therefore
+/// repairs a `PATH` that stopped covering `claude`/`codex` (a new `nvm`
+/// version, say) instead of preserving the breakage.
 #[must_use]
-pub fn render(home: &Path, factoryd: &Path, extra_arguments: &[String], path_env: &str) -> String {
+pub fn merged_path(existing: Option<&str>, required: &[PathBuf]) -> String {
+    let mut entries: Vec<PathBuf> = match existing {
+        Some(existing) => std::env::split_paths(existing).collect(),
+        None => std::env::split_paths(LAUNCHD_DEFAULT_PATH)
+            .chain(std::env::split_paths(BASE_PATH))
+            .collect(),
+    };
+    for (position, directory) in required.iter().enumerate() {
+        if !entries.contains(directory) {
+            entries.insert(position.min(entries.len()), directory.clone());
+        }
+    }
+    let mut seen: Vec<PathBuf> = Vec::new();
+    entries.retain(|entry| {
+        if seen.contains(entry) {
+            false
+        } else {
+            seen.push(entry.clone());
+            true
+        }
+    });
+    std::env::join_paths(entries)
+        .map(|joined| joined.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| BASE_PATH.to_owned())
+}
+
+/// Renders the job: `factoryd` (an absolute path, normally
+/// `<home>/bin/current/factoryd`) plus `extra_arguments`, with
+/// `environment` — every entry, plus `DARK_FACTORY_HOME` set to `home` —
+/// and logs under `<home>/logs`.
+#[must_use]
+pub fn render(
+    home: &Path,
+    factoryd: &Path,
+    extra_arguments: &[String],
+    environment: &BTreeMap<String, String>,
+) -> String {
     let arguments = std::iter::once(factoryd.to_string_lossy().into_owned())
         .chain(extra_arguments.iter().cloned())
         .map(|argument| format!("        <string>{}</string>", escape(&argument)))
         .collect::<Vec<_>>()
         .join("\n");
+    let mut environment = environment.clone();
+    environment.insert(
+        "DARK_FACTORY_HOME".to_owned(),
+        home.to_string_lossy().into_owned(),
+    );
+    let environment = environment
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>",
+                escape(key),
+                escape(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     TEMPLATE
         .replace("__PROGRAM_ARGUMENTS__", &arguments)
-        .replace("__PATH__", &escape(path_env))
+        .replace("__ENVIRONMENT__", &environment)
         .replace("__DARK_FACTORY_HOME__", &escape(&home.to_string_lossy()))
 }
 
@@ -110,15 +207,68 @@ pub fn carried_arguments(program_arguments: &[String]) -> Vec<String> {
     carried
 }
 
+/// Refuses to re-render a job onto a different `$DARK_FACTORY_HOME` than
+/// it runs with today: `factoryctl` may be running with a scratch home
+/// (`docs/development/WORKFLOW.md`, "Developing the daemon without
+/// disrupting a running factory"), and rewriting the operator's real job
+/// to it would move their live factory.
+pub fn check_home(existing: &ExistingJob, home: &Path, user_home: &Path) -> Result<(), String> {
+    let job_home = existing.home(user_home);
+    if same_path(&job_home, home) {
+        return Ok(());
+    }
+    Err(format!(
+        "the launchd job runs with DARK_FACTORY_HOME={} but this factoryctl is using {}; \
+         run it with the job's home (or remove the job) rather than moving the job",
+        job_home.display(),
+        home.display()
+    ))
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// Renders the job for `home` (keeping an existing job's extra arguments
+/// and environment; `PATH` merged with `provider_directories`), writes it
+/// at `plist`, and reloads it. The caller has already read and checked
+/// the existing job with [`read_existing`]/[`check_home`] — this is the
+/// mutating half. On a reload failure the file is already rewritten; the
+/// error names the recovery command.
+pub fn apply(
+    home: &Path,
+    plist: &Path,
+    existing: Option<&ExistingJob>,
+    provider_directories: &[PathBuf],
+) -> Result<(), String> {
+    let mut environment = existing
+        .map(|job| job.environment.clone())
+        .unwrap_or_default();
+    let path = merged_path(
+        environment.get("PATH").map(String::as_str),
+        provider_directories,
+    );
+    environment.insert("PATH".to_owned(), path);
+    let carried = existing
+        .map(|job| carried_arguments(&job.program_arguments))
+        .unwrap_or_default();
+    let factoryd = install::current_link(home).join("factoryd");
+    install(
+        plist,
+        &render(home, &factoryd, &carried, &environment),
+        home,
+    )?;
+    reload(rustix::process::getuid().as_raw(), plist)
+}
+
 /// Writes `content` at `plist` with mode `0600` (atomically: temp file,
 /// then rename), creating `~/Library/LaunchAgents` if needed, and creates
 /// `<home>/logs` (`0700`) so launchd can open the log files.
 pub fn install(plist: &Path, content: &str, home: &Path) -> Result<(), String> {
-    let logs = home.join("logs");
-    fs::create_dir_all(&logs)
-        .map_err(|error| format!("could not create {}: {error}", logs.display()))?;
-    fs::set_permissions(&logs, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("could not set permissions on {}: {error}", logs.display()))?;
+    install::create_private_dir(&home.join("logs"))?;
     if let Some(parent) = plist.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("could not create {}: {error}", parent.display()))?;
@@ -133,9 +283,11 @@ pub fn install(plist: &Path, content: &str, home: &Path) -> Result<(), String> {
 }
 
 /// (Re)loads the job from `plist`: `bootout` (ignored if it wasn't loaded)
-/// then `bootstrap`. launchd caches a job's `ProgramArguments`, so a plain
-/// `kickstart -k` would keep running the *old* binary after a rewrite —
-/// this is the only sequence that picks up a changed plist.
+/// then `bootstrap`, retried briefly because launchd can still be tearing
+/// the old instance down when the first `bootstrap` arrives. launchd
+/// caches a job's `ProgramArguments`, so a plain `kickstart -k` would keep
+/// running the *old* binary after a rewrite — this is the only sequence
+/// that picks up a changed plist.
 pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
     let domain = format!("gui/{uid}");
     let _ = Command::new("launchctl")
@@ -144,21 +296,29 @@ pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
-    let output = Command::new("launchctl")
-        .arg("bootstrap")
-        .arg(&domain)
-        .arg(plist)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run launchctl: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "launchctl bootstrap {domain} {} failed: {}",
-            plist.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let mut last_error = String::new();
+    for attempt in 1..=BOOTSTRAP_ATTEMPTS {
+        let output = Command::new("launchctl")
+            .arg("bootstrap")
+            .arg(&domain)
+            .arg(plist)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("could not run launchctl: {error}"))?;
+        if output.status.success() {
+            return Ok(());
+        }
+        last_error = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if attempt < BOOTSTRAP_ATTEMPTS {
+            thread::sleep(BOOTSTRAP_RETRY);
+        }
     }
-    Ok(())
+    Err(format!(
+        "launchctl bootstrap {domain} {} failed after {BOOTSTRAP_ATTEMPTS} attempts: {last_error}; \
+         the job is unloaded -- run `launchctl bootstrap {domain} {}` to load it",
+        plist.display(),
+        plist.display()
+    ))
 }
 
 fn escape(text: &str) -> String {
@@ -171,13 +331,27 @@ fn escape(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn environment(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
     #[test]
-    fn render_fills_every_placeholder_and_escapes() {
+    fn render_fills_every_placeholder_carries_the_environment_and_escapes() {
         let rendered = render(
             Path::new("/Users/me/.dark-factory"),
             Path::new("/Users/me/.dark-factory/bin/current/factoryd"),
             &["--max-active-runs".to_owned(), "6".to_owned()],
-            "/Users/me/.local/bin:/opt/homebrew/bin:/usr/bin:/bin&more",
+            &environment(&[
+                (
+                    "PATH",
+                    "/Users/me/.local/bin:/opt/homebrew/bin:/usr/bin:/bin&more",
+                ),
+                ("RUST_LOG", "info"),
+                ("DARK_FACTORY_HOME", "/somewhere/else"),
+            ]),
         );
         assert!(!rendered.contains("__"), "{rendered}");
         assert!(rendered.contains("<string>/Users/me/.dark-factory/bin/current/factoryd</string>"));
@@ -187,11 +361,35 @@ mod tests {
         assert!(rendered.contains(
             "<string>/Users/me/.local/bin:/opt/homebrew/bin:/usr/bin:/bin&amp;more</string>"
         ));
-        assert!(rendered.contains(
-            "<key>DARK_FACTORY_HOME</key>\n        <string>/Users/me/.dark-factory</string>"
-        ));
+        assert!(rendered.contains("<key>RUST_LOG</key>\n        <string>info</string>"));
+        assert!(
+            rendered.contains(
+                "<key>DARK_FACTORY_HOME</key>\n        <string>/Users/me/.dark-factory</string>"
+            ),
+            "the home always wins over whatever the environment said"
+        );
+        assert!(!rendered.contains("/somewhere/else"));
         assert!(
             rendered.contains("<string>/Users/me/.dark-factory/logs/factoryd.stderr.log</string>")
+        );
+        assert!(rendered.contains("<key>AbandonProcessGroup</key>\n    <true/>"));
+    }
+
+    #[test]
+    fn merged_path_prepends_missing_provider_directories_only() {
+        let required = [PathBuf::from("/nvm/bin"), PathBuf::from("/usr/bin")];
+        assert_eq!(
+            merged_path(Some("/usr/bin:/bin"), &required),
+            "/nvm/bin:/usr/bin:/bin"
+        );
+        assert_eq!(
+            merged_path(Some("/nvm/bin:/usr/bin"), &required),
+            "/nvm/bin:/usr/bin"
+        );
+        assert_eq!(
+            merged_path(None, &[PathBuf::from("/x/bin")]),
+            format!("/x/bin:{LAUNCHD_DEFAULT_PATH}:/opt/homebrew/bin:/usr/local/bin"),
+            "no PATH means launchd's default plus the base, deduplicated"
         );
     }
 
@@ -214,6 +412,28 @@ mod tests {
             ["--database", "/x/factory.db", "--max-active-runs", "3"].map(str::to_owned)
         );
         assert!(carried_arguments(&[]).is_empty());
+        assert!(carried_arguments(&["/f".to_owned(), "--runner".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn existing_job_home_comes_from_env_then_database_then_default() {
+        let user_home = Path::new("/Users/me");
+        let with_env = ExistingJob {
+            program_arguments: vec!["/f".to_owned()],
+            environment: environment(&[("DARK_FACTORY_HOME", "/tmp/scratch")]),
+        };
+        assert_eq!(with_env.home(user_home), Path::new("/tmp/scratch"));
+        let legacy = ExistingJob {
+            program_arguments: ["/f", "--database", "/Users/me/df/factory.db"]
+                .map(str::to_owned)
+                .to_vec(),
+            environment: environment(&[("PATH", "/usr/bin")]),
+        };
+        assert_eq!(legacy.home(user_home), Path::new("/Users/me/df"));
+        let bare = ExistingJob::default();
+        assert_eq!(bare.home(user_home), Path::new("/Users/me/.dark-factory"));
+        assert!(check_home(&legacy, Path::new("/Users/me/df"), user_home).is_ok());
+        assert!(check_home(&legacy, Path::new("/tmp/other"), user_home).is_err());
     }
 
     #[test]
@@ -247,7 +467,7 @@ mod tests {
             Path::new("/h"),
             Path::new("/h/bin/current/factoryd"),
             &["--max-active-runs".to_owned(), "2".to_owned()],
-            "/usr/bin:/bin",
+            &environment(&[("PATH", "/usr/bin:/bin"), ("LANG", "en_GB.UTF-8")]),
         );
         fs::write(&plist, rendered).unwrap();
         let existing = read_existing(&plist).unwrap().unwrap();
@@ -255,7 +475,14 @@ mod tests {
             existing.program_arguments,
             ["/h/bin/current/factoryd", "--max-active-runs", "2"].map(str::to_owned)
         );
-        assert_eq!(existing.path_env.as_deref(), Some("/usr/bin:/bin"));
+        assert_eq!(
+            existing.environment,
+            environment(&[
+                ("DARK_FACTORY_HOME", "/h"),
+                ("LANG", "en_GB.UTF-8"),
+                ("PATH", "/usr/bin:/bin"),
+            ])
+        );
         assert_eq!(
             read_existing(&root.path().join("missing.plist")).unwrap(),
             None

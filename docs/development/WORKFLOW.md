@@ -136,12 +136,17 @@ them.
    --locked --release`, then `scripts/package-release.sh` produces
    `dark-factory-<tag>-aarch64-apple-darwin.tar.gz` (the four binaries,
    flat), `SHA256SUMS`, and `latest.json`, and `gh release create` attaches
-   all three. `latest.json` is `{version, tag, assets: {<target>: {url,
+   all three; a tag with a pre-release suffix (`v0.2.0-rc.1`) is published
+   as a pre-release so `releases/latest` keeps pointing at the newest full
+   release. `latest.json` is `{version, tag, assets: {<target>: {url,
    sha256}}}`; the newest one is always at
    `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
    (a static URL, so no Vercel mirror is needed unless GitHub is
    unreachable from somewhere that matters). Only macOS arm64 is built
-   today; other targets are more `assets` keys when someone needs them.
+   today. **While the repository is private that URL 404s anonymously**, so
+   `factoryctl update` reports an error and the board's check fails
+   quietly — the update path starts working the moment the repository is
+   public.
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
    and prints JSON: `current`, `latest`, `update_available`, the platform
@@ -149,27 +154,42 @@ them.
    `factory-tui` reads the same cache and refetches at most hourly, in a
    background thread of the running board — no background service — and
    shows `update vX available: factoryctl update --install` in its status
-   line. `factoryctl health` now also returns the daemon's `version`.
-3. **Install**: `factoryctl update --install` downloads the platform
-   asset, verifies its SHA-256 against the manifest, unpacks it into
-   `$DARK_FACTORY_HOME/bin/<version>/` (staged and renamed into place only
-   once every binary checked out), atomically repoints
-   `$DARK_FACTORY_HOME/bin/current` at it, and — if
+   line. `factoryctl health` also returns the daemon's `version`.
+3. **Install**: `factoryctl update --install` first does every read-only
+   check (the manifest; the launchd job, if any, and that it runs with
+   *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
+   moving the operator's job), then downloads the platform asset, verifies
+   its SHA-256, unpacks it into `$DARK_FACTORY_HOME/bin/<version>/` (staged,
+   renamed into place only once every binary checked out; a complete
+   version already on disk is reused), atomically repoints
+   `$DARK_FACTORY_HOME/bin/current`, and — if
    `~/Library/LaunchAgents/com.dark-factory.factoryd.plist` exists —
-   rewrites that job to run `bin/current/factoryd` (keeping its `PATH` and
-   any other daemon arguments), `bootout`s and `bootstrap`s it, and waits
-   for `health` from the new daemon. Without a launchd job it stops after
-   activation and says so; restart the daemon however you run it.
+   rewrites that job to run `bin/current/factoryd` (keeping its other
+   arguments and environment; `PATH` gains the provider CLIs' directories
+   if it lacks them), `bootout`s and `bootstrap`s it, and waits for
+   `health` to answer **with the new version**. If the reload fails,
+   `bin/current` is rolled back and the error names the recovery command;
+   if the new daemon never answers, exit 1 says where the log is and how to
+   roll back by hand. If the new version is already installed and running,
+   nothing restarts. Without a launchd job it stops after activation and
+   says so; restart the daemon however you run it.
 4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
    an update never needs a separate migration step.
 5. **No lost work**: sessions and runners are independent process trees
    (`ARCHITECTURE.md`, invariant 4). The daemon restart is on the order of
    a second and touches no agent process; `factory-tui` reconnects on its
-   own. Two compatibility rules follow: the runner control protocol must
-   stay backward compatible within a major version (a runner spawned by
-   version N is supervised by daemon N+1 after an update), and running
-   sessions' hooks keep working because they invoke `factoryctl` through
-   the `bin/current` symlink, which now resolves to the new version.
+   own. Under launchd this holds because every runner is its own
+   process-group leader *and* the job sets `AbandonProcessGroup` — without
+   either, `bootout`/`kickstart -k` kills the daemon's whole group, sessions
+   included (verified with a throwaway job; `sessions_e2e`'s
+   `factoryd_process_group_kill_does_not_take_sessions` guards it). Two
+   compatibility rules follow, in both directions: the runner control
+   protocol must stay backward compatible within a major version (a runner
+   spawned by daemon N is supervised by daemon N+1 after an update, and —
+   in the seconds between `activate` and the new daemon answering — daemon
+   N spawns runner N+1), and running sessions' hooks keep working because
+   they invoke `factoryctl` through the `bin/current` symlink, which now
+   resolves to the new version, against whichever daemon is up.
 6. **Rollback**: `ln -sfn <previous-version> $DARK_FACTORY_HOME/bin/current`
    (or repoint it the same atomic way) and `launchctl kickstart -k
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,

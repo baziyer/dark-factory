@@ -174,7 +174,10 @@ fn install_verifies_unpacks_and_activates_then_reports_no_launchd_job() {
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(report["installed"], "999.0.0");
     assert_eq!(report["launchd"], "not_installed");
-    assert_eq!(report["health"]["ok"], false);
+    assert!(
+        report.get("health").is_none(),
+        "no daemon was restarted, so no health claim: {report}"
+    );
     let bin = fixture.home().join("bin");
     for name in BINARIES {
         let installed = bin.join("999.0.0").join(name);
