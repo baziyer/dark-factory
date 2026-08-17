@@ -257,13 +257,12 @@ terminal setup — never terminal *output* — before synthesizing anything.**
 get_termios`, `crates/factory-runner/src/lib.rs`'s `supervise_terminal`,
 via a dedicated thread sharing the master through a `Mutex` rather than
 `unsafe` fd tricks — this workspace forbids `unsafe_code`) every 100 ms for
-up to 30 s, and reports it once, as a durable, replayable lifecycle event —
-`RunnerEvent::TerminalRaw`, additive to `RUNNER_PROTOCOL_VERSION` 1 (see
-`docs/development/WORKFLOW.md`'s "runner control protocol must stay
-backward compatible within a major version": an older reader that does not
-know this variant fails to parse only the one frame carrying it, same as
-any other additive `RunnerEvent`, not the connection or the daemon) —
-exactly like `Started`. `wait_for_runner_exit`/`consume_until_exit`
+up to 120 s. When the tty enters raw mode, the runner reports it once as
+the durable, replayable lifecycle event `RunnerEvent::TerminalRaw`. This
+event is additive to `RUNNER_PROTOCOL_VERSION` 1. An older daemon reads
+this data-free event as `RunnerEvent::Unknown` and continues. See
+`docs/development/WORKFLOW.md` for the protocol compatibility requirement.
+`wait_for_runner_exit`/`consume_until_exit`
 (`execution.rs`) watch the same subscription they already hold open for
 `Exited`, and the moment `RunnerEvent::TerminalRaw` arrives for a Codex
 session (`should_synthesize_session_start`, gated on
@@ -300,10 +299,15 @@ free, no new request type needed. Synthesis is idempotent
 (`Store::synthesize_session_start`'s own doc comment), so seeing the event
 again on every reconnect attempt is harmless.
 
-If a Codex session's tty never leaves canonical mode within the poll
-window, nothing is synthesized, and the session's own deadline (a separate
-change, tracked independently) is the honest failure mode — not a loop
-that keeps guessing.
+If the tty stays in canonical mode for 120 s, the runner emits
+`RunnerEvent::TerminalRawTimedOut`. The daemon logs a warning for a Codex
+session, does not synthesize `SessionStart`, and leaves the session
+`starting`. Issue #52 adds the durable session-start deadline and needs the
+session to remain `starting` so it can fail and retry it. Until #52 lands,
+there is no durable backstop: the session stays `starting` until an operator
+posts its `SessionStart` hook by hand. An old runner under a new daemon does
+not know `TerminalRaw`, so it cannot trigger synthesis and has the same
+outcome. The bounded poll never loops or guesses that the terminal is ready.
 
 No config on the Dark Factory side can fix Codex's own deferred
 `SessionStart` dispatch — it is Codex's own session-lifecycle timing, not a
