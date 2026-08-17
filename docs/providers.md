@@ -76,10 +76,10 @@ them into `factory_core::ProviderHookEvent` values (see
      on argv.
    - If your CLI supports hooks, wire every event in
      `providers::hooks::HOOK_EVENTS` to
-     `providers::hooks::hook_command(&ctx.factoryctl_path,
-     &ctx.hook_token_path, event)`, written into whatever configuration
-     format your CLI expects. Use `providers::hooks::write_private_file`
-     to write it (atomic, mode `0600`, parent directory `0700`).
+     `providers::hooks::hook_command(&ctx.factoryctl_path, &ctx.hook_token_path, event)`,
+     written into whatever configuration format your CLI expects. Use
+     `providers::hooks::write_private_file` to write it (atomic, mode
+     `0600`, parent directory `0700`).
    - If your CLI needs isolated credentials/config (like Codex's
      `CODEX_HOME`), seed it once under `ctx.agent_dir` (per *agent*, not
      per session, so a resumed session can find prior state — see
@@ -206,11 +206,11 @@ Concretely:
   other `DARK_FACTORY_*` identity variable.
 - `factoryctl task done`/`task blocked`/`agent message` — the three
   agent-facing mutations, not every command — fall back to writing the
-  intended request as JSON to `$DARK_FACTORY_AGENT_DIR/outbox/<unix
-  ms>-<8 hex>.json` (`crates/factoryctl/src/outbox.rs`) on any connect/send
-  failure to the daemon socket, printing `queued: outbox/<name> (delivered
-  on the next hook)` and exiting `0` rather than failing the agent's tool
-  call outright.
+  intended request as JSON to
+  `$DARK_FACTORY_AGENT_DIR/outbox/<unix ms>-<8 hex>.json`
+  (`crates/factoryctl/src/outbox.rs`) on any connect/send failure to the
+  daemon socket, printing `queued: outbox/<name> (delivered on the next hook)`
+  and exiting `0` rather than failing the agent's tool call outright.
 - `factoryctl hook` — which always runs unsandboxed — drains that
   directory before every hook request it sends, not just `Stop`: it sends
   each queued request to the daemon in submission order, deleting the file

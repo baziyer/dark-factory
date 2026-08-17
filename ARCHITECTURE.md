@@ -25,9 +25,10 @@ catalogue.
    task *episodes* — not a fresh process per task. `factoryd` resolves a
    trusted absolute runner path, clears the daemon's ambient environment to
    a fixed non-secret allowlist plus a small allowlisted
-   `session_environment` (`DARK_FACTORY_AGENT/PROJECT/SOCKET/
-   SESSION_TOKEN_FILE/FACTORYCTL` — a provider's only way to reach
-   `factoryctl` and identify itself), and creates a private socket and
+   `session_environment`
+   (`DARK_FACTORY_AGENT/PROJECT/SOCKET/SESSION_TOKEN_FILE/FACTORYCTL` — a
+   provider's only way to reach `factoryctl` and identify itself), and
+   creates a private socket and
    bounded, retained `terminal.log` before spawning one process group under
    the PTY. A `starting` session row exists before the spawn is even
    attempted, so a failure is always durably visible (`session list`/the
@@ -69,12 +70,11 @@ catalogue.
    lifecycle — that is the session runner's job, once, generically, for
    every provider including the `shell` reference implementation (see
    `docs/providers.md`). Durable session state is driven entirely by the
-   provider's own hook invocations (`factoryctl hook --token-file PATH
-   <Event>`, normalized into `factory_core::ProviderHookEvent`), never by
-   decoding raw terminal bytes; the local control API may still expose or
-   attach live to a session's retained `terminal.log` for operator
-   inspection — none of this enters public events, webhook snapshots, or
-   tracing.
+   provider's own hook invocations (`factoryctl hook --token-file PATH <Event>`,
+   normalized into `factory_core::ProviderHookEvent`), never by decoding raw
+   terminal bytes; the local control API may still expose or attach live to
+   a session's retained `terminal.log` for operator inspection — none of
+   this enters public events, webhook snapshots, or tracing.
 6. The local control and event API uses a private Unix socket by default. A
    subscription captures a durable replay head and marks when it has caught up.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a

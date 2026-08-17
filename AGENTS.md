@@ -23,10 +23,10 @@ Read-only context unless a task explicitly asks you to edit them:
 
 - `~/dark-factory-site`: the Next.js site (Vercel), future home of the
   hosted release manifest (see `docs/development/WORKFLOW.md`).
-- `~/rust-hem-runner`: an unrelated project. Its `AGENTS.md`, `scripts/
-  new-worktree.sh`, and `docs/development/RELEASE_WORKFLOW.md` are useful
-  *style* references for worktree/release process, nothing more — don't
-  port its product specifics here.
+- `~/rust-hem-runner`: an unrelated project. Its `AGENTS.md`,
+  `scripts/new-worktree.sh`, and `docs/development/RELEASE_WORKFLOW.md`
+  are useful *style* references for worktree/release process, nothing
+  more — don't port its product specifics here.
 
 ## Critical rules
 
@@ -51,8 +51,8 @@ Read-only context unless a task explicitly asks you to edit them:
    fallbacks that hide a real failure behind a plausible-looking success.
 4. **Simplest implementation over cleverness.** Prefer the boring, obvious
    fix. Maintainability beats a clever one-liner.
-5. **CLI first.** Every operator action is a `factoryctl` request; `
-   factory-tui` calls the exact same local-API request path, never a
+5. **CLI first.** Every operator action is a `factoryctl` request;
+   `factory-tui` calls the exact same local-API request path, never a
    shortcut only the TUI can take. Add the CLI command before or alongside
    any TUI affordance for it.
 6. **Tests around the load-bearing paths**: queue durability, event
