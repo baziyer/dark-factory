@@ -19,6 +19,7 @@ use factory_core::{AgentId, AgentRole, AgentSnapshot, ProjectId, ProjectSnapshot
 use crate::model::state::AgentState;
 use crate::model::{Board, RouteKind};
 use crate::theme::Theme;
+use crate::ui;
 use factory_core::attention::Attention;
 
 /// Width, in cells, of one station "slot": the glyph itself plus one cell reserved for a route
@@ -27,6 +28,10 @@ use factory_core::attention::Attention;
 pub const STATION_SLOT_WIDTH: u16 = 2;
 pub const MIN_WORKSHOP_WIDTH: u16 = 12;
 pub const MAX_WORKSHOP_WIDTH: u16 = 34;
+/// Longest a project name is shown before the box's own title truncates it (middle-truncated,
+/// like every other id/name in this crate — see [`ui::truncate_middle`]) rather than growing the
+/// box without bound for a pathological name.
+const MAX_PROJECT_NAME_DISPLAY: usize = 24;
 /// Fixed box height: top border, stations row, in-tray/capacity row, bottom border. Constant
 /// regardless of station count, which is what makes "positions stable across updates; no
 /// animation" trivially true — a workshop never grows taller as agents are added, only wider (and
@@ -91,9 +96,22 @@ fn ordered_agents<'a>(agents: &[&'a AgentSnapshot]) -> Vec<&'a AgentSnapshot> {
     ordered
 }
 
-fn workshop_width(station_count: usize) -> u16 {
+/// A workshop box's width: wide enough for its packed stations (clamped to
+/// [`MIN_WORKSHOP_WIDTH`]/[`MAX_WORKSHOP_WIDTH`] as before), *or* wide enough for its own name —
+/// whichever needs more room (issue #68: a fixed 10-column box titled `Dark Facto` truncated a
+/// project name into its own border). `display_name` is `project_name`, already middle-truncated
+/// to [`MAX_PROJECT_NAME_DISPLAY`] (`render_workshop`'s title uses the exact same string, so the
+/// two never disagree about what fits).
+fn workshop_width(station_count: usize, display_name: &str) -> u16 {
     let inner = u16::try_from(station_count.max(1)).unwrap_or(u16::MAX) * STATION_SLOT_WIDTH;
-    (inner + 2).clamp(MIN_WORKSHOP_WIDTH, MAX_WORKSHOP_WIDTH)
+    let stations = (inner + 2).clamp(MIN_WORKSHOP_WIDTH, MAX_WORKSHOP_WIDTH);
+    // The title is rendered as " {name} " (one border column, then a leading space, the name,
+    // a trailing space, then at least one clear column before the closing border - see
+    // `render_workshop`'s `set_text` call, which would otherwise overwrite it).
+    let name_width = u16::try_from(display_name.chars().count())
+        .unwrap_or(u16::MAX)
+        .saturating_add(4);
+    stations.max(name_width)
 }
 
 /// Packs one workshop box per project, left-to-right in the given (already creation-ordered)
@@ -118,7 +136,8 @@ pub fn compute_workshops(
             .filter(|a| a.project_id == project.id)
             .collect();
         let ordered = ordered_agents(&project_agents);
-        let width = workshop_width(ordered.len());
+        let display_name = ui::truncate_middle(&project.name, MAX_PROJECT_NAME_DISPLAY);
+        let width = workshop_width(ordered.len(), &display_name);
 
         if cursor_x > 0 && cursor_x.saturating_add(width) > wrap_width {
             cursor_x = 0;
@@ -394,7 +413,12 @@ fn render_workshop(
         border_style,
     );
 
-    let title = format!(" {} ", layout.project_name);
+    // Same truncation `compute_workshops` already sized this box's width against, so the title
+    // can never run into (let alone overwrite) the box's own right border.
+    let title = format!(
+        " {} ",
+        ui::truncate_middle(&layout.project_name, MAX_PROJECT_NAME_DISPLAY)
+    );
     set_text(buf, rect, rect.x + 1, rect.y, &title, Style::default());
 
     let content_y = rect.y + 1;
@@ -539,8 +563,8 @@ mod tests {
             agent("worker-a", "a", AgentRole::Worker, None),
             agent("orch-c", "c", AgentRole::Orchestrator, None),
         ];
-        let width_a = workshop_width(2);
-        let width_b = workshop_width(0);
+        let width_a = workshop_width(2, "a");
+        let width_b = workshop_width(0, "b");
         let layout = compute_workshops(&projects, &agents, width_a + width_b);
         assert_eq!(
             layout[2].rect.y, WORKSHOP_HEIGHT,
@@ -739,6 +763,61 @@ mod tests {
         assert!(
             content_row.trim().starts_with("factoryctl"),
             "expected a truncated CLI hint, got {content_row:?}"
+        );
+    }
+
+    // -- #68: the project box sizes to its name, and never overwrites its own border -----------
+
+    #[test]
+    fn workshop_box_grows_to_fit_a_name_longer_than_the_station_driven_width() {
+        let mut proj = project("dark-factory", 0);
+        proj.name = "Dark Factory".to_owned();
+        let agents = vec![agent("orch", "dark-factory", AgentRole::Orchestrator, None)];
+        let layout = compute_workshops(&[proj], &agents, 200);
+        // One station clamps the station-driven width to MIN_WORKSHOP_WIDTH (12); "Dark Factory"
+        // (12 chars) needs 12+4=16 to leave its own border alone - the box must grow past the min
+        // instead of truncating the name into `Dark Facto` (issue #68's exact symptom).
+        assert!(
+            layout[0].rect.width >= 16,
+            "expected the box to grow for its name, got width {}",
+            layout[0].rect.width
+        );
+
+        let board = crate::model::Board::new(false, 0, crate::theme::FORTRESS);
+        let area = Rect::new(0, 0, layout[0].rect.width, WORKSHOP_HEIGHT);
+        let mut buf = Buffer::empty(area);
+        render(
+            &mut buf,
+            area,
+            &layout,
+            &board,
+            &crate::theme::FORTRESS,
+            None,
+            None,
+        );
+
+        let top_right = buf
+            .cell((
+                layout[0].rect.x + layout[0].rect.width - 1,
+                layout[0].rect.y,
+            ))
+            .unwrap();
+        assert_eq!(
+            top_right.symbol(),
+            "┐",
+            "the title must not overwrite the box's own border"
+        );
+    }
+
+    #[test]
+    fn workshop_box_width_caps_at_a_pathologically_long_project_name() {
+        let mut proj = project("p", 0);
+        proj.name = "a".repeat(200);
+        let layout = compute_workshops(&[proj], &[], 200);
+        assert!(
+            layout[0].rect.width <= u16::try_from(MAX_PROJECT_NAME_DISPLAY).unwrap() + 4,
+            "the name must be truncated rather than growing the box without bound, got width {}",
+            layout[0].rect.width
         );
     }
 }
