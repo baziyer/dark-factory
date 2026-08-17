@@ -314,12 +314,10 @@ pub enum RunnerEvent {
     /// The reverse direction -- an *older* runner talking to a newer
     /// daemon -- needs no catch-all: an old runner simply never sends
     /// `TerminalRaw` (it does not know the event exists), so a Codex
-    /// session it supervises never gets synthesized this way. Today,
-    /// with `#52` not yet merged, that session sits `starting` until an
-    /// operator manually posts the hook by hand, exactly as before this
-    /// track (`docs/providers.md`'s Codex `SessionStart` section states
-    /// this plainly rather than implying a backstop that does not exist
-    /// yet).
+    /// session it supervises never gets synthesized this way. The session
+    /// stays `starting`, where `#52`'s durable session-start deadline can
+    /// fail and retry it. `docs/providers.md`'s Codex `SessionStart`
+    /// section describes both upgrade directions.
     #[serde(other)]
     Unknown,
 }
