@@ -9,6 +9,7 @@
 //! `vt100::Screen` at once.
 
 mod attach;
+mod client_state;
 mod fortress;
 mod keys;
 mod model;
@@ -176,6 +177,8 @@ fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<NetMsg>();
     net::spawn_fleet_session(client.clone(), tx.clone());
+    // `--project` wins; otherwise open on whatever was focused last time.
+    let initial_project = cli_project.or_else(client_state::load_focused_project);
 
     let mut board = Board::new(config.dev_local_pty, now_ms(), config.theme);
     let mut panes: PaneMap = HashMap::new();
@@ -187,7 +190,7 @@ fn main() -> anyhow::Result<()> {
         &socket,
         &tx,
         &rx,
-        cli_project,
+        initial_project,
         &mut panes,
         config.debug_log.as_deref(),
     )?;
@@ -207,7 +210,7 @@ fn run(
     socket: &std::path::Path,
     tx: &mpsc::Sender<NetMsg>,
     rx: &mpsc::Receiver<NetMsg>,
-    cli_project: Option<factory_core::ProjectId>,
+    initial_project: Option<factory_core::ProjectId>,
     panes: &mut PaneMap,
     debug_log: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
@@ -217,7 +220,8 @@ fn run(
     let tick = Duration::from_millis(150);
     let mut last_second = Instant::now();
     let mut last_update_check = Instant::now();
-    let mut cli_project_applied = false;
+    let mut initial_project_applied = false;
+    let mut remembered_project = board.focused_project.clone();
     net::spawn_update_check(tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, debug_log);
@@ -248,7 +252,12 @@ fn run(
         }
 
         while let Ok(msg) = rx.try_recv() {
-            apply_net_msg(msg, board, cli_project.as_ref(), &mut cli_project_applied);
+            apply_net_msg(
+                msg,
+                board,
+                initial_project.as_ref(),
+                &mut initial_project_applied,
+            );
             needs_redraw = true;
         }
 
@@ -259,6 +268,13 @@ fn run(
         for pane in panes.values() {
             if pane.dirty() {
                 needs_redraw = true;
+            }
+        }
+
+        if board.focused_project != remembered_project {
+            remembered_project.clone_from(&board.focused_project);
+            if let Some(project_id) = &remembered_project {
+                client_state::save_focused_project(project_id);
             }
         }
 
@@ -436,8 +452,8 @@ fn apply_intent(
 fn apply_net_msg(
     msg: NetMsg,
     board: &mut Board,
-    cli_project: Option<&factory_core::ProjectId>,
-    cli_project_applied: &mut bool,
+    initial_project: Option<&factory_core::ProjectId>,
+    initial_project_applied: &mut bool,
 ) {
     match msg {
         NetMsg::ConnectionRetrying(detail) => board.set_retrying(detail),
@@ -450,11 +466,11 @@ fn apply_net_msg(
             sessions,
         } => {
             board.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
-            if !*cli_project_applied {
-                if let Some(project_id) = cli_project {
+            if !*initial_project_applied {
+                if let Some(project_id) = initial_project {
                     board.focus_project(project_id.clone());
                 }
-                *cli_project_applied = true;
+                *initial_project_applied = true;
             }
         }
         NetMsg::Event(event) => board.apply_event(event),

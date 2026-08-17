@@ -158,6 +158,19 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
 
 fn render_picker(frame: &mut Frame, area: Rect, board: &Board, picker: &PickerState) {
     let (title, items): (String, Vec<ListItem>) = match &picker.kind {
+        PickerKind::Project(projects) => (
+            "focus which project?".to_owned(),
+            projects
+                .iter()
+                .map(|id| {
+                    let label = board.projects.iter().find(|p| &p.id == id).map_or_else(
+                        || id.to_string(),
+                        |project| format!("{} — {}", id, project.name),
+                    );
+                    ListItem::new(label)
+                })
+                .collect(),
+        ),
         PickerKind::AssignAgent(task_id) => {
             let project_id = board.task_project(task_id);
             let ids = project_id
@@ -234,6 +247,7 @@ const HELP_TEXT: &[&str] = &[
     "n          new task (needs a focused project)",
     "m          message the selected agent",
     "o          message the orchestrator (picks by Tab if more than one)",
+    "p          focus a project (remembered for next time; Fortress stays fleet-wide)",
     "x          stop the selected agent — 2-press confirm",
     "g / G      jump to (G: and focus) the next agent needing attention",
     "!          Workshop: toggle attention-only filter",

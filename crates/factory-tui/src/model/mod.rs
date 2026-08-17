@@ -616,7 +616,7 @@ impl Board {
                 .to_owned();
         }
         "1-4 views  j/k move  Tab switch  Enter/l zoom in  Esc/h zoom out  n new  m message  \
-         o orchestrator  x stop  g/G attention  ? help  q detach"
+         o orchestrator  p project  x stop  g/G attention  ? help  q detach"
             .to_owned()
     }
 

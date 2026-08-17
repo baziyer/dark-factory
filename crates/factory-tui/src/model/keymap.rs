@@ -95,6 +95,8 @@ pub enum Action {
     NewTask,
     MessageAgent,
     MessageOrchestrator,
+    /// `p`: pick the focused project from a list (remembered across runs, see `main.rs`).
+    SwitchProject,
     /// `x`: stop the selected agent (2-press confirm).
     StopSelected,
     Detach,
@@ -132,6 +134,7 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('n') => Some(Action::NewTask),
         KeyCode::Char('m') => Some(Action::MessageAgent),
         KeyCode::Char('o') => Some(Action::MessageOrchestrator),
+        KeyCode::Char('p') => Some(Action::SwitchProject),
         KeyCode::Char('x') => Some(Action::StopSelected),
         KeyCode::Char('q') => Some(Action::Detach),
         KeyCode::Char('g') => Some(Action::JumpNeedsAttention),
@@ -210,6 +213,8 @@ impl PromptState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PickerKind {
+    /// Every project, oldest first, snapshotted at open time.
+    Project(Vec<ProjectId>),
     AssignAgent(TaskId),
     /// Candidates snapshotted at open time (so the list can't drift mid-pick) — `Tab`/`j`/`k`
     /// cycle through them, matching the design brief's "`o` message the orchestrator ... if
@@ -341,6 +346,7 @@ impl Board {
             Action::NewTask => self.begin_new_task(),
             Action::MessageAgent => self.begin_message_agent(),
             Action::MessageOrchestrator => self.begin_message_orchestrator(),
+            Action::SwitchProject => self.begin_switch_project(),
             Action::StopSelected => self.begin_stop_selected(),
             Action::Detach => {
                 self.quit = true;
@@ -648,6 +654,28 @@ impl Board {
         }
     }
 
+    fn begin_switch_project(&mut self) -> Intent {
+        let projects: Vec<ProjectId> = self
+            .projects_sorted()
+            .into_iter()
+            .map(|project| project.id)
+            .collect();
+        if projects.is_empty() {
+            self.set_status("no projects yet", StatusLevel::Error);
+            return Intent::Redraw;
+        }
+        let cursor = self
+            .focused_project
+            .as_ref()
+            .and_then(|focused| projects.iter().position(|id| id == focused))
+            .unwrap_or(0);
+        self.mode = Mode::Picker(PickerState {
+            kind: PickerKind::Project(projects),
+            cursor,
+        });
+        Intent::Redraw
+    }
+
     fn begin_stop_selected(&mut self) -> Intent {
         let Some(agent_id) = self.selected_agent.clone() else {
             self.set_status("no agent selected", StatusLevel::Error);
@@ -858,6 +886,7 @@ impl Board {
             return Intent::None;
         };
         let len = match &picker.kind {
+            PickerKind::Project(projects) => projects.len(),
             PickerKind::AssignAgent(_) => picker_agent_count(self, picker),
             PickerKind::Orchestrator(candidates) => candidates.len(),
         };
@@ -891,6 +920,16 @@ impl Board {
             return Intent::None;
         };
         match picker.kind {
+            PickerKind::Project(projects) => {
+                self.mode = Mode::Normal;
+                if let Some(project_id) = projects.get(picker.cursor).cloned() {
+                    self.focus_project(project_id);
+                    if self.view == View::Fortress {
+                        self.view = View::Workshop;
+                    }
+                }
+                Intent::Redraw
+            }
             PickerKind::AssignAgent(task_id) => {
                 self.mode = Mode::Normal;
                 let Some(project_id) = self.task_project(&task_id) else {
@@ -1081,6 +1120,7 @@ mod tests {
             (KeyCode::Char('n'), Action::NewTask),
             (KeyCode::Char('m'), Action::MessageAgent),
             (KeyCode::Char('o'), Action::MessageOrchestrator),
+            (KeyCode::Char('p'), Action::SwitchProject),
             (KeyCode::Char('x'), Action::StopSelected),
             (KeyCode::Char('q'), Action::Detach),
             (KeyCode::Char('g'), Action::JumpNeedsAttention),
@@ -1168,6 +1208,51 @@ mod tests {
 
         board.handle_key(key(KeyCode::Char('[')));
         assert_eq!(board.selected_workshop.as_ref().unwrap().as_str(), "proj");
+    }
+
+    #[test]
+    fn p_opens_a_project_picker_that_refocuses_and_zooms_to_workshop() {
+        let mut board = board_with_an_empty_second_project();
+        assert_eq!(board.view, View::Fortress);
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "proj");
+
+        board.handle_key(key(KeyCode::Char('p')));
+        let Mode::Picker(PickerState {
+            kind: PickerKind::Project(projects),
+            cursor,
+        }) = &board.mode
+        else {
+            panic!("expected a project picker, got {:?}", board.mode);
+        };
+        assert_eq!(projects.len(), 2, "every project, oldest first");
+        assert_eq!(*cursor, 0, "cursor starts on the focused project");
+
+        board.handle_key(key(KeyCode::Char('j')));
+        board.handle_key(key(KeyCode::Enter));
+        assert!(matches!(board.mode, Mode::Normal));
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "empty");
+        assert_eq!(
+            board.view,
+            View::Workshop,
+            "from FORTRESS, picking a project zooms in"
+        );
+
+        // From WORKSHOP the picker keeps the view; the cursor follows the focused project.
+        board.handle_key(key(KeyCode::Char('p')));
+        let Mode::Picker(PickerState { cursor, .. }) = &board.mode else {
+            panic!("expected a project picker");
+        };
+        assert_eq!(*cursor, 1);
+        board.handle_key(key(KeyCode::Char('k')));
+        board.handle_key(key(KeyCode::Enter));
+        assert_eq!(board.focused_project.as_ref().unwrap().as_str(), "proj");
+        assert_eq!(board.view, View::Workshop);
+
+        // No projects at all: a status message, no picker.
+        let mut empty = Board::new(false, 0, crate::theme::FORTRESS);
+        empty.handle_key(key(KeyCode::Char('p')));
+        assert!(matches!(empty.mode, Mode::Normal));
+        assert_eq!(empty.status_line_text(), "no projects yet");
     }
 
     #[test]
