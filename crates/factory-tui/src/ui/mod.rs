@@ -11,8 +11,8 @@ mod workshop;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::model::{Board, Mode, View};
 use crate::pane::PaneMap;
@@ -106,4 +106,14 @@ pub(super) fn dim(frame: &mut Frame, area: Rect, text: impl Into<String>) {
         Paragraph::new(text.into()).style(Style::default().fg(Color::DarkGray)),
         area,
     );
+}
+
+/// A `List` with this crate's one highlight convention (`"> "`, bold) — every list-backed panel
+/// and picker (WORKSHOP's tasks/agents, the assign/orchestrator pickers, the task menu) shares it
+/// rather than repeating `.highlight_symbol(..).highlight_style(..)` at each call site.
+pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -> List<'a> {
+    List::new(items)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
 }

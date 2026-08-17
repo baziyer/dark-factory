@@ -5,7 +5,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Clear, ListItem, ListState, Paragraph};
 
 use crate::model::{
     Board, Connection, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
@@ -191,10 +191,7 @@ fn render_picker(frame: &mut Frame, area: Rect, board: &Board, picker: &PickerSt
         return;
     }
 
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let list = ui::styled_list(items, block);
     let mut state = ListState::default();
     state.select(Some(picker.cursor));
     frame.render_stateful_widget(list, rect, &mut state);
@@ -216,10 +213,7 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
     );
     frame.render_widget(Clear, rect);
     let block = ui::block(title).border_style(Style::default().fg(Color::Cyan));
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let list = ui::styled_list(items, block);
     let mut state = ListState::default();
     state.select(Some(menu.cursor));
     frame.render_stateful_widget(list, rect, &mut state);

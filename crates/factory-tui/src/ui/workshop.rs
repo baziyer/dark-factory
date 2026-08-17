@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{ListItem, ListState, Paragraph, Wrap};
 
 use factory_core::{AgentRole, ProjectId, TaskStatus};
 
@@ -145,10 +145,7 @@ fn render_tasks(
     let filter_badge = if board.attention_filter { " [!]" } else { "" };
     let title = format!(" {project_name} — tasks{filter_badge} ");
     let block = ui::block(title).border_style(panel_style(focused));
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let list = ui::styled_list(items, block);
 
     let mut state = ListState::default();
     if !tasks.is_empty() {
@@ -240,10 +237,7 @@ fn render_agents(frame: &mut Frame, area: Rect, board: &Board, project_id: &Proj
     let focused = board.workshop_focus == WorkshopPane::Agents;
     let filter_badge = if board.attention_filter { " [!]" } else { "" };
     let block = ui::block(format!(" agents{filter_badge} ")).border_style(panel_style(focused));
-    let list = List::new(items)
-        .block(block)
-        .highlight_symbol("> ")
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD));
+    let list = ui::styled_list(items, block);
 
     let mut state = ListState::default();
     if !tree.is_empty() {
