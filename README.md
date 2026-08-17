@@ -205,8 +205,14 @@ generated settings, so an agent's own progress report never stalls on a
 permission prompt nobody is there to answer. Codex's own sandbox can still
 block an agent's *own* `factoryctl task done`/`task blocked`/`agent
 message` call even though hooks always get through; a file-based outbox
-(drained by the next hook) covers that gap. Full mechanism, including
-per-provider argv and generated config: [docs/providers.md](docs/providers.md).
+(drained by the next hook) covers that gap. Codex agents seed their
+per-agent `CODEX_HOME` from the Codex home the daemon's environment names
+(`$CODEX_HOME`, else your own `~/.codex`) — so a factory can run on a
+different Codex account than your shell: `CODEX_HOME=~/.codex-dogfood
+codex login` once, then `CODEX_HOME=~/.codex-dogfood factoryctl init`,
+which carries it into the launchd job (`factoryctl doctor` shows which home
+is in effect). Full mechanism, including per-provider argv and generated
+config: [docs/providers.md](docs/providers.md).
 
 ## The Minerva webhook endpoint
 

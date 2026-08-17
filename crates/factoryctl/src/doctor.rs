@@ -83,6 +83,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         checks.push(check_program(program));
     }
     checks.push(check_claude_json(user_home.as_deref()));
+    checks.push(check_codex_seed(user_home.as_deref()));
     if daemon_reachable {
         checks.extend(check_projects(&Client::new(socket), &home));
     }
@@ -328,6 +329,38 @@ fn check_claude_json(user_home: Option<&Path>) -> Check {
                 path.display()
             ),
         ),
+    }
+}
+
+/// Which Codex home agents seed their credentials from, and whether it is
+/// logged in.
+fn check_codex_seed(user_home: Option<&Path>) -> Check {
+    let Some(user_home) = user_home else {
+        return Check::warn("codex-seed", "HOME is not set");
+    };
+    let job = launchd::read_existing(&launchd::plist_path(user_home))
+        .ok()
+        .flatten();
+    let seed_home = probes::codex_seed_home(job.as_ref().map(|job| &job.environment), user_home);
+    let overridden = seed_home != user_home.join(".codex");
+    if seed_home.join("auth.json").is_file() {
+        Check::ok(
+            "codex-seed",
+            format!(
+                "{} (auth.json present{})",
+                seed_home.display(),
+                if overridden { "; via CODEX_HOME" } else { "" }
+            ),
+        )
+    } else {
+        Check::warn(
+            "codex-seed",
+            format!(
+                "{} has no auth.json; Codex agents will have no credentials (log that home in with `CODEX_HOME={} codex login`)",
+                seed_home.display(),
+                seed_home.display()
+            ),
+        )
     }
 }
 

@@ -144,9 +144,16 @@ them into `factory_core::ProviderHookEvent` values (see
 ## Codex: `CODEX_HOME` seeding is filtered, not a raw copy
 
 `CodexProvider` seeds each agent's isolated `CODEX_HOME` once
-(`seed_codex_home_once`, `crates/factoryd/src/providers/codex.rs`) by
-copying the operator's real `~/.codex/config.toml` — but filtered, not
-verbatim. Copying it whole was the original design and stalled every
+(`seed_codex_home_once`, `crates/factoryd/src/providers/codex.rs`) from the
+Codex home the daemon's own environment names — `$CODEX_HOME` if set, else
+`~/.codex`, exactly as `codex` resolves its own — copying its `config.toml`
+(filtered, see below) and symlinking its `auth.json`. That is how a factory
+runs on a different Codex account than the operator's shell: log it in once
+(`CODEX_HOME=~/.codex-dogfood codex login`) and give the daemon that
+`CODEX_HOME` (`CODEX_HOME=~/.codex-dogfood factoryctl init` carries it into
+the launchd job; `factoryctl doctor` reports which home is in effect and
+whether it holds an `auth.json`). Copying `config.toml` whole was the
+original design and it is filtered, not verbatim, because: Copying it whole was the original design and stalled every
 session at "Starting MCP servers" on a real machine: the operator's own
 `config.toml` brings along `[mcp_servers.*]` (Codex launches every one of
 them before a session becomes usable, several of which expect an

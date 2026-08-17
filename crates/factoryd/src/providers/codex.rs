@@ -15,6 +15,7 @@
 //! need to confirm a Codex thread identity is a canonical UUID.
 
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
 };
@@ -153,23 +154,33 @@ fn table_header_top_level_key(line: &str) -> Option<String> {
 /// vetting Codex's normal hook-trust prompt would otherwise ask for. See
 /// `docs/providers.md`.
 pub struct CodexProvider {
-    /// The operator's real Codex home to seed a fresh per-agent
-    /// `CODEX_HOME` from (`config.toml`, `auth.json`). Defaults to
-    /// `$HOME/.codex`; overridable for tests via
+    /// The Codex home to seed a fresh per-agent `CODEX_HOME` from
+    /// (`config.toml`, `auth.json`): the daemon's own `$CODEX_HOME` if set
+    /// — Codex's own convention, and how a factory runs on a different
+    /// account than the operator's shell (`CODEX_HOME=~/.codex-dogfood`
+    /// in the launchd job) — else `$HOME/.codex`; overridable for tests via
     /// [`CodexProvider::with_source_home`].
     source_home: Option<PathBuf>,
 }
 
 impl CodexProvider {
-    /// Resolves the seed source from `$HOME/.codex`, matching Codex's own
-    /// default `CODEX_HOME`. `None` (no `$HOME`) means a fresh per-agent
-    /// home always starts from [`MINIMAL_CONFIG_TOML`] with no `auth.json`
-    /// link — Codex will then have no subscription credentials, same as
-    /// running `codex` with no prior login.
+    /// Resolves the seed source exactly as `codex` itself resolves its home:
+    /// `$CODEX_HOME` if set, else `$HOME/.codex`. `None` (neither set)
+    /// means a fresh per-agent home always starts from
+    /// [`MINIMAL_CONFIG_TOML`] with no `auth.json` link — Codex will then
+    /// have no subscription credentials, same as running `codex` with no
+    /// prior login.
     #[must_use]
     pub fn new() -> Self {
+        Self::from_environment(std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))
+    }
+
+    fn from_environment(codex_home: Option<OsString>, home: Option<OsString>) -> Self {
         Self {
-            source_home: std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")),
+            source_home: codex_home
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| home.map(|home| PathBuf::from(home).join(".codex"))),
         }
     }
 
@@ -1092,5 +1103,27 @@ mod provider_tests {
             Some("model_providers".to_owned())
         );
         assert_eq!(table_header_top_level_key("not a header"), None);
+    }
+
+    #[test]
+    fn the_daemons_codex_home_overrides_the_operators_own() {
+        let dogfood = CodexProvider::from_environment(
+            Some("/Users/me/.codex-dogfood".into()),
+            Some("/Users/me".into()),
+        );
+        assert_eq!(
+            dogfood.source_home.as_deref(),
+            Some(Path::new("/Users/me/.codex-dogfood"))
+        );
+        let personal = CodexProvider::from_environment(Some("".into()), Some("/Users/me".into()));
+        assert_eq!(
+            personal.source_home.as_deref(),
+            Some(Path::new("/Users/me/.codex")),
+            "an empty override means unset"
+        );
+        assert_eq!(
+            CodexProvider::from_environment(None, None).source_home,
+            None
+        );
     }
 }

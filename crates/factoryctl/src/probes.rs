@@ -110,6 +110,22 @@ pub fn daemon_answers(socket: &Path) -> bool {
         .is_ok()
 }
 
+/// The Codex home agents seed from, given a launchd job's environment (or
+/// none): `CODEX_HOME` from the job, else from this process, else
+/// `<user_home>/.codex` — mirroring `CodexProvider::new`.
+#[must_use]
+pub fn codex_seed_home(
+    job_environment: Option<&std::collections::BTreeMap<String, String>>,
+    user_home: &Path,
+) -> PathBuf {
+    job_environment
+        .and_then(|environment| environment.get("CODEX_HOME").cloned())
+        .or_else(|| std::env::var("CODEX_HOME").ok())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| user_home.join(".codex"))
+}
+
 /// Polls `health` at `socket` until a daemon answers — with `version`
 /// equal to `expected_version` when one is given, so a just-restarted job
 /// is not mistaken for the daemon it replaced — or `timeout` elapses.
