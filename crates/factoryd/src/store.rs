@@ -1015,6 +1015,61 @@ impl Store {
         ))
     }
 
+    /// Persists a session's provider-assigned identity once it becomes
+    /// known after the session was created without one -- today only
+    /// Codex, whose thread id the daemon does not choose up front (unlike
+    /// Claude's `--session-id`, `TRACK5-DESIGN.md` §1) but learns from the
+    /// payload of that session's own first `SessionStart` hook. Called
+    /// unconditionally from the `ProviderHook` handler for every provider:
+    /// a no-op (not an error), returning `None`, if the session already
+    /// carries a `provider_session_id` -- Claude's is assigned at creation
+    /// time (always already set), a resumed session already carries its
+    /// prior identity forward, and a duplicate/replayed hook must not
+    /// clobber an established identity. Returns `Some` with the updated
+    /// snapshot and event when it actually set one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::SessionNotFound`] if `session_id` does not
+    /// exist, or [`StoreError::InvalidExecutionMetadata`] if
+    /// `provider_session_id` fails the same validation
+    /// [`Store::create_session`] applies.
+    pub fn set_provider_session_id(
+        &mut self,
+        session_id: &SessionId,
+        provider_session_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<(SessionSnapshot, EventEnvelope)>> {
+        validate_provider_session(Some(provider_session_id))?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if session.provider_session_id.is_some() {
+            return Ok(None);
+        }
+        transaction.execute(
+            "UPDATE sessions SET provider_session_id = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![provider_session_id, now_ms, session_id.as_str()],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let event = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(Some((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        )))
+    }
+
     /// Persists stop intent on a live session so the daemon knows a
     /// `process exited`/`failed`-shaped end is actually a graceful stop.
     pub fn request_session_stop(

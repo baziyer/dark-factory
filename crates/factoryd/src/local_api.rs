@@ -1258,6 +1258,33 @@ async fn handle_request(
                 serde_json::json!({})
             };
             if event == ProviderHookEvent::SessionStart {
+                // Codex reports its own thread id back in this hook's
+                // payload (a Claude-shaped `session_id` field -- its
+                // `--session-id` is instead assigned by the daemon up
+                // front, so `Store::create_session` already set it there;
+                // see `TRACK5-DESIGN.md` §1 and `TRACK5D` item 5).
+                // Unconditional for every provider: `set_provider_session_id`
+                // is a no-op once a session already carries one, which
+                // Claude's and a resumed session's already do.
+                if let Some(provider_session_id) = payload
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let identify_session_id = session_id.clone();
+                    let identify_provider_session_id = provider_session_id.to_owned();
+                    state
+                        .commit_and_publish(move |store| {
+                            match store.set_provider_session_id(
+                                &identify_session_id,
+                                &identify_provider_session_id,
+                                now_ms()?,
+                            )? {
+                                Some((_, event)) => Ok(((), vec![event])),
+                                None => Ok(((), Vec::new())),
+                            }
+                        })
+                        .await?;
+                }
                 // Proof the CLI is up: an agent's very first delivery is
                 // PTY-typed (idle-session path), which needs this hook to
                 // have fired at least once before typing anything

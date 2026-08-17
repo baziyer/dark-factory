@@ -525,18 +525,16 @@ async fn spawn_session_for_agent(
     let provider_impl = select_provider(agent.snapshot.provider);
     let capabilities = provider_impl.capabilities();
 
-    // NOTE (decision, not yet implemented): resuming a prior provider
-    // session/thread is only wired for Claude, whose `--session-id` the
-    // daemon assigns itself up front, so no hook-learned confirmation is
-    // needed (TRACK5-DESIGN.md §1). Codex reports its thread id back via
-    // the `SessionStart` hook payload's `session_id` field, but nothing
-    // yet persists that into `sessions.provider_session_id` -- doing so
-    // safely means threading the raw hook payload through
-    // `record_hook_event` (today only bounded/derived fields cross that
-    // boundary) across ~16 call sites in `tests/sessions_store.rs`, out of
-    // proportion for this pass. Net effect: Codex sessions never resume
-    // across a daemon/session restart today, always launching fresh. See
-    // the final report's known-failure-modes section.
+    // The most recent provider-session identity this agent's sessions ever
+    // confirmed, live or historical -- generic across providers by design
+    // (TRACK5-DESIGN.md §1): Claude's is assigned by the daemon itself at
+    // creation time (`Store::create_session`, below), so it is always
+    // already set; Codex's is learned back from its own first
+    // `SessionStart` hook payload and persisted by
+    // `Store::set_provider_session_id` (`local_api.rs`'s `ProviderHook`
+    // handler, TRACK5D item 5). Either way, a fresh spawn just asks "does
+    // this agent have a prior session with one" and resumes it when
+    // `capabilities.resume` allows.
     let resume_project_id = project_id.clone();
     let resume_agent_id = agent_id.clone();
     let resume = if capabilities.resume {

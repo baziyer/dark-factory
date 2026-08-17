@@ -271,6 +271,111 @@ fn session_control_target_resolves_by_session_and_by_run() {
     ));
 }
 
+// --- Provider session identity (Codex resume, item 5) ---------------------
+
+#[test]
+fn set_provider_session_id_persists_and_publishes_an_event() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    assert_eq!(snapshot.provider_session_id, None);
+
+    let (session, event) = store
+        .set_provider_session_id(&snapshot.id, "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d", 6)
+        .unwrap()
+        .expect("first call sets it");
+    assert_eq!(
+        session.provider_session_id.as_deref(),
+        Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+    );
+    assert!(matches!(
+        event.event,
+        FactoryEvent::SessionChanged { session: ref changed }
+            if changed.provider_session_id.as_deref()
+                == Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+    ));
+}
+
+#[test]
+fn set_provider_session_id_is_a_no_op_once_already_set() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .set_provider_session_id(&snapshot.id, "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d", 6)
+        .unwrap()
+        .expect("first call sets it");
+
+    // A second call (e.g. a duplicate/replayed SessionStart hook) with a
+    // different value never clobbers the established identity.
+    let outcome = store
+        .set_provider_session_id(&snapshot.id, "22222222-2222-4222-8222-222222222222", 7)
+        .unwrap();
+    assert!(outcome.is_none());
+
+    let target = store
+        .session_control_target(&project_id("factory"), &snapshot.id)
+        .unwrap();
+    assert_eq!(target.runner_instance_id.as_str(), "instance-s1");
+    let stored = store
+        .last_provider_session_id(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    assert_eq!(
+        stored.as_deref(),
+        Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+    );
+}
+
+#[test]
+fn set_provider_session_id_is_a_no_op_when_already_set_at_session_creation() {
+    // Claude's provider_session_id is assigned by the daemon up front (the
+    // session's own id) rather than learned from a hook payload, so a
+    // later `set_provider_session_id` call -- as if a hook also reported
+    // one -- is correctly a no-op, the same as a duplicated Codex
+    // SessionStart.
+    let mut store = fixture();
+    let mut session_already_identified = new_session("s1", "factory", "curie");
+    session_already_identified.provider_session_id =
+        Some("2f5a1e2e-2222-4444-8888-0123456789ab".to_owned());
+    let (snapshot, _) = store.create_session(session_already_identified, 5).unwrap();
+    assert_eq!(
+        snapshot.provider_session_id.as_deref(),
+        Some("2f5a1e2e-2222-4444-8888-0123456789ab")
+    );
+
+    let outcome = store
+        .set_provider_session_id(&snapshot.id, "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d", 6)
+        .unwrap();
+    assert!(outcome.is_none());
+}
+
+#[test]
+fn set_provider_session_id_rejects_an_unknown_session() {
+    let mut store = fixture();
+    let error = store
+        .set_provider_session_id(
+            &session_id("missing"),
+            "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+            5,
+        )
+        .unwrap_err();
+    assert!(matches!(error, StoreError::SessionNotFound));
+}
+
+#[test]
+fn set_provider_session_id_rejects_an_invalid_identity() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let error = store
+        .set_provider_session_id(&snapshot.id, "", 6)
+        .unwrap_err();
+    assert!(matches!(error, StoreError::InvalidExecutionMetadata));
+}
+
 // --- Hook state machine --------------------------------------------------
 
 #[test]

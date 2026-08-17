@@ -332,6 +332,36 @@ fn create_shell_agent(client: &Client, agent_id: &str) -> factory_core::AgentSna
     agent
 }
 
+/// Like [`create_shell_agent`], but `sh -lc <command>` runs an arbitrary
+/// one-off `command` instead of the standard `shell-agent.sh` fixture --
+/// for tests that only need to simulate one specific hook payload/protocol
+/// detail `shell-agent.sh` itself does not exercise.
+fn create_shell_agent_with_command(
+    client: &Client,
+    agent_id: &str,
+    command: String,
+) -> factory_core::AgentSnapshot {
+    let response = client
+        .request(LocalRequest::CreateAgent {
+            id: AgentId::try_from(agent_id).unwrap(),
+            project_id: project_id(),
+            parent_agent_id: None,
+            role: AgentRole::Worker,
+            provider: Provider::Shell,
+            model: Some(command),
+            worktree: None,
+        })
+        .unwrap();
+    let ServerFrame::Response {
+        response: LocalResponse::AgentCreated { agent },
+        ..
+    } = response
+    else {
+        panic!("expected AgentCreated, got {response:?}");
+    };
+    agent
+}
+
 fn create_task(client: &Client, id: &str, title: &str, body: &str) {
     let response = client
         .request(LocalRequest::CreateTask {
@@ -954,6 +984,84 @@ fn terminal_input_reaches_the_live_process_through_attach() {
         "the typed `exit` keystroke should be echoed in the retained terminal output, got {replayed:?}"
     );
 
+    daemon.stop();
+}
+
+// --- (g) TRACK5D item 5: a SessionStart hook payload's session_id
+//     persists as the session's provider_session_id (Codex resume) -------
+
+#[test]
+fn session_start_hook_payload_session_id_persists_as_provider_session_id() {
+    // Codex reports its own thread id back in its first SessionStart
+    // hook's payload (a Claude-shaped `session_id` field); the daemon
+    // persists it via `Store::set_provider_session_id` so a later spawn
+    // for this agent can `codex resume <thread-id>`. Simulated here with
+    // the shell provider (no real Codex session, no tokens spent) posting
+    // the exact payload shape by hand.
+    const FAKE_CODEX_THREAD_ID: &str = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+
+    // `agent_profiles.model` is validated as a single-line, control-
+    // character-free string bounded at 256 bytes (`validate_agent_model`),
+    // so this is `;`-separated and as short as it can be rather than
+    // newline-separated like `shell-agent.sh`.
+    let command = "printf '{\"session_id\":\"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d\"}' | \
+\"$DARK_FACTORY_FACTORYCTL\" hook --token-file \"$DARK_FACTORY_SESSION_TOKEN_FILE\" SessionStart \
+>/dev/null; while :; do sleep 3600; done"
+        .to_owned();
+    create_shell_agent_with_command(&client, "curie", command);
+    // Some pending work is required to trigger the initial spawn at all;
+    // this custom command never reads stdin, so the delivery itself is
+    // irrelevant to what this test checks (and is not waited on).
+    create_task(&client, "task-1", "Trigger a spawn", "irrelevant body");
+    assign_task(&client, "task-1", "curie");
+
+    let session = poll_until(DELIVERY_TIMEOUT, || {
+        session_by_agent(&client, "curie").filter(|session| session.provider_session_id.is_some())
+    });
+    assert_eq!(
+        session.provider_session_id.as_deref(),
+        Some(FAKE_CODEX_THREAD_ID)
+    );
+
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
+
+// --- (h) TRACK5D item 1: a bare `factoryctl` (no absolute path, no
+//     DARK_FACTORY_FACTORYCTL) resolves via PATH inside a resident
+//     session -----------------------------------------------------------
+
+#[test]
+fn bare_factoryctl_resolves_via_path_inside_a_terminal_mode_session() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+
+    // Deliberately unset the one env var the shell fixture would normally
+    // fall back to, and never reference an absolute path: this only
+    // succeeds if factoryctl's own directory was actually prepended to
+    // PATH for this terminal-mode launch (`runner_process.rs`'s
+    // `apply_runner_environment`).
+    let command = "unset DARK_FACTORY_FACTORYCTL; \
+TOKEN_FILE=\"$DARK_FACTORY_SESSION_TOKEN_FILE\"; \
+printf '{}' | factoryctl hook --token-file \"$TOKEN_FILE\" SessionStart >/dev/null; \
+while :; do sleep 3600; done"
+        .to_owned();
+    create_shell_agent_with_command(&client, "curie", command);
+    create_task(&client, "task-1", "Trigger a spawn", "irrelevant body");
+    assign_task(&client, "task-1", "curie");
+
+    // A SessionStart hook moves a `starting` session to `idle`
+    // (`Store::record_hook_event`): this only happens if the bare
+    // `factoryctl hook ...` call actually resolved and reached the
+    // daemon.
+    wait_for_session_state(&client, "curie", SessionState::Idle);
+
+    cleanup_session(&client, "curie");
     daemon.stop();
 }
 
