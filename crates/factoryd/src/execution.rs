@@ -57,7 +57,7 @@ use crate::{
     providers::{self, SpawnContext, hooks},
     runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
     runner_process::{self, LaunchSpec, ProviderEnvironment},
-    store::{RecoverableSession, StoreError},
+    store::{RecoverableSession, SessionRow, StoreError},
 };
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
@@ -108,6 +108,18 @@ const MAX_DELIVERY_TASK_BODY_BYTES: usize = 16_384;
 /// error message can never itself turn a spawn failure into a second,
 /// confusing store error.
 const MAX_WAIT_REASON_BYTES: usize = 512;
+/// Default for [`Config::session_start_deadline`] (issue #24): how long a
+/// session may sit `starting` before the daemon gives up on its
+/// `SessionStart` hook ever arriving and treats it exactly like a failed
+/// spawn attempt. A real Codex session was observed whose TUI rendered and
+/// sat fully idle, hooks never firing, for several minutes -- root cause
+/// not established, but "starting forever" must not be a reachable steady
+/// state regardless. 120s is generous enough for a cold Codex start with
+/// many MCP servers/plugins syncing. Not an operator flag, env var, or
+/// config file key (AGENTS.md rule 3) -- [`Config::session_start_deadline`]
+/// exists only so tests can shorten it; production always uses this
+/// constant (`main.rs`).
+pub const SESSION_START_DEADLINE: Duration = Duration::from_secs(120);
 const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
 (DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
@@ -144,6 +156,14 @@ pub struct Config {
     /// resource bound, not a hard failure (`--max-active-runs`, README's
     /// "Local control plane").
     pub max_active_runs: usize,
+    /// How long a session may stay `starting` before [`dispatch_agent`]
+    /// treats it as a failed spawn attempt (issue #24, see
+    /// [`SESSION_START_DEADLINE`]'s doc comment). A struct field rather
+    /// than a bare constant purely so a test can shorten it; every real
+    /// caller (`main.rs`) passes [`SESSION_START_DEADLINE`] -- there is
+    /// deliberately no CLI flag, environment variable, or config file key
+    /// for this (AGENTS.md rule 3).
+    pub session_start_deadline: Duration,
 }
 
 /// One explicit queued task to deliver now into its agent's live, idle
@@ -980,8 +1000,119 @@ async fn dispatch_agent(
             )
             .await
         }
+        Some(session) if session.state == SessionState::Starting => {
+            enforce_start_deadline(
+                config, state, wake_tx, backoff, project_id, agent_id, &session,
+            )
+            .await
+        }
         Some(_) => Ok(()),
     }
+}
+
+/// Issue #24: a session that has been `starting` for longer than
+/// [`Config::session_start_deadline`] is treated exactly like a failed
+/// spawn attempt, so "starting forever" is never a reachable steady state
+/// even though the missing-hook root cause itself is not established. The
+/// deadline is measured from the session's durable `started_at_ms`
+/// (`dispatch_agent`'s ordinary per-agent pass -- wake-triggered or the 5
+/// second safety tick -- calls this for every `starting` session, so this
+/// also catches a session recovered `starting` after a daemon restart, not
+/// just a freshly spawned one).
+async fn enforce_start_deadline(
+    config: &Config,
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    backoff: &SpawnBackoff,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+    session: &SessionRow,
+) -> Result<(), Error> {
+    let now = now_ms()?;
+    // A negative gap (the clock moved backward since the session's
+    // `started_at_ms` was recorded) is treated as "not yet due" rather
+    // than an immediate deadline hit -- clock skew must never be the
+    // reason a freshly spawned session gets killed.
+    let elapsed = u64::try_from(now.saturating_sub(session.started_at_ms)).unwrap_or(0);
+    if Duration::from_millis(elapsed) < config.session_start_deadline {
+        return Ok(());
+    }
+
+    let session_id = session.id.clone();
+    // Stop the runner (best-effort, reusing the same control path
+    // `local_api.rs`'s `StopSession` handler uses): if the control socket
+    // is already unreachable there is nothing left to stop, and the
+    // session is still recorded `failed` below regardless -- this must
+    // never be the reason a stuck session stays visible as `starting`.
+    let target_project_id = project_id.clone();
+    let target_session_id = session_id.clone();
+    match state
+        .with_store(move |store| {
+            store.session_control_target(&target_project_id, &target_session_id)
+        })
+        .await
+    {
+        Ok(target) => {
+            if let Ok(control_run_id) = session_run_id(&session_id) {
+                if let Err(error) = RunnerClient::new(
+                    target.runner_runtime,
+                    control_run_id,
+                    target.runner_instance_id,
+                )
+                .stop(0)
+                .await
+                {
+                    tracing::warn!(
+                        %error,
+                        %project_id,
+                        %agent_id,
+                        %session_id,
+                        "could not stop a session past its start deadline; recording it failed anyway"
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                %project_id,
+                %agent_id,
+                %session_id,
+                "could not resolve a session past its start deadline's control target; recording it failed anyway"
+            );
+        }
+    }
+
+    let reason = format!(
+        "SessionStart hook not received within {}s (the provider started but its hooks did not \
+         reach factoryd); recover by hand with `factoryctl hook --token-file <session token file> \
+         SessionStart` -- see README's \"Unattended operation\"",
+        config.session_start_deadline.as_secs()
+    );
+    let fail_session_id = session_id.clone();
+    state
+        .commit_and_publish(move |store| {
+            let (snapshot, events) =
+                store.end_session_with_reason(&fail_session_id, None, None, Some(reason), now)?;
+            Ok((snapshot, events))
+        })
+        .await?;
+
+    // Same events/log line a failed spawn attempt already emits
+    // (`dispatch_agent`'s own `None` branch, above): the next attempt is
+    // backed off, and the dispatcher is woken so it respawns once that
+    // backoff elapses rather than waiting a full extra safety tick.
+    let (retry_in, attempt) = backoff.record_failure(agent_id);
+    tracing::warn!(
+        %project_id,
+        %agent_id,
+        %session_id,
+        attempt,
+        retry_in_secs = retry_in.as_secs(),
+        "session start deadline exceeded; recorded failed and backing off"
+    );
+    send_wake(wake_tx, project_id.clone(), agent_id.clone());
+    Ok(())
 }
 
 async fn has_pending_work(
@@ -2238,6 +2369,7 @@ mod tests {
             guidance_root: directory.to_path_buf(),
             socket_path: directory.join("f.sock"),
             max_active_runs: 1,
+            session_start_deadline: SESSION_START_DEADLINE,
         }
     }
 
