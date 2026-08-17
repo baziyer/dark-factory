@@ -79,6 +79,32 @@ should be revisited, not silently relied on:
   harness killing the daemon right after `StopSession` returns, say) will
   still orphan the runner process. `crates/factoryd/tests/sessions_e2e.rs`'s
   `cleanup_session`/`Daemon::drop` document the pattern to follow.
+- **A Codex agent's own `factoryctl` tool calls (not the daemon's hooks)
+  can fail under the `workspace-write` sandbox**: verified on one real
+  Codex session (temp home, this track's item 7 check). Hooks
+  (`SessionStart`/`UserPromptSubmit`/.../`Stop`, all daemon-authored
+  commands Codex itself invokes) reached the daemon reliably every time —
+  the resident-session/hook architecture is solid. But when the *agent*
+  decided to run `factoryctl task done ...` as its own shell-command tool
+  call (exactly what a composed delivery's instructions ask it to do),
+  Codex's own sandboxed tool execution returned `Operation not permitted
+  (os error 1)` even though the socket's directory is inside
+  `writable_roots`; the task stayed `running` forever, silently, since the
+  agent had no way to tell it failed beyond its own transcript.
+  `sandbox_mode = "danger-full-access"` (this track's documented fallback
+  to try) does not cleanly fix it either in this environment: it removes
+  the sandbox restriction but makes Codex's own built-in `codex_apps` MCP
+  server hang indefinitely at startup instead of failing fast the way it
+  does under `workspace-write` (reproduced twice, once resuming a prior
+  session and once on a brand new agent, so it is not a `--resume`
+  artifact). Shipped default stays `workspace-write` (fails fast and
+  deterministically, and every other real-Codex behavior confirmed sound)
+  rather than a change that trades one hang for another. Needs either a
+  narrower sandbox exception (specifically for connecting to the daemon's
+  own control socket, not a blanket `network_access`/`danger-full-access`
+  toggle) or an upstream Codex fix for `codex_apps`' own timeout behavior;
+  out of this track's scope to chase further.
+
 Resolved since (Track 5E — daemon follow-ups):
 
 - **An operator's own MCP server config stalling a Codex session

@@ -506,23 +506,50 @@ fn wait_for_session_state(client: &Client, agent_id: &str, state: SessionState) 
 }
 
 /// Like [`wait_for_session_state`] for `Idle`, but confirms it *stays*
-/// idle for a short settle window before returning. A single composed
-/// delivery is typed as one multi-line PTY write; the shell fixture reads
-/// it back line by line (its own doc comment), running a full hook cycle
-/// per line -- so it can pass through `idle` transiently between the task
-/// header line (which finishes the task) and a later line (e.g. the
-/// memory-file footer, always present) before truly settling. A precise
-/// fix would need the fixture to tell the daemon it is done with an entire
-/// delivery, not just one line; simplest for now is a test-side settle
-/// check, since only this suite's own timing depends on "idle" meaning
-/// "fully done," not the product's own delivery/ack logic.
+/// idle continuously across a full settle window before returning, not
+/// just at one single later instant. A single composed delivery is typed
+/// as one multi-line PTY write; the shell fixture reads it back line by
+/// line (its own doc comment), running a full hook cycle per line -- so
+/// it can pass through `idle` transiently between the task header line
+/// (which finishes the task) and a later line (e.g. the memory-file
+/// footer, always present) before truly settling. This track's item 10:
+/// a single re-check after a fixed sleep (the original approach) is only
+/// as robust as that one sleep being longer than however long the
+/// remaining lines take to process, which is not a safe assumption on a
+/// loaded machine -- found live, `factoryd_restart_does_not_lose_a_live_session`
+/// flaking with the session observed `Working` immediately after a
+/// restart that followed what this function had just certified as stable
+/// `Idle`. Polling continuously through the whole window and restarting
+/// the wait on any non-idle observation closes that gap: a fixture still
+/// mid-delivery is caught well before the window elapses, not raced
+/// against it. A precise fix would need the fixture to tell the daemon it
+/// is done with an entire delivery, not just one line; this is a
+/// test-side settle check, since only this suite's own timing depends on
+/// "idle" meaning "fully done," not the product's own delivery/ack logic.
+const IDLE_SETTLE_WINDOW: Duration = Duration::from_secs(3);
+const IDLE_SETTLE_POLL: Duration = Duration::from_millis(150);
+
 fn wait_for_stable_idle(client: &Client, agent_id: &str) -> SessionSnapshot {
     loop {
         let idle = wait_for_session_state(client, agent_id, SessionState::Idle);
-        std::thread::sleep(Duration::from_millis(750));
-        if let Some(still) = session_by_agent(client, agent_id) {
-            if still.id == idle.id && still.state == SessionState::Idle {
-                return still;
+        let settle_deadline = Instant::now() + IDLE_SETTLE_WINDOW;
+        let mut stayed_idle = true;
+        while Instant::now() < settle_deadline {
+            std::thread::sleep(IDLE_SETTLE_POLL);
+            match session_by_agent(client, agent_id) {
+                Some(session) if session.id == idle.id && session.state == SessionState::Idle => {}
+                _ => {
+                    stayed_idle = false;
+                    break;
+                }
+            }
+        }
+        if !stayed_idle {
+            continue;
+        }
+        if let Some(final_snapshot) = session_by_agent(client, agent_id) {
+            if final_snapshot.id == idle.id && final_snapshot.state == SessionState::Idle {
+                return final_snapshot;
             }
         }
     }
