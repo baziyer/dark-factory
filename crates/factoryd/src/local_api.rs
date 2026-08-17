@@ -1292,6 +1292,12 @@ async fn handle_request(
                     Ok((agent, vec![event]))
                 })
                 .await?;
+            // Issue #24 finding 4: a resume is itself the operator's retry
+            // decision for an agent the dispatcher may have paused after
+            // repeated session-start-deadline failures, so it gets a clean
+            // backoff/streak slate rather than being immediately eligible
+            // to re-trip the same pause on its very next deadline.
+            execution.resume_backoff(&wake_agent_id);
             execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentResumed { agent })
         }
