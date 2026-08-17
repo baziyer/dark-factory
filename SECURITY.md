@@ -53,9 +53,10 @@ operator from their own agents. Concretely:
   filtered copy of your `~/.codex/config.toml` into a per-agent
   `CODEX_HOME` (with `auth.json` symlinked, never copied); and, in each
   project's own git repository, `git worktree add -b agent/<id>` per agent
-  (a branch and `.git/worktrees/<id>` metadata; removed with the agent). A
-  project whose root is not a git repository has its sessions run directly
-  in that root.
+  (the worktree and its `.git/worktrees/<id>` metadata go when the agent
+  is deleted; the `agent/<id>` branch stays in your repository). A project
+  whose root is not a git repository has its sessions run directly in that
+  root.
 
 ## Out of scope
 
