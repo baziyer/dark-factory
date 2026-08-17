@@ -26,22 +26,19 @@ pub fn locate_on_path(program: &str) -> Option<PathBuf> {
     })
 }
 
-/// The directories [`PROBED_PROGRAMS`] resolve from on this process's `PATH`,
-/// deduplicated, in probe order — what a launchd job's `PATH` must contain
-/// for sessions to find them.
+/// Each of [`PROBED_PROGRAMS`] this process's `PATH` resolves, with the
+/// directory it resolves from — what a launchd job's `PATH` must be able to
+/// find for sessions to run them (see `launchd::merged_path`).
 #[must_use]
-pub fn provider_directories() -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    for program in PROBED_PROGRAMS {
-        if let Some(directory) =
-            locate_on_path(program).and_then(|path| path.parent().map(Path::to_path_buf))
-        {
-            if !directories.contains(&directory) {
-                directories.push(directory);
-            }
-        }
-    }
-    directories
+pub fn provider_directories() -> Vec<(&'static str, PathBuf)> {
+    PROBED_PROGRAMS
+        .iter()
+        .filter_map(|program| {
+            locate_on_path(program)
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .map(|directory| (*program, directory))
+        })
+        .collect()
 }
 
 /// Polls `health` at `socket` until a daemon answers — with `version`

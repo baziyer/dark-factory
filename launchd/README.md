@@ -14,8 +14,8 @@ config, secrets, and plist at mode `0600`.
 launchd jobs do not inherit a login shell's `PATH` -- under `launchd` it is
 just `/usr/bin:/bin:/usr/sbin:/sbin`. `factoryd` has no `--codex`/`--claude`
 flag; it resolves `claude`/`codex` by bare name through the session `PATH`
-it hands each spawned agent, so `__PATH__` below must already include
-whatever directories `claude` and `codex` actually live in on this machine
+it hands each spawned agent, so the `PATH` in `__ENVIRONMENT__` below must
+already include whatever directories `claude` and `codex` actually live in on this machine
 (`~/.local/bin`, `~/.nvm/.../bin`, `/opt/homebrew/bin`, ...) or a
 launchd-managed daemon will never find either provider, even though the
 exact same command works fine from an

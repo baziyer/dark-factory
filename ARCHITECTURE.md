@@ -42,9 +42,12 @@ catalogue.
    single pending-delivery slot per agent keeps the dispatcher's PTY-typed
    path and a hook-reply delivery from ever composing and delivering the
    same task or messages twice. `factoryd`'s own restart never stops a
-   session: `factory-runner` is a detached process tree, and a fresh daemon
-   recovers by reconnecting to its control socket and replaying its
-   retained spool from sequence zero; a session with no live connection at
+   session: `factory-runner` is a detached process tree — spawned as its
+   own process-group leader, and the launchd job abandons its group, so a
+   group-wide signal to the daemon (launchd's `bootout`, a terminal's
+   Ctrl-C) reaches no runner — and a fresh daemon recovers by reconnecting
+   to its control socket and replaying its retained spool from sequence
+   zero; a session with no live connection at
    all, or whose endpoint never becomes reachable again within a bounded
    number of reconnect attempts, is recorded `failed`/`unverifiable` rather
    than left dangling. `factory-runner` deliberately holds its control

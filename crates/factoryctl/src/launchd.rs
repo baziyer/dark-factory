@@ -119,22 +119,32 @@ pub fn read_existing(plist: &Path) -> Result<Option<ExistingJob>, String> {
 }
 
 /// A `PATH` for the job: `existing` (or, when the job had none, launchd's
-/// default plus [`BASE_PATH`]) with every directory in `required` — the
-/// provider CLIs' directories, see [`crate::probes::provider_directories`]
-/// — prepended if it isn't already there. Re-rendering a job therefore
+/// default plus [`BASE_PATH`]) with, for each `(program, directory)` in
+/// `required` — the provider CLIs and where this shell resolves them, see
+/// [`crate::probes::provider_directories`] — `directory` prepended only if
+/// no entry already there resolves `program`. Re-rendering a job therefore
 /// repairs a `PATH` that stopped covering `claude`/`codex` (a new `nvm`
-/// version, say) instead of preserving the breakage.
+/// version, say) without changing which binary a job that still finds
+/// them runs.
 #[must_use]
-pub fn merged_path(existing: Option<&str>, required: &[PathBuf]) -> String {
+pub fn merged_path(existing: Option<&str>, required: &[(&str, PathBuf)]) -> String {
     let mut entries: Vec<PathBuf> = match existing {
         Some(existing) => std::env::split_paths(existing).collect(),
         None => std::env::split_paths(LAUNCHD_DEFAULT_PATH)
             .chain(std::env::split_paths(BASE_PATH))
             .collect(),
     };
-    for (position, directory) in required.iter().enumerate() {
-        if !entries.contains(directory) {
-            entries.insert(position.min(entries.len()), directory.clone());
+    let mut inserted = 0;
+    for (program, directory) in required {
+        let resolvable = entries.iter().any(|entry| {
+            let candidate = entry.join(program);
+            fs::metadata(&candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        });
+        if !resolvable && !entries.contains(directory) {
+            entries.insert(inserted.min(entries.len()), directory.clone());
+            inserted += 1;
         }
     }
     let mut seen: Vec<PathBuf> = Vec::new();
@@ -242,7 +252,7 @@ pub fn apply(
     home: &Path,
     plist: &Path,
     existing: Option<&ExistingJob>,
-    provider_directories: &[PathBuf],
+    provider_directories: &[(&str, PathBuf)],
 ) -> Result<(), String> {
     let mut environment = existing
         .map(|job| job.environment.clone())
@@ -376,20 +386,39 @@ mod tests {
     }
 
     #[test]
-    fn merged_path_prepends_missing_provider_directories_only() {
-        let required = [PathBuf::from("/nvm/bin"), PathBuf::from("/usr/bin")];
+    fn merged_path_prepends_a_directory_only_when_no_entry_resolves_the_program() {
+        let root = tempfile::tempdir().unwrap();
+        let old = root.path().join("old-bin");
+        let new = root.path().join("new-bin");
+        for dir in [&old, &new] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let executable = |dir: &Path, name: &str| {
+            let path = dir.join(name);
+            fs::write(&path, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        executable(&old, "claude");
+        executable(&new, "claude");
+        executable(&new, "codex");
+        let required = [("claude", new.clone()), ("codex", new.clone())];
+        let old_s = old.to_string_lossy().into_owned();
+        let new_s = new.to_string_lossy().into_owned();
+        // The job already resolves `claude` from old-bin: that stays first; only
+        // `codex` (unresolvable) pulls new-bin in, and once, after it.
         assert_eq!(
-            merged_path(Some("/usr/bin:/bin"), &required),
-            "/nvm/bin:/usr/bin:/bin"
+            merged_path(Some(&format!("{old_s}:/usr/bin")), &required),
+            format!("{new_s}:{old_s}:/usr/bin")
         );
+        // Both already resolvable: untouched.
         assert_eq!(
-            merged_path(Some("/nvm/bin:/usr/bin"), &required),
-            "/nvm/bin:/usr/bin"
+            merged_path(Some(&format!("{new_s}:/usr/bin")), &required),
+            format!("{new_s}:/usr/bin")
         );
+        // No PATH at all: launchd's default plus the base, with the provider dir first.
         assert_eq!(
-            merged_path(None, &[PathBuf::from("/x/bin")]),
-            format!("/x/bin:{LAUNCHD_DEFAULT_PATH}:/opt/homebrew/bin:/usr/local/bin"),
-            "no PATH means launchd's default plus the base, deduplicated"
+            merged_path(None, &[("codex", new.clone())]),
+            format!("{new_s}:{LAUNCHD_DEFAULT_PATH}:/opt/homebrew/bin:/usr/local/bin")
         );
     }
 
