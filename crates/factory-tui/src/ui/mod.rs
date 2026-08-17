@@ -58,6 +58,28 @@ pub(super) fn truncate(text: &str, max: usize) -> String {
     }
 }
 
+/// Truncates `text` to at most `max` characters by cutting the middle and inserting an ellipsis,
+/// keeping both the head and the tail. The fix for ids/names that share a long prefix and would
+/// otherwise truncate to the exact same fragment (`first-floor-worker` vs `first-floor-worker-2`,
+/// issue #68) — [`truncate`] alone can't tell those apart since it only ever cuts the end.
+/// Falls back to [`truncate`] when `max` is too small to keep a real head and tail either side of
+/// the ellipsis.
+pub(super) fn truncate_middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_owned();
+    }
+    if max <= 3 {
+        return truncate(text, max);
+    }
+    let keep = max - 1; // one column for the ellipsis itself
+    let head_len = keep / 2;
+    let tail_len = keep - head_len;
+    let head: String = chars[..head_len].iter().collect();
+    let tail: String = chars[chars.len() - tail_len..].iter().collect();
+    format!("{head}\u{2026}{tail}")
+}
+
 /// Pads `text` to exactly `width` columns (truncating first if it's already longer).
 pub(super) fn pad(text: &str, width: usize) -> String {
     let truncated = truncate(text, width);
@@ -116,4 +138,41 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
         .block(block)
         .highlight_symbol("> ")
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_middle_passes_through_text_that_already_fits() {
+        assert_eq!(truncate_middle("short", 10), "short");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail_around_one_ellipsis() {
+        // 10 chars -> 5: keep=4, split 2/2.
+        assert_eq!(truncate_middle("abcdefghij", 5), "ab\u{2026}ij");
+    }
+
+    #[test]
+    fn truncate_middle_falls_back_to_end_truncation_when_too_narrow_for_both_halves() {
+        assert_eq!(truncate_middle("abcdefghij", 3), truncate("abcdefghij", 3));
+    }
+
+    #[test]
+    fn truncate_middle_distinguishes_ids_that_share_a_long_prefix() {
+        // The exact strings from issue #68, at the width that used to collide (WORKSHOP's old
+        // fixed 12-column name field) — `truncate` (end-truncation) makes both "first-floor…";
+        // `truncate_middle` must not.
+        let a = truncate_middle("first-floor-worker", 12);
+        let b = truncate_middle("first-floor-worker-2", 12);
+        assert_ne!(a, b, "{a:?} vs {b:?} are still indistinguishable");
+        // Confirms this width really was the bug: end-truncation alone collapses both to the
+        // same fragment.
+        assert_eq!(
+            truncate("first-floor-worker", 12),
+            truncate("first-floor-worker-2", 12)
+        );
+    }
 }
