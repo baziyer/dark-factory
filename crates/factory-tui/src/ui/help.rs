@@ -270,7 +270,8 @@ const HELP_TEXT: &[&str] = &[
     "g / G      jump to (G: and focus) the next agent needing attention",
     "!          Workshop: toggle attention-only filter",
     "PgUp/PgDn  Focus: scroll terminal scrollback",
-    "Ctrl-]     Terminals/Focus: toggle pane input vs. board control",
+    "i          Terminals: start typing into the focused pane (Focus starts there already)",
+    "Ctrl-]     Terminals/Focus: toggle typing into the pane vs. board control",
     "q          detach (quits the client only — never stops the factory)",
     "?          toggle this help",
 ];

@@ -391,19 +391,19 @@ fn sync_task_detail(board: &mut Board, client: &Client, tx: &mpsc::Sender<NetMsg
     }
 }
 
-/// Which pane currently owns the keyboard: the focused TERMINALS tile, or FOCUS's one pane.
+/// Which pane currently owns the keyboard: the focused TERMINALS tile, or FOCUS's one pane. The
+/// same `Board::terminals_focused_pane` the highlight in `ui::terminals` reads, so the two can
+/// never point at different panes.
 fn forwarding_target(board: &Board) -> Option<SessionId> {
     match board.view {
-        model::View::Terminals => board
-            .focus_target()
-            .or_else(|| board.terminal_targets().into_iter().next()),
+        model::View::Terminals => board.terminals_focused_pane(),
         model::View::Focus => board.focus_target(),
         model::View::Fortress | model::View::Workshop => None,
     }
 }
 
 fn forward_paste_if_applicable(board: &Board, panes: &PaneMap, text: &str) {
-    if !board.pane_forwarding {
+    if board.pane_mode != model::PaneMode::Typing {
         return;
     }
     let Some(session_id) = forwarding_target(board) else {

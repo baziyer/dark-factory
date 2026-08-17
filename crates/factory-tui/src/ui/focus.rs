@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 
 use tui_term::widget::PseudoTerminal;
 
-use crate::model::Board;
+use crate::model::{Board, PaneMode};
 use crate::pane::PaneMap;
 use crate::ui;
 
@@ -34,19 +34,19 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
         crate::pane::PaneKind::Daemon => String::new(),
     };
     let scroll_offset = pane.scroll_offset();
-    let mode_hint = if !board.pane_forwarding {
-        "CONTROL — Ctrl-] back to pane"
+    let mode_hint = if board.pane_mode == PaneMode::Board {
+        "BOARD — Ctrl-] back to pane"
     } else if scroll_offset > 0 {
-        "PANE — PgDn/scroll to return to live"
+        "TYPING — PgDn/scroll to return to live"
     } else {
-        "PANE — Ctrl-] for board control"
+        "TYPING — Ctrl-] for board control"
     };
     let scroll_hint = if scroll_offset > 0 {
         format!("  [scrolled back {scroll_offset}]")
     } else {
         String::new()
     };
-    let color = if board.pane_forwarding {
+    let color = if board.pane_mode == PaneMode::Typing {
         Color::Cyan
     } else {
         Color::Yellow
@@ -80,7 +80,7 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
 
     // Suppress the hardware cursor while scrolled back — showing the *live* cursor position
     // among historical content would be actively misleading (see this module's doc comment).
-    if board.pane_forwarding && scroll_offset == 0 && !screen.hide_cursor() {
+    if board.pane_mode == PaneMode::Typing && scroll_offset == 0 && !screen.hide_cursor() {
         let (row, col) = screen.cursor_position();
         let x = inner.x.saturating_add(col);
         let y = inner.y.saturating_add(row);

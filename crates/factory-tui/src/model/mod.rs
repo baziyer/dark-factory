@@ -36,8 +36,8 @@ use factory_core::{
 pub use announcements::Announcement;
 pub use factory_core::attention::{self, Attention, Rated};
 pub use keymap::{
-    Intent, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState, TASK_MENU_ITEMS,
-    TaskMenuState, View, WorkshopPane,
+    Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
+    TASK_MENU_ITEMS, TaskMenuState, View, WorkshopPane,
 };
 pub use state::AgentState;
 
@@ -154,10 +154,13 @@ pub struct Board {
     pub attention_filter: bool,
 
     pub mode: Mode,
-    /// TERMINALS/FOCUS only: whether keystrokes go to the focused pane (`true`, the default) or
-    /// are interpreted as board `Action`s (`false`), toggled by the spike's `Ctrl-]` prefix —
-    /// Herdr's "exclusive input ownership for a pane" adopted per `REFS-HERDR-REPOMON.md`.
-    pub pane_forwarding: bool,
+    /// TERMINALS/FOCUS only: whether keystrokes are interpreted as board `Action`s (`Board`) or
+    /// go to the focused pane (`Typing`). TERMINALS *enters* in `Board` — Tab/j/k/arrows move
+    /// focus between panes, `i`/Ctrl-] start typing — so navigation never looks dead the moment
+    /// you land there; FOCUS enters in `Typing` (you zoomed in to talk to it), Ctrl-] returning
+    /// to board keys. Herdr's "exclusive input ownership for a pane" adopted per
+    /// `REFS-HERDR-REPOMON.md`, now with an explicit per-view default instead of always-on.
+    pub pane_mode: PaneMode,
 
     pub status: Option<StatusMessage>,
 
@@ -194,7 +197,7 @@ impl Board {
             workshop_focus: WorkshopPane::Tasks,
             attention_filter: false,
             mode: Mode::Normal,
-            pane_forwarding: true,
+            pane_mode: PaneMode::Board,
             status: None,
             caught_up: false,
             quit: false,
@@ -549,6 +552,30 @@ impl Board {
         self.session_id_for_pane(agent)
     }
 
+    /// The single source of truth for which TERMINALS tile is focused: `selected_agent`'s pane,
+    /// falling back to the first tile only when the selected agent has no live pane here. Used
+    /// for both the highlighted border (`ui::terminals`) and the key-forwarding target
+    /// (`main.rs`'s `forwarding_target`) so the two can never point at different panes — the fix
+    /// for zooming in from a selected worker and landing on a different agent's terminal.
+    #[must_use]
+    pub fn terminals_focused_pane(&self) -> Option<SessionId> {
+        self.focus_target()
+            .or_else(|| self.terminal_targets().into_iter().next())
+    }
+
+    /// Whether the current view has a live pane keys could actually be forwarded to right now.
+    /// `PaneMode::Typing` only ever forwards when this is true — an empty TERMINALS/FOCUS screen
+    /// (no live session at all) always leaves every key acting on the board, never silently
+    /// eating it as input for a pane that isn't there.
+    #[must_use]
+    fn has_live_pane(&self) -> bool {
+        match self.view {
+            View::Terminals => self.terminals_focused_pane().is_some(),
+            View::Focus => self.focus_target().is_some(),
+            View::Fortress | View::Workshop => false,
+        }
+    }
+
     /// Which sessions should currently be attached, given `self.view`. FORTRESS/WORKSHOP attach
     /// nothing — "detach without stopping the worker" applies just as much to *leaving* TERMINALS
     /// or FOCUS as it does to quitting the whole client.
@@ -623,11 +650,15 @@ impl Board {
 
     fn normal_help_text(&self) -> String {
         if matches!(self.view, View::Terminals | View::Focus) {
-            if self.pane_forwarding {
-                return "Ctrl-] board control  1-4 views  q detach".to_owned();
+            if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
+                let target = self
+                    .selected_agent
+                    .as_ref()
+                    .map_or_else(|| "pane".to_owned(), std::string::ToString::to_string);
+                return format!("TYPING \u{2192} {target}   Ctrl-] board   1-4 views   q detach");
             }
-            return "CONTROL  1-4 views  Tab/j/k switch pane  Enter/l zoom  Esc/h back  \
-                     Ctrl-] back to pane  ? help"
+            return "BOARD  i type  Tab/j/k switch pane  Enter/l zoom  Esc/h back  \
+                     1-4 views  ? help  q detach"
                 .to_owned();
         }
         if self.view == View::Fortress {

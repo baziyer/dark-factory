@@ -72,6 +72,17 @@ pub enum WorkshopPane {
     Agents,
 }
 
+/// TERMINALS/FOCUS's input mode — see [`Board::pane_mode`]'s doc comment for the per-view
+/// defaults and how to switch between them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneMode {
+    /// Keys are board `Action`s: Tab/j/k/arrows move focus between panes, Enter zooms in.
+    Board,
+    /// Keys go to the focused pane. Only ever *actually* forwarded when a live pane exists — see
+    /// `Board::has_live_pane`.
+    Typing,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Action + keymap
 // ---------------------------------------------------------------------------------------------
@@ -117,8 +128,8 @@ pub enum Action {
 
 /// The one keymap: every key the board recognizes in its base navigation mode, independent of
 /// which view is active (`Board::dispatch` supplies the context). Returns `None` for anything not
-/// bound — callers fall through to whatever else might want the key (a live pane, when
-/// `pane_forwarding` is on, is handled a level up in `Board::handle_normal_key`).
+/// bound — callers fall through to whatever else might want the key (a live pane, while
+/// `pane_mode` is `Typing`, is handled a level up in `Board::handle_normal_key`).
 #[must_use]
 pub fn keymap(key: KeyEvent) -> Option<Action> {
     match key.code {
@@ -279,7 +290,7 @@ pub enum Intent {
     Redraw,
     Quit,
     Send(LocalRequest),
-    /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_forwarding` on);
+    /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
     /// `main.rs` encodes and forwards to whichever pane is currently focused.
     ForwardKey(KeyEvent),
     /// FOCUS only: scroll the focused pane's `vt100` scrollback up (`up: true`) or down.
@@ -327,11 +338,23 @@ impl Board {
     fn handle_normal_key(&mut self, key: KeyEvent) -> Intent {
         if matches!(self.view, View::Terminals | View::Focus) {
             if key == crate::keys::PREFIX_KEY {
-                self.pane_forwarding = !self.pane_forwarding;
+                self.pane_mode = match self.pane_mode {
+                    PaneMode::Typing => PaneMode::Board,
+                    PaneMode::Board => PaneMode::Typing,
+                };
                 return Intent::Redraw;
             }
-            if self.pane_forwarding {
+            // Never forward when there's nothing to forward to — an empty TERMINALS/FOCUS
+            // screen always leaves every key acting on the board, `Typing` or not.
+            if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
                 return Intent::ForwardKey(key);
+            }
+            if self.pane_mode == PaneMode::Board
+                && key.code == KeyCode::Char('i')
+                && self.has_live_pane()
+            {
+                self.pane_mode = PaneMode::Typing;
+                return Intent::Redraw;
             }
         }
         let Some(action) = keymap(key) else {
@@ -391,8 +414,13 @@ impl Board {
 
     fn switch_view(&mut self, view: View) -> Intent {
         self.view = view;
-        if matches!(view, View::Terminals | View::Focus) {
-            self.pane_forwarding = true;
+        // TERMINALS *enters* in Board mode (Tab/j/k/arrows visibly move focus, no invisible
+        // forwarding); FOCUS enters in Typing (you asked for this one pane to talk to). Other
+        // views don't consult `pane_mode` at all, so leaving it as-is there is harmless.
+        match view {
+            View::Terminals => self.pane_mode = PaneMode::Board,
+            View::Focus => self.pane_mode = PaneMode::Typing,
+            View::Fortress | View::Workshop => {}
         }
         Intent::Redraw
     }
@@ -451,7 +479,7 @@ impl Board {
                         .map(|agent| agent.id.clone());
                 }
                 self.view = View::Focus;
-                self.pane_forwarding = true;
+                self.pane_mode = PaneMode::Typing;
                 Intent::Redraw
             }
             View::Focus => Intent::None,
@@ -494,7 +522,7 @@ impl Board {
                 };
                 self.selected_agent = Some(agent_id);
                 self.view = View::Terminals;
-                self.pane_forwarding = true;
+                self.pane_mode = PaneMode::Board;
                 Intent::Redraw
             }
         }
@@ -783,7 +811,7 @@ impl Board {
         self.selected_workshop = None;
         if also_focus {
             self.view = View::Focus;
-            self.pane_forwarding = true;
+            self.pane_mode = PaneMode::Typing;
         }
         Intent::Redraw
     }
@@ -1586,26 +1614,107 @@ mod tests {
 
     // -- TERMINALS / FOCUS -------------------------------------------------------------------
 
+    /// The bug this fixes: entering TERMINALS used to silently turn pane-forwarding on, so
+    /// `Tab`/`j`/`k`/`1`-`4` looked dead (they were being typed into the pane instead). TERMINALS
+    /// must enter in `Board` mode: navigation keys act on the board, and an unbound key is simply
+    /// a no-op rather than being sent to a pane.
     #[test]
-    fn terminals_forwards_keys_by_default() {
+    fn terminals_enters_in_board_mode_not_typing() {
         let mut board = board_in_workshop();
-        board.view = View::Terminals;
+        board.dev_local_pty = true;
+        let intent = board.handle_key(key(KeyCode::Char('3')));
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Terminals);
+        assert_eq!(board.pane_mode, PaneMode::Board);
+
+        let intent = board.handle_key(key(KeyCode::Tab));
+        assert!(matches!(intent, Intent::Redraw));
+        assert!(
+            board.selected_agent.is_some(),
+            "Tab should cycle the pane cursor, not be forwarded"
+        );
+
+        let intent = board.handle_key(key(KeyCode::Char('a')));
+        assert!(
+            matches!(intent, Intent::None),
+            "an unbound key is a no-op in board mode, not pane input"
+        );
+    }
+
+    #[test]
+    fn i_switches_terminals_to_typing_when_a_pane_is_focused() {
+        let mut board = board_in_workshop();
+        board.dev_local_pty = true;
+        board.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(board.pane_mode, PaneMode::Board);
+
+        let intent = board.handle_key(key(KeyCode::Char('i')));
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.pane_mode, PaneMode::Typing);
+
         let intent = board.handle_key(key(KeyCode::Char('a')));
         assert!(matches!(intent, Intent::ForwardKey(_)));
     }
 
     #[test]
-    fn prefix_key_toggles_forwarding_in_terminals() {
+    fn prefix_key_toggles_between_board_and_typing_in_terminals() {
         let mut board = board_in_workshop();
-        board.view = View::Terminals;
-        assert!(board.pane_forwarding);
+        board.dev_local_pty = true;
+        board.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(board.pane_mode, PaneMode::Board);
+
         let intent = board.handle_key(crate::keys::PREFIX_KEY);
         assert!(matches!(intent, Intent::Redraw));
-        assert!(!board.pane_forwarding);
-        // Now in control mode, normal keymap applies.
+        assert_eq!(board.pane_mode, PaneMode::Typing);
+        let intent = board.handle_key(key(KeyCode::Char('a')));
+        assert!(matches!(intent, Intent::ForwardKey(_)));
+
+        let intent = board.handle_key(crate::keys::PREFIX_KEY);
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.pane_mode, PaneMode::Board);
+        // Back in board mode, normal keymap applies.
         let intent = board.handle_key(key(KeyCode::Char('1')));
         assert!(matches!(intent, Intent::Redraw));
         assert_eq!(board.view, View::Fortress);
+    }
+
+    /// No live sessions at all (TERMINALS' empty-state screen): every key, including `i`, must
+    /// keep acting on the board rather than being silently swallowed as input for a pane that
+    /// isn't there — forwarding must be impossible here, not just off by default.
+    #[test]
+    fn terminals_empty_state_never_forwards_keys() {
+        let mut board = board_in_workshop();
+        assert!(board.terminal_targets().is_empty());
+        board.handle_key(key(KeyCode::Char('3')));
+        assert_eq!(board.view, View::Terminals);
+
+        let intent = board.handle_key(key(KeyCode::Char('i')));
+        assert_eq!(
+            board.pane_mode,
+            PaneMode::Board,
+            "no live pane to type into"
+        );
+        assert!(!matches!(intent, Intent::ForwardKey(_)));
+
+        let intent = board.handle_key(key(KeyCode::Char('1')));
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Fortress, "1-4 must still switch views");
+    }
+
+    /// FOCUS is a deliberate single-pane zoom-in — it should be ready to type into immediately,
+    /// unlike TERMINALS' multi-pane board.
+    #[test]
+    fn focus_defaults_to_typing_mode() {
+        let mut board = board_in_workshop();
+        board.dev_local_pty = true;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        let intent = board.handle_key(key(KeyCode::Char('4')));
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Focus);
+        assert_eq!(board.pane_mode, PaneMode::Typing);
+
+        let intent = board.handle_key(key(KeyCode::Char('a')));
+        assert!(matches!(intent, Intent::ForwardKey(_)));
     }
 
     /// Jumping straight to TERMINALS (`3`) and zooming in (`Enter`) without ever cycling a pane
@@ -1617,7 +1726,7 @@ mod tests {
         let mut board = board_in_workshop();
         board.view = View::Terminals;
         board.dev_local_pty = true;
-        board.pane_forwarding = false;
+        board.pane_mode = PaneMode::Board;
         assert_eq!(board.selected_agent, None);
 
         let intent = board.handle_key(key(KeyCode::Enter));
@@ -1640,7 +1749,7 @@ mod tests {
         let mut board = board_in_workshop();
         board.view = View::Terminals;
         board.dev_local_pty = true;
-        board.pane_forwarding = false;
+        board.pane_mode = PaneMode::Board;
         board.selected_agent = Some(AgentId::try_from("someone-else").unwrap());
 
         board.handle_key(key(KeyCode::Enter));
@@ -1648,11 +1757,66 @@ mod tests {
         assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "orch");
     }
 
+    /// The design's second worked example: zooming into TERMINALS from WORKSHOP's agents pane
+    /// with the *second* agent selected must focus that agent's pane, not fall back to the
+    /// first (the orchestrator's) — the "zoom in from a selected worker lands on the
+    /// orchestrator's terminal" bug. `terminals_focused_pane` is the single source of truth both
+    /// the highlight and the key-forwarding target read from, so asserting it here covers both.
+    #[test]
+    fn zoom_from_the_second_agent_focuses_that_agents_terminal() {
+        let mut board = board_in_workshop();
+        board.dev_local_pty = true;
+        board.workshop_focus = WorkshopPane::Agents;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+
+        let intent = board.handle_key(key(KeyCode::Enter));
+
+        assert!(matches!(intent, Intent::Redraw));
+        assert_eq!(board.view, View::Terminals);
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
+        assert_eq!(
+            board.terminals_focused_pane(),
+            Some(SessionId::try_from("dev-alice").unwrap()),
+            "the focused pane must be the agent that was selected, not the first tile"
+        );
+
+        // Tab in TERMINALS' board mode moves the cursor and the focused pane together.
+        board.handle_key(key(KeyCode::Tab));
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "bob");
+        assert_eq!(
+            board.terminals_focused_pane(),
+            Some(SessionId::try_from("dev-bob").unwrap()),
+            "the highlighted pane must follow the cursor Tab just moved"
+        );
+    }
+
+    /// Same bug, reached from FORTRESS: cursor on the second agent, zoom in twice (FORTRESS →
+    /// WORKSHOP → TERMINALS) — the focused terminal must still be that agent's, not the first
+    /// tile's.
+    #[test]
+    fn zoom_from_a_fortress_cursor_on_the_second_agent_focuses_that_agents_terminal() {
+        let mut board = board_with_one_project();
+        board.dev_local_pty = true;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+
+        board.handle_key(key(KeyCode::Enter)); // FORTRESS -> WORKSHOP, agents pane, alice selected
+        assert_eq!(board.view, View::Workshop);
+        assert_eq!(board.workshop_focus, WorkshopPane::Agents);
+
+        board.handle_key(key(KeyCode::Enter)); // WORKSHOP agents -> TERMINALS
+        assert_eq!(board.view, View::Terminals);
+        assert_eq!(board.selected_agent.as_ref().unwrap().as_str(), "alice");
+        assert_eq!(
+            board.terminals_focused_pane(),
+            Some(SessionId::try_from("dev-alice").unwrap())
+        );
+    }
+
     #[test]
     fn focus_scroll_actions_only_fire_in_focus_view() {
         let mut board = board_in_workshop();
         board.view = View::Terminals;
-        board.pane_forwarding = false;
+        board.pane_mode = PaneMode::Board;
         let intent = board.handle_key(key(KeyCode::PageUp));
         assert!(matches!(intent, Intent::None));
 
@@ -1662,12 +1826,12 @@ mod tests {
     }
 
     /// The handoff's "up one level" ladder, one `Esc` at a time: FOCUS → TERMINALS → WORKSHOP →
-    /// FORTRESS. Only reachable while `pane_forwarding` is off (`Ctrl-]`) in TERMINALS/FOCUS —
-    /// with it on (the default), `Esc` goes to the live pane instead, by design.
+    /// FORTRESS. Only reachable while `pane_mode` is `Board` in TERMINALS/FOCUS — while `Typing`
+    /// (FOCUS's default), `Esc` goes to the live pane instead, by design.
     #[test]
     fn esc_steps_up_one_level_at_a_time_through_every_view() {
         let mut board = board_in_workshop();
-        board.pane_forwarding = false;
+        board.pane_mode = PaneMode::Board;
 
         board.view = View::Focus;
         board.handle_key(key(KeyCode::Esc));

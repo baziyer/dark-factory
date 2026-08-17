@@ -65,7 +65,7 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
         return;
     }
 
-    let focused_session = board.focus_target();
+    let focused_session = board.terminals_focused_pane();
 
     for (session_id, rect) in targets.iter().zip(pane_rects(area, targets.len())) {
         render_pane_tile(
