@@ -2518,6 +2518,7 @@ mod deletion_gate_tests {
             guidance_root: directory.to_path_buf(),
             socket_path: directory.join("f.sock"),
             max_active_runs: 1,
+            session_start_deadline: execution::SESSION_START_DEADLINE,
         }
     }
 
