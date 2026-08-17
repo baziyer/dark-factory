@@ -27,6 +27,7 @@ use factory_core::{
 };
 
 use factoryctl::Client;
+use factoryctl::update::{self, UpdateCheck};
 
 const MIN_BACKOFF: Duration = Duration::from_millis(400);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
@@ -95,6 +96,8 @@ pub enum NetMsg {
         task_id: TaskId,
         result: Result<LocalResponse, String>,
     },
+    /// The result of the hourly release-manifest check (`spawn_update_check`).
+    UpdateCheck(UpdateCheck),
 }
 
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
@@ -348,6 +351,21 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
             thread::sleep(delay);
             delay = next_backoff(delay);
         }
+    });
+}
+
+/// Runs one release-manifest check in the background (`factoryctl::update::check`: served from
+/// `$DARK_FACTORY_HOME/update-check.json` while that is under an hour old, otherwise one `curl`
+/// of the manifest) and reports it. `main.rs` calls this at startup and then hourly from the 1 Hz
+/// tick — the check itself is what caps the network cost, so a board restarted every minute
+/// still fetches at most once an hour. No `$DARK_FACTORY_HOME` (no `HOME`) means no check.
+pub fn spawn_update_check(tx: Sender<NetMsg>, now_ms: i64) {
+    let Ok(home) = factory_core::paths::dark_factory_home() else {
+        return;
+    };
+    thread::spawn(move || {
+        let check = update::check(&home, &update::manifest_url(), now_ms, false);
+        let _ = tx.send(NetMsg::UpdateCheck(check));
     });
 }
 

@@ -97,6 +97,9 @@ pub struct Board {
 
     pub connection: Connection,
     pub connection_detail: Option<String>,
+    /// A newer release's version, once the hourly manifest check has found one
+    /// (`net::spawn_update_check`); shown in the status line.
+    pub update_available: Option<String>,
 
     /// Every project on the daemon, in whatever order the last snapshot/event delivered them —
     /// use [`Board::projects_sorted`] for creation order.
@@ -163,6 +166,7 @@ impl Board {
             theme,
             connection: Connection::Connecting,
             connection_detail: None,
+            update_available: None,
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
