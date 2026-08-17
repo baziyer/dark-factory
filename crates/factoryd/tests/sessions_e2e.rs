@@ -1409,6 +1409,119 @@ fn task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_h
     daemon.stop();
 }
 
+// --- (j) PR #50 re-review: a refused DeleteProject must not destroy files
+
+/// Regression test for PR #50's re-review, new blocking finding, one level
+/// up from `local_api.rs`'s `a_refused_delete_agent_leaves_every_file_intact`:
+/// `delete_project_locked` removes the *entire* `projects/<p>/` tree --
+/// every agent's guidance files and git worktree -- before
+/// `store.delete_project`'s own `ProjectHasActiveRun` precondition, which
+/// lives inside that call's transaction, the very last step. So a project
+/// with a live session used to get every one of its files destroyed by a
+/// `DeleteProject` that then reported the project was *not* deleted.
+///
+/// Needs a genuinely live session (not just an in-flight preparation) to
+/// trip `ProjectHasActiveRun`, which the `local_api.rs` harness can't
+/// produce (its `runner_program` deliberately doesn't exist) -- this file
+/// can, via a real `shell` provider session. `delete_project_locked` now
+/// calls `store.check_project_deletable` first, so this refusal costs no
+/// files at all.
+#[test]
+fn a_refused_delete_project_leaves_every_file_intact() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    create_shell_agent(&client, "curie");
+
+    const MARKER: &str = "PLEASE DO NOT LOSE THIS";
+    let profile_updated = client
+        .request(LocalRequest::UpdateAgentProfile {
+            project_id: project_id(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+            // `update_agent_profile` unconditionally overwrites `model`
+            // with whatever is passed (`model = excluded.model`, no
+            // "leave unchanged" case) -- for the `shell` provider, `model`
+            // *is* the command run under `sh -lc` (`create_shell_agent`'s
+            // own doc comment), so `None` here would silently swap
+            // `shell-agent.sh` for a plain interactive shell that never
+            // posts a single hook, hanging every wait below. Preserve the
+            // fixture command `create_shell_agent` set.
+            model: Some(shell_agent_path()),
+            permission_mode: None,
+            instructions: MARKER.into(),
+            memory: String::new(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            profile_updated,
+            ServerFrame::Response {
+                response: LocalResponse::AgentProfileUpdated { .. },
+                ..
+            }
+        ),
+        "{profile_updated:?}"
+    );
+
+    create_task(
+        &client,
+        "task-1",
+        "Trigger a spawn",
+        "keep the session alive",
+    );
+    assign_task(&client, "task-1", "curie");
+    // shell-agent.sh completes the task and settles back to Idle -- still
+    // live (`ended_at_ms IS NULL`), which is exactly what
+    // `ProjectHasActiveRun` checks for.
+    wait_for_session_state(&client, "curie", SessionState::Idle);
+
+    let deleted = client
+        .request(LocalRequest::DeleteProject {
+            project_id: project_id(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            deleted,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: factory_core::local::ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ),
+        "a project with a live session must be refused, not deleted, got {deleted:?}"
+    );
+
+    let fetched = client
+        .request(LocalRequest::GetAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            &fetched,
+            ServerFrame::Response {
+                response: LocalResponse::Agent { agent },
+                ..
+            } if agent.profile.instructions == MARKER
+        ),
+        "instructions.md must survive a refused project delete untouched, got {fetched:?}"
+    );
+
+    let project_dir = factory_core::paths::project_dir(home.path(), &project_id());
+    assert!(
+        project_dir.is_dir(),
+        "the whole projects/<p>/ tree, including every agent's worktree, must survive a \
+         refused delete"
+    );
+
+    cleanup_session(&client, "curie");
+    daemon.stop();
+}
+
 // --- attach helpers ----------------------------------------------------
 
 /// Reads up to `max_frames` frames from an `AttachTerminal` connection in
