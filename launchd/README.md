@@ -12,13 +12,13 @@ secrets, and plist at mode `0600`.
 ## Render and install
 
 launchd jobs do not inherit a login shell's `PATH` -- under `launchd` it is
-just `/usr/bin:/bin:/usr/sbin:/sbin`. `factoryd` resolves `claude`/`codex`
-by bare name through the session `PATH` it hands each spawned agent (see
-the top-level README's "no `--codex`/`--claude` override"), so
-`__PATH__` below must already include whatever directories `claude` and
-`codex` actually live in on this machine (`~/.local/bin`, `~/.nvm/.../bin`,
-`/opt/homebrew/bin`, ...) or a launchd-managed daemon will never find
-either provider, even though the exact same command works fine from an
+just `/usr/bin:/bin:/usr/sbin:/sbin`. `factoryd` has no `--codex`/`--claude`
+flag; it resolves `claude`/`codex` by bare name through the session `PATH`
+it hands each spawned agent, so `__PATH__` below must already include
+whatever directories `claude` and `codex` actually live in on this machine
+(`~/.local/bin`, `~/.nvm/.../bin`, `/opt/homebrew/bin`, ...) or a
+launchd-managed daemon will never find either provider, even though the
+exact same command works fine from an
 interactive shell. Find them first:
 
 ```sh

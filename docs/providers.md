@@ -118,11 +118,11 @@ them into `factory_core::ProviderHookEvent` values (see
      if it does not already exist and parse as valid JSON, since that file
      is real user state Dark Factory does not own.
    - If your CLI has its own default-deny permission/approval prompt for
-     shell commands (Claude's native Bash approval, matched here), and the
+     shell commands (Claude's native Bash approval, matched here), the
      product's posture for it is "the native prompt is the human-in-the-
-     loop gate" (`TRACK5-DESIGN.md` §5 — do not pass a blanket bypass
-     flag), pre-approve *only* the composed delivery's own `factoryctl`
-     calls in whatever narrow, CLI-native allowlist mechanism exists (see
+     loop gate" — do not pass a blanket bypass flag. Instead pre-approve
+     *only* the composed delivery's own `factoryctl` calls in whatever
+     narrow, CLI-native allowlist mechanism exists (see
      `claude_settings_json`'s `permissions.allow`) — otherwise an agent's
      own progress report never gets past its first Bash prompt when nobody
      is attached to answer it.
