@@ -737,6 +737,63 @@ mod provider_tests {
             );
         }
 
+        /// The steady-state path, not the one-time path: `pretrust_worktree`
+        /// runs on every session spawn (`spawn_spec`, above), so re-trusting
+        /// a worktree that already has `hasTrustDialogAccepted: true` sitting
+        /// among its other fields -- not the brand-new-entry case the
+        /// previous test covers -- is what most calls actually hit. Same
+        /// hand-written-fixture reasoning as that test (never built through
+        /// `serde_json::Map`, for the same self-referential-order reason).
+        /// `IndexMap::insert` on a key that is already present updates the
+        /// value in place without moving it, and the value here is already
+        /// `true`, so this is a true no-op end to end: the whole file,
+        /// including this project entry's own key order and every sibling
+        /// field, must come back byte-for-byte identical to the fixture --
+        /// no splice needed, unlike the new-entry case.
+        #[test]
+        fn a_worktree_already_marked_trusted_is_rewritten_byte_for_byte_unchanged() {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join(".claude.json");
+
+            let fixture = [
+                r#"{"#,
+                r#"  "userID": "sentinel-user-id","#,
+                r#"  "numStartups": 12,"#,
+                r#"  "projects": {"#,
+                r#"    "/Users/op/other-repo": {"#,
+                r#"      "lastSessionId": "sentinel-other-session","#,
+                r#"      "hasTrustDialogAccepted": true,"#,
+                r#"      "allowedTools": ["#,
+                r#"        "Bash(git *)","#,
+                r#"        "Read""#,
+                r#"      ]"#,
+                r#"    },"#,
+                r#"    "/Users/op/dark-factory-worktrees/worker-9": {"#,
+                r#"      "lastSessionId": "sentinel-worker-9-session","#,
+                r#"      "hasTrustDialogAccepted": true,"#,
+                r#"      "allowedTools": [],"#,
+                r#"      "mcpServers": null"#,
+                r#"    }"#,
+                r#"  },"#,
+                r#"  "firstStartTime": "2025-01-01T00:00:00.000Z","#,
+                r#"  "cachedChangelog": null"#,
+                r#"}"#,
+            ]
+            .join("\n");
+            std::fs::write(&path, &fixture).unwrap();
+
+            let worktree = PathBuf::from("/Users/op/dark-factory-worktrees/worker-9");
+            pretrust_worktree(&worktree, home.path());
+
+            let actual = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                actual, fixture,
+                "re-trusting a worktree that is already trusted must change \
+                 nothing at all -- not this entry's key order, not any \
+                 sibling field, not a single byte of the file"
+            );
+        }
+
         /// Atomicity (temp file + rename, same directory) and permission
         /// preservation are shared, generic guarantees of
         /// `hooks::write_file_with_mode` and already covered for it
