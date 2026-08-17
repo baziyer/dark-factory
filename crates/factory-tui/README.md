@@ -27,6 +27,12 @@ status line shows `RETRYING` with the connection error and keeps retrying with b
 `FleetStatus` request `factoryctl status` makes; yellow when at the cap) and, at most hourly,
 `update vX available` (see README's "Local service, releases, and updates").
 
+Right after the initial fleet snapshot loads, the board also backfills its announcements log and
+agent activity sparklines with the daemon's last 200 retained events (`EventsAfter`, the same
+request `factoryctl events` uses) before subscribing to the live stream — so a board opened an hour
+into a run shows recent history immediately instead of starting from `announcements (0)` and blank
+sparklines.
+
 This board loads **every** project's agents/tasks/runs/sessions at once (FORTRESS is fleet-wide)
 and *focuses* one project at a time for WORKSHOP/TERMINALS/FOCUS — `--project` sets that initial
 focus; otherwise the project focused last time (saved in `$DARK_FACTORY_HOME/factory-tui.json`),
@@ -39,14 +45,20 @@ FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4) — see the top-le
 [README.md](../../README.md) for the key table. Briefly:
 
 - **FORTRESS** — spatial factory overview: each project is a persistent "workshop" box (positioned
-  deterministically by creation order), agents are glyphs at stations with a route connector to the
-  orchestrator, plus a queued-work/capacity bar. Attention-ranked announcements float on the right.
-  A custom widget writes every glyph directly into the `ratatui::buffer::Buffer` (`fortress.rs`) —
-  no `Canvas`, no `Paragraph` for the map.
+  deterministically by creation order, sized to fit its own name — never truncated into its own
+  border), agents are glyphs at stations with a route connector to the orchestrator, plus a
+  queued-work/capacity bar. Attention-ranked announcements float on the right, backfilled from the
+  daemon's retained event log on connect (see "Running it" above) so a freshly opened board isn't
+  starting from zero. A custom widget writes every glyph directly into the `ratatui::buffer::Buffer`
+  (`fortress.rs`) — no `Canvas`, no `Paragraph` for the map.
 - **WORKSHOP** — one focused project: task queue, agent hierarchy (indented tree with state,
-  activity sparkline, wait-reason), and a detail pane for whichever item is selected. A task's
-  body/result isn't in the fleet snapshot or `TaskChanged` events (those carry only the durable
-  snapshot), so the detail pane lazily fetches it with `GetTask` on first selection.
+  per-minute activity sparkline, wait-reason), and a detail pane for whichever row the cursor is
+  on — always the one thing, never a row the cursor highlights while the detail pane shows
+  something else. Ids and names are middle-truncated (`first-…orker-2`, not two identical
+  `first-floor…`s) and get whatever width is left after the fixed-width columns, not a width
+  hardcoded ahead of them. A task's body/result isn't in the fleet snapshot or `TaskChanged` events
+  (those carry only the durable snapshot), so the detail pane lazily fetches it with `GetTask` on
+  first selection.
 - **TERMINALS** — tiled live PTYs of the focused project's live sessions, 2-4 panes.
 - **FOCUS** — one pane, full-screen, with scrollback (`PgUp`/`PgDn`).
 
@@ -81,11 +93,15 @@ every other piece of code calls them instead of inspecting `SessionState`/`RunSt
   needs-input, each with a `priority()`) used for fortress badges, announcement ordering, `g`/`G`,
   and WORKSHOP's `!` filter.
 
-**Session state wins over run-status inference whenever a session exists** (hooks supersede
-inference — `ARCHITECTURE.md`'s invariant 5). If an agent has no session yet, both functions fall
-back to the pre-sessions run-status mapping and mark the result `inferred: true` — surfaced in
-WORKSHOP's detail pane as a `~` prefix (e.g. `~latest run: Failed`) so an operator can always tell
-observed-from-hooks state apart from guessed-from-run-history state.
+**Session state wins over run-status inference whenever a *live* session exists** (hooks supersede
+inference — `ARCHITECTURE.md`'s invariant 5). Once an agent's session ends, `current_session_id`
+clears and both functions fall back to the pre-sessions run-status mapping, marking the result
+`inferred: true` — surfaced in WORKSHOP's detail pane as a `~` prefix (e.g. `~latest run: Failed`)
+so an operator can always tell observed-from-hooks state apart from guessed-from-run-history state.
+The detail pane itself distinguishes an agent that has *never* had a session (`~no session yet —
+state inferred from run history`) from one whose session merely ended (`no live session — last
+session Stopped 3m ago`, still followed by the run-history basis for the inferred state) — the
+latter is not "no session yet".
 
 ## Architecture
 
