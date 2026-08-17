@@ -125,12 +125,15 @@ and `claude` by bare name through each session's sanitized `PATH` (no
 `--codex`/`--claude` override -- there is nothing daemon-side to configure
 per provider binary; a provider process is resolved the same way an
 operator's own shell would resolve it), stores session runtime state under
-`$DARK_FACTORY_HOME/runs`, and allows four concurrently active sessions.
-Use `--runner`, `--factoryctl`, `--runtime-root`, and `--max-active-runs`
-to set those explicitly; `factoryd` refuses to start if `--runner`/
-`--factoryctl` do not resolve to an executable file (build the workspace
-first: `cargo build --workspace`), and `health` reports both resolved
-paths. A resident
+`$DARK_FACTORY_HOME/runs`, and caps live sessions at four across the whole
+daemon (not per project or agent). Use `--runner`, `--factoryctl`,
+`--runtime-root`, and `--max-active-runs` to set those explicitly; the cap is
+enforced by the dispatcher -- an agent with pending work and no live session
+is simply left unspawned, retried automatically once another session ends,
+while the daemon is already at the limit. `factoryd` refuses to start if
+`--runner`/`--factoryctl` do not resolve to an executable file (build the
+workspace first: `cargo build --workspace`), and `health` reports both
+resolved paths. A resident
 session has no daemon-enforced turn or budget cap (that was a print-mode-only
 concept; resident sessions deliberately omit `--max-turns`/`--max-budget-usd`
 and run until the operator stops them or the provider process exits on its

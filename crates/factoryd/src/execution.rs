@@ -135,6 +135,14 @@ pub struct Config {
     /// (`task done`, `agent message`, ...) can reach the daemon without
     /// relying on `$DARK_FACTORY_HOME` resolution inside the session.
     pub socket_path: PathBuf,
+    /// Daemon-wide cap on live sessions (`ended_at_ms IS NULL`, across every
+    /// project), enforced by [`dispatch_agent`]: an agent with pending work
+    /// and no live session is left alone -- not spawned, not backed off --
+    /// while [`Store::live_session_count`](crate::store::Store::live_session_count)
+    /// is already at or above this value. The 5 second safety tick retries
+    /// automatically once a session ends and count drops, so this is a
+    /// resource bound, not a hard failure (`--max-active-runs`, README's
+    /// "Local control plane").
     pub max_active_runs: usize,
 }
 
@@ -588,7 +596,9 @@ async fn dispatch_agent(
                 // their delay window (no log spam beyond the one already
                 // emitted when the failure that started the delay was
                 // recorded).
-                if backoff.ready(agent_id) {
+                if backoff.ready(agent_id)
+                    && !at_concurrency_limit(config, state, project_id, agent_id).await?
+                {
                     match spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
                         .await
                     {
@@ -637,6 +647,38 @@ async fn has_pending_work(
         })
         .await?;
     Ok(!messages.is_empty())
+}
+
+/// `true` if the daemon is already at `Config::max_active_runs` live
+/// sessions (this track's item 2): the caller must leave `agent_id`
+/// unspawned this pass rather than attempt it. Deliberately does not touch
+/// [`SpawnBackoff`] -- this is not a broken spawn path, just a full resource
+/// pool, and the 5 second safety tick (`reconcile_all`) re-checks every
+/// agent with pending work on its own, so the next session to end frees a
+/// slot within one tick without needing a per-agent wake. Logged at `info`
+/// (not `warn`, matching `dispatch_agent`'s own failure log next to it) so
+/// an operator watching `factoryd`'s log can see *why* an agent with
+/// pending work is not starting, since -- unlike an actual spawn failure --
+/// there is no `starting`/`failed` session row to carry a `wait_reason`
+/// (nothing was ever created).
+async fn at_concurrency_limit(
+    config: &Config,
+    state: &DaemonState,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<bool, Error> {
+    let live_count = state.with_store(|store| store.live_session_count()).await?;
+    if live_count < config.max_active_runs {
+        return Ok(false);
+    }
+    tracing::info!(
+        %project_id,
+        %agent_id,
+        live_count,
+        max_active_runs = config.max_active_runs,
+        "session spawn deferred: max-active-runs reached"
+    );
+    Ok(true)
 }
 
 // --- Session spawn ---------------------------------------------------
@@ -1835,6 +1877,155 @@ mod tests {
         let mut cfg = config(directory.path());
         cfg.max_active_runs = 0;
         assert!(matches!(spawn(cfg, state), Err(Error::InvalidConcurrency)));
+    }
+
+    /// This track's item 2: `max_active_runs` must actually bound live
+    /// sessions, not just be validated non-zero at startup
+    /// (`spawn_rejects_zero_concurrency`, above). Drives `dispatch_agent`
+    /// directly (no real `factory-runner`/PTY needed -- the real E2E spawn
+    /// path is exercised by `sessions_e2e.rs`) against a daemon already at
+    /// its one-session cap: `waiter` has pending work and no live session,
+    /// but must be left entirely alone -- not just failed-and-backed-off --
+    /// while `occupant`'s session is still live. Asserting on the *session
+    /// count* (not just `live_session_for_agent(waiter)`, which would also
+    /// read `None` after a failed spawn attempt, since a failed session's
+    /// `ended_at_ms` is set) is what actually distinguishes "never
+    /// attempted" from "attempted and failed": `config.runner_program`
+    /// deliberately points at a nonexistent binary, so a real spawn
+    /// attempt here would durably fail loudly, not silently succeed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_agent_defers_spawn_at_the_concurrency_limit() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let occupant_id = AgentId::try_from("occupant").unwrap();
+        let waiter_id = AgentId::try_from("waiter").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        for agent_id in [&occupant_id, &waiter_id] {
+            store
+                .create_agent(
+                    crate::store::NewAgent {
+                        id: agent_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    1_000,
+                )
+                .unwrap();
+        }
+        // `occupant` already holds the daemon's one concurrency slot.
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+                    project_id: project_id.clone(),
+                    agent_id: occupant_id.clone(),
+                    provider: Provider::Shell,
+                    provider_session_id: None,
+                    worktree: worktree.clone(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: directory
+                        .path()
+                        .join("runs")
+                        .join("session-1")
+                        .to_string_lossy()
+                        .into_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        // `waiter` has pending work and no live session of its own.
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: TaskId::try_from("task-1").unwrap(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Do the thing".to_owned(),
+                    body: "Do the thing.".to_owned(),
+                    priority: 0,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id,
+                &TaskId::try_from("task-1").unwrap(),
+                Some(&waiter_id),
+                1_000,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let mut cfg = config(directory.path());
+        cfg.max_active_runs = 1;
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let backoff = SpawnBackoff::new();
+
+        assert!(
+            at_concurrency_limit(&cfg, &state, &project_id, &waiter_id)
+                .await
+                .unwrap(),
+            "one live session must already saturate max_active_runs: 1"
+        );
+
+        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &waiter_id)
+            .await
+            .unwrap();
+
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "waiter must not get a session row at all -- not attempted, not failed"
+        );
+        assert_eq!(sessions[0].agent_id, occupant_id);
+
+        // Freeing the slot lets the very next dispatch through -- no
+        // artificial backoff delay left over from being deferred.
+        state
+            .commit_and_publish({
+                let session_id = sessions[0].id.clone();
+                move |store| {
+                    let (snapshot, events) =
+                        store.end_session_with_reason(&session_id, None, None, None, 2_000)?;
+                    Ok((snapshot, events))
+                }
+            })
+            .await
+            .unwrap();
+        assert!(
+            !at_concurrency_limit(&cfg, &state, &project_id, &waiter_id)
+                .await
+                .unwrap(),
+            "ending occupant's session must free the slot immediately"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

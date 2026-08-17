@@ -1298,6 +1298,20 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
+    /// Count of live sessions (`ended_at_ms IS NULL`) across every project
+    /// in this daemon instance -- what `Config::max_active_runs` (this
+    /// track's item 2) bounds. Daemon-wide, not per-project: one `factoryd`
+    /// process is one resource pool (README's "allows four concurrently
+    /// active sessions").
+    pub fn live_session_count(&self) -> Result<usize> {
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE ended_at_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count).unwrap_or(0))
+    }
+
     /// The most recent provider session/thread identity this agent's prior
     /// sessions confirmed, if any -- live or historical, most recent first.
     /// A fresh session spawn passes this to `SpawnContext::resume` (when the
