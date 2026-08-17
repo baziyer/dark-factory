@@ -410,9 +410,27 @@ fn seed_rules_directory(
             });
         }
     };
+    seed_rule_paths(
+        codex_home,
+        &source_rules_dir,
+        entries.map(|entry| entry.map(|entry| entry.path())),
+    )
+}
+
+/// Copies the fallible path stream returned by `read_dir`. Kept separate
+/// only so the iterator's per-entry error case can be tested without
+/// relying on a filesystem race.
+fn seed_rule_paths(
+    codex_home: &Path,
+    source_rules_dir: &Path,
+    paths: impl IntoIterator<Item = io::Result<PathBuf>>,
+) -> Result<(), ProviderError> {
     let rules_dir = codex_home.join("rules");
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
+        let path = path.map_err(|source| ProviderError::Seed {
+            path: source_rules_dir.to_path_buf(),
+            source,
+        })?;
         if path.extension().and_then(|extension| extension.to_str()) != Some("rules") {
             continue;
         }
@@ -1110,6 +1128,38 @@ mod provider_tests {
             "an operator's own forbid rules must be preserved, not dropped"
         );
         assert!(!seeded_rules_dir.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn a_rules_directory_entry_error_fails_instead_of_omitting_a_forbid_rule() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_rules_dir = directory.path().join("source-rules");
+        let forbid_path = source_rules_dir.join("hardening.rules");
+        fs::create_dir_all(&source_rules_dir).unwrap();
+        fs::write(
+            &forbid_path,
+            "forbid_rule(pattern=[\"rm\", \"-rf\", \"/\"])\n",
+        )
+        .unwrap();
+        let codex_home = directory.path().join("codex-home");
+        let entries = [
+            Err(io::Error::other("directory entry disappeared")),
+            Ok(forbid_path),
+        ];
+
+        let error = seed_rule_paths(&codex_home, &source_rules_dir, entries).unwrap_err();
+
+        match error {
+            ProviderError::Seed { path, source } => {
+                assert_eq!(path, source_rules_dir);
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+            }
+            other => panic!("expected a seed error, got {other:?}"),
+        }
+        assert!(
+            !codex_home.join("rules").join("hardening.rules").exists(),
+            "an entry iteration error must abort seeding, never return success with a forbid rule omitted"
+        );
     }
 
     #[test]
