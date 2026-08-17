@@ -122,6 +122,97 @@ fn session_changed_event_updates_the_sessions_map() {
     );
 }
 
+// -- announcement dedup ---------------------------------------------------------------------
+
+/// The bug: the daemon emits one `SessionChanged` per hook, most of which don't change `state`
+/// at all — the first dogfood run saw 65 announcements in a few minutes, almost all "session
+/// working" repeated by hooks that touched the row without moving it. Feeding the same state N
+/// times must announce exactly once.
+#[test]
+fn session_changed_events_with_unchanged_state_announce_only_once() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    for i in 0..5 {
+        b.apply_event(EventEnvelope {
+            protocol_version: 1,
+            sequence: i,
+            occurred_at_ms: i,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-1", "alice", "a", SessionState::Working),
+            },
+        });
+    }
+    assert_eq!(b.announcements.len(), 1);
+}
+
+/// A real transition — the state actually changing — must still announce, even right after a
+/// run of hook-only updates that didn't.
+#[test]
+fn session_changed_event_with_a_new_state_announces_again() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 0,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    });
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    });
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 2,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::WaitingForInput),
+        },
+    });
+    assert_eq!(b.announcements.len(), 2);
+}
+
+/// The very first `SessionChanged` seen for a session (nothing recorded yet, `None`) always
+/// announces — dedup only ever suppresses a *repeat* of a known state.
+#[test]
+fn first_session_changed_event_for_a_session_always_announces() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 0,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Starting),
+        },
+    });
+    assert_eq!(b.announcements.len(), 1);
+}
+
 // -- state/attention precedence ----------------------------------------------------------------
 
 #[test]
