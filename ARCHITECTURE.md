@@ -95,6 +95,22 @@ catalogue.
    terminal bytes; the local control API may still expose or attach live to
    a session's retained `terminal.log` for operator inspection — none of
    this enters public events, webhook snapshots, or tracing.
+   Carve-out: Codex 0.147 does not dispatch its own `SessionStart` hook at
+   TUI startup — only once its first turn begins, which the daemon cannot
+   wait for without deadlocking every fresh Codex session (`docs/
+   providers.md`'s Codex `SessionStart` section has the full evidence). The
+   daemon records a `SessionStart` itself the moment `factory-runner`
+   reports the provider's own tty left canonical mode
+   (`RunnerEvent::TerminalRaw`, from `tcgetattr` on the pty master —
+   `crates/factory-runner/src/lib.rs`'s `supervise_terminal`): a
+   kernel-level fact about the child's own terminal setup, not decoded
+   terminal *output*, so no provider's own bytes are ever read or
+   interpreted to make this decision. The synthesized transition
+   (`Store::synthesize_session_start`) stays durably distinguishable from a
+   real hook (it never sets `last_hook_event`), and Codex's own real,
+   delayed `SessionStart` is still recorded normally whenever it arrives.
+   No other provider gets this treatment; only Codex is known to defer the
+   hook this way.
 6. The local control and event API uses a private Unix socket by default. A
    subscription captures a durable replay head and marks when it has caught up.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a

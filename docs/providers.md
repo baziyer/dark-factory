@@ -230,25 +230,84 @@ session deadlocks forever — Codex waits for a typed prompt to begin the
 turn that would fire `SessionStart`; the daemon waits for `SessionStart`
 before typing anything.
 
-The fix (`synthesize_codex_session_start`, `execution.rs`) is the smallest
-daemon-side handshake that does not read any terminal output: once a
-Codex agent's provider process is confirmed spawned, the daemon calls the
-exact same `record_hook_event(SessionStart)` a real hook POST would make,
-directly against the store, and wakes the dispatcher — automating exactly
-what the operator's manual nudge did live, with the identical proven-safe
-result (every later hook fires normally afterward). Writing to the PTY
-before Codex's own read loop starts is safe regardless of timing: PTY
-input is kernel-buffered, not read-loop-gated. If Codex's own real (once-
-delayed) `SessionStart(source=startup)` arrives later anyway — which it
-does, after the first turn it caused — it is a harmless no-op:
-`record_hook_event`'s `SessionStart` arm only transitions a session still
-`starting`, and `set_provider_session_id` (`local_api.rs`) is already
-idempotent once a provider session id is set. This is Codex-only
-(`agent.snapshot.provider == Provider::Codex`); no other provider needs it.
+**The first version of this fix synthesized `SessionStart` immediately on
+"process spawned" — that is wrong, and not hypothetically.** A freshly
+opened pty pair starts in canonical mode with echo on (`openpty`'s own
+default; neither `factory-runner` nor `portable_pty::spawn_command` ever
+calls `tcsetattr` on the slave), and stays that way until the provider
+itself enables raw mode during its own startup, seconds later. A line
+written into a canonical-mode tty longer than `MAX_CANON` (1024 bytes on
+macOS) is silently discarded past the limit, submitting `\r` included — and
+a composed delivery routinely contains one line longer than that (the task
+body alone is budgeted 16 KiB). Worse, with the child not yet reading, the
+body and its submitting `\r` sit contiguously in the input queue and the
+first `read()` the provider ever does returns both at once — exactly the
+condition that defeats `type_and_await_ack`'s own submit-timing heuristic,
+so the unacknowledged delivery retries by re-typing the *entire* text,
+reachably producing a truncated first copy still sitting in the composer,
+a full second copy appended later, and one `\r` submitting both together
+as one corrupted, duplicated prompt. None of this shows up nudging an
+already-booted, already-raw-mode Codex by hand (which is all the evidence
+above covers) — it is specific to typing at the instant a process is
+merely confirmed spawned, before its tty leaves canonical mode.
 
-No config on the Dark Factory side can fix this — it is Codex's own
-session-lifecycle timing, not a hooks-table or trust-state shape a
-generated `config.toml` controls.
+**The fix instead waits for a kernel-level fact about the child's own
+terminal setup — never terminal *output* — before synthesizing anything.**
+`factory-runner` polls the pty master's line discipline (`MasterPty::
+get_termios`, `crates/factory-runner/src/lib.rs`'s `supervise_terminal`,
+via a dedicated thread sharing the master through a `Mutex` rather than
+`unsafe` fd tricks — this workspace forbids `unsafe_code`) every 100 ms for
+up to 30 s, and reports it once, as a durable, replayable lifecycle event —
+`RunnerEvent::TerminalRaw`, additive to `RUNNER_PROTOCOL_VERSION` 1 (see
+`docs/development/WORKFLOW.md`'s "runner control protocol must stay
+backward compatible within a major version": an older reader that does not
+know this variant fails to parse only the one frame carrying it, same as
+any other additive `RunnerEvent`, not the connection or the daemon) —
+exactly like `Started`. `wait_for_runner_exit`/`consume_until_exit`
+(`execution.rs`) watch the same subscription they already hold open for
+`Exited`, and the moment `RunnerEvent::TerminalRaw` arrives for a Codex
+session (`should_synthesize_session_start`, gated on
+`provider == Provider::Codex` at each caller's own spawn or recovery site —
+never for Claude/`shell`), call `synthesize_codex_session_start`, which
+makes the exact same `starting -> idle` transition a real hook would
+(`Store::synthesize_session_start`) directly against the store, and wakes
+the dispatcher — automating exactly what the operator's manual nudge did
+live, with the identical proven-safe result (every later hook fires
+normally afterward), now gated on the pty genuinely being ready to receive
+input rather than a guess about timing. If Codex's own real (once-delayed)
+`SessionStart(source=startup)` arrives later anyway — which it does, after
+the first turn it caused — it is a harmless no-op: `record_hook_event`'s
+`SessionStart` arm only transitions a session still `starting`, and
+`set_provider_session_id` (`local_api.rs`) is already idempotent once a
+provider session id is set.
+
+**The synthesized transition stays durably distinguishable from a real
+one.** `Store::synthesize_session_start` deliberately never touches
+`last_hook_event`/`last_hook_at_ms`, unlike `record_hook_event` — leaving
+them at whatever they already were (`None`, for a session no hook has ever
+reached) means `state = idle` with `last_hook_event IS NULL` can only
+happen via synthesis, never a genuine hook POST, so `session list`/`agent
+status` never claim a hook fired that never did. No schema or wire change
+was needed for this.
+
+**Recovery** (a daemon restart while a Codex session is still `starting`)
+needs no separate mechanism: `RunnerClient::subscribe` is always a
+replay-plus-live stream from sequence zero, so a recovered session's fresh
+subscription (`consume_until_exit`) sees `RunnerEvent::TerminalRaw` again
+on replay if the runner already logged it before the restart — "the runner
+re-reports on subscribe" falls out of the existing durable-spool design for
+free, no new request type needed. Synthesis is idempotent
+(`Store::synthesize_session_start`'s own doc comment), so seeing the event
+again on every reconnect attempt is harmless.
+
+If a Codex session's tty never leaves canonical mode within the poll
+window, nothing is synthesized, and the session's own deadline (a separate
+change, tracked independently) is the honest failure mode — not a loop
+that keeps guessing.
+
+No config on the Dark Factory side can fix Codex's own deferred
+`SessionStart` dispatch — it is Codex's own session-lifecycle timing, not a
+hooks-table or trust-state shape a generated `config.toml` controls.
 
 ## Codex: unattended approvals — `approval_policy`, network access, and a pre-seeded `factoryctl` rule
 
@@ -280,17 +339,20 @@ gates were involved, and both had to change:
   *asks* before running a sandboxed or escalation-requiring command, not
   what the sandbox itself permits — flipping it to `never` removes an
   interactive question nobody is there to answer, it does not widen what a
-  session can do. `SECURITY.md`'s own boundary already says as much: "Its
-  security boundary is the operating-system user it runs as; it does not
-  try to protect the operator from their own agents. ... An agent's own
-  `permission_mode` widens or narrows that." One consequence is worth
-  knowing: under `never`, Codex cannot *ask* to escalate a command out of
-  the sandbox at all (confirmed in the 0.147 binary: an internal check
-  refuses "escalated permissions if the approval policy is [never]") — so
-  anything that needs to reach outside `workspace-write`'s own limits must
-  already be granted directly in the sandbox itself, which is exactly what
-  the next point does for the one thing every agent needs past the
-  sandbox's previous default.
+  session can do by itself. `SECURITY.md`'s own boundary already says as
+  much: "Its security boundary is the operating-system user it runs as; it
+  does not try to protect the operator from their own agents. ... An
+  agent's own `permission_mode` widens or narrows that." One consequence is
+  worth knowing precisely: under `never`, Codex cannot *ask* to escalate a
+  command out of the sandbox at all (confirmed in the 0.147 binary: an
+  internal check refuses "escalated permissions if the approval policy is
+  [never]") — but Codex's own exec-policy checks (built-in denials, and any
+  `forbid_rule` an operator's own `rules/*.rules` carries forward, see
+  below) are unaffected by `approval_policy` either way; only the `allow`
+  side is ever gated by it. Anything that needs to reach outside
+  `workspace-write`'s own limits must already be granted directly in the
+  sandbox itself, which is exactly what the next point does for the one
+  thing every agent needs past the sandbox's previous default.
 - **`network_access` is now `true`** in `[sandbox_workspace_write]`
   (previously `false`). Confirmed live that `false` denies even a *local*
   Unix-socket connect — seatbelt has no "just localhost" exception — which
@@ -298,26 +360,49 @@ gates were involved, and both had to change:
   orchestrator's own everyday `factoryctl agent add`/`task add`/`task
   assign`/`session list` calls (only `task done`/`task blocked`/`agent
   message` have the outbox fallback below; nothing else does). This is a
-  real widening — general outbound network access, not just the daemon's
-  own socket — accepted under `SECURITY.md`'s documented threat model, not
-  a gap in it. The alternative tried and rejected was a provider-wide
-  `danger-full-access` bypass instead of a narrower `network_access` flip:
-  it traded this hang for a worse one, since `codex_apps`'s own built-in
-  MCP server hangs indefinitely at startup under it.
-- **A `factoryctl` prefix rule is now pre-seeded.** `CodexProvider` writes
-  `CODEX_HOME/rules/default.rules` once, at first seed (never overwritten
-  on a later spawn, matching `config.toml`'s own seed-once contract — an
-  operator's or Codex's own later additions to the file are preserved):
+  real widening — reads are already unrestricted under `workspace-write`,
+  so `network_access = true` means a Codex session can read anything the
+  operator's own user can read and send it anywhere on the internet, with
+  no prompt at any point in the session — accepted under `SECURITY.md`'s
+  documented threat model, not a gap in it. The alternative tried and
+  rejected was a provider-wide `danger-full-access` bypass instead of a
+  narrower `network_access` flip: it traded this hang for a worse one,
+  since `codex_apps`'s own built-in MCP server hangs indefinitely at
+  startup under it.
+- **A `factoryctl` prefix rule is pre-seeded and kept present.**
+  `CodexProvider` ensures `CODEX_HOME/rules/default.rules` contains
   ```
   prefix_rule(pattern=["factoryctl"], decision="allow")
   ```
   the exact shape (confirmed against a real dogfood agent's own
   operator-approved `rules/default.rules`) Codex itself writes once an
-  operator chooses "don't ask again" by hand. Seeding it up front means no
-  agent ever has to hit that prompt once before reaching the same state —
-  and it keeps `factoryctl` working unattended even for an agent an
-  operator has explicitly overridden back to `approval_policy = "on-
-  request"`, which does still consult rules.
+  operator chooses "don't ask again" by hand. Unlike `config.toml`'s
+  one-time seed, this is checked and, if missing, appended on *every*
+  spawn (`ensure_factoryctl_rule_present`) — not just when the file does
+  not exist yet: a real dogfood agent already had a `rules/default.rules`
+  from Codex approving some other command, with no `factoryctl` rule in
+  it, and a seed-once-if-missing check would never have reached it. **This
+  rule is inert under the shipped default.** `approval_policy = "never"`
+  never consults rules at all, `allow` or `forbid`, so this line does
+  nothing until an operator overrides an agent to `on-request` — at which
+  point it pre-approves **unsandboxed** execution of any command whose
+  parsed prefix is `factoryctl`, every subcommand (including `factoryctl
+  update`/`factoryctl init`), not just the task/agent verbs a session's own
+  delivery composes (`SECURITY.md` states this precisely; `prefix_rule` is
+  documented in the 0.147 binary's own strings as valid "only with
+  `sandbox_permissions: \"require_escalated\"`"). It is seeded anyway so an
+  operator who does override one agent does not also have to rediscover
+  and re-approve `factoryctl` by hand.
+
+  Separately, and unlike `config.toml`'s `mcp_servers`/`projects`/`hooks`
+  tables (deliberately dropped, above): every `source_home/rules/*.rules`
+  file an operator already has — including their own `forbid_rule`s — is
+  now copied into a fresh agent's seeded home once, at first seed
+  (`seed_rules_directory`, the same one-time-per-file contract as
+  `config.toml`). Before this, `rules/` was never read from the source
+  home at all, so an operator who had hardened their own `~/.codex` with
+  approval or `forbid` rules lost every one of them, silently, in every
+  factory agent.
 
 ## Sandboxed providers: the outbox
 
@@ -328,20 +413,29 @@ own tool calls. But an agent's *own* `factoryctl task done`/`task
 blocked`/`agent message` call — the one a composed delivery's instructions
 ask it to run once it finishes its work — is just another shell-command
 tool call as far as the provider is concerned, and can be sandboxed right
-along with everything else. Confirmed on one real Codex session
-(`workspace-write`, ROADMAP.md's now-resolved unresolved decision): the
-Unix-socket connect to the daemon's control socket failed with `Operation
-not permitted (os error 1)` even though the socket's own directory is
-inside `writable_roots` — the task stayed `running` forever, silently,
-since the agent's own transcript was the only place the failure showed up.
+along with everything else. Confirmed on one real Codex session under the
+`network_access = false` this provider used to ship (see the section
+above for why it is now `true`): the Unix-socket connect to the daemon's
+control socket failed with `Operation not permitted (os error 1)` even
+though the socket's own directory is inside `writable_roots` — seatbelt
+has no "just localhost" exception for a Unix-domain connect, so
+`workspace-write`'s network restriction reached the daemon's own socket
+too — and the task stayed `running` forever, silently, since the agent's
+own transcript was the only place the failure showed up.
 
-Rather than chase a narrower sandbox exception (or a provider-specific
-`danger-full-access`-style bypass — tried, and traded one hang for a worse
-one: Codex's own built-in `codex_apps` MCP server hangs indefinitely at
-startup under it, see ROADMAP.md), Dark Factory borrows Munder Difflin's
-file-based agent outbox: an agent writes its intended mutation as a file in
-its own directory, and the harness carries it the rest of the way.
-Concretely:
+Rather than chase a narrower sandbox exception at the time (or a
+provider-specific `danger-full-access`-style bypass — tried, and traded
+one hang for a worse one: Codex's own built-in `codex_apps` MCP server
+hangs indefinitely at startup under it), Dark Factory borrowed Munder
+Difflin's file-based agent outbox: an agent writes its intended mutation as
+a file in its own directory, and the harness carries it the rest of the
+way. `network_access = true` (above) has since made the daemon's socket
+directly reachable from a Codex session, so this fallback is no longer the
+*only* way `task done`/`task blocked`/`agent message` reach the daemon —
+but it stays as a belt-and-braces path for any other reason the socket
+might be briefly unreachable (the daemon restarting mid-session, for
+instance), and nothing about wiring a new provider changes: implement it
+the same way regardless. Concretely:
 
 - Every session's environment includes `DARK_FACTORY_AGENT_DIR` (this
   agent's guidance directory, `factory_core::paths::agent_dir` — already

@@ -204,14 +204,25 @@ worktree came from the daemon itself, never from an untrusted source.
 prepended to `PATH`) and pre-approved as a Bash command prefix in Claude's
 generated settings, so an agent's own progress report never stalls on a
 permission prompt nobody is there to answer. Codex agents get the
-equivalent treatment: `approval_policy = "never"` (an operator can override
-it per agent) plus a pre-seeded `CODEX_HOME/rules/default.rules` prefix
-rule for `factoryctl`, and `network_access = true` in the sandbox so the
+equivalent treatment: `approval_policy = "never"` by default (an operator
+can override it per agent, in which case a pre-seeded `CODEX_HOME/rules/
+default.rules` prefix rule keeps `factoryctl` itself unattended — inert,
+by design, under the shipped `never` default, where nothing is ever asked
+in the first place), and `network_access = true` in the sandbox so the
 daemon's own control socket (and a worker's `git push`/`gh pr create`) are
 actually reachable, not just unblocked from asking. A file-based outbox
 (drained by the next hook) is still the fallback for an agent's own
 `factoryctl task done`/`task blocked`/`agent message` call if the daemon is
-ever unreachable for some other reason. Codex agents seed their
+ever unreachable for some other reason.
+
+A Codex session also reaches `idle` and starts receiving work without ever
+seeing its own `SessionStart` hook: Codex 0.147 does not dispatch it until
+a turn is already underway, so the daemon records the transition itself
+the moment `factory-runner` reports the provider's pty left canonical
+mode — a real, once-delayed `SessionStart` from Codex is still recorded
+normally whenever it eventually arrives. See `docs/providers.md` and
+`ARCHITECTURE.md` invariant 5's carve-out for the full evidence and
+mechanism. Codex agents seed their
 per-agent `CODEX_HOME` from the Codex home the daemon's environment names
 (`$CODEX_HOME`, else your own `~/.codex`) — so a factory can run on a
 different Codex account than your shell: `CODEX_HOME=~/.codex-dogfood
