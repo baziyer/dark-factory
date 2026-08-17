@@ -63,6 +63,11 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// How long PTY-typed delivery waits for a matching `UserPromptSubmit` hook
 /// before retrying once (TRACK5-DESIGN.md §3/A3).
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Gap between a composed delivery's text and its submitting `\r`, sent as
+/// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
+/// has the why: real Claude Code's paste-vs-keystroke heuristic otherwise
+/// absorbs a `\r` inside the same burst as just another newline).
+const SUBMIT_DELAY: Duration = Duration::from_millis(80);
 /// Safety-net reconciliation sweep; a reconciler, not the source of truth
 /// (TRACK5-WIRE.md) -- event-driven wakes are expected to beat this in the
 /// common case.
@@ -892,11 +897,24 @@ async fn deliver_pending(
     Ok(())
 }
 
-/// Types `text` plus a trailing `\r` into `session_id`'s PTY, waiting up to
-/// [`ACK_TIMEOUT`] for a `UserPromptSubmit` hook to confirm receipt;
-/// retries once on timeout. Subscribing to the daemon's event stream
-/// *before* writing (not after) avoids missing a hook that fires between
-/// the write and the subscribe call.
+/// Types `text` into `session_id`'s PTY, then submits it with a trailing
+/// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for a
+/// `UserPromptSubmit` hook to confirm receipt; retries once on timeout.
+/// Subscribing to the daemon's event stream *before* writing (not after)
+/// avoids missing a hook that fires between the write and the subscribe
+/// call.
+///
+/// The text and its submitting `\r` are deliberately two separate
+/// `TerminalInput` writes, not one buffer ending in `\r` (found manually
+/// against real Claude Code -- TRACK5C-BRIEF.md step 7's manual check,
+/// not a hypothetical): a multi-line composed delivery arrives at Claude
+/// Code's own input box as a burst; its paste-vs-keystroke heuristic reads
+/// a `\r` inside that same burst as just another inserted newline, not a
+/// submission, leaving the whole delivery sitting typed-but-unsent (the
+/// session durably parks at `waiting_for_input`/`delivery unacknowledged`,
+/// this function's ack wait always losing the race). A short pause after
+/// the text lets that burst visibly end before `\r` arrives on its own,
+/// which is what actually submits it.
 ///
 /// Deliberate simplification of TRACK5-DESIGN.md/A3's "bounded prefix
 /// compare" of the acknowledged prompt against what was typed: the daemon
@@ -914,13 +932,18 @@ async fn type_and_await_ack(
     session_id: &SessionId,
     text: &str,
 ) -> bool {
-    let encoded = encode_terminal_bytes(format!("{text}\r").as_bytes());
+    let body = encode_terminal_bytes(text.as_bytes());
+    let submit = encode_terminal_bytes(b"\r");
     for _attempt in 0..2 {
         let mut events = state.subscribe();
         let Ok(write_started_at_ms) = now_ms() else {
             return false;
         };
-        if client.terminal_input(encoded.clone()).await.is_err() {
+        if client.terminal_input(body.clone()).await.is_err() {
+            continue;
+        }
+        sleep_until(Instant::now() + SUBMIT_DELAY).await;
+        if client.terminal_input(submit.clone()).await.is_err() {
             continue;
         }
         if wait_for_ack(&mut events, session_id, write_started_at_ms, ACK_TIMEOUT).await {
