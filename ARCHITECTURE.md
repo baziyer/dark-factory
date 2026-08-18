@@ -33,7 +33,10 @@ catalogue.
    provider's only way to reach `factoryctl` and identify itself), and
    creates a private socket and
    bounded, retained `terminal.log` before spawning one process group under
-   the PTY. A `starting` session row exists before the spawn is even
+   the PTY. The runner does not publish its terminal `Exited` event until
+   that owned group is empty, including after hard-stop escalation, so the
+   session remains the durable owner until provider tools are gone. A
+   `starting` session row exists before the spawn is even
    attempted, so a failure is always durably visible (`session list`/the
    TUI, an announcement, the error as `wait_reason`); a persistently broken
    spawn path retries with exponential per-agent backoff (5s doubling to a

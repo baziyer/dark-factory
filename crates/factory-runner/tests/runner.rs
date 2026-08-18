@@ -950,6 +950,60 @@ fn stop_is_idempotent_and_terminates_the_owned_process_group() {
     runner.wait_for_clean_exit();
 }
 
+/// A provider tool can outlive its immediate shell, and that tool can have a
+/// still deeper child of its own. The stop path must not publish `Exited`
+/// between the provider leader's death and the group's final disappearance:
+/// doing so would let the daemon clear the session's ownership while these
+/// exact processes were still running in the agent worktree.
+#[test]
+fn forced_stop_reaps_nested_child_and_grandchild_before_terminal_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let child_marker = directory.path().join("child.pid");
+    let grandchild_marker = directory.path().join("grandchild.pid");
+    let runner = RunningRunner::spawn_program(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "trap '' TERM; /bin/sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; trap \"\" TERM; while :; do sleep 1; done' sh \"$2\" & echo $! > \"$1\"; while :; do sleep 1; done",
+            "sh",
+            child_marker.to_str().unwrap(),
+            grandchild_marker.to_str().unwrap(),
+        ],
+    );
+    let child_pid = wait_for_pid_file(&child_marker);
+    let grandchild_pid = wait_for_pid_file(&grandchild_marker);
+
+    assert_command_ack(
+        request(
+            &runner,
+            INSTANCE_ID,
+            RunnerRequest::Stop {
+                command_id: "stop-nested".into(),
+                grace_ms: 0,
+            },
+        ),
+        "stop-nested",
+    );
+    runner.wait_for_terminal_spool();
+    wait_for_process_exit(child_pid);
+    wait_for_process_exit(grandchild_pid);
+
+    let frames = subscribe_through_terminal(&runner, 0);
+    assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
+        event,
+        RunnerEvent::Exited {
+            exit_code: None,
+            signal: Some(15 | 9),
+        }
+    )));
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "stopped-nested-persisted"),
+        "stopped-nested-persisted",
+    );
+    runner.wait_for_clean_exit();
+}
+
 /// The leader here exits entirely on its own — no `Stop` is ever sent — so
 /// the group cleanup reaches this descendant with `DEFAULT_GROUP_GRACE`
 /// (2s), not the shorter `GROUP_CLEANUP_GRACE`: this straggler's TERM is its
@@ -1030,6 +1084,36 @@ fn runner_sigterm_reaps_the_group_and_preserves_unacknowledged_spool() {
             )
         })
     }));
+}
+
+/// The second production leak shape is an interrupted agent/tool turn: the
+/// runner receives its own shutdown signal while a nested tool tree is still
+/// alive. The runner must terminate that same owned group before it exits,
+/// without broad process-name signalling.
+#[test]
+fn runner_interrupt_reaps_nested_child_and_grandchild() {
+    let directory = tempfile::tempdir().unwrap();
+    let child_marker = directory.path().join("interrupt-child.pid");
+    let grandchild_marker = directory.path().join("interrupt-grandchild.pid");
+    let mut runner = RunningRunner::spawn_program(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "trap '' TERM; /bin/sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; trap \"\" TERM; while :; do sleep 1; done' sh \"$2\" & echo $! > \"$1\"; while :; do sleep 1; done",
+            "sh",
+            child_marker.to_str().unwrap(),
+            grandchild_marker.to_str().unwrap(),
+        ],
+    );
+    let child_pid = wait_for_pid_file(&child_marker);
+    let grandchild_pid = wait_for_pid_file(&grandchild_marker);
+    let runner_pid = Pid::from_raw(i32::try_from(runner.runner_pid()).unwrap()).unwrap();
+    kill_process(runner_pid, Signal::TERM).unwrap();
+
+    runner.wait_for_terminal_spool();
+    wait_for_process_exit(child_pid);
+    wait_for_process_exit(grandchild_pid);
+    runner.wait_for_successful_exit();
 }
 
 #[test]
@@ -1220,6 +1304,10 @@ fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
 
     let occupied = directory.path().join("occupied");
     fs::create_dir(&occupied).unwrap();
+    // Keep this fixture a non-private preexisting path even on hosts whose
+    // umask would otherwise make tempfile children mode 0700 (which the
+    // daemon legitimately stages and the runner adopts).
+    fs::set_permissions(&occupied, fs::Permissions::from_mode(0o755)).unwrap();
     let sentinel = occupied.join("sentinel");
     fs::write(&sentinel, b"preserve").unwrap();
     let status = runner_command(
@@ -1237,6 +1325,7 @@ fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
 
     let target = directory.path().join("target");
     fs::create_dir(&target).unwrap();
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     let linked = directory.path().join("linked");
     std::os::unix::fs::symlink(&target, &linked).unwrap();
     let status = runner_command(

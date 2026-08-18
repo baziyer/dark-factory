@@ -53,6 +53,11 @@ const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
 /// its own, with no `Stop`/shutdown ever requested.
 const DEFAULT_GROUP_GRACE: Duration = Duration::from_secs(2);
 const POST_KILL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// After the hard group kill, do not publish `Exited` until the kernel has
+/// removed every member of the owned group. This is deliberately bounded so
+/// a broken process table cannot wedge the runner forever; the error path
+/// leaves no terminal event for the daemon to mistake for a clean stop.
+const GROUP_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Grace the group cleanup (the pass that reaps anything still holding the
 /// process group after the leader itself has already exited) gives a
 /// straggler *only when a `Stop` or runner shutdown was actually requested*
@@ -2126,7 +2131,7 @@ async fn reap_group_stragglers(
         tokio::select! {
             () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
                 signal_process_group(pid, Signal::KILL)?;
-                return Ok(());
+                return wait_for_group_empty(pid).await;
             }
             () = sleep(GROUP_POLL_INTERVAL) => {
                 if !process_group_exists(pid)? {
@@ -2145,6 +2150,29 @@ async fn reap_group_stragglers(
                 *runner_signalled = true;
             }
         }
+    }
+}
+
+/// Waits until a group that was hard-killed is no longer visible to the
+/// kernel. Sending `SIGKILL` is asynchronous: returning immediately would let
+/// the runner append `Exited` while a provider tool is still present, allowing
+/// the daemon to clear the session's ownership and an operator to delete its
+/// worktree underneath that tool.
+async fn wait_for_group_empty(pid: Pid) -> Result<(), Error> {
+    match timeout(GROUP_KILL_REAP_TIMEOUT, async {
+        loop {
+            if !process_group_exists(pid)? {
+                return Ok(());
+            }
+            sleep(GROUP_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::Task(
+            "owned process group remained after SIGKILL".into(),
+        )),
     }
 }
 

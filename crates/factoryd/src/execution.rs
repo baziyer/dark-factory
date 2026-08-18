@@ -29,10 +29,7 @@
 use std::{
     collections::HashMap,
     fs, io,
-    os::unix::{
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-        process::ExitStatusExt,
-    },
+    os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
@@ -1725,12 +1722,31 @@ async fn supervise_child(
     )
     .await;
     let wait_status = child.wait().await;
-    let (exit_code, exit_signal) = match event_exit {
-        Some(status) => status,
-        None => match wait_status {
-            Ok(status) => (status.code(), status.signal()),
-            Err(_) => (None, None),
-        },
+    let Some((exit_code, exit_signal)) = event_exit else {
+        let status = wait_status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|error| format!("runner wait failed: {error}"));
+        let reason =
+            format!("provider cleanup was not confirmed; runner ended without Exited ({status})");
+        let session_id_for_update = session_id.clone();
+        let Ok(failed_at_ms) = now_ms() else {
+            tracing::error!(
+                %session_id,
+                "could not timestamp provider cleanup failure"
+            );
+            return;
+        };
+        let _ = state
+            .commit_and_publish(move |store| {
+                let (snapshot, event) = store.mark_session_cleanup_failed(
+                    &session_id_for_update,
+                    reason,
+                    failed_at_ms,
+                )?;
+                Ok((snapshot, vec![event]))
+            })
+            .await;
+        return;
     };
     end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
 }

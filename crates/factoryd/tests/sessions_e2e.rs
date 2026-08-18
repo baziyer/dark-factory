@@ -84,6 +84,11 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryd"));
         command
             .env("DARK_FACTORY_HOME", home)
+            // The review worker environment carries the operator's live
+            // DARK_FACTORY_SOCKET; an explicit fixture socket is required
+            // so these tests can never claim or touch that install.
+            .arg("--socket")
+            .arg(&socket)
             .arg("--runner")
             .arg(runner)
             .arg("--factoryctl")
