@@ -49,6 +49,9 @@ pub(super) fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &m
     if area.width == 0 || area.height == 0 {
         return;
     }
+    const BUILDING_WIDTH: u16 = 10;
+    const AGENT_START: u16 = 11;
+    const AGENT_WIDTH: u16 = 7;
     let selected = Modifier::REVERSED | Modifier::BOLD;
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -72,13 +75,15 @@ pub(super) fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         ])),
         area,
     );
-    hits.add(
-        Rect::new(area.x, area.y, 10.min(area.width), 1),
-        Target::View(View::Building),
-    );
-    if area.width > 11 {
+    if area.width >= BUILDING_WIDTH {
         hits.add(
-            Rect::new(area.x + 11, area.y, 7.min(area.width - 11), 1),
+            Rect::new(area.x, area.y, BUILDING_WIDTH, 1),
+            Target::View(View::Building),
+        );
+    }
+    if area.width >= AGENT_START + AGENT_WIDTH {
+        hits.add(
+            Rect::new(area.x + AGENT_START, area.y, AGENT_WIDTH, 1),
             Target::View(View::Agent),
         );
     }
@@ -297,6 +302,50 @@ mod tests {
 
         let empty = render(&Board::new(false, 0, crate::theme::PLAIN), 120, 24);
         assert_eq!(empty.target_at(1, 2), None);
+    }
+
+    #[test]
+    fn footer_tabs_are_clickable_only_when_their_complete_labels_fit() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+
+        let below_building = render(&board, 9, 1);
+        assert_eq!(below_building.target_at(0, 0), None);
+        assert_eq!(below_building.target_at(8, 0), None);
+
+        let building = render(&board, 10, 1);
+        assert_eq!(building.target_at(0, 0), Some(Target::View(View::Building)));
+        assert_eq!(building.target_at(9, 0), Some(Target::View(View::Building)));
+
+        let below_agent = render(&board, 17, 1);
+        assert_eq!(
+            below_agent.target_at(9, 0),
+            Some(Target::View(View::Building))
+        );
+        assert_eq!(below_agent.target_at(11, 0), None);
+        assert_eq!(below_agent.target_at(16, 0), None);
+        assert_eq!(
+            route(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 11,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &below_agent,
+                None,
+                &mut crate::mouse::Capture::default(),
+            ),
+            Route::None
+        );
+
+        let complete = render(&board, 18, 1);
+        assert_eq!(complete.target_at(11, 0), Some(Target::View(View::Agent)));
+        assert_eq!(complete.target_at(17, 0), Some(Target::View(View::Agent)));
+
+        // Every redraw returns a fresh hit map, so shrinking below the threshold cannot retain
+        // the complete frame's AGENT target.
+        let resized = render(&board, 12, 1);
+        assert_eq!(resized.target_at(11, 0), None);
     }
 
     #[test]
