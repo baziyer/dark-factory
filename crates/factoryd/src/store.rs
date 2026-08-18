@@ -3250,6 +3250,9 @@ impl Store {
         let rated = agent_attention(session.as_ref(), latest_run.as_ref());
         Ok(AgentStatus {
             agent,
+            // Git is inspected asynchronously by the local API after the
+            // consistent store snapshot has been released.
+            worktree: None,
             session,
             current_run,
             queue_depth: u32::try_from(queue.len()).unwrap_or(u32::MAX),

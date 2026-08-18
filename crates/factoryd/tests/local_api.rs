@@ -2153,6 +2153,12 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
             curie.attention_inferred,
             "no session: inferred from (no) run"
         );
+        let fleet_worktree = curie
+            .worktree
+            .as_ref()
+            .expect("fleet status includes the agent working directory");
+        assert!(fleet_worktree.error.is_some(), "{fleet_worktree:?}");
+        assert!(!fleet_worktree.dirty);
         assert_eq!(status.attention.len(), 1);
         let item = &status.attention[0];
         assert_eq!(
@@ -2182,6 +2188,7 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         // The project root is not a git repository, so the agent runs in the
         // root itself; the status says so instead of pretending a clean tree.
         let worktree = detail.worktree.expect("the agent has a working directory");
+        assert_eq!(Some(&worktree), detail.status.worktree.as_ref());
         assert!(worktree.error.is_some(), "{worktree:?}");
         assert!(!worktree.dirty);
 

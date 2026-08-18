@@ -591,7 +591,7 @@ async fn handle_request(
             let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
             let at_capacity = live_sessions >= live_session_cap;
             let mut attention = Vec::new();
-            let projects = projects
+            let mut projects: Vec<status::ProjectStatus> = projects
                 .into_iter()
                 .map(|rows| {
                     let crate::store::ProjectStatusRows {
@@ -617,6 +617,14 @@ async fn handle_request(
                     }
                 })
                 .collect();
+            for project in &mut projects {
+                for agent in &mut project.agents {
+                    agent.worktree = match agent.agent.worktree.as_deref() {
+                        Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
+                        None => None,
+                    };
+                }
+            }
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
                 status: status::FleetStatus {
@@ -635,7 +643,7 @@ async fn handle_request(
         } => {
             let lookup_project_id = project_id.clone();
             let lookup_agent_id = agent_id.clone();
-            let agent_status = state
+            let mut agent_status = state
                 .with_store(move |store| store.agent_status(&lookup_project_id, &lookup_agent_id))
                 .await?;
             let detail =
@@ -645,6 +653,7 @@ async fn handle_request(
                 Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
                 None => None,
             };
+            agent_status.worktree = worktree.clone();
             Ok(LocalResponse::AgentStatus {
                 status: Box::new(status::AgentStatusDetail {
                     status: agent_status,

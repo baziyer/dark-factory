@@ -57,6 +57,11 @@ pub struct ProjectStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentStatus {
     pub agent: AgentSnapshot,
+    /// Current git state of the agent's working directory. Fleet status
+    /// includes this so an orchestrator can inspect work before deciding
+    /// whether a stopped or blocked worker is safe to recover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -315,6 +320,7 @@ mod tests {
                 .map_or(Attention::Routine, |s| session_attention(s.state)),
             attention_inferred: session.is_none(),
             agent,
+            worktree: None,
             session,
             current_run: None,
             queue,

@@ -83,6 +83,11 @@ catalogue.
    agent branches start from `origin/HEAD`, or local `main` when no remote
    default exists, never the project root's current checkout; an
    operator may override it with an explicit `--worktree`.
+   Fleet and per-agent status both expose the same live git summary for
+   that worktree. A worker waiting for input is an operator-attention
+   condition, not permission to stop or replace it; recovery begins by
+   inspecting that summary and preserving or explicitly resolving dirty
+   work.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
    environment additions, generated configuration) and what they can do
