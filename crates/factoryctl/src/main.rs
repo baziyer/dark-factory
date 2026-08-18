@@ -80,7 +80,8 @@ Check that the daemon is reachable and responding.";
 const STATUS_HELP: &str = "usage: factoryctl status [--json]
 
 A concise human summary of the whole daemon at one instant: projects,
-agents, sessions, queues, worktrees, and anything needing attention.
+agents, sessions, project backlogs, assigned worker queues, worktrees, and
+anything needing attention.
 factory-tui reads the same request. For history, use the list commands.
 
 Options:

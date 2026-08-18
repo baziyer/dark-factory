@@ -710,7 +710,7 @@ async fn handle_request(
                     let crate::store::ProjectStatusRows {
                         project,
                         agents,
-                        unassigned,
+                        backlog,
                         blocked,
                     } = rows;
                     attention.extend(status::attention_items(
@@ -722,8 +722,8 @@ async fn handle_request(
                     status::ProjectStatus {
                         project,
                         agents,
-                        unassigned_queue_depth: u32::try_from(unassigned.len()).unwrap_or(u32::MAX),
-                        unassigned_queue: unassigned
+                        backlog_depth: u32::try_from(backlog.len()).unwrap_or(u32::MAX),
+                        backlog: backlog
                             .into_iter()
                             .take(status::MAX_QUEUE_PREVIEW)
                             .collect(),
@@ -1994,8 +1994,8 @@ mod worktree_status_tests {
                 updated_at_ms: 0,
             },
             agents,
-            unassigned_queue_depth: 0,
-            unassigned_queue: Vec::new(),
+            backlog_depth: 0,
+            backlog: Vec::new(),
         }];
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));

@@ -2164,8 +2164,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(status.projects.len(), 1);
         let project = &status.projects[0];
         assert_eq!(project.project.id, project_id("factory"));
-        assert_eq!(project.unassigned_queue_depth, 1);
-        assert_eq!(project.unassigned_queue[0].id, task_id("t-loose"));
+        assert_eq!(project.backlog_depth, 1);
+        assert_eq!(project.backlog[0].id, task_id("t-loose"));
         assert_eq!(project.agents.len(), 1);
         let curie = &project.agents[0];
         assert_eq!(curie.agent.id, agent_id("curie"));

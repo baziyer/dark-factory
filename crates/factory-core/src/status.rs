@@ -8,7 +8,7 @@
 //! queued and blocked tasks (the full task/run/session ledgers stay behind
 //! the paginated `List*` requests), per-agent queue previews truncated to
 //! [`MAX_QUEUE_PREVIEW`] with the true depth alongside — but not paginated:
-//! unassigned queues and blocked tasks are listed in full, so a factory with
+//! project backlogs and blocked tasks are listed in full, so a factory with
 //! thousands of open tasks would push one frame past
 //! `MAX_LOCAL_FRAME_BYTES`; that is where pagination would go.
 
@@ -48,8 +48,8 @@ pub struct ProjectStatus {
     pub agents: Vec<AgentStatus>,
     /// Project-backlog tasks not assigned to any agent (the operator's or an
     /// orchestrator's to hand out).
-    pub unassigned_queue_depth: u32,
-    pub unassigned_queue: Vec<TaskSnapshot>,
+    pub backlog_depth: u32,
+    pub backlog: Vec<TaskSnapshot>,
 }
 
 /// One agent's live picture: its session (if any), current run, and what is

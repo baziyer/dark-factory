@@ -16,12 +16,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
-/// its agents' statuses, its unassigned queue, and its blocked tasks (see
+/// its agents' statuses, its project backlog, and its blocked tasks (see
 /// [`Store::fleet_status`]).
 pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
-    pub unassigned: Vec<TaskSnapshot>,
+    pub backlog: Vec<TaskSnapshot>,
     pub blocked: Vec<TaskSnapshot>,
 }
 
@@ -3584,7 +3584,7 @@ impl Store {
 
     /// Every project's live picture in one read: agents with their live
     /// (or, failing that, most recent) session, current run, queued tasks,
-    /// and undelivered inbox count; per-project unassigned queue; the
+    /// and undelivered inbox count; per-project backlog; the
     /// project's blocked tasks (for the attention list). One connection,
     /// so every field is from the same instant. See
     /// `factory_core::status`.
@@ -3619,12 +3619,12 @@ impl Store {
                 .iter()
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
-            let unassigned = self.queued_tasks(&project.id, None)?;
+            let backlog = self.queued_tasks(&project.id, None)?;
             let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
                 agents,
-                unassigned,
+                backlog,
                 blocked,
             });
         }
