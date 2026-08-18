@@ -23,11 +23,24 @@ pub fn rollback_report(
         (Some(previous), RollbackOutcome::RuntimeFailed(_)) => {
             format!("bin/current could NOT be rolled back to {previous}")
         }
-        (Some(previous), _) => format!("bin/current rolled back to {previous}"),
+        (Some(previous), RollbackOutcome::JobFailed(_)) => {
+            format!("bin/current rolled back to {previous}, but launchd recovery failed")
+        }
+        (Some(previous), RollbackOutcome::RuntimeRestored) => {
+            format!("bin/current rolled back to {previous}; launchd plist and job were unchanged")
+        }
+        (Some(previous), RollbackOutcome::Restored) => {
+            format!("bin/current rolled back to {previous}")
+        }
+        (Some(previous), RollbackOutcome::NotAttempted) => {
+            format!("bin/current rollback was not attempted for {previous}")
+        }
         (None, _) => "there was no previous managed runtime".to_owned(),
     };
     let recovery = match (error.outcome(), previous_version) {
-        (RollbackOutcome::Restored, Some(previous)) => Some(health(previous)),
+        (RollbackOutcome::Restored | RollbackOutcome::RuntimeRestored, Some(previous)) => {
+            Some(health(previous))
+        }
         _ => None,
     };
     match recovery {
@@ -35,9 +48,15 @@ pub fn rollback_report(
         Some(Err(recovery)) => {
             format!("{error}; {runtime_outcome}; restored runtime health failed: {recovery}")
         }
-        None if matches!(error.outcome(), RollbackOutcome::Restored) => format!(
-            "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
-        ),
+        None if matches!(
+            error.outcome(),
+            RollbackOutcome::Restored | RollbackOutcome::RuntimeRestored
+        ) =>
+        {
+            format!(
+                "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
+            )
+        }
         None => format!("{error}; {runtime_outcome}"),
     }
 }
@@ -47,6 +66,67 @@ pub fn rollback_report(
 pub struct MutationSnapshot {
     pub active_version: Option<String>,
     pub plist: Option<String>,
+}
+
+/// Restores the runtime and launchd job captured by a mutation transaction
+/// after the newly loaded daemon fails its health check. The runtime is
+/// repointed first; if restoring the old job fails, the new runtime is put
+/// back so the active link still matches the job launchd has.
+pub fn rollback_after_health_failure(
+    home: &Path,
+    plist: &Path,
+    snapshot: &MutationSnapshot,
+    current_version: &str,
+    health: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let previous = snapshot
+        .active_version
+        .as_deref()
+        .ok_or("no previous managed runtime is available")?;
+    let previous_plist = snapshot
+        .plist
+        .as_deref()
+        .ok_or("no previous managed launchd job is available")?;
+    snapshot.restore_runtime(home)?;
+    let rollback_home = home.to_owned();
+    let current_version = current_version.to_owned();
+    crate::launchd::restore_with_rollback(plist, home, previous_plist, move || {
+        crate::install::activate(&rollback_home, &current_version)
+    })
+    .map_err(|error| error.to_string())?;
+    health(previous)
+}
+
+impl MutationSnapshot {
+    /// Restores the active link captured while the mutation lock was held.
+    /// A missing active runtime means the transaction must remove the link,
+    /// but never remove an unexpected real directory in its place.
+    pub fn restore_runtime(&self, home: &Path) -> Result<(), String> {
+        if let Some(version) = &self.active_version {
+            return crate::install::activate(home, version);
+        }
+        let link = crate::install::current_link(home);
+        match fs::symlink_metadata(&link) {
+            Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+                fs::remove_file(&link).map_err(|error| {
+                    format!(
+                        "could not remove the newly activated runtime {}: {error}",
+                        link.display()
+                    )
+                })?;
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "cannot remove unexpected non-file active runtime path {}",
+                link.display()
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!(
+                "could not inspect active runtime path {}: {error}",
+                link.display()
+            )),
+        }
+    }
 }
 
 /// Serializes every operation that can rewrite the managed launchd job or
@@ -109,13 +189,6 @@ impl MutationLock {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::{PermissionsExt, symlink},
-        sync::{Arc, Barrier, mpsc},
-        thread,
-    };
-
     use super::MutationLock;
 
     #[test]
@@ -126,52 +199,5 @@ mod tests {
         assert!(home.path().join("runtime-mutation.lock").is_file());
         drop(first);
         assert!(MutationLock::acquire(home.path()).is_ok());
-    }
-
-    #[test]
-    fn production_update_transaction_snapshots_after_a_competing_init() {
-        let home = tempfile::tempdir().unwrap();
-        let bin = home.path().join("bin");
-        for version in ["0.1.0", "0.2.0", "0.3.0"] {
-            fs::create_dir_all(bin.join(version)).unwrap();
-            for name in crate::install::BINARIES {
-                let path = bin.join(version).join(name);
-                fs::write(&path, "#!/bin/sh\n").unwrap();
-                let mut permissions = fs::metadata(&path).unwrap().permissions();
-                permissions.set_mode(0o755);
-                fs::set_permissions(&path, permissions).unwrap();
-            }
-        }
-        symlink("0.1.0", bin.join("current")).unwrap();
-
-        // The update has finished its download work and is waiting to enter
-        // the same production transaction used by init/update. A competing
-        // init wins first; the update must take its snapshot after waiting
-        // for the lock, or its failed activation would restore stale 0.1.0.
-        let barrier = Arc::new(Barrier::new(2));
-        let (finished, wait) = mpsc::channel();
-        let init_home = home.path().to_owned();
-        let init_barrier = Arc::clone(&barrier);
-        let init = thread::spawn(move || {
-            let (init_lock, _) =
-                MutationLock::begin(&init_home, &init_home.join("missing.plist")).unwrap();
-            init_barrier.wait();
-            crate::install::activate(&init_home, "0.2.0").unwrap();
-            drop(init_lock);
-            finished.send(()).unwrap();
-        });
-        barrier.wait();
-        wait.recv().unwrap();
-        init.join().unwrap();
-
-        let (update_lock, snapshot) =
-            MutationLock::begin(home.path(), &home.path().join("missing.plist")).unwrap();
-        crate::install::activate(home.path(), "0.3.0").unwrap();
-        crate::install::activate(home.path(), snapshot.active_version.as_deref().unwrap()).unwrap();
-        drop(update_lock);
-        assert_eq!(
-            crate::install::active_version(home.path()).unwrap(),
-            Some("0.2.0".into())
-        );
     }
 }

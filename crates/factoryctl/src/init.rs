@@ -130,8 +130,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
     }
-    let previous_version = snapshot.active_version;
-    let previous_plist = snapshot.plist;
+    let previous_version = snapshot.active_version.clone();
     install::activate(&home, version)?;
     println!("install: bin/current -> {version}");
 
@@ -191,10 +190,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         &probes::provider_directories(),
         &carried,
         None,
-        || match previous_version.as_deref() {
-            Some(previous) => install::activate(&home, previous),
-            None => Ok(()),
-        },
+        || snapshot.restore_runtime(&home),
     );
     if let Err(error) = apply {
         return Err(runtime::rollback_report(
@@ -218,20 +214,16 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     match probes::wait_for_daemon(socket, Duration::from_secs(20), Some(version)) {
         Ok(version) => println!("daemon: {version} answering at {}", socket.display()),
         Err(error) => {
-            let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
-                (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
-                    .and_then(|()| {
-                        launchd::restore_with_rollback(&plist, &home, previous_plist, || {
-                            install::activate(&home, version)
-                        })
-                        .map_err(|error| error.to_string())
-                    })
-                    .and_then(|()| {
-                        probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
-                            .map(|_| ())
-                    }),
-                _ => Err("no previous managed runtime is available".to_owned()),
-            };
+            let rollback = runtime::rollback_after_health_failure(
+                &home,
+                &plist,
+                &snapshot,
+                version,
+                |previous| {
+                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                        .map(|_| ())
+                },
+            );
             println!(
                 "daemon: not answering with {version} yet ({error}); rollback {}; see {}/logs/factoryd.stderr.log",
                 rollback.as_ref().map(|()| "restored").unwrap_or("failed"),

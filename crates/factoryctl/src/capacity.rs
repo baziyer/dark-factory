@@ -150,13 +150,15 @@ pub fn set_for(
             extra_environment: &std::collections::BTreeMap::new(),
             capacity: Some(requested),
         },
-        || Ok(()),
+        || snapshot.restore_runtime(home),
     )
     .map_err(|error| error.to_string())?;
     if let Err(error) = probes::wait_for_managed_daemon_for(target, socket, HEALTH_WAIT, None, home)
     {
         let rollback =
-            launchd::restore_with_rollback_for(target, &plist, home, previous_plist, || Ok(()));
+            launchd::restore_with_rollback_for(target, &plist, home, previous_plist, || {
+                snapshot.restore_runtime(home)
+            });
         return match rollback {
             Ok(()) => {
                 match probes::wait_for_managed_daemon_for(target, socket, HEALTH_WAIT, None, home) {

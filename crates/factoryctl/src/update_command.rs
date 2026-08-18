@@ -81,11 +81,30 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     let installed = install::install_release(&home, &manifest, &mut log)?;
     let (_runtime_lock, snapshot) = runtime::MutationLock::begin(&home, &plist)?;
-    let previous_version = snapshot.active_version;
-    let previous_plist = snapshot.plist;
+    let previous_version = snapshot.active_version.clone();
     let existing = launchd::read_existing(&plist)?;
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
+    }
+    if let Some(active) = snapshot.active_version.as_deref()
+        && active != manifest.version
+        && !update::is_newer(&manifest.version, active)
+    {
+        log(&format!(
+            "active runtime {active} is newer than downloaded {}; not activating a downgrade",
+            manifest.version
+        ));
+        println!(
+            "{}",
+            json!({
+                "installed": false,
+                "current": install::current_link(&home),
+                "active": active,
+                "launchd": "unchanged",
+                "skipped": "active runtime is newer than the selected release",
+            })
+        );
+        return Ok(0);
     }
     install::activate(&home, &manifest.version)?;
     log(&format!("bin/current -> {}", manifest.version));
@@ -111,14 +130,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         &probes::provider_directories(),
         &std::collections::BTreeMap::new(),
         None,
-        {
-            let rollback_home = home.clone();
-            let previous_version = previous_version.clone();
-            move || match previous_version.as_deref() {
-                Some(previous) => install::activate(&rollback_home, previous),
-                None => Ok(()),
-            }
-        },
+        || snapshot.restore_runtime(&home),
     ) {
         return Err(runtime::rollback_report(
             &error,
@@ -145,22 +157,16 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             Ok(0)
         }
         Err(error) => {
-            let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
-                (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
-                    .and_then(|()| {
-                        let rollback_home = home.clone();
-                        let manifest_version = manifest.version.clone();
-                        launchd::restore_with_rollback(&plist, &home, previous_plist, move || {
-                            install::activate(&rollback_home, &manifest_version)
-                        })
-                        .map_err(|error| error.to_string())
-                    })
-                    .and_then(|()| {
-                        probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
-                            .map(|_| ())
-                    }),
-                _ => Err("no previous managed runtime is available".to_owned()),
-            };
+            let rollback = runtime::rollback_after_health_failure(
+                &home,
+                &plist,
+                &snapshot,
+                &manifest.version,
+                |previous| {
+                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                        .map(|_| ())
+                },
+            );
             println!(
                 "{}",
                 json!({
