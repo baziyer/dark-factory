@@ -415,7 +415,7 @@ pub enum StoreError {
     AgentNotFound,
     #[error("project repository authority is not configured")]
     RepositoryAuthorityMissing,
-    #[error("project repository authority must be configured before any agent session starts")]
+    #[error("project repository authority must be configured before any factory session starts")]
     RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
@@ -2710,8 +2710,8 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_live_session: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id = ?1 AND ended_at_ms IS NULL)",
-            params![project_id.as_str()],
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE ended_at_ms IS NULL)",
+            [],
             |row| row.get(0),
         )?;
         if has_live_session {

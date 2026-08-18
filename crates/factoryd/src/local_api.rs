@@ -3472,6 +3472,19 @@ mod deletion_gate_tests {
                 1,
             )
             .unwrap();
+        let unconfigured_project_id = ProjectId::try_from("unconfigured-project").unwrap();
+        let unconfigured_root = directory.path().join("unconfigured-repo");
+        std::fs::create_dir(&unconfigured_root).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: unconfigured_project_id.clone(),
+                    name: "Unconfigured project".into(),
+                    root: unconfigured_root.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
         store
             .set_repository_authority(
                 &project_id,
@@ -3541,17 +3554,20 @@ mod deletion_gate_tests {
                 5,
             )
             .unwrap();
-        assert!(matches!(
-            store.set_repository_authority(
-                &project_id,
-                &crate::store::RepositoryAuthority {
-                    remote_url: "https://github.com/attacker/poison.git".into(),
-                    base_branch: "main".into(),
-                },
-                6,
+        assert!(
+            matches!(
+                store.set_repository_authority(
+                    &unconfigured_project_id,
+                    &crate::store::RepositoryAuthority {
+                        remote_url: "https://github.com/attacker/poison.git".into(),
+                        base_branch: "main".into(),
+                    },
+                    6,
+                ),
+                Err(crate::store::StoreError::RepositoryAuthorityRequiresIdleProject)
             ),
-            Err(crate::store::StoreError::RepositoryAuthorityRequiresIdleProject)
-        ));
+            "a live session in project A must block first-write poisoning of project B"
+        );
         let state = ApiState::new(store);
         let secret = "PRIVATE_COMMIT_MESSAGE_SENTINEL";
         std::fs::write(work_a.join("a.txt"), "PRIVATE_DIFF_SENTINEL\n").unwrap();
