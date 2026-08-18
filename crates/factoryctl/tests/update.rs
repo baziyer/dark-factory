@@ -6,11 +6,17 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    io::{BufRead, BufReader, Write},
+    os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Path, PathBuf},
     process::Command,
+    thread,
 };
 
+use factory_core::{
+    PROTOCOL_VERSION,
+    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+};
 use serde_json::Value;
 
 const BINARIES: [&str; 4] = ["factoryd", "factory-runner", "factoryctl", "factory-tui"];
@@ -31,16 +37,26 @@ impl Fixture {
         self.root.path().join("home")
     }
 
+    fn write_binaries(&self, directory: &Path, version: &str) {
+        fs::create_dir_all(directory).unwrap();
+        for name in BINARIES {
+            let path = directory.join(name);
+            fs::write(&path, format!("#!/bin/sh\necho {name} {version}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn activate(&self, version: &str) {
+        let bin = self.home().join("bin");
+        self.write_binaries(&bin.join(version), version);
+        std::os::unix::fs::symlink(version, bin.join("current")).unwrap();
+    }
+
     /// Writes an archive of four fake executables and a manifest naming
     /// `version`, returns the manifest's `file://` URL.
     fn publish(&self, version: &str, sha_override: Option<&str>) -> String {
         let source = self.root.path().join(format!("src-{version}"));
-        fs::create_dir_all(&source).unwrap();
-        for name in BINARIES {
-            let path = source.join(name);
-            fs::write(&path, format!("#!/bin/sh\necho {name} {version}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        self.write_binaries(&source, version);
         let archive = self
             .root
             .path()
@@ -87,13 +103,7 @@ impl Fixture {
     }
 
     fn factoryctl(&self, url: &str, args: &[&str]) -> (i32, Value, String) {
-        let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-            .args(args)
-            .env("DARK_FACTORY_HOME", self.home())
-            .env("HOME", self.root.path().join("user-home"))
-            .env("DARK_FACTORY_UPDATE_URL", url)
-            .output()
-            .expect("run factoryctl");
+        let output = self.command(url, args).output().expect("run factoryctl");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
         let json: Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
@@ -101,10 +111,93 @@ impl Fixture {
         });
         (output.status.code().unwrap_or(-1), json, stderr)
     }
+
+    fn command(&self, url: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
+        command
+            .args(args)
+            .env("DARK_FACTORY_HOME", self.home())
+            .env("HOME", self.root.path().join("user-home"))
+            .env("DARK_FACTORY_UPDATE_URL", url);
+        command
+    }
+
+    fn write_launchd_job(&self) {
+        let user_home = self.root.path().join("user-home");
+        let plist = user_home.join("Library/LaunchAgents/com.dark-factory.factoryd.plist");
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(
+            plist,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <plist version=\"1.0\"><dict>\
+                 <key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string></array>\
+                 <key>EnvironmentVariables</key><dict>\
+                 <key>DARK_FACTORY_HOME</key><string>{}</string>\
+                 </dict></dict></plist>\n",
+                self.home().display(),
+                self.home().display()
+            ),
+        )
+        .unwrap();
+    }
+
+    fn fake_launchctl(&self, success: bool) -> (PathBuf, PathBuf) {
+        let tools = self.root.path().join(if success {
+            "tools-success"
+        } else {
+            "tools-failure"
+        });
+        fs::create_dir_all(&tools).unwrap();
+        let log = tools.join("launchctl.log");
+        let program = tools.join("launchctl");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\nexit {}\n",
+                i32::from(!success)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        (tools, log)
+    }
 }
 
 fn read_link(path: &Path) -> String {
     fs::read_link(path).unwrap().to_string_lossy().into_owned()
+}
+
+fn serve_health_once(socket: &Path, version: &str) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    let version = version.to_owned();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::Health)
+        );
+        let frame = ServerFrame::Response {
+            protocol_version: PROTOCOL_VERSION,
+            response: LocalResponse::Health {
+                runner_path: "/tmp/factory-runner".to_owned(),
+                factoryctl_path: "/tmp/factoryctl".to_owned(),
+                version,
+            },
+        };
+        serde_json::to_writer(&mut stream, &frame).unwrap();
+        stream.write_all(b"\n").unwrap();
+    })
+}
+
+fn prepend_path(command: &mut Command, directory: &Path) {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let paths = std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited));
+    command.env("PATH", std::env::join_paths(paths).unwrap());
 }
 
 #[test]
@@ -114,6 +207,7 @@ fn update_reports_a_newer_release_and_caches_the_check() {
     let (code, report, _) = fixture.factoryctl(&url, &["update"]);
     assert_eq!(code, 0);
     assert_eq!(report["current"], factoryctl::update::CURRENT_VERSION);
+    assert!(report["active"].is_null());
     assert_eq!(report["latest"], "999.0.0");
     assert_eq!(report["update_available"], true);
     assert!(
@@ -133,6 +227,112 @@ fn update_reports_a_newer_release_and_caches_the_check() {
 }
 
 #[test]
+fn homebrew_bootstrap_updates_an_older_active_runtime() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    let latest = factoryctl::update::CURRENT_VERSION;
+    let url = fixture.publish(latest, None);
+
+    let (code, report, stderr) = fixture.factoryctl(&url, &["update"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(report["current"], latest);
+    assert_eq!(report["active"], "0.1.0");
+    assert_eq!(report["latest"], latest);
+    assert_eq!(report["update_available"], true);
+
+    let (code, report, stderr) = fixture.factoryctl(&url, &["update", "--install"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(report["installed"], latest);
+    assert_eq!(report["launchd"], "not_installed");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), latest);
+}
+
+#[test]
+fn matching_active_runtime_and_daemon_are_a_no_op() {
+    let fixture = Fixture::new();
+    let latest = factoryctl::update::CURRENT_VERSION;
+    fixture.activate(latest);
+    let url = fixture.publish(latest, None);
+    let socket = fixture.home().join("f.sock");
+    let server = serve_health_once(&socket, latest);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    let output = command
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout["installed"], latest);
+    assert_eq!(stdout["launchd"], "unchanged");
+    assert_eq!(stdout["health"]["version"], latest);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already installed and running"));
+    assert_eq!(read_link(&fixture.home().join("bin/current")), latest);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_reload_failure_rolls_back_the_active_runtime() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    fixture.write_launchd_job();
+    let latest = factoryctl::update::CURRENT_VERSION;
+    let url = fixture.publish(latest, None);
+    let (tools, log) = fixture.fake_launchctl(false);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    prepend_path(&mut command, &tools);
+    let output = command.env("FAKE_LAUNCHCTL_LOG", &log).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("bin/current rolled back to 0.1.0"));
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.1.0");
+    assert!(fixture.home().join("bin").join(latest).is_dir());
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("bootout"));
+    assert!(calls.contains("bootstrap"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn launchd_reload_restarts_into_the_new_active_runtime() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    fixture.write_launchd_job();
+    let latest = factoryctl::update::CURRENT_VERSION;
+    let url = fixture.publish(latest, None);
+    let (tools, log) = fixture.fake_launchctl(true);
+    let socket = fixture.home().join("f.sock");
+    let server = serve_health_once(&socket, latest);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    prepend_path(&mut command, &tools);
+    let output = command
+        .env("FAKE_LAUNCHCTL_LOG", &log)
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout["installed"], latest);
+    assert_eq!(stdout["launchd"], "reloaded");
+    assert_eq!(stdout["health"]["version"], latest);
+    assert_eq!(read_link(&fixture.home().join("bin/current")), latest);
+    let calls = fs::read_to_string(log).unwrap();
+    assert!(calls.contains("bootout"));
+    assert!(calls.contains("bootstrap"));
+}
+
+#[test]
 fn update_with_nothing_newer_is_a_no_op_for_install_too() {
     let fixture = Fixture::new();
     let url = fixture.publish("0.0.1", None);
@@ -143,6 +343,19 @@ fn update_with_nothing_newer_is_a_no_op_for_install_too() {
     assert_eq!(code, 0);
     assert_eq!(report["installed"], false);
     assert!(!fixture.home().join("bin").exists());
+}
+
+#[test]
+fn update_never_downgrades_a_newer_active_runtime() {
+    let fixture = Fixture::new();
+    fixture.activate("999.0.0");
+    let url = fixture.publish(factoryctl::update::CURRENT_VERSION, None);
+    let (code, report, stderr) = fixture.factoryctl(&url, &["update", "--install"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(report["active"], "999.0.0");
+    assert_eq!(report["update_available"], false);
+    assert_eq!(report["installed"], false);
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "999.0.0");
 }
 
 #[test]

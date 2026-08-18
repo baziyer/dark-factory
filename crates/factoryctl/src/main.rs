@@ -21,6 +21,7 @@ mod install;
 mod launchd;
 mod outbox;
 mod probes;
+mod status;
 mod update_command;
 mod usage;
 
@@ -45,7 +46,7 @@ Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a 
 
 Commands:
   health                                      Check the daemon
-  status                                      The whole fleet at one instant: sessions, queues, attention, live-session cap
+  status [--json]                             The whole fleet at one instant: sessions, queues, attention, live-session cap
   auto on|off|status                         Set or show the factory-wide provider bypass default
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Diagnose the install, one line each; exit 1 if any fail
@@ -78,16 +79,15 @@ Options:
 const HEALTH_HELP: &str = "usage: factoryctl health
 
 Check that the daemon is reachable and responding.";
-const STATUS_HELP: &str = "usage: factoryctl status
+const STATUS_HELP: &str = "usage: factoryctl status [--json]
 
-One JSON frame with the whole daemon at one instant, built in one store
-read: every project's agents with their live (or most recent) session,
-current run, queued tasks (oldest first, first 10 listed, full depth
-alongside), and undelivered inbox count; each project's unassigned queue;
-the daemon's live-session cap and how many sessions are live; and an
-attention list (sessions waiting for input or failed, blocked tasks,
-paused agents with work, agents waiting for capacity), most urgent first.
-factory-tui reads the same request. For history, use the list commands.";
+A concise human summary of the whole daemon at one instant: projects,
+agents, sessions, queues, worktrees, and anything needing attention.
+factory-tui reads the same request. For history, use the list commands.
+
+Options:
+  --json                       Print the complete protocol response frame
+  -h, --help                   Show this help";
 const INIT_HELP: &str = "usage: factoryctl init [--yes] [--no-launchd]
 
 Guided first install on this machine:
@@ -129,10 +129,11 @@ Options:
   -h, --help                 Show this help";
 const UPDATE_HELP: &str = "usage: factoryctl update [--install]
 
-Fetch the newest release's manifest and report whether it is newer than
-this build (JSON on stdout; the result is also cached in
-$DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads
-at most hourly).
+Fetch the newest release's manifest and report the invoking factoryctl,
+the active bin/current runtime, and whether the release is newer than the
+active runtime (JSON on stdout; the manifest result is also cached in
+$DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads at
+most hourly). With no active runtime, compare with the invoking factoryctl.
 
 With --install: download that release for this platform, verify its SHA-256
 against the manifest, unpack it into $DARK_FACTORY_HOME/bin/<version>/, and
@@ -152,7 +153,7 @@ the new version; 1 when the manifest can't be fetched (private repository,
 offline) or the restarted daemon doesn't answer in time.
 
 Options:
-  --install                  Download, verify, install, and activate the newer release
+  --install                  Download, verify, and activate the latest needed release
   -h, --help                 Show this help";
 const USAGE_HELP: &str = "usage: factoryctl usage
 
@@ -727,7 +728,9 @@ const HOOK_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 enum CliCommand {
     Help(&'static str),
     Health,
-    Status,
+    Status {
+        json: bool,
+    },
     SetAutoMode {
         enabled: bool,
     },
@@ -1040,12 +1043,23 @@ fn run() -> Result<i32, String> {
         return Ok(if is_error(&frame) { 2 } else { 0 });
     }
 
+    let human_status = matches!(&command, CliCommand::Status { json: false });
     let request = request_for(command)?;
     if is_outboxable(&request) {
         return run_outboxable(&client, request, &mut output);
     }
     let frame = client.request(request).map_err(|error| error.to_string())?;
-    write_frame(&mut output, &frame)?;
+    if human_status {
+        match &frame {
+            ServerFrame::Response {
+                response: LocalResponse::FleetStatus { status },
+                ..
+            } => status::write(&mut output, status)?,
+            _ => write_frame(&mut output, &frame)?,
+        }
+    } else {
+        write_frame(&mut output, &frame)?;
+    }
     Ok(if is_error(&frame) { 2 } else { 0 })
 }
 
@@ -1298,8 +1312,9 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             if wants_help(&args) {
                 return Ok((socket, CliCommand::Help(STATUS_HELP)));
             }
+            let json = take_flag(&mut args, "--json")?;
             require_empty(&args)?;
-            Ok((socket, CliCommand::Status))
+            Ok((socket, CliCommand::Status { json }))
         }
         "auto" => {
             if wants_help(&args) {
@@ -1315,7 +1330,9 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             match action.as_str() {
                 "on" => Ok((socket, CliCommand::SetAutoMode { enabled: true })),
                 "off" => Ok((socket, CliCommand::SetAutoMode { enabled: false })),
-                "status" => Ok((socket, CliCommand::Status)),
+                // Keep this compatibility alias machine-readable; the
+                // human-first command is `factoryctl status`.
+                "status" => Ok((socket, CliCommand::Status { json: true })),
                 _ => Err("auto action must be `on`, `off`, or `status`".into()),
             }
         }
@@ -2041,7 +2058,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
-        CliCommand::Status => Ok(LocalRequest::FleetStatus),
+        CliCommand::Status { .. } => Ok(LocalRequest::FleetStatus),
         CliCommand::SetAutoMode { enabled } => Ok(LocalRequest::SetAutoMode { enabled }),
         CliCommand::Usage
         | CliCommand::Version
@@ -3106,7 +3123,19 @@ mod tests {
             request_for(parse_args(args(&["status"])).unwrap().1).unwrap(),
             LocalRequest::FleetStatus
         );
-        assert!(parse_args(args(&["status", "--json"])).is_err());
+        assert_eq!(
+            parse_args(args(&["status"])).unwrap().1,
+            CliCommand::Status { json: false }
+        );
+        assert_eq!(
+            parse_args(args(&["status", "--json"])).unwrap().1,
+            CliCommand::Status { json: true }
+        );
+        assert_eq!(
+            request_for(parse_args(args(&["status", "--json"])).unwrap().1).unwrap(),
+            LocalRequest::FleetStatus
+        );
+        assert!(parse_args(args(&["status", "--json", "--json"])).is_err());
         let (_, command) = parse_args(args(&[
             "agent",
             "status",

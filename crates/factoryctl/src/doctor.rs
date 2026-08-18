@@ -75,8 +75,13 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let mut checks = Vec::new();
 
     checks.push(check_home(&home));
-    checks.push(check_install(&home));
-    let daemon = check_daemon(socket);
+    let active_version = update::active_version(&home);
+    checks.push(check_install(&home, &active_version));
+    let active_version = active_version
+        .as_ref()
+        .ok()
+        .and_then(|version| version.as_deref());
+    let daemon = check_daemon(socket, active_version);
     let daemon_reachable = daemon.status != Status::Fail;
     checks.push(daemon);
     checks.push(check_launchd(user_home.as_deref()));
@@ -88,7 +93,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     if daemon_reachable {
         checks.extend(check_projects(&Client::new(socket), &home));
     }
-    checks.push(check_update(&home));
+    checks.push(check_update(&home, active_version));
 
     let failed = checks.iter().any(|check| check.status == Status::Fail);
     if options.json {
@@ -143,25 +148,27 @@ fn check_home(home: &Path) -> Check {
     Check::ok("home", format!("{display} (0700)"))
 }
 
-fn check_install(home: &Path) -> Check {
+fn check_install(home: &Path, active_version: &Result<Option<String>, String>) -> Check {
     let link = install::current_link(home);
-    match fs::read_link(&link) {
-        Ok(target) => {
-            let version = target.to_string_lossy().into_owned();
-            match install::verify_binaries(&install::version_dir(home, &version)) {
-                Ok(()) => Check::ok(
-                    "install",
-                    format!(
-                        "bin/current -> {version} (this factoryctl is {})",
-                        update::CURRENT_VERSION
-                    ),
-                ),
-                Err(error) => {
-                    Check::fail("install", format!("bin/current -> {version}, but {error}"))
-                }
-            }
+    match active_version {
+        Ok(Some(version)) if version == update::CURRENT_VERSION => {
+            Check::ok("install", format!("bin/current -> {version}"))
         }
-        Err(_) => Check::warn(
+        Ok(Some(version)) if update::is_newer(version, update::CURRENT_VERSION) => Check::ok(
+            "install",
+            format!(
+                "bin/current -> {version} (newer than this factoryctl {})",
+                update::CURRENT_VERSION
+            ),
+        ),
+        Ok(Some(version)) => Check::warn(
+            "install",
+            format!(
+                "bin/current -> {version}, this factoryctl is {} (`factoryctl update --install` activates the latest release)",
+                update::CURRENT_VERSION
+            ),
+        ),
+        Ok(None) => Check::warn(
             "install",
             format!(
                 "no installed release at {} (running {} from {}; `factoryctl init` installs it)",
@@ -173,10 +180,12 @@ fn check_install(home: &Path) -> Check {
                     .map_or_else(|| "?".to_owned(), |dir| dir.display().to_string())
             ),
         ),
+        Err(error) => Check::fail("install", error.clone()),
     }
 }
 
-fn check_daemon(socket: &Path) -> Check {
+fn check_daemon(socket: &Path, active_version: Option<&str>) -> Check {
+    let expected = active_version.unwrap_or(update::CURRENT_VERSION);
     match Client::new(socket).request_with_timeout(LocalRequest::Health, Duration::from_secs(5)) {
         Ok(ServerFrame::Response {
             response: LocalResponse::Health { version, .. },
@@ -190,17 +199,19 @@ fn check_daemon(socket: &Path) -> Check {
                         socket.display()
                     ),
                 )
-            } else if version != update::CURRENT_VERSION {
+            } else if version != expected {
                 Check::warn(
                     "daemon",
                     format!(
-                        "running {version} at {}, this factoryctl is {} (restart the daemon to pick up the installed binaries)",
+                        "running {version} at {}, active runtime is {expected} (restart the daemon to pick up the installed binaries)",
                         socket.display(),
-                        update::CURRENT_VERSION
                     ),
                 )
             } else {
-                Check::ok("daemon", format!("{version} at {}", socket.display()))
+                Check::ok(
+                    "daemon",
+                    format!("{version} at {} (matches active runtime)", socket.display()),
+                )
             }
         }
         Ok(_) => Check::fail("daemon", "unexpected reply to health"),
@@ -433,9 +444,10 @@ fn check_projects(client: &Client, home: &Path) -> Vec<Check> {
     checks
 }
 
-fn check_update(home: &Path) -> Check {
+fn check_update(home: &Path, active_version: Option<&str>) -> Check {
     let check = update::check(home, &update::manifest_url(), update::now_ms(), false);
-    match (check.available(), &check.error) {
+    let installed = active_version.unwrap_or(&check.current);
+    match (check.available_from(installed), &check.error) {
         (Some(manifest), _) => Check::warn(
             "update",
             format!(
@@ -446,7 +458,7 @@ fn check_update(home: &Path) -> Check {
         (None, Some(error)) => Check::warn("update", format!("could not check: {error}")),
         (None, None) => Check::ok(
             "update",
-            format!("{} is the latest release", update::CURRENT_VERSION),
+            format!("{installed} is the latest installed release"),
         ),
     }
 }

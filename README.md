@@ -112,6 +112,9 @@ factoryctl status
 factoryctl agent status --project my-project --agent worker-1
 ```
 
+`factoryctl status` is a concise fleet summary for people. Use
+`factoryctl status --json` when a script needs the complete protocol frame.
+
 You can answer an agent in its terminal or send a durable message:
 
 ```sh

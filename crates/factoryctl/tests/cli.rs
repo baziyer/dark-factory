@@ -9,6 +9,7 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskId,
     local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    status::FleetStatus,
 };
 
 fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalResponse) {
@@ -120,6 +121,68 @@ fn health_prints_exactly_one_machine_readable_server_frame() {
             ..
         }
     ));
+    server.join().unwrap();
+}
+
+#[test]
+fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let status = FleetStatus {
+        generated_at_ms: 123,
+        auto_mode: true,
+        live_session_cap: 4,
+        live_sessions: 0,
+        projects: Vec::new(),
+        attention: Vec::new(),
+    };
+    let expected_frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::FleetStatus {
+            status: status.clone(),
+        },
+    };
+    let mut expected_json = serde_json::to_vec(&expected_frame).unwrap();
+    expected_json.push(b'\n');
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+                RequestEnvelope::new(LocalRequest::FleetStatus)
+            );
+            write_response(
+                &mut stream,
+                LocalResponse::FleetStatus {
+                    status: status.clone(),
+                },
+            );
+        }
+    });
+
+    let human = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "status"])
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{human:?}");
+    assert!(human.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "Dark Factory: auto on | sessions 0/4 | projects 0 | attention 0\n"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "status", "--json"])
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{json:?}");
+    assert!(json.stderr.is_empty());
+    assert_eq!(json.stdout, expected_json);
     server.join().unwrap();
 }
 
