@@ -1881,16 +1881,18 @@ async fn commit_delivery(
                     let run_id = opened.run.id.clone();
                     Ok((Some(run_id), opened.events))
                 }
-                // Already open: `commit_pending_delivery_on_prompt` (called
-                // synchronously from `local_api.rs`'s `ProviderHook`
-                // handler, *before* its own reply reaches the client) won
-                // this exact commit already -- this caller's own ack-wait
-                // just observed the same delivery landing a little later.
-                // Not an error: the episode this call wanted open *is*
-                // open, just not by this call (see that function's own
-                // doc comment for why committing here, first, used to
-                // lose a real race against a fast-reacting client).
-                Err(StoreError::AgentUnavailable) => Ok((None, Vec::new())),
+                // The synchronous `UserPromptSubmit` hook commit can win
+                // this dispatcher's later ack-driven commit. A sufficiently
+                // fast client can also finish that run before this retry,
+                // yielding `TaskNotQueued` instead of `AgentUnavailable`.
+                // Both are benign only when the exact task was already
+                // delivered to this exact session; cancellation,
+                // reassignment, and another open task remain real errors.
+                Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
+                    if store.has_run_episode(&session_id, &task_id)? =>
+                {
+                    Ok((None, Vec::new()))
+                }
                 Err(error) => Err(error),
             },
             None => {
@@ -3630,6 +3632,143 @@ mod tests {
             .expect("the recovered session must still exist");
         assert_eq!(session.state, SessionState::Failed);
         assert!(!session.state.is_live());
+    }
+
+    /// Issue #85: the synchronous `UserPromptSubmit` path can open a run,
+    /// then a fast client can finish it before the dispatcher's ack path
+    /// retries the commit for its already-composed candidate. That exact
+    /// stale candidate is idempotent; an unrelated non-queued task is not.
+    #[tokio::test]
+    async fn delivery_commit_ignores_only_a_task_already_run_in_the_same_session() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let task_id = TaskId::try_from("task-1").unwrap();
+        let cancelled_task_id = TaskId::try_from("task-2").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: "/tmp/factory".to_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".to_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".to_owned(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                1_001,
+            )
+            .unwrap();
+        for id in [&task_id, &cancelled_task_id] {
+            store
+                .create_task(
+                    crate::store::NewTask {
+                        id: id.clone(),
+                        project_id: project_id.clone(),
+                        parent_task_id: None,
+                        title: "Do the thing".to_owned(),
+                        body: "Do the thing.".to_owned(),
+                        priority: 0,
+                    },
+                    1_002,
+                )
+                .unwrap();
+            store
+                .assign_task(&project_id, id, Some(&agent_id), 1_003)
+                .unwrap();
+        }
+
+        // The hook handler wins the first commit and the client finishes
+        // the run before the dispatcher's commit resumes.
+        store
+            .open_run_episode(&session_id, &task_id, 1_004)
+            .unwrap();
+        store
+            .complete_task(&project_id, &task_id, "done".to_owned(), 1_005)
+            .unwrap();
+        store
+            .cancel_task(&project_id, &cancelled_task_id, 1_006)
+            .unwrap();
+        let event_count = store.events_after(0, 100).unwrap().len();
+        let state = DaemonState::new(store);
+
+        let result = commit_delivery(
+            &state,
+            &project_id,
+            &agent_id,
+            &session_id,
+            Delivery {
+                task_id: Some(task_id.clone()),
+                text: "already delivered".to_owned(),
+            },
+            1_007,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, None);
+        let events = state
+            .with_store(move |store| store.events_after(0, 100))
+            .await
+            .unwrap();
+        assert_eq!(events.len(), event_count, "the retry commits no events");
+
+        let error = commit_delivery(
+            &state,
+            &project_id,
+            &agent_id,
+            &session_id,
+            Delivery {
+                task_id: Some(cancelled_task_id),
+                text: "never delivered".to_owned(),
+            },
+            1_008,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonStateError::Store(StoreError::TaskNotQueued)
+        ));
     }
 
     #[test]
