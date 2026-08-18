@@ -130,7 +130,9 @@ fn request_response_with_timeout(
         .map_err(|error| error.to_string())?
     {
         ServerFrame::Response { response, .. } => Ok(response),
-        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+        ServerFrame::Event { .. }
+        | ServerFrame::AttachReady { .. }
+        | ServerFrame::TerminalOutput { .. } => {
             Err("daemon returned a stream frame instead of a response".into())
         }
     }
