@@ -152,6 +152,7 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
 /// first) — "attention-ranked lines float above routine ones" from the design brief. `height` is
 /// how many lines the caller has room to show.
 #[must_use]
+#[cfg(test)]
 pub fn ranked<'a>(
     announcements: impl Iterator<Item = &'a Announcement>,
     height: usize,

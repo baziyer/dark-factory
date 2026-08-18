@@ -25,7 +25,7 @@ use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, Serv
 use factory_core::status::FleetStatus;
 use factory_core::{
     AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, SessionSnapshot,
-    TaskDetail, TaskId,
+    TaskDetail,
 };
 
 use factoryctl::Client;
@@ -102,14 +102,6 @@ pub enum NetMsg {
     EventsReplay(Vec<EventEnvelope>),
     CaughtUp,
     OperationResult(Result<LocalResponse, String>),
-    /// The result of a background `GetTask` fetch issued by `spawn_task_detail_request` — kept
-    /// distinct from `OperationResult` because `Board::apply_task_detail_result` needs to know
-    /// *which* task id a failure was for (to clear `pending_detail` and allow a retry), which a
-    /// generic `LocalResponse::Error` carries no correlation for.
-    TaskDetailResult {
-        task_id: TaskId,
-        result: Result<LocalResponse, String>,
-    },
     /// The result of the hourly release-manifest check (`spawn_update_check`).
     UpdateCheck(UpdateCheck),
     /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — refreshed in a
@@ -486,29 +478,6 @@ pub fn spawn_request(client: Client, tx: Sender<NetMsg>, request: LocalRequest) 
     thread::spawn(move || {
         let result = request_response(&client, request);
         let _ = tx.send(NetMsg::OperationResult(result));
-    });
-}
-
-/// Fires one `GetTask` request in the background for `task_id`'s full detail
-/// (body/result/blocked_reason) and reports back via [`NetMsg::TaskDetailResult`] rather than
-/// the generic `OperationResult` path — see that variant's doc comment for why. Paired with
-/// `Board::begin_task_detail_fetch`, called from `main.rs`'s main loop whenever WORKSHOP's
-/// selected task's cached detail is missing or stale.
-pub fn spawn_task_detail_request(
-    client: Client,
-    tx: Sender<NetMsg>,
-    project_id: ProjectId,
-    task_id: TaskId,
-) {
-    thread::spawn(move || {
-        let result = request_response(
-            &client,
-            LocalRequest::GetTask {
-                project_id,
-                task_id: task_id.clone(),
-            },
-        );
-        let _ = tx.send(NetMsg::TaskDetailResult { task_id, result });
     });
 }
 

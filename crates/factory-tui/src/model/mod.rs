@@ -8,10 +8,8 @@
 //! ## Multi-project scope (Track 6c)
 //!
 //! Unlike the pre-Track-6c board (which loaded one project at a time), `Board` holds **every**
-//! project's agents/tasks/runs/sessions at once — FORTRESS is a fleet-wide floor plan of every
-//! project as a "workshop", per the design brief, so the data underneath it has to be fleet-wide
-//! too. `focused_project` narrows WORKSHOP/TERMINALS/FOCUS to one project at a time; FORTRESS
-//! ignores it entirely.
+//! project's agents/tasks/runs/sessions at once. BUILDING is fleet-wide; AGENT follows the
+//! selected agent while `focused_project` supplies scope for project actions.
 //!
 //! ## Deriving agent state and attention
 //!
@@ -25,24 +23,22 @@ pub mod announcements;
 mod keymap;
 pub mod state;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 
-use factory_core::local::{ErrorCode, LocalResponse};
+use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
-    TaskStatus,
 };
 
 pub use announcements::Announcement;
 pub use factory_core::attention::{self, Attention, Rated};
 pub use keymap::{
     Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
-    TASK_MENU_ITEMS, TaskMenuState, View, WorkshopPane,
+    TASK_MENU_ITEMS, TaskMenuState, View,
 };
 pub use state::AgentState;
 
-use crate::fortress;
 use crate::theme::Theme;
 
 /// How many announcement lines the ring buffer keeps. Old lines fall off the front.
@@ -51,8 +47,6 @@ pub const ANNOUNCEMENT_CAPACITY: usize = 500;
 const STATUS_STICKY_MS: i64 = 6_000;
 /// Maximum length of a sticky status/error message in the non-wrapping footer.
 const STATUS_TEXT_MAX_CHARS: usize = 64;
-/// TERMINALS tiles at most this many panes at once (design brief: "2-4 panes").
-pub const MAX_TERMINAL_PANES: usize = 4;
 
 // ---------------------------------------------------------------------------------------------
 // Small enums
@@ -78,16 +72,6 @@ pub enum Connection {
     Retrying,
 }
 
-/// A fortress workshop's route from its orchestrator to one of its top-level workers. `None`
-/// draws no connector at all; see `fortress::render_workshop` and `Board::route_kind_for`'s doc
-/// comment for the (documented, approximate) rule used to tell `Durable` from `Transient`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RouteKind {
-    None,
-    Durable,
-    Transient,
-}
-
 // ---------------------------------------------------------------------------------------------
 // Board
 // ---------------------------------------------------------------------------------------------
@@ -105,67 +89,32 @@ pub struct Board {
     /// `factoryd --max-active-runs`, learned from `FleetStatus` after bootstrap; the status line
     /// shows live sessions against it.
     pub live_session_cap: Option<u32>,
-    /// The inner width the FORTRESS floor was last rendered at (`ui::fortress_view` records it
-    /// each frame). Keyboard navigation over the floor recomputes the same layout from it, so
-    /// the cursor moves over exactly what is on screen. A `Cell` because the renderer only holds
-    /// `&Board`.
-    pub fortress_width: std::cell::Cell<u16>,
-
     /// Every project on the daemon, in whatever order the last snapshot/event delivered them —
     /// use [`Board::projects_sorted`] for creation order.
     pub projects: Vec<ProjectSnapshot>,
-    /// Which project WORKSHOP/TERMINALS/FOCUS are scoped to. FORTRESS ignores this.
+    /// Project used by project-scoped actions and remembered across TUI runs.
     pub focused_project: Option<ProjectId>,
 
     pub agents: BTreeMap<AgentId, AgentSnapshot>,
-    /// Git summaries received through the CLI-first fleet-status request.
-    pub worktrees: BTreeMap<AgentId, factory_core::status::WorktreeStatus>,
     pub tasks: BTreeMap<TaskId, TaskDetail>,
     pub runs: BTreeMap<RunId, RunSnapshot>,
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
-
-    /// `updated_at_ms` of the task snapshot as of the last successful full-detail fetch
-    /// (`GetTask`, or any other response that happens to carry a fresh `TaskDetail` — see
-    /// `merge_response`), per task. `TaskChanged` events only ever carry the durable snapshot
-    /// (see `apply_event`'s doc comment), so this is what lets [`Board::task_detail_needs_fetch`]
-    /// tell "never fetched" and "fetched, but a newer snapshot has since arrived" apart from
-    /// "fetched and still current".
-    detail_synced_at: BTreeMap<TaskId, i64>,
-    /// Tasks with a `GetTask` request currently in flight, so `main.rs` doesn't fire a duplicate
-    /// one every loop tick while waiting on the first (see `begin_task_detail_fetch`).
-    pending_detail: HashSet<TaskId>,
+    pub agent_details: BTreeMap<AgentId, AgentDetail>,
+    pub messages: BTreeMap<AgentId, Vec<AgentMessage>>,
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
 
     pub view: View,
-    /// The one cross-view agent selection cursor (FORTRESS glyph, WORKSHOP's agent tree,
-    /// TERMINALS/FOCUS's pane) — "one selection cursor follows through" per the repomon reference
-    /// this design adopts (`REFS-HERDR-REPOMON.md`).
+    /// The one agent selection shared by BUILDING and AGENT.
     pub selected_agent: Option<AgentId>,
-    /// FORTRESS-only: `[`/`]` (and the spatial cursor landing on an empty workshop) set this
-    /// independently of `selected_agent`, over workshops (projects) themselves rather than the
-    /// agents inside them — how a project with zero agents is reached, since `selected_agent`'s
-    /// cursor has no candidates there (see `Board::cycle_selected_workshop`,
-    /// `move_fortress_cursor`, and `zoom_in`'s doc comments).
-    /// Mutually exclusive with `selected_agent` in practice (each cursor clears the other) so
-    /// FORTRESS never shows two different "selections" onscreen at once.
-    pub selected_workshop: Option<ProjectId>,
-    /// WORKSHOP's task-list cursor.
+    /// Task targeted by a task action modal.
     pub selected_task: Option<TaskId>,
-    /// WORKSHOP's `Tab`-toggled pane focus (tasks vs. the agent tree).
-    pub workshop_focus: WorkshopPane,
-    /// WORKSHOP's `!` toggle: show only tasks/agents needing operator attention.
-    pub attention_filter: bool,
-
     pub mode: Mode,
-    /// TERMINALS/FOCUS only: whether keystrokes are interpreted as board `Action`s (`Board`) or
-    /// go to the focused pane (`Typing`). TERMINALS *enters* in `Board` — Tab/j/k/arrows move
-    /// focus between panes, `i`/Ctrl-] start typing — so navigation never looks dead the moment
-    /// you land there; FOCUS enters in `Typing` (you zoomed in to talk to it), Ctrl-] returning
-    /// to board keys. Herdr's "exclusive input ownership for a pane" adopted per
-    /// `REFS-HERDR-REPOMON.md`, now with an explicit per-view default instead of always-on.
+    /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
+    /// AGENT's terminal consumes the full content area while true.
+    pub terminal_maximized: bool,
 
     pub status: Option<StatusMessage>,
 
@@ -184,26 +133,22 @@ impl Board {
             connection_detail: None,
             update_available: None,
             live_session_cap: None,
-            fortress_width: std::cell::Cell::new(fortress::MIN_WORKSHOP_WIDTH),
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
-            worktrees: BTreeMap::new(),
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
             sessions: BTreeMap::new(),
-            detail_synced_at: BTreeMap::new(),
-            pending_detail: HashSet::new(),
+            agent_details: BTreeMap::new(),
+            messages: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
-            view: View::Fortress,
+            view: View::Building,
             selected_agent: None,
-            selected_workshop: None,
             selected_task: None,
-            workshop_focus: WorkshopPane::Tasks,
-            attention_filter: false,
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
+            terminal_maximized: false,
             status: None,
             caught_up: false,
             quit: false,
@@ -224,46 +169,32 @@ impl Board {
         projects
     }
 
-    #[must_use]
-    pub fn agents_vec(&self) -> Vec<AgentSnapshot> {
-        self.agents.values().cloned().collect()
-    }
-
-    #[must_use]
-    pub fn worktree_for(
-        &self,
-        agent_id: &AgentId,
-    ) -> Option<&factory_core::status::WorktreeStatus> {
-        self.worktrees.get(agent_id)
-    }
-
-    pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
-        self.live_session_cap = Some(status.live_session_cap);
-        self.worktrees = status
-            .projects
-            .into_iter()
-            .flat_map(|project| project.agents)
-            .filter_map(|agent| agent.worktree.map(|worktree| (agent.agent.id, worktree)))
-            .collect();
-    }
-
     /// Every agent, in FORTRESS's exact left-to-right/top-to-bottom visual order (project
     /// creation order, then orchestrator/worker/sub-agent order within each workshop). The single
     /// source of truth for that order — `Tab`/`j`/`k` cycling, `g`/`G`, and TERMINALS' pane order
     /// all call this rather than re-deriving it, so they can never drift from what's drawn.
     #[must_use]
     pub fn agents_in_fortress_order(&self) -> Vec<AgentId> {
-        let projects = self.projects_sorted();
-        let agents = self.agents_vec();
-        // `wrap_width` only affects where a workshop wraps to a new row, never the sequence
-        // agents are visited in, so any width works here — `u16::MAX` guarantees no wrapping.
-        fortress::compute_workshops(&projects, &agents, u16::MAX)
+        self.projects_sorted()
             .into_iter()
-            .flat_map(|workshop| {
-                workshop
-                    .stations
+            .flat_map(|project| {
+                let mut agents: Vec<_> = self
+                    .agents
+                    .values()
+                    .filter(|agent| agent.project_id == project.id)
+                    .collect();
+                agents.sort_by_key(|agent| {
+                    (
+                        agent.role != AgentRole::Orchestrator,
+                        agent.parent_agent_id.is_some(),
+                        agent.created_at_ms,
+                        agent.id.clone(),
+                    )
+                });
+                agents
                     .into_iter()
-                    .map(|station| station.agent_id)
+                    .map(|agent| agent.id.clone())
+                    .collect::<Vec<_>>()
             })
             .collect()
     }
@@ -284,52 +215,6 @@ impl Board {
             .collect()
     }
 
-    /// WORKSHOP's agent tree, respecting `attention_filter` when set (only rows needing operator
-    /// attention survive).
-    #[must_use]
-    pub fn visible_agent_tree(&self, project_id: &ProjectId) -> Vec<(AgentId, u8)> {
-        let all = self.agent_tree(project_id);
-        if !self.attention_filter {
-            return all;
-        }
-        all.into_iter()
-            .filter(|(id, _)| {
-                self.agents
-                    .get(id)
-                    .is_some_and(|agent| self.agent_attention(agent).value.needs_operator())
-            })
-            .collect()
-    }
-
-    /// One project's tasks in queue order (oldest first).
-    #[must_use]
-    pub fn tasks_in(&self, project_id: &ProjectId) -> Vec<&TaskDetail> {
-        let mut tasks: Vec<&TaskDetail> = self
-            .tasks
-            .values()
-            .filter(|task| &task.snapshot.project_id == project_id)
-            .collect();
-        tasks.sort_by(|a, b| {
-            a.snapshot
-                .created_at_ms
-                .cmp(&b.snapshot.created_at_ms)
-                .then_with(|| a.snapshot.id.as_str().cmp(b.snapshot.id.as_str()))
-        });
-        tasks
-    }
-
-    /// WORKSHOP's task list, respecting `attention_filter` when set.
-    #[must_use]
-    pub fn visible_tasks(&self, project_id: &ProjectId) -> Vec<&TaskDetail> {
-        let all = self.tasks_in(project_id);
-        if !self.attention_filter {
-            return all;
-        }
-        all.into_iter()
-            .filter(|task| attention::task_attention(task.snapshot.status).needs_operator())
-            .collect()
-    }
-
     // -- derived views: task detail (lazy `GetTask` fetch) ----------------------------------
 
     /// Whether `task_id`'s cached [`TaskDetail`] (`body`/`result`/`blocked_reason`) is missing or
@@ -338,75 +223,16 @@ impl Board {
     /// created — or changed, e.g. completed and gained a `result` — after this client started
     /// watching has an up-to-date `snapshot` but a `body`/`result` frozen at whatever it was the
     /// last time (if ever) `GetTask` actually ran for it. `false` for a task id the board doesn't
-    /// know about at all (nothing to fetch a project id for).
-    #[must_use]
-    pub fn task_detail_needs_fetch(&self, task_id: &TaskId) -> bool {
-        let Some(task) = self.tasks.get(task_id) else {
-            return false;
-        };
-        self.detail_synced_at
-            .get(task_id)
-            .is_none_or(|&synced_at| synced_at < task.snapshot.updated_at_ms)
-    }
-
     /// Whether `task_id`'s hasn't been fully loaded yet and a `GetTask` fetch is in flight for it
-    /// — WORKSHOP's detail pane shows "(loading…)" in this state rather than "(no body)".
-    #[must_use]
-    pub fn is_task_detail_pending(&self, task_id: &TaskId) -> bool {
-        self.pending_detail.contains(task_id)
-    }
-
     /// If `task_id`'s detail needs fetching ([`Board::task_detail_needs_fetch`]) and no fetch for
     /// it is already in flight, marks one in flight and returns the project id to fetch it from.
     /// Idempotent: calling again before the response lands (`apply_task_detail_result`) returns
     /// `None`, so `main.rs` can call this unconditionally on every loop tick — e.g. whenever
     /// WORKSHOP's selected task changes, or a `TaskChanged` event bumps the selected task's
-    /// `updated_at_ms` — without flooding the daemon with duplicate requests per task id.
-    #[must_use = "a Some(project_id) means pending_detail was just marked — the caller must \
-                  actually send the GetTask request or it will never be retried"]
-    pub fn begin_task_detail_fetch(&mut self, task_id: &TaskId) -> Option<ProjectId> {
-        if self.pending_detail.contains(task_id) || !self.task_detail_needs_fetch(task_id) {
-            return None;
-        }
-        let project_id = self.tasks.get(task_id)?.snapshot.project_id.clone();
-        self.pending_detail.insert(task_id.clone());
-        Some(project_id)
-    }
-
     /// Folds a background `GetTask` fetch's result back into board state (see
     /// `net::spawn_task_detail_request`). Kept separate from `apply_response`'s generic
     /// `NetMsg::OperationResult` path because a failed fetch needs `pending_detail` cleared for
     /// the *specific* task it was for, which a generic `LocalResponse::Error` (no request-echo)
-    /// can't tell us.
-    pub fn apply_task_detail_result(
-        &mut self,
-        task_id: TaskId,
-        result: Result<LocalResponse, String>,
-    ) {
-        self.pending_detail.remove(&task_id);
-        match result {
-            Ok(LocalResponse::Task { task }) => {
-                self.detail_synced_at
-                    .insert(task.snapshot.id.clone(), task.snapshot.updated_at_ms);
-                self.tasks.insert(task.snapshot.id.clone(), task);
-            }
-            Ok(LocalResponse::Error { code, message }) => {
-                self.set_status(
-                    format!("{}: {message}", error_code_word(code)),
-                    StatusLevel::Error,
-                );
-            }
-            Ok(_) => {} // unexpected response shape for `GetTask`; nothing to fold in
-            Err(error) => {
-                self.set_status(
-                    format!("couldn't load task#{task_id} detail: {error}"),
-                    StatusLevel::Error,
-                );
-            }
-        }
-        self.clamp_selection();
-    }
-
     #[must_use]
     pub fn orchestrators_in(&self, project_id: Option<&ProjectId>) -> Vec<&AgentSnapshot> {
         let mut orchestrators: Vec<&AgentSnapshot> = self
@@ -474,46 +300,6 @@ impl Board {
         )
     }
 
-    /// Whether, and how, to draw a route connector from a workshop's orchestrator to `worker`.
-    /// `Transient` while the worker currently has an open episode; `Durable` if it has ever been
-    /// assigned a task in this project (a documented approximation — the wire protocol doesn't
-    /// track *which* orchestrator assigned/messaged a worker, only whether a task is/was assigned
-    /// to it, so this reads as "this workshop has a standing relationship with this worker" rather
-    /// than tracing a specific message); `None` otherwise.
-    #[must_use]
-    pub fn route_kind_for(&self, worker: &AgentSnapshot) -> RouteKind {
-        if self.agent_state(worker).value == AgentState::Working {
-            return RouteKind::Transient;
-        }
-        let ever_assigned = self.tasks.values().any(|task| {
-            task.snapshot.project_id == worker.project_id
-                && task.snapshot.assigned_agent_id.as_ref() == Some(&worker.id)
-        });
-        if ever_assigned {
-            RouteKind::Durable
-        } else {
-            RouteKind::None
-        }
-    }
-
-    #[must_use]
-    pub fn queued_task_count(&self, project_id: &ProjectId) -> usize {
-        self.tasks
-            .values()
-            .filter(|task| &task.snapshot.project_id == project_id)
-            .filter(|task| task.snapshot.status == TaskStatus::Queued)
-            .count()
-    }
-
-    #[must_use]
-    pub fn idle_capacity_count(&self, project_id: &ProjectId) -> usize {
-        self.agents
-            .values()
-            .filter(|agent| &agent.project_id == project_id && agent.role == AgentRole::Worker)
-            .filter(|agent| self.agent_state(agent).value == AgentState::Idle)
-            .count()
-    }
-
     // -- derived views: terminal attach targets ----------------------------------------------
 
     /// The session id `main.rs` should attach a pane to for `agent`, if any. Real usage: only an
@@ -550,21 +336,6 @@ impl Board {
     }
 
     /// Up to [`MAX_TERMINAL_PANES`] targets in the focused project, in fortress order — the panes
-    /// TERMINALS tiles.
-    #[must_use]
-    pub fn terminal_targets(&self) -> Vec<SessionId> {
-        let Some(project_id) = self.focused_project.clone() else {
-            return Vec::new();
-        };
-        self.agents_in_fortress_order()
-            .into_iter()
-            .filter_map(|agent_id| self.agents.get(&agent_id))
-            .filter(|agent| agent.project_id == project_id)
-            .filter_map(|agent| self.session_id_for_pane(agent))
-            .take(MAX_TERMINAL_PANES)
-            .collect()
-    }
-
     /// The selected agent's target — what FOCUS attaches when entered directly (e.g. via `G`),
     /// not necessarily one of `terminal_targets`.
     #[must_use]
@@ -576,27 +347,10 @@ impl Board {
         self.session_id_for_pane(agent)
     }
 
-    /// The single source of truth for which TERMINALS tile is focused: `selected_agent`'s pane,
-    /// falling back to the first tile only when the selected agent has no live pane here. Used
-    /// for both the highlighted border (`ui::terminals`) and the key-forwarding target
-    /// (`main.rs`'s `forwarding_target`) so the two can never point at different panes — the fix
-    /// for zooming in from a selected worker and landing on a different agent's terminal.
-    #[must_use]
-    pub fn terminals_focused_pane(&self) -> Option<SessionId> {
-        self.focus_target()
-            .or_else(|| self.terminal_targets().into_iter().next())
-    }
-
     /// The agent targeted by the focused pane, falling back to the selection outside TERMINALS.
     #[must_use]
     pub fn pane_target_agent(&self) -> Option<AgentId> {
-        match self.view {
-            View::Terminals => self
-                .terminals_focused_pane()
-                .and_then(|session_id| self.agent_for_pane_session(&session_id))
-                .map(|agent| agent.id.clone()),
-            View::Focus | View::Fortress | View::Workshop => self.selected_agent.clone(),
-        }
+        self.selected_agent.clone()
     }
 
     /// Whether the current view has a live pane keys could actually be forwarded to right now.
@@ -605,11 +359,7 @@ impl Board {
     /// eating it as input for a pane that isn't there.
     #[must_use]
     fn has_live_pane(&self) -> bool {
-        match self.view {
-            View::Terminals => self.terminals_focused_pane().is_some(),
-            View::Focus => self.focus_target().is_some(),
-            View::Fortress | View::Workshop => false,
-        }
+        self.view == View::Agent && self.focus_target().is_some()
     }
 
     /// Which sessions should currently be attached, given `self.view`. FORTRESS/WORKSHOP attach
@@ -617,10 +367,10 @@ impl Board {
     /// or FOCUS as it does to quitting the whole client.
     #[must_use]
     pub fn desired_sessions(&self) -> Vec<SessionId> {
-        match self.view {
-            View::Terminals => self.terminal_targets(),
-            View::Focus => self.focus_target().into_iter().collect(),
-            View::Fortress | View::Workshop => Vec::new(),
+        if self.view == View::Agent {
+            self.focus_target().into_iter().collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -688,25 +438,22 @@ impl Board {
     }
 
     fn normal_help_text(&self) -> String {
-        if matches!(self.view, View::Terminals | View::Focus) {
+        if self.view == View::Agent {
             if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
                 let target = self
                     .pane_target_agent()
                     .map_or_else(|| "pane".to_owned(), |id| id.to_string());
                 return format!("TYPING \u{2192} {target}   Ctrl-] board");
             }
-            return "BOARD  i type  Tab/j/k switch pane  Enter/l zoom  Esc/h back  \
-                     1-4 views  ? help  q detach"
+            return "BOARD  i/Enter type  [/] or j/k agent  z maximise  Esc back  ? help  q detach"
                 .to_owned();
         }
-        if self.view == View::Fortress {
-            return "1-4 views  hjkl/arrows move cursor  Tab cycle  Enter zoom in  n new  \
-                    m message  o orchestrator  p project  x stop  g/G attention  ? help  q detach"
+        if self.view == View::Building {
+            return "j/k floors  Enter agent  g needs-you  n new  m message  o orchestrator  \
+                    p project  x stop  ? help  q detach"
                 .to_owned();
         }
-        "1-4 views  j/k move  Tab switch  Enter/l zoom in  Esc/h zoom out  n new  m message  \
-         o orchestrator  p project  x stop  g/G attention  ? help  q detach"
-            .to_owned()
+        String::new()
     }
 
     // -- ticking --------------------------------------------------------------------------
@@ -958,8 +705,6 @@ impl Board {
         match response {
             LocalResponse::TaskCreated { task } => {
                 let id = task.snapshot.id.clone();
-                self.detail_synced_at
-                    .insert(id.clone(), task.snapshot.updated_at_ms);
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 format!("created task#{id}")
             }
@@ -972,12 +717,6 @@ impl Board {
             | LocalResponse::TaskBlocked { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
-                // Every one of these carries a fresh, full `TaskDetail` (body/result/
-                // blocked_reason all current as of this response), so mark it synced too - not
-                // just the `GetTask` path - to avoid a redundant fetch on the next render.
-                self.detail_synced_at
-                    .insert(id.clone(), task.snapshot.updated_at_ms);
-                self.pending_detail.remove(&id);
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
@@ -993,7 +732,8 @@ impl Board {
             LocalResponse::Agent { agent } | LocalResponse::AgentProfileUpdated { agent } => {
                 let id = agent.snapshot.id.clone();
                 self.agents
-                    .insert(agent.snapshot.id.clone(), agent.snapshot);
+                    .insert(agent.snapshot.id.clone(), agent.snapshot.clone());
+                self.agent_details.insert(id.clone(), agent);
                 format!("agent {id} updated")
             }
             LocalResponse::AgentDeleted { agent_id, .. } => {
@@ -1009,6 +749,17 @@ impl Board {
             }
             LocalResponse::AgentMessageSent { message } => {
                 format!("message sent to {}", message.recipient_agent_id)
+            }
+            LocalResponse::AgentMessages { messages, .. } => {
+                if let Some(agent_id) = messages
+                    .first()
+                    .map(|message| message.recipient_agent_id.clone())
+                {
+                    self.messages.insert(agent_id.clone(), messages);
+                    format!("loaded messages for {agent_id}")
+                } else {
+                    "loaded messages".to_owned()
+                }
             }
             LocalResponse::RunAccepted { run_id } => format!("started run {run_id}"),
             LocalResponse::RunStopped { run_id } => format!("stop requested for run {run_id}"),
@@ -1032,20 +783,11 @@ impl Board {
                 self.selected_agent = None;
             }
         }
-        if let Some(id) = &self.selected_workshop {
-            if !self.projects.iter().any(|p| &p.id == id) {
-                self.selected_workshop = None;
-            }
-        }
         if let Some(id) = &self.selected_task {
             if !self.tasks.contains_key(id) {
                 self.selected_task = None;
             }
         }
-        // Deleted tasks shouldn't leak into these two indefinitely.
-        self.detail_synced_at
-            .retain(|id, _| self.tasks.contains_key(id));
-        self.pending_detail.retain(|id| self.tasks.contains_key(id));
     }
 }
 

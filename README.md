@@ -150,27 +150,31 @@ than reported as clean.
 
 ## The TUI
 
-`factory-tui` is the same control surface as the CLI, plus live
-inspection: FORTRESS (spatial fleet overview) → WORKSHOP (one project's
-tasks and agent hierarchy) → TERMINALS (tiled live PTYs) → FOCUS
-(full-screen PTY with scrollback).
+`factory-tui` is the same control surface as the CLI, plus live inspection.
+BUILDING is home: one project-grouped floor per agent shows provider, state,
+recent activity, queue depth, current task, and delegation routes. NEEDS YOU
+ranks waiting, failed, and blocked agents oldest first. Enter opens AGENT:
+the selected agent's live terminal, assigned/running queue, private inbox,
+and settings. An orchestrator additionally shows its project queue and
+delegation summary.
 
 | Key | Action |
 |---|---|
-| `1`-`4` | switch view directly |
-| `Enter`, `Esc` | zoom in / out one level |
-| `h`/`j`/`k`/`l`, arrows | FORTRESS: move the cursor over stations (empty workshops included); elsewhere `←`/`h` back, `→`/`l` in, `j`/`k` move |
-| `Tab` | cycle agents (FORTRESS/TERMINALS/FOCUS) or panes (WORKSHOP) |
-| `[`/`]` | FORTRESS: cycle the selected workshop |
+| `j`/`k`, arrows | select the next/previous agent floor |
+| `Enter`, `Esc` | open the selected AGENT / return to BUILDING |
+| `[`/`]` | previous/next agent without leaving AGENT |
 | `n` | new task |
 | `m` / `o` | message the selected agent / the orchestrator |
 | `p` | focus a project from a list (remembered for next time; `--project` overrides) |
 | `x` | stop the selected agent (2-press confirm) |
-| `g` / `G` | jump to (and `G`: focus) the next agent needing attention |
-| `!` | WORKSHOP: needs-attention-only filter |
-| `PgUp`/`PgDn` | FOCUS: scroll terminal scrollback |
-| `i` | TERMINALS: start typing into the focused pane (FOCUS starts there already) |
-| `Ctrl-]` | TERMINALS/FOCUS: toggle typing into the pane vs. board control |
+| `g` | jump to the next agent in NEEDS YOU |
+| `i` / `Enter` | from AGENT board mode, type into the terminal |
+| `Ctrl-]` | return terminal input to AGENT board mode |
+| `z` | maximise/restore the terminal |
+| `PgUp`/`PgDn` | scroll terminal history |
+| `Space` | pause/resume the selected agent through the shared daemon request |
+| `I` / `M` | edit `instructions.md` / `memory.md` in `$EDITOR` with the TUI suspended |
+| `t` | manage the first active task in the selected agent's queue |
 | `q` | detach — never stops the factory |
 | `?` | help overlay |
 

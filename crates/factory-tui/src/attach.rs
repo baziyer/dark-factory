@@ -4,7 +4,7 @@
 //! iterator wrapping a `BufReader<UnixStream>` with no way to reach the underlying socket from
 //! outside it, so there is no way to make a blocked read return early on detach. `Pane`'s
 //! daemon-attached backend needs exactly that — "detach without stopping the worker" (design
-//! brief) should mean the socket closes *promptly* when the operator leaves TERMINALS/FOCUS, not
+//! brief) should mean the socket closes *promptly* when the operator leaves AGENT, not
 //! "leaks a thread and a file descriptor until the whole client process exits". Connecting
 //! directly here keeps a `UnixStream` (or a `try_clone` of one) in `Pane`'s hands so its `detach`
 //! can call `shutdown()` on it, which unblocks the reader thread's blocking `read()` immediately.

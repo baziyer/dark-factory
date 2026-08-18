@@ -1,125 +1,58 @@
 # factory-tui
 
-The operator board: a `ratatui` terminal app for watching and directing agents on a Dark Factory
-daemon. Dwarf-Fortress-flavored on purpose — a spatial floor plan of every project's agents,
-attention-ranked announcements, a per-project workshop drill-down, and live terminal panes — not a
-dashboard.
+The detachable operator board for a Dark Factory daemon. It uses the same local requests as
+`factoryctl`; closing it never stops agents.
 
 ## Running it
 
 ```sh
 cargo run -p factory-tui
 cargo run -p factory-tui -- --socket /path/to/f.sock
-cargo run -p factory-tui -- --project my-project     # focus this project on startup
-                                                      # (default: the one focused last time,
-                                                      #  saved in $DARK_FACTORY_HOME/factory-tui.json)
-cargo run -p factory-tui -- --theme plain             # ASCII glyphs, no hue-based color
-cargo run -p factory-tui -- --dev-local-pty           # TERMINALS/FOCUS attach a local shell
-                                                        # instead of a live daemon session
-                                                        # (offline pane testing; keep or drop: #33)
+cargo run -p factory-tui -- --project my-project
+cargo run -p factory-tui -- --theme plain
+cargo run -p factory-tui -- --dev-local-pty
 ```
 
-Socket resolution matches `factoryctl` exactly: `--socket`, then `$DARK_FACTORY_SOCKET`, then
-`$DARK_FACTORY_HOME/f.sock`, then `$HOME/.dark-factory/f.sock`. If the daemon isn't reachable, the
-status line shows `RETRYING` with the connection error and keeps retrying with backoff (capped at
-5s) — it never crashes or blocks the UI. Once live, the status line also shows `n/cap live`
-(sessions that haven't ended against `factoryd --max-active-runs`, the cap coming from the same
-`FleetStatus` request `factoryctl status` makes; yellow when at the cap) and, at most hourly,
-`update vX available` (see README's "Local service, releases, and updates").
+Socket resolution matches `factoryctl`: `--socket`, `$DARK_FACTORY_SOCKET`,
+`$DARK_FACTORY_HOME/f.sock`, then `$HOME/.dark-factory/f.sock`. The board reconnects with
+bounded backoff and loads every project's agents, tasks, runs, sessions, and recent retained
+events. `--dev-local-pty` is for isolated terminal testing only.
 
-Right after the initial fleet snapshot loads, the board also backfills its announcements log and
-agent activity sparklines with the daemon's last 200 retained events (`EventsAfter`, the same
-request `factoryctl events` uses) before subscribing to the live stream — so a board opened an hour
-into a run shows recent history immediately instead of starting from `announcements (0)` and blank
-sparklines.
+## BUILDING
 
-This board loads **every** project's agents/tasks/runs/sessions at once (FORTRESS is fleet-wide)
-and *focuses* one project at a time for WORKSHOP/TERMINALS/FOCUS — `--project` sets that initial
-focus; otherwise the project focused last time (saved in `$DARK_FACTORY_HOME/factory-tui.json`),
-else the oldest by creation order; `p` opens a picker, and `Enter` on an agent in FORTRESS
-re-focuses whichever project that agent belongs to.
+BUILDING is home. Agents are floors grouped by project. Each row shows the agent glyph and name,
+provider, observed or inferred state, recent hook-event sparkline, queue depth, current task, and
+a route for delegated agents. NEEDS YOU lists waiting, failed, and blocked work oldest first.
 
-## The four views
+Use `j`/`k` to move, `g` for the next NEEDS YOU item, and Enter to open AGENT. `n` creates
+a task, `m` messages the selected agent, `o` messages an orchestrator, `p` focuses a project,
+and `x` stops the selected agent after confirmation.
 
-FORTRESS (1) → WORKSHOP (2) → TERMINALS (3) → FOCUS (4) — see the top-level
-[README.md](../../README.md) for the key table. Briefly:
+## AGENT
 
-- **FORTRESS** — spatial factory overview: each project is a persistent "workshop" box (positioned
-  deterministically by creation order, sized to fit its own name — never truncated into its own
-  border), agents are glyphs at stations with a route connector to the orchestrator, plus a
-  queued-work/capacity bar. Attention-ranked announcements float on the right, backfilled from the
-  daemon's retained event log on connect (see "Running it" above) so a freshly opened board isn't
-  starting from zero. A custom widget writes every glyph directly into the `ratatui::buffer::Buffer`
-  (`fortress.rs`) — no `Canvas`, no `Paragraph` for the map.
-- **WORKSHOP** — one focused project: task queue, agent hierarchy (indented tree with state,
-  per-minute activity sparkline, wait-reason), and a detail pane for whichever row the cursor is
-  on — always the one thing, never a row the cursor highlights while the detail pane shows
-  something else. Ids and names are middle-truncated (`first-…orker-2`, not two identical
-  `first-floor…`s) and get whatever width is left after the fixed-width columns, not a width
-  hardcoded ahead of them. A task's body/result isn't in the fleet snapshot or `TaskChanged` events
-  (those carry only the durable snapshot), so the detail pane lazily fetches it with `GetTask` on
-  first selection.
-- **TERMINALS** — tiled live PTYs of the focused project's live sessions, 2-4 panes.
-- **FOCUS** — one pane, full-screen, with scrollback (`PgUp`/`PgDn`).
+AGENT keeps one live terminal large, with the agent's active queue, private inbox, and settings
+alongside. An orchestrator also shows its unassigned project queue and direct delegation count.
 
-`Enter` is contextual per view (zoom into WORKSHOP from FORTRESS; open the task action menu or zoom
-into TERMINALS from WORKSHOP; zoom into FOCUS from TERMINALS). On FORTRESS `h`/`j`/`k`/`l` and the
-arrows move a cursor over the floor, Dwarf-Fortress style — left/right along a row of stations,
-up/down to the nearest station on the row above/below — over exactly the layout that is on screen
-(the renderer records the width it drew with, `Board::fortress_width`, and navigation recomputes
-the same deterministic layout); an empty workshop is a stop too, so a project with no agents yet
-is reachable. Elsewhere `←`/`h` and `→`/`l` zoom out/in and `j`/`k` move within lists. WORKSHOP's
-task action menu — **assign · cancel · retry · delete · edit title · start** — is the only place
-those actions live. Everything is one `Action` enum and one `keymap()` function
-(`model/keymap.rs`): a key always produces the same `Action`; only what `Board::dispatch` does
-with it depends on the view.
+Use `[`/`]` or `j`/`k` in BOARD mode to switch agents. `i` or Enter gives the terminal
+exclusive input; `Ctrl-]` returns to BOARD mode. `z` maximises the terminal and
+`PgUp`/`PgDn` scroll history. Esc returns to BUILDING.
 
-## Theme
+Settings use shared daemon requests: Space pauses/resumes, `v` edits the model, and `a` edits
+the permission/approval mode. `I` and `M` suspend the TUI and open the agent's
+`instructions.md` and `memory.md` in `$EDITOR`. `t` opens the shared task action menu for
+the first active queued item.
 
-`--theme fortress` (default) or `--theme plain`. One `Theme` struct (`theme.rs`), two consts:
-`fortress` uses the full Dwarf-Fortress glyph set (`◆ C X c ▒ ░ ! × ✓ ═ ─`); `plain` is pure ASCII
-(`@ C X c # . ! x + = -`) with no color beyond bold/dim. Every glyph the board can draw comes from
-the active `Theme` — nothing falls back to a hardcoded Unicode character under `--theme plain`
-(`theme::tests::glyph_tables_are_complete_and_ascii_for_plain` guards this).
+## State and attention
 
-## How agent state and attention are derived
+`Board::agent_state` and `Board::agent_attention` are the single mapping points from durable
+state to the UI. Live session hooks win over run inference. Inferred attention is prefixed with
+`~`.
 
-Two functions are the single mapping points from durable daemon state onto what the board draws;
-every other piece of code calls them instead of inspecting `SessionState`/`RunStatus` itself:
+## Architecture and safe testing
 
-- `Board::agent_state` → the five-way `AgentState` (idle/working/waiting/stopped/failed) used for
-  glyph color everywhere.
-- `Board::agent_attention` → the four-way `Attention` taxonomy (routine < completed < failed <
-  needs-input, each with a `priority()`) used for fortress badges, announcement ordering, `g`/`G`,
-  and WORKSHOP's `!` filter.
+`model/` owns pure state and key handling, `net.rs` owns socket I/O, `pane.rs` and
+`attach.rs` own terminal attachment, and `ui/` renders BUILDING and AGENT.
 
-**Session state wins over run-status inference whenever a *live* session exists** (hooks supersede
-inference — `ARCHITECTURE.md`'s invariant 5). Once an agent's session ends, `current_session_id`
-clears and both functions fall back to the pre-sessions run-status mapping, marking the result
-`inferred: true` — surfaced in WORKSHOP's detail pane as a `~` prefix (e.g. `~latest run: Failed`)
-so an operator can always tell observed-from-hooks state apart from guessed-from-run-history state.
-The detail pane itself distinguishes an agent that has *never* had a session (`~no session yet —
-state inferred from run history`) from one whose session merely ended (`no live session — last
-session Stopped 3m ago`, still followed by the run-history basis for the inferred state) — the
-latter is not "no session yet".
-
-## Architecture
-
-- `model/` — the view-model, fully unit tested (`cargo test -p factory-tui`) without a terminal,
-  daemon, or PTY: `mod.rs` (`Board`, fleet-wide state, the session-vs-run precedence rule),
-  `keymap.rs` (`View`, `Action`, key-handling), `attention.rs`, `state.rs` (activity sparklines,
-  announcements ring buffer), `announcements.rs`.
-- `fortress.rs` — FORTRESS's custom widget (pure geometry in, `Buffer` writes out).
-- `theme.rs`, `net.rs` (every socket touch outside terminal attach), `attach.rs` (the dedicated
-  `AttachTerminal` connection), `pane.rs` (`Pane`: a daemon-attached session or, `--dev-local-pty`
-  only, a local PTY child — everything downstream of "bytes arrived" is backend-agnostic),
-  `keys.rs`/`query.rs` (crossterm-key-to-terminal-bytes encoder and the terminal-query responder).
-- `ui/` — pure rendering of `Board` plus, for TERMINALS/FOCUS, the live `Pane`s.
-- `main.rs` — CLI args, terminal setup/teardown, the event loop (non-blocking `NetMsg` drain, pane
-  reconciliation, a 1Hz tick, redraw only when something changed — not a busy poll).
-
-## Testing against a real (throwaway) daemon
-
-Never point this at `~/.dark-factory` or the live `launchd` daemon — see
-[docs/development/WORKFLOW.md](../../docs/development/WORKFLOW.md) for running a throwaway daemon
-on a temporary `$DARK_FACTORY_HOME`.
+Never test against `~/.dark-factory` or the live launchd daemon. Follow
+[the development workflow](../../docs/development/WORKFLOW.md) with a temporary
+`$DARK_FACTORY_HOME` and socket.

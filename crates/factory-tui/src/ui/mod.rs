@@ -1,13 +1,10 @@
-//! Rendering for all four views (`Board::view`), dispatched from [`draw`], plus the shared bottom
+//! Rendering for BUILDING and AGENT (`Board::view`), dispatched from [`draw`], plus the shared bottom
 //! status/help line and modal overlays (prompt/picker/task-menu/confirm/help), which every view
 //! can show on top of itself.
 
-mod announcements;
-mod focus;
-mod fortress_view;
+mod agent;
+mod building;
 mod help;
-mod terminals;
-mod workshop;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -31,10 +28,8 @@ pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) {
     let (content_area, status_area) = (outer[0], outer[1]);
 
     match board.view {
-        View::Fortress => fortress_view::draw(frame, content_area, board),
-        View::Workshop => workshop::draw(frame, content_area, board),
-        View::Terminals => terminals::draw(frame, content_area, board, panes),
-        View::Focus => focus::draw(frame, content_area, board, panes),
+        View::Building => building::draw(frame, content_area, board),
+        View::Agent => agent::draw(frame, content_area, board, panes),
     }
     help::render_status_line(frame, status_area, board);
 
@@ -81,16 +76,6 @@ pub(super) fn truncate_middle(text: &str, max: usize) -> String {
 }
 
 /// Pads `text` to exactly `width` columns (truncating first if it's already longer).
-pub(super) fn pad(text: &str, width: usize) -> String {
-    let truncated = truncate(text, width);
-    let len = truncated.chars().count();
-    if len >= width {
-        truncated
-    } else {
-        format!("{truncated}{}", " ".repeat(width - len))
-    }
-}
-
 /// A `Rect` centered within `area`, `width` columns by `height` rows (clamped to fit).
 pub(super) fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
