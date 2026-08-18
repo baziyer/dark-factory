@@ -154,7 +154,7 @@ for rollback details. See the
 - [TUI guide](crates/factory-tui/README.md)
 - [Provider setup and behavior](docs/providers.md)
 - [Architecture and safety rules](ARCHITECTURE.md)
-- [External integrations](https://github.com/baziyer/dark-factory/issues/100)
+- [External integrations](docs/webhooks.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 

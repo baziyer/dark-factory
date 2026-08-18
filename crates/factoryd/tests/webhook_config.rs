@@ -2,6 +2,7 @@ use std::{
     fs,
     os::unix::fs::{PermissionsExt, symlink},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -15,6 +16,7 @@ use factoryd::{
     webhook_http::{WebhookHttpMetrics, load_webhook_config, webhook_router},
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const LEGACY_SECRET: &str = "private-legacy-secret-sentinel";
@@ -30,6 +32,308 @@ fn agent_id(value: &str) -> AgentId {
 fn private_write(path: &std::path::Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn generic_config(secret_file: &std::path::Path) -> Value {
+    json!({"version":1,"bind":"127.0.0.1:0","endpoints":[{
+        "id":"monitor","wireProfile":"generic_v1","secretFile":secret_file
+    }]})
+}
+
+fn signature(secret: &[u8], body: &[u8]) -> String {
+    let mut key = [0_u8; 64];
+    key[..secret.len()].copy_from_slice(secret);
+    let mut inner = key;
+    let mut outer = key;
+    for byte in &mut inner {
+        *byte ^= 0x36;
+    }
+    for byte in &mut outer {
+        *byte ^= 0x5c;
+    }
+    let digest = Sha256::new()
+        .chain_update(inner)
+        .chain_update(body)
+        .finalize();
+    let digest = Sha256::new()
+        .chain_update(outer)
+        .chain_update(digest)
+        .finalize();
+    format!("sha256={digest:x}")
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn generic_events_authenticate_are_idempotent_and_reject_unknown_targets() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let secret_file = directory.path().join("secret");
+    private_write(&secret_file, b"generic-secret");
+    let config_path = directory.path().join("webhooks.json");
+    private_write(
+        &config_path,
+        serde_json::to_vec(&generic_config(&secret_file)).unwrap(),
+    );
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/tmp/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("worker"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+            },
+            2,
+        )
+        .unwrap();
+    let metrics = Arc::new(WebhookHttpMetrics::default());
+    let router = webhook_router(
+        DaemonState::new(store),
+        load_webhook_config(&config_path).unwrap(),
+        Arc::clone(&metrics),
+    )
+    .await
+    .unwrap();
+    let timestamp_ms = now_ms();
+    let body = serde_json::to_vec(&json!({"version":1,"eventId":"evt-1","timestampMs":timestamp_ms,"projectId":"factory","type":"task","data":{"title":"Imported","body":"Do it"}})).unwrap();
+    let call = |signature_value: String| {
+        Request::post("/monitor/events")
+            .header("x-dark-factory-signature", signature_value)
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    assert_eq!(
+        router
+            .clone()
+            .oneshot(call("sha256=00".into()))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = router
+        .clone()
+        .oneshot(call(signature(b"generic-secret", &body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let response = router
+        .clone()
+        .oneshot(call(signature(b"generic-secret", &body)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(value["status"], "duplicate");
+
+    for payload in [
+        json!({"version":1,"eventId":"evt-backlog","timestampMs":timestamp_ms,"projectId":"factory","type":"backlog","data":{"title":"Backlog","body":"Queue it"}}),
+        json!({"version":1,"eventId":"evt-message","timestampMs":timestamp_ms,"projectId":"factory","type":"message","data":{"agentId":"worker","body":"Recover now"}}),
+    ] {
+        let bytes = serde_json::to_vec(&payload).unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/monitor/events")
+                    .header(
+                        "x-dark-factory-signature",
+                        signature(b"generic-secret", &bytes),
+                    )
+                    .body(Body::from(bytes))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    let changed = serde_json::to_vec(&json!({"version":1,"eventId":"evt-1","timestampMs":timestamp_ms,"projectId":"factory","type":"message","data":{"agentId":"different-target","body":"Changed"}})).unwrap();
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/monitor/events")
+                .header(
+                    "x-dark-factory-signature",
+                    signature(b"generic-secret", &changed),
+                )
+                .body(Body::from(changed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"], "idempotency_mismatch");
+
+    let mut mutated = body.clone();
+    let position = mutated
+        .windows("Imported".len())
+        .position(|window| window == b"Imported")
+        .unwrap();
+    mutated[position] = b'X';
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/monitor/events")
+                .header(
+                    "x-dark-factory-signature",
+                    signature(b"generic-secret", &body),
+                )
+                .body(Body::from(mutated))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    for (event_id, timestamp_ms) in [
+        ("evt-stale", now_ms() - 300_001),
+        ("evt-future", now_ms() + 60_000),
+    ] {
+        let invalid_time = serde_json::to_vec(&json!({"version":1,"eventId":event_id,"timestampMs":timestamp_ms,"projectId":"factory","type":"task","data":{"title":"Imported","body":"Do it"}})).unwrap();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/monitor/events")
+                    .header(
+                        "x-dark-factory-signature",
+                        signature(b"generic-secret", &invalid_time),
+                    )
+                    .body(Body::from(invalid_time))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(response).await["error"], "timestamp_out_of_range");
+    }
+
+    let oversized = vec![b'x'; 1024 * 1024 + 1];
+    let request = Request::post("/monitor/events")
+        .header(
+            "x-dark-factory-signature",
+            signature(b"generic-secret", &oversized),
+        )
+        .body(Body::from(oversized))
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    let unknown = serde_json::to_vec(&json!({"version":1,"eventId":"evt-2","timestampMs":now_ms(),"projectId":"missing","type":"task","data":{"title":"Imported","body":"Do it"}})).unwrap();
+    let request = Request::post("/monitor/events")
+        .header(
+            "x-dark-factory-signature",
+            signature(b"generic-secret", &unknown),
+        )
+        .body(Body::from(unknown))
+        .unwrap();
+    assert_eq!(
+        router.oneshot(request).await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        metrics.snapshot().authenticated_requests,
+        8,
+        "task, duplicate, backlog, message, mismatch, stale, future, and unknown are authenticated outcomes"
+    );
+    assert_eq!(metrics.snapshot().bounded_rejections, 1);
+}
+
+#[tokio::test]
+async fn generic_rate_limit_keeps_the_generic_response_and_metrics_contract() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let secret_file = directory.path().join("secret");
+    private_write(&secret_file, b"generic-secret");
+    let config_path = directory.path().join("webhooks.json");
+    private_write(
+        &config_path,
+        serde_json::to_vec(&generic_config(&secret_file)).unwrap(),
+    );
+    let metrics = Arc::new(WebhookHttpMetrics::default());
+    let router = webhook_router(
+        DaemonState::new(Store::open_in_memory().unwrap()),
+        load_webhook_config(&config_path).unwrap(),
+        Arc::clone(&metrics),
+    )
+    .await
+    .unwrap();
+    let body = b"{}".to_vec();
+    for _ in 0..60 {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/monitor/events")
+                    .header(
+                        "x-dark-factory-signature",
+                        signature(b"generic-secret", &body),
+                    )
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["status"], "rejected");
+    }
+    let response = router
+        .oneshot(
+            Request::post("/monitor/events")
+                .header(
+                    "x-dark-factory-signature",
+                    signature(b"generic-secret", &body),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let value = body_json(response).await;
+    assert_eq!(value["status"], "rejected");
+    assert_eq!(value["error"], "rate_limited");
+    assert_eq!(metrics.snapshot().authenticated_requests, 60);
+    assert_eq!(metrics.snapshot().rate_limited_requests, 1);
+}
+
+#[tokio::test]
+async fn configured_targets_are_resolved_per_request_not_at_startup() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let secret_file = directory.path().join("secret");
+    private_write(&secret_file, LEGACY_SECRET);
+    let config_path = directory.path().join("webhooks.json");
+    private_write(
+        &config_path,
+        serde_json::to_vec(&config_json("127.0.0.1:0", &secret_file)).unwrap(),
+    );
+    let config = load_webhook_config(&config_path).unwrap();
+    let _router = webhook_router(
+        DaemonState::new(Store::open_in_memory().unwrap()),
+        config,
+        Arc::new(WebhookHttpMetrics::default()),
+    )
+    .await
+    .unwrap();
 }
 
 /// The exact shape Minerva's live `webhooks.json` uses today: one endpoint,
@@ -234,10 +538,10 @@ fn more_than_one_endpoint_or_a_missing_endpoint_fails_closed() {
 }
 
 #[test]
-fn only_the_legacy_v1_wire_profile_is_accepted() {
+fn unknown_wire_profiles_are_rejected() {
     let (_directory, config_path, _state) = fixture();
     let mut unsupported = fs::read_to_string(&config_path).unwrap();
-    unsupported = unsupported.replace("legacy_v1", "factory_v1");
+    unsupported = unsupported.replace("legacy_v1", "factory_v2");
     private_write(&config_path, unsupported);
     assert!(load_webhook_config(&config_path).is_err());
 }

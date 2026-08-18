@@ -78,9 +78,17 @@ pub const MAX_AGENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
 pub const MAX_SESSION_PAGE_ITEMS: u32 = 1000;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 1000;
+pub const MAX_TASK_TITLE_BYTES: usize = 240;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Applies the task-title contract shared by every local and connector write.
+#[must_use]
+pub fn normalize_task_title(value: String) -> Option<String> {
+    let value = value.trim().to_owned();
+    (!value.is_empty() && value.len() <= MAX_TASK_TITLE_BYTES).then_some(value)
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunTerminal {

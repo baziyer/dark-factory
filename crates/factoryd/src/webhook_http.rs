@@ -23,7 +23,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use factory_core::{AgentId, ObserverHealth, ProjectId, TaskId};
+use factory_core::{AgentId, MessageId, ObserverHealth, ProjectId, TaskId};
 use rustix::fs::OFlags;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -34,9 +34,9 @@ use tokio::net::TcpListener;
 use crate::{
     daemon_state::{DaemonState, DaemonStateError},
     store::{
-        NewWebhookTask, OperationalTaskStatus, StoreError, WebhookAnswer, WebhookDocument,
-        WebhookOpenQuestion, WebhookSnapshot, WebhookSnapshotAgent, WebhookSnapshotTask,
-        WebhookTaskPoll,
+        ConnectorEventInput, ConnectorEventResult, NewWebhookTask, OperationalTaskStatus,
+        StoreError, WebhookAnswer, WebhookDocument, WebhookOpenQuestion, WebhookSnapshot,
+        WebhookSnapshotAgent, WebhookSnapshotTask, WebhookTaskPoll,
     },
 };
 
@@ -49,8 +49,11 @@ const MAX_FROM_CHARS: usize = 240;
 const MAX_DOCUMENT_BYTES: usize = 128 * 1024;
 const ENDPOINT_RATE_LIMIT: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+const EVENT_MAX_AGE_MS: i64 = 5 * 60 * 1000;
+const EVENT_MAX_FUTURE_SKEW_MS: i64 = 30 * 1000;
 const LEGACY_SECRET_HEADER: &str = "x-md-webhook-secret";
 const LEGACY_TOKEN_HEADER: &str = "x-md-webhook-token";
+const SIGNATURE_HEADER: &str = "x-dark-factory-signature";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 #[derive(Deserialize)]
@@ -191,11 +194,13 @@ impl WebhookSecret {
     }
 }
 
-/// Only one wire profile remains: the `legacy_v1` shape Minerva speaks. The
-/// `wireProfile` config key is still required and still validated, so an
-/// operator's existing `webhooks.json` keeps loading unchanged; any other
-/// value is rejected as invalid configuration.
-const SUPPORTED_WIRE_PROFILE: &str = "legacy_v1";
+/// `generic_v1` is the product contract. `legacy_v1` remains only as a
+/// compatibility adapter for existing deployments.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WireProfile {
+    GenericV1,
+    LegacyV1,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -203,8 +208,10 @@ struct RawEndpointConfig {
     id: String,
     wire_profile: String,
     secret_file: PathBuf,
-    project_id: ProjectId,
-    orchestrator_agent_id: AgentId,
+    #[serde(default)]
+    project_id: Option<ProjectId>,
+    #[serde(default)]
+    orchestrator_agent_id: Option<AgentId>,
 }
 
 #[derive(Deserialize)]
@@ -218,8 +225,9 @@ struct RawWebhookConfig {
 struct WebhookEndpoint {
     id: String,
     secret: Arc<WebhookSecret>,
-    project_id: ProjectId,
-    orchestrator_agent_id: AgentId,
+    project_id: Option<ProjectId>,
+    orchestrator_agent_id: Option<AgentId>,
+    wire_profile: WireProfile,
 }
 
 /// Fully validated, privacy-sensitive webhook listener configuration. Exactly
@@ -347,8 +355,8 @@ struct HttpState {
 struct RequestEndpoint {
     id: String,
     secret: Arc<WebhookSecret>,
-    project_id: ProjectId,
-    orchestrator_agent_id: AgentId,
+    project_id: Option<ProjectId>,
+    orchestrator_agent_id: Option<AgentId>,
 }
 
 impl From<&WebhookEndpoint> for RequestEndpoint {
@@ -391,6 +399,7 @@ impl RateLimits {
 
 #[derive(Clone, Copy)]
 enum Route {
+    Event,
     Create,
     Poll,
     Snapshot,
@@ -402,6 +411,7 @@ enum Route {
 impl Route {
     const fn name(self) -> &'static str {
         match self {
+            Self::Event => "event",
             Self::Create => "create",
             Self::Poll => "poll",
             Self::Snapshot => "snapshot",
@@ -486,10 +496,16 @@ pub fn load_webhook_config(path: &Path) -> Result<WebhookHttpConfig, WebhookHttp
     }
     let [endpoint] = <[RawEndpointConfig; 1]>::try_from(raw.endpoints)
         .map_err(|_| WebhookHttpError::InvalidConfig)?;
-    if !valid_endpoint_id(&endpoint.id)
-        || endpoint.wire_profile != SUPPORTED_WIRE_PROFILE
-        || !endpoint.secret_file.is_absolute()
-    {
+    let wire_profile = match endpoint.wire_profile.as_str() {
+        "generic_v1" => WireProfile::GenericV1,
+        "legacy_v1"
+            if endpoint.project_id.is_some() && endpoint.orchestrator_agent_id.is_some() =>
+        {
+            WireProfile::LegacyV1
+        }
+        _ => return Err(WebhookHttpError::InvalidConfig),
+    };
+    if !valid_endpoint_id(&endpoint.id) || !endpoint.secret_file.is_absolute() {
         return Err(WebhookHttpError::InvalidConfig);
     }
     let configured_metadata = std::fs::symlink_metadata(&endpoint.secret_file)
@@ -509,6 +525,7 @@ pub fn load_webhook_config(path: &Path) -> Result<WebhookHttpConfig, WebhookHttp
             secret: Arc::new(secret),
             project_id: endpoint.project_id,
             orchestrator_agent_id: endpoint.orchestrator_agent_id,
+            wire_profile,
         },
     })
 }
@@ -519,14 +536,6 @@ pub async fn webhook_router(
     config: WebhookHttpConfig,
     metrics: Arc<WebhookHttpMetrics>,
 ) -> Result<Router, WebhookHttpError> {
-    let project_id = config.endpoint.project_id.clone();
-    let orchestrator_agent_id = config.endpoint.orchestrator_agent_id.clone();
-    daemon
-        .with_store(move |store| {
-            store.webhook_snapshot(&project_id, &orchestrator_agent_id, unix_time_ms())
-        })
-        .await
-        .map_err(|_| WebhookHttpError::InvalidConfig)?;
     let state = HttpState {
         daemon,
         endpoint: Arc::new(config.endpoint),
@@ -534,6 +543,7 @@ pub async fn webhook_router(
         metrics,
     };
     Ok(Router::new()
+        .route("/{endpoint}/events", post(accept_event))
         .route("/{endpoint}", get(poll_task).post(create_task))
         .route("/{endpoint}/snapshot", get(read_snapshot))
         .route("/{endpoint}/answer", post(answer_question))
@@ -595,14 +605,295 @@ fn rate_limited(state: &HttpState, route: Route) -> Option<Response> {
         outcome = "rate_limited",
         status = 429_u16
     );
-    Some(json_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        json!({ "ok": false, "error": "rate limited" }),
-    ))
+    let body = match route {
+        Route::Event => json!({"status":"rejected","error":"rate_limited"}),
+        _ => json!({"ok":false,"error":"rate limited"}),
+    };
+    Some(json_response(StatusCode::TOO_MANY_REQUESTS, body))
 }
 
 fn endpoint(state: &HttpState, id: &str) -> Option<RequestEndpoint> {
-    (state.endpoint.id == id).then(|| RequestEndpoint::from(state.endpoint.as_ref()))
+    (state.endpoint.id == id && state.endpoint.wire_profile == WireProfile::LegacyV1)
+        .then(|| RequestEndpoint::from(state.endpoint.as_ref()))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConnectorEnvelope {
+    version: u16,
+    event_id: String,
+    timestamp_ms: i64,
+    project_id: ProjectId,
+    #[serde(flatten)]
+    payload: ConnectorPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+enum ConnectorPayload {
+    Task {
+        title: String,
+        body: String,
+        #[serde(default)]
+        priority: i32,
+    },
+    Backlog {
+        title: String,
+        body: String,
+        #[serde(default)]
+        priority: i32,
+    },
+    Message {
+        #[serde(rename = "agentId")]
+        agent_id: AgentId,
+        body: String,
+    },
+}
+
+fn hmac_sha256(secret: &[u8], body: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key = [0_u8; BLOCK];
+    if secret.len() > BLOCK {
+        key[..32].copy_from_slice(&Sha256::digest(secret));
+    } else {
+        key[..secret.len()].copy_from_slice(secret);
+    }
+    let mut inner_key = key;
+    let mut outer_key = key;
+    for byte in &mut inner_key {
+        *byte ^= 0x36;
+    }
+    for byte in &mut outer_key {
+        *byte ^= 0x5c;
+    }
+    let inner = Sha256::new()
+        .chain_update(inner_key)
+        .chain_update(body)
+        .finalize();
+    Sha256::new()
+        .chain_update(outer_key)
+        .chain_update(inner)
+        .finalize()
+        .into()
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    let value = value.strip_prefix("sha256=")?;
+    if value.len() != 64 {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+        let digit = |byte: u8| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        out[index] = digit(pair[0])? * 16 + digit(pair[1])?;
+    }
+    Some(out)
+}
+
+fn event_timestamp_is_fresh(timestamp_ms: i64, now_ms: i64) -> bool {
+    timestamp_ms >= now_ms.saturating_sub(EVENT_MAX_AGE_MS)
+        && timestamp_ms <= now_ms.saturating_add(EVENT_MAX_FUTURE_SKEW_MS)
+}
+
+async fn accept_event(
+    State(state): State<HttpState>,
+    AxumPath(endpoint_id): AxumPath<String>,
+    request: Request<Body>,
+) -> Response {
+    let route = Route::Event;
+    if let Some(response) = rate_limited(&state, route) {
+        return response;
+    }
+    let started = Instant::now();
+    if state.endpoint.id != endpoint_id || state.endpoint.wire_profile != WireProfile::GenericV1 {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"status":"rejected","error":"unauthorized"}),
+        );
+    }
+    let signature = request
+        .headers()
+        .get(SIGNATURE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(decode_hex_32);
+    let bytes = match to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            state
+                .metrics
+                .bounded_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            return json_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"status":"rejected","error":"payload_too_large"}),
+            );
+        }
+    };
+    let expected = hmac_sha256(&state.endpoint.secret.0, &bytes);
+    if !signature.is_some_and(|provided| crate::store::constant_time_eq(&expected, &provided)) {
+        return json_response(
+            StatusCode::UNAUTHORIZED,
+            json!({"status":"rejected","error":"unauthorized"}),
+        );
+    }
+    let envelope: ConnectorEnvelope = match serde_json::from_slice(&bytes) {
+        Ok(value) => value,
+        Err(_) => {
+            return authenticated_response(
+                &state,
+                route,
+                started,
+                StatusCode::BAD_REQUEST,
+                "invalid_envelope",
+                json!({"status":"rejected","error":"invalid_envelope"}),
+            );
+        }
+    };
+    if envelope.version != 1 || envelope.event_id.is_empty() || envelope.event_id.len() > 128 {
+        return authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_envelope",
+            json!({"status":"rejected","error":"invalid_envelope"}),
+        );
+    }
+    let received_at_ms = unix_time_ms();
+    if !event_timestamp_is_fresh(envelope.timestamp_ms, received_at_ms) {
+        return authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "timestamp_out_of_range",
+            json!({"status":"rejected","error":"timestamp_out_of_range"}),
+        );
+    }
+    let payload_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let result_id = match random_hex::<12>() {
+        Ok(id) => format!("connector-{id}"),
+        Err(_) => {
+            return authenticated_response(
+                &state,
+                route,
+                started,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                json!({"status":"rejected","error":"internal"}),
+            );
+        }
+    };
+    let input = match envelope.payload {
+        ConnectorPayload::Task {
+            title,
+            body,
+            priority,
+        }
+        | ConnectorPayload::Backlog {
+            title,
+            body,
+            priority,
+        } => {
+            let Ok(id) = TaskId::try_from(result_id) else {
+                unreachable!()
+            };
+            ConnectorEventInput::Task {
+                id,
+                project_id: envelope.project_id,
+                title,
+                body,
+                priority,
+            }
+        }
+        ConnectorPayload::Message { agent_id, body } => {
+            let Ok(id) = MessageId::try_from(result_id) else {
+                unreachable!()
+            };
+            ConnectorEventInput::Message {
+                id,
+                project_id: envelope.project_id,
+                recipient_agent_id: agent_id,
+                body,
+            }
+        }
+    };
+    let endpoint_id = endpoint_id.clone();
+    let event_id = envelope.event_id;
+    match state
+        .daemon
+        .commit_and_publish(move |store| {
+            store.apply_connector_event(
+                &endpoint_id,
+                &event_id,
+                payload_digest,
+                input,
+                received_at_ms,
+            )
+        })
+        .await
+    {
+        Ok(ConnectorEventResult::Accepted { kind, id }) => authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::ACCEPTED,
+            "accepted",
+            json!({"status":"accepted","kind":kind,"id":id}),
+        ),
+        Ok(ConnectorEventResult::Duplicate { kind, id }) => authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::OK,
+            "duplicate",
+            json!({"status":"duplicate","kind":kind,"id":id}),
+        ),
+        Err(DaemonStateError::Store(
+            StoreError::WebhookProjectNotFound | StoreError::AgentNotFound,
+        )) => authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::NOT_FOUND,
+            "unknown_target",
+            json!({"status":"rejected","error":"unknown_target"}),
+        ),
+        Err(DaemonStateError::Store(
+            StoreError::InvalidWebhookInput
+            | StoreError::InvalidAgentMessage
+            | StoreError::InvalidTaskInput,
+        )) => authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
+            json!({"status":"rejected","error":"invalid_payload"}),
+        ),
+        Err(DaemonStateError::Store(StoreError::ConnectorEventPayloadMismatch)) => {
+            authenticated_response(
+                &state,
+                route,
+                started,
+                StatusCode::CONFLICT,
+                "idempotency_mismatch",
+                json!({"status":"rejected","error":"idempotency_mismatch"}),
+            )
+        }
+        Err(_) => authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::CONFLICT,
+            "conflict",
+            json!({"status":"rejected","error":"conflict"}),
+        ),
+    }
 }
 
 fn authenticate(endpoint: &RequestEndpoint, headers: &HeaderMap) -> bool {
@@ -1019,8 +1310,10 @@ async fn create_task(
     };
     let task = NewWebhookTask {
         id: task_id,
-        project_id: endpoint.project_id,
-        orchestrator_agent_id: endpoint.orchestrator_agent_id,
+        project_id: endpoint.project_id.expect("legacy endpoint project"),
+        orchestrator_agent_id: endpoint
+            .orchestrator_agent_id
+            .expect("legacy endpoint orchestrator"),
         endpoint_id: endpoint.id,
         title: input.title,
         body: input.message,
@@ -1085,7 +1378,7 @@ async fn poll_task(
     };
     let started = Instant::now();
     let hash = token_hash(token);
-    let project_id = endpoint.project_id;
+    let project_id = endpoint.project_id.expect("legacy endpoint project");
     let endpoint_id = endpoint.id;
     let poll = state
         .daemon
@@ -1127,8 +1420,10 @@ async fn read_snapshot(
     if !authenticate(&endpoint, &headers) {
         return unauthorized();
     }
-    let project_id = endpoint.project_id;
-    let orchestrator_agent_id = endpoint.orchestrator_agent_id;
+    let project_id = endpoint.project_id.expect("legacy endpoint project");
+    let orchestrator_agent_id = endpoint
+        .orchestrator_agent_id
+        .expect("legacy endpoint orchestrator");
     let now_ms = unix_time_ms();
     let snapshot = state
         .daemon
@@ -1213,10 +1508,12 @@ async fn answer_question(
         }
     };
     let answer = WebhookAnswer {
-        project_id: endpoint.project_id,
+        project_id: endpoint.project_id.expect("legacy endpoint project"),
         task_id: input.task_id,
         answer: input.answer,
-        orchestrator_agent_id: endpoint.orchestrator_agent_id,
+        orchestrator_agent_id: endpoint
+            .orchestrator_agent_id
+            .expect("legacy endpoint orchestrator"),
         notification_task_id,
         answered_at_ms: unix_time_ms(),
     };
@@ -1297,7 +1594,7 @@ async fn read_document(
             json!({ "ok": false, "error": "valid taskId and documentId required" }),
         );
     };
-    let project_id = endpoint.project_id;
+    let project_id = endpoint.project_id.expect("legacy endpoint project");
     let document = state
         .daemon
         .with_store(move |store| {
@@ -1380,4 +1677,30 @@ async fn method_not_allowed(State(state): State<HttpState>) -> Response {
         return response;
     }
     StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_MAX_AGE_MS, EVENT_MAX_FUTURE_SKEW_MS, event_timestamp_is_fresh};
+
+    #[test]
+    fn connector_timestamp_window_has_exact_past_and_future_boundaries() {
+        let now_ms = 1_800_000_000_000_i64;
+        assert!(event_timestamp_is_fresh(now_ms, now_ms));
+        assert!(event_timestamp_is_fresh(now_ms - EVENT_MAX_AGE_MS, now_ms));
+        assert!(!event_timestamp_is_fresh(
+            now_ms - EVENT_MAX_AGE_MS - 1,
+            now_ms
+        ));
+        assert!(event_timestamp_is_fresh(
+            now_ms + EVENT_MAX_FUTURE_SKEW_MS,
+            now_ms
+        ));
+        assert!(!event_timestamp_is_fresh(
+            now_ms + EVENT_MAX_FUTURE_SKEW_MS + 1,
+            now_ms
+        ));
+        assert!(!event_timestamp_is_fresh(i64::MIN, i64::MAX));
+        assert!(!event_timestamp_is_fresh(i64::MAX, i64::MIN));
+    }
 }
