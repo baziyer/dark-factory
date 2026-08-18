@@ -17,6 +17,22 @@
    `AGENTS.md`'s "Critical rules" for the exact steps.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
+### Testing resident sessions
+
+An E2E harness must not stop `factoryd` immediately after a `StopSession`
+response. That response only confirms that `factory-runner` accepted the stop;
+the runner stays alive until the daemon observes its terminal event and sends
+`AcknowledgeExit`. Killing the daemon between those steps leaves the runner
+waiting for an acknowledgement that can never arrive.
+
+Tests that create resident sessions must therefore use both safeguards in
+`crates/factoryd/tests/sessions_e2e.rs`: call `cleanup_session` on the normal
+path, which waits until the session is non-live before stopping the daemon, and
+retain `Daemon`'s `Drop` cleanup for assertion failures. A test may stop the
+daemon while a session is live only when daemon restart/recovery is the behavior
+under test; it must reconnect, then perform the same cleanup handshake before
+returning. Never replace this with a fixed sleep or a bare `daemon.stop()`.
+
 ### Developing the daemon without disrupting a running factory
 
 Never point a development build at `~/.dark-factory` or the installed
