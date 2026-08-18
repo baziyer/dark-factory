@@ -327,7 +327,7 @@ impl Pane {
         }
     }
 
-    // -- scrollback (FOCUS's PgUp/PgDn) ------------------------------------------------------
+    // -- scrollback (AGENT.s PgUp/PgDn) ------------------------------------------------------
 
     /// How many scrollback lines are currently in view (0 = live tail). Reads straight from
     /// `vt100::Screen::scrollback`, which is already clamped to how much history actually exists.

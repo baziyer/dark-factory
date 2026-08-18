@@ -1,4 +1,4 @@
-//! `factory-tui`: the Dwarf-Fortress-flavored operator board. See `README.md` for the four views,
+//! `factory-tui`: the BUILDING/AGENT operator board. See `README.md` for the two screens,
 //! keys, theme flag, and what's stubbed pending 5C (live sessions); see `SPIKE.md` for the
 //! terminal-fidelity research this crate grew out of.
 //!
@@ -10,7 +10,6 @@
 
 mod attach;
 mod client_state;
-mod fortress;
 mod keys;
 mod model;
 mod net;
@@ -111,7 +110,7 @@ fn print_help() {
          --socket PATH        Control-socket path (default: see README.md's 3-step resolution)\n    \
          --project ID         Focus this project on startup (default: the oldest by creation order)\n    \
          --theme fortress|plain   Glyph theme (default: fortress)\n    \
-         --dev-local-pty       TERMINALS/FOCUS attach a local shell instead of a live daemon\n                          \
+         --dev-local-pty       AGENT attaches a local shell instead of a live daemon\n                          \
          session (offline testing only — see README.md)\n    \
          --debug-log DIR       With --dev-local-pty, log a pane's raw PTY bytes to DIR\n    \
          -h, --help            Show this help\n    \
@@ -234,6 +233,7 @@ fn run(
     let mut last_update_check = Instant::now();
     let mut initial_project_applied = false;
     let mut remembered_project = board.focused_project.clone();
+    let mut loaded_context_agent = None;
     net::spawn_update_check(tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, debug_log);
@@ -276,7 +276,7 @@ fn run(
         if sync_panes(board, panes, socket, debug_log) {
             needs_redraw = true;
         }
-        sync_task_detail(board, client, tx);
+        sync_agent_context(board, client, tx, &mut loaded_context_agent);
         for pane in panes.values() {
             if pane.dirty() {
                 needs_redraw = true;
@@ -311,7 +311,7 @@ fn run(
 /// Reconciles `panes` against `Board::desired_sessions()`: attaches (or, under
 /// `--dev-local-pty`, spawns a local shell for) anything newly needed, detaches anything no
 /// longer needed. Cheap to call every loop iteration (a handful of id comparisons) — deliberately
-/// not gated on a redraw, so leaving TERMINALS/FOCUS detaches promptly even if nothing else
+/// not gated on a redraw, so leaving AGENT detaches promptly even if nothing else
 /// changed that frame. Returns whether anything changed (worth a redraw).
 fn sync_panes(
     board: &mut Board,
@@ -380,27 +380,51 @@ fn sync_panes(
 /// carry the durable snapshot, not `body`/`result`). Cheap to call every loop iteration like
 /// `sync_panes`: a couple of map lookups when nothing needs fetching, and `begin_task_detail_fetch`
 /// itself dedupes so a request already in flight is never fired twice.
-fn sync_task_detail(board: &mut Board, client: &Client, tx: &mpsc::Sender<NetMsg>) {
-    if board.view != model::View::Workshop {
+fn sync_agent_context(
+    board: &mut Board,
+    client: &Client,
+    tx: &mpsc::Sender<NetMsg>,
+    loaded: &mut Option<factory_core::AgentId>,
+) {
+    if board.view != model::View::Agent || board.selected_agent == *loaded {
         return;
     }
-    let Some(task_id) = board.selected_task.clone() else {
+    let Some(agent_id) = board.selected_agent.clone() else {
         return;
     };
-    if let Some(project_id) = board.begin_task_detail_fetch(&task_id) {
-        net::spawn_task_detail_request(client.clone(), tx.clone(), project_id, task_id);
-    }
+    let Some(agent) = board.agents.get(&agent_id) else {
+        return;
+    };
+    let project_id = agent.project_id.clone();
+    board.messages.insert(agent_id.clone(), Vec::new());
+    *loaded = Some(agent_id.clone());
+    net::spawn_request(
+        client.clone(),
+        tx.clone(),
+        factory_core::local::LocalRequest::GetAgent {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+        },
+    );
+    net::spawn_request(
+        client.clone(),
+        tx.clone(),
+        factory_core::local::LocalRequest::ListAgentMessages {
+            project_id,
+            agent_id,
+            after_id: None,
+            limit: 100,
+        },
+    );
 }
 
-/// Which pane currently owns the keyboard: the focused TERMINALS tile, or FOCUS's one pane. The
+/// AGENT.s selected pane owns the keyboard only in TYPING mode. The
 /// same `Board::terminals_focused_pane` the highlight in `ui::terminals` reads, so the two can
 /// never point at different panes.
 fn forwarding_target(board: &Board) -> Option<SessionId> {
-    match board.view {
-        model::View::Terminals => board.terminals_focused_pane(),
-        model::View::Focus => board.focus_target(),
-        model::View::Fortress | model::View::Workshop => None,
-    }
+    (board.view == model::View::Agent)
+        .then(|| board.focus_target())
+        .flatten()
 }
 
 fn forward_paste_if_applicable(board: &Board, panes: &PaneMap, text: &str) {
@@ -458,6 +482,22 @@ fn apply_intent(
             }
             true
         }
+        Intent::EditFile(path) => {
+            restore_terminal();
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
+            let result = std::process::Command::new(editor).arg(path).status();
+            let _ = enable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableBracketedPaste,
+                cursor::Hide
+            );
+            if let Err(error) = result {
+                board.note_error(format!("editor failed: {error}"));
+            }
+            true
+        }
     }
 }
 
@@ -489,9 +529,6 @@ fn apply_net_msg(
         NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
-        NetMsg::TaskDetailResult { task_id, result } => {
-            board.apply_task_detail_result(task_id, result);
-        }
         NetMsg::UpdateCheck(check) => {
             board.update_available = check.available().map(|manifest| manifest.version.clone());
         }

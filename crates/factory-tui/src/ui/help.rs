@@ -31,7 +31,7 @@ fn connection_badge(board: &Board) -> Span<'static> {
 
 fn view_badge(view: View) -> Span<'static> {
     Span::styled(
-        format!(" {}:{} ", view.number(), view.label()),
+        format!(" {} ", view.label()),
         Style::default().fg(Color::Black).bg(Color::Cyan),
     )
 }
@@ -131,6 +131,8 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageAgent(agent_id) => format!("message {agent_id}"),
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
+        PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
+        PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
     };
     let height = u16::try_from(prompt.labels.len()).unwrap_or(1) + 4;
     let rect = centered_rect(area, 60, height);
@@ -256,22 +258,21 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
 }
 
 const HELP_TEXT: &[&str] = &[
-    "1-4        switch view (Fortress / Workshop / Terminals / Focus)",
-    "Enter      zoom in       Esc      zoom out",
-    "h/j/k/l    Fortress: move the cursor over stations (arrows too); elsewhere ←/h back, →/l in",
-    "Tab        cycle agents (Fortress/Terminals/Focus) or panes (Workshop)",
-    "j/k, ↑/↓   move (Fortress: a row up/down)",
-    "[ / ]      Fortress: cycle selected workshop (reaches a project with no agents yet)",
+    "BUILDING / AGENT — two screens, BOARD / TYPING — two input modes",
+    "Enter/Esc  open selected agent / return to BUILDING",
+    "j/k, ↑/↓   previous/next agent floor",
+    "[ / ]      previous/next agent without leaving AGENT",
     "n          new task (needs a focused project)",
     "m          message the selected agent",
     "o          message the orchestrator (picks by Tab if more than one)",
-    "p          focus a project (remembered for next time; Fortress stays fleet-wide)",
+    "p          focus a project (remembered for next time)",
     "x          stop the selected agent — 2-press confirm",
-    "g / G      jump to (G: and focus) the next agent needing attention",
-    "!          Workshop: toggle attention-only filter",
-    "PgUp/PgDn  Focus: scroll terminal scrollback",
-    "i          Terminals: start typing into the focused pane (Focus starts there already)",
-    "Ctrl-]     Terminals/Focus: toggle typing into the pane vs. board control",
+    "g          jump to the next agent in NEEDS YOU",
+    "i/Enter    AGENT: type into the live terminal",
+    "Ctrl-]     return terminal input to BOARD mode",
+    "z          maximise/restore terminal     PgUp/PgDn scroll",
+    "Space      pause/resume agent            t manage active task",
+    "I / M      edit instructions.md / memory.md in $EDITOR",
     "q          detach (quits the client only — never stops the factory)",
     "?          toggle this help",
 ];
