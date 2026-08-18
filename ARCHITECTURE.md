@@ -79,7 +79,9 @@ catalogue.
    acknowledgement orphans the runner process (#26 records the
    test-harness risk this creates). One git worktree per agent
    (`agent/<id>`, provisioned on `CreateAgent`, removed on `DeleteAgent`)
-   keeps concurrent agents from colliding in the same working tree; an
+   keeps concurrent agents from colliding in the same working tree. New
+   agent branches start from `origin/HEAD`, or local `main` when no remote
+   default exists, never the project root's current checkout; an
    operator may override it with an explicit `--worktree`.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
