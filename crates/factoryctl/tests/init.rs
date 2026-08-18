@@ -53,6 +53,8 @@ fn run_with_env(
         .env("DARK_FACTORY_HOME", root.join("home"))
         .env("HOME", root.join("user-home"))
         .env("DARK_FACTORY_UPDATE_URL", "http://127.0.0.1:9/never")
+        // Never inherit a developer session's socket and reach its live daemon.
+        .env_remove("DARK_FACTORY_SOCKET")
         // The developer's shell may point CODEX_HOME at another account.
         .env_remove("CODEX_HOME")
         .stdin(Stdio::null());
