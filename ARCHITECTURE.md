@@ -138,8 +138,12 @@ catalogue.
    configuration. `factoryctl git commit`, `git push`, and `pr open|update`
    authenticate the live session token and carry no caller-selected project,
    agent, path, branch, or remote. `factoryd` re-resolves the exact managed
-   worktree and `agent/<id>` branch, serializes repository operations through
-   one committer, rejects protected/detached/mismatched refs, and writes
+   worktree and `agent/<id>` branch, uses an empty-config temporary
+   gitdir/index so repository hooks, filters, helpers, fsmonitor, and external
+   drivers cannot execute, and publishes commits with a compare-and-swap ref
+   update. Remote and PR base come from operator-pinned durable state, never
+   mutable `origin` metadata. It serializes repository operations through one
+   committer, rejects protected/detached/mismatched refs, and writes
    credential- and content-free request/result events. Review and merge remain
    outside this API, preserving the independent-review invariant.
 9. Once deletion of an agent or project begins, every known writer of files

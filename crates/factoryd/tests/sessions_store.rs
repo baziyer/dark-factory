@@ -191,7 +191,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -320,7 +320,7 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 18);
+    assert_eq!(version, 19);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

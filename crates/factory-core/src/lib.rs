@@ -510,6 +510,9 @@ pub enum FactoryEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reference: Option<String>,
     },
+    RepositoryAuthorityChanged {
+        project_id: ProjectId,
+    },
     ProjectChanged {
         project: ProjectSnapshot,
     },

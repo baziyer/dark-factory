@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -245,6 +245,22 @@ pub struct WebhookDocument {
     pub content: String,
 }
 
+pub struct NewRepositoryOperation {
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub operation: String,
+    pub phase: String,
+    pub success: Option<bool>,
+    pub reference: Option<String>,
+    pub occurred_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryAuthority {
+    pub remote_url: String,
+    pub base_branch: String,
+}
 // --- Sessions -------------------------------------------------------------
 //
 // One resident interactive provider process per agent (PTY-backed,
@@ -397,6 +413,8 @@ pub enum StoreError {
     EventSequenceGap { expected: i64, found: i64 },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
+    #[error("project repository authority is not configured")]
+    RepositoryAuthorityMissing,
     #[error("task was not found in the requested project")]
     TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]
@@ -2654,6 +2672,42 @@ impl Store {
             .ok_or(StoreError::ProjectNotFound)
     }
 
+    pub fn set_repository_authority(
+        &mut self,
+        project_id: &ProjectId,
+        authority: &RepositoryAuthority,
+        now_ms: i64,
+    ) -> Result<EventEnvelope> {
+        self.get_project(project_id)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO project_repository_authority (project_id, remote_url, base_branch, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![project_id.as_str(), authority.remote_url, authority.base_branch, now_ms],
+        )?;
+        let event = FactoryEvent::RepositoryAuthorityChanged {
+            project_id: project_id.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        })
+    }
+
+    pub fn repository_authority(&self, project_id: &ProjectId) -> Result<RepositoryAuthority> {
+        self.connection.query_row(
+            "SELECT remote_url, base_branch FROM project_repository_authority WHERE project_id = ?1",
+            params![project_id.as_str()],
+            |row| Ok(RepositoryAuthority { remote_url: row.get(0)?, base_branch: row.get(1)? }),
+        ).optional()?.ok_or(StoreError::RepositoryAuthorityMissing)
+    }
+
     pub fn list_projects(
         &self,
         after_id: Option<&ProjectId>,
@@ -4631,6 +4685,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0018_agent_budgets.sql"))?;
         transaction.pragma_update(None, "user_version", 18)?;
         transaction.commit()?;
+        current = 18;
+    }
+    if current == 18 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0019_repository_authority.sql"))?;
+        transaction.pragma_update(None, "user_version", 19)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -4757,6 +4818,12 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             project_id: Some(project_id),
             task_id: None,
             agent_id: Some(agent_id),
+            run_id: None,
+        },
+        FactoryEvent::RepositoryAuthorityChanged { project_id } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: None,
             run_id: None,
         },
         FactoryEvent::ProjectChanged { project } => EventMetadata {

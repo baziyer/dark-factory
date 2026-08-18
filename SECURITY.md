@@ -49,6 +49,13 @@ operator from their own agents. Concretely:
   already running as the operator can still search filesystem-readable
   credentials or evade environment policy. The separate runner user in #54
   remains the outer security boundary.
+  The operator first pins each project's canonical remote and PR base in the
+  durable store. Privileged Git runs with empty global/system config and a
+  daemon-created temporary gitdir/index; repository hooks, clean filters,
+  fsmonitor, credential/SSH helpers, external diff drivers, URL rewrites, and
+  non-allowlisted protocols are inert. Commit publication is a compare-and-
+  swap against the validated HEAD. Output is streamed into a hard bound; a
+  timeout or overflow kills and reaps the entire command process group.
 - **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
   tool call reaches an authenticated `PreToolUse` hook. The daemon denies
   recognizable force-push, pushed-ref deletion, branch-delete, and

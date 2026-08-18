@@ -465,6 +465,7 @@ name = "factoryd"
 version = "0.1.1"
 dependencies = [
  "axum",
+ "base64",
  "factory-core",
  "factory-runner",
  "factoryctl",

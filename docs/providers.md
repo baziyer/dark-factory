@@ -36,6 +36,9 @@ operator's `gh` configuration. Workers use the session-authenticated
 provider adapter must not add a separate remote credential path. This is an
 authority and audit boundary, not OS isolation; #54 tracks the separate runner
 user that supplies that outer wall.
+Repository execution itself never consumes provider or repository config: the
+daemon uses an empty-config temporary gitdir/index and an operator-pinned
+remote/base, with compare-and-swap ref publication.
 
 ## The `Provider` trait
 

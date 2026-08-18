@@ -141,6 +141,11 @@ pub enum LocalRequest {
         project_id: ProjectId,
         text: String,
     },
+    SetProjectRepositoryAuthority {
+        project_id: ProjectId,
+        remote_url: String,
+        base_branch: String,
+    },
     CreateTask {
         id: TaskId,
         project_id: ProjectId,
@@ -466,6 +471,9 @@ pub enum LocalResponse {
     },
     ProjectGuidanceUpdated {
         project: ProjectDetail,
+    },
+    ProjectRepositoryAuthoritySet {
+        project_id: ProjectId,
     },
     TaskCreated {
         task: TaskDetail,

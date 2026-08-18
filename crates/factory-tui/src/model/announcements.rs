@@ -170,6 +170,7 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         | FactoryEvent::PolicyDecision { .. }
         | FactoryEvent::AgentBudgetChanged { .. }
         | FactoryEvent::RepositoryOperation { .. }
+        | FactoryEvent::RepositoryAuthorityChanged { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
     };

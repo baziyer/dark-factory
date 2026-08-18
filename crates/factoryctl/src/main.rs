@@ -188,7 +188,8 @@ Actions:
   open --title TEXT (--body TEXT | --body-file PATH)
   update --number N --title TEXT (--body TEXT | --body-file PATH)";
 
-const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete|get|guidance> [options]
+const PROJECT_HELP: &str =
+    "usage: factoryctl project <add|list|delete|get|guidance|repository> [options]
 
 Manage projects.
 
@@ -198,6 +199,7 @@ Actions:
   delete    Delete a project that has no non-terminal run
   get       Fetch one project, including its guidance file path
   guidance  Manage a project's standing guidance file
+  repository  Set the daemon-owned remote and PR base used by agent requests
 
 Run `factoryctl project <action> --help` for action-specific options.";
 const PROJECT_ADD_HELP: &str = "usage: factoryctl project add --name TEXT --root PATH [options]
@@ -744,6 +746,11 @@ enum CliCommand {
     ProjectGuidanceSet {
         project_id: String,
         file: String,
+    },
+    ProjectRepositorySet {
+        project_id: String,
+        remote_url: String,
+        base_branch: String,
     },
     TaskAdd {
         id: Option<String>,
@@ -1482,6 +1489,21 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
                 _ => Err(format!("unknown project guidance action {sub_action:?}")),
             }
         }
+        "repository" => {
+            let sub_action = take_action(&mut args, "project repository")?;
+            if sub_action != "set" {
+                return Err(format!("unknown project repository action {sub_action:?}"));
+            }
+            let project_id = required_project(&mut args)?;
+            let remote_url = required_option(&mut args, "--remote")?;
+            let base_branch = required_option(&mut args, "--base")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ProjectRepositorySet {
+                project_id,
+                remote_url,
+                base_branch,
+            })
+        }
         _ => Err(format!("unknown project action {action:?}")),
     }
 }
@@ -2036,6 +2058,15 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 text: read_guidance_file(&file)?,
             })
         }
+        CliCommand::ProjectRepositorySet {
+            project_id,
+            remote_url,
+            base_branch,
+        } => Ok(LocalRequest::SetProjectRepositoryAuthority {
+            project_id: parse_id(project_id, "project")?,
+            remote_url,
+            base_branch,
+        }),
         CliCommand::TaskAdd {
             id,
             project_id,
