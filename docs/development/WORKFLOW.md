@@ -322,6 +322,9 @@ before launchd is touched, a refusal to race a hand-started daemon on the
 same socket, then the launchd job rendered with a `PATH` that can find
 those CLIs (an existing job keeps its arguments and environment and gets
 its `PATH` repaired), loaded, and the daemon awaited *with this version*.
+Once the daemon answers, `init` lists projects through the local API and only
+suggests creating the demo project for an empty fleet; existing fleets get
+`factoryctl status` and `factory-tui` instead.
 `factoryctl doctor [--json]` runs the same diagnostic probes plus the daemon
 (reachable? same version as the binaries?), the launchd job (installed,
 loaded, `PATH` — launchd's default when the job sets none — covers the

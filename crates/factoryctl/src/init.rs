@@ -17,7 +17,8 @@ use std::{
     time::Duration,
 };
 
-use factoryctl::update;
+use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
+use factoryctl::{Client, update};
 
 use crate::{install, launchd, probes};
 
@@ -151,7 +152,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         );
     }
     if options.no_launchd {
-        print_next_steps(&home, false);
+        print_next_steps(&home, NextSteps::StartDaemon);
         return Ok(0);
     }
     if !options.yes
@@ -160,7 +161,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         )?
     {
         println!("stopped before touching launchd; binaries are installed and activated");
-        print_next_steps(&home, false);
+        print_next_steps(&home, NextSteps::StartDaemon);
         return Ok(0);
     }
 
@@ -199,11 +200,15 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                 "daemon: not answering with {version} yet ({error}); see {}/logs/factoryd.stderr.log",
                 home.display()
             );
-            print_next_steps(&home, true);
+            print_next_steps(&home, NextSteps::DoctorOnly);
             return Ok(1);
         }
     }
-    print_next_steps(&home, true);
+    let (next_steps, diagnostic) = project_next_steps(has_projects(&Client::new(socket)));
+    if let Some(diagnostic) = diagnostic {
+        println!("{diagnostic}");
+    }
+    print_next_steps(&home, next_steps);
     Ok(0)
 }
 
@@ -216,16 +221,61 @@ fn same_binaries(a: &Path, b: &Path) -> bool {
     })
 }
 
-fn print_next_steps(home: &Path, daemon: bool) {
-    println!(
+#[derive(Clone, Copy)]
+enum NextSteps {
+    StartDaemon,
+    DoctorOnly,
+    FirstProject,
+    Fleet,
+}
+
+fn print_next_steps(home: &Path, next_steps: NextSteps) {
+    println!("{}", next_steps_text(home, next_steps));
+}
+
+fn next_steps_text(home: &Path, next_steps: NextSteps) -> String {
+    format!(
         "\nnext:\n  export PATH=\"{}:$PATH\"   # factoryctl and factory-tui\n  factoryctl doctor{}",
         install::current_link(home).display(),
-        if daemon {
-            "\n  factoryctl project add --id demo --name Demo --root \"$PWD\"\n  factory-tui"
-        } else {
-            "\n  factoryd &   # or `factoryctl init` again to install the launchd job"
+        match next_steps {
+            NextSteps::StartDaemon => {
+                "\n  factoryd &   # or `factoryctl init` again to install the launchd job"
+            }
+            NextSteps::DoctorOnly => "",
+            NextSteps::FirstProject => {
+                "\n  factoryctl project add --id demo --name Demo --root \"$PWD\"\n  factory-tui"
+            }
+            NextSteps::Fleet => "\n  factoryctl status\n  factory-tui",
         }
-    );
+    )
+}
+
+fn project_next_steps(result: Result<bool, String>) -> (NextSteps, Option<String>) {
+    match result {
+        Ok(false) => (NextSteps::FirstProject, None),
+        Ok(true) => (NextSteps::Fleet, None),
+        Err(error) => (
+            NextSteps::Fleet,
+            Some(format!("projects: could not list projects: {error}")),
+        ),
+    }
+}
+
+fn has_projects(client: &Client) -> Result<bool, String> {
+    let frame = client
+        .request(LocalRequest::ListProjects {
+            after_id: None,
+            limit: 1,
+        })
+        .map_err(|error| error.to_string())?;
+    let ServerFrame::Response {
+        response: LocalResponse::Projects { projects, .. },
+        ..
+    } = frame
+    else {
+        return Err("unexpected reply to list projects".into());
+    };
+    Ok(!projects.is_empty())
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {
@@ -240,4 +290,114 @@ fn confirm(prompt: &str) -> Result<bool, String> {
         .read_line(&mut answer)
         .map_err(|error| error.to_string())?;
     Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        path::Path,
+        thread,
+    };
+
+    use factory_core::{
+        PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+        local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    };
+
+    use super::{NextSteps, has_projects, next_steps_text, project_next_steps};
+
+    fn project() -> ProjectSnapshot {
+        ProjectSnapshot {
+            id: ProjectId::try_from("factory").unwrap(),
+            name: "Factory".into(),
+            root: "/tmp/factory".into(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn next_steps_for(projects: Vec<ProjectSnapshot>) -> String {
+        next_steps_for_response(LocalResponse::Projects {
+            projects,
+            next_after_id: None,
+        })
+        .0
+    }
+
+    fn next_steps_for_response(response: LocalResponse) -> (String, Option<String>) {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<RequestEnvelope>(&request).unwrap(),
+                RequestEnvelope::new(LocalRequest::ListProjects {
+                    after_id: None,
+                    limit: 1,
+                })
+            );
+            serde_json::to_writer(
+                &mut stream,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let result = has_projects(&factoryctl::Client::new(socket));
+        server.join().unwrap();
+        let (next_steps, diagnostic) = project_next_steps(result);
+        (next_steps_text(directory.path(), next_steps), diagnostic)
+    }
+
+    #[test]
+    fn fresh_home_gets_a_first_project_path() {
+        let next_steps = next_steps_for(Vec::new());
+        assert!(next_steps.contains("factoryctl project add --id demo"));
+        assert!(next_steps.contains("factory-tui"));
+        assert!(!next_steps.contains("factoryctl status"));
+    }
+
+    #[test]
+    fn existing_project_home_skips_demo_creation() {
+        let next_steps = next_steps_for(vec![project()]);
+        assert!(next_steps.contains("factoryctl status"));
+        assert!(next_steps.contains("factory-tui"));
+        assert!(!next_steps.contains("factoryctl project add"));
+    }
+
+    #[test]
+    fn project_list_failure_is_reported_without_suggesting_demo_creation() {
+        let (next_steps, diagnostic) = next_steps_for_response(LocalResponse::Health {
+            runner_path: "/tmp/factory-runner".into(),
+            factoryctl_path: "/tmp/factoryctl".into(),
+            version: "0.2.0".into(),
+        });
+        assert_eq!(
+            diagnostic.as_deref(),
+            Some("projects: could not list projects: unexpected reply to list projects")
+        );
+        assert!(next_steps.contains("factoryctl status"));
+        assert!(next_steps.contains("factory-tui"));
+        assert!(!next_steps.contains("factoryctl project add"));
+    }
+
+    #[test]
+    fn daemon_startup_failure_only_suggests_diagnosis() {
+        let next_steps = next_steps_text(Path::new("/tmp/home"), NextSteps::DoctorOnly);
+        assert!(next_steps.contains("factoryctl doctor"));
+        assert!(!next_steps.contains("factoryctl project add"));
+        assert!(!next_steps.contains("factoryctl status"));
+        assert!(!next_steps.contains("factoryd &"));
+    }
 }

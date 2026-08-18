@@ -47,7 +47,9 @@ factoryctl doctor
 ```
 
 `init` installs the active runtime in `~/.dark-factory/bin/current` and asks
-before installing the background service. `doctor` does not repair or
+before installing the background service. Its final next steps offer a first
+project for an empty fleet, or `factoryctl status` and `factory-tui` when a
+project already exists. `doctor` does not repair or
 reconfigure the installation; its release check may refresh
 `~/.dark-factory/update-check.json`. See [provider setup](docs/providers.md)
 for other account choices. The [manual release
