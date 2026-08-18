@@ -143,7 +143,10 @@ also exposes each agent's worktree `git status` (branch, changed files,
 dirty); `agent status` adds the agent's profile and guidance paths. A
 `waiting_for_input` worker should be routed to the operator, not restarted
 or replaced. Inspect that worker's status and preserve or explicitly
-resolve a dirty worktree before any recovery action.
+resolve a dirty worktree before any recovery action. The TUI refreshes this
+shared status in the background every five seconds; git probes are
+deadline-bounded, and an unavailable result is shown explicitly rather
+than reported as clean.
 
 ## The TUI
 

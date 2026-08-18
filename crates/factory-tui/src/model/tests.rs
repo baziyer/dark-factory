@@ -28,10 +28,10 @@ fn apply_fleet_snapshot_focuses_the_oldest_project_by_default() {
 }
 
 #[test]
-fn fleet_status_projects_worktree_state_into_the_board() {
+fn later_fleet_status_replaces_clean_worktree_state_without_a_reconnect() {
     let snapshot = agent("alice", "a", AgentRole::Worker, None);
     let mut b = board();
-    b.apply_fleet_status(FleetStatus {
+    let mut status = FleetStatus {
         generated_at_ms: 0,
         live_session_cap: 4,
         live_sessions: 0,
@@ -42,8 +42,8 @@ fn fleet_status_projects_worktree_state_into_the_board() {
                 worktree: Some(WorktreeStatus {
                     path: "/work/alice".into(),
                     branch: Some("agent/alice".into()),
-                    changed_files: 2,
-                    dirty: true,
+                    changed_files: 0,
+                    dirty: false,
                     error: None,
                 }),
                 session: None,
@@ -58,7 +58,15 @@ fn fleet_status_projects_worktree_state_into_the_board() {
             unassigned_queue: Vec::new(),
         }],
         attention: Vec::new(),
-    });
+    };
+
+    b.apply_fleet_status(status.clone());
+    assert!(!b.worktree_for(&snapshot.id).unwrap().dirty);
+
+    let refreshed = status.projects[0].agents[0].worktree.as_mut().unwrap();
+    refreshed.changed_files = 2;
+    refreshed.dirty = true;
+    b.apply_fleet_status(status);
 
     assert_eq!(b.live_session_cap, Some(4));
     let worktree = b.worktree_for(&snapshot.id).unwrap();

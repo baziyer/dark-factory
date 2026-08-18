@@ -50,6 +50,9 @@ use crate::{
     },
 };
 
+const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
+const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
+
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -617,14 +620,7 @@ async fn handle_request(
                     }
                 })
                 .collect();
-            for project in &mut projects {
-                for agent in &mut project.agents {
-                    agent.worktree = match agent.agent.worktree.as_deref() {
-                        Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
-                        None => None,
-                    };
-                }
-            }
+            populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
                 status: status::FleetStatus {
@@ -1627,6 +1623,47 @@ async fn handle_request(
         }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
     }
+}
+
+async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
+    let mut pending = Vec::new();
+    for (project_index, project) in projects.iter_mut().enumerate() {
+        for (agent_index, agent) in project.agents.iter_mut().enumerate() {
+            if let Some(path) = agent.agent.worktree.clone() {
+                agent.worktree = Some(status::WorktreeStatus {
+                    path: path.clone(),
+                    branch: None,
+                    changed_files: 0,
+                    dirty: false,
+                    error: Some("fleet git status deadline exceeded".to_owned()),
+                });
+                pending.push((project_index, agent_index, PathBuf::from(path)));
+            }
+        }
+    }
+
+    let _ = timeout(FLEET_WORKTREE_DEADLINE, async {
+        let mut probes = JoinSet::new();
+        let mut pending = pending.into_iter();
+        loop {
+            while probes.len() < MAX_CONCURRENT_WORKTREE_PROBES {
+                let Some((project_index, agent_index, path)) = pending.next() else {
+                    break;
+                };
+                probes.spawn(async move {
+                    let worktree = crate::worktrees::status(&path).await;
+                    (project_index, agent_index, worktree)
+                });
+            }
+            let Some(result) = probes.join_next().await else {
+                break;
+            };
+            if let Ok((project_index, agent_index, worktree)) = result {
+                projects[project_index].agents[agent_index].worktree = Some(worktree);
+            }
+        }
+    })
+    .await;
 }
 
 /// Absolute guidance-file paths for one agent, computed from the daemon's
