@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 const CONTROL_SOCKET_FILE: &str = "control.sock";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
+const LEGACY_ATTACH_READY_TIMEOUT: Duration = Duration::from_millis(250);
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_STOP_GRACE_MS: u64 = 60_000;
 
@@ -161,16 +162,23 @@ impl RunnerClient {
         let mut reader = self
             .request(RunnerRequest::AttachTerminal { since_offset })
             .await?;
-        let frame = read_control_frame(&mut reader, "runner terminal attach").await?;
-        validate_protocol(frame.protocol_version())?;
-        match frame {
-            RunnerFrame::AttachReady { .. } => {}
-            RunnerFrame::Error { code, .. } => {
-                return Err(RunnerClientError::RunnerRejected { code });
+        let pending = match timeout(LEGACY_ATTACH_READY_TIMEOUT, reader.read_frame()).await {
+            Ok(result) => {
+                let frame = result?;
+                validate_protocol(frame.protocol_version())?;
+                match frame {
+                    RunnerFrame::TerminalOutput { offset, bytes, .. } => Some((offset, bytes)),
+                    RunnerFrame::Error { code, .. } => {
+                        return Err(RunnerClientError::RunnerRejected { code });
+                    }
+                    frame => return Err(frame_error(frame)),
+                }
             }
-            frame => return Err(frame_error(frame)),
-        }
-        Ok(TerminalSubscription { reader })
+            // v1 runners had no empty-replay acknowledgement. A silent surviving
+            // runner is still a valid attachment; retain its reader for later output.
+            Err(_) => None,
+        };
+        Ok(TerminalSubscription { reader, pending })
     }
 
     /// Writes operator input to a terminal-mode run's PTY. `bytes` is
@@ -268,11 +276,15 @@ impl fmt::Debug for RunnerStreamItem {
 /// to end: the daemon proxy forwards it opaquely without decoding.
 pub struct TerminalSubscription {
     reader: FrameReader,
+    pending: Option<(u64, String)>,
 }
 
 impl TerminalSubscription {
     /// Returns the next chunk's byte-stream offset and base64-encoded bytes.
     pub async fn next_chunk(&mut self) -> Result<(u64, String), RunnerClientError> {
+        if let Some(chunk) = self.pending.take() {
+            return Ok(chunk);
+        }
         let frame = self.reader.read_frame().await?;
         validate_protocol(frame.protocol_version())?;
         match frame {
@@ -435,9 +447,6 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
         },
         RunnerFrame::CommandAck { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner event",
-        },
-        RunnerFrame::AttachReady { .. } => RunnerClientError::UnexpectedFrame {
-            expected: "runner event or command acknowledgement",
         },
         RunnerFrame::TerminalOutput { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner command acknowledgement",

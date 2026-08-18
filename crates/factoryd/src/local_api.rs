@@ -501,9 +501,11 @@ fn spawn_terminal_attach(
             }
         };
         if frame_tx
-            .send(ServerFrame::AttachReady {
+            .send(ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: session_id.clone(),
+                offset: since_offset,
+                bytes: String::new(),
             })
             .await
             .is_err()

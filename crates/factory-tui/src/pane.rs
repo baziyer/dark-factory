@@ -445,12 +445,9 @@ fn spawn_attach_reader_thread(
     std::thread::spawn(move || {
         attach::read_frames(reader, |frame| {
             match frame {
-                ServerFrame::AttachReady { .. } => {
-                    attached.store(true, Ordering::Release);
-                    dirty.store(true, Ordering::Release);
-                }
                 ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
+                        attached.store(true, Ordering::Release);
                         if let Ok(mut parser) = parser.lock() {
                             parser.process(&decoded);
                             dirty.store(true, Ordering::Release);
