@@ -137,6 +137,8 @@ cat >"$staging/latest.json" <<JSON
   }
 }
 JSON
+manifest_sha=$(shasum -a 256 "$staging/latest.json" | cut -d' ' -f1)
+printf '%s  %s\n' "$manifest_sha" latest.json >>"$staging/SHA256SUMS"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 "$script_dir/render-homebrew-formula.sh" "$tag" "$staging/SHA256SUMS" "$repository" \

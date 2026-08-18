@@ -266,9 +266,12 @@ them.
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
    so a rollback never re-downloads.
 7. **Homebrew bootstrap substrate**: this repository renders the exact
-   custom-tap formula from the same two archive checksums and publishes it
-   as `dark-factory.rb`. The tap does not exist yet; #102 remains open until
-   a real published release passes install/audit/test from the future
+   custom-tap formula from the two archive checksums and the update-manifest
+   checksum, then publishes it as `dark-factory.rb`. The versioned manifest
+   is the formula's required top-level source; an architecture-selected
+   resource supplies the binaries. The formula is not published in the tap
+   yet; #102 remains open until a real published release passes
+   install/audit/test from the
    `baziyer/homebrew-tap` repository. To update that tap after a release:
 
    ```sh
@@ -282,10 +285,10 @@ them.
    brew test baziyer/tap/dark-factory
    ```
 
-   The formula checksums the selected arm or Intel archive and installs all
-   four binaries. It deliberately defines no `service` block. Homebrew owns
-   only the bootstrap copy: `factoryctl init` installs the active versioned
-   runtime and launchd job, and `factoryctl update --install` remains the
+   The formula checksums the manifest and selected arm or Intel archive, then
+   installs all four binaries. It deliberately defines no `service` block.
+   Homebrew owns only the bootstrap copy: `factoryctl init` installs the
+   active versioned runtime and launchd job, and `factoryctl update --install` remains the
    sole active-runtime updater so live-session preservation, atomic switch,
    health verification, and rollback stay in one implementation. The
    formula caveats state the same split.

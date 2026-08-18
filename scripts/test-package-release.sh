@@ -49,7 +49,7 @@ factoryd" ] || fail "$target archive has unexpected contents: $listing"
       END { exit NR == 4 ? 0 : 1 }
     ' || fail "$target archive metadata is not normalized"
 done
-(cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "archive checksums failed"
+(cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "release checksums failed"
 
 ruby -rjson -e '
   manifest = JSON.parse(File.read(ARGV.fetch(0)))
@@ -73,9 +73,12 @@ done
 for binary in factoryd factory-runner factoryctl factory-tui; do
     grep -Fq "$binary" "$formula" || fail "formula omitted $binary"
 done
-grep -Fq 'resource("binaries").stage' "$formula" || fail "formula does not install its selected resource"
 grep -Fq 'on_arm do' "$formula" || fail "formula omitted the arm architecture block"
 grep -Fq 'on_intel do' "$formula" || fail "formula omitted the Intel architecture block"
+grep -Fq 'url "https://github.com/example/project/releases/download/v1.2.3/latest.json"' "$formula" \
+    || fail "formula has no stable top-level source"
+grep -Fq 'resource("binaries").stage' "$formula" \
+    || fail "formula does not install its selected resource"
 if grep -Fq 'Hardware::CPU' "$formula"; then
     fail "formula bypasses Homebrew architecture blocks"
 fi
