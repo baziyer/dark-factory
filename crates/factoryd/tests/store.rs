@@ -718,6 +718,44 @@ fn delete_task_requires_no_active_run_and_no_subtasks() {
 }
 
 #[test]
+fn recreating_a_deleted_task_id_gets_a_new_immutable_incarnation() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let create = |title: &str| NewTask {
+        id: task_id("task-1"),
+        project_id: project_id("factory"),
+        parent_task_id: None,
+        title: title.into(),
+        body: String::new(),
+        priority: 0,
+    };
+    store.create_task(create("Original"), 2).unwrap();
+    let session_id = SessionId::try_from("session-1").unwrap();
+    let (original, _) = store
+        .task_delivery_marker(&session_id, &task_id("task-1"))
+        .unwrap();
+
+    store
+        .delete_task(&project_id("factory"), &task_id("task-1"), 3)
+        .unwrap();
+    store.create_task(create("Replacement"), 4).unwrap();
+    let (replacement, _) = store
+        .task_delivery_marker(&session_id, &task_id("task-1"))
+        .unwrap();
+
+    assert_ne!(original, replacement);
+}
+
+#[test]
 fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
     let mut store = Store::open_in_memory().unwrap();
     store

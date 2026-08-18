@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -569,6 +569,7 @@ impl Store {
         let event = FactoryEvent::TaskChanged {
             task: record.snapshot.clone(),
         };
+        let incarnation_id = Uuid::new_v4().hyphenated().to_string();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -576,8 +577,8 @@ impl Store {
         transaction.execute(
             "INSERT INTO tasks (
                 id, project_id, parent_task_id, assigned_agent_id, title, body,
-                status, priority, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8)",
+                status, priority, created_at_ms, updated_at_ms, incarnation_id
+             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
             params![
                 record.snapshot.id.as_str(),
                 record.snapshot.project_id.as_str(),
@@ -586,7 +587,8 @@ impl Store {
                 record.body,
                 record.snapshot.priority,
                 record.snapshot.created_at_ms,
-                record.snapshot.updated_at_ms
+                record.snapshot.updated_at_ms,
+                incarnation_id,
             ],
         )?;
         let sequence = append_event(&transaction, now_ms, &event)?;
@@ -1729,20 +1731,48 @@ impl Store {
         })
     }
 
-    /// Number of times this task has been delivered into this resident
-    /// session. This is the existing durable attempt ledger: retries add a
-    /// run row while retaining prior rows.
-    pub fn run_episode_count(&self, session_id: &SessionId, task_id: &TaskId) -> Result<usize> {
-        self.connection
+    /// Immutable task incarnation plus the number of attempts already
+    /// delivered into this resident session. Together they identify one
+    /// composed delivery across retries and task-id deletion/reuse.
+    pub fn task_delivery_marker(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+    ) -> Result<(String, usize)> {
+        let incarnation_id: String = self
+            .connection
             .query_row(
-                "SELECT COUNT(*) FROM runs WHERE session_id = ?1 AND task_id = ?2",
-                params![session_id.as_str(), task_id.as_str()],
+                "SELECT incarnation_id FROM tasks WHERE id = ?1",
+                params![task_id.as_str()],
                 |row| row.get(0),
             )
-            .map_err(StoreError::from)
-            .and_then(|count: i64| {
-                usize::try_from(count).map_err(|_| StoreError::InvalidExecutionMetadata)
-            })
+            .optional()?
+            .ok_or(StoreError::TaskNotFound)?;
+        let count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM runs WHERE session_id = ?1 AND task_id = ?2",
+            params![session_id.as_str(), task_id.as_str()],
+            |row| row.get(0),
+        )?;
+        let count = usize::try_from(count).map_err(|_| StoreError::InvalidExecutionMetadata)?;
+        Ok((incarnation_id, count))
+    }
+
+    /// Whether the exact composed task incarnation gained a run in this
+    /// session after its delivery marker was captured.
+    pub fn delivery_attempt_committed(
+        &self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        incarnation_id: &str,
+        prior_run_count: usize,
+    ) -> Result<bool> {
+        match self.task_delivery_marker(session_id, task_id) {
+            Ok((current_incarnation, count)) => {
+                Ok(current_incarnation == incarnation_id && count > prior_run_count)
+            }
+            Err(StoreError::TaskNotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// `factoryctl task done`: closes the open episode `succeeded`,
@@ -4327,6 +4357,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_no_foreign_key_violations(connection)?;
+        current = 15;
+    }
+    if current == 15 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0016_task_incarnations.sql"))?;
+        transaction.pragma_update(None, "user_version", 16)?;
+        transaction.commit()?;
     }
     Ok(())
 }

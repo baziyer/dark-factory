@@ -183,6 +183,13 @@ disposable observers. A launch is proven only after a real provider command
 has run and an observer and daemon have both restarted without stopping or
 misidentifying it.
 
+Each task row has an internal immutable incarnation identity, separate from
+its operator-facing task id. Delivery commits carry that identity plus the
+resident session's prior episode count, so only a run created for the exact
+composed task incarnation makes a concurrent commit idempotent. Retrying a
+task preserves its incarnation; deleting and recreating the same task id does
+not.
+
 ## Deliberately unresolved
 
 - Zero-downtime handoff between two daemon binaries is deferred (see
