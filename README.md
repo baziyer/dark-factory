@@ -98,7 +98,7 @@ launchd setting with `factoryctl capacity status` and `factoryctl capacity set
 processes, live session IDs, queued work, and durable state are preserved. A
 higher value can increase concurrent provider/subscription use; a lower value
 leaves saturated work queued. A failed reload or health check restores the
-prior setting; agent sessions cannot change capacity.
+prior setting; the provider-session shell policy denies capacity mutation.
 
 The TUI has two screens:
 

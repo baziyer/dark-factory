@@ -638,6 +638,7 @@ async fn handle_request(
             runner_path: execution.runner_program().to_string_lossy().into_owned(),
             factoryctl_path: execution.factoryctl_path().to_string_lossy().into_owned(),
             version: env!("CARGO_PKG_VERSION").to_owned(),
+            process_id: std::process::id(),
         }),
         LocalRequest::SetAutoMode { enabled } => {
             state

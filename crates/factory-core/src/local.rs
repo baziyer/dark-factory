@@ -452,6 +452,10 @@ pub enum LocalResponse {
         factoryctl_path: String,
         #[serde(default)]
         version: String,
+        /// The daemon process identity, used by managed-service reloads to
+        /// reject an unrelated manual daemon answering on the same socket.
+        #[serde(default)]
+        process_id: u32,
     },
     AutoModeSet {
         enabled: bool,

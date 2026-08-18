@@ -24,7 +24,7 @@ use std::{
 };
 
 use factoryctl::update::UpdateCheck;
-use factoryctl::{install, launchd, probes, update};
+use factoryctl::{install, launchd, probes, runtime, update};
 use serde_json::json;
 
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
@@ -81,6 +81,18 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     }
 
     let installed = install::install_release(&home, &manifest, &mut log)?;
+    let _runtime_lock = runtime::MutationLock::acquire(&home)?;
+    let existing = launchd::read_existing(&plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, &home, &user_home)?;
+    }
+    let previous_plist = existing
+        .as_ref()
+        .map(|_| {
+            std::fs::read_to_string(&plist)
+                .map_err(|error| format!("could not save the existing launchd plist: {error}"))
+        })
+        .transpose()?;
     install::activate(&home, &manifest.version)?;
     log(&format!("bin/current -> {}", manifest.version));
 
@@ -134,6 +146,14 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             Ok(0)
         }
         Err(error) => {
+            let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
+                (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
+                    .and_then(|()| launchd::restore(&plist, &home, previous_plist))
+                    .and_then(|()| {
+                        probes::wait_for_daemon(socket, HEALTH_WAIT, Some(previous)).map(|_| ())
+                    }),
+                _ => Err("no previous managed runtime is available".to_owned()),
+            };
             println!(
                 "{}",
                 json!({
@@ -142,8 +162,12 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                     "current": install::current_link(&home),
                     "launchd": "reloaded",
                     "health": { "ok": false, "error": error },
+                    "rollback": rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
                 })
             );
+            if let Err(rollback_error) = rollback {
+                eprintln!("update: rollback failed: {rollback_error}");
+            }
             eprintln!(
                 "update: the new daemon did not answer within {}s ({error}); see {}/logs/factoryd.stderr.log, \
                  or roll back with `ln -sfn {} {}` and `launchctl kickstart -k gui/$(id -u)/{}`",

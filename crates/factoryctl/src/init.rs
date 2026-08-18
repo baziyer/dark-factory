@@ -18,7 +18,7 @@ use std::{
 };
 
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
-use factoryctl::{Client, install, launchd, probes, update};
+use factoryctl::{Client, install, launchd, probes, runtime, update};
 
 pub struct Options {
     /// Skip the consent prompt (`--yes`).
@@ -123,6 +123,19 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         install::install_from_dir(&home, &source, version)?;
         println!("install: {} <- {}", destination.display(), source.display());
     }
+    let _runtime_lock = runtime::MutationLock::acquire(&home)?;
+    let existing = launchd::read_existing(&plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, &home, &user_home)?;
+    }
+    let previous_version = install::active_version(&home)?;
+    let previous_plist = existing
+        .as_ref()
+        .map(|_| {
+            fs::read_to_string(&plist)
+                .map_err(|error| format!("could not save the existing launchd plist: {error}"))
+        })
+        .transpose()?;
     install::activate(&home, version)?;
     println!("install: bin/current -> {version}");
 
@@ -195,10 +208,19 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     match probes::wait_for_daemon(socket, Duration::from_secs(20), Some(version)) {
         Ok(version) => println!("daemon: {version} answering at {}", socket.display()),
         Err(error) => {
+            let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
+                (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
+                    .and_then(|()| launchd::restore(&plist, &home, previous_plist)),
+                _ => Err("no previous managed runtime is available".to_owned()),
+            };
             println!(
-                "daemon: not answering with {version} yet ({error}); see {}/logs/factoryd.stderr.log",
+                "daemon: not answering with {version} yet ({error}); rollback {}; see {}/logs/factoryd.stderr.log",
+                rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
                 home.display()
             );
+            if let Err(rollback_error) = rollback {
+                println!("rollback: {rollback_error}");
+            }
             print_next_steps(&home, NextSteps::DoctorOnly);
             return Ok(1);
         }
@@ -381,6 +403,7 @@ mod tests {
             runner_path: "/tmp/factory-runner".into(),
             factoryctl_path: "/tmp/factoryctl".into(),
             version: "0.2.0".into(),
+            process_id: 0,
         });
         assert_eq!(
             diagnostic.as_deref(),

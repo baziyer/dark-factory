@@ -7,14 +7,11 @@
 
 use std::{
     env,
-    fs::{self, OpenOptions},
-    io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use crate::{launchd, probes};
+use crate::{launchd, probes, runtime};
 
 pub const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
 pub const MAX_MAX_ACTIVE_RUNS: usize = 64;
@@ -74,22 +71,22 @@ pub fn status(_home: &Path, user_home: &Path) -> Result<CapacityStatus, String> 
     })
 }
 
-/// Applies one operator capacity change. The setting is deliberately absent
-/// from the local daemon protocol: an authenticated provider session is not an
-/// operator and must not be able to request it. The provider-session markers
-/// are checked here as a second line of defense for both the CLI and TUI.
+/// Applies one capacity change. The setting is deliberately absent from the
+/// local daemon protocol; the daemon's explicit PreToolUse policy denies
+/// provider-session shell mutations before this operator-side service runs.
 pub fn set(
     home: &Path,
     user_home: &Path,
     socket: &Path,
     requested: usize,
 ) -> Result<CapacityChange, String> {
-    ensure_operator()?;
     let requested = validate(requested)?;
-    let _lock = CapacityLock::acquire(home)?;
+    let _lock = runtime::MutationLock::acquire(home)?;
     let plist = launchd::plist_path(user_home);
     let existing = launchd::read_existing(&plist)?
         .ok_or("no launchd job is installed; capacity changes require the managed daemon")?;
+    let previous_plist = std::fs::read_to_string(&plist)
+        .map_err(|error| format!("could not save the existing launchd plist: {error}"))?;
     launchd::check_home(&existing, home, user_home)?;
     if !probes::launchd_loaded() {
         if probes::daemon_answers(socket) {
@@ -100,6 +97,8 @@ pub fn set(
         }
         return Err("the Dark Factory launchd job is not loaded".into());
     }
+    probes::wait_for_managed_daemon(socket, Duration::from_secs(2), None, home)
+        .map_err(|error| format!("managed launchd health check failed: {error}"))?;
     let previous =
         launchd::max_active_runs(&existing.program_arguments)?.unwrap_or(DEFAULT_MAX_ACTIVE_RUNS);
     if previous == requested {
@@ -117,21 +116,19 @@ pub fn set(
         &std::collections::BTreeMap::new(),
         Some(requested),
     )?;
-    if probes::wait_for_daemon(socket, HEALTH_WAIT, None).is_err() {
-        let rollback = launchd::apply(
-            home,
-            &plist,
-            Some(&existing),
-            &probes::provider_directories(),
-            &std::collections::BTreeMap::new(),
-            Some(previous),
-        );
+    if let Err(error) = probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
+        let rollback = launchd::restore(&plist, home, &previous_plist);
         return match rollback {
-            Ok(()) => Err(format!(
-                "factoryd did not answer after the capacity change; capacity rolled back to {previous}"
-            )),
-            Err(error) => Err(format!(
-                "factoryd did not answer after the capacity change; rollback to {previous} failed: {error}"
+            Ok(()) => match probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
+                Ok(_) => Err(format!(
+                    "managed daemon health failed after the capacity change ({error}); capacity rolled back to {previous}"
+                )),
+                Err(recovery) => Err(format!(
+                    "managed daemon health failed after the capacity change ({error}); capacity plist restored but rollback health failed: {recovery}"
+                )),
+            },
+            Err(rollback) => Err(format!(
+                "managed daemon health failed after the capacity change ({error}); rollback to {previous} failed: {rollback}"
             )),
         };
     }
@@ -139,58 +136,6 @@ pub fn set(
         previous,
         current: requested,
     })
-}
-
-struct CapacityLock {
-    path: PathBuf,
-}
-
-impl CapacityLock {
-    fn acquire(home: &Path) -> Result<Self, String> {
-        let path = home.join("capacity.lock");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::AlreadyExists {
-                    "another capacity or runtime update is already in progress".to_owned()
-                } else {
-                    format!("could not lock capacity setting: {error}")
-                }
-            })?;
-        if let Err(error) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
-            let _ = fs::remove_file(&path);
-            return Err(format!("could not secure capacity lock: {error}"));
-        }
-        Ok(Self { path })
-    }
-}
-
-impl Drop for CapacityLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn ensure_operator() -> Result<(), String> {
-    ensure_operator_with(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
-}
-
-fn ensure_operator_with(has_value: impl Fn(&str) -> bool) -> Result<(), String> {
-    if [
-        "DARK_FACTORY_AGENT",
-        "DARK_FACTORY_AGENT_DIR",
-        "DARK_FACTORY_SESSION_TOKEN_FILE",
-    ]
-    .into_iter()
-    .any(has_value)
-    {
-        return Err(
-            "capacity changes are operator-only; agent sessions cannot change capacity".into(),
-        );
-    }
-    Ok(())
 }
 
 fn factory_home() -> Result<PathBuf, String> {
@@ -207,26 +152,5 @@ mod tests {
         assert_eq!(validate(MAX_MAX_ACTIVE_RUNS), Ok(MAX_MAX_ACTIVE_RUNS));
         assert!(validate(0).is_err());
         assert!(validate(MAX_MAX_ACTIVE_RUNS + 1).is_err());
-    }
-
-    #[test]
-    fn concurrent_capacity_changes_are_rejected_by_a_private_lock() {
-        let home = tempfile::tempdir().unwrap();
-        let first = CapacityLock::acquire(home.path()).unwrap();
-        assert!(CapacityLock::acquire(home.path()).is_err());
-        drop(first);
-        assert!(CapacityLock::acquire(home.path()).is_ok());
-    }
-
-    #[test]
-    fn provider_session_identity_is_not_an_operator_principal() {
-        for blocked in [
-            "DARK_FACTORY_AGENT",
-            "DARK_FACTORY_AGENT_DIR",
-            "DARK_FACTORY_SESSION_TOKEN_FILE",
-        ] {
-            assert!(ensure_operator_with(|name| name == blocked).is_err());
-        }
-        assert!(ensure_operator_with(|_| false).is_ok());
     }
 }

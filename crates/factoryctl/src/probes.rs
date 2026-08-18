@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::Client;
+use crate::{Client, install};
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
 
 use crate::launchd;
@@ -161,5 +161,170 @@ pub fn wait_for_daemon(
             return Err(last_error);
         }
         thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// Polls health and launchd together, requiring the responder to be the
+/// process launchd owns for the managed job and to use the active sibling
+/// binaries. A healthy socket responder alone is not sufficient: a manually
+/// started daemon can otherwise make a failed managed reload look successful.
+pub fn wait_for_managed_daemon(
+    socket: &Path,
+    timeout: Duration,
+    expected_version: Option<&str>,
+    home: &Path,
+) -> Result<String, String> {
+    let client = Client::new(socket);
+    let expected_runner = install::current_link(home)
+        .join("factory-runner")
+        .to_string_lossy()
+        .into_owned();
+    let expected_factoryctl = install::current_link(home)
+        .join("factoryctl")
+        .to_string_lossy()
+        .into_owned();
+    let deadline = Instant::now() + timeout;
+    loop {
+        let last_error = match launchd::job_pid(rustix::process::getuid().as_raw()) {
+            Ok(Some(job_pid)) => {
+                match client.request_with_timeout(LocalRequest::Health, Duration::from_secs(2)) {
+                    Ok(ServerFrame::Response {
+                        response:
+                            LocalResponse::Health {
+                                runner_path,
+                                factoryctl_path,
+                                version,
+                                process_id,
+                            },
+                        ..
+                    }) => {
+                        match validate_managed_health(
+                            &HealthProbe {
+                                runner_path: &runner_path,
+                                factoryctl_path: &factoryctl_path,
+                                version: &version,
+                                process_id,
+                            },
+                            job_pid,
+                            expected_version,
+                            &ManagedPaths {
+                                runner: &expected_runner,
+                                factoryctl: &expected_factoryctl,
+                            },
+                        ) {
+                            Ok(()) => return Ok(version),
+                            Err(error) => error,
+                        }
+                    }
+                    Ok(_) => "unexpected reply to health".to_owned(),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Ok(None) => "managed launchd job has no live process".to_owned(),
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            return Err(last_error);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+struct HealthProbe<'a> {
+    runner_path: &'a str,
+    factoryctl_path: &'a str,
+    version: &'a str,
+    process_id: u32,
+}
+
+struct ManagedPaths<'a> {
+    runner: &'a str,
+    factoryctl: &'a str,
+}
+
+fn validate_managed_health(
+    health: &HealthProbe<'_>,
+    job_pid: u32,
+    expected_version: Option<&str>,
+    expected_paths: &ManagedPaths<'_>,
+) -> Result<(), String> {
+    if health.process_id == 0 || health.process_id != job_pid {
+        return Err(format!(
+            "health answered from process {}, not managed launchd process {job_pid}",
+            health.process_id
+        ));
+    }
+    if health.runner_path != expected_paths.runner
+        || health.factoryctl_path != expected_paths.factoryctl
+    {
+        return Err("managed job answered with unexpected runtime paths".to_owned());
+    }
+    if let Some(expected) = expected_version {
+        if health.version != expected {
+            return Err(format!(
+                "a daemon answers, but it is {} rather than {expected}",
+                if health.version.is_empty() {
+                    "an older version"
+                } else {
+                    health.version
+                }
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HealthProbe, ManagedPaths, validate_managed_health};
+
+    #[test]
+    fn managed_health_rejects_unrelated_processes_and_paths() {
+        let paths = ManagedPaths {
+            runner: "/r",
+            factoryctl: "/c",
+        };
+        assert!(
+            validate_managed_health(
+                &HealthProbe {
+                    runner_path: "/r",
+                    factoryctl_path: "/c",
+                    version: "0.2.0",
+                    process_id: 99,
+                },
+                100,
+                Some("0.2.0"),
+                &paths,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_health(
+                &HealthProbe {
+                    runner_path: "/manual/r",
+                    factoryctl_path: "/manual/c",
+                    version: "0.2.0",
+                    process_id: 100,
+                },
+                100,
+                Some("0.2.0"),
+                &paths,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_managed_health(
+                &HealthProbe {
+                    runner_path: "/r",
+                    factoryctl_path: "/c",
+                    version: "0.2.0",
+                    process_id: 100,
+                },
+                100,
+                Some("0.2.0"),
+                &paths,
+            )
+            .is_ok()
+        );
     }
 }

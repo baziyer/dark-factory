@@ -33,6 +33,7 @@ fn request_writes_one_json_line_and_reads_one_versioned_frame() {
                 runner_path: "/opt/factory-runner".to_owned(),
                 factoryctl_path: "/opt/factoryctl".to_owned(),
                 version: "0.1.0".to_owned(),
+                process_id: 0,
             },
         };
         serde_json::to_writer(&mut stream, &frame).unwrap();
@@ -48,6 +49,7 @@ fn request_writes_one_json_line_and_reads_one_versioned_frame() {
                 runner_path: "/opt/factory-runner".to_owned(),
                 factoryctl_path: "/opt/factoryctl".to_owned(),
                 version: "0.1.0".to_owned(),
+                process_id: 0,
             },
         }
     );
