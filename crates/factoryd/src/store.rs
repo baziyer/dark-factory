@@ -1824,6 +1824,17 @@ impl Store {
             .collect()
     }
 
+    pub fn get_session(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionSnapshot> {
+        load_session(&self.connection, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .map(|session| session.snapshot())
+            .ok_or(StoreError::SessionNotFound)
+    }
+
     /// The agent's current live session, if any.
     pub fn live_session_for_agent(
         &self,
@@ -1911,6 +1922,53 @@ impl Store {
                  wait_reason = ?2
              WHERE id = ?3",
             params![now_ms, wait_reason, session_id.as_str()],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let event = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    /// Keeps a session live and visibly degraded when the runner disappears
+    /// without first publishing its provider's terminal event. Clearing the
+    /// live session here would make an incompletely reaped process tree
+    /// deletable; leaving the ownership row in place makes cleanup failure
+    /// fail closed while exposing the reason to status/TUI operators.
+    pub fn mark_session_cleanup_failed(
+        &mut self,
+        session_id: &SessionId,
+        reason: String,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        if reason.is_empty() || reason.len() > MAX_WAIT_REASON_BYTES {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        transaction.execute(
+            "UPDATE sessions
+             SET activity = 'cleanup_failed', activity_inferred = 1,
+                 wait_reason = ?1, observer_health = 'degraded',
+                 observer_health_since_ms = ?2, updated_at_ms = ?2
+             WHERE id = ?3",
+            params![reason, now_ms, session_id.as_str()],
         )?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();

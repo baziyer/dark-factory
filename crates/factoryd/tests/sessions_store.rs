@@ -1152,6 +1152,30 @@ fn end_session_after_an_operator_stop_closes_the_episode_stopped_not_failed() {
     assert_eq!(task.snapshot.status, TaskStatus::Cancelled);
 }
 
+#[test]
+fn cleanup_failure_keeps_session_owned_and_blocks_agent_deletion() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+
+    let (session, event) = store
+        .mark_session_cleanup_failed(&snapshot.id, "owned group did not disappear".into(), 6)
+        .unwrap();
+    assert!(session.state.is_live());
+    assert_eq!(session.activity.as_deref(), Some("cleanup_failed"));
+    assert_eq!(
+        session.wait_reason.as_deref(),
+        Some("owned group did not disappear")
+    );
+    assert!(matches!(event.event, FactoryEvent::SessionChanged { .. }));
+    assert_eq!(session.ended_at_ms, None);
+    assert!(matches!(
+        store.check_agent_deletable(&project_id("factory"), &agent_id("curie")),
+        Err(StoreError::AgentHasLiveSession)
+    ));
+}
+
 // --- complete_task / block_task / cancel_run -----------------------------
 
 #[test]

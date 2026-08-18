@@ -13,7 +13,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -110,6 +110,7 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
             .mode(mode)
             .custom_flags(nofollow_flag())
             .open(&temp_path)?;
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         file.sync_all()
     })();
