@@ -14,59 +14,43 @@ Claude Code, Codex CLI, and a shell provider for tests.
 
 ## Install
 
-Install Git and at least one provider. Run the matching login and check before
-you run `init`:
+After installing Git and at least one provider, install the Dark Factory
+bootstrap:
 
 ```sh
-claude auth login && claude auth status  # for Claude Code
-codex login && codex login status        # for Codex CLI
+brew install baziyer/tap/dark-factory
 ```
 
-To keep factory Codex sessions on a separate account, set up a dedicated home
-first. Keep `CODEX_HOME` set when you later run `factoryctl init`:
+Sign in to the provider you will use:
+
+```sh
+claude auth login && claude auth status  # Claude Code
+codex login && codex login status        # Codex CLI
+```
+
+To use a separate Codex account for factory sessions, set `CODEX_HOME` before
+you sign in and keep it set for `init`:
 
 ```sh
 export CODEX_HOME="$HOME/.codex-dark-factory"
 codex login && codex login status
 ```
 
-See the [provider guide](docs/providers.md) for other account choices. Then
-download and verify the latest Dark Factory release:
+Initialize Dark Factory, add its active commands to your path, and check the
+installation:
 
 ```sh
-work_dir=$(mktemp -d /tmp/dark-factory-install.XXXXXX)
-curl -fsSL https://github.com/baziyer/dark-factory/releases/latest/download/latest.json \
-  -o "$work_dir/latest.json"
-case "$(uname -m)" in
-  arm64) platform_key=aarch64-apple-darwin ;;
-  x86_64) platform_key=x86_64-apple-darwin ;;
-  *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
-esac
-asset_url=$(plutil -extract "assets.$platform_key.url" raw -o - "$work_dir/latest.json")
-asset_sha=$(plutil -extract "assets.$platform_key.sha256" raw -o - "$work_dir/latest.json")
-curl -fL "$asset_url" -o "$work_dir/dark-factory.tar.gz"
-printf '%s  %s\n' "$asset_sha" "$work_dir/dark-factory.tar.gz" | shasum -a 256 -c -
-tar -xzf "$work_dir/dark-factory.tar.gz" -C "$work_dir"
-"$work_dir/factoryctl" init
-```
-
-The commands use `curl` to avoid macOS browser quarantine. If you use a browser,
-clear quarantine from the extracted directory before you run `init`:
-
-```sh
-xattr -dr com.apple.quarantine /path/to/extracted/dark-factory
-```
-
-`init` installs the binaries in `~/.dark-factory/bin/current`. It asks before
-it installs the background service. Add the installed commands to your shell:
-
-```sh
+factoryctl init
 echo 'export PATH="$HOME/.dark-factory/bin/current:$PATH"' >> ~/.zprofile
-export PATH="$HOME/.dark-factory/bin/current:$PATH"
+source ~/.zprofile
 factoryctl doctor
 ```
 
-`doctor` reports each failed check and does not change your system.
+`init` installs the active runtime in `~/.dark-factory/bin/current` and asks
+before installing the background service. `doctor` reports failed checks
+without changing your system. See [provider setup](docs/providers.md) for
+other account choices. Release archives and checksums remain available on the
+[releases page](https://github.com/baziyer/dark-factory/releases).
 
 ## Start a factory
 
@@ -144,15 +128,19 @@ merge remain independent operator actions.
 ## Update
 
 ```sh
-factoryctl update
+brew upgrade baziyer/tap/dark-factory
 factoryctl update --install
 factoryctl doctor
 ```
 
-An update restarts the daemon. Running agent sessions continue. See the
-[release and update guide](docs/development/WORKFLOW.md#release-and-update)
-for rollback details. See the
-[service guide](launchd/README.md#uninstall) to uninstall Dark Factory.
+Homebrew updates the bootstrap. `factoryctl update --install` updates the active
+runtime and restarts the daemon; running agent sessions continue. Do not use
+`brew services` for Dark Factory.
+
+`brew uninstall dark-factory` removes only the bootstrap. The active runtime,
+launchd job, and state remain. See the [service and uninstall
+guide](launchd/README.md#uninstall) for safe removal and the [release and update
+guide](docs/development/WORKFLOW.md#release-and-update) for rollback details.
 
 ## Learn more
 
