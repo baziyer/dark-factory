@@ -211,8 +211,11 @@ always overrides the factory default. `factoryctl status` reports
 `auto_mode`. Every tool call still passes through the daemon's authenticated
 `PreToolUse` hook: a small deny policy blocks destructive git operations,
 permits recursive forced deletion only for simple literal targets confined
-to the agent worktree, and blocks named secret paths. It records allow/deny
-decisions in the durable event ledger. A
+to the agent worktree, and blocks recognized direct access to named secret
+paths. It records allow/deny
+decisions in the durable event ledger. Unsupported shell expansion and
+substitution syntax denies closed; quoted arguments and quoted heredoc bodies
+remain available for normal review/comment prose. A
 file-based outbox
 (drained by the next hook) is still the fallback for an agent's own
 `factoryctl task done`/`task blocked`/`agent message` call if the daemon is
