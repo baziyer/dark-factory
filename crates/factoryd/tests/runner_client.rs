@@ -69,6 +69,14 @@ fn encoded(frame: RunnerFrame) -> Vec<u8> {
     bytes
 }
 
+fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
+    RunnerFrame::TerminalOutput {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        offset,
+        bytes: bytes.to_owned(),
+    }
+}
+
 struct FakeRunner {
     _directory: tempfile::TempDir,
     runtime_dir: PathBuf,
@@ -662,4 +670,57 @@ async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_
 
     drop(subscription);
     assert_subscribe_request(fake).await;
+}
+
+#[tokio::test]
+async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
+    let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-output");
+    let fake = fake_runner(vec![vec![encoded(terminal_output(7, &bytes))]]).await;
+    let mut subscription = client(&fake.runtime_dir).attach_terminal(7).await.unwrap();
+    assert_eq!(subscription.next_chunk().await.unwrap(), (7, bytes));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![RequestEnvelope::new(
+            run_id(),
+            instance_id(),
+            RunnerRequest::AttachTerminal { since_offset: 7 }
+        )]
+    );
+}
+
+#[tokio::test]
+async fn silent_old_v1_runner_has_a_bounded_fallback_without_losing_later_output() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime_dir = directory.path().join("runtime");
+    std::fs::create_dir(&runtime_dir).unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("control.sock")).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let mut stream = reader.into_inner();
+        stream
+            .write_all(&encoded(terminal_output(
+                0,
+                &factory_core::runner::encode_terminal_bytes(b"later"),
+            )))
+            .await
+            .unwrap();
+    });
+
+    let started = tokio::time::Instant::now();
+    let mut subscription = client(&runtime_dir).attach_terminal(0).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(350),
+        "legacy silent attach stayed blocked"
+    );
+    let (offset, bytes) = subscription.next_chunk().await.unwrap();
+    assert_eq!(offset, 0);
+    assert_eq!(
+        factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
+        b"later"
+    );
+    server.await.unwrap();
 }

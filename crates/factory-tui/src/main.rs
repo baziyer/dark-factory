@@ -684,9 +684,11 @@ mod main_tests {
                 serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
                 "attach_terminal"
             );
-            let ready = ServerFrame::AttachReady {
+            let ready = ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                offset: 0,
+                bytes: String::new(),
             };
             serde_json::to_writer(&mut attach, &ready).unwrap();
             attach.write_all(b"\n").unwrap();
@@ -736,7 +738,10 @@ mod main_tests {
             std::thread::sleep(Duration::from_millis(10));
             sync_panes(&mut board, &mut panes, &socket, None);
         }
-        assert!(board.pane_ready, "silent pane never observed AttachReady");
+        assert!(
+            board.pane_ready,
+            "silent pane never observed readiness output"
+        );
 
         let enter = board.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(board.pane_mode, model::PaneMode::Typing);

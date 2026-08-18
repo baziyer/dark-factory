@@ -140,13 +140,7 @@ mod tests {
     }
 
     fn ready_line(session_id: &str) -> Vec<u8> {
-        let frame = ServerFrame::AttachReady {
-            protocol_version: factory_core::PROTOCOL_VERSION,
-            session_id: SessionId::try_from(session_id).unwrap(),
-        };
-        let mut line = serde_json::to_vec(&frame).unwrap();
-        line.push(b'\n');
-        line
+        frame_line(session_id, 0, b"")
     }
 
     #[test]
@@ -158,7 +152,10 @@ mod tests {
             frames.push(frame);
             true
         });
-        assert!(matches!(frames[0], ServerFrame::AttachReady { .. }));
+        assert!(matches!(
+            &frames[0],
+            ServerFrame::TerminalOutput { bytes, .. } if bytes.is_empty()
+        ));
         assert!(matches!(frames[1], ServerFrame::TerminalOutput { .. }));
     }
 

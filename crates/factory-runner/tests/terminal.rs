@@ -267,10 +267,6 @@ fn terminal_mode_attaches_replays_and_streams_written_input() {
         RunnerRequest::AttachTerminal { since_offset: 0 },
     );
     let mut reader = BufReader::new(stream);
-    assert!(matches!(
-        read_frame(&mut reader),
-        RunnerFrame::AttachReady { .. }
-    ));
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !String::from_utf8_lossy(&collected).contains("hello") {
@@ -341,10 +337,10 @@ fn silent_terminal_acknowledges_attach_before_first_input_reaches_child() {
         RunnerRequest::AttachTerminal { since_offset: 0 },
     );
     let mut reader = BufReader::new(stream);
-    assert!(matches!(
-        read_frame(&mut reader),
-        RunnerFrame::AttachReady { .. }
-    ));
+    let RunnerFrame::TerminalOutput { bytes, .. } = read_frame(&mut reader) else {
+        panic!("silent attach did not use the v1 terminal-output boundary");
+    };
+    assert!(decode_terminal_bytes(&bytes).unwrap().is_empty());
 
     assert_command_ack(request(
         &runner,
@@ -547,10 +543,6 @@ fn late_attach_replays_only_from_the_requested_offset() {
         RunnerRequest::AttachTerminal { since_offset: 0 },
     );
     let mut reader = BufReader::new(stream);
-    assert!(matches!(
-        read_frame(&mut reader),
-        RunnerFrame::AttachReady { .. }
-    ));
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while collected.len() < 10 {
@@ -574,10 +566,6 @@ fn late_attach_replays_only_from_the_requested_offset() {
         RunnerRequest::AttachTerminal { since_offset: 5 },
     );
     let mut reader = BufReader::new(stream);
-    assert!(matches!(
-        read_frame(&mut reader),
-        RunnerFrame::AttachReady { .. }
-    ));
     let frame = read_frame(&mut reader);
     let RunnerFrame::TerminalOutput { offset, bytes, .. } = frame else {
         panic!("expected terminal output, got {frame:?}");
@@ -652,8 +640,8 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     );
     let frame = read_frame(&mut BufReader::new(stream));
     assert!(
-        matches!(frame, RunnerFrame::AttachReady { .. }),
-        "expected a fresh reattach acknowledgement, got {frame:?}"
+        matches!(frame, RunnerFrame::TerminalOutput { offset: 0, .. }),
+        "expected a fresh v1 terminal-output replay, got {frame:?}"
     );
 
     let _ = request(

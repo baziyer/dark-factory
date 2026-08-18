@@ -1350,16 +1350,20 @@ async fn attach_terminal_connection(
         )
         .await;
     }
-    send_frame(
-        write,
-        &RunnerFrame::AttachReady {
-            protocol_version: RUNNER_PROTOCOL_VERSION,
-        },
-    )
-    .await?;
     terminal_log
         .replay(write, snapshot, since_offset, snapshot.total_bytes)
         .await?;
+    // A v1-compatible readiness boundary: old clients already understand
+    // TerminalOutput, and zero bytes do not alter their parser state.
+    send_frame(
+        write,
+        &RunnerFrame::TerminalOutput {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            offset: snapshot.total_bytes,
+            bytes: String::new(),
+        },
+    )
+    .await?;
     let mut delivered = snapshot.total_bytes;
 
     loop {
