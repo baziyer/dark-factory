@@ -36,6 +36,19 @@ operator from their own agents. Concretely:
   the operator's OS user, including credentials. `factoryctl auto off`
   changes the default for future sessions; an explicit agent profile
   permission mode wins for that agent.
+- **Remote repository writes use a narrower daemon capability.** Sessions do
+  not inherit token variables or `SSH_AUTH_SOCK`; their environment also
+  resets Git credential helpers, disables Git SSH and prompts, and hides the
+  operator's `gh` configuration. `factoryctl git status|diff|commit|push` and
+  `factoryctl pr open|update` authenticate the live session token and let the
+  daemon operate only on that session's exact worktree and `agent/<id>` ref.
+  Callers cannot provide a path, remote, refspec, force/delete flag, or PR
+  head. Request/result events omit diffs, commit/PR prose, and credentials;
+  merge and release remain external-reviewer/operator actions. This reduces
+  accidentally delegated authority, but is not OS isolation: a process
+  already running as the operator can still search filesystem-readable
+  credentials or evade environment policy. The separate runner user in #54
+  remains the outer security boundary.
 - **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
   tool call reaches an authenticated `PreToolUse` hook. The daemon denies
   recognizable force-push, pushed-ref deletion, branch-delete, and
@@ -76,14 +89,16 @@ operator from their own agents. Concretely:
   Ordinary pause and budget exhaustion are separate durable holds, and both
   spawn and delivery consult exhaustion directly rather than trusting a
   shared or cached pause projection.
-- **Hooks are authenticated; the rest is your user.** A provider's hook
+- **Hooks and repository requests are authenticated; the rest is your user.** A provider's hook
   invocations identify their session by a per-session random token in a
   `0600` file (never on argv or in the environment). An agent's own `task
   done`/`task blocked`/`agent message` calls, and every operator command,
   are plain local-API requests: whoever can open the socket — any process
   running as you, including every session — can make them, naming any
-  agent. Per-session authentication of those calls is planned (roles and
-  a review queue), not present. The daemon spawns runners with a fixed
+  agent. Repository commands are the exception: they authenticate that same
+  live-session bearer token and infer their target identity from it.
+  Per-session authentication of the remaining calls is planned (roles and a
+  review queue), not present. The daemon spawns runners with a fixed
   non-secret environment allowlist, not its own ambient environment.
 - **Bounded inputs everywhere.** Guidance files, hook payloads, local-API
   frames, retained terminal logs, and webhook bodies all have hard size
