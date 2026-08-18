@@ -40,6 +40,110 @@ pub const MAX_ACTIVE_RUNS_ARGUMENT: &str = "--max-active-runs";
 /// credentials from.
 pub const INIT_CARRIED_ENVIRONMENT: [&str; 1] = ["CODEX_HOME"];
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RollbackOutcome {
+    NotAttempted,
+    Restored,
+    RuntimeFailed(String),
+    JobFailed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MutationError {
+    message: String,
+    outcome: RollbackOutcome,
+}
+
+impl MutationError {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            outcome: RollbackOutcome::NotAttempted,
+        }
+    }
+
+    fn rolled_back(message: String) -> Self {
+        Self {
+            message,
+            outcome: RollbackOutcome::Restored,
+        }
+    }
+
+    fn runtime_failed(message: String, runtime: String) -> Self {
+        Self {
+            message,
+            outcome: RollbackOutcome::RuntimeFailed(runtime),
+        }
+    }
+
+    fn job_failed(message: String, job: String) -> Self {
+        Self {
+            message,
+            outcome: RollbackOutcome::JobFailed(job),
+        }
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> &RollbackOutcome {
+        &self.outcome
+    }
+}
+
+impl std::fmt::Display for MutationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MutationError {}
+
+/// The launchd service identity used by a managed runtime. Production uses
+/// the fixed operator label; tests can inject a unique label in the same user
+/// domain without booting out the operator's live service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchdTarget {
+    domain: String,
+    label: String,
+}
+
+pub struct ApplyRequest<'a> {
+    pub target: &'a LaunchdTarget,
+    pub home: &'a Path,
+    pub plist: &'a Path,
+    pub existing: Option<&'a ExistingJob>,
+    pub provider_directories: &'a [(&'a str, PathBuf)],
+    pub extra_environment: &'a BTreeMap<String, String>,
+    pub capacity: Option<usize>,
+}
+
+impl LaunchdTarget {
+    #[must_use]
+    pub fn for_user(uid: u32) -> Self {
+        Self {
+            domain: format!("gui/{uid}"),
+            label: LABEL.to_owned(),
+        }
+    }
+
+    #[must_use]
+    pub fn new(domain: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            domain: domain.into(),
+            label: label.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
+
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// The subset of this process's environment that [`INIT_CARRIED_ENVIRONMENT`]
 /// names and that is set (non-empty).
 #[must_use]
@@ -60,10 +164,19 @@ const BOOTSTRAP_RETRY: Duration = Duration::from_millis(500);
 /// `~/Library/LaunchAgents/com.dark-factory.factoryd.plist`.
 #[must_use]
 pub fn plist_path(user_home: &Path) -> PathBuf {
+    plist_path_for(
+        user_home,
+        &LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+    )
+}
+
+/// Path for an explicitly selected managed launchd identity.
+#[must_use]
+pub fn plist_path_for(user_home: &Path, target: &LaunchdTarget) -> PathBuf {
     user_home
         .join("Library")
         .join("LaunchAgents")
-        .join(format!("{LABEL}.plist"))
+        .join(format!("{}.plist", target.label()))
 }
 
 /// What an existing job runs and with which environment, read back through
@@ -195,6 +308,24 @@ pub fn render(
     extra_arguments: &[String],
     environment: &BTreeMap<String, String>,
 ) -> String {
+    render_for(
+        &LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+        home,
+        factoryd,
+        extra_arguments,
+        environment,
+    )
+}
+
+/// Renders a job for an explicitly selected managed launchd identity.
+#[must_use]
+pub fn render_for(
+    target: &LaunchdTarget,
+    home: &Path,
+    factoryd: &Path,
+    extra_arguments: &[String],
+    environment: &BTreeMap<String, String>,
+) -> String {
     let arguments = std::iter::once(factoryd.to_string_lossy().into_owned())
         .chain(extra_arguments.iter().cloned())
         .map(|argument| format!("        <string>{}</string>", escape(&argument)))
@@ -217,6 +348,10 @@ pub fn render(
         .collect::<Vec<_>>()
         .join("\n");
     TEMPLATE
+        .replace(
+            &format!("<string>{LABEL}</string>"),
+            &format!("<string>{}</string>", escape(target.label())),
+        )
         .replace("__PROGRAM_ARGUMENTS__", &arguments)
         .replace("__ENVIRONMENT__", &environment)
         .replace("__DARK_FACTORY_HOME__", &escape(&home.to_string_lossy()))
@@ -325,7 +460,7 @@ pub fn apply(
     provider_directories: &[(&str, PathBuf)],
     extra_environment: &BTreeMap<String, String>,
     capacity: Option<usize>,
-) -> Result<(), String> {
+) -> Result<(), MutationError> {
     apply_with_rollback(
         home,
         plist,
@@ -348,7 +483,35 @@ pub fn apply_with_rollback(
     extra_environment: &BTreeMap<String, String>,
     capacity: Option<usize>,
     rollback_runtime: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), MutationError> {
+    apply_with_rollback_for(
+        ApplyRequest {
+            target: &LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+            home,
+            plist,
+            existing,
+            provider_directories,
+            extra_environment,
+            capacity,
+        },
+        rollback_runtime,
+    )
+}
+
+/// Applies a managed launchd mutation for an explicitly selected service.
+pub fn apply_with_rollback_for(
+    request: ApplyRequest<'_>,
+    rollback_runtime: impl FnMut() -> Result<(), String>,
+) -> Result<(), MutationError> {
+    let ApplyRequest {
+        target,
+        home,
+        plist,
+        existing,
+        provider_directories,
+        extra_environment,
+        capacity,
+    } = request;
     let mut environment = existing
         .map(|job| job.environment.clone())
         .unwrap_or_default();
@@ -364,30 +527,32 @@ pub fn apply_with_rollback(
     environment.insert("PATH".to_owned(), path);
     let existing_arguments = existing.map_or(&[][..], |job| job.program_arguments.as_slice());
     let capacity = capacity
-        .or(max_active_runs(existing_arguments)?.or(Some(DEFAULT_MAX_ACTIVE_RUNS)))
-        .ok_or("capacity is not configured")?;
+        .or(max_active_runs(existing_arguments)
+            .map_err(MutationError::plain)?
+            .or(Some(DEFAULT_MAX_ACTIVE_RUNS)))
+        .ok_or_else(|| MutationError::plain("capacity is not configured"))?;
     let carried = carried_arguments_with_capacity(existing_arguments, capacity);
     let factoryd = install::current_link(home).join("factoryd");
-    let content = render(home, &factoryd, &carried, &environment);
+    let content = render_for(target, home, &factoryd, &carried, &environment);
     let old_content = if plist.exists() {
         Some(fs::read_to_string(plist).map_err(|error| {
-            format!(
+            MutationError::plain(format!(
                 "could not read the existing launchd plist {}: {error}",
                 plist.display()
-            )
+            ))
         })?)
     } else {
         None
     };
     install_and_reload(plist, home, &content, old_content, rollback_runtime, || {
-        reload(rustix::process::getuid().as_raw(), plist)
+        reload_for(target, plist)
     })
 }
 
 /// Restores a previously saved plist and reloads that exact managed job. This
 /// is used after a post-reload health failure, where merely repointing
 /// `bin/current` would leave launchd running the changed job state.
-pub fn restore(plist: &Path, home: &Path, content: &str) -> Result<(), String> {
+pub fn restore(plist: &Path, home: &Path, content: &str) -> Result<(), MutationError> {
     restore_with_rollback(plist, home, content, || Ok(()))
 }
 
@@ -399,19 +564,36 @@ pub fn restore_with_rollback(
     home: &Path,
     content: &str,
     rollback_runtime: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<(), MutationError> {
+    restore_with_rollback_for(
+        &LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+        plist,
+        home,
+        content,
+        rollback_runtime,
+    )
+}
+
+/// Restores a saved plist for an explicitly selected managed service.
+pub fn restore_with_rollback_for(
+    target: &LaunchdTarget,
+    plist: &Path,
+    home: &Path,
+    content: &str,
+    rollback_runtime: impl FnMut() -> Result<(), String>,
+) -> Result<(), MutationError> {
     let current = if plist.exists() {
         Some(fs::read_to_string(plist).map_err(|error| {
-            format!(
+            MutationError::plain(format!(
                 "could not read the current launchd plist {}: {error}",
                 plist.display()
-            )
+            ))
         })?)
     } else {
         None
     };
     install_and_reload(plist, home, content, current, rollback_runtime, || {
-        reload(rustix::process::getuid().as_raw(), plist)
+        reload_for(target, plist)
     })
 }
 
@@ -422,30 +604,40 @@ fn install_and_reload(
     old_content: Option<String>,
     mut rollback_runtime: impl FnMut() -> Result<(), String>,
     mut reload: impl FnMut() -> Result<(), String>,
-) -> Result<(), String> {
-    install(plist, content, home)?;
+) -> Result<(), MutationError> {
+    install(plist, content, home).map_err(MutationError::plain)?;
     match reload() {
         Ok(()) => Ok(()),
         Err(error) => {
             if let Err(runtime) = rollback_runtime() {
-                return Err(format!(
-                    "{error}; runtime rollback failed before restoring the launchd plist: {runtime}"
+                return Err(MutationError::runtime_failed(
+                    format!(
+                        "{error}; runtime rollback failed before restoring the launchd plist: {runtime}"
+                    ),
+                    runtime,
                 ));
             }
             let rollback = match old_content {
                 Some(content) => {
-                    install(plist, &content, home)?;
+                    install(plist, &content, home).map_err(MutationError::plain)?;
                     reload().map_err(|recovery| {
-                        format!(
-                            "plist restored but managed launchd job recovery failed: {recovery}"
+                        MutationError::job_failed(
+                            format!(
+                                "{error}; plist restored but managed launchd job recovery failed: {recovery}"
+                            ),
+                            recovery,
                         )
                     })
                 }
-                None => fs::remove_file(plist).map_err(|restore| restore.to_string()),
+                None => fs::remove_file(plist).map_err(|restore| {
+                    MutationError::job_failed(error.clone(), restore.to_string())
+                }),
             };
             match rollback {
-                Ok(()) => Err(format!("{error}; launchd plist and job rolled back")),
-                Err(rollback) => Err(format!("{error}; launchd rollback failed: {rollback}")),
+                Ok(()) => Err(MutationError::rolled_back(format!(
+                    "{error}; launchd plist and job rolled back"
+                ))),
+                Err(rollback) => Err(rollback),
             }
         }
     }
@@ -476,9 +668,15 @@ pub fn install(plist: &Path, content: &str, home: &Path) -> Result<(), String> {
 /// running the *old* binary after a rewrite — this is the only sequence
 /// that picks up a changed plist.
 pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
-    let domain = format!("gui/{uid}");
+    reload_for(&LaunchdTarget::for_user(uid), plist)
+}
+
+/// Reloads a selected launchd service from `plist`.
+pub fn reload_for(target: &LaunchdTarget, plist: &Path) -> Result<(), String> {
+    let domain = target.domain();
+    let service = format!("{domain}/{}", target.label());
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{LABEL}")])
+        .args(["bootout", &service])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -487,7 +685,7 @@ pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
     for attempt in 1..=BOOTSTRAP_ATTEMPTS {
         let output = Command::new("launchctl")
             .arg("bootstrap")
-            .arg(&domain)
+            .arg(domain)
             .arg(plist)
             .stdin(Stdio::null())
             .output()
@@ -510,7 +708,12 @@ pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
 
 /// Returns the PID launchd currently associates with its managed job.
 pub fn job_pid(uid: u32) -> Result<Option<u32>, String> {
-    let domain = format!("gui/{uid}/{LABEL}");
+    job_pid_for(&LaunchdTarget::for_user(uid))
+}
+
+/// Returns the PID launchd associates with a selected managed service.
+pub fn job_pid_for(target: &LaunchdTarget) -> Result<Option<u32>, String> {
+    let domain = format!("{}/{}", target.domain(), target.label());
     let output = Command::new("launchctl")
         .args(["print", &domain])
         .stdin(Stdio::null())
@@ -581,6 +784,24 @@ mod tests {
             rendered.contains("<string>/Users/me/.dark-factory/logs/factoryd.stderr.log</string>")
         );
         assert!(rendered.contains("<key>AbandonProcessGroup</key>\n    <true/>"));
+    }
+
+    #[test]
+    fn injected_target_changes_only_the_managed_label_and_plist_name() {
+        let target = LaunchdTarget::new("gui/501", "com.dark-factory.test.capacity");
+        let rendered = render_for(
+            &target,
+            Path::new("/tmp/factory"),
+            Path::new("/tmp/factory/bin/current/factoryd"),
+            &[],
+            &BTreeMap::new(),
+        );
+        assert!(rendered.contains("<string>com.dark-factory.test.capacity</string>"));
+        assert!(!rendered.contains("<string>com.dark-factory.factoryd</string>"));
+        assert_eq!(
+            plist_path_for(Path::new("/Users/me"), &target),
+            Path::new("/Users/me/Library/LaunchAgents/com.dark-factory.test.capacity.plist")
+        );
     }
 
     #[test]
@@ -726,7 +947,8 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(error.contains("plist and job rolled back"));
+        assert_eq!(error.outcome(), &RollbackOutcome::Restored);
+        assert!(error.to_string().contains("plist and job rolled back"));
         assert_eq!(reloads, 2);
         assert_eq!(*events.borrow(), ["reload", "runtime", "reload"]);
         assert_eq!(fs::read_to_string(plist).unwrap(), "old");

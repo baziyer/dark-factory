@@ -491,6 +491,10 @@ impl Board {
         self.set_status(text, StatusLevel::Error);
     }
 
+    pub fn note_info(&mut self, text: impl Into<String>) {
+        self.set_status(text, StatusLevel::Info);
+    }
+
     /// The current mode/modal hint followed by a recent bounded status or error. The footer lays
     /// this variable text between fixed tab and essential-control regions, so clipping cannot
     /// move or hide controls that fit the rendered width.

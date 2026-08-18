@@ -85,15 +85,16 @@ pub fn probe_version(program: &Path) -> Option<String> {
 /// Whether launchd has the job loaded for this user.
 #[must_use]
 pub fn launchd_loaded() -> bool {
+    launchd_loaded_for(&launchd::LaunchdTarget::for_user(
+        rustix::process::getuid().as_raw(),
+    ))
+}
+
+/// Whether an explicitly selected launchd service is loaded.
+#[must_use]
+pub fn launchd_loaded_for(target: &launchd::LaunchdTarget) -> bool {
     Command::new("launchctl")
-        .args([
-            "print",
-            &format!(
-                "gui/{}/{}",
-                rustix::process::getuid().as_raw(),
-                launchd::LABEL
-            ),
-        ])
+        .args(["print", &format!("{}/{}", target.domain(), target.label())])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -174,6 +175,23 @@ pub fn wait_for_managed_daemon(
     expected_version: Option<&str>,
     home: &Path,
 ) -> Result<String, String> {
+    wait_for_managed_daemon_for(
+        &launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+        socket,
+        timeout,
+        expected_version,
+        home,
+    )
+}
+
+/// Polls health and an explicitly selected launchd service together.
+pub fn wait_for_managed_daemon_for(
+    target: &launchd::LaunchdTarget,
+    socket: &Path,
+    timeout: Duration,
+    expected_version: Option<&str>,
+    home: &Path,
+) -> Result<String, String> {
     let client = Client::new(socket);
     let expected_runner = install::current_link(home)
         .join("factory-runner")
@@ -185,7 +203,7 @@ pub fn wait_for_managed_daemon(
         .into_owned();
     let deadline = Instant::now() + timeout;
     loop {
-        let last_error = match launchd::job_pid(rustix::process::getuid().as_raw()) {
+        let last_error = match launchd::job_pid_for(target) {
             Ok(Some(job_pid)) => {
                 match client.request_with_timeout(LocalRequest::Health, Duration::from_secs(2)) {
                     Ok(ServerFrame::Response {
