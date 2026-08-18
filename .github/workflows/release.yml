@@ -59,7 +59,7 @@ jobs:
           git clean -ffdx
 
       - name: Install the pinned toolchain
-        run: rustup toolchain install 1.85.0 --profile minimal --no-self-update
+        run: rustup toolchain install 1.86.0 --profile minimal --no-self-update
 
       - name: Check that the tag matches the workspace version
         run: |
@@ -70,7 +70,7 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo +1.85.0 build --locked --release --workspace
+        run: cargo +1.86.0 build --locked --release --workspace
 
       - name: Package
         run: ./scripts/package-release.sh "$TAG" "$TARGET" "${CARGO_TARGET_DIR:-target}/release" dist "$GITHUB_REPOSITORY"
