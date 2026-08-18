@@ -2,8 +2,8 @@
 //!
 //! `update` fetches the release manifest (always fresh — an operator asking
 //! wants the real answer; the result is still cached for `factory-tui`'s
-//! hourly status-line check) and prints where this build stands. `--install`
-//! then downloads and verifies the newer release into
+//! hourly status-line check) and reports both the invoking binary and active
+//! installed runtime. `--install` then downloads and verifies the release into
 //! `$DARK_FACTORY_HOME/bin/<version>/`, repoints `bin/current`, and — if
 //! this machine's launchd job exists — rewrites it to run from `bin/current`
 //! and reloads it, restarting only the daemon; running sessions are never
@@ -38,14 +38,14 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let home =
         absolute(factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?);
     let check = update::check(&home, &update::manifest_url(), update::now_ms(), true);
-    let available = check.available().cloned();
+    let active_version = install::active_version(&home)?;
 
     if !options.install {
-        println!("{}", check_json(&check));
+        println!("{}", check_json(&check, active_version.as_deref()));
         return Ok(check_exit_code(&check));
     }
-    let Some(manifest) = available else {
-        let mut report = check_json(&check);
+    let Some(manifest) = install_candidate(&check, active_version.as_deref()).cloned() else {
+        let mut report = check_json(&check, active_version.as_deref());
         report["installed"] = json!(false);
         println!("{report}");
         return Ok(check_exit_code(&check));
@@ -61,7 +61,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         launchd::check_home(existing, &home, &user_home)?;
     }
     let mut log = |line: &str| eprintln!("update: {line}");
-    let previous_version = install::current_version(&home);
+    let previous_version = active_version;
     if previous_version.as_deref() == Some(manifest.version.as_str())
         && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version)).is_ok()
     {
@@ -166,10 +166,29 @@ fn check_exit_code(check: &UpdateCheck) -> i32 {
     }
 }
 
-fn check_json(check: &UpdateCheck) -> serde_json::Value {
-    let available = check.available();
+/// The release to install or reconcile. An active runtime equal to the
+/// manifest still enters the existing health check, which is the no-op when
+/// the daemon already matches and the restart path when it does not.
+fn install_candidate<'a>(
+    check: &'a UpdateCheck,
+    active_version: Option<&str>,
+) -> Option<&'a update::Manifest> {
+    let manifest = check.latest.as_ref()?;
+    if !manifest.assets.contains_key(update::platform_key()) {
+        return None;
+    }
+    match active_version {
+        Some(active) => (active == manifest.version || update::is_newer(&manifest.version, active))
+            .then_some(manifest),
+        None => update::is_newer(&manifest.version, &check.current).then_some(manifest),
+    }
+}
+
+fn check_json(check: &UpdateCheck, active_version: Option<&str>) -> serde_json::Value {
+    let available = check.available_from(active_version.unwrap_or(&check.current));
     let mut report = json!({
         "current": check.current,
+        "active": active_version,
         "checked_at_ms": check.checked_at_ms,
         "update_available": available.is_some(),
     });

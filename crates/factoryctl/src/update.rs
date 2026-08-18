@@ -68,9 +68,16 @@ impl UpdateCheck {
     /// found one.
     #[must_use]
     pub fn available(&self) -> Option<&Manifest> {
+        self.available_from(&self.current)
+    }
+
+    /// The newer version available relative to `current`. The cached
+    /// [`Self::current`] is the invoking binary; callers that manage an
+    /// installed runtime can compare against that active version instead.
+    #[must_use]
+    pub fn available_from(&self, current: &str) -> Option<&Manifest> {
         self.latest.as_ref().filter(|manifest| {
-            manifest.assets.contains_key(platform_key())
-                && is_newer(&manifest.version, &self.current)
+            manifest.assets.contains_key(platform_key()) && is_newer(&manifest.version, current)
         })
     }
 }
@@ -248,6 +255,12 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
     }
 }
 
+/// Whether `version` has the release version shape this updater can compare.
+#[must_use]
+pub fn is_valid_version(version: &str) -> bool {
+    parse_version(version).is_some()
+}
+
 /// `(core, is_release, pre_release)`: tuple ordering gives core first, then
 /// a release above any pre-release of the same core, then pre-releases in
 /// string order.
@@ -284,6 +297,9 @@ mod tests {
         assert!(is_newer("0.2.0", "0.2.0-rc.1"));
         assert!(!is_newer("0.2.0-rc.1", "0.2.0"));
         assert!(is_newer("0.2.0-rc.2", "0.2.0-rc.1"));
+        assert!(is_valid_version("0.2.0"));
+        assert!(is_valid_version("v0.2.0-rc.1"));
+        assert!(!is_valid_version("not-a-version"));
     }
 
     #[test]
@@ -320,6 +336,11 @@ mod tests {
             check(Some(manifest("0.0.1", platform_key())))
                 .available()
                 .is_none()
+        );
+        assert!(
+            check(Some(manifest(CURRENT_VERSION, platform_key())))
+                .available_from("0.1.0")
+                .is_some()
         );
         assert!(check(None).available().is_none());
     }

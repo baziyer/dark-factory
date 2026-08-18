@@ -21,7 +21,7 @@
 use std::{
     fs, io,
     os::unix::fs::{PermissionsExt, symlink},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
@@ -51,12 +51,42 @@ pub fn current_link(home: &Path) -> PathBuf {
     bin_dir(home).join("current")
 }
 
-/// The version `bin/current` points at, if the link exists.
-#[must_use]
-pub fn current_version(home: &Path) -> Option<String> {
-    let target = fs::read_link(current_link(home)).ok()?;
-    let name = target.file_name()?.to_str()?;
-    (!name.is_empty()).then(|| name.to_owned())
+/// The validated version `bin/current` points at, or `None` when no active
+/// runtime has been installed. The link must be the one-component relative
+/// shape [`activate`] writes, and its target must contain all four binaries.
+pub fn active_version(home: &Path) -> Result<Option<String>, String> {
+    let link = current_link(home);
+    let metadata = match fs::symlink_metadata(&link) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", link.display())),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a symbolic link", link.display()));
+    }
+    let target = fs::read_link(&link)
+        .map_err(|error| format!("could not read {}: {error}", link.display()))?;
+    let mut components = target.components();
+    let version = match (components.next(), components.next()) {
+        (Some(Component::Normal(version)), None) => version
+            .to_str()
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| format!("{} has an invalid target", link.display()))?,
+        _ => return Err(format!("{} has an invalid target", link.display())),
+    };
+    if !update::is_valid_version(version) {
+        return Err(format!(
+            "{} names invalid version {version:?}",
+            link.display()
+        ));
+    }
+    verify_binaries(&version_dir(home, version)).map_err(|error| {
+        format!(
+            "{} points at an invalid active runtime: {error}",
+            link.display()
+        )
+    })?;
+    Ok(Some(version.to_owned()))
 }
 
 /// Downloads this platform's asset from `manifest`, verifies its SHA-256,
@@ -230,18 +260,33 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fake_binaries(&version_dir(home.path(), "0.1.0"));
         fake_binaries(&version_dir(home.path(), "0.2.0"));
-        assert_eq!(current_version(home.path()), None);
+        assert_eq!(active_version(home.path()).unwrap(), None);
         activate(home.path(), "0.2.0").unwrap();
-        assert_eq!(current_version(home.path()).as_deref(), Some("0.2.0"));
+        assert_eq!(
+            active_version(home.path()).unwrap().as_deref(),
+            Some("0.2.0")
+        );
         assert!(current_link(home.path()).join("factoryd").exists());
         activate(home.path(), "0.1.0").unwrap();
-        assert_eq!(current_version(home.path()).as_deref(), Some("0.1.0"));
+        assert_eq!(
+            active_version(home.path()).unwrap().as_deref(),
+            Some("0.1.0")
+        );
         assert!(activate(home.path(), "9.9.9").is_err());
         assert_eq!(
-            current_version(home.path()).as_deref(),
+            active_version(home.path()).unwrap().as_deref(),
             Some("0.1.0"),
             "failed activate leaves current alone"
         );
+
+        fs::remove_file(current_link(home.path())).unwrap();
+        symlink("../0.1.0", current_link(home.path())).unwrap();
+        assert!(active_version(home.path()).is_err());
+
+        fs::remove_file(current_link(home.path())).unwrap();
+        fake_binaries(&version_dir(home.path(), "not-a-version"));
+        symlink("not-a-version", current_link(home.path())).unwrap();
+        assert!(active_version(home.path()).is_err());
     }
 
     #[test]

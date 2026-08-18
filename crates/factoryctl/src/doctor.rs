@@ -145,23 +145,15 @@ fn check_home(home: &Path) -> Check {
 
 fn check_install(home: &Path) -> Check {
     let link = install::current_link(home);
-    match fs::read_link(&link) {
-        Ok(target) => {
-            let version = target.to_string_lossy().into_owned();
-            match install::verify_binaries(&install::version_dir(home, &version)) {
-                Ok(()) => Check::ok(
-                    "install",
-                    format!(
-                        "bin/current -> {version} (this factoryctl is {})",
-                        update::CURRENT_VERSION
-                    ),
-                ),
-                Err(error) => {
-                    Check::fail("install", format!("bin/current -> {version}, but {error}"))
-                }
-            }
-        }
-        Err(_) => Check::warn(
+    match install::active_version(home) {
+        Ok(Some(version)) => Check::ok(
+            "install",
+            format!(
+                "bin/current -> {version} (this factoryctl is {})",
+                update::CURRENT_VERSION
+            ),
+        ),
+        Ok(None) => Check::warn(
             "install",
             format!(
                 "no installed release at {} (running {} from {}; `factoryctl init` installs it)",
@@ -173,6 +165,7 @@ fn check_install(home: &Path) -> Check {
                     .map_or_else(|| "?".to_owned(), |dir| dir.display().to_string())
             ),
         ),
+        Err(error) => Check::fail("install", error),
     }
 }
 
