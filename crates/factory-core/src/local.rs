@@ -325,8 +325,10 @@ pub enum LocalRequest {
     /// on this connection. The connection commits to terminal-proxy mode:
     /// after the first `AttachTerminal`, only more `AttachTerminal` requests
     /// are accepted on it (a client may attach several sessions on one
-    /// connection), and `ServerFrame::TerminalOutput` frames for every
-    /// attached session are multiplexed onto it, tagged by `session_id`.
+    /// connection). A successful attach produces `ServerFrame::AttachReady`
+    /// even when the retained log is empty, then `ServerFrame::TerminalOutput`
+    /// frames for every attached session are multiplexed onto it, tagged by
+    /// `session_id`.
     /// Detaching happens implicitly on disconnect. `TerminalInput` and
     /// `ResizeTerminal` are independent, ordinary one-shot requests (like
     /// `StopRun`); they do not need to run on an attached connection.
@@ -559,6 +561,12 @@ pub enum ServerFrame {
         protocol_version: u16,
         event: EventEnvelope,
     },
+    /// The runner accepted this terminal attachment. Output may follow, but
+    /// an empty or silent terminal is ready for input after this frame.
+    AttachReady {
+        protocol_version: u16,
+        session_id: SessionId,
+    },
     /// One chunk of retained-then-live PTY output for a session attached on
     /// this connection via `AttachTerminal`. `bytes` is base64-encoded raw
     /// bytes; opaque to every layer between the runner and the client.
@@ -578,6 +586,9 @@ impl ServerFrame {
                 protocol_version, ..
             }
             | Self::Event {
+                protocol_version, ..
+            }
+            | Self::AttachReady {
                 protocol_version, ..
             }
             | Self::TerminalOutput {

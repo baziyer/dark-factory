@@ -158,9 +158,18 @@ impl RunnerClient {
         &self,
         since_offset: u64,
     ) -> Result<TerminalSubscription, RunnerClientError> {
-        let reader = self
+        let mut reader = self
             .request(RunnerRequest::AttachTerminal { since_offset })
             .await?;
+        let frame = read_control_frame(&mut reader, "runner terminal attach").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::AttachReady { .. } => {}
+            RunnerFrame::Error { code, .. } => {
+                return Err(RunnerClientError::RunnerRejected { code });
+            }
+            frame => return Err(frame_error(frame)),
+        }
         Ok(TerminalSubscription { reader })
     }
 
@@ -426,6 +435,9 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
         },
         RunnerFrame::CommandAck { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner event",
+        },
+        RunnerFrame::AttachReady { .. } => RunnerClientError::UnexpectedFrame {
+            expected: "runner event or command acknowledgement",
         },
         RunnerFrame::TerminalOutput { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner command acknowledgement",

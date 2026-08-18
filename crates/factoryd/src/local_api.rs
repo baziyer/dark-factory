@@ -500,6 +500,16 @@ fn spawn_terminal_attach(
                 return;
             }
         };
+        if frame_tx
+            .send(ServerFrame::AttachReady {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: session_id.clone(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
         loop {
             match subscription.next_chunk().await {
                 Ok((offset, bytes)) => {

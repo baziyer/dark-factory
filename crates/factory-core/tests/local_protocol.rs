@@ -705,6 +705,18 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
     assert_eq!(value["type"], "terminal_output");
     assert_eq!(value["data"]["session_id"], "session-1");
     assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
+
+    let ready = ServerFrame::AttachReady {
+        protocol_version: PROTOCOL_VERSION,
+        session_id: session_id("session-1"),
+    };
+    assert_eq!(
+        serde_json::to_value(&ready).unwrap(),
+        serde_json::json!({
+            "type": "attach_ready",
+            "data": {"protocol_version": PROTOCOL_VERSION, "session_id": "session-1"}
+        })
+    );
 }
 
 #[test]

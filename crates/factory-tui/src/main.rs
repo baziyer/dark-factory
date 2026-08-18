@@ -450,7 +450,6 @@ fn sync_agent_context(
         return;
     };
     let project_id = agent.project_id.clone();
-    board.messages.insert(agent_id.clone(), Vec::new());
     for request in context_requests(project_id, agent_id) {
         net::spawn_request(client.clone(), tx.clone(), request);
     }
@@ -611,6 +610,14 @@ fn apply_net_msg(
 mod main_tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    use factory_core::local::{LocalResponse, ServerFrame};
+    use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::test_fixtures::{agent, project, session};
 
     #[test]
     fn editor_command_parses_arguments_and_quotes_without_a_shell() {
@@ -660,5 +667,85 @@ mod main_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn silent_attach_ack_enters_typing_and_first_key_reaches_the_child_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut attach, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(attach.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
+                "attach_terminal"
+            );
+            let ready = ServerFrame::AttachReady {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+            };
+            serde_json::to_writer(&mut attach, &ready).unwrap();
+            attach.write_all(b"\n").unwrap();
+            attach.flush().unwrap();
+
+            let (mut input, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(input.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let value = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+            assert_eq!(value["request"]["type"], "terminal_input");
+            assert_eq!(
+                factory_core::runner::decode_terminal_bytes(
+                    value["request"]["data"]["bytes"].as_str().unwrap()
+                )
+                .unwrap(),
+                b"x"
+            );
+            let accepted = ServerFrame::Response {
+                protocol_version: PROTOCOL_VERSION,
+                response: LocalResponse::TerminalInputAccepted {
+                    session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                },
+            };
+            serde_json::to_writer(&mut input, &accepted).unwrap();
+            input.write_all(b"\n").unwrap();
+            input.flush().unwrap();
+        });
+
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(factory_core::SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let mut panes = PaneMap::new();
+        sync_panes(&mut board, &mut panes, &socket, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !board.pane_ready && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            sync_panes(&mut board, &mut panes, &socket, None);
+        }
+        assert!(board.pane_ready, "silent pane never observed AttachReady");
+
+        let enter = board.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(board.pane_mode, model::PaneMode::Typing);
+        assert!(matches!(enter, Intent::Redraw));
+        let first_key = board.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(first_key, Intent::ForwardKey(_)));
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        apply_intent(first_key, &mut board, &client, &tx, &panes);
+        server.join().unwrap();
     }
 }

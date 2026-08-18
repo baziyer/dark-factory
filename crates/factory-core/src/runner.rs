@@ -164,6 +164,9 @@ pub enum RunnerFrame {
         code: RunnerErrorCode,
         message: String,
     },
+    /// The runner accepted a terminal attachment and completed the retained-log
+    /// snapshot boundary. Live output may follow, but is not required.
+    AttachReady { protocol_version: u16 },
     /// One chunk of retained-then-live PTY output for an attached terminal
     /// session. `offset` is the byte-stream position of `bytes[0]`; the next
     /// expected offset is `offset + bytes.len()` after decoding.
@@ -193,6 +196,7 @@ impl RunnerFrame {
             | Self::Error {
                 protocol_version, ..
             }
+            | Self::AttachReady { protocol_version }
             | Self::TerminalOutput {
                 protocol_version, ..
             } => *protocol_version,

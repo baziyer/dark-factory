@@ -439,6 +439,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shell-words",
+ "tempfile",
  "tui-term",
  "uuid",
 ]
