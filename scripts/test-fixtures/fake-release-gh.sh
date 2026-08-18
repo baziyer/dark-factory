@@ -108,6 +108,16 @@ case "${1:-} ${2:-}" in
             fatal) http_error 403 ;;
         esac
         if [ ! -f "$state/release" ]; then
+            case "$scenario" in
+                release-not-found)
+                    echo "release not found" >&2
+                    exit 1
+                    ;;
+                decorated-not-found)
+                    echo "GraphQL: release not found" >&2
+                    exit 1
+                    ;;
+            esac
             http_error 404
         fi
         draft=true
