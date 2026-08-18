@@ -274,6 +274,75 @@ fn init_failed_activation_restores_bootstrap_and_checks_managed_health() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn init_malformed_existing_capacity_restores_runtime_and_reports_unchanged_job() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("user-home")).unwrap();
+    let factoryctl = staged_factoryctl(root.path());
+    let (code, _, stderr) = run(&factoryctl, root.path(), &["init", "--yes", "--no-launchd"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let home = root.path().join("home");
+    let old = home.join("bin/0.1.0");
+    fs::create_dir_all(&old).unwrap();
+    for name in SIBLINGS.iter().chain(["factoryctl"].iter()) {
+        let path = old.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::remove_file(home.join("bin/current")).unwrap();
+    std::os::unix::fs::symlink("0.1.0", home.join("bin/current")).unwrap();
+    let plist = root
+        .path()
+        .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    let old_plist = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.dark-factory.factoryd</string><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string><string>--max-active-runs</string><string>malformed</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
+        home.display(),
+        home.display()
+    );
+    fs::write(&plist, &old_plist).unwrap();
+    let (tools, log) = fake_launchctl_first_reload_fails(root.path());
+    let path = std::env::join_paths(
+        std::iter::once(tools).chain(
+            std::env::var_os("PATH")
+                .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        ),
+    )
+    .unwrap();
+    let socket = home.join("f.sock");
+    let server = serve_managed_health_once(&socket, "0.1.0", &home, 4242);
+    let (code, _stdout, stderr) = run_with_env(
+        &factoryctl,
+        root.path(),
+        &["init", "--yes"],
+        &[
+            ("PATH", path.as_os_str()),
+            ("FAKE_LAUNCHCTL_LOG", log.as_os_str()),
+            ("DARK_FACTORY_SOCKET", socket.as_os_str()),
+        ],
+    );
+    server.join().unwrap();
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("bin/current rolled back to 0.1.0"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("launchd plist and job were unchanged"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("restored runtime is healthy"), "{stderr}");
+    assert_eq!(
+        fs::read_link(home.join("bin/current")).unwrap(),
+        Path::new("0.1.0")
+    );
+    assert_eq!(fs::read_to_string(&plist).unwrap(), old_plist);
+    assert!(!fs::read_to_string(log).unwrap().contains("bootstrap"));
+}
+
 #[test]
 fn init_refuses_to_touch_launchd_without_consent_on_a_non_terminal() {
     let root = tempfile::tempdir().unwrap();

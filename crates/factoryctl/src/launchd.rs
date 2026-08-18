@@ -43,6 +43,7 @@ pub const INIT_CARRIED_ENVIRONMENT: [&str; 1] = ["CODEX_HOME"];
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RollbackOutcome {
     NotAttempted,
+    RuntimeRestored,
     Restored,
     RuntimeFailed(String),
     JobFailed(String),
@@ -66,6 +67,13 @@ impl MutationError {
         Self {
             message,
             outcome: RollbackOutcome::Restored,
+        }
+    }
+
+    fn runtime_restored(message: String) -> Self {
+        Self {
+            message,
+            outcome: RollbackOutcome::RuntimeRestored,
         }
     }
 
@@ -501,7 +509,7 @@ pub fn apply_with_rollback(
 /// Applies a managed launchd mutation for an explicitly selected service.
 pub fn apply_with_rollback_for(
     request: ApplyRequest<'_>,
-    rollback_runtime: impl FnMut() -> Result<(), String>,
+    mut rollback_runtime: impl FnMut() -> Result<(), String>,
 ) -> Result<(), MutationError> {
     let ApplyRequest {
         target,
@@ -526,21 +534,30 @@ pub fn apply_with_rollback_for(
     );
     environment.insert("PATH".to_owned(), path);
     let existing_arguments = existing.map_or(&[][..], |job| job.program_arguments.as_slice());
-    let capacity = capacity
-        .or(max_active_runs(existing_arguments)
-            .map_err(MutationError::plain)?
-            .or(Some(DEFAULT_MAX_ACTIVE_RUNS)))
-        .ok_or_else(|| MutationError::plain("capacity is not configured"))?;
+    let configured_capacity = match max_active_runs(existing_arguments) {
+        Ok(capacity) => capacity,
+        Err(error) => return Err(rollback_after_activation(error, &mut rollback_runtime)),
+    };
+    let capacity = match capacity.or(configured_capacity.or(Some(DEFAULT_MAX_ACTIVE_RUNS))) {
+        Some(capacity) => capacity,
+        None => return Err(MutationError::plain("capacity is not configured")),
+    };
     let carried = carried_arguments_with_capacity(existing_arguments, capacity);
     let factoryd = install::current_link(home).join("factoryd");
     let content = render_for(target, home, &factoryd, &carried, &environment);
     let old_content = if plist.exists() {
-        Some(fs::read_to_string(plist).map_err(|error| {
-            MutationError::plain(format!(
-                "could not read the existing launchd plist {}: {error}",
-                plist.display()
-            ))
-        })?)
+        Some(match fs::read_to_string(plist) {
+            Ok(content) => content,
+            Err(error) => {
+                return Err(rollback_after_activation(
+                    format!(
+                        "could not read the existing launchd plist {}: {error}",
+                        plist.display()
+                    ),
+                    &mut rollback_runtime,
+                ));
+            }
+        })
     } else {
         None
     };
@@ -580,21 +597,43 @@ pub fn restore_with_rollback_for(
     plist: &Path,
     home: &Path,
     content: &str,
-    rollback_runtime: impl FnMut() -> Result<(), String>,
+    mut rollback_runtime: impl FnMut() -> Result<(), String>,
 ) -> Result<(), MutationError> {
     let current = if plist.exists() {
-        Some(fs::read_to_string(plist).map_err(|error| {
-            MutationError::plain(format!(
-                "could not read the current launchd plist {}: {error}",
-                plist.display()
-            ))
-        })?)
+        Some(match fs::read_to_string(plist) {
+            Ok(content) => content,
+            Err(error) => {
+                return Err(rollback_after_activation(
+                    format!(
+                        "could not read the current launchd plist {}: {error}",
+                        plist.display()
+                    ),
+                    &mut rollback_runtime,
+                ));
+            }
+        })
     } else {
         None
     };
     install_and_reload(plist, home, content, current, rollback_runtime, || {
         reload_for(target, plist)
     })
+}
+
+fn rollback_after_activation(
+    error: impl Into<String>,
+    rollback_runtime: &mut impl FnMut() -> Result<(), String>,
+) -> MutationError {
+    let error = error.into();
+    match rollback_runtime() {
+        Ok(()) => MutationError::runtime_restored(format!(
+            "{error}; bin/current rolled back; launchd plist and job were unchanged"
+        )),
+        Err(runtime) => MutationError::runtime_failed(
+            format!("{error}; runtime rollback failed: {runtime}"),
+            runtime,
+        ),
+    }
 }
 
 fn install_and_reload(
@@ -605,7 +644,9 @@ fn install_and_reload(
     mut rollback_runtime: impl FnMut() -> Result<(), String>,
     mut reload: impl FnMut() -> Result<(), String>,
 ) -> Result<(), MutationError> {
-    install(plist, content, home).map_err(MutationError::plain)?;
+    if let Err(error) = install(plist, content, home) {
+        return Err(rollback_after_activation(error, &mut rollback_runtime));
+    }
     match reload() {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -619,7 +660,14 @@ fn install_and_reload(
             }
             let rollback = match old_content {
                 Some(content) => {
-                    install(plist, &content, home).map_err(MutationError::plain)?;
+                    if let Err(restore) = install(plist, &content, home) {
+                        return Err(MutationError::job_failed(
+                            format!(
+                                "{error}; runtime restored but launchd plist recovery failed: {restore}"
+                            ),
+                            restore,
+                        ));
+                    }
                     reload().map_err(|recovery| {
                         MutationError::job_failed(
                             format!(
@@ -952,6 +1000,37 @@ mod tests {
         assert_eq!(reloads, 2);
         assert_eq!(*events.borrow(), ["reload", "runtime", "reload"]);
         assert_eq!(fs::read_to_string(plist).unwrap(), "old");
+    }
+
+    #[test]
+    fn rollback_reporting_distinguishes_runtime_and_job_recovery_failures() {
+        let not_attempted = MutationError::plain("malformed capacity");
+        let not_attempted_report =
+            crate::runtime::rollback_report(&not_attempted, Some("0.1.0"), |_| {
+                panic!("an unattempted rollback must not claim health")
+            });
+        assert!(not_attempted_report.contains("rollback was not attempted"));
+        assert!(!not_attempted_report.contains("restored runtime is healthy"));
+
+        let runtime = MutationError::runtime_failed(
+            "activation failed; runtime rollback failed: broken link".to_owned(),
+            "broken link".to_owned(),
+        );
+        let runtime_report = crate::runtime::rollback_report(&runtime, Some("0.1.0"), |_| {
+            panic!("runtime failure must not claim health")
+        });
+        assert!(runtime_report.contains("could NOT be rolled back"));
+        assert!(!runtime_report.contains("restored runtime is healthy"));
+
+        let job = MutationError::job_failed(
+            "activation failed; launchd recovery failed".to_owned(),
+            "launchd recovery failed".to_owned(),
+        );
+        let job_report = crate::runtime::rollback_report(&job, Some("0.1.0"), |_| {
+            panic!("job failure must not claim health")
+        });
+        assert!(job_report.contains("rolled back to 0.1.0, but launchd recovery failed"));
+        assert!(!job_report.contains("restored runtime is healthy"));
     }
 
     #[test]
