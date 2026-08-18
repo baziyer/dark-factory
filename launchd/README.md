@@ -66,6 +66,36 @@ session — with the daemon on `bootout`/`kickstart -k`.
 Subscription headroom has no background service or log: run `factoryctl
 usage` on demand in a terminal instead.
 
+## Uninstall
+
+Commit or copy any uncommitted agent work first. List the sessions in each
+project. Stop every live session before you stop the daemon:
+
+```sh
+factoryctl session list --project PROJECT_ID
+factoryctl session stop --project PROJECT_ID --session SESSION_ID --grace-ms 5000
+factoryctl session list --project PROJECT_ID
+```
+
+Repeat `session stop` for each entry that has no `ended_at_ms`. A stop closes
+its active task run. Check the final list before you continue. Then unload the
+service and remove its job file:
+
+```sh
+launchctl bootout gui/$(id -u)/com.dark-factory.factoryd
+rm ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
+```
+
+This keeps `~/.dark-factory`, including its database, worktrees, logs, and
+installed versions. It also leaves each `agent/<id>` branch in its project
+repository, Claude trust entries in `~/.claude.json`, and provider login state.
+You can reinstall the service without losing this state.
+
+Deleting `~/.dark-factory` is a separate and irreversible action. It deletes
+the factory history and managed worktrees. This guide does not run that action.
+Archive or inspect the directory first, and only remove it after every session
+has stopped. External agent branches and Claude trust entries still remain.
+
 ## Removing a previously installed usage-monitor job
 
 Older checkouts installed a separate `com.dark-factory.usage-monitor` job.

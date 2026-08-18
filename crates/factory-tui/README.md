@@ -1,59 +1,58 @@
 # factory-tui
 
-The detachable operator board for a Dark Factory daemon. It uses the same local requests as
-`factoryctl`; closing it never stops agents.
+`factory-tui` is the terminal board for a running Dark Factory. It uses the
+same local API as `factoryctl`. Closing it does not stop the daemon or an agent.
 
-## Running it
+## Run it
 
 ```sh
-cargo run -p factory-tui
-cargo run -p factory-tui -- --socket /path/to/f.sock
-cargo run -p factory-tui -- --project my-project
-cargo run -p factory-tui -- --theme plain
-cargo run -p factory-tui -- --dev-local-pty
+factory-tui
+factory-tui --project my-project
+factory-tui --theme plain
+factory-tui --help
 ```
 
-Socket resolution matches `factoryctl`: `--socket`, `$DARK_FACTORY_SOCKET`,
-`$DARK_FACTORY_HOME/f.sock`, then `$HOME/.dark-factory/f.sock`. The board reconnects with
-bounded backoff and loads every project's agents, tasks, runs, sessions, and recent retained
-events. `--dev-local-pty` is for isolated terminal testing only.
+The board reconnects if the daemon restarts. It remembers the last focused
+project unless `--project` selects one.
 
-## BUILDING
+## Screens
 
-BUILDING is home. Agents are floors grouped by project. Each row shows the agent glyph and name,
-provider, observed or inferred state, recent hook-event sparkline, queue depth, current task, and
-a route for delegated agents. NEEDS YOU lists waiting, failed, and blocked work oldest first.
+BUILDING shows the full factory. Each project is a building. Each agent has a
+floor. The NEEDS YOU list includes agents and tasks. It lists attention items
+globally, oldest first.
 
-Use `j`/`k` to move, `g` for the next NEEDS YOU item, and Enter to open AGENT. `n` creates
-a task, `m` messages the selected agent, `o` messages an orchestrator, `p` focuses a project,
-and `x` stops the selected agent after confirmation.
+AGENT shows the selected agent. It includes the live terminal, assigned and
+active work, durable messages, and settings. The orchestrator also shows the
+project queue.
 
-## AGENT
+## Main keys
 
-AGENT keeps one live terminal large, with the agent's active queue, private inbox, and settings
-alongside. An orchestrator also lists the project queue by assignee (including unassigned work)
-and shows each parent-to-child delegation edge.
+| Key | Action |
+|---|---|
+| `Enter` | Open the selected agent. In AGENT, start typing in a live terminal. |
+| `Esc` | Return to BUILDING. |
+| `j` / `k`, arrows | Select the next or previous agent. |
+| `[` / `]` | Select another agent without leaving AGENT. |
+| `g` | Go to the next item in NEEDS YOU. |
+| `n` | Add a task. |
+| `m` / `o` | Message the selected agent or an orchestrator. |
+| `p` | Select a project. |
+| `Space` | Pause or resume the selected agent. |
+| `t` | Manage the active task. |
+| `I` / `M` | Edit the agent instructions or memory in `$EDITOR`. |
+| `v` / `a` | Edit the agent model or permission mode. |
+| `z` | Maximize or restore the terminal. |
+| `PgUp` / `PgDn` | Scroll the terminal. |
+| `Ctrl-]` | Stop sending keys to the terminal and control the board. |
+| `x` | Stop the selected agent after confirmation. |
+| `?` | Show all keys. |
+| `q` | Detach from the factory. |
 
-Use `[`/`]` or `j`/`k` in BOARD mode to switch agents. `i` or Enter gives the terminal
-exclusive input; `Ctrl-]` returns to BOARD mode. `z` maximises the terminal and
-`PgUp`/`PgDn` scroll history. Esc returns to BUILDING.
+All actions use daemon requests. There is no TUI-only control path. See the
+[main README](../../README.md) for setup and first use.
 
-Settings use shared daemon requests: Space pauses/resumes, `v` edits the model, and `a` edits
-the permission/approval mode. `I` and `M` suspend the TUI and open the agent's
-`instructions.md` and `memory.md` in `$EDITOR`. `t` opens the shared task action menu for
-the first active queued item.
+## Development
 
-## State and attention
-
-`Board::agent_state` and `Board::agent_attention` are the single mapping points from durable
-state to the UI. Live session hooks win over run inference. Inferred attention is prefixed with
-`~`.
-
-## Architecture and safe testing
-
-`model/` owns pure state and key handling, `net.rs` owns socket I/O, `pane.rs` and
-`attach.rs` own terminal attachment, and `ui/` renders BUILDING and AGENT.
-
-Never test against `~/.dark-factory` or the live launchd daemon. Follow
-[the development workflow](../../docs/development/WORKFLOW.md) with a temporary
-`$DARK_FACTORY_HOME` and socket.
+Use `--dev-local-pty` only for offline terminal testing. Never point a
+development build at the live install. Follow the
+[development workflow](../../docs/development/WORKFLOW.md#developing-the-daemon-without-disrupting-a-running-factory).
