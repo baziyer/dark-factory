@@ -21,6 +21,11 @@ BUILDING shows the full factory. Each project is a building. Each agent has a
 floor. The NEEDS YOU list includes agents and tasks. It lists attention items
 globally, oldest first.
 
+BUILDING activity sparklines are event-driven: each bar is a five-second bucket,
+with eight visible bars covering the most recent 40 seconds. Durable hook/tool
+events add counts; idle time only advances empty buckets, so a silent agent
+ages out without decorative animation.
+
 AGENT shows the selected agent. It includes the live terminal, assigned and
 active work, durable messages, and settings. The orchestrator also shows the
 project queue.

@@ -123,8 +123,12 @@ catalogue.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
    message is a durable write before it wakes the orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals
-   repaint when their PTY emits bytes. Each repaint replaces the complete
-   mouse hit map for footer tabs/help/detach controls, visible rows, and pane
+   repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
+   for elapsed-time labels and to age the bounded five-second activity
+   sparklines while visible; durable hook/tool events are the only source of
+   activity counts, with no background animation or state polling as a source
+   of truth. Each repaint replaces the complete mouse hit map for footer
+   tabs/help/detach controls, visible rows, and pane
    geometry; a click is revalidated against current model state before it can
    select anything.
    Board hit testing and terminal input are separate routes: only events inside
@@ -134,9 +138,6 @@ catalogue.
    If local scrollback is nonzero, a child-bound coordinate event is consumed
    while resetting to the live tail; forwarding can resume only from a later
    event after that redraw, so historical coordinates never act on live state.
-   A 1Hz tick may request a coarse repaint for elapsed-time
-   labels and activity sparklines while visible; no background animation or
-   state polling is a source of truth.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
