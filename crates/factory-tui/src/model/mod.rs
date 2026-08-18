@@ -125,6 +125,7 @@ pub struct Board {
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
+    activity_projects: BTreeMap<AgentId, ProjectId>,
     seen_event_sequences: state::RingBuffer<i64>,
 
     pub view: View,
@@ -168,6 +169,7 @@ impl Board {
             messages: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
+            activity_projects: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             view: View::Building,
             selected_agent: None,
@@ -597,6 +599,7 @@ impl Board {
             .collect();
         self.runs = runs.into_iter().map(|r| (r.id.clone(), r)).collect();
         self.sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+        self.prune_activity_to_current_agents();
         self.ensure_default_focus();
     }
 
@@ -680,11 +683,7 @@ impl Board {
             if !self.remember_event_sequence(event.sequence) {
                 continue;
             }
-            if let FactoryEvent::AgentDeleted { agent_id, .. } = &event.event {
-                self.activity.remove(agent_id);
-            } else if let Some(agent_id) = event_agent(&event.event) {
-                self.record_activity(agent_id, event.occurred_at_ms);
-            }
+            self.apply_event_activity(&event.event, event.occurred_at_ms);
             let worth_announcing = match &event.event {
                 FactoryEvent::SessionChanged { session } => {
                     last_session_state.insert(session.id.clone(), session.state)
@@ -700,9 +699,7 @@ impl Board {
         if !self.remember_event_sequence(event.sequence) {
             return;
         }
-        if let Some(agent_id) = event_agent(&event.event) {
-            self.record_activity(agent_id, event.occurred_at_ms);
-        }
+        self.apply_event_activity(&event.event, event.occurred_at_ms);
 
         let worth_announcing = self.should_announce(&event);
         self.maybe_announce(&event, worth_announcing);
@@ -758,7 +755,6 @@ impl Board {
             }
             FactoryEvent::AgentDeleted { agent_id, .. } => {
                 self.agents.remove(&agent_id);
-                self.activity.remove(&agent_id);
             }
             FactoryEvent::ProjectDeleted { project_id } => {
                 self.projects.retain(|p| p.id != project_id);
@@ -836,7 +832,7 @@ impl Board {
             }
             LocalResponse::AgentDeleted { agent_id, .. } => {
                 self.agents.remove(&agent_id);
-                self.activity.remove(&agent_id);
+                self.remove_activity(&agent_id);
                 format!("removed agent {agent_id}")
             }
             LocalResponse::AgentPaused { agent } | LocalResponse::AgentResumed { agent } => {
@@ -903,32 +899,110 @@ impl Board {
         true
     }
 
+    /// Records or removes the activity projection for one durable event. Keeping lifecycle
+    /// cleanup here makes replay and live delivery share the same ownership rules.
+    fn apply_event_activity(&mut self, event: &FactoryEvent, occurred_at_ms: i64) {
+        match event {
+            FactoryEvent::AgentDeleted { agent_id, .. } => self.remove_activity(agent_id),
+            FactoryEvent::ProjectDeleted { project_id } => self.remove_project_activity(project_id),
+            _ => {
+                if let Some((agent_id, project_id)) = self.event_agent_project(event) {
+                    self.record_activity(&agent_id, &project_id, occurred_at_ms);
+                }
+            }
+        }
+    }
+
     /// Records durable activity and immediately anchors the series to the board clock. This
     /// keeps replayed history in its true recent bucket, or drops it if it is already outside the
-    /// horizon, without waiting for the next repaint tick.
-    fn record_activity(&mut self, agent_id: &AgentId, occurred_at_ms: i64) {
+    /// horizon, without waiting for the next repaint tick. Future timestamps are clamped so a
+    /// skewed provider cannot pin a live bucket ahead of the board clock.
+    fn record_activity(&mut self, agent_id: &AgentId, project_id: &ProjectId, occurred_at_ms: i64) {
+        if self
+            .activity_projects
+            .get(agent_id)
+            .is_some_and(|existing| existing != project_id)
+        {
+            self.remove_activity(agent_id);
+        }
+        self.activity_projects
+            .insert(agent_id.clone(), project_id.clone());
         let now_ms = self.now_ms;
+        let occurred_at_ms = occurred_at_ms.min(now_ms);
         let series = self.activity.entry(agent_id.clone()).or_default();
         series.record(occurred_at_ms);
         series.roll_to(now_ms);
     }
-}
 
-fn event_agent(event: &FactoryEvent) -> Option<&AgentId> {
-    match event {
-        FactoryEvent::TaskChanged { task } => task.assigned_agent_id.as_ref(),
-        FactoryEvent::RunChanged { run } => Some(&run.agent_id),
-        FactoryEvent::AgentChanged { agent } => Some(&agent.id),
-        FactoryEvent::AgentDeleted { agent_id, .. } => Some(agent_id),
-        FactoryEvent::SessionChanged { session } => Some(&session.agent_id),
-        FactoryEvent::PolicyDecision { agent_id, .. } => Some(agent_id),
-        FactoryEvent::AgentBudgetChanged { agent_id, .. } => Some(agent_id),
-        FactoryEvent::RepositoryOperation { agent_id, .. } => Some(agent_id),
-        FactoryEvent::RepositoryAuthorityChanged { .. } => None,
-        FactoryEvent::AutoModeChanged { .. }
-        | FactoryEvent::TaskDeleted { .. }
-        | FactoryEvent::ProjectChanged { .. }
-        | FactoryEvent::ProjectDeleted { .. } => None,
+    fn event_agent_project(&self, event: &FactoryEvent) -> Option<(AgentId, ProjectId)> {
+        match event {
+            FactoryEvent::TaskChanged { task } => task
+                .assigned_agent_id
+                .as_ref()
+                .map(|agent_id| (agent_id.clone(), task.project_id.clone())),
+            FactoryEvent::RunChanged { run } => {
+                Some((run.agent_id.clone(), run.project_id.clone()))
+            }
+            FactoryEvent::AgentChanged { agent } => {
+                Some((agent.id.clone(), agent.project_id.clone()))
+            }
+            FactoryEvent::SessionChanged { session } => {
+                Some((session.agent_id.clone(), session.project_id.clone()))
+            }
+            FactoryEvent::PolicyDecision {
+                project_id,
+                agent_id,
+                ..
+            }
+            | FactoryEvent::AgentBudgetChanged {
+                project_id,
+                agent_id,
+                ..
+            }
+            | FactoryEvent::RepositoryOperation {
+                project_id,
+                agent_id,
+                ..
+            } => Some((agent_id.clone(), project_id.clone())),
+            FactoryEvent::AgentDeleted { .. }
+            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::AutoModeChanged { .. }
+            | FactoryEvent::TaskDeleted { .. }
+            | FactoryEvent::ProjectChanged { .. }
+            | FactoryEvent::ProjectDeleted { .. } => None,
+        }
+    }
+
+    fn remove_activity(&mut self, agent_id: &AgentId) {
+        self.activity.remove(agent_id);
+        self.activity_projects.remove(agent_id);
+    }
+
+    fn remove_project_activity(&mut self, project_id: &ProjectId) {
+        let agent_ids: Vec<AgentId> = self
+            .activity_projects
+            .iter()
+            .filter(|(_, activity_project)| *activity_project == project_id)
+            .map(|(agent_id, _)| agent_id.clone())
+            .collect();
+        for agent_id in agent_ids {
+            self.remove_activity(&agent_id);
+        }
+    }
+
+    fn prune_activity_to_current_agents(&mut self) {
+        self.activity.retain(|agent_id, _| {
+            self.agents.get(agent_id).is_some_and(|agent| {
+                self.activity_projects.get(agent_id) == Some(&agent.project_id)
+            })
+        });
+        self.activity_projects.retain(|agent_id, project_id| {
+            self.activity.contains_key(agent_id)
+                && self
+                    .agents
+                    .get(agent_id)
+                    .is_some_and(|agent| &agent.project_id == project_id)
+        });
     }
 }
 

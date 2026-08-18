@@ -196,7 +196,7 @@ pub fn braille_sparkline(counts: &[u64], width: usize) -> String {
         let level = if max == 0 {
             0
         } else {
-            ((count.saturating_mul(7) + max / 2) / max).min(7) as usize
+            ((u128::from(count) * 7 + u128::from(max) / 2) / u128::from(max)).min(7) as usize
         };
         out.push(BRAILLE_LEVELS[level]);
     }
@@ -312,6 +312,14 @@ mod tests {
         series.buckets.push_back((0, u64::MAX));
         series.record(0);
         assert_eq!(series.counts(), vec![u64::MAX]);
+    }
+
+    #[test]
+    fn braille_sparkline_renders_saturated_counts_without_overflow() {
+        assert_eq!(
+            braille_sparkline(&[u64::MAX], 1),
+            BRAILLE_LEVELS[7].to_string()
+        );
     }
 
     #[test]
