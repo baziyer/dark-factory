@@ -473,6 +473,10 @@ impl Board {
         self.set_status(text, StatusLevel::Error);
     }
 
+    pub fn note_info(&mut self, text: impl Into<String>) {
+        self.set_status(text, StatusLevel::Info);
+    }
+
     /// The text the bottom status/help line should show right now: the key-help reminder for the
     /// current mode/view *always* renders, so the operator never loses the "what keys work"
     /// reference. A recent status/error follows the hint, so the non-wrapping renderer clips the
@@ -527,11 +531,11 @@ impl Board {
                     .map_or_else(|| "pane".to_owned(), |id| id.to_string());
                 return format!("TYPING \u{2192} {target}   Ctrl-] board");
             }
-            return "BOARD  i/Enter type  [/] or j/k agent  z maximise  Esc back  ? help  q detach"
+            return "BOARD  i/Enter type  C capacity  [/] or j/k agent  z maximise  Esc back  ? help  q detach"
                 .to_owned();
         }
         if self.view == View::Building {
-            return "j/k floors  Enter agent  g needs-you  n new  m message  o orchestrator  \
+            return "j/k floors  Enter agent  C capacity  g needs-you  n new  m message  o orchestrator  \
                     p project  x stop  ? help  q detach"
                 .to_owned();
         }

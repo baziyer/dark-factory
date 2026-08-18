@@ -18,13 +18,9 @@ use factory_core::{
         LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, ServerFrame,
     },
 };
-use factoryctl::{Client, update};
+use factoryctl::probes::PROBED_PROGRAMS;
+use factoryctl::{Client, install, launchd, probes, update};
 use serde::Serialize;
-
-use crate::{
-    install, launchd,
-    probes::{self, PROBED_PROGRAMS},
-};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]

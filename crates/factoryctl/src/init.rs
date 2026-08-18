@@ -18,9 +18,7 @@ use std::{
 };
 
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
-use factoryctl::{Client, update};
-
-use crate::{install, launchd, probes};
+use factoryctl::{Client, install, launchd, probes, update};
 
 pub struct Options {
     /// Skip the consent prompt (`--yes`).
@@ -183,6 +181,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         existing.as_ref(),
         &probes::provider_directories(),
         &carried,
+        None,
     )?;
     println!(
         "launchd: {} loaded{}",

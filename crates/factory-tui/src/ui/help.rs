@@ -133,6 +133,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
+        PromptKind::Capacity => "live-session capacity".to_owned(),
     };
     let height = u16::try_from(prompt.labels.len()).unwrap_or(1) + 4;
     let rect = centered_rect(area, 60, height);
