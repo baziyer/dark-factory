@@ -645,15 +645,10 @@ fn wait_for_task_status(client: &Client, task_id: &str, status: TaskStatus) -> T
 /// group, including a mid-`sleep` grandchild. Waiting here (rather than
 /// firing the request and immediately calling `daemon.stop()`, as a caller
 /// might otherwise do right after) matters for a subtler reason than just
-/// "the process is still exiting": `StopSession`'s RPC returns as soon as
-/// the runner *accepts* the stop command, well before the daemon's own
-/// background `supervise_child` task finishes subscribing to and
-/// acknowledging the runner's terminal event (`execution.rs`'s
-/// `wait_for_runner_exit` -- `factory_runner::run` will not let its own
-/// process exit without that acknowledgement). If the daemon is killed
-/// before that in-flight background task completes, the runner is
-/// orphaned forever, still waiting for an acknowledgement nothing will
-/// ever send again.
+/// "the process is still exiting": `StopSession`'s RPC waits for the daemon
+/// to observe the runner's terminal event and complete its cleanup handshake.
+/// The runner then receives `AcknowledgeExit` and exits; the helper's second
+/// wait proves that final process-level condition before the daemon stops.
 fn cleanup_session(daemon: &Daemon, agent_id: &str) {
     let client = daemon.client();
     let home = daemon.socket.parent().expect("daemon socket has a parent");
@@ -954,6 +949,14 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
             ..
         }
     ));
+
+    // The RPC response is the cleanup boundary: do not hide an ordering
+    // regression by polling until terminal state after it returns.
+    let returned_session = session_by_agent(&client, "curie").expect("session after StopSession");
+    assert!(
+        !returned_session.state.is_live(),
+        "StopSession returned before the session became terminal"
+    );
 
     // The session process actually exits and the daemon records it
     // terminal; the open episode closes stopped/operator_stop, task

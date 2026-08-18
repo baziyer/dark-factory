@@ -1174,6 +1174,13 @@ fn cleanup_failure_keeps_session_owned_and_blocks_agent_deletion() {
         store.check_agent_deletable(&project_id("factory"), &agent_id("curie")),
         Err(StoreError::AgentHasLiveSession)
     ));
+    let recovered = store
+        .recoverable_sessions()
+        .unwrap()
+        .into_iter()
+        .find(|candidate| candidate.session_id == snapshot.id)
+        .expect("cleanup-failed live session survives the recovery query");
+    assert!(recovered.cleanup_failed);
 }
 
 // --- complete_task / block_task / cancel_run -----------------------------

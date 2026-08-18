@@ -15,6 +15,10 @@ pub mod runner;
 pub mod status;
 
 pub const PROTOCOL_VERSION: u16 = 1;
+/// Durable activity marker for a live session whose provider process tree was
+/// not observed to finish cleanup. It deliberately remains live so ownership
+/// and deletion stay blocked until an operator verifies the tree.
+pub const CLEANUP_FAILED_ACTIVITY: &str = "cleanup_failed";
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -54,7 +54,11 @@ use crate::{
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
-const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(65);
+// A stop may consume the caller's 60s grace, then up to 5s waiting for the
+// killed process group to disappear and another 5s draining provider output.
+// Keep the API bound above that complete runner path rather than timing out
+// while the runner is still proving cleanup.
+const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(75);
 const STOP_COMPLETION_POLL: Duration = Duration::from_millis(20);
 
 enum RepositoryRequest {
@@ -3066,7 +3070,7 @@ async fn wait_for_session_stop(
             if !snapshot.state.is_live() {
                 return Ok(());
             }
-            if snapshot.activity.as_deref() == Some("cleanup_failed") {
+            if snapshot.activity.as_deref() == Some(factory_core::CLEANUP_FAILED_ACTIVITY) {
                 return Err(ApiFailure::Conflict(
                     snapshot
                         .wait_reason

@@ -10,7 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunSnapshot, RunStatus, SessionSnapshot, SessionState, TaskStatus};
+use crate::{
+    CLEANUP_FAILED_ACTIVITY, RunSnapshot, RunStatus, SessionSnapshot, SessionState, TaskStatus,
+};
 
 /// How urgently something wants the operator's attention, ranked low to high. `Ord`/`PartialOrd`
 /// follow declaration order, so `a.max(b)` and sorting by this enum directly implement "float
@@ -71,6 +73,18 @@ pub const fn session_attention(state: SessionState) -> Attention {
     }
 }
 
+/// Maps a session snapshot to attention, including live sessions that remain
+/// owned after cleanup could not be proven. Such a session must stay live for
+/// deletion safety but must still route the operator to it as failed.
+#[must_use]
+pub fn session_snapshot_attention(session: &SessionSnapshot) -> Attention {
+    if session.activity.as_deref() == Some(CLEANUP_FAILED_ACTIVITY) {
+        Attention::Failed
+    } else {
+        session_attention(session.state)
+    }
+}
+
 /// Maps a run's status onto [`Attention]` — the fallback used when an agent has no session yet
 /// (see [`agent_attention`]).
 #[must_use]
@@ -110,7 +124,7 @@ pub fn agent_attention(
 ) -> Rated<Attention> {
     match latest_session {
         Some(session) if session.ended_at_ms.is_none() => {
-            Rated::observed(session_attention(session.state))
+            Rated::observed(session_snapshot_attention(session))
         }
         Some(session) if session.state == SessionState::Failed => {
             Rated::observed(Attention::Failed)

@@ -323,7 +323,7 @@ impl Board {
     #[must_use]
     pub fn agent_state(&self, agent: &AgentSnapshot) -> Rated<AgentState> {
         if let Some(session) = self.session_for(agent) {
-            return Rated::observed(state::agent_state_from_session(session.state));
+            return Rated::observed(state::agent_state_from_session_snapshot(session));
         }
         Rated::inferred(state::agent_state_from_run(
             self.latest_run_for(&agent.id).map(|run| run.status),

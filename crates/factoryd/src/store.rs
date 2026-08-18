@@ -1,10 +1,11 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
-    ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
-    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentBudget, AgentId, AgentRole, AgentSnapshot, CLEANUP_FAILED_ACTIVITY, EventEnvelope,
+    FactoryEvent, MessageId, ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+    Provider, ProviderHookEvent, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
+    RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
+    TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
@@ -406,6 +407,7 @@ pub struct RecoverableSession {
     pub runner_runtime: String,
     pub runner_protocol_version: u16,
     pub observer_health: ObserverHealth,
+    pub cleanup_failed: bool,
 }
 
 /// Result of opening a task-episode inside a live session.
@@ -1964,11 +1966,11 @@ impl Store {
         }
         transaction.execute(
             "UPDATE sessions
-             SET activity = 'cleanup_failed', activity_inferred = 1,
-                 wait_reason = ?1, observer_health = 'degraded',
-                 observer_health_since_ms = ?2, updated_at_ms = ?2
-             WHERE id = ?3",
-            params![reason, now_ms, session_id.as_str()],
+             SET activity = ?1, activity_inferred = 1,
+                 wait_reason = ?2, observer_health = 'degraded',
+                 observer_health_since_ms = ?3, updated_at_ms = ?3
+             WHERE id = ?4",
+            params![CLEANUP_FAILED_ACTIVITY, reason, now_ms, session_id.as_str()],
         )?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
@@ -1992,7 +1994,7 @@ impl Store {
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider, provider_session_id, worktree, runner_instance_id,
-                    runner_runtime, runner_protocol_version, observer_health
+                    runner_runtime, runner_protocol_version, observer_health, activity
              FROM sessions
              WHERE ended_at_ms IS NULL
              ORDER BY project_id, started_at_ms, id",
@@ -2001,6 +2003,7 @@ impl Store {
             let provider: String = row.get(1)?;
             let protocol: i64 = row.get(6)?;
             let observer_health: String = row.get(7)?;
+            let activity: Option<String> = row.get(8)?;
             Ok(RecoverableSession {
                 session_id: parse_id(row.get(0)?, 0)?,
                 provider: parse_provider(&provider, 1)?,
@@ -2012,6 +2015,7 @@ impl Store {
                     rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
                 })?,
                 observer_health: parse_observer_health(&observer_health, 7)?,
+                cleanup_failed: activity.as_deref() == Some(CLEANUP_FAILED_ACTIVITY),
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

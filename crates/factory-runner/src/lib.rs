@@ -2064,22 +2064,15 @@ fn shorten_deadline(grace: Duration, deadline: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
-/// A process-group ID stops being ours the moment its leader is reaped: the
-/// kernel is then free to hand that same numeric PID to an unrelated future
-/// process on the same host. If that new process belongs to a different
-/// user or session, `kill(-pgid, ...)` reaching it can return `EPERM`
-/// instead of the `ESRCH` a truly-gone group would give — same underlying
-/// situation (nothing of ours is there anymore), different errno. On a busy
-/// host (this repo's own self-hosted runner spawns dozens of these
-/// processes concurrently) that reuse window is real, not theoretical:
-/// reproduced directly by spawning this exact natural-leader-exit scenario
-/// in a tight loop — 3 `EPERM` crashes in 20 runs on `main`, pre-`GROUP_POLL_INTERVAL`.
-/// Polling `process_group_exists` far more often than the old single check
-/// did only widens the exposure. Treat both errnos as "gone", not a hard
-/// I/O failure that aborts the run without ever recording its `Exited`
-/// event.
+/// `EPERM` is not evidence that an owned group is gone: it means a process
+/// group with this numeric ID is still present but outside our authority (or
+/// that its ownership cannot be proved). A PGID is reusable after its leader
+/// exits, so treating `EPERM` as `ESRCH` could publish `Exited` while an
+/// unrelated group remained, or send it a later `KILL`. Fail closed instead;
+/// the daemon records cleanup failure and keeps the session live for verified
+/// operator cleanup. Only `ESRCH` proves that this numeric group is absent.
 fn is_group_gone(error: rustix::io::Errno) -> bool {
-    matches!(error, rustix::io::Errno::SRCH | rustix::io::Errno::PERM)
+    matches!(error, rustix::io::Errno::SRCH)
 }
 
 fn signal_process_group(pid: Pid, signal: Signal) -> Result<(), Error> {

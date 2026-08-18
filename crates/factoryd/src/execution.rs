@@ -2457,6 +2457,13 @@ async fn supervise_recovered(
     mut shutdown_rx: watch::Receiver<bool>,
     max_attempts: u32,
 ) {
+    if recovered.cleanup_failed {
+        tracing::warn!(
+            session_id = %recovered.session_id,
+            "leaving cleanup-failed session live until an operator verifies provider cleanup"
+        );
+        return;
+    }
     let runtime_dir = PathBuf::from(&recovered.runner_runtime);
     let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
         return;
@@ -3814,6 +3821,7 @@ mod tests {
             runner_runtime: runtime_dir.to_string_lossy().into_owned(),
             runner_protocol_version: 1,
             observer_health: factory_core::ObserverHealth::Unknown,
+            cleanup_failed: false,
         };
 
         supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
@@ -3828,6 +3836,100 @@ mod tests {
             .expect("the recovered session must still exist");
         assert_eq!(session.state, SessionState::Failed);
         assert!(!session.state.is_live());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failed_session_stays_owned_when_recovery_restarts() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id,
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree,
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id,
+                    runner_runtime: directory.path().join("missing").display().to_string(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .mark_session_cleanup_failed(
+                &session_id,
+                "provider cleanup was not confirmed".to_owned(),
+                1_001,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let recovered = state
+            .with_store(|store| Ok(store.recoverable_sessions()?.pop().unwrap()))
+            .await
+            .unwrap();
+        assert!(recovered.cleanup_failed);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
+
+        let session = state
+            .with_store(move |store| store.get_session(&project_id, &session_id))
+            .await
+            .unwrap();
+        assert!(session.state.is_live());
+        assert_eq!(
+            session.activity.as_deref(),
+            Some(factory_core::CLEANUP_FAILED_ACTIVITY)
+        );
+        assert!(matches!(
+            state
+                .with_store(|store| {
+                    store.check_agent_deletable(
+                        &ProjectId::try_from("factory").unwrap(),
+                        &AgentId::try_from("curie").unwrap(),
+                    )
+                })
+                .await,
+            Err(DaemonStateError::Store(StoreError::AgentHasLiveSession))
+        ));
     }
 
     /// Issue #85 and PR #90 review: only a run created after candidate

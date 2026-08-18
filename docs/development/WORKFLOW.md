@@ -30,9 +30,10 @@ leaves the runner waiting for an acknowledgement that can never arrive.
 
 Tests that create resident sessions must therefore use both safeguards in
 `crates/factoryd/tests/sessions_e2e.rs`: call `cleanup_session` on the normal
-path, which waits until the session is non-live **and its runner process has
-exited** before stopping the daemon (pausing the agent first so pending fixture
-work cannot spawn a replacement), and retain `Daemon`'s `Drop` cleanup for
+path. Its `StopSession` request does not return until the session is non-live;
+the helper then also waits until its runner process has exited before stopping
+the daemon (pausing the agent first so pending fixture work cannot spawn a
+replacement). Retain `Daemon`'s `Drop` cleanup for
 assertion failures. A test may stop the daemon while a session is live only when
 daemon restart/recovery is the behavior under test; it must reconnect, then
 perform the same cleanup handshake before returning. Never replace this with a

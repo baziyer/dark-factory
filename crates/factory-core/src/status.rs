@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
     SessionSnapshot, TaskId, TaskSnapshot,
-    attention::{Attention, session_attention, task_attention},
+    attention::{Attention, session_snapshot_attention, task_attention},
     local::AgentDetail,
 };
 
@@ -184,7 +184,7 @@ pub fn attention_items(
             });
         }
         if let Some(session) = &status.session {
-            match session_attention(session.state) {
+            match session_snapshot_attention(session) {
                 Attention::NeedsInput => items.push(AttentionItem {
                     kind: AttentionKind::NeedsInput,
                     level: Attention::NeedsInput,
@@ -355,7 +355,7 @@ mod tests {
             queue_depth: u32::try_from(queue.len()).unwrap(),
             attention: session
                 .as_ref()
-                .map_or(Attention::Routine, |s| session_attention(s.state)),
+                .map_or(Attention::Routine, session_snapshot_attention),
             attention_inferred: session.is_none(),
             agent,
             worktree: None,
@@ -449,5 +449,23 @@ mod tests {
             vec![],
         )];
         assert!(attention_items(&project, &agents, &[], true).is_empty());
+    }
+
+    #[test]
+    fn cleanup_failed_live_session_is_shared_failed_attention() {
+        let project = ProjectId::try_from("p").unwrap();
+        let mut cleanup = session(SessionState::Idle, 1);
+        cleanup.activity = Some(crate::CLEANUP_FAILED_ACTIVITY.to_owned());
+        cleanup.wait_reason = Some("provider cleanup was not confirmed".to_owned());
+        let items = attention_items(
+            &project,
+            &[status(agent("a", false), Some(cleanup), vec![])],
+            &[],
+            true,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::SessionFailed);
+        assert_eq!(items[0].level, Attention::Failed);
+        assert_eq!(items[0].detail, "provider cleanup was not confirmed");
     }
 }
