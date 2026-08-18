@@ -812,15 +812,18 @@ fn health_version_is_additive_so_a_new_client_reads_an_old_daemon() {
             runner_path: "/r".to_owned(),
             factoryctl_path: "/c".to_owned(),
             version: String::new(),
+            process_id: 0,
         }
     );
     let value = serde_json::to_value(LocalResponse::Health {
         runner_path: "/r".to_owned(),
         factoryctl_path: "/c".to_owned(),
         version: "0.1.0".to_owned(),
+        process_id: 0,
     })
     .unwrap();
     assert_eq!(value["data"]["version"], "0.1.0");
+    assert_eq!(value["data"]["process_id"], 0);
 }
 
 #[test]

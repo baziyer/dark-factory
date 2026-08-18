@@ -79,18 +79,18 @@ const HEALTH_HELP: &str = "usage: factoryctl health
 Check that the daemon is reachable and responding.";
 const STATUS_HELP: &str = "usage: factoryctl status [--json]
 
-One JSON frame with the whole daemon at one instant, built in one store
-read: every project's agents with their live (or most recent) session,
-current run, queued tasks (oldest first, first 10 listed, full depth
-alongside), and undelivered inbox count; each project's unassigned queue;
-the daemon's live-session cap and how many sessions are live; and an
-attention list (sessions waiting for input or failed, blocked tasks,
-paused agents with work, agents waiting for capacity), most urgent first.
-factory-tui reads the same request. For history, use the list commands.";
+A concise human summary of the whole daemon at one instant: projects,
+agents, sessions, queues, worktrees, and anything needing attention.
+factory-tui reads the same request. For history, use the list commands.
+
+Options:
+  --json                       Print the complete protocol response frame
+  -h, --help                   Show this help";
 
 const CAPACITY_HELP: &str = "usage: factoryctl capacity <status|set N>
 
-The capacity is a finite daemon-wide live-session bound. `set` is operator-only,
+The capacity is a finite daemon-wide live-session bound. `set` is operator-only
+(provider-session shell policy denies this mutation),
 requires the managed launchd job, shows that launchd will restart only factoryd
 while preserving runner processes/session state, and rolls the plist back if the
 reload or health check fails. Valid values are 1 through 64.";
@@ -1008,15 +1008,7 @@ fn run() -> Result<i32, String> {
             "capacity: {previous} -> {requested} live sessions; launchd will restart only factoryd, preserving live runner processes and session state; higher values can increase concurrent provider/subscription use, lower values leave work queued"
         );
         let change = capacity::set_from_environment(&socket, *value)?;
-        println!(
-            "{}",
-            serde_json::json!({
-                "previous": change.previous,
-                "capacity": change.current,
-                "launchd": "reloaded",
-                "live_sessions_preserved": true,
-            })
-        );
+        println!("{}", capacity_result(&change));
         return Ok(0);
     }
     if let CliCommand::Update { install } = command {
@@ -1102,6 +1094,15 @@ fn run() -> Result<i32, String> {
         write_frame(&mut output, &frame)?;
     }
     Ok(if is_error(&frame) { 2 } else { 0 })
+}
+
+fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
+    serde_json::json!({
+        "previous": change.previous,
+        "capacity": change.current,
+        "launchd": "reloaded",
+        "live_sessions_preserved": true,
+    })
 }
 
 /// The agent-facing mutations a session's own `factoryctl` calls make on
@@ -2743,6 +2744,17 @@ mod tests {
     }
 
     #[test]
+    fn capacity_result_promises_live_session_preservation_in_the_cli_contract() {
+        let value = capacity_result(&capacity::CapacityChange {
+            previous: 4,
+            current: 8,
+        });
+        assert_eq!(value["previous"], 4);
+        assert_eq!(value["capacity"], 8);
+        assert_eq!(value["live_sessions_preserved"], true);
+    }
+
+    #[test]
     fn help_is_available_without_a_daemon_connection() {
         assert_eq!(
             parse_args(args(&["--help"])).unwrap(),
@@ -3232,6 +3244,13 @@ mod tests {
                 if project_id == "factory".try_into().unwrap() && agent_id == "god".try_into().unwrap()
         ));
         assert!(parse_args(args(&["agent", "status", "--project", "factory"])).is_err());
+    }
+
+    #[test]
+    fn status_help_keeps_the_human_default_and_json_escape_hatch() {
+        assert!(STATUS_HELP.contains("A concise human summary"));
+        assert!(STATUS_HELP.contains("--json"));
+        assert!(!STATUS_HELP.contains("One JSON frame"));
     }
 
     #[test]

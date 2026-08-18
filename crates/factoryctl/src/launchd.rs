@@ -359,26 +359,50 @@ pub fn apply(
     })
 }
 
+/// Restores a previously saved plist and reloads that exact managed job. This
+/// is used after a post-reload health failure, where merely repointing
+/// `bin/current` would leave launchd running the changed job state.
+pub fn restore(plist: &Path, home: &Path, content: &str) -> Result<(), String> {
+    let current = if plist.exists() {
+        Some(fs::read_to_string(plist).map_err(|error| {
+            format!(
+                "could not read the current launchd plist {}: {error}",
+                plist.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    install_and_reload(plist, home, content, current, || {
+        reload(rustix::process::getuid().as_raw(), plist)
+    })
+}
+
 fn install_and_reload(
     plist: &Path,
     home: &Path,
     content: &str,
     old_content: Option<String>,
-    reload: impl FnOnce() -> Result<(), String>,
+    mut reload: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     install(plist, content, home)?;
     match reload() {
         Ok(()) => Ok(()),
         Err(error) => {
             let rollback = match old_content {
-                Some(content) => install(plist, &content, home),
+                Some(content) => {
+                    install(plist, &content, home)?;
+                    reload().map_err(|recovery| {
+                        format!(
+                            "plist restored but managed launchd job recovery failed: {recovery}"
+                        )
+                    })
+                }
                 None => fs::remove_file(plist).map_err(|restore| restore.to_string()),
             };
             match rollback {
-                Ok(()) => Err(format!("{error}; launchd plist rolled back")),
-                Err(rollback) => Err(format!(
-                    "{error}; launchd plist rollback failed: {rollback}"
-                )),
+                Ok(()) => Err(format!("{error}; launchd plist and job rolled back")),
+                Err(rollback) => Err(format!("{error}; launchd rollback failed: {rollback}")),
             }
         }
     }
@@ -439,6 +463,27 @@ pub fn reload(uid: u32, plist: &Path) -> Result<(), String> {
         plist.display(),
         plist.display()
     ))
+}
+
+/// Returns the PID launchd currently associates with its managed job.
+pub fn job_pid(uid: u32) -> Result<Option<u32>, String> {
+    let domain = format!("gui/{uid}/{LABEL}");
+    let output = Command::new("launchctl")
+        .args(["print", &domain])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("could not run launchctl print: {error}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_job_pid(&String::from_utf8_lossy(&output.stdout)))
+}
+
+fn parse_job_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let value = line.trim().strip_prefix("pid = ")?;
+        value.parse().ok()
+    })
 }
 
 fn escape(text: &str) -> String {
@@ -577,17 +622,61 @@ mod tests {
     }
 
     #[test]
+    fn capacity_setting_persists_across_init_update_and_reinit_argument_carry() {
+        let initial =
+            ["/factoryd", "--max-active-runs", "8", "--database", "/db"].map(str::to_owned);
+        let init =
+            carried_arguments_with_capacity(&initial, max_active_runs(&initial).unwrap().unwrap());
+        let update_input = std::iter::once("/factoryd".to_owned())
+            .chain(init)
+            .collect::<Vec<_>>();
+        let update = carried_arguments_with_capacity(
+            &update_input,
+            max_active_runs(&update_input).unwrap().unwrap(),
+        );
+        let reinit_input = std::iter::once("/factoryd".to_owned())
+            .chain(update)
+            .collect::<Vec<_>>();
+        let reinit = carried_arguments_with_capacity(
+            &reinit_input,
+            max_active_runs(&reinit_input).unwrap().unwrap(),
+        );
+        assert_eq!(max_active_runs(&reinit).unwrap(), Some(8));
+        assert_eq!(
+            reinit
+                .iter()
+                .filter(|argument| *argument == "--max-active-runs")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn failed_reload_restores_the_previous_plist() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let plist = root.path().join("Library/LaunchAgents/job.plist");
         install(&plist, "old", &home).unwrap();
+        let mut reloads = 0;
         let error = install_and_reload(&plist, &home, "new", Some("old".to_owned()), || {
-            Err("reload failed".to_owned())
+            reloads += 1;
+            if reloads == 1 {
+                Err("reload failed".to_owned())
+            } else {
+                Ok(())
+            }
         })
         .unwrap_err();
-        assert!(error.contains("plist rolled back"));
+        assert!(error.contains("plist and job rolled back"));
+        assert_eq!(reloads, 2);
         assert_eq!(fs::read_to_string(plist).unwrap(), "old");
+    }
+
+    #[test]
+    fn launchd_pid_parser_requires_a_real_job_pid() {
+        assert_eq!(parse_job_pid("state = running\npid = 1234\n"), Some(1234));
+        assert_eq!(parse_job_pid("state = running\n"), None);
+        assert_eq!(parse_job_pid("pid = nope\n"), None);
     }
 
     #[test]

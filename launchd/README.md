@@ -58,8 +58,9 @@ with `factoryctl capacity status` or `factoryctl capacity set N`; values from
 1 through 64 are accepted. The managed operation shows its process and
 subscription impact, reloads only `factoryd`, waits for health, and restores
 the previous plist if reload/health fails. Higher values can increase concurrent
-provider/subscription use; lower values leave saturated work queued. It refuses agent-session origins,
-manual daemons, and an unloaded/missing launchd job. `factoryctl init` and
+provider/subscription use; lower values leave saturated work queued. The
+provider-session shell policy denies the mutation; the managed operation also
+refuses manual daemons and an unloaded/missing launchd job. `factoryctl init` and
 `factoryctl update --install` preserve the setting when they rewrite the job.
 Any other `factoryd` flag goes into `ProgramArguments` as further `<string>`
 elements; `factoryctl update --install` carries them and the environment over

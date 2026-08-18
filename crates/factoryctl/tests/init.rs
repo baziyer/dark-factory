@@ -268,6 +268,7 @@ fn doctor_report(active_version: &str, daemon_version: &str) -> serde_json::Valu
                 runner_path: "/tmp/factory-runner".to_owned(),
                 factoryctl_path: "/tmp/factoryctl".to_owned(),
                 version: daemon_version,
+                process_id: 0,
             },
             LocalResponse::Projects {
                 projects: Vec::new(),
