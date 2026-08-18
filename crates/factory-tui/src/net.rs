@@ -536,6 +536,7 @@ mod tests {
     fn empty_fleet(generated_at_ms: i64) -> FleetStatus {
         FleetStatus {
             generated_at_ms,
+            auto_mode: false,
             live_session_cap: 4,
             live_sessions: 0,
             projects: Vec::new(),

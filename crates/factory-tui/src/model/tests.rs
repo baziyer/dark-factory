@@ -33,6 +33,7 @@ fn later_fleet_status_replaces_clean_worktree_state_without_a_reconnect() {
     let mut b = board();
     let mut status = FleetStatus {
         generated_at_ms: 0,
+        auto_mode: false,
         live_session_cap: 4,
         live_sessions: 0,
         projects: vec![ProjectStatus {
