@@ -1224,6 +1224,11 @@ fn block_task_closes_the_episode_stopped_with_a_blocked_reason() {
         Some(factory_core::RunClosedBy::TaskBlocked)
     );
     assert_eq!(closed.task.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(closed.task.blocked_reason.as_deref(), Some("needs input"));
+    let blocked = store.blocked_tasks(&project_id("factory")).unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].task.id, task_id("task-1"));
+    assert_eq!(blocked[0].reason.as_deref(), Some("needs input"));
 }
 
 #[test]

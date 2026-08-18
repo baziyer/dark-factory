@@ -23,7 +23,7 @@ pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
     pub backlog: Vec<TaskSnapshot>,
-    pub blocked: Vec<TaskSnapshot>,
+    pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
 const SCHEMA_VERSION: i64 = 24;
@@ -4193,6 +4193,7 @@ impl Store {
             worktree: None,
             session,
             current_run,
+            latest_run,
             queue_depth: u32::try_from(queue.len()).unwrap_or(u32::MAX),
             queue: queue.into_iter().take(MAX_QUEUE_PREVIEW).collect(),
             inbox_pending: u32::try_from(inbox_pending).unwrap_or(u32::MAX),
@@ -4272,15 +4273,23 @@ impl Store {
     }
 
     /// Tasks an agent marked blocked, oldest update first.
-    fn blocked_tasks(&self, project_id: &ProjectId) -> Result<Vec<TaskSnapshot>> {
+    pub fn blocked_tasks(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<factory_core::status::BlockedTaskStatus>> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
              WHERE project_id = ?1 AND status = 'blocked'
              ORDER BY updated_at_ms, id",
         )?;
-        let rows = statement.query_map(params![project_id.as_str()], task_snapshot_from_row)?;
+        let rows = statement.query_map(params![project_id.as_str()], |row| {
+            Ok(factory_core::status::BlockedTaskStatus {
+                task: task_snapshot_from_row(row)?,
+                reason: row.get(9)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 

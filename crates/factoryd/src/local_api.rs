@@ -840,9 +840,27 @@ async fn handle_request(
         } => {
             let lookup_project_id = project_id.clone();
             let lookup_agent_id = agent_id.clone();
-            let mut agent_status = state
-                .with_store(move |store| store.agent_status(&lookup_project_id, &lookup_agent_id))
+            let (mut agent_status, blocked, live_sessions, generated_at_ms) = state
+                .with_store(move |store| {
+                    let status = store.agent_status(&lookup_project_id, &lookup_agent_id)?;
+                    let blocked = store
+                        .blocked_tasks(&lookup_project_id)?
+                        .into_iter()
+                        .filter(|blocked| {
+                            blocked.task.assigned_agent_id.as_ref() == Some(&lookup_agent_id)
+                        })
+                        .collect::<Vec<_>>();
+                    Ok((status, blocked, store.live_session_count()?, now_ms()?))
+                })
                 .await?;
+            let at_capacity = live_sessions >= execution.max_active_runs();
+            let mut attention = status::attention_items(
+                &project_id,
+                std::slice::from_ref(&agent_status),
+                &blocked,
+                at_capacity,
+            );
+            status::sort_attention(&mut attention);
             let detail =
                 agent_detail_with_guidance(state, execution, guidance_root, &project_id, &agent_id)
                     .await?;
@@ -853,9 +871,11 @@ async fn handle_request(
             agent_status.worktree = worktree.clone();
             Ok(LocalResponse::AgentStatus {
                 status: Box::new(status::AgentStatusDetail {
+                    generated_at_ms,
                     status: agent_status,
                     detail,
                     worktree,
+                    attention,
                 }),
             })
         }
@@ -2063,6 +2083,7 @@ mod worktree_status_tests {
                 worktree: None,
                 session: None,
                 current_run: None,
+                latest_run: None,
                 queue_depth: 0,
                 queue: Vec::new(),
                 inbox_pending: 0,

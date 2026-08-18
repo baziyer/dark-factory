@@ -11,13 +11,12 @@
 //! project's agents/tasks/runs/sessions at once. BUILDING is fleet-wide; AGENT follows the
 //! selected agent while `focused_project` supplies scope for project actions.
 //!
-//! ## Deriving agent state and attention
+//! ## Deriving agent state
 //!
-//! [`Board::agent_state`] and [`Board::agent_attention`] are the two functions everything else in
-//! this crate goes through instead of inspecting [`SessionState`]/[`RunStatus`] itself: "session
-//! state wins over run-status inference when a session exists" (design brief §5). Both return a
-//! [`attention::Rated`] value so callers can show the `~` prefix the brief asks for whenever the
-//! answer was inferred from run/task lifecycle state rather than observed from a session's hooks.
+//! [`Board::agent_state`] is the one function everything else in this crate goes through instead
+//! of inspecting [`SessionState`]/[`RunStatus`] itself. Operator attention is not derived here:
+//! it is the shared CLI-first [`factory_core::status::AttentionItem`] projection received in
+//! fleet status.
 
 pub mod announcements;
 mod keymap;
@@ -26,13 +25,14 @@ pub mod state;
 use std::collections::{BTreeMap, HashMap};
 
 use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
+use factory_core::status::{AttentionItem, AttentionReasonKind};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
 };
 
 pub use announcements::Announcement;
-pub use factory_core::attention::{self, Attention, Rated};
+pub use factory_core::attention::Rated;
 pub use keymap::{
     Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
     TaskMenuState, View,
@@ -77,18 +77,9 @@ pub enum Connection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AttentionTarget {
-    Agent(AgentId),
-    Task(TaskId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttentionItem {
-    pub target: AttentionTarget,
-    pub project_id: ProjectId,
-    pub attention: Attention,
-    pub inferred: bool,
-    pub since_ms: i64,
+pub struct AttentionFocus {
+    pub item: AttentionItem,
+    pub resolved: bool,
 }
 
 /// Durable ownership for an activity series. `None` is retained only for replay events received
@@ -130,6 +121,8 @@ pub struct Board {
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
     pub agent_details: BTreeMap<AgentId, AgentDetail>,
     pub messages: BTreeMap<AgentId, Vec<AgentMessage>>,
+    /// Authoritative CLI-first attention projection from `FleetStatus`.
+    pub attention: Vec<AttentionItem>,
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
@@ -141,6 +134,8 @@ pub struct Board {
     pub selected_agent: Option<AgentId>,
     /// Task targeted by a task action modal.
     pub selected_task: Option<TaskId>,
+    /// Explicit action card selected by `g` or a NEEDS YOU click.
+    pub attention_focus: Option<AttentionFocus>,
     pub mode: Mode,
     /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
@@ -175,6 +170,7 @@ impl Board {
             sessions: BTreeMap::new(),
             agent_details: BTreeMap::new(),
             messages: BTreeMap::new(),
+            attention: Vec::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
@@ -182,6 +178,7 @@ impl Board {
             view: View::Building,
             selected_agent: None,
             selected_task: None,
+            attention_focus: None,
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
             pane_ready: false,
@@ -194,6 +191,8 @@ impl Board {
 
     pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
         self.live_session_cap = Some(status.live_session_cap);
+        self.attention = status.attention;
+        self.reconcile_attention_focus();
         self.worktrees = status
             .projects
             .into_iter()
@@ -371,74 +370,38 @@ impl Board {
         ))
     }
 
-    /// The agent's newest session by start time, live or ended.
-    #[must_use]
-    pub fn latest_session_for(&self, agent_id: &AgentId) -> Option<&SessionSnapshot> {
-        self.sessions
-            .values()
-            .filter(|session| &session.agent_id == agent_id)
-            .max_by_key(|session| (session.started_at_ms, session.id.clone()))
-    }
-
-    /// The [`Attention`] taxonomy's precedence rule, shared with `factoryctl status`
-    /// (`factory_core::attention::agent_attention`).
-    #[must_use]
-    pub fn agent_attention(&self, agent: &AgentSnapshot) -> Rated<Attention> {
-        attention::agent_attention(
-            self.latest_session_for(&agent.id),
-            self.latest_run_for(&agent.id),
-        )
-    }
-
     #[must_use]
     pub fn attention_items(&self) -> Vec<AttentionItem> {
-        let mut items = Vec::new();
-        for agent in self.agents.values() {
-            let rated = self.agent_attention(agent);
-            if rated.value.needs_operator() {
-                let since_ms = self
-                    .session_for(agent)
-                    .map_or(agent.updated_at_ms, |session| session.state_since_ms);
-                items.push(AttentionItem {
-                    target: AttentionTarget::Agent(agent.id.clone()),
-                    project_id: agent.project_id.clone(),
-                    attention: rated.value,
-                    inferred: rated.inferred,
-                    since_ms,
-                });
-            }
+        self.attention
+            .iter()
+            .filter(|item| item.level.needs_operator())
+            .cloned()
+            .collect()
+    }
+
+    fn reconcile_attention_focus(&mut self) {
+        let Some(focus) = self.attention_focus.as_mut() else {
+            return;
+        };
+        if let Some(current) = self
+            .attention
+            .iter()
+            .find(|item| same_attention_source(item, &focus.item))
+        {
+            focus.item = current.clone();
+            focus.resolved = false;
+        } else if !focus.resolved {
+            focus.resolved = true;
+            self.set_status(
+                "attention changed or resolved before action",
+                StatusLevel::Info,
+            );
         }
-        for task in self.tasks.values() {
-            let level = attention::task_attention(task.snapshot.status);
-            if level.needs_operator() {
-                items.push(AttentionItem {
-                    target: AttentionTarget::Task(task.snapshot.id.clone()),
-                    project_id: task.snapshot.project_id.clone(),
-                    attention: level,
-                    inferred: false,
-                    since_ms: task.snapshot.updated_at_ms,
-                });
-            }
-        }
-        items.sort_by(|a, b| {
-            a.since_ms
-                .cmp(&b.since_ms)
-                .then_with(|| match (&a.target, &b.target) {
-                    (AttentionTarget::Agent(a), AttentionTarget::Agent(b)) => {
-                        a.as_str().cmp(b.as_str())
-                    }
-                    (AttentionTarget::Task(a), AttentionTarget::Task(b)) => {
-                        a.as_str().cmp(b.as_str())
-                    }
-                    (AttentionTarget::Agent(_), AttentionTarget::Task(_)) => {
-                        std::cmp::Ordering::Less
-                    }
-                    (AttentionTarget::Task(_), AttentionTarget::Agent(_)) => {
-                        std::cmp::Ordering::Greater
-                    }
-                })
-        });
-        items
+    }
+
+    fn invalidate_attention(&mut self, mut invalid: impl FnMut(&AttentionItem) -> bool) {
+        self.attention.retain(|item| !invalid(item));
+        self.reconcile_attention_focus();
     }
 
     // -- derived views: terminal attach targets ----------------------------------------------
@@ -754,6 +717,42 @@ impl Board {
 
         let worth_announcing = self.should_announce(&event);
         self.maybe_announce(&event, worth_announcing);
+
+        match &event.event {
+            FactoryEvent::AgentBudgetChanged { agent_id, .. } => {
+                self.invalidate_attention(|item| {
+                    item.agent_id.as_ref() == Some(agent_id)
+                        && item.reason.kind == AttentionReasonKind::BudgetExhausted
+                })
+            }
+            FactoryEvent::AgentChanged { agent } => self.invalidate_attention(|item| {
+                item.agent_id.as_ref() == Some(&agent.id)
+                    && item.reason.kind == AttentionReasonKind::PausedWithWork
+            }),
+            FactoryEvent::TaskChanged { task } => {
+                self.invalidate_attention(|item| item.task_id.as_ref() == Some(&task.id));
+            }
+            FactoryEvent::RunChanged { run } => {
+                self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
+            }
+            FactoryEvent::SessionChanged { session } => {
+                self.invalidate_attention(|item| item.session_id.as_ref() == Some(&session.id));
+            }
+            FactoryEvent::TaskDeleted { task_id, .. } => {
+                self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
+            }
+            FactoryEvent::AgentDeleted { agent_id, .. } => {
+                self.invalidate_attention(|item| item.agent_id.as_ref() == Some(agent_id));
+            }
+            FactoryEvent::ProjectDeleted { project_id } => {
+                self.invalidate_attention(|item| &item.project_id == project_id);
+            }
+            FactoryEvent::AutoModeChanged { .. }
+            | FactoryEvent::PolicyDecision { .. }
+            | FactoryEvent::RepositoryOperation { .. }
+            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::ProjectChanged { .. } => {}
+        }
 
         match event.event {
             FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
@@ -1114,6 +1113,16 @@ impl Board {
                     .is_none_or(|created_at_ms| created_at_ms == agent.created_at_ms)
         })
     }
+}
+
+pub(crate) fn same_attention_source(a: &AttentionItem, b: &AttentionItem) -> bool {
+    a.reason.kind == b.reason.kind
+        && a.project_id == b.project_id
+        && a.agent_id == b.agent_id
+        && a.task_id == b.task_id
+        && a.session_id == b.session_id
+        && a.run_id == b.run_id
+        && a.since_ms == b.since_ms
 }
 
 fn truncate_status(text: &str, max: usize) -> String {

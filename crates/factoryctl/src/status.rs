@@ -2,13 +2,8 @@ use std::io::Write;
 
 use factory_core::{
     SessionState,
-    status::{AttentionKind, FleetStatus, WorktreeStatus},
+    status::{FleetStatus, WorktreeStatus, age_text, display_text},
 };
-
-/// Keeps each operator-controlled value to one terminal-safe, scannable row.
-/// IDs and enum labels are validated/fixed elsewhere; every free-form field
-/// rendered by this module passes through [`display_text`].
-const MAX_DISPLAY_CHARS: usize = 160;
 
 pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String> {
     writeln!(
@@ -56,16 +51,23 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                 subject.push('/');
                 subject.push_str(agent_id.as_str());
             }
-            if let Some(task_id) = &item.task_id {
-                subject.push_str(" task ");
-                subject.push_str(task_id.as_str());
-            }
             writeln!(
                 output,
-                "  {} | {} | {}",
-                attention_label(item.kind),
+                "  {} | {} | task {} | session {} | run {} | age {} | {} | action: {}",
+                item.reason.kind.label(),
                 subject,
-                display_text(&item.detail)
+                item.task_id
+                    .as_ref()
+                    .map_or("—", factory_core::TaskId::as_str),
+                item.session_id
+                    .as_ref()
+                    .map_or("—", factory_core::SessionId::as_str),
+                item.run_id
+                    .as_ref()
+                    .map_or("—", factory_core::RunId::as_str),
+                age_text(status.generated_at_ms, item.since_ms),
+                display_text(&item.reason.summary),
+                item.action_text(),
             )
             .map_err(|error| error.to_string())?;
         }
@@ -104,61 +106,16 @@ fn worktree_label(worktree: Option<&WorktreeStatus>) -> String {
     }
 }
 
-const fn attention_label(kind: AttentionKind) -> &'static str {
-    match kind {
-        AttentionKind::NeedsInput => "needs input",
-        AttentionKind::BudgetExhausted => "budget exhausted",
-        AttentionKind::SessionFailed => "session failed",
-        AttentionKind::TaskBlocked => "task blocked",
-        AttentionKind::PausedWithWork => "paused with work",
-        AttentionKind::WaitingForCapacity => "waiting for capacity",
-    }
-}
-
-fn display_text(value: &str) -> String {
-    let mut output = String::new();
-    let mut length = 0;
-    let mut pending_space = false;
-    let mut truncated = false;
-
-    for character in value.chars() {
-        if character.is_whitespace() {
-            pending_space = !output.is_empty();
-            continue;
-        }
-        if character.is_control() {
-            continue;
-        }
-        let separator = usize::from(pending_space && !output.is_empty());
-        if length + separator + 1 > MAX_DISPLAY_CHARS {
-            truncated = true;
-            break;
-        }
-        if separator == 1 {
-            output.push(' ');
-            length += 1;
-        }
-        output.push(character);
-        length += 1;
-        pending_space = false;
-    }
-
-    if truncated {
-        if length == MAX_DISPLAY_CHARS {
-            output.pop();
-        }
-        output.push('…');
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use factory_core::{
         AgentBudget, AgentId, AgentRole, AgentSnapshot, ProjectId, ProjectSnapshot, Provider,
         SessionId, SessionSnapshot,
         attention::Attention,
-        status::{AgentStatus, AttentionItem, ProjectStatus},
+        status::{
+            AgentStatus, AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind,
+            MAX_ATTENTION_SUMMARY_CHARS, ProjectStatus,
+        },
     };
 
     use super::*;
@@ -227,6 +184,7 @@ mod tests {
             worktree,
             session: state.map(|state| session(agent_id, state)),
             current_run: None,
+            latest_run: None,
             queue_depth,
             queue: Vec::new(),
             inbox_pending,
@@ -311,24 +269,32 @@ mod tests {
             ],
             attention: vec![
                 AttentionItem {
-                    kind: AttentionKind::NeedsInput,
                     level: Attention::NeedsInput,
                     project_id: project_id.clone(),
                     agent_id: Some(AgentId::try_from("reviewer").unwrap()),
                     task_id: None,
                     session_id: Some(SessionId::try_from("session-reviewer").unwrap()),
+                    run_id: None,
                     since_ms: 1,
-                    detail: "approve\ncommand \u{1b}[2JFORGED".into(),
+                    reason: AttentionReason {
+                        kind: AttentionReasonKind::ProviderPermission,
+                        summary: display_text("approve\ncommand \u{1b}[2J\u{202e}FORGED\u{2066}"),
+                        action: AttentionAction::ReviewProviderPermission,
+                    },
                 },
                 AttentionItem {
-                    kind: AttentionKind::TaskBlocked,
                     level: Attention::NeedsInput,
                     project_id,
                     agent_id: None,
                     task_id: Some(id("task-7")),
                     session_id: None,
+                    run_id: None,
                     since_ms: 2,
-                    detail: "dependency missing".into(),
+                    reason: AttentionReason {
+                        kind: AttentionReasonKind::WorkerBlocked,
+                        summary: "dependency missing".into(),
+                        action: AttentionAction::RetryTask,
+                    },
                 },
             ],
         };
@@ -346,8 +312,8 @@ mod tests {
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
                 "\nEmpty (empty) | agents 0 | backlog 0\n",
                 "\nAttention:\n",
-                "  needs input | factory/reviewer | approve command [2JFORGED\n",
-                "  task blocked | factory task task-7 | dependency missing\n",
+                "  provider permission | factory/reviewer | task — | session session-reviewer | run — | age 0s | approve command [2JFORGED | action: review the provider prompt before entering terminal typing\n",
+                "  worker blocked | factory | task task-7 | session — | run — | age 0s | dependency missing | action: factoryctl task retry --project factory --task task-7\n",
             )
         );
         assert!(
@@ -357,13 +323,15 @@ mod tests {
             "human output contains a terminal control: {output:?}"
         );
         assert!(output.contains("東京🛠️e\u{301}"));
+        assert!(!output.contains('\u{202e}'));
+        assert!(!output.contains('\u{2066}'));
     }
 
     #[test]
     fn display_text_is_bounded_after_normalizing_and_removing_controls() {
         let value = format!("  safe\t\u{1b}[2J\u{9b}{}  ", "界".repeat(200));
         let rendered = display_text(&value);
-        assert_eq!(rendered.chars().count(), MAX_DISPLAY_CHARS);
+        assert_eq!(rendered.chars().count(), MAX_ATTENTION_SUMMARY_CHARS);
         assert!(rendered.starts_with("safe [2J"));
         assert!(rendered.ends_with('…'));
         assert!(rendered.chars().all(|character| !character.is_control()));

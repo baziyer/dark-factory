@@ -668,7 +668,7 @@ fn apply_replay_drops_activity_for_an_agent_deleted_during_the_replay_window() {
     );
 }
 
-// -- state/attention precedence ----------------------------------------------------------------
+// -- state precedence --------------------------------------------------------------------------
 
 #[test]
 fn session_state_wins_over_run_status_when_both_exist() {
@@ -693,10 +693,6 @@ fn session_state_wins_over_run_status_when_both_exist() {
         !rated_state.inferred,
         "observed from a session, not inferred"
     );
-
-    let rated_attention = b.agent_attention(agent);
-    assert_eq!(rated_attention.value, Attention::Routine);
-    assert!(!rated_attention.inferred);
 }
 
 #[test]
