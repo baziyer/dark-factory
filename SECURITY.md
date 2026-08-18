@@ -47,8 +47,8 @@ operator from their own agents. Concretely:
   merge and release remain external-reviewer/operator actions. This reduces
   accidentally delegated authority, but is not OS isolation: a process
   already running as the operator can still search filesystem-readable
-  credentials or evade environment policy. The separate runner user in #54
-  remains the outer security boundary.
+  credentials or evade environment policy. The optional hardened agent
+  runner in #125 is the planned outer security boundary.
   The operator first pins each project's canonical remote and PR base in the
   durable store, before any agent session exists; later first-writer or
   retarget attempts are rejected. Privileged Git pins the linked-worktree
@@ -88,7 +88,8 @@ operator from their own agents. Concretely:
   syscalls can evade a string-level hook policy; it does not protect the
   operator from a malicious agent. Worktrees provide collision isolation,
   not filesystem or credential isolation. A separate OS user remains the
-  planned outer boundary (#54).
+  planned outer boundary (#125). CI runner isolation is a separate boundary
+  tracked in #54.
 - **Budgets are a tool-call circuit breaker, not monetary accounting.** Each
   agent defaults to 1,000 authenticated `PreToolUse` calls per reset. The
   daemon durably counts observations, pauses delivery and denies subsequent

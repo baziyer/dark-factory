@@ -51,10 +51,13 @@ Read-only context unless a task explicitly asks you to edit them:
    fallbacks that hide a real failure behind a plausible-looking success.
 4. **Simplest implementation over cleverness.** Prefer the boring, obvious
    fix. Maintainability beats a clever one-liner.
-5. **CLI first.** Every operator action is a `factoryctl` request;
-   `factory-tui` calls the exact same local-API request path, never a
-   shortcut only the TUI can take. Add the CLI command before or alongside
-   any TUI affordance for it.
+5. **Shared operation first; TUI primary.** Every daemon-owned runtime action
+   is a `factoryd` local-API operation. Bootstrap, service-lifecycle, and
+   update actions that must work while the daemon is absent live in shared
+   Rust library code. `factory-tui` is the primary operator client;
+   `factoryctl` provides parity for recovery, diagnostics, scripting, and
+   automation. Neither client gets a shortcut or hidden behavior unavailable
+   through the shared operation.
 6. **Tests around the load-bearing paths**: queue durability, event
    projection (durable state → wire events → TUI model), PTY lifecycle,
    detach/reattach. A change to any of these needs a test that would have
@@ -93,5 +96,5 @@ Read-only context unless a task explicitly asks you to edit them:
   provider contract.
 - Known problems and their smallest fix: [GitHub issues labelled
   `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue).
-- Day-to-day workflow and the (unimplemented) release/update design:
+- Day-to-day workflow and the implemented release/update process:
   [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md).

@@ -102,6 +102,8 @@ Guided first install on this machine:
   5. render ~/Library/LaunchAgents/com.dark-factory.factoryd.plist with a PATH that
      can find those CLIs, load it, and wait for the daemon to answer health with
      this version
+  6. show first-project next steps for an empty fleet, or status and the TUI when
+     projects already exist
 
 Re-running is safe: an existing job keeps its extra daemon arguments and
 environment (its PATH is repaired if a provider CLI moved), an installed
