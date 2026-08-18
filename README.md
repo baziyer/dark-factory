@@ -64,6 +64,10 @@ and sandboxing. Dark Factory still applies its tool deny policy. Run
 future sessions. Read the [security policy](SECURITY.md) before you assign real
 work.
 
+`factoryctl agent status` reports each session's configured override separately
+from the exact runtime values it could establish; unavailable provider metadata
+is shown as `unreported`.
+
 Run these commands in a Git repository:
 
 ```sh

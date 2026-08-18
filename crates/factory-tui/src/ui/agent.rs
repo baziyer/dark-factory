@@ -200,34 +200,48 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
     } else {
         "running (pause via factoryctl)"
     };
-    let (model, permission, files) = board.agent_details.get(agent_id).map_or_else(
-        || {
-            (
-                "loading…".to_owned(),
-                "loading…".to_owned(),
-                "instructions.md  memory.md".to_owned(),
-            )
-        },
-        |detail| {
-            (
-                detail
-                    .profile
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "provider default".to_owned()),
-                detail
-                    .profile
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| "provider default".to_owned()),
-                format!("{}\n{}", detail.instructions_path, detail.memory_path),
-            )
-        },
-    );
+    let (configured_model, configured_permission, files) =
+        board.agent_details.get(agent_id).map_or_else(
+            || {
+                (
+                    "loading…".to_owned(),
+                    "loading…".to_owned(),
+                    "instructions.md  memory.md".to_owned(),
+                )
+            },
+            |detail| {
+                (
+                    detail
+                        .profile
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| "provider default".to_owned()),
+                    detail
+                        .profile
+                        .permission_mode
+                        .clone()
+                        .unwrap_or_else(|| "provider default".to_owned()),
+                    format!("{}\n{}", detail.instructions_path, detail.memory_path),
+                )
+            },
+        );
+    let session = board.session_for(agent);
+    let running_model = session
+        .and_then(|session| session.runtime_model.as_deref())
+        .unwrap_or("unreported");
+    let running_reasoning = session
+        .and_then(|session| session.runtime_reasoning_effort.as_deref())
+        .unwrap_or("unreported");
+    let running_permission = session
+        .and_then(|session| session.runtime_permission_mode.as_deref())
+        .unwrap_or("unreported");
+    let running_control = session
+        .and_then(|session| session.runtime_control_mode.as_deref())
+        .unwrap_or("unreported");
     frame.render_widget(
         Paragraph::new(format!(
-            "provider: {:?}\nmodel: {model}\npermission: {permission}\n{pause}\n{files}",
-            agent.provider
+            "provider: {:?}\nconfigured model: {configured_model}\nrunning model: {running_model}\nconfigured permission: {configured_permission}\nrunning permission: {running_permission}\nrunning reasoning: {running_reasoning}\nrunning control: {running_control}\n{pause}\n{files}",
+            agent.provider,
         ))
         .block(ui::block(" settings ")),
         rows[2],

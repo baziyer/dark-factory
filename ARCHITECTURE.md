@@ -235,6 +235,23 @@ composed task incarnation makes a concurrent commit idempotent. Retrying a
 task preserves its incarnation; deleting and recreating the same task id does
 not.
 
+### Runtime-resolved provider settings
+
+An agent profile's configured overrides are not a claim about what a provider
+actually ran. At session spawn, authoritative launch/config evidence is stored
+on that session for model, reasoning effort, permission mode, and control mode.
+The values remain historical after the session ends; missing evidence is
+explicitly unreported rather than inferred from a provider default. The local
+API, `factoryctl agent status`, and `factory-tui` all project the same fields.
+
+The separate resumed-Codex delivery failure remains tracked by
+[#158](https://github.com/baziyer/dark-factory/issues/158): live evidence shows
+that after a clean stop and provider-thread resume, a completed task followed
+by a newly assigned task can reach `delivery unacknowledged` without creating
+a run or typing the new task body. Its regression shape is completed task →
+stop resident session → resume the same provider thread → assign the next task;
+the acceptance condition is the new task body entering a running task.
+
 ## Deliberately unresolved
 
 - Zero-downtime handoff between two daemon binaries is deferred (see
