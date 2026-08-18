@@ -675,8 +675,10 @@ Options:
 const SESSION_STOP_HELP: &str =
     "usage: factoryctl session stop --project ID --session ID [--grace-ms N]
 
-Gracefully stops a session's PTY-backed provider process group. Any open
-run (task episode) closes with closed_by=operator_stop.
+Gracefully stops a session's PTY-backed provider process group and waits for
+the runner to confirm that the owned group is gone. Any open run (task
+episode) closes with closed_by=operator_stop. Cleanup failure leaves the
+session live and returns an error instead of claiming it stopped.
 
 Required:
   --project ID           Project the session belongs to
@@ -3195,7 +3197,12 @@ mod tests {
                 }
             )
         );
-        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
+        let missing_project = parse_args(args(&["attach", "--session", "session-1"]));
+        if env::var_os("DARK_FACTORY_PROJECT").is_some() {
+            assert!(missing_project.is_ok());
+        } else {
+            assert!(missing_project.is_err());
+        }
         assert!(
             request_for(CliCommand::Attach {
                 project_id: "project-1".into(),

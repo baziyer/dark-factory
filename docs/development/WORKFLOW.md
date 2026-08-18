@@ -5,6 +5,9 @@
 1. `./scripts/new-worktree.sh <slug>` — one worktree per task, never work
    directly on `main`.
 2. Build and iterate: `cargo build --workspace`.
+   A runner's terminal event is emitted only after its provider process group
+   has been reaped; a stop response therefore does not make an agent
+   deletable until the owned provider tools are gone.
 3. Before opening a PR: `./scripts/local-ci.sh` (fmt, clippy at
    `-D warnings`, the full test suite, `git diff --check`) — this is the
    authoritative gate; CI runs the exact same script (see "CI and GitHub"
@@ -19,11 +22,11 @@
 
 ### Testing resident sessions
 
-An E2E harness must not stop `factoryd` immediately after a `StopSession`
-response. That response only confirms that `factory-runner` accepted the stop;
-the runner stays alive until the daemon observes its terminal event and sends
-`AcknowledgeExit`. Killing the daemon between those steps leaves the runner
-waiting for an acknowledgement that can never arrive.
+An E2E harness should still stop `factoryd` only after the session's terminal
+state and runner process have been observed. `StopSession` now waits for the
+runner's terminal event and group cleanup, but the runner stays alive until
+the daemon sends `AcknowledgeExit`; killing the daemon between those steps
+leaves the runner waiting for an acknowledgement that can never arrive.
 
 Tests that create resident sessions must therefore use both safeguards in
 `crates/factoryd/tests/sessions_e2e.rs`: call `cleanup_session` on the normal

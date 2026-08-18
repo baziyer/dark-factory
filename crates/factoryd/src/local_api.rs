@@ -35,7 +35,7 @@ use tokio::{
     },
     sync::{Semaphore, broadcast, mpsc, watch},
     task::JoinSet,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 pub use crate::daemon_state::DaemonState as ApiState;
@@ -54,6 +54,8 @@ use crate::{
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
+const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(65);
+const STOP_COMPLETION_POLL: Duration = Duration::from_millis(20);
 
 enum RepositoryRequest {
     Status,
@@ -1363,15 +1365,6 @@ async fn handle_request(
                     store.run_control_target(&lookup_project_id, &lookup_run_id)
                 })
                 .await?;
-            let control_run_id = run_id.clone();
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_run_id = run_id.clone();
             let run = state
@@ -1388,18 +1381,34 @@ async fn handle_request(
             // tell this apart from a crash and would wrongly close the
             // episode `failed`/`session_ended` instead of
             // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
-            if let Some(session_id) = run.session_id.clone() {
+            let session_id = if let Some(session_id) = run.session_id.clone() {
                 let session_project_id = project_id.clone();
-                let _ = state
+                let stop_session_id = session_id.clone();
+                state
                     .commit_and_publish(move |store| {
                         let (session, event) = store.request_session_stop(
                             &session_project_id,
-                            &session_id,
+                            &stop_session_id,
                             now_ms()?,
                         )?;
                         Ok((session, vec![event]))
                     })
-                    .await;
+                    .await?;
+                Some(session_id)
+            } else {
+                None
+            };
+            let control_run_id = run_id.clone();
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
+            if let Some(session_id) = session_id {
+                wait_for_session_stop(state, &project_id, &session_id).await?;
             }
             Ok(LocalResponse::RunStopped { run_id })
         }
@@ -1518,15 +1527,6 @@ async fn handle_request(
                     store.session_control_target(&lookup_project_id, &lookup_session_id)
                 })
                 .await?;
-            let control_run_id = session_control_run_id(&session_id)?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_session_id = session_id.clone();
             state
@@ -1539,6 +1539,16 @@ async fn handle_request(
                     Ok((session, vec![event]))
                 })
                 .await?;
+            let control_run_id = session_control_run_id(&session_id)?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
+            wait_for_session_stop(state, &project_id, &session_id).await?;
             Ok(LocalResponse::SessionStopped { session_id })
         }
         LocalRequest::ProviderHook {
@@ -3027,6 +3037,48 @@ fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> I
     }
     items.pop();
     items.last().map(id)
+}
+
+/// Waits for the runner's durable terminal observation before acknowledging
+/// a stop to the operator. A timeout or explicit cleanup failure leaves the
+/// session live, so `DeleteAgent` cannot make an unconfirmed process tree
+/// undiscoverable.
+async fn wait_for_session_stop(
+    state: &ApiState,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+) -> Result<(), ApiFailure> {
+    let project_id = project_id.clone();
+    let session_id = session_id.clone();
+    match timeout(STOP_COMPLETION_TIMEOUT, async {
+        loop {
+            let snapshot = state
+                .with_store({
+                    let project_id = project_id.clone();
+                    let session_id = session_id.clone();
+                    move |store| store.get_session(&project_id, &session_id)
+                })
+                .await?;
+            if !snapshot.state.is_live() {
+                return Ok(());
+            }
+            if snapshot.activity.as_deref() == Some("cleanup_failed") {
+                return Err(ApiFailure::Conflict(
+                    snapshot
+                        .wait_reason
+                        .unwrap_or_else(|| "provider cleanup was not confirmed".into()),
+                ));
+            }
+            sleep(STOP_COMPLETION_POLL).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ApiFailure::Conflict(
+            "provider cleanup did not complete; session remains owned and live".into(),
+        )),
+    }
 }
 
 /// The runner protocol still keys control requests by `RunId` (see
