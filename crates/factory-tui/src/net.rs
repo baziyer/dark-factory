@@ -17,8 +17,9 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, ServerFrame};
 use factory_core::status::FleetStatus;
@@ -33,6 +34,7 @@ use factoryctl::update::{self, UpdateCheck};
 const MIN_BACKOFF: Duration = Duration::from_millis(400);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 const FLEET_STATUS_REFRESH: Duration = Duration::from_secs(5);
+const FLEET_STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Page size for projects/agents/runs/sessions listing. Deliberately **not**
 /// `factory_core::local::MAX_{PROJECT,AGENT,RUN,SESSION}_PAGE_ITEMS` (each declared as `1000`):
@@ -117,6 +119,22 @@ pub enum NetMsg {
 
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
+        ServerFrame::Response { response, .. } => Ok(response),
+        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+            Err("daemon returned a stream frame instead of a response".into())
+        }
+    }
+}
+
+fn request_response_with_timeout(
+    client: &Client,
+    request: LocalRequest,
+    timeout: Duration,
+) -> Result<LocalResponse, String> {
+    match client
+        .request_with_timeout(request, timeout)
+        .map_err(|error| error.to_string())?
+    {
         ServerFrame::Response { response, .. } => Ok(response),
         ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
             Err("daemon returned a stream frame instead of a response".into())
@@ -386,19 +404,65 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
 
 /// Refreshes non-event state without delaying subscription reads. Git worktree changes publish
 /// no daemon event, so connect-time-only status becomes stale as soon as an agent edits a file.
-pub fn spawn_fleet_status_refresh(client: Client, tx: Sender<NetMsg>) {
-    thread::spawn(move || {
+pub struct FleetStatusRefresh {
+    shutdown: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for FleetStatusRefresh {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.shutdown;
+        *lock.lock().unwrap() = true;
+        wake.notify_one();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn_fleet_status_refresh(client: Client, tx: Sender<NetMsg>) -> FleetStatusRefresh {
+    spawn_fleet_status_refresh_with(
+        client,
+        tx,
+        FLEET_STATUS_REFRESH,
+        FLEET_STATUS_REQUEST_TIMEOUT,
+    )
+}
+
+fn spawn_fleet_status_refresh_with(
+    client: Client,
+    tx: Sender<NetMsg>,
+    interval: Duration,
+    request_timeout: Duration,
+) -> FleetStatusRefresh {
+    let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
+    let worker_shutdown = Arc::clone(&shutdown);
+    let thread = thread::spawn(move || {
         loop {
+            let started = Instant::now();
             if let Ok(LocalResponse::FleetStatus { status }) =
-                request_response(&client, LocalRequest::FleetStatus)
+                request_response_with_timeout(&client, LocalRequest::FleetStatus, request_timeout)
             {
                 if tx.send(NetMsg::FleetStatus(status)).is_err() {
                     return;
                 }
             }
-            thread::sleep(FLEET_STATUS_REFRESH);
+            let remaining = interval.saturating_sub(started.elapsed());
+            let (lock, wake) = &*worker_shutdown;
+            let stopped = lock.lock().unwrap();
+            if *stopped {
+                return;
+            }
+            let (stopped, _) = wake.wait_timeout(stopped, remaining).unwrap();
+            if *stopped {
+                return;
+            }
         }
     });
+    FleetStatusRefresh {
+        shutdown,
+        thread: Some(thread),
+    }
 }
 
 /// Runs one release-manifest check in the background (`factoryctl::update::check`: served from
@@ -451,6 +515,8 @@ pub fn spawn_task_detail_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn explicit_socket_wins_over_everything() {
@@ -465,5 +531,87 @@ mod tests {
             delay = next_backoff(delay);
         }
         assert_eq!(delay, MAX_BACKOFF);
+    }
+
+    fn empty_fleet(generated_at_ms: i64) -> FleetStatus {
+        FleetStatus {
+            generated_at_ms,
+            live_session_cap: 4,
+            live_sessions: 0,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_worker_repeats_start_to_start_and_is_independent_of_other_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (starts_tx, starts_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            for sequence in 1..=2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                starts_tx.send(Instant::now()).unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                thread::sleep(Duration::from_millis(100));
+                serde_json::to_writer(
+                    &mut stream,
+                    &ServerFrame::Response {
+                        protocol_version: factory_core::PROTOCOL_VERSION,
+                        response: LocalResponse::FleetStatus {
+                            status: empty_fleet(sequence),
+                        },
+                    },
+                )
+                .unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = spawn_fleet_status_refresh_with(
+            Client::new(&socket),
+            tx.clone(),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+        );
+        tx.send(NetMsg::CaughtUp).unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)).unwrap(),
+            NetMsg::CaughtUp
+        ));
+        let first = rx.recv_timeout(Duration::from_millis(300)).unwrap();
+        let second = rx.recv_timeout(Duration::from_millis(300)).unwrap();
+        assert!(matches!(first, NetMsg::FleetStatus(status) if status.generated_at_ms == 1));
+        assert!(matches!(second, NetMsg::FleetStatus(status) if status.generated_at_ms == 2));
+        let first_start = starts_rx.recv().unwrap();
+        let second_start = starts_rx.recv().unwrap();
+        assert!(
+            second_start.duration_since(first_start) < Duration::from_millis(260),
+            "refresh interval drifted by response time"
+        );
+        drop(worker);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn refresh_worker_shutdown_interrupts_failure_backoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = Client::new(directory.path().join("missing.sock"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let worker = spawn_fleet_status_refresh_with(
+            client,
+            tx,
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        );
+        thread::sleep(Duration::from_millis(20));
+
+        let started = Instant::now();
+        drop(worker);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }

@@ -177,7 +177,7 @@ fn main() -> anyhow::Result<()> {
 
     let (tx, rx) = mpsc::channel::<NetMsg>();
     net::spawn_fleet_session(client.clone(), tx.clone());
-    net::spawn_fleet_status_refresh(client.clone(), tx.clone());
+    let _fleet_status_refresh = net::spawn_fleet_status_refresh(client.clone(), tx.clone());
     // `--project` wins; otherwise open on whatever was focused last time — but only for the
     // daemon `$DARK_FACTORY_HOME` names: an explicit `--socket`/`$DARK_FACTORY_SOCKET` may be a
     // scratch daemon, whose projects must not overwrite (or be seeded from) the real home's

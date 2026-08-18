@@ -1626,6 +1626,24 @@ async fn handle_request(
 }
 
 async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
+    populate_fleet_worktrees_with(
+        projects,
+        MAX_CONCURRENT_WORKTREE_PROBES,
+        FLEET_WORKTREE_DEADLINE,
+        |path| async move { crate::worktrees::status(&path).await },
+    )
+    .await;
+}
+
+async fn populate_fleet_worktrees_with<Probe, ProbeFuture>(
+    projects: &mut [status::ProjectStatus],
+    max_concurrent: usize,
+    deadline: Duration,
+    probe: Probe,
+) where
+    Probe: Fn(PathBuf) -> ProbeFuture + Clone + Send + 'static,
+    ProbeFuture: Future<Output = status::WorktreeStatus> + Send + 'static,
+{
     let mut pending = Vec::new();
     for (project_index, project) in projects.iter_mut().enumerate() {
         for (agent_index, agent) in project.agents.iter_mut().enumerate() {
@@ -1642,28 +1660,132 @@ async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
         }
     }
 
-    let _ = timeout(FLEET_WORKTREE_DEADLINE, async {
-        let mut probes = JoinSet::new();
-        let mut pending = pending.into_iter();
-        loop {
-            while probes.len() < MAX_CONCURRENT_WORKTREE_PROBES {
-                let Some((project_index, agent_index, path)) = pending.next() else {
-                    break;
-                };
-                probes.spawn(async move {
-                    let worktree = crate::worktrees::status(&path).await;
-                    (project_index, agent_index, worktree)
-                });
-            }
-            let Some(result) = probes.join_next().await else {
+    let mut probes = JoinSet::new();
+    let mut pending = pending.into_iter();
+    let deadline = tokio::time::sleep(deadline);
+    tokio::pin!(deadline);
+    loop {
+        while probes.len() < max_concurrent {
+            let Some((project_index, agent_index, path)) = pending.next() else {
                 break;
             };
-            if let Ok((project_index, agent_index, worktree)) = result {
-                projects[project_index].agents[agent_index].worktree = Some(worktree);
+            let probe = probe.clone();
+            probes.spawn(async move {
+                let worktree = probe(path).await;
+                (project_index, agent_index, worktree)
+            });
+        }
+        if probes.is_empty() {
+            break;
+        }
+        tokio::select! {
+            () = &mut deadline => {
+                probes.abort_all();
+                while probes.join_next().await.is_some() {}
+                break;
+            }
+            result = probes.join_next() => {
+                let Some(result) = result else {
+                    break;
+                };
+                if let Ok((project_index, agent_index, worktree)) = result {
+                    projects[project_index].agents[agent_index].worktree = Some(worktree);
+                }
             }
         }
-    })
-    .await;
+    }
+}
+
+#[cfg(test)]
+mod worktree_status_tests {
+    use super::*;
+    use factory_core::{AgentRole, AgentSnapshot, ProjectSnapshot, Provider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ActiveProbe(Arc<AtomicUsize>);
+
+    impl Drop for ActiveProbe {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_probe_window_deadline_and_cancellation_are_bounded() {
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let mut agents = Vec::new();
+        for index in 0..12 {
+            let id = AgentId::try_from(format!("worker-{index}")).unwrap();
+            agents.push(status::AgentStatus {
+                agent: AgentSnapshot {
+                    id,
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                    current_run_id: None,
+                    paused: false,
+                    current_session_id: None,
+                    worktree: Some(format!("/work/{index}")),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                worktree: None,
+                session: None,
+                current_run: None,
+                queue_depth: 0,
+                queue: Vec::new(),
+                inbox_pending: 0,
+                attention: factory_core::attention::Attention::Routine,
+                attention_inferred: true,
+            });
+        }
+        let mut projects = vec![status::ProjectStatus {
+            project: ProjectSnapshot {
+                id: project_id,
+                name: "Factory".into(),
+                root: "/work".into(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            agents,
+            unassigned_queue_depth: 0,
+            unassigned_queue: Vec::new(),
+        }];
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let probe = {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move |_path: PathBuf| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    let _active = ActiveProbe(active);
+                    std::future::pending::<status::WorktreeStatus>().await
+                }
+            }
+        };
+        let started = std::time::Instant::now();
+
+        populate_fleet_worktrees_with(&mut projects, 8, Duration::from_millis(30), probe).await;
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert_eq!(peak.load(Ordering::SeqCst), 8);
+        assert_eq!(
+            active.load(Ordering::SeqCst),
+            0,
+            "probes were not cancelled"
+        );
+        assert!(projects[0].agents.iter().all(|agent| {
+            agent.worktree.as_ref().is_some_and(|worktree| {
+                !worktree.dirty
+                    && worktree.error.as_deref() == Some("fleet git status deadline exceeded")
+            })
+        }));
+    }
 }
 
 /// Absolute guidance-file paths for one agent, computed from the daemon's
