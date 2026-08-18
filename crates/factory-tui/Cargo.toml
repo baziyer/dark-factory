@@ -10,8 +10,6 @@ name = "factory-tui"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned below the latest crates.io release: ratatui 0.30.2 needs rustc 1.88,
-# while this workspace is pinned to rust-version 1.86 (see SPIKE.md "MSRV").
 # `crossterm` and `vt100` are deliberately NOT direct dependencies: both ratatui and tui-term
 # re-export the exact crossterm/vt100 versions they were built against (`ratatui::crossterm`,
 # `tui_term::vt100`) specifically so downstream crates avoid a duplicate, version-mismatched

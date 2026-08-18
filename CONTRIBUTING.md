@@ -13,7 +13,7 @@ cargo build --workspace
 ./scripts/local-ci.sh
 ```
 
-`local-ci.sh` is the authoritative gate (`cargo +1.86.0 fmt --check`,
+`local-ci.sh` is the authoritative gate (`cargo +1.88.0 fmt --check`,
 `clippy --all-targets --all-features -D warnings` across the whole
 workspace, every test with `--test-threads=1`, and `git diff --check`).
 CI runs the same script on every pull request (the `checks` status
