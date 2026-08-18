@@ -6,7 +6,7 @@ use factory_core::{
     RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
     SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::agent_attention,
-    status::{AgentStatus, MAX_QUEUE_PREVIEW},
+    status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
@@ -405,6 +405,8 @@ pub enum StoreError {
     InvalidAgentProfile,
     #[error("agent budget is invalid or exceeds its bound")]
     InvalidAgentBudget,
+    #[error("agent budget is exhausted; reset it before resuming")]
+    AgentBudgetExhausted,
     #[error("agent message is invalid or exceeds its bound")]
     InvalidAgentMessage,
     #[error("task is not queued in the requested project")]
@@ -770,11 +772,14 @@ impl Store {
             return Err(StoreError::AgentNotFound);
         }
         let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
         let event = FactoryEvent::AgentBudgetChanged {
             project_id: project_id.clone(),
             agent_id: agent_id.clone(),
             budget: budget.clone(),
             action: "configured".into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
         };
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
@@ -798,11 +803,6 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let was_exhausted: Option<bool> = transaction.query_row(
-            "SELECT exhausted FROM agent_budgets WHERE agent_id = ?1 AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2)",
-            params![agent_id.as_str(), project_id.as_str()], |row| row.get(0),
-        ).optional()?;
-        let was_exhausted = was_exhausted.ok_or(StoreError::AgentNotFound)?;
         let changed = transaction.execute(
             "UPDATE agent_budgets SET tool_calls = 0, exhausted = 0, reset_at_ms = ?1, updated_at_ms = ?1
              WHERE agent_id = ?2 AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND project_id = ?3)",
@@ -811,18 +811,15 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::AgentNotFound);
         }
-        if was_exhausted {
-            transaction.execute(
-                "UPDATE agents SET paused = 0, updated_at_ms = ?1 WHERE id = ?2",
-                params![now_ms, agent_id.as_str()],
-            )?;
-        }
         let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
         let event = FactoryEvent::AgentBudgetChanged {
             project_id: project_id.clone(),
             agent_id: agent_id.clone(),
             budget: budget.clone(),
             action: "reset".into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
         };
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
@@ -859,19 +856,18 @@ impl Store {
                 "UPDATE agent_budgets SET exhausted = 1, updated_at_ms = ?1 WHERE agent_id = ?2",
                 params![now_ms, agent_id.as_str()],
             )?;
-            transaction.execute(
-                "UPDATE agents SET paused = 1, updated_at_ms = ?1 WHERE id = ?2",
-                params![now_ms, agent_id.as_str()],
-            )?;
         } else {
             transaction.execute("UPDATE agent_budgets SET tool_calls = tool_calls + 1, updated_at_ms = ?1 WHERE agent_id = ?2", params![now_ms, agent_id.as_str()])?;
         }
         let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
         let event = FactoryEvent::AgentBudgetChanged {
             project_id: project_id.clone(),
             agent_id: agent_id.clone(),
             budget: budget.clone(),
             action: if denied { "denied" } else { "observed" }.into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
         };
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
@@ -904,7 +900,16 @@ impl Store {
         agent_id: &AgentId,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        if self.agent_budget(project_id, agent_id)?.exhausted {
+            return Err(StoreError::AgentBudgetExhausted);
+        }
         self.set_agent_paused(project_id, agent_id, false, now_ms)
+    }
+
+    /// Effective durable hold, composing the ordinary agent hold with the
+    /// independent budget circuit breaker.
+    pub fn agent_is_held(&self, project_id: &ProjectId, agent_id: &AgentId) -> Result<bool> {
+        Ok(!agent_pause_reasons(&self.connection, project_id, agent_id)?.is_empty())
     }
 
     fn set_agent_paused(
@@ -991,18 +996,7 @@ impl Store {
         project_id: &ProjectId,
         agent_id: &AgentId,
     ) -> Result<Option<TaskId>> {
-        let paused: Option<bool> = self
-            .connection
-            .query_row(
-                "SELECT paused FROM agents WHERE id = ?1 AND project_id = ?2",
-                params![agent_id.as_str(), project_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(paused) = paused else {
-            return Err(StoreError::AgentNotFound);
-        };
-        if paused {
+        if self.agent_is_held(project_id, agent_id)? {
             return Ok(None);
         }
         let id: Option<String> = self
@@ -3411,6 +3405,7 @@ impl Store {
         Ok(AgentStatus {
             agent,
             budget: self.agent_budget(project_id, agent_id)?,
+            pause_reasons: agent_pause_reasons(&self.connection, project_id, agent_id)?,
             // Git is inspected asynchronously by the local API after the
             // consistent store snapshot has been released.
             worktree: None,
@@ -4040,7 +4035,8 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
     connection
         .query_row(
             "SELECT a.id, a.project_id, a.parent_agent_id, a.role, a.provider,
-                    a.paused, a.worktree, a.created_at_ms, a.updated_at_ms,
+                    (a.paused OR COALESCE((SELECT b.exhausted FROM agent_budgets b WHERE b.agent_id = a.id), 0)),
+                    a.worktree, a.created_at_ms, a.updated_at_ms,
                     (SELECT r.id FROM runs r
                      WHERE r.agent_id = a.id
                        AND r.ended_at_ms IS NULL
@@ -4330,6 +4326,31 @@ fn budget_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentBudget> {
         updated_at_ms: row.get(4)?,
         monetary_spend: None,
     })
+}
+
+fn agent_pause_reasons(
+    connection: &Connection,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<Vec<AgentPauseReason>> {
+    let holds: Option<(bool, bool)> = connection
+        .query_row(
+            "SELECT a.paused, b.exhausted FROM agents a
+             JOIN agent_budgets b ON b.agent_id = a.id
+             WHERE a.id = ?1 AND a.project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (agent_hold, budget_exhausted) = holds.ok_or(StoreError::AgentNotFound)?;
+    let mut reasons = Vec::with_capacity(2);
+    if agent_hold {
+        reasons.push(AgentPauseReason::AgentHold);
+    }
+    if budget_exhausted {
+        reasons.push(AgentPauseReason::BudgetExhausted);
+    }
+    Ok(reasons)
 }
 
 fn load_agent_message(

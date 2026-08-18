@@ -96,6 +96,36 @@ fn session_changed_event_updates_the_sessions_map() {
     );
 }
 
+#[test]
+fn budget_event_updates_the_effective_pause_projection() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let agent_id = AgentId::try_from("alice").unwrap();
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 0,
+        event: FactoryEvent::AgentBudgetChanged {
+            project_id: ProjectId::try_from("a").unwrap(),
+            agent_id: agent_id.clone(),
+            budget: factory_core::AgentBudget {
+                exhausted: true,
+                ..Default::default()
+            },
+            action: "denied".into(),
+            paused: true,
+            pause_reasons: vec![factory_core::status::AgentPauseReason::BudgetExhausted],
+        },
+    });
+    assert!(b.agents[&agent_id].paused);
+}
+
 // -- announcement dedup ---------------------------------------------------------------------
 
 /// The bug: the daemon emits one `SessionChanged` per hook, most of which don't change `state`

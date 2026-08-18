@@ -72,8 +72,12 @@ fn tool_call_budget_is_durable_exhausts_and_requires_reset() {
     assert!(
         matches!(event.event, FactoryEvent::AgentBudgetChanged { action, .. } if action == "denied")
     );
+    assert!(matches!(
+        store.resume_agent(&project_id("factory"), &agent_id("worker"), 6),
+        Err(StoreError::AgentBudgetExhausted)
+    ));
     let (reset, _) = store
-        .reset_agent_budget(&project_id("factory"), &agent_id("worker"), 6)
+        .reset_agent_budget(&project_id("factory"), &agent_id("worker"), 7)
         .unwrap();
     assert_eq!(reset.tool_calls, 0);
     assert!(!reset.exhausted);
@@ -84,6 +88,102 @@ fn tool_call_budget_is_durable_exhausts_and_requires_reset() {
             .agent
             .paused
     );
+
+    // The independent ordinary hold survives budget exhaustion and reset.
+    store
+        .pause_agent(&project_id("factory"), &agent_id("worker"), 8)
+        .unwrap();
+    assert!(
+        !store
+            .observe_tool_call(&project_id("factory"), &agent_id("worker"), 9)
+            .unwrap()
+            .1
+    );
+    assert!(
+        store
+            .observe_tool_call(&project_id("factory"), &agent_id("worker"), 10)
+            .unwrap()
+            .1
+    );
+    store
+        .reset_agent_budget(&project_id("factory"), &agent_id("worker"), 11)
+        .unwrap();
+    let status = store
+        .agent_status(&project_id("factory"), &agent_id("worker"))
+        .unwrap();
+    assert!(status.agent.paused);
+    assert_eq!(
+        status.pause_reasons,
+        vec![factory_core::status::AgentPauseReason::AgentHold]
+    );
+    store
+        .resume_agent(&project_id("factory"), &agent_id("worker"), 12)
+        .unwrap();
+    assert!(
+        !store
+            .agent_is_held(&project_id("factory"), &agent_id("worker"))
+            .unwrap()
+    );
+}
+
+#[test]
+fn concurrent_tool_observations_cannot_cross_the_limit() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let mut store = Store::open(&database).unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work/factory".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("worker"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .set_agent_budget(&project_id("factory"), &agent_id("worker"), Some(1), 3)
+        .unwrap();
+    drop(store);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let mut joins = Vec::new();
+    for now in [4, 5] {
+        let database = database.clone();
+        let barrier = barrier.clone();
+        joins.push(std::thread::spawn(move || {
+            let mut store = Store::open(database).unwrap();
+            barrier.wait();
+            store
+                .observe_tool_call(&project_id("factory"), &agent_id("worker"), now)
+                .unwrap()
+                .1
+        }));
+    }
+    let denied = joins
+        .into_iter()
+        .map(|join| join.join().unwrap())
+        .filter(|denied| *denied)
+        .count();
+    assert_eq!(denied, 1);
+    let store = Store::open(database).unwrap();
+    let budget = store
+        .agent_budget(&project_id("factory"), &agent_id("worker"))
+        .unwrap();
+    assert_eq!(budget.tool_calls, 1);
+    assert!(budget.exhausted);
 }
 
 /// Creates a live session for `agent` and opens a task-episode for `task`

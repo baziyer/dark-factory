@@ -178,6 +178,7 @@ impl ApiFailure {
                 | StoreError::AgentHasLiveSession
                 | StoreError::AgentHasChildren
                 | StoreError::AgentRunHasDependents
+                | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun
                 | StoreError::RunNotStoppable),
             ) => (ErrorCode::Conflict, error.to_string()),
@@ -1791,6 +1792,7 @@ mod worktree_status_tests {
             let id = AgentId::try_from(format!("worker-{index}")).unwrap();
             agents.push(status::AgentStatus {
                 budget: factory_core::AgentBudget::default(),
+                pause_reasons: Vec::new(),
                 agent: AgentSnapshot {
                     id,
                     project_id: project_id.clone(),
@@ -3061,6 +3063,37 @@ mod deletion_gate_tests {
             .await
             .unwrap();
         assert!(status.budget.exhausted && status.agent.paused);
+        let resume = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ResumeAgent {
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            resume,
+            Err(ApiFailure::Store(StoreError::AgentBudgetExhausted))
+        ));
+        let stopped = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::Stop,
+                payload: serde_json::json!({}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            stopped,
+            LocalResponse::ProviderHookReply { ref reply }
+                if *reply == serde_json::json!({})
+        ));
         handle_request(
             &state,
             &execution,

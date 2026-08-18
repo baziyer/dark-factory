@@ -186,6 +186,9 @@ catalogue.
     makes subsequent tool hooks fail closed until an explicit reset. A
     provider metric the daemon cannot observe authoritatively is unavailable,
     not zero and not estimated.
+    The ordinary agent hold and budget hold compose independently: resume
+    cannot bypass exhaustion, reset cannot erase an ordinary hold, and spawn
+    and delivery query the durable budget hold themselves.
 
 ## First launch
 

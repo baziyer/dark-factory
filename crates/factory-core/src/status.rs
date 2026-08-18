@@ -59,6 +59,9 @@ pub struct AgentStatus {
     pub agent: AgentSnapshot,
     #[serde(default)]
     pub budget: AgentBudget,
+    /// Independent durable reasons contributing to `agent.paused`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pause_reasons: Vec<AgentPauseReason>,
     /// Current git state of the agent's working directory. Fleet status
     /// includes this so an orchestrator can inspect work before deciding
     /// whether a stopped or blocked worker is safe to recover.
@@ -78,6 +81,14 @@ pub struct AgentStatus {
     /// session (`inferred == false`) or from its run (no session).
     pub attention: Attention,
     pub attention_inferred: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPauseReason {
+    /// The ordinary agent hold set by `agent pause` or reliability logic.
+    AgentHold,
+    BudgetExhausted,
 }
 
 /// `factoryctl agent status`: everything [`AgentStatus`] has, plus the
@@ -204,7 +215,7 @@ pub fn attention_items(
             }
         }
         if status.queue_depth > 0 {
-            if agent.paused {
+            if agent.paused && !status.budget.exhausted {
                 items.push(AttentionItem {
                     kind: AttentionKind::PausedWithWork,
                     level: Attention::NeedsInput,
@@ -336,6 +347,7 @@ mod tests {
     ) -> AgentStatus {
         AgentStatus {
             budget: AgentBudget::default(),
+            pause_reasons: Vec::new(),
             queue_depth: u32::try_from(queue.len()).unwrap(),
             attention: session
                 .as_ref()

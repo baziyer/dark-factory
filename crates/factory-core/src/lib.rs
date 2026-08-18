@@ -491,6 +491,10 @@ pub enum FactoryEvent {
         agent_id: AgentId,
         budget: AgentBudget,
         action: String,
+        /// Effective pause after this transition, including independent holds.
+        paused: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pause_reasons: Vec<crate::status::AgentPauseReason>,
     },
     ProjectChanged {
         project: ProjectSnapshot,

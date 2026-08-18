@@ -701,9 +701,14 @@ impl Board {
         self.maybe_announce(&event, worth_announcing);
 
         match event.event {
-            FactoryEvent::AutoModeChanged { .. }
-            | FactoryEvent::PolicyDecision { .. }
-            | FactoryEvent::AgentBudgetChanged { .. } => {}
+            FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
+            FactoryEvent::AgentBudgetChanged {
+                agent_id, paused, ..
+            } => {
+                if let Some(agent) = self.agents.get_mut(&agent_id) {
+                    agent.paused = paused;
+                }
+            }
             FactoryEvent::ProjectChanged { project } => {
                 if let Some(existing) = self.projects.iter_mut().find(|p| p.id == project.id) {
                     *existing = project;

@@ -67,11 +67,15 @@ operator from their own agents. Concretely:
 - **Budgets are a tool-call circuit breaker, not monetary accounting.** Each
   agent defaults to 1,000 authenticated `PreToolUse` calls per reset. The
   daemon durably counts observations, pauses delivery and denies subsequent
-  calls at exhaustion, and requires an explicit reset or larger limit. The
+  calls at exhaustion, and requires an explicit reset (changing the limit
+  alone never reopens an exhausted circuit). The
   shipped provider hook protocols do not report trustworthy per-agent token,
   subscription, or currency spend, so those values are unavailable rather
   than estimated. Calls that bypass hooks also bypass this limit; provider
   billing controls remain the actual monetary boundary.
+  Ordinary pause and budget exhaustion are separate durable holds, and both
+  spawn and delivery consult exhaustion directly rather than trusting a
+  shared or cached pause projection.
 - **Hooks are authenticated; the rest is your user.** A provider's hook
   invocations identify their session by a per-session random token in a
   `0600` file (never on argv or in the environment). An agent's own `task

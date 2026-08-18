@@ -156,6 +156,9 @@ budget status`, change it with `agent budget set --max-tool-calls N` (or
 Budget observations and operator changes are append-only events. Claude and
 Codex do not expose trustworthy per-agent monetary accounting to this
 runtime, so spend is reported as unavailable, never as zero or an estimate.
+The ordinary `agent pause` hold and budget hold are independent: `resume`
+is rejected while the budget is exhausted, and `budget reset` never removes
+an ordinary hold. Status exposes both effective `paused` and `pause_reasons`.
 
 ## The TUI
 
