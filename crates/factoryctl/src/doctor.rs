@@ -1,8 +1,9 @@
-//! `factoryctl doctor`: read-only checks of this machine's Dark Factory
-//! install, one line per check, non-zero exit if anything fails. Every
-//! probe it uses (`crate::probes`) is the same one `factoryctl init` and
-//! `update --install` use, so the three commands can't disagree about what
-//! "healthy" means.
+//! `factoryctl doctor`: diagnostic checks of this machine's Dark Factory
+//! install, one line per check, non-zero exit if anything fails. It never
+//! repairs or reconfigures the install; the release check can refresh the
+//! update cache. Every probe it uses (`crate::probes`) is the same one
+//! `factoryctl init` and `update --install` use, so the three commands can't
+//! disagree about what "healthy" means.
 
 use std::{
     fs,

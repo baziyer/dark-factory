@@ -1,7 +1,6 @@
 #!/bin/sh
 # Render the exact Formula/dark-factory.rb candidate for the custom tap.
-# This repository does not publish the tap; #102 stays open until the formula
-# has been installed and tested against a real release from that tap.
+# Publishing that candidate to the public tap remains a reviewed handoff.
 set -eu
 
 tag="${1:-}"

@@ -47,10 +47,12 @@ factoryctl doctor
 ```
 
 `init` installs the active runtime in `~/.dark-factory/bin/current` and asks
-before installing the background service. `doctor` reports failed checks
-without changing your system. See [provider setup](docs/providers.md) for
-other account choices. Release archives and checksums remain available on the
-[releases page](https://github.com/baziyer/dark-factory/releases).
+before installing the background service. `doctor` does not repair or
+reconfigure the installation; its release check may refresh
+`~/.dark-factory/update-check.json`. See [provider setup](docs/providers.md)
+for other account choices. The [manual release
+install](docs/install.md#manual-release-archive) covers archive selection,
+checksum verification, and Gatekeeper recovery.
 
 ## Start a factory
 
