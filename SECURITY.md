@@ -30,30 +30,24 @@ operator from their own agents. Concretely:
 - **Provider processes run as you, with your subscriptions.** A `claude` or
   `codex` session is your CLI, authenticated the way your shell's is, in a
   git worktree the daemon created. Whatever that CLI can do on your machine,
-  a session can ask it to do. Every Codex agent, orchestrator and worker
-  alike, runs under `workspace-write` with `network_access = true`: reads
-  are already unrestricted under `workspace-write`, so this means a Codex
-  session can read anything the operator's own user account can read and
-  send it anywhere on the internet, with no prompt at any point in the
-  session (needed for `git push`/`gh pr create`, and for the daemon's own
-  control socket, which seatbelt has no "just localhost" exception for).
-  `approval_policy = "never"` is the shipped default for every Codex agent,
-  under which the pre-seeded `CODEX_HOME/rules/default.rules` `factoryctl`
-  prefix rule is inert — `never` never asks, so an `allow` rule is never
-  consulted (a `forbid_rule` an operator's own `rules/*.rules` carries
-  forward, and Codex's own exec-policy checks, still apply regardless of
-  `approval_policy`; only the `allow` side is gated by it). If an operator
-  overrides an agent to
-  `approval_policy = "on-request"` (`agent profile set --permission-mode
-  on-request`), that rule becomes live and pre-approves **unsandboxed**
-  execution of any command whose parsed prefix is `factoryctl` — every
-  subcommand, including `factoryctl update` (replaces the installed
-  binaries) and `factoryctl init` (rewrites the launchd job), not just the
-  task/agent verbs a session's own delivery composes. Claude Code keeps its
-  native permission prompts, with only `Bash(factoryctl *)` pre-approved
-  (see `README.md`, "Unattended operation"). An agent's own
-  `permission_mode` widens or narrows any of this. See `docs/providers.md`
-  for the full write-up and rationale.
+  a session can ask it to do. Auto mode is on by default: Claude bypasses
+  permissions and Codex bypasses approvals and its sandbox. These processes
+  can read, modify, execute, delete, and transmit anything accessible to
+  the operator's OS user, including credentials. `factoryctl auto off`
+  changes the default for future sessions; an explicit agent profile
+  permission mode wins for that agent.
+- **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
+  tool call reaches an authenticated `PreToolUse` hook. The daemon denies
+  recognizable force-push/branch-delete/reset-hard commands, `rm -rf`
+  targets not literally rooted in the agent worktree, and reads/writes of
+  named secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, Codex `auth.json`,
+  credentials, and gcloud config). It fails closed if the daemon cannot
+  answer and records each decision as an append-only event. Shell quoting,
+  interpreters, generated scripts, MCP tools, provider bugs, or direct
+  syscalls can evade a string-level hook policy; it does not protect the
+  operator from a malicious agent. Worktrees provide collision isolation,
+  not filesystem or credential isolation. A separate OS user remains the
+  planned outer boundary (#54).
 - **Hooks are authenticated; the rest is your user.** A provider's hook
   invocations identify their session by a per-session random token in a
   `0600` file (never on argv or in the environment). An agent's own `task
@@ -80,9 +74,8 @@ operator from their own agents. Concretely:
 
 ## Out of scope
 
-- An agent doing something harmful with access it legitimately has (that is
-  the provider CLI's permission model and your task design, not a Dark
-  Factory boundary).
+- An agent evading the hook tripwire or doing something harmful with the
+  operator-level access auto mode intentionally grants it.
 - Vulnerabilities in `claude`, `codex`, or the models behind them.
 - Anything requiring the attacker to already run code as your user.
 

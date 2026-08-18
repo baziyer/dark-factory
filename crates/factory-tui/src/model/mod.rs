@@ -851,6 +851,7 @@ impl Board {
         self.maybe_announce(&event, worth_announcing);
 
         match event.event {
+            FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
             FactoryEvent::ProjectChanged { project } => {
                 if let Some(existing) = self.projects.iter_mut().find(|p| p.id == project.id) {
                     *existing = project;
@@ -1034,7 +1035,9 @@ fn event_agent(event: &FactoryEvent) -> Option<&AgentId> {
         FactoryEvent::AgentChanged { agent } => Some(&agent.id),
         FactoryEvent::AgentDeleted { agent_id, .. } => Some(agent_id),
         FactoryEvent::SessionChanged { session } => Some(&session.agent_id),
-        FactoryEvent::TaskDeleted { .. }
+        FactoryEvent::PolicyDecision { agent_id, .. } => Some(agent_id),
+        FactoryEvent::AutoModeChanged { .. }
+        | FactoryEvent::TaskDeleted { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => None,
     }

@@ -66,28 +66,10 @@ sandbox_mode = \"workspace-write\"";
 const MINIMAL_CONFIG_TOML: &str =
     "# Dark Factory generated Codex home (no ~/.codex/config.toml was found to copy).\n";
 
-/// Codex's own default when `spawn_spec` passes no `approval_policy` at all
-/// is `on-request`: a native prompt for every shell command that is not
-/// already sandbox-permitted -- with nobody attached to answer it in an
-/// unattended factory (this track's dogfood run: `god`'s very first
-/// `factoryctl agent add` stopped on it, and every later `factoryctl` call,
-/// even a bare `sleep 30`, prompted again until the operator chose "don't
-/// ask again for commands that start with `factoryctl`"). `spawn_spec`
-/// passes this explicitly instead, for both the orchestrator and worker
-/// roles -- a real per-role evaluation that happens to reach the same
-/// answer for both, not an oversight: both need unattended operation, and
-/// Codex's `workspace-write` sandbox (`SANDBOX_MODE_COMMENT_AND_LINE`) plus
-/// this track's `network_access = true` (`config_block_toml`) remain the
-/// actual gate on what a session can reach, unaffected by
-/// `approval_policy` -- flipping it to `never` removes an interactive
-/// question nobody is there to answer, not a security boundary
-/// (`SECURITY.md`: "Its security boundary is the operating-system user it
-/// runs as; it does not try to protect the operator from their own
-/// agents"). An operator can still override this per agent with `agent
-/// profile set --permission-mode <on-request|never>`
-/// (`ctx.permission_mode`), which always wins over this default. See
-/// `docs/providers.md` for the full write-up.
-const DEFAULT_APPROVAL_POLICY: &str = "never";
+/// The native posture used when factory auto mode is off and an agent has
+/// no explicit override. Auto mode uses Codex's full bypass flag instead;
+/// an explicit `on-request`/`never` profile always wins.
+const DEFAULT_APPROVAL_POLICY: &str = "on-request";
 
 /// Pre-approves this agent's own `factoryctl` calls the same way Codex's
 /// own interactive "don't ask again for commands that start with
@@ -96,16 +78,12 @@ const DEFAULT_APPROVAL_POLICY: &str = "never";
 /// wrote in exactly this shape once the operator chose it by hand (see
 /// `docs/providers.md`).
 ///
-/// **Inert under [`DEFAULT_APPROVAL_POLICY`].** Confirmed from the
-/// installed `codex-cli 0.147.0` binary's own strings: `prefix_rule`'s
+/// Confirmed from the installed `codex-cli 0.147.0` binary's own strings:
+/// `prefix_rule`'s
 /// `allow` decision is only ever consulted under `approval_policy =
 /// "on-request"` ("you cannot request additional permissions unless the
-/// approval policy is OnRequest") -- under this provider's shipped
-/// default, `never`, nothing ever asks, so nothing ever reads this file's
-/// `allow` rules either. It is seeded anyway so an operator who overrides
-/// one agent back to `on-request` (`agent profile set --permission-mode
-/// on-request`) does not also have to rediscover and re-approve
-/// `factoryctl` by hand. When it *is* consulted, be precise about what it
+/// approval policy is OnRequest"). It is seeded for auto-off or explicitly
+/// `on-request` sessions. When it is consulted, be precise about what it
 /// grants: the same binary's strings describe `prefix_rule` as valid "only
 /// with `sandbox_permissions: \"require_escalated\"`", i.e. this rule
 /// pre-approves **unsandboxed** execution of any command whose parsed
@@ -194,9 +172,9 @@ fn table_header_top_level_key(line: &str) -> Option<String> {
 }
 
 /// Interactive-session [`Provider`] for Codex. Launches `codex
-/// --dangerously-bypass-hook-trust [--model M] -c
-/// approval_policy="<permission_mode or DEFAULT_APPROVAL_POLICY>" [resume
-/// <thread-id>]` with
+/// --dangerously-bypass-hook-trust [--model M]
+/// (--dangerously-bypass-approvals-and-sandbox | -c approval_policy=M)
+/// [resume <thread-id>]` with
 /// `CODEX_HOME` pointed at this agent's own seeded home (per orchestrator
 /// amendment A2, `TRACK5-DESIGN.md`: per *agent*, not per session, so
 /// `codex resume` can find its own prior rollout file across a stop and
@@ -267,12 +245,16 @@ impl Provider for CodexProvider {
         // -- so an unattended agent never silently inherits a native
         // approval prompt nobody is there to answer. See
         // `DEFAULT_APPROVAL_POLICY`'s own doc comment.
-        let approval_policy = ctx
-            .permission_mode
-            .as_deref()
-            .unwrap_or(DEFAULT_APPROVAL_POLICY);
-        args.push("-c".to_owned());
-        args.push(format!("approval_policy=\"{approval_policy}\""));
+        if ctx.permission_mode.is_none() && ctx.auto_mode {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+        } else {
+            let approval_policy = ctx
+                .permission_mode
+                .as_deref()
+                .unwrap_or(DEFAULT_APPROVAL_POLICY);
+            args.push("-c".to_owned());
+            args.push(format!("approval_policy=\"{approval_policy}\""));
+        }
         if let Some(thread_id) = &ctx.resume {
             validate_thread_id(thread_id).map_err(|_| ProviderError::ResumeIdNotUuid {
                 value: thread_id.clone(),
@@ -829,6 +811,7 @@ mod provider_tests {
             worktree: directory.join("worktree"),
             model: None,
             permission_mode: None,
+            auto_mode: true,
             resume: None,
             hook_token_path: directory.join("runtime").join("hook.token"),
             factoryctl_path: PathBuf::from("/abs/factoryctl"),
@@ -850,11 +833,9 @@ mod provider_tests {
             launch.args,
             vec![
                 "--dangerously-bypass-hook-trust".to_owned(),
-                "-c".to_owned(),
-                "approval_policy=\"never\"".to_owned(),
+                "--dangerously-bypass-approvals-and-sandbox".to_owned(),
             ],
-            "an agent with no explicit permission_mode must still get an \
-             explicit approval_policy, never Codex's own on-request default"
+            "auto mode bypasses both approvals and the sandbox"
         );
         let codex_home = directory.path().join("agent-dir").join("codex-home");
         assert_eq!(

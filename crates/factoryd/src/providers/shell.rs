@@ -72,6 +72,7 @@ mod tests {
             worktree: directory.join("worktree"),
             model: None,
             permission_mode: None,
+            auto_mode: true,
             resume: None,
             hook_token_path: directory.join("runtime").join("hook.token"),
             factoryctl_path: PathBuf::from("/abs/factoryctl"),

@@ -203,17 +203,16 @@ A brand-new agent's first session never blocks on either CLI's one-time
 just created (for Claude, an entry in `~/.claude.json`; for Codex, a
 `trust_level` entry in the agent's seeded `config.toml`), because that
 worktree came from the daemon itself, never from an untrusted source.
-`factoryctl` is always resolvable inside a session (its directory is
-prepended to `PATH`) and pre-approved as a Bash command prefix in Claude's
-generated settings, so an agent's own progress report never stalls on a
-permission prompt nobody is there to answer. Codex agents get the
-equivalent treatment: `approval_policy = "never"` by default (an operator
-can override it per agent, in which case a pre-seeded `CODEX_HOME/rules/
-default.rules` prefix rule keeps `factoryctl` itself unattended — inert,
-by design, under the shipped `never` default, where nothing is ever asked
-in the first place), and `network_access = true` in the sandbox so the
-daemon's own control socket (and a worker's `git push`/`gh pr create`) are
-actually reachable, not just unblocked from asking. A file-based outbox
+Auto mode is durable, factory-wide, and on by default. It launches Claude
+with `--permission-mode bypassPermissions` and Codex with
+`--dangerously-bypass-approvals-and-sandbox`; `factoryctl auto off` returns
+new sessions to native prompts, and an explicit per-agent permission mode
+always overrides the factory default. `factoryctl status` reports
+`auto_mode`. Every tool call still passes through the daemon's authenticated
+`PreToolUse` hook: a small deny policy blocks destructive git operations,
+recursive forced deletion outside the agent worktree, and named secret
+paths, and records allow/deny decisions in the durable event ledger. A
+file-based outbox
 (drained by the next hook) is still the fallback for an agent's own
 `factoryctl task done`/`task blocked`/`agent message` call if the daemon is
 ever unreachable for some other reason.

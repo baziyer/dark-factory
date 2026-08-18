@@ -29,6 +29,10 @@ pub const MAX_QUEUE_PREVIEW: usize = 10;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FleetStatus {
     pub generated_at_ms: i64,
+    /// Factory-wide provider bypass. Explicit per-agent permission modes
+    /// still override this default.
+    #[serde(default)]
+    pub auto_mode: bool,
     /// `factoryd --max-active-runs`: the daemon-wide cap on live sessions.
     pub live_session_cap: u32,
     /// Sessions that have not ended, across every project.

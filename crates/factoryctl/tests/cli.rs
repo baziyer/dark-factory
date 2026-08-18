@@ -455,6 +455,30 @@ fn hook_fails_open_when_the_token_file_is_missing() {
     );
 }
 
+#[test]
+fn pre_tool_use_fails_closed_when_the_policy_daemon_is_unavailable() {
+    let directory = tempfile::tempdir().unwrap();
+    let missing_token = directory.path().join("missing.token");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            directory.path().join("missing.sock").to_str().unwrap(),
+            "hook",
+            "--token-file",
+            missing_token.to_str().unwrap(),
+            "PreToolUse",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let reply: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
+}
+
 /// `--project` may be omitted anywhere it is otherwise required if
 /// `$DARK_FACTORY_PROJECT` is set in the process environment, matching how
 /// the daemon exports it into a session.

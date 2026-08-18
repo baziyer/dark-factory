@@ -117,15 +117,12 @@ them into `factory_core::ProviderHookEvent` values (see
      matches; and never create or overwrite the CLI's own trust-state file
      if it does not already exist and parse as valid JSON, since that file
      is real user state Dark Factory does not own.
-   - If your CLI has its own default-deny permission/approval prompt for
-     shell commands (Claude's native Bash approval, matched here), the
-     product's posture for it is "the native prompt is the human-in-the-
-     loop gate" — do not pass a blanket bypass flag. Instead pre-approve
-     *only* the composed delivery's own `factoryctl` calls in whatever
-     narrow, CLI-native allowlist mechanism exists (see
-     `claude_settings_json`'s `permissions.allow`) — otherwise an agent's
-     own progress report never gets past its first Bash prompt when nobody
-     is attached to answer it.
+   - Implement the factory-wide `SpawnContext::auto_mode` posture. With no
+     explicit per-agent permission mode, on means the provider's full
+     approval/sandbox bypass and off means its native approval posture. An
+     explicit per-agent mode always wins. This only removes provider prompts:
+     every tool must still invoke the authenticated `PreToolUse` hook so the
+     daemon can answer its policy gate.
 4. In `capabilities()`, return `hooks: true` if you wired hooks up,
    `resume: true` if step 3's resume path is real, and the permission-mode
    strings your CLI actually accepts (validated end to end, not just
@@ -312,7 +309,16 @@ No config on the Dark Factory side can fix Codex's own deferred
 `SessionStart` dispatch — it is Codex's own session-lifecycle timing, not a
 hooks-table or trust-state shape a generated `config.toml` controls.
 
-## Codex: unattended approvals — `approval_policy`, network access, and a pre-seeded `factoryctl` rule
+## Codex: unattended approvals — historical pre-auto-mode design
+
+This section records the v0.1.1 design evidence that led to auto mode; it is
+not the current launch contract. Current default launches use
+`--dangerously-bypass-approvals-and-sandbox`. `factoryctl auto off` uses
+`approval_policy="on-request"`; an explicit per-agent `on-request` or `never`
+still wins. The generated workspace-write configuration and copied rules
+remain useful when bypass is off, but they are not a security boundary while
+bypass is on. The daemon's `PreToolUse` policy and its documented limitations
+are the current in-process tripwire (see `SECURITY.md`).
 
 Left at Codex's own default, every agent stops on a native "Would you like
 to run the following command?" prompt with nobody attached to answer it: a
@@ -522,13 +528,9 @@ Two different test doubles exist at two different layers, easy to conflate:
   treated uniformly as "waiting for input," whether that's a permission
   prompt or genuine idle-wait — providers report what actually happened;
   the state machine, not the provider, decides what it means. A provider
-  never *answers* a permission prompt on the operator's behalf, even when
-  the underlying hook contract would let it: Codex's own
-  `permission-request.command.output` schema accepts a `decision` with
-  `behavior: allow`/`deny` that would auto-approve or auto-deny the tool
-  call, but `factoryctl hook`'s reply for this event is always `{}`
-  (`local_api.rs`'s `ProviderHook` handler only builds a real reply for
-  `Stop`/`SubagentStop`'s delivery contract) — Dark Factory only observes.
+  does not answer `PermissionRequest` approval prompts; auto mode prevents
+  those prompts. The separate `PreToolUse` hook always receives the
+  factory's allow/deny policy answer and is durably audited.
 - They do not manage ambient environment (`HOME`, `PATH`, ...); that is the
   session runner's sanitized-environment concern.
   `InteractiveLaunch::env` is only for provider-specific additions, like

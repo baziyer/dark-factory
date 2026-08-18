@@ -37,7 +37,7 @@ const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -45,6 +45,7 @@ Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a 
 Commands:
   health                                      Check the daemon
   status                                      The whole fleet at one instant: sessions, queues, attention, live-session cap
+  auto on|off|status                         Set or show the factory-wide provider bypass default
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Read-only checks of the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
@@ -681,6 +682,9 @@ enum CliCommand {
     Help(&'static str),
     Health,
     Status,
+    SetAutoMode {
+        enabled: bool,
+    },
     Usage,
     Version,
     Update {
@@ -1042,11 +1046,9 @@ fn queue_to_outbox(
 }
 
 /// Executes `factoryctl hook`: forwards one provider hook payload to the
-/// daemon and prints its `reply` JSON verbatim. Fails open — on any local or
-/// daemon-side problem (unreadable token file, malformed or oversized
-/// stdin, unreachable/slow/erroring daemon) it prints `{}` and always
-/// returns 0, because a stuck or erroring hook must never abort the
-/// operator's live provider session.
+/// daemon and prints its `reply` JSON verbatim. Lifecycle hooks fail open so
+/// they cannot wedge a provider; `PreToolUse` fails closed because losing
+/// the daemon must not silently remove the auto-mode policy gate.
 ///
 /// Before sending the hook itself, drains `$DARK_FACTORY_AGENT_DIR/outbox/`
 /// (a no-op when the variable is unset or the directory doesn't exist) —
@@ -1058,7 +1060,17 @@ fn run_hook(client: &Client, token_file: &str, event: ProviderHookEvent) -> i32 
     if let Ok(agent_dir) = env::var(AGENT_DIR_ENV) {
         outbox::drain(client, Path::new(&agent_dir));
     }
-    let reply = hook_reply(client, token_file, event).unwrap_or_else(|| serde_json::json!({}));
+    let reply = hook_reply(client, token_file, event).unwrap_or_else(|| {
+        if event == ProviderHookEvent::PreToolUse {
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Dark Factory policy unavailable"
+            }})
+        } else {
+            serde_json::json!({})
+        }
+    });
     println!("{reply}");
     0
 }
@@ -1095,8 +1107,8 @@ fn hook_reply(
 
 /// Reads at most `limit` bytes of stdin and parses them as one JSON value.
 /// Returns `None` (never an error the caller must format) if stdin exceeds
-/// the bound or is not valid JSON, matching `hook_reply`'s fail-open
-/// contract.
+/// the bound or is not valid JSON; the event-specific caller chooses the
+/// fail-open or fail-closed reply.
 fn read_bounded_stdin_json(limit: usize) -> Option<serde_json::Value> {
     use std::io::Read;
     let mut buffer = Vec::new();
@@ -1211,6 +1223,24 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             }
             require_empty(&args)?;
             Ok((socket, CliCommand::Status))
+        }
+        "auto" => {
+            if wants_help(&args) {
+                return Ok((
+                    socket,
+                    CliCommand::Help(
+                        "usage: factoryctl auto <on|off|status>\n\nSet the durable factory-wide provider bypass default, or show fleet status containing its current value.",
+                    ),
+                ));
+            }
+            let action = take_action(&mut args, "auto")?;
+            require_empty(&args)?;
+            match action.as_str() {
+                "on" => Ok((socket, CliCommand::SetAutoMode { enabled: true })),
+                "off" => Ok((socket, CliCommand::SetAutoMode { enabled: false })),
+                "status" => Ok((socket, CliCommand::Status)),
+                _ => Err("auto action must be `on`, `off`, or `status`".into()),
+            }
         }
         "version" | "--version" | "-V" => {
             require_empty(&args)?;
@@ -1805,6 +1835,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Status => Ok(LocalRequest::FleetStatus),
+        CliCommand::SetAutoMode { enabled } => Ok(LocalRequest::SetAutoMode { enabled }),
         CliCommand::Usage
         | CliCommand::Version
         | CliCommand::Update { .. }
@@ -2720,6 +2751,14 @@ mod tests {
 
     #[test]
     fn status_and_agent_status_map_to_the_status_requests() {
+        assert_eq!(
+            request_for(parse_args(args(&["auto", "off"])).unwrap().1).unwrap(),
+            LocalRequest::SetAutoMode { enabled: false }
+        );
+        assert_eq!(
+            request_for(parse_args(args(&["auto", "status"])).unwrap().1).unwrap(),
+            LocalRequest::FleetStatus
+        );
         assert_eq!(
             request_for(parse_args(args(&["status"])).unwrap().1).unwrap(),
             LocalRequest::FleetStatus

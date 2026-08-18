@@ -187,10 +187,9 @@ impl SessionState {
 /// wired only into the Codex provider's generated hooks
 /// (`providers::codex::hooks_block_toml`), not the shared
 /// `providers::hooks::HOOK_EVENTS` both providers iterate. Either way the
-/// daemon only *observes*: `factoryctl hook`'s reply for this event is
-/// always `{}` (`local_api.rs`'s `ProviderHook` handler), never a
-/// `decision`, so Dark Factory never answers a provider's own approval
-/// prompt on the operator's behalf.
+/// daemon only observes `PermissionRequest`; auto mode avoids the native
+/// prompt, while the separate `PreToolUse` hook is where the daemon answers
+/// its own allow/deny policy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHookEvent {
@@ -442,6 +441,21 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum FactoryEvent {
+    /// Factory-wide autonomy posture changed. Policy decisions are recorded
+    /// separately so the event ledger explains both configuration and use.
+    AutoModeChanged {
+        enabled: bool,
+    },
+    /// The daemon's answer to one provider `PreToolUse` hook.
+    PolicyDecision {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        session_id: SessionId,
+        tool_name: String,
+        decision: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule: Option<String>,
+    },
     ProjectChanged {
         project: ProjectSnapshot,
     },
