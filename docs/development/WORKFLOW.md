@@ -187,9 +187,9 @@ remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
 GitHub Releases are the source of truth for binaries; nothing else builds
 them.
 
-1. **Build and publish**: pushing a semver tag (`git tag v0.1.1 && git push
-   origin v0.1.1`, on a commit whose `Cargo.toml` workspace version is
-   `0.1.1` — the workflow refuses a mismatch) runs
+1. **Build and publish**: pushing a semver tag (`git tag v0.2.0 && git push
+   origin v0.2.0`, on a commit whose `Cargo.toml` workspace version is
+   `0.2.0` — the workflow refuses a mismatch) runs
    `.github/workflows/release.yml` on the trusted self-hosted arm Mac. One
    serialized job builds `aarch64-apple-darwin` and then
    `x86_64-apple-darwin`; there is no release-writing matrix to race shared

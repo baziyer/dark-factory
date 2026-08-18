@@ -1,6 +1,6 @@
 name: Release
 
-# A semver tag (`v0.1.0`) pushed by a maintainer builds the macOS arm64
+# A semver tag (`v0.2.0`) pushed by a maintainer builds the macOS arm64
 # and Intel binaries serially and publishes them, a SHA256SUMS file, a tap
 # formula candidate, and the `latest.json` manifest as a GitHub Release.
 # `factoryctl update` reads that manifest at
