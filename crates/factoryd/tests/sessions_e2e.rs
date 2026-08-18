@@ -135,6 +135,7 @@ impl Drop for Daemon {
         // machine's uptime -- best-effort and bounded: if the daemon
         // itself is already gone or wedged, this must not hang teardown.
         let mut stopped_any = false;
+        let mut daemon_reachable = false;
         if let Ok(ServerFrame::Response {
             response: LocalResponse::Sessions { sessions, .. },
             ..
@@ -146,6 +147,7 @@ impl Drop for Daemon {
             },
             Duration::from_secs(2),
         ) {
+            daemon_reachable = true;
             for session in sessions {
                 if session.state.is_live() {
                     stopped_any = true;
@@ -190,10 +192,12 @@ impl Drop for Daemon {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            // A terminal database row precedes the runner's acknowledgement
-            // shutdown by a small but real interval. Keep the daemon alive for
-            // that final protocol step too; otherwise killing it here can strand
-            // a runner that has already disappeared from the live-session query.
+        }
+        // A terminal database row can precede runner disappearance. Keep a
+        // still-reachable daemon alive for that final protocol step even when
+        // Drop found no live row. An explicitly stopped restart-test daemon is
+        // unreachable here, so its intentionally surviving runner is untouched.
+        if daemon_reachable {
             if let Some(home) = self.socket.parent() {
                 wait_for_no_runners_under(home, Duration::from_secs(5));
             }
@@ -1165,6 +1169,60 @@ fn terminal_input_reaches_the_live_process_through_attach() {
 
     cleanup_session(&daemon, "curie");
     daemon.stop();
+}
+
+#[test]
+fn daemon_drop_waits_for_a_runner_after_its_session_is_terminal() {
+    let home = private_tempdir();
+    let mut lingering_runner = None;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Project { daemon, .. } = setup_project(home.path());
+        let client = daemon.client();
+        create_shell_agent(&client, "curie");
+        create_task(&client, "task-1", "First", "finish before the panic");
+        assign_task(&client, "task-1", "curie");
+        wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+        let session = wait_for_stable_idle(&client, "curie");
+        client
+            .request(LocalRequest::TerminalInput {
+                project_id: project_id(),
+                session_id: session.id,
+                bytes: factory_core::runner::encode_terminal_bytes(b"exit\r"),
+            })
+            .unwrap();
+        poll_until(DELIVERY_TIMEOUT, || {
+            session_by_agent(&client, "curie").filter(|session| !session.state.is_live())
+        });
+
+        // Hold a process with the exact home-scoped runner command shape
+        // across unwind. This deterministically widens the otherwise tiny
+        // terminal-row/runner-disappearance interval that Drop must cover.
+        let runner = home.path().join("factory-runner-drop-race");
+        std::fs::write(&runner, "#!/bin/sh\nsleep 1\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        lingering_runner = Some(
+            Command::new(&runner)
+                .arg("--runtime-dir")
+                .arg(home.path().join("runs/drop-race"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        poll_until(READY_TIMEOUT, || {
+            (live_runners_under(home.path()) == 1).then_some(())
+        });
+        panic!("exercise Daemon::drop after terminal state");
+    }));
+
+    assert!(unwound.is_err());
+    assert_eq!(
+        live_runners_under(home.path()),
+        0,
+        "Drop must wait for every runner scoped to its private home"
+    );
+    lingering_runner.unwrap().wait().unwrap();
 }
 
 // --- (g) TRACK5D item 5: a SessionStart hook payload's session_id
