@@ -547,3 +547,15 @@ fn a_long_status_message_is_truncated_and_the_hint_stays_intact() {
         "the combined line must be far shorter than the original 500-char message: {line}"
     );
 }
+
+#[test]
+fn normal_footer_keeps_only_contextual_essentials_and_help() {
+    let mut b = board();
+    assert_eq!(b.help_text(), "j/k agent  Enter open  g needs-you  ? help");
+
+    b.view = View::Agent;
+    assert_eq!(
+        b.help_text(),
+        "BOARD  j/k agent  i/Enter type  Esc BUILDING  ? help"
+    );
+}

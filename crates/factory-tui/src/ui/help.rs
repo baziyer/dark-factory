@@ -9,7 +9,7 @@ use ratatui::widgets::{Clear, ListItem, ListState, Paragraph};
 
 use crate::model::{
     Board, Connection, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
-    TASK_MENU_ITEMS, TaskMenuState, View,
+    TASK_MENU_ITEMS, TaskMenuState,
 };
 use crate::ui::{self, centered_rect};
 
@@ -29,13 +29,6 @@ fn connection_badge(board: &Board) -> Span<'static> {
     }
 }
 
-fn view_badge(view: View) -> Span<'static> {
-    Span::styled(
-        format!(" {} ", view.label()),
-        Style::default().fg(Color::Black).bg(Color::Cyan),
-    )
-}
-
 pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
     if area.height == 0 {
         return;
@@ -45,12 +38,7 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
     } else {
         Color::White
     };
-    let mut spans = vec![
-        connection_badge(board),
-        Span::raw(" "),
-        view_badge(board.view),
-        Span::raw(" "),
-    ];
+    let mut spans = vec![connection_badge(board), Span::raw(" ")];
     if let Some(cap) = board.live_session_cap {
         let live = board.live_session_count();
         spans.push(Span::styled(

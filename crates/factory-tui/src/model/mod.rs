@@ -545,13 +545,10 @@ impl Board {
                     .map_or_else(|| "pane".to_owned(), |id| id.to_string());
                 return format!("TYPING \u{2192} {target}   Ctrl-] board");
             }
-            return "BOARD  i/Enter type  [/] or j/k agent  z maximise  Esc back  ? help  q detach"
-                .to_owned();
+            return "BOARD  j/k agent  i/Enter type  Esc BUILDING  ? help".to_owned();
         }
         if self.view == View::Building {
-            return "j/k floors  Enter agent  g needs-you  n new  m message  o orchestrator  \
-                    p project  x stop  ? help  q detach"
-                .to_owned();
+            return "j/k agent  Enter open  g needs-you  ? help".to_owned();
         }
         String::new()
     }

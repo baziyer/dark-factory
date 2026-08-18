@@ -59,7 +59,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
-                "[BUILDING]",
+                format!("[{}]", View::Building.label()),
                 Style::default().add_modifier(if board.view == View::Building {
                     selected
                 } else {
@@ -68,7 +68,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) 
             ),
             Span::raw(" "),
             Span::styled(
-                "[AGENT]",
+                format!("[{}]", View::Agent.label()),
                 Style::default().add_modifier(if board.view == View::Agent {
                     selected
                 } else {
