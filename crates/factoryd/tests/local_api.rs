@@ -1103,6 +1103,28 @@ async fn cancel_update_and_delete_are_local_control_operations() {
             }
         ));
 
+        // Reusing an operator-facing id creates a new task incarnation,
+        // never a continuation of the deleted task's delivery identity.
+        let replacement = request(
+            &socket,
+            LocalRequest::CreateTask {
+                id: task_id("task-1"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Replacement".into(),
+                body: "different body".into(),
+                priority: 0,
+            },
+        )
+        .await;
+        assert!(matches!(
+            replacement,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { ref task },
+                ..
+            } if task.snapshot.title == "Replacement" && task.body == "different body"
+        ));
+
         let guidance_root = socket.parent().unwrap();
         let agent_guidance_dir = factory_core::paths::agent_dir(
             guidance_root,

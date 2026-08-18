@@ -1822,6 +1822,7 @@ async fn wait_for_runner_exit(
 /// or a `Stop`/`SubagentStop` hook reply should deliver next for an agent.
 struct Delivery {
     task_id: Option<factory_core::TaskId>,
+    task_incarnation_id: Option<String>,
     prior_run_count: Option<usize>,
     text: String,
 }
@@ -1848,10 +1849,13 @@ async fn compose_delivery(
                 .as_ref()
                 .map(|id| store.get_task(&project_id, id))
                 .transpose()?;
-            let prior_run_count = task_id
+            let task_marker = task_id
                 .as_ref()
-                .map(|id| store.run_episode_count(&session_id, id))
+                .map(|id| store.task_delivery_marker(&session_id, id))
                 .transpose()?;
+            let (task_incarnation_id, prior_run_count) = task_marker
+                .map(|(incarnation_id, count)| (Some(incarnation_id), Some(count)))
+                .unwrap_or((None, None));
             let agent = store.get_agent_detail(&project_id, &agent_id)?;
             let text = compose_text(
                 &guidance_root,
@@ -1863,6 +1867,7 @@ async fn compose_delivery(
             );
             Ok(Some(Delivery {
                 task_id,
+                task_incarnation_id,
                 prior_run_count,
                 text,
             }))
@@ -1886,9 +1891,13 @@ async fn commit_delivery(
     let agent_id = agent_id.clone();
     let session_id = session_id.clone();
     state
-        .commit_and_publish(
-            move |store| match (delivery.task_id, delivery.prior_run_count) {
-                (Some(task_id), Some(prior_run_count)) => {
+        .commit_and_publish(move |store| {
+            match (
+                delivery.task_id,
+                delivery.task_incarnation_id,
+                delivery.prior_run_count,
+            ) {
+                (Some(task_id), Some(task_incarnation_id), Some(prior_run_count)) => {
                     match store.open_run_episode(&session_id, &task_id, now_ms) {
                         Ok(opened) => {
                             let run_id = opened.run.id.clone();
@@ -1898,27 +1907,31 @@ async fn commit_delivery(
                         // win this dispatcher's later ack-driven commit. A
                         // sufficiently fast client can also finish that run
                         // before this retry, yielding `TaskNotQueued` instead
-                        // of `AgentUnavailable`. The run count captured while
-                        // composing is the durable attempt generation: only a
-                        // new run for this task in this session proves this
-                        // candidate was already committed. Historical retry
-                        // episodes do not satisfy the strict increase.
+                        // of `AgentUnavailable`. The immutable incarnation and
+                        // run count captured while composing are the durable
+                        // attempt identity: only a new run for this exact task
+                        // row in this session proves the candidate committed.
+                        // Historical retries and delete/recreate ABA do not.
                         Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
-                            if store.run_episode_count(&session_id, &task_id)?
-                                > prior_run_count =>
+                            if store.delivery_attempt_committed(
+                                &session_id,
+                                &task_id,
+                                &task_incarnation_id,
+                                prior_run_count,
+                            )? =>
                         {
                             Ok((None, Vec::new()))
                         }
                         Err(error) => Err(error),
                     }
                 }
-                (None, None) => {
+                (None, None, None) => {
                     store.deliver_agent_messages(&project_id, &agent_id, &session_id, now_ms)?;
                     Ok((None, Vec::new()))
                 }
                 _ => Err(StoreError::InvalidExecutionMetadata),
-            },
-        )
+            }
+        })
         .await
 }
 
@@ -3681,6 +3694,7 @@ mod tests {
         let agent_id = AgentId::try_from("curie").unwrap();
         let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
         let race_task_id = TaskId::try_from("race-task").unwrap();
+        let aba_task_id = TaskId::try_from("aba-task").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
         let occupying_task_id = TaskId::try_from("task-2").unwrap();
         let mut store = Store::open_in_memory().unwrap();
@@ -3737,7 +3751,7 @@ mod tests {
                 1_001,
             )
             .unwrap();
-        for id in [&race_task_id, &task_id, &occupying_task_id] {
+        for id in [&race_task_id, &aba_task_id, &task_id, &occupying_task_id] {
             store
                 .create_task(
                     crate::store::NewTask {
@@ -3758,12 +3772,50 @@ mod tests {
 
         // Original race: the candidate observes no prior episode, then the
         // hook opens one and the fast client finishes it before this commit.
-        let prior_run_count = store.run_episode_count(&session_id, &race_task_id).unwrap();
+        let (race_incarnation, prior_run_count) = store
+            .task_delivery_marker(&session_id, &race_task_id)
+            .unwrap();
         store
             .open_run_episode(&session_id, &race_task_id, 1_004)
             .unwrap();
         store
             .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_005)
+            .unwrap();
+
+        // ABA counterexample: retain a delivery marker for the old row,
+        // delete it, then create and run a different task with the same
+        // operator-facing id. Its replacement run must not prove the old
+        // composed text was delivered.
+        let (old_incarnation, old_run_count) = store
+            .task_delivery_marker(&session_id, &aba_task_id)
+            .unwrap();
+        store.delete_task(&project_id, &aba_task_id, 1_006).unwrap();
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: aba_task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Replacement".to_owned(),
+                    body: "Different work.".to_owned(),
+                    priority: 0,
+                },
+                1_007,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &aba_task_id, Some(&agent_id), 1_008)
+            .unwrap();
+        store
+            .open_run_episode(&session_id, &aba_task_id, 1_009)
+            .unwrap();
+        store
+            .complete_task(
+                &project_id,
+                &aba_task_id,
+                "replacement done".to_owned(),
+                1_010,
+            )
             .unwrap();
         let event_count = store.events_after(0, 100).unwrap().len();
         let state = DaemonState::new(store);
@@ -3775,10 +3827,11 @@ mod tests {
             &session_id,
             Delivery {
                 task_id: Some(race_task_id),
+                task_incarnation_id: Some(race_incarnation),
                 prior_run_count: Some(prior_run_count),
                 text: "already delivered".to_owned(),
             },
-            1_006,
+            1_011,
         )
         .await
         .unwrap();
@@ -3788,6 +3841,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(events.len(), event_count, "the retry commits no events");
+
+        let aba = commit_delivery(
+            &state,
+            &project_id,
+            &agent_id,
+            &session_id,
+            Delivery {
+                task_id: Some(aba_task_id),
+                task_incarnation_id: Some(old_incarnation),
+                prior_run_count: Some(old_run_count),
+                text: "old task body".to_owned(),
+            },
+            1_012,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            aba,
+            DaemonStateError::Store(StoreError::TaskNotQueued)
+        ));
 
         // Historical episode -> retry -> unrelated cancellation. The run
         // count did not advance after this candidate was composed.
@@ -3824,11 +3897,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let retry_run_count = state
+        let (task_incarnation, retry_run_count) = state
             .with_store({
                 let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.run_episode_count(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&session_id, &task_id)
             })
             .await
             .unwrap();
@@ -3850,6 +3923,7 @@ mod tests {
             &session_id,
             Delivery {
                 task_id: Some(task_id.clone()),
+                task_incarnation_id: Some(task_incarnation),
                 prior_run_count: Some(retry_run_count),
                 text: "cancelled retry".to_owned(),
             },
@@ -3875,11 +3949,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let retry_run_count = state
+        let (task_incarnation, retry_run_count) = state
             .with_store({
                 let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.run_episode_count(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&session_id, &task_id)
             })
             .await
             .unwrap();
@@ -3901,6 +3975,7 @@ mod tests {
             &session_id,
             Delivery {
                 task_id: Some(task_id),
+                task_incarnation_id: Some(task_incarnation),
                 prior_run_count: Some(retry_run_count),
                 text: "blocked by another run".to_owned(),
             },

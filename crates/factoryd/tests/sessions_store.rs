@@ -92,11 +92,11 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 15 as of 0015's
+/// which always migrates to the current `SCHEMA_VERSION`, 16 as of 0016's
 /// `last_hook_event` CHECK widening for `permission_request` -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
-/// chain including 0015's own `sessions` rebuild.
+/// chain including 0015's `sessions` rebuild and 0016's task incarnations.
 #[test]
 fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let directory = tempfile::tempdir().unwrap();
@@ -190,7 +190,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
 
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
@@ -282,6 +282,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
         connection
             .execute(
+                "INSERT INTO tasks (
+                    id, project_id, title, body, status, priority, created_at_ms, updated_at_ms
+                 ) VALUES ('legacy-task', 'factory', 'Legacy', '', 'queued', 0, 2, 2)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
                 "INSERT INTO sessions (
                     id, project_id, agent_id, provider, worktree, hook_token, state,
                     state_since_ms, runner_instance_id, runner_runtime,
@@ -297,14 +305,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 migration.
+    // Opening through the real store runs the 0015 and 0016 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
     connection
         .execute_batch("PRAGMA foreign_keys = ON;")
         .unwrap();
@@ -313,7 +321,18 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             row.get(0)
         })
         .unwrap();
-    assert_eq!(violations, 0, "migration 0015 left a foreign key violation");
+    assert_eq!(
+        violations, 0,
+        "migration chain left a foreign key violation"
+    );
+    let incarnation: String = connection
+        .query_row(
+            "SELECT incarnation_id FROM tasks WHERE id = 'legacy-task'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(incarnation, "legacy:legacy-task");
 
     // The widened CHECK now accepts `permission_request` for a session
     // that survived the rebuild from before 0015 existed.
