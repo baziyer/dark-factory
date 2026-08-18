@@ -42,7 +42,10 @@ own work **done** or **blocked** the same way, from inside its session:
 
 Every agent gets its own git worktree (`agent/<id>`, created on `agent
 add`, removed on `agent delete`), so concurrent agents never collide in
-one working tree. Standing instructions, memory, and project guidance live
+one working tree. A new agent branch starts at the project's remote default
+branch (`origin/HEAD`), or local `main` when there is no remote; changing the
+project root's current checkout does not change that base. Standing
+instructions, memory, and project guidance live
 as plain Markdown files under `$DARK_FACTORY_HOME` (Munder-Difflin style)
 rather than opaque database columns — composed into what an agent reads at
 task delivery, editable by the operator or the agent itself. SQLite is the

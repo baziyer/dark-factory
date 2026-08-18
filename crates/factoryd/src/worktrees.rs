@@ -1,6 +1,6 @@
 //! One git worktree per agent (D3, `TRACK5-WIRE.md`): `CreateAgent`
 //! provisions `$DARK_FACTORY_HOME/projects/<project>/worktrees/<agent>` on
-//! branch `agent/<agent_id>` from the project root's current `HEAD`, and a
+//! branch `agent/<agent_id>` from the project's default branch, and a
 //! resident session's cwd is that worktree; `DeleteAgent` removes it again
 //! unless it is dirty.
 //!
@@ -41,7 +41,9 @@ pub async fn is_git_repo(project_root: &Path) -> bool {
 }
 
 /// Creates `worktree_dir` as a new worktree of the repository at
-/// `project_root`, on `branch`, from `HEAD`. If `branch` already exists
+/// `project_root`, on `branch`, from the remote's default branch
+/// (`origin/HEAD`), falling back to local `main` for repositories without
+/// a remote. If `branch` already exists
 /// (an agent re-created after a prior `DeleteAgent`, or a hand-created
 /// branch of the same name), reuses it instead of failing -- matching
 /// `TRACK5-WIRE.md`'s "branch may already exist -> reuse".
@@ -57,9 +59,18 @@ pub async fn add(
             .map_err(|error| WorktreeError::Git(format!("directory worker panicked: {error}")))??;
     }
     let target = worktree_dir.to_string_lossy().into_owned();
+    let base = if git_ref_exists(project_root, "refs/remotes/origin/HEAD").await? {
+        "refs/remotes/origin/HEAD"
+    } else if git_ref_exists(project_root, "refs/heads/main").await? {
+        "refs/heads/main"
+    } else {
+        return Err(WorktreeError::Git(
+            "project has neither origin/HEAD nor a local main branch".into(),
+        ));
+    };
     let fresh = run_git(
         project_root,
-        &["worktree", "add", "-b", branch, &target, "HEAD"],
+        &["worktree", "add", "-b", branch, &target, base],
     )
     .await?;
     if fresh.status.success() {
@@ -76,6 +87,15 @@ pub async fn add(
     Err(WorktreeError::Git(
         String::from_utf8_lossy(&reused.stderr).into_owned(),
     ))
+}
+
+async fn git_ref_exists(project_root: &Path, reference: &str) -> Result<bool, WorktreeError> {
+    let output = run_git(
+        project_root,
+        &["show-ref", "--verify", "--quiet", reference],
+    )
+    .await?;
+    Ok(output.status.success())
 }
 
 /// Removes `worktree_dir` from the repository at `project_root`. Refuses
@@ -204,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_creates_a_worktree_on_a_new_branch_from_head() {
+    async fn add_creates_a_worktree_on_a_new_branch_from_main() {
         let repo = tempfile::tempdir().unwrap();
         init_repo(repo.path()).await;
         let worktree_dir = repo.path().join("worktrees").join("curie");
@@ -221,6 +241,56 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "agent/curie"
         );
+    }
+
+    #[tokio::test]
+    async fn add_ignores_the_project_roots_current_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["checkout", "-q", "-b", "integration"]).await;
+        std::fs::write(repo.path().join("integration-only.txt"), b"wrong base\n").unwrap();
+        git(repo.path(), &["add", "integration-only.txt"]).await;
+        git(repo.path(), &["commit", "-q", "-m", "integration work"]).await;
+        let worktree_dir = repo.path().join("worktrees").join("curie");
+
+        add(repo.path(), &worktree_dir, "agent/curie")
+            .await
+            .unwrap();
+
+        assert!(!worktree_dir.join("integration-only.txt").exists());
+        let base = run_git(
+            &worktree_dir,
+            &["merge-base", "--is-ancestor", "main", "HEAD"],
+        )
+        .await
+        .unwrap();
+        assert!(base.status.success());
+    }
+
+    #[tokio::test]
+    async fn add_prefers_the_remote_default_over_local_main() {
+        let source = tempfile::tempdir().unwrap();
+        init_repo(source.path()).await;
+        git(source.path(), &["checkout", "-q", "-b", "trunk"]).await;
+        std::fs::write(source.path().join("TRUNK.md"), b"default\n").unwrap();
+        git(source.path(), &["add", "TRUNK.md"]).await;
+        git(source.path(), &["commit", "-q", "-m", "trunk work"]).await;
+        let bare = tempfile::tempdir().unwrap();
+        git(bare.path(), &["init", "-q", "--bare"]).await;
+        let bare_path = bare.path().to_string_lossy();
+        git(source.path(), &["remote", "add", "origin", &bare_path]).await;
+        git(source.path(), &["push", "-q", "origin", "main", "trunk"]).await;
+        git(bare.path(), &["symbolic-ref", "HEAD", "refs/heads/trunk"]).await;
+        git(source.path(), &["fetch", "-q", "origin"]).await;
+        git(source.path(), &["remote", "set-head", "origin", "-a"]).await;
+        git(source.path(), &["checkout", "-q", "main"]).await;
+        let worktree_dir = source.path().join("worktrees").join("curie");
+
+        add(source.path(), &worktree_dir, "agent/curie")
+            .await
+            .unwrap();
+
+        assert!(worktree_dir.join("TRUNK.md").is_file());
     }
 
     #[tokio::test]

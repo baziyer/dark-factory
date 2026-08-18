@@ -1782,7 +1782,8 @@ async fn ensure_agent_guidance(
 /// did not pass `--worktree` explicitly (D3, `TRACK5-WIRE.md`): a fresh
 /// `git worktree add -b agent/<agent_id>` under
 /// `agent_worktree_dir(guidance_root, project_id, agent_id)` from the
-/// project root's current `HEAD` when the project root is a git repo,
+/// project's `origin/HEAD` (or local `main` without a remote) when the
+/// project root is a git repo,
 /// else the project root itself. A `git worktree add` failure (a real one,
 /// not "branch already exists" -- `worktrees::add` already retries that)
 /// falls back to the project root rather than blocking agent creation
