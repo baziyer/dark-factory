@@ -15,6 +15,7 @@ use factory_core::local::LocalRequest;
 use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId};
 
 use super::{AttentionTarget, Board, StatusLevel};
+use crate::mouse::Target as MouseTarget;
 
 // ---------------------------------------------------------------------------------------------
 // View
@@ -318,6 +319,60 @@ impl Board {
         }
     }
 
+    /// Applies a target from the most recently rendered mouse hit map. Every id is checked again
+    /// against current board state so a fleet update can only turn an old target into a no-op.
+    pub fn handle_mouse_target(&mut self, target: MouseTarget) -> Intent {
+        if !matches!(self.mode, Mode::Normal) {
+            return Intent::None;
+        }
+        match target {
+            MouseTarget::View(View::Building) => self.back_to_building(),
+            MouseTarget::View(View::Agent) => self.open_agent(),
+            MouseTarget::Agent(agent_id) => {
+                if self.select_agent(agent_id) {
+                    Intent::Redraw
+                } else {
+                    Intent::None
+                }
+            }
+            MouseTarget::Task(task_id) => {
+                let Some(agent_id) = self.selected_agent.as_ref() else {
+                    return Intent::None;
+                };
+                let Some(task) = self
+                    .active_tasks_for_agent(agent_id)
+                    .into_iter()
+                    .find(|task| task.snapshot.id == task_id)
+                else {
+                    return Intent::None;
+                };
+                self.focused_project = Some(task.snapshot.project_id.clone());
+                self.selected_task = Some(task_id);
+                self.pane_mode = PaneMode::Board;
+                Intent::Redraw
+            }
+            MouseTarget::Attention(target) => {
+                if self.select_attention_target(&target) {
+                    Intent::Redraw
+                } else {
+                    Intent::None
+                }
+            }
+            MouseTarget::Pane(session_id) => {
+                let Some(agent_id) = self
+                    .agent_for_pane_session(&session_id)
+                    .map(|agent| agent.id.clone())
+                else {
+                    return Intent::None;
+                };
+                self.select_agent(agent_id);
+                self.view = View::Agent;
+                self.pane_mode = PaneMode::Board;
+                Intent::Redraw
+            }
+        }
+    }
+
     fn handle_normal_key(&mut self, key: KeyEvent) -> Intent {
         if self.view == View::Agent {
             if key == crate::keys::PREFIX_KEY {
@@ -413,15 +468,20 @@ impl Board {
 
     fn cycle_selected_agent(&mut self, forward: bool) -> Intent {
         let candidates = self.agents_in_fortress_order();
-        self.selected_agent = step(&candidates, self.selected_agent.as_ref(), forward);
-        if let Some(agent) = self
-            .selected_agent
-            .as_ref()
-            .and_then(|id| self.agents.get(id))
-        {
-            self.focused_project = Some(agent.project_id.clone());
+        if let Some(agent_id) = step(&candidates, self.selected_agent.as_ref(), forward) {
+            self.select_agent(agent_id);
         }
         Intent::Redraw
+    }
+
+    fn select_agent(&mut self, agent_id: AgentId) -> bool {
+        let Some(agent) = self.agents.get(&agent_id) else {
+            return false;
+        };
+        self.focused_project = Some(agent.project_id.clone());
+        self.selected_agent = Some(agent_id);
+        self.selected_task = None;
+        true
     }
 
     fn toggle_pause(&mut self) -> Intent {
@@ -464,17 +524,13 @@ impl Board {
         let Some(agent_id) = self.selected_agent.as_ref() else {
             return Intent::None;
         };
+        let tasks = self.active_tasks_for_agent(agent_id);
         let Some(task_id) = self
-            .tasks
-            .values()
-            .find(|task| {
-                task.snapshot.assigned_agent_id.as_ref() == Some(agent_id)
-                    && matches!(
-                        task.snapshot.status,
-                        factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
-                    )
-            })
-            .map(|task| task.snapshot.id.clone())
+            .selected_task
+            .as_ref()
+            .filter(|selected| tasks.iter().any(|task| &task.snapshot.id == *selected))
+            .cloned()
+            .or_else(|| tasks.first().map(|task| task.snapshot.id.clone()))
         else {
             self.set_status("agent queue is empty", StatusLevel::Info);
             return Intent::Redraw;
@@ -643,8 +699,20 @@ impl Board {
             AttentionTarget::Task(id) => self.selected_task.as_ref() == Some(id),
         });
         let next = &items[current.map_or(0, |index| (index + 1) % items.len())];
-        self.focused_project = Some(next.project_id.clone());
-        match &next.target {
+        self.select_attention_target(&next.target);
+        Intent::Redraw
+    }
+
+    fn select_attention_target(&mut self, target: &AttentionTarget) -> bool {
+        let Some(item) = self
+            .attention_items()
+            .into_iter()
+            .find(|item| &item.target == target)
+        else {
+            return false;
+        };
+        self.focused_project = Some(item.project_id);
+        match target {
             AttentionTarget::Agent(id) => {
                 self.selected_agent = Some(id.clone());
                 self.selected_task = None;
@@ -661,7 +729,7 @@ impl Board {
         }
         self.view = View::Building;
         self.pane_mode = PaneMode::Board;
-        Intent::Redraw
+        true
     }
 
     // -- Confirm ----------------------------------------------------------------------------
@@ -1179,5 +1247,109 @@ mod tests {
             board.handle_key(key(KeyCode::Char('q'))),
             Intent::Quit
         ));
+    }
+
+    #[test]
+    fn mouse_tabs_agents_and_attention_use_keyboard_state_transitions() {
+        let mut keyboard = board();
+        keyboard.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        keyboard.handle_key(key(KeyCode::Down));
+
+        let mut mouse = board();
+        mouse.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        mouse.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("bob").unwrap()));
+        assert_eq!(mouse.selected_agent, keyboard.selected_agent);
+        assert_eq!(mouse.focused_project, keyboard.focused_project);
+        assert_eq!(mouse.selected_task, keyboard.selected_task);
+
+        keyboard.handle_key(key(KeyCode::Right));
+        mouse.handle_mouse_target(MouseTarget::View(View::Agent));
+        assert_eq!(mouse.view, keyboard.view);
+        assert_eq!(mouse.pane_mode, keyboard.pane_mode);
+
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, None, 1);
+        keyboard.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            Vec::new(),
+            vec![blocked.clone()],
+            Vec::new(),
+            Vec::new(),
+        );
+        mouse.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            Vec::new(),
+            vec![blocked],
+            Vec::new(),
+            Vec::new(),
+        );
+        keyboard.selected_agent = None;
+        mouse.selected_agent = None;
+        keyboard.handle_key(key(KeyCode::Char('g')));
+        mouse.handle_mouse_target(MouseTarget::Attention(AttentionTarget::Task(
+            TaskId::try_from("blocked").unwrap(),
+        )));
+        assert_eq!(mouse.selected_agent, keyboard.selected_agent);
+        assert_eq!(mouse.selected_task, keyboard.selected_task);
+        assert_eq!(mouse.focused_project, keyboard.focused_project);
+        assert_eq!(mouse.view, keyboard.view);
+    }
+
+    #[test]
+    fn task_click_selects_the_exact_visible_task_for_the_existing_task_action() {
+        let mut board = board();
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![
+                task("first", "proj", TaskStatus::Queued, Some("alice"), 1),
+                task("second", "proj", TaskStatus::Running, Some("alice"), 2),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("second").unwrap()));
+        board.handle_key(key(KeyCode::Char('t')));
+        assert!(matches!(
+            &board.mode,
+            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "second"
+        ));
+    }
+
+    #[test]
+    fn stale_rows_and_unready_panes_fail_closed() {
+        let mut board = board();
+        let before = board.selected_agent.clone();
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("deleted").unwrap())),
+            Intent::None
+        ));
+        assert_eq!(board.selected_agent, before);
+
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.tasks.insert(
+            TaskId::try_from("done").unwrap(),
+            task("done", "proj", TaskStatus::Succeeded, Some("alice"), 0),
+        );
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("done").unwrap())),
+            Intent::None
+        ));
+        assert!(board.selected_task.is_none());
+
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.pane_mode = PaneMode::Typing;
+        board.pane_ready = false;
+        board.handle_mouse_target(MouseTarget::Pane(SessionId::try_from("session").unwrap()));
+        assert_eq!(board.pane_mode, PaneMode::Board);
+
+        board.mode = Mode::Help;
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::View(View::Building)),
+            Intent::None
+        ));
+        assert_eq!(board.view, View::Agent);
     }
 }

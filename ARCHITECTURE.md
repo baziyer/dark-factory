@@ -123,9 +123,15 @@ catalogue.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
    message is a durable write before it wakes the orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals
-   repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
-   for elapsed-time labels and activity sparklines while visible; no
-   background animation or state polling is a source of truth.
+   repaint when their PTY emits bytes. Each repaint replaces the complete
+   mouse hit map for screen tabs, visible rows, and pane geometry; a click is
+   revalidated against current model state before it can select anything.
+   Board hit testing and terminal input are separate routes: only events inside
+   the rendered terminal content, while the pane is in typing mode, are encoded
+   for a child, and only when that child's parsed output has enabled an xterm
+   mouse protocol. A 1Hz tick may request a coarse repaint for elapsed-time
+   labels and activity sparklines while visible; no background animation or
+   state polling is a source of truth.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,

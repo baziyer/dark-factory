@@ -27,6 +27,7 @@ use factoryctl::Client;
 
 use crate::attach::{self, AttachConnection};
 use crate::keys::KeyContext;
+use crate::mouse::TerminalMouseContext;
 use crate::query::QueryResponder;
 
 /// How long after a local-PTY spawn we keep appending raw PTY bytes to the debug log, per the
@@ -241,6 +242,16 @@ impl Pane {
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.with_screen(vt100::Screen::bracketed_paste)
+    }
+
+    /// Mouse mode and encoding requested by the child through DECSET. `main.rs` treats `None`
+    /// mode as a hard do-not-forward boundary, rather than inferring support from pane focus.
+    #[must_use]
+    pub fn mouse_context(&self) -> TerminalMouseContext {
+        self.with_screen(|screen| TerminalMouseContext {
+            mode: screen.mouse_protocol_mode(),
+            encoding: screen.mouse_protocol_encoding(),
+        })
     }
 
     /// Writes raw, already-encoded terminal input to the child (local PTY) or forwards it to the

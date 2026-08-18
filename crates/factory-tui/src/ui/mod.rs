@@ -9,27 +9,36 @@ mod help;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::model::{Board, Mode, View};
+use crate::mouse::{HitMap, Target};
 use crate::pane::PaneMap;
 
-pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) {
+pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) -> HitMap {
+    let mut hits = HitMap::default();
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
-        return;
+        return hits;
     }
 
     let status_height = 1u16.min(area.height);
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(status_height)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(status_height),
+        ])
         .split(area);
-    let (content_area, status_area) = (outer[0], outer[1]);
+    let (tabs_area, content_area, status_area) = (outer[0], outer[1], outer[2]);
+
+    render_tabs(frame, tabs_area, board, &mut hits);
 
     match board.view {
-        View::Building => building::draw(frame, content_area, board),
-        View::Agent => agent::draw(frame, content_area, board, panes),
+        View::Building => building::draw(frame, content_area, board, &mut hits),
+        View::Agent => agent::draw(frame, content_area, board, panes, &mut hits),
     }
     help::render_status_line(frame, status_area, board);
 
@@ -38,6 +47,46 @@ pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) {
         Mode::Prompt(_) | Mode::Picker(_) | Mode::TaskMenu(_) | Mode::Confirm(_) | Mode::Help
     ) {
         help::render_overlay(frame, area, board);
+    }
+    hits
+}
+
+fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let selected = Modifier::REVERSED | Modifier::BOLD;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "[BUILDING]",
+                Style::default().add_modifier(if board.view == View::Building {
+                    selected
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                "[AGENT]",
+                Style::default().add_modifier(if board.view == View::Agent {
+                    selected
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+        ])),
+        area,
+    );
+    hits.add(
+        Rect::new(area.x, area.y, 10.min(area.width), 1),
+        Target::View(View::Building),
+    );
+    if area.width > 11 {
+        hits.add(
+            Rect::new(area.x + 11, area.y, 7.min(area.width - 11), 1),
+            Target::View(View::Agent),
+        );
     }
 }
 
@@ -128,6 +177,22 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mouse::{Route, Target, route};
+    use crate::test_fixtures::{agent, project, task};
+    use factory_core::{AgentId, AgentRole, TaskId, TaskStatus};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn render(board: &Board, width: u16, height: u16) -> HitMap {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut panes = PaneMap::new();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| hits = draw(frame, board, &mut panes))
+            .unwrap();
+        hits
+    }
 
     #[test]
     fn truncate_middle_passes_through_text_that_already_fits() {
@@ -159,5 +224,80 @@ mod tests {
             truncate("first-floor-worker", 12),
             truncate("first-floor-worker-2", 12)
         );
+    }
+
+    #[test]
+    fn rendered_building_rows_and_tabs_are_the_hit_authority() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![task("blocked", "proj", TaskStatus::Blocked, None, 0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let hits = render(&board, 120, 24);
+        assert_eq!(hits.target_at(0, 0), Some(Target::View(View::Building)));
+        assert_eq!(hits.target_at(11, 0), Some(Target::View(View::Agent)));
+        assert_eq!(
+            hits.target_at(1, 3),
+            Some(Target::Agent(AgentId::try_from("alice").unwrap()))
+        );
+        assert_eq!(
+            hits.target_at(83, 2),
+            Some(Target::Attention(crate::model::AttentionTarget::Task(
+                TaskId::try_from("blocked").unwrap()
+            )))
+        );
+    }
+
+    #[test]
+    fn agent_task_and_unattached_pane_regions_are_clickable_but_not_terminal_input() {
+        let mut board = Board::new(true, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![task("task-1", "proj", TaskStatus::Queued, Some("alice"), 0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        let hits = render(&board, 120, 24);
+        assert_eq!(
+            hits.target_at(83, 2),
+            Some(Target::Task(TaskId::try_from("task-1").unwrap()))
+        );
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            route(click, &hits, None, &mut crate::mouse::Capture::default()),
+            Route::Board(Target::Pane(_))
+        ));
+    }
+
+    #[test]
+    fn resize_replaces_clipped_and_empty_row_targets() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let full = render(&board, 120, 24);
+        assert!(matches!(full.target_at(1, 3), Some(Target::Agent(_))));
+
+        let clipped = render(&board, 30, 3);
+        assert_eq!(clipped.target_at(1, 3), None);
+        assert_eq!(clipped.target_at(0, 0), Some(Target::View(View::Building)));
+
+        let empty = render(&Board::new(false, 0, crate::theme::PLAIN), 120, 24);
+        assert_eq!(empty.target_at(1, 3), None);
     }
 }

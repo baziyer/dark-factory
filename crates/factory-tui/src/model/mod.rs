@@ -246,6 +246,24 @@ impl Board {
             .collect()
     }
 
+    /// Active work assigned to one agent, in the same stable order AGENT renders and targets it.
+    #[must_use]
+    pub fn active_tasks_for_agent(&self, agent_id: &AgentId) -> Vec<&TaskDetail> {
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.snapshot.assigned_agent_id.as_ref() == Some(agent_id)
+                    && matches!(
+                        task.snapshot.status,
+                        factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
+                    )
+            })
+            .collect();
+        tasks.sort_by_key(|task| (task.snapshot.created_at_ms, task.snapshot.id.clone()));
+        tasks
+    }
+
     // -- derived views: task detail (lazy `GetTask` fetch) ----------------------------------
 
     /// Whether `task_id`'s cached [`TaskDetail`] (`body`/`result`/`blocked_reason`) is missing or

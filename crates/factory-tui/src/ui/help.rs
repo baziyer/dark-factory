@@ -271,6 +271,7 @@ const HELP_TEXT: &[&str] = &[
     "i/Enter    AGENT: type into the live terminal",
     "Ctrl-]     return terminal input to BOARD mode",
     "z          maximise/restore terminal     PgUp/PgDn scroll",
+    "mouse      click tabs/rows/pane; wheel scrolls terminal history",
     "Space      pause/resume agent            t manage active task",
     "I / M      edit instructions.md / memory.md in $EDITOR",
     "q          detach (quits the client only — never stops the factory)",
