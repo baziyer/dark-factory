@@ -599,12 +599,6 @@ fn apply_intent(
         Intent::ForwardKey(key) => {
             if let Some(session_id) = forwarding_target(board) {
                 if let Some(pane) = panes.get(&session_id) {
-                    // Typing while scrolled back snaps to the live tail — matches common
-                    // terminal-emulator behavior and gives `scroll_reset` its one production
-                    // call site (scrolling itself only ever moves the offset forward/back).
-                    if pane.scroll_offset() > 0 {
-                        pane.scroll_reset();
-                    }
                     let bytes = keys::encode_key(key, pane.key_context());
                     pane.write_input(&bytes);
                 }

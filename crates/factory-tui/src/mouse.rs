@@ -242,14 +242,18 @@ fn encode(event: MouseEvent, column: u16, row: u16, context: TerminalMouseContex
         // Legacy encodings do not identify the released button; button 3 means release.
         button = 3;
     }
-    if event.modifiers.contains(KeyModifiers::SHIFT) {
-        button += 4;
-    }
-    if event.modifiers.contains(KeyModifiers::ALT) {
-        button += 8;
-    }
-    if event.modifiers.contains(KeyModifiers::CONTROL) {
-        button += 16;
+    // X10/DECSET 9 reports button presses without modifier bits. Those bits were added by the
+    // later VT200 tracking modes and must not leak into X10 packets.
+    if context.mode != MouseProtocolMode::Press {
+        if event.modifiers.contains(KeyModifiers::SHIFT) {
+            button += 4;
+        }
+        if event.modifiers.contains(KeyModifiers::ALT) {
+            button += 8;
+        }
+        if event.modifiers.contains(KeyModifiers::CONTROL) {
+            button += 16;
+        }
     }
     if motion {
         button += 32;
@@ -277,6 +281,11 @@ fn encode(event: MouseEvent, column: u16, row: u16, context: TerminalMouseContex
         MouseProtocolEncoding::Utf8 => {
             let mut bytes = b"\x1b[M".to_vec();
             for value in [button + 32, u32::from(column) + 32, u32::from(row) + 32] {
+                // Xterm's 1005 extension is a one- or two-byte UTF-8 encoding, limiting
+                // coordinates to 2015 (2047 after the protocol's +32 offset).
+                if value > 2_047 {
+                    return Vec::new();
+                }
                 let Some(character) = char::from_u32(value) else {
                     return Vec::new();
                 };
@@ -453,6 +462,50 @@ mod tests {
                 context(MouseProtocolMode::AnyMotion, MouseProtocolEncoding::Default)
             ),
             [0x1b, b'[', b'M', 67, 33, 33]
+        );
+    }
+
+    #[test]
+    fn x10_ignores_modifiers_and_utf8_coordinates_fail_closed_past_2015() {
+        let mut shifted_press = event(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        shifted_press.modifiers = KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL;
+        assert_eq!(
+            encode(
+                shifted_press,
+                1,
+                1,
+                context(MouseProtocolMode::Press, MouseProtocolEncoding::Default)
+            ),
+            [0x1b, b'[', b'M', 32, 33, 33]
+        );
+
+        let press = event(MouseEventKind::Down(MouseButton::Left), 0, 0);
+        assert!(
+            !encode(
+                press,
+                2_015,
+                2_015,
+                context(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Utf8)
+            )
+            .is_empty()
+        );
+        assert!(
+            encode(
+                press,
+                2_016,
+                1,
+                context(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Utf8)
+            )
+            .is_empty()
+        );
+        assert!(
+            encode(
+                press,
+                1,
+                2_016,
+                context(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Utf8)
+            )
+            .is_empty()
         );
     }
 
