@@ -11,10 +11,12 @@
 //! (the agent's own git commands, the operator's) touches the same
 //! checkout concurrently.
 
-use std::path::Path;
+use std::{path::Path, time::Duration};
 
 use factory_core::status::WorktreeStatus;
 use tokio::process::Command;
+
+const STATUS_DEADLINE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
@@ -138,6 +140,25 @@ pub async fn remove(project_root: &Path, worktree_dir: &Path) -> Result<(), Work
 /// gone, not a repository, ...) is reported in the summary's `error`, never
 /// as a clean tree.
 pub async fn status(worktree_dir: &Path) -> WorktreeStatus {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(worktree_dir)
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--porcelain=v1",
+            "--branch",
+        ])
+        .env("GIT_TERMINAL_PROMPT", "0");
+    status_command(worktree_dir, command, STATUS_DEADLINE).await
+}
+
+async fn status_command(
+    worktree_dir: &Path,
+    mut command: Command,
+    deadline: Duration,
+) -> WorktreeStatus {
     let path = worktree_dir.to_string_lossy().into_owned();
     let failed = |error: String| WorktreeStatus {
         path: path.clone(),
@@ -146,19 +167,11 @@ pub async fn status(worktree_dir: &Path) -> WorktreeStatus {
         dirty: false,
         error: Some(error),
     };
-    let output = match run_git(
-        worktree_dir,
-        &[
-            "--no-optional-locks",
-            "status",
-            "--porcelain=v1",
-            "--branch",
-        ],
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(error) => return failed(format!("could not run git: {error}")),
+    command.kill_on_drop(true);
+    let output = match tokio::time::timeout(deadline, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return failed(format!("could not run git: {error}")),
+        Err(_) => return failed("git status timed out".to_owned()),
     };
     if !output.status.success() {
         return failed(String::from_utf8_lossy(&output.stderr).trim().to_owned());
@@ -337,6 +350,19 @@ mod tests {
         assert!(!missing.dirty);
         let plain = tempfile::tempdir().unwrap();
         assert!(status(plain.path()).await.error.is_some());
+    }
+
+    #[tokio::test]
+    async fn status_reports_a_stalled_git_probe_as_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 60"]);
+
+        let status = status_command(directory.path(), command, Duration::from_millis(10)).await;
+
+        assert_eq!(status.error.as_deref(), Some("git status timed out"));
+        assert!(!status.dirty);
+        assert_eq!(status.changed_files, 0);
     }
 
     #[tokio::test]

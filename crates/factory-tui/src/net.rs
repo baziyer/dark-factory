@@ -32,6 +32,7 @@ use factoryctl::update::{self, UpdateCheck};
 
 const MIN_BACKOFF: Duration = Duration::from_millis(400);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+const FLEET_STATUS_REFRESH: Duration = Duration::from_secs(5);
 
 /// Page size for projects/agents/runs/sessions listing. Deliberately **not**
 /// `factory_core::local::MAX_{PROJECT,AGENT,RUN,SESSION}_PAGE_ITEMS` (each declared as `1000`):
@@ -109,9 +110,8 @@ pub enum NetMsg {
     },
     /// The result of the hourly release-manifest check (`spawn_update_check`).
     UpdateCheck(UpdateCheck),
-    /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — fetched once
-    /// after the bootstrap snapshot for the fields the board doesn't otherwise learn (today: the
-    /// live-session cap; live counts and attention are then kept from events).
+    /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — refreshed in a
+    /// separate worker because worktree git state changes without durable events.
     FleetStatus(FleetStatus),
 }
 
@@ -338,15 +338,6 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
             match client.subscribe(after_sequence) {
                 Ok(subscription) => {
                     let _ = tx.send(NetMsg::ConnectionLive);
-                    // The cap is per daemon process: re-read it on every (re)connect, so a
-                    // daemon restarted with a different --max-active-runs is reflected.
-                    if let Ok(LocalResponse::FleetStatus { status }) =
-                        request_response(&client, LocalRequest::FleetStatus)
-                    {
-                        if tx.send(NetMsg::FleetStatus(status)).is_err() {
-                            return;
-                        }
-                    }
                     let mut failure = "event stream ended".to_owned();
                     for frame in subscription {
                         match frame {
@@ -389,6 +380,23 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
             }
             thread::sleep(delay);
             delay = next_backoff(delay);
+        }
+    });
+}
+
+/// Refreshes non-event state without delaying subscription reads. Git worktree changes publish
+/// no daemon event, so connect-time-only status becomes stale as soon as an agent edits a file.
+pub fn spawn_fleet_status_refresh(client: Client, tx: Sender<NetMsg>) {
+    thread::spawn(move || {
+        loop {
+            if let Ok(LocalResponse::FleetStatus { status }) =
+                request_response(&client, LocalRequest::FleetStatus)
+            {
+                if tx.send(NetMsg::FleetStatus(status)).is_err() {
+                    return;
+                }
+            }
+            thread::sleep(FLEET_STATUS_REFRESH);
         }
     });
 }

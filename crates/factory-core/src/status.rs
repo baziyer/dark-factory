@@ -79,7 +79,9 @@ pub struct AgentStatus {
 }
 
 /// `factoryctl agent status`: everything [`AgentStatus`] has, plus the
-/// profile and guidance paths, and the worktree's git state.
+/// profile and guidance paths. `worktree` is retained at the old outer
+/// location for compatibility while [`AgentStatus::worktree`] is shared
+/// with fleet status.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentStatusDetail {
     pub status: AgentStatus,
