@@ -14,7 +14,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use factory_core::local::LocalRequest;
 use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId};
 
-use super::{Board, StatusLevel};
+use super::{AttentionTarget, Board, StatusLevel};
 
 // ---------------------------------------------------------------------------------------------
 // View
@@ -321,10 +321,13 @@ impl Board {
     fn handle_normal_key(&mut self, key: KeyEvent) -> Intent {
         if self.view == View::Agent {
             if key == crate::keys::PREFIX_KEY {
-                self.pane_mode = match self.pane_mode {
-                    PaneMode::Typing => PaneMode::Board,
-                    PaneMode::Board => PaneMode::Typing,
-                };
+                if self.pane_mode == PaneMode::Typing {
+                    self.pane_mode = PaneMode::Board;
+                } else if self.has_live_pane() {
+                    self.pane_mode = PaneMode::Typing;
+                } else {
+                    self.set_status("terminal is not attached yet", StatusLevel::Error);
+                }
                 return Intent::Redraw;
             }
             if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
@@ -332,9 +335,12 @@ impl Board {
             }
             if self.pane_mode == PaneMode::Board
                 && matches!(key.code, KeyCode::Char('i') | KeyCode::Enter)
-                && self.has_live_pane()
             {
-                self.pane_mode = PaneMode::Typing;
+                if self.has_live_pane() {
+                    self.pane_mode = PaneMode::Typing;
+                } else {
+                    self.set_status("terminal is not attached yet", StatusLevel::Error);
+                }
                 return Intent::Redraw;
             }
         }
@@ -356,7 +362,7 @@ impl Board {
                 self.quit = true;
                 Intent::Quit
             }
-            Action::JumpNeedsAttention => self.jump_to_attention(false),
+            Action::JumpNeedsAttention => self.jump_to_attention(),
             Action::ToggleHelp => {
                 self.mode = Mode::Help;
                 Intent::Redraw
@@ -624,30 +630,37 @@ impl Board {
         Intent::Redraw
     }
 
-    fn jump_to_attention(&mut self, also_focus: bool) -> Intent {
-        let candidates: Vec<AgentId> = self
-            .agents_in_fortress_order()
-            .into_iter()
-            .filter(|id| {
-                self.agents
-                    .get(id)
-                    .is_some_and(|agent| self.agent_attention(agent).value.needs_operator())
-            })
-            .collect();
-        if candidates.is_empty() {
-            self.set_status("no agents need attention", StatusLevel::Info);
+    fn jump_to_attention(&mut self) -> Intent {
+        let items = self.attention_items();
+        if items.is_empty() {
+            self.set_status("nothing needs attention", StatusLevel::Info);
             return Intent::Redraw;
         }
-        let next = step(&candidates, self.selected_agent.as_ref(), true)
-            .unwrap_or_else(|| candidates[0].clone());
-        if let Some(agent) = self.agents.get(&next) {
-            self.focused_project = Some(agent.project_id.clone());
+        let current = items.iter().position(|item| match &item.target {
+            AttentionTarget::Agent(id) => {
+                self.selected_task.is_none() && self.selected_agent.as_ref() == Some(id)
+            }
+            AttentionTarget::Task(id) => self.selected_task.as_ref() == Some(id),
+        });
+        let next = &items[current.map_or(0, |index| (index + 1) % items.len())];
+        self.focused_project = Some(next.project_id.clone());
+        match &next.target {
+            AttentionTarget::Agent(id) => {
+                self.selected_agent = Some(id.clone());
+                self.selected_task = None;
+                self.set_status(format!("attention: agent {id}"), StatusLevel::Info);
+            }
+            AttentionTarget::Task(id) => {
+                self.selected_task = Some(id.clone());
+                self.selected_agent = self
+                    .tasks
+                    .get(id)
+                    .and_then(|task| task.snapshot.assigned_agent_id.clone());
+                self.set_status(format!("attention: task#{id}"), StatusLevel::Info);
+            }
         }
-        self.selected_agent = Some(next);
-        if also_focus {
-            self.view = View::Agent;
-            self.pane_mode = PaneMode::Typing;
-        }
+        self.view = View::Building;
+        self.pane_mode = PaneMode::Board;
         Intent::Redraw
     }
 
@@ -1030,8 +1043,8 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{agent, project, session};
-    use factory_core::{AgentRole, SessionState};
+    use crate::test_fixtures::{agent, project, session, task};
+    use factory_core::{AgentRole, SessionState, TaskStatus};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1090,6 +1103,7 @@ mod tests {
         let mut board = board();
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.pane_ready = true;
         board.handle_key(key(KeyCode::Char('i')));
         assert_eq!(board.pane_mode, PaneMode::Typing);
         assert!(matches!(
@@ -1107,6 +1121,63 @@ mod tests {
         assert!(matches!(
             board.handle_key(key(KeyCode::Char(' '))),
             Intent::Send(LocalRequest::PauseAgent { .. })
+        ));
+    }
+
+    #[test]
+    fn attention_is_globally_oldest_and_g_selects_an_unassigned_task() {
+        let mut board = board();
+        let mut waiting = session("waiting", "alice", "proj", SessionState::WaitingForInput);
+        waiting.updated_at_ms = 20;
+        waiting.state_since_ms = 20;
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(SessionId::try_from("waiting").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            vec![
+                task("old-task", "proj", TaskStatus::Blocked, None, 10),
+                task("new-task", "proj", TaskStatus::Failed, None, 30),
+            ],
+            Vec::new(),
+            vec![waiting],
+        );
+        let items = board.attention_items();
+        assert!(matches!(&items[0].target, AttentionTarget::Task(id) if id.as_str() == "old-task"));
+        assert!(matches!(&items[1].target, AttentionTarget::Agent(id) if id.as_str() == "alice"));
+        assert!(matches!(&items[2].target, AttentionTarget::Task(id) if id.as_str() == "new-task"));
+        board.selected_agent = None;
+        board.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(
+            board.selected_task.as_ref().map(TaskId::as_str),
+            Some("old-task")
+        );
+        assert_eq!(
+            board.focused_project.as_ref().map(ProjectId::as_str),
+            Some("proj")
+        );
+    }
+
+    #[test]
+    fn unattached_terminal_never_enters_typing_or_loses_keys() {
+        let mut board = board();
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.pane_ready = false;
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('i'))),
+            Intent::Redraw
+        ));
+        assert_eq!(board.pane_mode, PaneMode::Board);
+        assert!(
+            board
+                .status
+                .as_ref()
+                .is_some_and(|status| status.text.contains("not attached"))
+        );
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('q'))),
+            Intent::Quit
         ));
     }
 }

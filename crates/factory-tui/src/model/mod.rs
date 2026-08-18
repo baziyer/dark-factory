@@ -72,6 +72,21 @@ pub enum Connection {
     Retrying,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttentionTarget {
+    Agent(AgentId),
+    Task(TaskId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttentionItem {
+    pub target: AttentionTarget,
+    pub project_id: ProjectId,
+    pub attention: Attention,
+    pub inferred: bool,
+    pub since_ms: i64,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Board
 // ---------------------------------------------------------------------------------------------
@@ -113,6 +128,8 @@ pub struct Board {
     pub mode: Mode,
     /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
+    /// Set by the pane reconciler only after the selected terminal is actually attached.
+    pub pane_ready: bool,
     /// AGENT's terminal consumes the full content area while true.
     pub terminal_maximized: bool,
 
@@ -148,6 +165,7 @@ impl Board {
             selected_task: None,
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
+            pane_ready: false,
             terminal_maximized: false,
             status: None,
             caught_up: false,
@@ -300,6 +318,57 @@ impl Board {
         )
     }
 
+    #[must_use]
+    pub fn attention_items(&self) -> Vec<AttentionItem> {
+        let mut items = Vec::new();
+        for agent in self.agents.values() {
+            let rated = self.agent_attention(agent);
+            if rated.value.needs_operator() {
+                let since_ms = self
+                    .session_for(agent)
+                    .map_or(agent.updated_at_ms, |session| session.state_since_ms);
+                items.push(AttentionItem {
+                    target: AttentionTarget::Agent(agent.id.clone()),
+                    project_id: agent.project_id.clone(),
+                    attention: rated.value,
+                    inferred: rated.inferred,
+                    since_ms,
+                });
+            }
+        }
+        for task in self.tasks.values() {
+            let level = attention::task_attention(task.snapshot.status);
+            if level.needs_operator() {
+                items.push(AttentionItem {
+                    target: AttentionTarget::Task(task.snapshot.id.clone()),
+                    project_id: task.snapshot.project_id.clone(),
+                    attention: level,
+                    inferred: false,
+                    since_ms: task.snapshot.updated_at_ms,
+                });
+            }
+        }
+        items.sort_by(|a, b| {
+            a.since_ms
+                .cmp(&b.since_ms)
+                .then_with(|| match (&a.target, &b.target) {
+                    (AttentionTarget::Agent(a), AttentionTarget::Agent(b)) => {
+                        a.as_str().cmp(b.as_str())
+                    }
+                    (AttentionTarget::Task(a), AttentionTarget::Task(b)) => {
+                        a.as_str().cmp(b.as_str())
+                    }
+                    (AttentionTarget::Agent(_), AttentionTarget::Task(_)) => {
+                        std::cmp::Ordering::Less
+                    }
+                    (AttentionTarget::Task(_), AttentionTarget::Agent(_)) => {
+                        std::cmp::Ordering::Greater
+                    }
+                })
+        });
+        items
+    }
+
     // -- derived views: terminal attach targets ----------------------------------------------
 
     /// The session id `main.rs` should attach a pane to for `agent`, if any. Real usage: only an
@@ -359,7 +428,7 @@ impl Board {
     /// eating it as input for a pane that isn't there.
     #[must_use]
     fn has_live_pane(&self) -> bool {
-        self.view == View::Agent && self.focus_target().is_some()
+        self.view == View::Agent && self.pane_ready
     }
 
     /// Which sessions should currently be attached, given `self.view`. FORTRESS/WORKSHOP attach

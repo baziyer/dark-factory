@@ -50,6 +50,48 @@ struct Config {
     theme: theme::Theme,
 }
 
+struct ContextRefresh {
+    agent: Option<factory_core::AgentId>,
+    was_agent_view: bool,
+    last_refresh: Instant,
+    force: bool,
+}
+
+impl ContextRefresh {
+    fn new() -> Self {
+        Self {
+            agent: None,
+            was_agent_view: false,
+            last_refresh: Instant::now() - Duration::from_secs(10),
+            force: false,
+        }
+    }
+
+    fn should_refresh(
+        &mut self,
+        agent: &factory_core::AgentId,
+        in_agent: bool,
+        now: Instant,
+    ) -> bool {
+        if !in_agent {
+            self.was_agent_view = false;
+            return false;
+        }
+        let entering = !self.was_agent_view;
+        let changed = self.agent.as_ref() != Some(agent);
+        let due = now.duration_since(self.last_refresh) >= Duration::from_secs(5);
+        self.was_agent_view = true;
+        if entering || changed || due || self.force {
+            self.agent = Some(agent.clone());
+            self.last_refresh = now;
+            self.force = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn parse_args() -> Config {
     let mut socket = None;
     let mut project = None;
@@ -233,7 +275,7 @@ fn run(
     let mut last_update_check = Instant::now();
     let mut initial_project_applied = false;
     let mut remembered_project = board.focused_project.clone();
-    let mut loaded_context_agent = None;
+    let mut context_refresh = ContextRefresh::new();
     net::spawn_update_check(tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, debug_log);
@@ -264,6 +306,9 @@ fn run(
         }
 
         while let Ok(msg) = rx.try_recv() {
+            if matches!(&msg, NetMsg::ConnectionLive) {
+                context_refresh.force = true;
+            }
             apply_net_msg(
                 msg,
                 board,
@@ -276,7 +321,7 @@ fn run(
         if sync_panes(board, panes, socket, debug_log) {
             needs_redraw = true;
         }
-        sync_agent_context(board, client, tx, &mut loaded_context_agent);
+        sync_agent_context(board, client, tx, &mut context_refresh);
         for pane in panes.values() {
             if pane.dirty() {
                 needs_redraw = true;
@@ -371,51 +416,62 @@ fn sync_panes(
         }
     }
 
+    let ready = board.focus_target().is_some_and(|session_id| {
+        panes
+            .get(&session_id)
+            .is_some_and(|pane| pane.is_ready() && pane.attach_error().is_none())
+    });
+    changed |= board.pane_ready != ready;
+    board.pane_ready = ready;
+    if !ready && board.pane_mode == model::PaneMode::Typing {
+        board.pane_mode = model::PaneMode::Board;
+        changed = true;
+    }
     changed
 }
 
-/// Issues a `GetTask` fetch for WORKSHOP's currently selected task if its cached detail is
-/// missing or stale (`Board::begin_task_detail_fetch`) — the fix for task detail showing empty
-/// for a task created (or completed) after this client started (`TaskChanged` events only ever
-/// carry the durable snapshot, not `body`/`result`). Cheap to call every loop iteration like
-/// `sync_panes`: a couple of map lookups when nothing needs fetching, and `begin_task_detail_fetch`
-/// itself dedupes so a request already in flight is never fired twice.
+/// Loads private profile and inbox data when AGENT is entered and on a bounded refresh cadence.
 fn sync_agent_context(
     board: &mut Board,
     client: &Client,
     tx: &mpsc::Sender<NetMsg>,
-    loaded: &mut Option<factory_core::AgentId>,
+    refresh: &mut ContextRefresh,
 ) {
-    if board.view != model::View::Agent || board.selected_agent == *loaded {
-        return;
-    }
+    let in_agent = board.view == model::View::Agent;
     let Some(agent_id) = board.selected_agent.clone() else {
+        refresh.was_agent_view = in_agent;
         return;
     };
+    let now = Instant::now();
+    if !refresh.should_refresh(&agent_id, in_agent, now) {
+        return;
+    }
     let Some(agent) = board.agents.get(&agent_id) else {
         return;
     };
     let project_id = agent.project_id.clone();
     board.messages.insert(agent_id.clone(), Vec::new());
-    *loaded = Some(agent_id.clone());
-    net::spawn_request(
-        client.clone(),
-        tx.clone(),
+    for request in context_requests(project_id, agent_id) {
+        net::spawn_request(client.clone(), tx.clone(), request);
+    }
+}
+
+fn context_requests(
+    project_id: factory_core::ProjectId,
+    agent_id: factory_core::AgentId,
+) -> [factory_core::local::LocalRequest; 2] {
+    [
         factory_core::local::LocalRequest::GetAgent {
             project_id: project_id.clone(),
             agent_id: agent_id.clone(),
         },
-    );
-    net::spawn_request(
-        client.clone(),
-        tx.clone(),
         factory_core::local::LocalRequest::ListAgentMessages {
             project_id,
             agent_id,
             after_id: None,
             limit: 100,
         },
-    );
+    ]
 }
 
 /// AGENT.s selected pane owns the keyboard only in TYPING mode. The
@@ -485,7 +541,11 @@ fn apply_intent(
         Intent::EditFile(path) => {
             restore_terminal();
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_owned());
-            let result = std::process::Command::new(editor).arg(path).status();
+            let result = editor_command(&editor, &path).and_then(|mut command| {
+                command
+                    .status()
+                    .map_err(|error| format!("editor failed: {error}"))
+            });
             let _ = enable_raw_mode();
             let _ = execute!(
                 io::stdout(),
@@ -494,11 +554,22 @@ fn apply_intent(
                 cursor::Hide
             );
             if let Err(error) = result {
-                board.note_error(format!("editor failed: {error}"));
+                board.note_error(error);
             }
             true
         }
     }
+}
+
+fn editor_command(editor: &str, path: &str) -> Result<std::process::Command, String> {
+    let mut words =
+        shell_words::split(editor).map_err(|error| format!("invalid $EDITOR: {error}"))?;
+    if words.is_empty() {
+        return Err("$EDITOR is empty".to_owned());
+    }
+    let mut command = std::process::Command::new(words.remove(0));
+    command.args(words).arg(path);
+    Ok(command)
 }
 
 fn apply_net_msg(
@@ -533,5 +604,61 @@ fn apply_net_msg(
             board.update_available = check.available().map(|manifest| manifest.version.clone());
         }
         NetMsg::FleetStatus(status) => board.apply_fleet_status(status),
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn editor_command_parses_arguments_and_quotes_without_a_shell() {
+        let command = editor_command("code --wait 'folder name'", "/tmp/file name.md").unwrap();
+        assert_eq!(command.get_program(), OsStr::new("code"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("--wait"),
+                OsStr::new("folder name"),
+                OsStr::new("/tmp/file name.md")
+            ]
+        );
+        assert!(editor_command("'unterminated", "/tmp/file").is_err());
+        assert!(editor_command("   ", "/tmp/file").is_err());
+        assert!(
+            editor_command("/definitely/missing/editor --wait", "/tmp/file")
+                .unwrap()
+                .status()
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn context_refreshes_on_reentry_reconnect_and_a_bounded_interval() {
+        let agent = factory_core::AgentId::try_from("alice").unwrap();
+        let now = Instant::now();
+        let mut refresh = ContextRefresh::new();
+        assert!(refresh.should_refresh(&agent, true, now));
+        assert!(!refresh.should_refresh(&agent, true, now + Duration::from_secs(1)));
+        assert!(!refresh.should_refresh(&agent, false, now + Duration::from_secs(2)));
+        assert!(refresh.should_refresh(&agent, true, now + Duration::from_secs(3)));
+        assert!(!refresh.should_refresh(&agent, true, now + Duration::from_secs(4)));
+        refresh.force = true;
+        assert!(refresh.should_refresh(&agent, true, now + Duration::from_secs(4)));
+        assert!(refresh.should_refresh(&agent, true, now + Duration::from_secs(9)));
+        let requests = context_requests(factory_core::ProjectId::try_from("proj").unwrap(), agent);
+        assert!(matches!(
+            requests[0],
+            factory_core::local::LocalRequest::GetAgent { .. }
+        ));
+        assert!(matches!(
+            requests[1],
+            factory_core::local::LocalRequest::ListAgentMessages {
+                after_id: None,
+                limit: 100,
+                ..
+            }
+        ));
     }
 }
