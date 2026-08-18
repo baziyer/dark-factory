@@ -3116,16 +3116,7 @@ mod deletion_gate_tests {
     /// exactly like a real provider process would), and one task assigned
     /// to that agent -- pending work for `compose_delivery` to find, so a
     /// gate decline is distinguishable from "nothing to deliver anyway".
-    async fn setup(
-        directory: &Path,
-    ) -> (
-        ApiState,
-        execution::Handle,
-        tokio::task::JoinHandle<Result<(), execution::Error>>,
-        ProjectId,
-        AgentId,
-        TaskId,
-    ) {
+    async fn setup(directory: &Path) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
@@ -3154,31 +3145,6 @@ mod deletion_gate_tests {
             )
             .unwrap();
         store
-            .create_session(
-                NewSession {
-                    id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Shell,
-                    provider_session_id: None,
-                    worktree: directory.to_string_lossy().into_owned(),
-                    codex_home: None,
-                    hook_token: "a".repeat(HOOK_TOKEN_LEN),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: directory
-                        .join("runs")
-                        .join("session-1")
-                        .to_string_lossy()
-                        .into_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
             .create_task(
                 NewTask {
                     id: task_id.clone(),
@@ -3191,13 +3157,55 @@ mod deletion_gate_tests {
                 1_000,
             )
             .unwrap();
-        store
-            .assign_task(&project_id, &task_id, Some(&agent_id), 1_000)
-            .unwrap();
-
         let state = ApiState::new(store);
         let (execution, join) = execution::spawn(config(directory), state.clone()).unwrap();
-        (state, execution, join, project_id, agent_id, task_id)
+        // These hook tests exercise request-local state transitions, not
+        // runner recovery. Stop the dispatcher while the store has no live
+        // session, then install the synthetic session. Otherwise startup
+        // recovery correctly ends that runner-less row and races token lookup.
+        execution.shutdown().await.unwrap();
+        join.await.unwrap().unwrap();
+        let session_project_id = project_id.clone();
+        let session_agent_id = agent_id.clone();
+        let session_task_id = task_id.clone();
+        let session_worktree = directory.to_string_lossy().into_owned();
+        let session_runtime = directory
+            .join("runs")
+            .join("session-1")
+            .to_string_lossy()
+            .into_owned();
+        state
+            .commit_and_publish(move |store| {
+                let (_, session_event) = store.create_session(
+                    NewSession {
+                        id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+                        project_id: session_project_id.clone(),
+                        agent_id: session_agent_id.clone(),
+                        provider: Provider::Shell,
+                        provider_session_id: None,
+                        worktree: session_worktree,
+                        codex_home: None,
+                        hook_token: "a".repeat(HOOK_TOKEN_LEN),
+                        runner_instance_id: RunnerInstanceId::try_from(
+                            "22222222-2222-4222-8222-222222222222",
+                        )
+                        .unwrap(),
+                        runner_runtime: session_runtime,
+                        runner_protocol_version: 1,
+                    },
+                    1_000,
+                )?;
+                let (_, task_event) = store.assign_task(
+                    &session_project_id,
+                    &session_task_id,
+                    Some(&session_agent_id),
+                    1_000,
+                )?;
+                Ok(((), vec![session_event, task_event]))
+            })
+            .await
+            .unwrap();
+        (state, execution, project_id, agent_id, task_id)
     }
 
     /// `commit_pending_delivery_on_prompt`'s gated call site
@@ -3213,7 +3221,7 @@ mod deletion_gate_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_pending_delivery_on_prompt_declines_while_the_agent_is_deleting() {
         let directory = private_tempdir();
-        let (state, execution, join, project_id, agent_id, task_id) = setup(directory.path()).await;
+        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
 
         let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
         execution.begin_delete(&agent_id).await.unwrap();
@@ -3249,14 +3257,12 @@ mod deletion_gate_tests {
         );
 
         execution.end_delete(&agent_id);
-        execution.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pre_tool_use_denial_is_returned_and_durably_audited() {
         let directory = private_tempdir();
-        let (state, execution, join, ..) = setup(directory.path()).await;
+        let (state, execution, ..) = setup(directory.path()).await;
         let response = handle_request(
             &state,
             &execution,
@@ -3280,14 +3286,12 @@ mod deletion_gate_tests {
             FactoryEvent::PolicyDecision { decision, rule: Some(rule), .. }
                 if decision == "deny" && rule == "destructive_git"
         )));
-        execution.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exhausted_budget_denies_hook_and_reset_reopens_it() {
         let directory = private_tempdir();
-        let (state, execution, join, project_id, agent_id, _) = setup(directory.path()).await;
+        let (state, execution, project_id, agent_id, _) = setup(directory.path()).await;
         handle_request(
             &state,
             &execution,
@@ -3379,8 +3383,6 @@ mod deletion_gate_tests {
         assert!(
             matches!(third, LocalResponse::ProviderHookReply { ref reply } if *reply == serde_json::json!({}))
         );
-        execution.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
     }
 
     /// `stop_hook_reply`'s gated call site (`Stop`/`SubagentStop`): with
@@ -3393,7 +3395,7 @@ mod deletion_gate_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_hook_reply_declines_while_the_agent_is_deleting() {
         let directory = private_tempdir();
-        let (state, execution, join, project_id, agent_id, task_id) = setup(directory.path()).await;
+        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
 
         execution.begin_delete(&agent_id).await.unwrap();
 
@@ -3432,8 +3434,6 @@ mod deletion_gate_tests {
         );
 
         execution.end_delete(&agent_id);
-        execution.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
     }
 
     #[tokio::test]

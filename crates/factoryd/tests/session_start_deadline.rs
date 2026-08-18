@@ -19,8 +19,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, PROTOCOL_VERSION, ProjectId, Provider, SessionId, SessionSnapshot,
-    SessionState, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, SessionId,
+    SessionSnapshot, SessionState, TaskId,
     local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 use factoryd::{
@@ -104,6 +104,11 @@ fn runner_alive(runtime_dir: &Path) -> bool {
         .any(|line| line.contains("factory-runner") && line.contains(needle.as_str()))
 }
 
+fn runner_control_ready(runtime_dir: &Path) -> bool {
+    runner_alive(runtime_dir)
+        && std::os::unix::net::UnixStream::connect(runtime_dir.join("control.sock")).is_ok()
+}
+
 // --- Local protocol helpers (same technique as `tests/local_api.rs`) ----
 
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
@@ -127,6 +132,58 @@ async fn request(socket: &Path, request: LocalRequest) -> ServerFrame {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     write_request(&mut stream, request).await;
     read_frame(&mut BufReader::new(stream)).await
+}
+
+async fn subscribe_from_current_head(socket: &Path) -> BufReader<UnixStream> {
+    let head = match request(socket, LocalRequest::LatestEventSequence).await {
+        ServerFrame::Response {
+            response: LocalResponse::EventHead { sequence },
+            ..
+        } => sequence,
+        frame => panic!("expected event head, got {frame:?}"),
+    };
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    write_request(
+        &mut stream,
+        LocalRequest::Subscribe {
+            after_sequence: head,
+        },
+    )
+    .await;
+    let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        read_frame(&mut reader).await,
+        ServerFrame::Response {
+            response: LocalResponse::Subscribed { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        read_frame(&mut reader).await,
+        ServerFrame::Response {
+            response: LocalResponse::CaughtUp { sequence },
+            ..
+        } if sequence == head
+    ));
+    reader
+}
+
+async fn next_event<T>(
+    reader: &mut BufReader<UnixStream>,
+    label: &str,
+    mut select: impl FnMut(FactoryEvent) -> Option<T>,
+) -> T {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let ServerFrame::Event { event, .. } = read_frame(reader).await
+                && let Some(value) = select(event.event)
+            {
+                return value;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for event: {label}"))
 }
 
 fn project_id() -> ProjectId {
@@ -375,6 +432,7 @@ struct Harness {
     shutdown_tx: oneshot::Sender<()>,
     socket: PathBuf,
     home: tempfile::TempDir,
+    session_start_deadline: Duration,
 }
 
 impl Harness {
@@ -410,6 +468,7 @@ impl Harness {
             shutdown_tx,
             socket,
             home,
+            session_start_deadline,
         }
     }
 
@@ -420,6 +479,23 @@ impl Harness {
     fn wake(&self, agent_id: &str) {
         self.execution
             .wake(project_id(), AgentId::try_from(agent_id).unwrap());
+    }
+
+    async fn wake_when_start_deadline_is_due(&self, session: &SessionSnapshot) {
+        let deadline_ms = session.started_at_ms.saturating_add(
+            i64::try_from(self.session_start_deadline.as_millis()).unwrap_or(i64::MAX),
+        );
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        if deadline_ms > now_ms {
+            tokio::time::sleep(Duration::from_millis((deadline_ms - now_ms) as u64)).await;
+        }
+        self.wake(session.agent_id.as_str());
     }
 
     async fn stop(self) {
@@ -473,7 +549,10 @@ async fn a_starting_session_past_its_deadline_fails_and_is_retried() {
     .await;
     let runtime_dir = harness.runtime_dir(first.id.as_str());
     if first.state == SessionState::Starting {
-        wait_until(Duration::from_secs(5), || runner_alive(&runtime_dir)).await;
+        wait_until(Duration::from_secs(5), || {
+            runner_control_ready(&runtime_dir)
+        })
+        .await;
     }
 
     // Past the (shortened) deadline in real wall-clock time: nudge
@@ -612,41 +691,65 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
     )
     .await;
     create_task(&socket, "task-1", "Do it", "do it").await;
+    let mut events = subscribe_from_current_head(&socket).await;
     assign_task(&socket, "task-1", "stuck").await;
 
-    // Drive three full spawn -> deadline -> failed cycles. Each iteration
-    // waits for a session id not seen before (robust to whichever of the
-    // dispatcher's own wake or this loop's nudges actually lands the
-    // respawn) and then for that exact session to fail.
+    // Drive three full spawn -> deadline -> failed cycles from durable
+    // transition events. The prior test repeatedly polled ListSessions and
+    // wake() behind independent 10-second clocks; under load it could observe
+    // a row only after the timeout intended for the next transition. Here a
+    // session's own started_at timestamp determines the one deadline wake,
+    // and the event stream acknowledges the exact transition before the test
+    // advances to the next cycle.
     let mut seen: Vec<SessionId> = Vec::new();
     for _ in 0..3 {
-        let spawned = wait_for(Duration::from_secs(30), || async {
-            harness.wake("stuck");
-            sessions_for_agent(&socket, "stuck")
-                .await
-                .into_iter()
-                .find(|session| !seen.contains(&session.id))
+        let spawned = next_event(&mut events, "a distinct starting session", |event| {
+            let FactoryEvent::SessionChanged { session } = event else {
+                return None;
+            };
+            (session.agent_id.as_str() == "stuck"
+                && session.state == SessionState::Starting
+                && !seen.contains(&session.id))
+            .then_some(session)
         })
         .await;
         seen.push(spawned.id.clone());
 
-        wait_for(Duration::from_secs(10), || async {
-            harness.wake("stuck");
-            sessions_for_agent(&socket, "stuck")
-                .await
-                .into_iter()
-                .find(|session| session.id == spawned.id && session.state == SessionState::Failed)
+        let runtime_dir = harness.runtime_dir(spawned.id.as_str());
+        wait_until(Duration::from_secs(5), || {
+            runner_control_ready(&runtime_dir)
         })
         .await;
+        harness.wake_when_start_deadline_is_due(&spawned).await;
+        let failed = next_event(&mut events, "that session's deadline failure", |event| {
+            let FactoryEvent::SessionChanged { session } = event else {
+                return None;
+            };
+            (session.id == spawned.id && session.state == SessionState::Failed).then_some(session)
+        })
+        .await;
+        assert!(
+            failed
+                .wait_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("SessionStart hook not received")),
+            "unexpected deadline failure: {failed:?}"
+        );
+        wait_until(Duration::from_secs(5), || !runner_alive(&runtime_dir)).await;
     }
 
-    // No fourth session: give the dispatcher a healthy window, nudging it
-    // repeatedly, so a missing fourth session is "paused, not just hasn't
-    // happened yet".
-    for _ in 0..15 {
-        harness.wake("stuck");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    let paused = next_event(
+        &mut events,
+        "agent pause after the third deadline",
+        |event| {
+            let FactoryEvent::AgentChanged { agent } = event else {
+                return None;
+            };
+            (agent.id.as_str() == "stuck" && agent.paused).then_some(agent)
+        },
+    )
+    .await;
+    assert!(paused.paused);
     let sessions = sessions_for_agent(&socket, "stuck").await;
     assert_eq!(
         sessions.len(),
@@ -662,12 +765,14 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
     // attention view) -- no new state, nothing extra to check here.
 
     resume_agent(&socket, "stuck").await;
-    let fourth = wait_for(Duration::from_secs(10), || async {
-        harness.wake("stuck");
-        sessions_for_agent(&socket, "stuck")
-            .await
-            .into_iter()
-            .find(|session| !seen.contains(&session.id))
+    let fourth = next_event(&mut events, "a new session after resume", |event| {
+        let FactoryEvent::SessionChanged { session } = event else {
+            return None;
+        };
+        (session.agent_id.as_str() == "stuck"
+            && session.state == SessionState::Starting
+            && !seen.contains(&session.id))
+        .then_some(session)
     })
     .await;
     assert!(
@@ -681,6 +786,10 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
     for session in sessions_for_agent(&socket, "stuck").await {
         if session.state.is_live() {
             let runtime_dir = harness.runtime_dir(session.id.as_str());
+            wait_until(Duration::from_secs(5), || {
+                runner_control_ready(&runtime_dir)
+            })
+            .await;
             stop_session(&socket, session.id.clone()).await;
             wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
         }
