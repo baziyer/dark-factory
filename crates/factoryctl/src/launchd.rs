@@ -22,6 +22,7 @@ use std::{
     time::Duration,
 };
 
+use crate::capacity::{DEFAULT_MAX_ACTIVE_RUNS, MAX_MAX_ACTIVE_RUNS};
 use crate::install;
 
 pub const LABEL: &str = "com.dark-factory.factoryd";
@@ -31,6 +32,7 @@ pub const LAUNCHD_DEFAULT_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Enough to find Homebrew/system tools; the provider CLIs' own directories
 /// are prepended by [`merged_path`].
 pub const BASE_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+pub const MAX_ACTIVE_RUNS_ARGUMENT: &str = "--max-active-runs";
 /// Daemon settings that live in the job's environment and that
 /// `factoryctl init` takes from the environment it runs in when set there
 /// (an existing job's value is kept otherwise; `update --install` never
@@ -238,6 +240,52 @@ pub fn carried_arguments(program_arguments: &[String]) -> Vec<String> {
     carried
 }
 
+/// Reads the capacity flag from an existing job. A missing flag is a legacy
+/// job and uses the conservative default; a malformed flag is surfaced rather
+/// than silently replaced by a plausible value.
+pub fn max_active_runs(program_arguments: &[String]) -> Result<Option<usize>, String> {
+    let mut arguments = program_arguments.iter().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument != MAX_ACTIVE_RUNS_ARGUMENT {
+            continue;
+        }
+        let value = arguments
+            .next()
+            .ok_or("--max-active-runs in the launchd job has no value")?;
+        let value = value
+            .parse::<usize>()
+            .map_err(|_| "--max-active-runs in the launchd job is not an integer")?;
+        if !(1..=MAX_MAX_ACTIVE_RUNS).contains(&value) {
+            return Err(format!(
+                "--max-active-runs in the launchd job must be between 1 and {MAX_MAX_ACTIVE_RUNS}"
+            ));
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
+}
+
+/// Carries an existing job's arguments while replacing its one capacity flag.
+#[must_use]
+pub fn carried_arguments_with_capacity(
+    program_arguments: &[String],
+    capacity: usize,
+) -> Vec<String> {
+    let mut carried = carried_arguments(program_arguments);
+    while let Some(index) = carried
+        .iter()
+        .position(|arg| arg == MAX_ACTIVE_RUNS_ARGUMENT)
+    {
+        carried.remove(index);
+        if index < carried.len() {
+            carried.remove(index);
+        }
+    }
+    carried.push(MAX_ACTIVE_RUNS_ARGUMENT.to_owned());
+    carried.push(capacity.to_string());
+    carried
+}
+
 /// Refuses to re-render a job onto a different `$DARK_FACTORY_HOME` than
 /// it runs with today: `factoryctl` may be running with a scratch home
 /// (`docs/development/WORKFLOW.md`, "Developing the daemon without
@@ -267,14 +315,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// and environment; `PATH` merged with `provider_directories`), writes it
 /// at `plist`, and reloads it. The caller has already read and checked
 /// the existing job with [`read_existing`]/[`check_home`] — this is the
-/// mutating half. On a reload failure the file is already rewritten; the
-/// error names the recovery command.
+/// mutating half. A failed reload restores the prior plist before returning.
 pub fn apply(
     home: &Path,
     plist: &Path,
     existing: Option<&ExistingJob>,
     provider_directories: &[(&str, PathBuf)],
     extra_environment: &BTreeMap<String, String>,
+    capacity: Option<usize>,
 ) -> Result<(), String> {
     let mut environment = existing
         .map(|job| job.environment.clone())
@@ -289,16 +337,51 @@ pub fn apply(
         provider_directories,
     );
     environment.insert("PATH".to_owned(), path);
-    let carried = existing
-        .map(|job| carried_arguments(&job.program_arguments))
-        .unwrap_or_default();
+    let existing_arguments = existing.map_or(&[][..], |job| job.program_arguments.as_slice());
+    let capacity = capacity
+        .or(max_active_runs(existing_arguments)?.or(Some(DEFAULT_MAX_ACTIVE_RUNS)))
+        .ok_or("capacity is not configured")?;
+    let carried = carried_arguments_with_capacity(existing_arguments, capacity);
     let factoryd = install::current_link(home).join("factoryd");
-    install(
-        plist,
-        &render(home, &factoryd, &carried, &environment),
-        home,
-    )?;
-    reload(rustix::process::getuid().as_raw(), plist)
+    let content = render(home, &factoryd, &carried, &environment);
+    let old_content = if plist.exists() {
+        Some(fs::read_to_string(plist).map_err(|error| {
+            format!(
+                "could not read the existing launchd plist {}: {error}",
+                plist.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    install_and_reload(plist, home, &content, old_content, || {
+        reload(rustix::process::getuid().as_raw(), plist)
+    })
+}
+
+fn install_and_reload(
+    plist: &Path,
+    home: &Path,
+    content: &str,
+    old_content: Option<String>,
+    reload: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    install(plist, content, home)?;
+    match reload() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let rollback = match old_content {
+                Some(content) => install(plist, &content, home),
+                None => fs::remove_file(plist).map_err(|restore| restore.to_string()),
+            };
+            match rollback {
+                Ok(()) => Err(format!("{error}; launchd plist rolled back")),
+                Err(rollback) => Err(format!(
+                    "{error}; launchd plist rollback failed: {rollback}"
+                )),
+            }
+        }
+    }
 }
 
 /// Writes `content` at `plist` with mode `0600` (atomically: temp file,
@@ -469,6 +552,42 @@ mod tests {
         );
         assert!(carried_arguments(&[]).is_empty());
         assert!(carried_arguments(&["/f".to_owned(), "--runner".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn capacity_argument_is_bounded_and_replaced_once() {
+        let existing = [
+            "/old/factoryd",
+            "--max-active-runs",
+            "8",
+            "--database",
+            "/x/factory.db",
+        ]
+        .map(str::to_owned);
+        assert_eq!(max_active_runs(&existing).unwrap(), Some(8));
+        assert_eq!(
+            carried_arguments_with_capacity(&existing, 12),
+            ["--database", "/x/factory.db", "--max-active-runs", "12"].map(str::to_owned)
+        );
+        assert!(max_active_runs(&["/f", "--max-active-runs", "65"].map(str::to_owned)).is_err());
+        assert_eq!(
+            max_active_runs(&["/f", "--database", "/x"].map(str::to_owned)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_reload_restores_the_previous_plist() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let plist = root.path().join("Library/LaunchAgents/job.plist");
+        install(&plist, "old", &home).unwrap();
+        let error = install_and_reload(&plist, &home, "new", Some("old".to_owned()), || {
+            Err("reload failed".to_owned())
+        })
+        .unwrap_err();
+        assert!(error.contains("plist rolled back"));
+        assert_eq!(fs::read_to_string(plist).unwrap(), "old");
     }
 
     #[test]

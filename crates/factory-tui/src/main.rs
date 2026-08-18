@@ -303,7 +303,7 @@ fn run(
             match event::read()? {
                 Event::Key(key) => {
                     let intent = board.handle_key(key);
-                    needs_redraw |= apply_intent(intent, board, client, tx, panes);
+                    needs_redraw |= apply_intent(intent, board, client, socket, tx, panes);
                 }
                 Event::Paste(text) => {
                     forward_paste_if_applicable(board, panes, &text);
@@ -596,6 +596,7 @@ fn apply_intent(
     intent: Intent,
     board: &mut Board,
     client: &Client,
+    socket: &std::path::Path,
     tx: &mpsc::Sender<NetMsg>,
     panes: &PaneMap,
 ) -> bool {
@@ -604,6 +605,13 @@ fn apply_intent(
         Intent::Redraw | Intent::Quit => true,
         Intent::Send(request) => {
             net::spawn_request(client.clone(), tx.clone(), request);
+            true
+        }
+        Intent::SetCapacity(capacity) => {
+            board.note_info(format!(
+                "capacity -> {capacity}; only factoryd restarts, runner sessions preserved; provider use may change"
+            ));
+            net::spawn_capacity_update(socket.to_owned(), tx.clone(), capacity);
             true
         }
         Intent::ForwardKey(key) => {
@@ -691,6 +699,13 @@ fn apply_net_msg(
         NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
+        NetMsg::CapacityResult(result) => match result {
+            Ok(change) => board.note_info(format!(
+                "capacity {} -> {} (runner sessions preserved)",
+                change.previous, change.current
+            )),
+            Err(error) => board.note_error(error),
+        },
         NetMsg::UpdateCheck {
             check,
             active_version,
@@ -888,7 +903,7 @@ mod main_tests {
         assert!(matches!(first_key, Intent::ForwardKey(_)));
         let client = Client::new(&socket);
         let (tx, _rx) = mpsc::channel();
-        apply_intent(first_key, &mut board, &client, &tx, &panes);
+        apply_intent(first_key, &mut board, &client, &socket, &tx, &panes);
         server.join().unwrap();
     }
 }

@@ -23,10 +23,9 @@ use std::{
     time::Duration,
 };
 
-use factoryctl::update::{self, UpdateCheck};
+use factoryctl::update::UpdateCheck;
+use factoryctl::{install, launchd, probes, update};
 use serde_json::json;
-
-use crate::{install, launchd, probes};
 
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
@@ -105,6 +104,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         Some(&existing),
         &probes::provider_directories(),
         &std::collections::BTreeMap::new(),
+        None,
     ) {
         let outcome = match &previous_version {
             Some(previous) if install::activate(&home, previous).is_ok() => {
