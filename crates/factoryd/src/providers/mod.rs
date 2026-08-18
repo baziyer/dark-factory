@@ -25,6 +25,18 @@ use std::path::PathBuf;
 
 use factory_core::{AgentId, ProjectId, SessionId};
 
+/// Returns the capability declaration for a provider kind without requiring
+/// callers to know which concrete provider implements it. Profile updates use
+/// this same declaration as launch, so an unsupported permission mode fails
+/// before it can be persisted for a future session.
+pub fn capabilities_for(kind: factory_core::Provider) -> Capabilities {
+    match kind {
+        factory_core::Provider::ClaudeCode => claude::ClaudeProvider::default().capabilities(),
+        factory_core::Provider::Codex => codex::CodexProvider::new().capabilities(),
+        factory_core::Provider::Shell => shell::ShellProvider.capabilities(),
+    }
+}
+
 /// Everything a provider needs to describe how to launch one resident
 /// interactive session for one agent. Built by the daemon (session
 /// spawn/resume logic in `execution.rs`), consumed by exactly one
@@ -97,6 +109,18 @@ pub struct InteractiveLaunch {
     /// file, hooks-seeded config, ...), for logging and tests only; the
     /// session runner does not read this list.
     pub generated_files: Vec<PathBuf>,
+    /// Runtime values established by the provider's actual launch/config
+    /// source. Missing values remain `None`; callers must not fill these from
+    /// marketing or presumed provider defaults.
+    pub runtime: RuntimeMetadata,
+}
+
+#[derive(Default)]
+pub struct RuntimeMetadata {
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub permission_mode: Option<String>,
+    pub control_mode: Option<String>,
 }
 
 /// What a provider supports, so generic callers (the dispatcher, the TUI)

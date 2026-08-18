@@ -28,6 +28,31 @@ questions:
 That's the whole boundary. A provider never touches a PTY, never parses the
 provider's own terminal output, and never owns process lifecycle.
 
+## Runtime-resolved session settings
+
+The agent profile is the configured override and remains separate from the
+session's historical runtime metadata. At spawn, a provider may report the
+model, reasoning effort, permission mode, and control mode only when the
+launch argv or a configuration file it actually uses establishes them. Those
+values are stored on the session row and remain on ended sessions, so changing
+an agent profile cannot rewrite history. `None` is rendered as `unreported`;
+the daemon never fills a missing provider default from a plausible model name.
+
+Codex reports an explicit `--model`, root-level `model` and
+`model_reasoning_effort` from its isolated seeded `config.toml`, and the exact
+approval/bypass posture Dark Factory passes on argv. Claude reports explicit
+launch values and its `bypassPermissions` auto-mode value; an omitted Claude
+default remains unreported. The same session snapshot is returned by
+`factoryctl agent status`/`session list` and consumed by `factory-tui`.
+
+Profile permission modes are validated against this same provider capability
+declaration before the profile row is written. For example, Codex accepts only
+`on-request` and `never`; `bypass` is the factory-wide auto-mode launch posture,
+not a valid Codex profile value, and is rejected instead of being deferred to
+the next session launch. Upgrade migration 0022 also clears invalid
+provider-scoped values already present in older profile rows, restoring the
+provider default so they cannot reach a post-upgrade launch argv.
+
 Repository authority is provider-independent too. Provider processes do not
 inherit ambient Git/GitHub token variables or the SSH agent; the runner resets
 Git credential helpers, disables Git SSH and prompting, and hides the
