@@ -48,7 +48,7 @@ Commands:
   status                                      The whole fleet at one instant: sessions, queues, attention, live-session cap
   auto on|off|status                         Set or show the factory-wide provider bypass default
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
-  doctor [--json]                             Read-only checks of the install, one line each; exit 1 if any fail
+  doctor [--json]                             Diagnose the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
   version                                     Print this factoryctl's version
   usage                                       Probe Codex subscription usage on demand
@@ -115,12 +115,13 @@ Options:
   -h, --help                 Show this help";
 const DOCTOR_HELP: &str = "usage: factoryctl doctor [--json]
 
-Read-only checks, one line each: the home directory and its permissions,
+Diagnostic checks, one line each: the home directory and its permissions,
 the installed release under bin/, the daemon (reachable? same version as
 this factoryctl?), the launchd job (installed, loaded, PATH covers claude/
 codex?), claude/codex/git on PATH with versions, ~/.claude.json (worktree
 pre-trust), every project's root and stale worktree directories, and
-whether a newer release exists (cached, at most one fetch per hour).
+whether a newer release exists (may refresh the cached result, at most one
+fetch per hour). This command does not repair or reconfigure the installation.
 Exits 1 if any check fails; warnings don't change the exit code.
 
 Options:

@@ -269,10 +269,11 @@ them.
    custom-tap formula from the two archive checksums and the update-manifest
    checksum, then publishes it as `dark-factory.rb`. The versioned manifest
    is the formula's required top-level source; an architecture-selected
-   resource supplies the binaries. The formula is not published in the tap
-   yet; #102 remains open until a real published release passes
-   install/audit/test from the
-   `baziyer/homebrew-tap` repository. To update that tap after a release:
+   resource supplies the binaries. The public tap is
+   [`baziyer/homebrew-tap`](https://github.com/baziyer/homebrew-tap). Its
+   v0.2.0 formula passed tap, install, test, binary-version, and scratch
+   `init`/`doctor` checks. After each release, update the tap from the published
+   formula asset:
 
    ```sh
    tap_dir=$(brew --repository baziyer/tap)
@@ -288,10 +289,10 @@ them.
    The formula checksums the manifest and selected arm or Intel archive, then
    installs all four binaries. It deliberately defines no `service` block.
    Homebrew owns only the bootstrap copy: `factoryctl init` installs the
-   active versioned runtime and launchd job, and `factoryctl update --install` remains the
-   sole active-runtime updater so live-session preservation, atomic switch,
-   health verification, and rollback stay in one implementation. The
-   formula caveats state the same split.
+   active versioned runtime and launchd job, and `factoryctl update --install`
+   remains the sole active-runtime updater so live-session preservation,
+   atomic switch, health verification, and rollback stay in one
+   implementation. The formula caveats state the same split.
    Accordingly, `brew uninstall dark-factory` removes only the Homebrew
    bootstrap commands; it leaves the launchd job, active runtime, database,
    worktrees, logs, and installed versions under `~/.dark-factory`. Follow
@@ -318,16 +319,17 @@ before launchd is touched, a refusal to race a hand-started daemon on the
 same socket, then the launchd job rendered with a `PATH` that can find
 those CLIs (an existing job keeps its arguments and environment and gets
 its `PATH` repaired), loaded, and the daemon awaited *with this version*.
-`factoryctl doctor [--json]` runs the same probes read-only plus the daemon
+`factoryctl doctor [--json]` runs the same diagnostic probes plus the daemon
 (reachable? same version as the binaries?), the launchd job (installed,
 loaded, `PATH` — launchd's default when the job sets none — covers the
 providers?), `~/.claude.json` for worktree pre-trust, every project's root
-and stale worktree directories, and the cached update check (which may
-fetch, at most hourly); one line per check, exit 1 on any failure. `init`,
-`doctor`, and `update --install` share one set of probes
-(`crates/factoryctl/src/probes.rs`) and one launchd path
-(`launchd::apply`), so they cannot disagree about what a healthy install
-looks like.
+and stale worktree directories, and the cached update check (which may fetch
+and refresh `$DARK_FACTORY_HOME/update-check.json`, at most hourly). It does
+not repair or reconfigure the installation; it prints one line per check and
+exits 1 on any failure. `init`, `doctor`, and `update --install` share one set
+of probes (`crates/factoryctl/src/probes.rs`) and one launchd path
+(`launchd::apply`), so they cannot disagree about what a healthy install looks
+like.
 
 ## Task list for whoever picks this up
 
@@ -335,6 +337,5 @@ looks like.
 - [x] `factoryctl update` (check-only) and `factory-tui` status-line signal
 - [x] `factoryctl update --install` (download, verify, repoint, reload, restart)
 - [x] `factoryctl init` and `factoryctl doctor`
-- [ ] Publish and real-install-test the Homebrew tap (#102; renderer and dual
-      release substrate are in this repository)
+- [x] Publish and real-install-test the Homebrew tap
 - [ ] Reconsider an npm wrapper after demonstrated non-macOS demand
