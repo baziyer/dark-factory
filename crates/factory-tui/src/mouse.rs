@@ -163,30 +163,30 @@ pub fn route(
     }
 
     if let Some(session_id) = capture.session_id.clone() {
-        match event.kind {
-            MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
-                let terminal = hits
-                    .terminal
-                    .as_ref()
-                    .filter(|terminal| terminal.session_id == session_id);
-                let context = terminal_context.filter(|context| context.enabled());
-                let release = matches!(event.kind, MouseEventKind::Up(_));
-                if release {
-                    capture.session_id = None;
+        let terminal = hits
+            .terminal
+            .as_ref()
+            .filter(|terminal| terminal.session_id == session_id);
+        let context = terminal_context.filter(|context| context.enabled());
+        match (terminal, context) {
+            (Some(terminal), Some(context)) => match event.kind {
+                MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
+                    let release = matches!(event.kind, MouseEventKind::Up(_));
+                    if release {
+                        capture.clear();
+                    }
+                    let (column, row) = relative_clamped(event, terminal.area);
+                    let bytes = encode(event, column, row, context);
+                    return if bytes.is_empty() {
+                        Route::None
+                    } else {
+                        Route::Terminal { session_id, bytes }
+                    };
                 }
-                let (Some(terminal), Some(context)) = (terminal, context) else {
-                    return Route::None;
-                };
-                let (column, row) = relative_clamped(event, terminal.area);
-                let bytes = encode(event, column, row, context);
-                return if bytes.is_empty() {
-                    Route::None
-                } else {
-                    Route::Terminal { session_id, bytes }
-                };
-            }
-            MouseEventKind::Down(_) => capture.session_id = None,
-            _ => {}
+                MouseEventKind::Down(_) => capture.clear(),
+                _ => {}
+            },
+            _ => capture.clear(),
         }
     }
 
@@ -693,5 +693,76 @@ mod tests {
                 bytes: b"\x1b[<0;8;3m".to_vec(),
             }
         );
+    }
+
+    #[test]
+    fn capture_loss_requires_a_fresh_down_after_recovery_and_never_blocks_the_board() {
+        let session_id = SessionId::try_from("session-1").unwrap();
+        let replacement_id = SessionId::try_from("session-2").unwrap();
+        let mut hits = HitMap::default();
+        hits.add(Rect::new(0, 0, 1, 1), Target::View(View::Building));
+        hits.set_terminal(Rect::new(1, 1, 8, 3), session_id.clone());
+        let enabled = Some(context(
+            MouseProtocolMode::ButtonMotion,
+            MouseProtocolEncoding::Sgr,
+        ));
+        let down = event(MouseEventKind::Down(MouseButton::Left), 2, 2);
+        let drag = event(MouseEventKind::Drag(MouseButton::Left), 3, 2);
+        let up = event(MouseEventKind::Up(MouseButton::Left), 3, 2);
+
+        for (lost_hits, lost_context) in [
+            (HitMap::default(), enabled),
+            (
+                {
+                    let mut replaced = HitMap::default();
+                    replaced.set_terminal(Rect::new(1, 1, 8, 3), replacement_id.clone());
+                    replaced
+                },
+                enabled,
+            ),
+            (hits.clone(), None),
+            (
+                hits.clone(),
+                Some(context(MouseProtocolMode::None, MouseProtocolEncoding::Sgr)),
+            ),
+        ] {
+            let mut capture = Capture::default();
+            assert!(matches!(
+                route(down, &hits, enabled, &mut capture),
+                Route::Terminal { .. }
+            ));
+            assert_eq!(capture.session_id, Some(session_id.clone()));
+
+            assert_eq!(
+                route(drag, &lost_hits, lost_context, &mut capture),
+                Route::None
+            );
+            assert!(capture.session_id.is_none());
+
+            // Recovery alone cannot resurrect ownership for a later drag or release.
+            assert_eq!(route(drag, &hits, enabled, &mut capture), Route::None);
+            assert_eq!(route(up, &hits, enabled, &mut capture), Route::None);
+
+            // The stale capture cannot consume a normal board press.
+            assert_eq!(
+                route(
+                    event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+                    &hits,
+                    enabled,
+                    &mut capture,
+                ),
+                Route::Board(Target::View(View::Building))
+            );
+
+            // Terminal motion resumes only after a new terminal press acquires capture.
+            assert!(matches!(
+                route(down, &hits, enabled, &mut capture),
+                Route::Terminal { .. }
+            ));
+            assert!(matches!(
+                route(drag, &hits, enabled, &mut capture),
+                Route::Terminal { .. }
+            ));
+        }
     }
 }
