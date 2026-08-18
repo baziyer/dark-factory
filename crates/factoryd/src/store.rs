@@ -1729,19 +1729,20 @@ impl Store {
         })
     }
 
-    /// Whether this exact task has already been delivered into this exact
-    /// session. Used to distinguish an idempotent delivery commit from an
-    /// unrelated `TaskNotQueued`/`AgentUnavailable` failure.
-    pub fn has_run_episode(&self, session_id: &SessionId, task_id: &TaskId) -> Result<bool> {
+    /// Number of times this task has been delivered into this resident
+    /// session. This is the existing durable attempt ledger: retries add a
+    /// run row while retaining prior rows.
+    pub fn run_episode_count(&self, session_id: &SessionId, task_id: &TaskId) -> Result<usize> {
         self.connection
             .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM runs WHERE session_id = ?1 AND task_id = ?2
-                 )",
+                "SELECT COUNT(*) FROM runs WHERE session_id = ?1 AND task_id = ?2",
                 params![session_id.as_str(), task_id.as_str()],
                 |row| row.get(0),
             )
             .map_err(StoreError::from)
+            .and_then(|count: i64| {
+                usize::try_from(count).map_err(|_| StoreError::InvalidExecutionMetadata)
+            })
     }
 
     /// `factoryctl task done`: closes the open episode `succeeded`,

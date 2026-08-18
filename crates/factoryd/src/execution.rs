@@ -1822,6 +1822,7 @@ async fn wait_for_runner_exit(
 /// or a `Stop`/`SubagentStop` hook reply should deliver next for an agent.
 struct Delivery {
     task_id: Option<factory_core::TaskId>,
+    prior_run_count: Option<usize>,
     text: String,
 }
 
@@ -1830,10 +1831,12 @@ async fn compose_delivery(
     guidance_root: &Path,
     project_id: &ProjectId,
     agent_id: &AgentId,
+    session_id: &SessionId,
 ) -> Result<Option<Delivery>, DaemonStateError> {
     let guidance_root = guidance_root.to_path_buf();
     let project_id = project_id.clone();
     let agent_id = agent_id.clone();
+    let session_id = session_id.clone();
     state
         .with_store(move |store| {
             let task_id = store.next_deliverable(&project_id, &agent_id)?;
@@ -1845,6 +1848,10 @@ async fn compose_delivery(
                 .as_ref()
                 .map(|id| store.get_task(&project_id, id))
                 .transpose()?;
+            let prior_run_count = task_id
+                .as_ref()
+                .map(|id| store.run_episode_count(&session_id, id))
+                .transpose()?;
             let agent = store.get_agent_detail(&project_id, &agent_id)?;
             let text = compose_text(
                 &guidance_root,
@@ -1854,7 +1861,11 @@ async fn compose_delivery(
                 &messages,
                 agent.snapshot.role,
             );
-            Ok(Some(Delivery { task_id, text }))
+            Ok(Some(Delivery {
+                task_id,
+                prior_run_count,
+                text,
+            }))
         })
         .await
 }
@@ -1875,31 +1886,39 @@ async fn commit_delivery(
     let agent_id = agent_id.clone();
     let session_id = session_id.clone();
     state
-        .commit_and_publish(move |store| match delivery.task_id {
-            Some(task_id) => match store.open_run_episode(&session_id, &task_id, now_ms) {
-                Ok(opened) => {
-                    let run_id = opened.run.id.clone();
-                    Ok((Some(run_id), opened.events))
+        .commit_and_publish(
+            move |store| match (delivery.task_id, delivery.prior_run_count) {
+                (Some(task_id), Some(prior_run_count)) => {
+                    match store.open_run_episode(&session_id, &task_id, now_ms) {
+                        Ok(opened) => {
+                            let run_id = opened.run.id.clone();
+                            Ok((Some(run_id), opened.events))
+                        }
+                        // The synchronous `UserPromptSubmit` hook commit can
+                        // win this dispatcher's later ack-driven commit. A
+                        // sufficiently fast client can also finish that run
+                        // before this retry, yielding `TaskNotQueued` instead
+                        // of `AgentUnavailable`. The run count captured while
+                        // composing is the durable attempt generation: only a
+                        // new run for this task in this session proves this
+                        // candidate was already committed. Historical retry
+                        // episodes do not satisfy the strict increase.
+                        Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
+                            if store.run_episode_count(&session_id, &task_id)?
+                                > prior_run_count =>
+                        {
+                            Ok((None, Vec::new()))
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
-                // The synchronous `UserPromptSubmit` hook commit can win
-                // this dispatcher's later ack-driven commit. A sufficiently
-                // fast client can also finish that run before this retry,
-                // yielding `TaskNotQueued` instead of `AgentUnavailable`.
-                // Both are benign only when the exact task was already
-                // delivered to this exact session; cancellation,
-                // reassignment, and another open task remain real errors.
-                Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
-                    if store.has_run_episode(&session_id, &task_id)? =>
-                {
+                (None, None) => {
+                    store.deliver_agent_messages(&project_id, &agent_id, &session_id, now_ms)?;
                     Ok((None, Vec::new()))
                 }
-                Err(error) => Err(error),
+                _ => Err(StoreError::InvalidExecutionMetadata),
             },
-            None => {
-                store.deliver_agent_messages(&project_id, &agent_id, &session_id, now_ms)?;
-                Ok((None, Vec::new()))
-            }
-        })
+        )
         .await
 }
 
@@ -1957,8 +1976,14 @@ pub(crate) async fn commit_pending_delivery_on_prompt(
     if !state.delivery_in_flight(&session.agent_id) {
         return Ok(());
     }
-    let Some(delivery) =
-        compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
+    let Some(delivery) = compose_delivery(
+        state,
+        guidance_root,
+        &session.project_id,
+        &session.agent_id,
+        &session.id,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -2017,8 +2042,14 @@ async fn deliver_pending(
     if !backoff.try_begin_preparation(agent_id) {
         return Ok(());
     }
-    let delivery_result =
-        compose_delivery(state, &config.guidance_root, project_id, agent_id).await;
+    let delivery_result = compose_delivery(
+        state,
+        &config.guidance_root,
+        project_id,
+        agent_id,
+        &session.id,
+    )
+    .await;
     backoff.end_preparation(agent_id);
     let Some(delivery) = delivery_result? else {
         return Ok(());
@@ -2177,8 +2208,14 @@ pub async fn stop_hook_reply(
     let Some(_delivery_slot) = state.try_delivery_slot(&session.agent_id) else {
         return Ok(serde_json::json!({}));
     };
-    let Some(delivery) =
-        compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
+    let Some(delivery) = compose_delivery(
+        state,
+        guidance_root,
+        &session.project_id,
+        &session.agent_id,
+        &session.id,
+    )
+    .await?
     else {
         return Ok(serde_json::json!({}));
     };
@@ -3634,17 +3671,18 @@ mod tests {
         assert!(!session.state.is_live());
     }
 
-    /// Issue #85: the synchronous `UserPromptSubmit` path can open a run,
-    /// then a fast client can finish it before the dispatcher's ack path
-    /// retries the commit for its already-composed candidate. That exact
-    /// stale candidate is idempotent; an unrelated non-queued task is not.
+    /// Issue #85 and PR #90 review: only a run created after candidate
+    /// composition proves the synchronous hook won this attempt. An older
+    /// episode for the same task/session must not hide either error form
+    /// after that task is retried.
     #[tokio::test]
     async fn delivery_commit_ignores_only_a_task_already_run_in_the_same_session() {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
         let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let race_task_id = TaskId::try_from("race-task").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
-        let cancelled_task_id = TaskId::try_from("task-2").unwrap();
+        let occupying_task_id = TaskId::try_from("task-2").unwrap();
         let mut store = Store::open_in_memory().unwrap();
         store
             .create_project(
@@ -3699,7 +3737,7 @@ mod tests {
                 1_001,
             )
             .unwrap();
-        for id in [&task_id, &cancelled_task_id] {
+        for id in [&race_task_id, &task_id, &occupying_task_id] {
             store
                 .create_task(
                     crate::store::NewTask {
@@ -3718,16 +3756,14 @@ mod tests {
                 .unwrap();
         }
 
-        // The hook handler wins the first commit and the client finishes
-        // the run before the dispatcher's commit resumes.
+        // Original race: the candidate observes no prior episode, then the
+        // hook opens one and the fast client finishes it before this commit.
+        let prior_run_count = store.run_episode_count(&session_id, &race_task_id).unwrap();
         store
-            .open_run_episode(&session_id, &task_id, 1_004)
+            .open_run_episode(&session_id, &race_task_id, 1_004)
             .unwrap();
         store
-            .complete_task(&project_id, &task_id, "done".to_owned(), 1_005)
-            .unwrap();
-        store
-            .cancel_task(&project_id, &cancelled_task_id, 1_006)
+            .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_005)
             .unwrap();
         let event_count = store.events_after(0, 100).unwrap().len();
         let state = DaemonState::new(store);
@@ -3738,10 +3774,11 @@ mod tests {
             &agent_id,
             &session_id,
             Delivery {
-                task_id: Some(task_id.clone()),
+                task_id: Some(race_task_id),
+                prior_run_count: Some(prior_run_count),
                 text: "already delivered".to_owned(),
             },
-            1_007,
+            1_006,
         )
         .await
         .unwrap();
@@ -3752,22 +3789,128 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), event_count, "the retry commits no events");
 
-        let error = commit_delivery(
+        // Historical episode -> retry -> unrelated cancellation. The run
+        // count did not advance after this candidate was composed.
+        state
+            .commit_and_publish({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    let opened = store.open_run_episode(&session_id, &task_id, 1_007)?;
+                    Ok((opened.run, opened.events))
+                }
+            })
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    let (task, event) = store.cancel_task(&project_id, &task_id, 1_008)?;
+                    Ok((task, vec![event]))
+                }
+            })
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    let (task, event) = store.retry_task(&project_id, &task_id, 1_009)?;
+                    Ok((task, vec![event]))
+                }
+            })
+            .await
+            .unwrap();
+        let retry_run_count = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.run_episode_count(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    let (task, event) = store.cancel_task(&project_id, &task_id, 1_010)?;
+                    Ok((task, vec![event]))
+                }
+            })
+            .await
+            .unwrap();
+        let task_not_queued = commit_delivery(
             &state,
             &project_id,
             &agent_id,
             &session_id,
             Delivery {
-                task_id: Some(cancelled_task_id),
-                text: "never delivered".to_owned(),
+                task_id: Some(task_id.clone()),
+                prior_run_count: Some(retry_run_count),
+                text: "cancelled retry".to_owned(),
             },
-            1_008,
+            1_011,
         )
         .await
         .unwrap_err();
         assert!(matches!(
-            error,
+            task_not_queued,
             DaemonStateError::Store(StoreError::TaskNotQueued)
+        ));
+
+        // Historical episode -> retry -> a different current run. The old
+        // task/session match must not hide the resulting AgentUnavailable.
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    let (task, event) = store.retry_task(&project_id, &task_id, 1_012)?;
+                    Ok((task, vec![event]))
+                }
+            })
+            .await
+            .unwrap();
+        let retry_run_count = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.run_episode_count(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let session_id = session_id.clone();
+                let occupying_task_id = occupying_task_id.clone();
+                move |store| {
+                    let opened = store.open_run_episode(&session_id, &occupying_task_id, 1_013)?;
+                    Ok((opened.run, opened.events))
+                }
+            })
+            .await
+            .unwrap();
+        let unavailable = commit_delivery(
+            &state,
+            &project_id,
+            &agent_id,
+            &session_id,
+            Delivery {
+                task_id: Some(task_id),
+                prior_run_count: Some(retry_run_count),
+                text: "blocked by another run".to_owned(),
+            },
+            1_014,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            unavailable,
+            DaemonStateError::Store(StoreError::AgentUnavailable)
         ));
     }
 
