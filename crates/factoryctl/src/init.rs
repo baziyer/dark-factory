@@ -27,6 +27,8 @@ pub struct Options {
     pub no_launchd: bool,
 }
 
+const HEALTH_WAIT: Duration = Duration::from_secs(30);
+
 pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let home = factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
     let user_home = env::var_os("HOME")
@@ -128,14 +130,9 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
     }
-    let previous_version = install::active_version(&home)?;
-    let previous_plist = existing
-        .as_ref()
-        .map(|_| {
-            fs::read_to_string(&plist)
-                .map_err(|error| format!("could not save the existing launchd plist: {error}"))
-        })
-        .transpose()?;
+    let snapshot = _runtime_lock.snapshot(&home, &plist)?;
+    let previous_version = snapshot.active_version;
+    let previous_plist = snapshot.plist;
     install::activate(&home, version)?;
     println!("install: bin/current -> {version}");
 
@@ -188,14 +185,47 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             socket.display()
         ));
     }
-    launchd::apply(
+    let apply = launchd::apply_with_rollback(
         &home,
         &plist,
         existing.as_ref(),
         &probes::provider_directories(),
         &carried,
         None,
-    )?;
+        || match previous_version.as_deref() {
+            Some(previous) => install::activate(&home, previous),
+            None => Ok(()),
+        },
+    );
+    if let Err(error) = apply {
+        let recovery = error
+            .contains("launchd plist and job rolled back")
+            .then(|| previous_version.as_deref())
+            .flatten()
+            .map(|previous| {
+                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                    .map(|_| ())
+            });
+        let runtime_outcome = match previous_version.as_deref() {
+            Some(previous) if error.contains("runtime rollback failed") => {
+                format!("bin/current could NOT be rolled back to {previous}")
+            }
+            Some(previous) => format!("bin/current rolled back to {previous}"),
+            None => "there was no previous managed runtime".to_owned(),
+        };
+        return Err(match recovery {
+            Some(Ok(())) => format!("{error}; {runtime_outcome}; restored runtime is healthy"),
+            Some(Err(recovery)) => {
+                format!("{error}; {runtime_outcome}; restored runtime health failed: {recovery}")
+            }
+            None if error.contains("launchd plist and job rolled back") => {
+                format!(
+                    "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
+                )
+            }
+            None => format!("{error}; {runtime_outcome}"),
+        });
+    }
     println!(
         "launchd: {} loaded{}",
         plist.display(),
@@ -210,7 +240,15 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         Err(error) => {
             let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
                 (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
-                    .and_then(|()| launchd::restore(&plist, &home, previous_plist)),
+                    .and_then(|()| {
+                        launchd::restore_with_rollback(&plist, &home, previous_plist, || {
+                            install::activate(&home, version)
+                        })
+                    })
+                    .and_then(|()| {
+                        probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                            .map(|_| ())
+                    }),
                 _ => Err("no previous managed runtime is available".to_owned()),
             };
             println!(

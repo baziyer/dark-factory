@@ -60,8 +60,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         launchd::check_home(existing, &home, &user_home)?;
     }
     let mut log = |line: &str| eprintln!("update: {line}");
-    let previous_version = active_version;
-    if previous_version.as_deref() == Some(manifest.version.as_str())
+    if active_version.as_deref() == Some(manifest.version.as_str())
         && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version)).is_ok()
     {
         log(&format!(
@@ -82,17 +81,13 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     let installed = install::install_release(&home, &manifest, &mut log)?;
     let _runtime_lock = runtime::MutationLock::acquire(&home)?;
+    let snapshot = _runtime_lock.snapshot(&home, &plist)?;
+    let previous_version = snapshot.active_version;
+    let previous_plist = snapshot.plist;
     let existing = launchd::read_existing(&plist)?;
     if let Some(existing) = &existing {
         launchd::check_home(existing, &home, &user_home)?;
     }
-    let previous_plist = existing
-        .as_ref()
-        .map(|_| {
-            std::fs::read_to_string(&plist)
-                .map_err(|error| format!("could not save the existing launchd plist: {error}"))
-        })
-        .transpose()?;
     install::activate(&home, &manifest.version)?;
     log(&format!("bin/current -> {}", manifest.version));
 
@@ -110,25 +105,52 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         return Ok(0);
     };
 
-    if let Err(error) = launchd::apply(
+    if let Err(error) = launchd::apply_with_rollback(
         &home,
         &plist,
         Some(&existing),
         &probes::provider_directories(),
         &std::collections::BTreeMap::new(),
         None,
-    ) {
-        let outcome = match &previous_version {
-            Some(previous) if install::activate(&home, previous).is_ok() => {
-                format!("bin/current rolled back to {previous}")
+        {
+            let rollback_home = home.clone();
+            let previous_version = previous_version.clone();
+            move || match previous_version.as_deref() {
+                Some(previous) => install::activate(&rollback_home, previous),
+                None => Ok(()),
             }
-            Some(previous) => format!("bin/current could NOT be rolled back to {previous}"),
+        },
+    ) {
+        let recovery = error
+            .contains("launchd plist and job rolled back")
+            .then(|| previous_version.as_deref())
+            .flatten()
+            .map(|previous| {
+                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                    .map(|_| ())
+            });
+        let runtime_outcome = match previous_version.as_deref() {
+            Some(previous) if error.contains("runtime rollback failed") => {
+                format!("bin/current could NOT be rolled back to {previous}")
+            }
+            Some(previous) => format!("bin/current rolled back to {previous}"),
             None => format!(
                 "bin/current stays at {} (there was no previous version)",
                 manifest.version
             ),
         };
-        return Err(format!("{error}; {outcome}"));
+        return Err(match recovery {
+            Some(Ok(())) => format!("{error}; {runtime_outcome}; restored runtime is healthy"),
+            Some(Err(recovery)) => {
+                format!("{error}; {runtime_outcome}; restored runtime health failed: {recovery}")
+            }
+            None if error.contains("launchd plist and job rolled back") => {
+                format!(
+                    "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
+                )
+            }
+            None => format!("{error}; {runtime_outcome}"),
+        });
     }
     log(&format!("rewrote and reloaded {}", plist.display()));
     match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
@@ -148,9 +170,16 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         Err(error) => {
             let rollback = match (previous_version.as_deref(), previous_plist.as_deref()) {
                 (Some(previous), Some(previous_plist)) => install::activate(&home, previous)
-                    .and_then(|()| launchd::restore(&plist, &home, previous_plist))
                     .and_then(|()| {
-                        probes::wait_for_daemon(socket, HEALTH_WAIT, Some(previous)).map(|_| ())
+                        let rollback_home = home.clone();
+                        let manifest_version = manifest.version.clone();
+                        launchd::restore_with_rollback(&plist, &home, previous_plist, move || {
+                            install::activate(&rollback_home, &manifest_version)
+                        })
+                    })
+                    .and_then(|()| {
+                        probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                            .map(|_| ())
                     }),
                 _ => Err("no previous managed runtime is available".to_owned()),
             };
