@@ -27,8 +27,8 @@ events add counts; idle time only advances empty buckets, so a silent agent
 ages out without decorative animation.
 
 AGENT shows the selected agent. It includes the live terminal, assigned and
-active work, durable messages, and settings. Its queue shows the running item
-first, then queued tasks in stable creation order with priority. The
+active work, durable messages, and settings. Its queue shows active assigned
+tasks in stable `(created_at_ms, id)` order. The
 orchestrator also shows the project backlog and worker queues; messages remain
 the inbox and review attention remains separate.
 
@@ -82,9 +82,8 @@ runner sessions alive. See the [main README](../../README.md) for setup and
 first use.
 
 Mouse clicks select the same agents, tasks, attention rows, and queue rows as
-keyboard navigation. Shift-clicking a queue row opens its task actions;
-shift-clicking the terminal focuses typing when it is attached. Board clicks
-never become terminal input.
+keyboard navigation. Press `Enter` or `i` to focus typing in an attached
+terminal. Board clicks never become terminal input.
 
 All actions use daemon requests. There is no TUI-only control path. See the
 [main README](../../README.md) for setup and first use.

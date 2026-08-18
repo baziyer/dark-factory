@@ -92,7 +92,7 @@ agent has a persistent session and its own worktree.
 The project backlog is unassigned queued work. A worker queue is the ordered
 work assigned to that worker; `factoryctl task add --agent ID` creates directly
 in it atomically, `factoryctl task list --agent ID` shows that worker's work in
-execution order, and `factoryctl task assign --task ID` moves queued work
+execution order, and `factoryctl task assign --project ID --task ID` moves queued work
 between workers or back to the backlog. The inbox is for messages, and review
 items remain separate from both.
 
