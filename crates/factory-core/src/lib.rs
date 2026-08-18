@@ -14,7 +14,9 @@ pub mod paths;
 pub mod runner;
 pub mod status;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Local API wire version. Bump for new request/response variants so an older
+/// daemon rejects a newer client explicitly instead of misreading its JSON.
+pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

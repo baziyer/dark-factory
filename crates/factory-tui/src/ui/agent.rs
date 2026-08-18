@@ -288,8 +288,12 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
     for agent in agents {
         let queue = board.active_tasks_for_agent(&agent.id);
         if !queue.is_empty() {
+            let prefix = agent
+                .parent_agent_id
+                .as_ref()
+                .map_or_else(String::new, |parent| format!("{parent} ═> "));
             lines.push(format!(
-                "  {}: {}",
+                "  {prefix}{}: {}",
                 agent.id,
                 queue
                     .iter()

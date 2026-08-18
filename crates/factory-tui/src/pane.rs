@@ -307,7 +307,9 @@ impl Pane {
         let y = event.row.saturating_sub(origin_y).saturating_add(1);
         let (mut code, suffix) = match event.kind {
             MouseEventKind::Down(button) => (mouse_button_code(button), 'M'),
-            MouseEventKind::Up(button) => (mouse_button_code(button), 'm'),
+            // Xterm uses code 3 for release regardless of which button was
+            // released; SGR keeps the same code and marks it with `m`.
+            MouseEventKind::Up(_) => (3, 'm'),
             MouseEventKind::Drag(button) => {
                 if !matches!(
                     mode,
@@ -345,19 +347,30 @@ impl Pane {
         {
             code += 16;
         }
-        let bytes = if encoding == MouseProtocolEncoding::Sgr {
-            format!("\x1b[<{code};{x};{y}{suffix}").into_bytes()
-        } else if x < 224 && y < 224 {
-            vec![
-                0x1b,
-                b'[',
-                b'M',
-                32 + code,
-                u8::try_from(32 + x).expect("mouse x is bounded above"),
-                u8::try_from(32 + y).expect("mouse y is bounded above"),
-            ]
-        } else {
-            return false;
+        let bytes = match encoding {
+            MouseProtocolEncoding::Sgr => format!("\x1b[<{code};{x};{y}{suffix}").into_bytes(),
+            MouseProtocolEncoding::Default => {
+                if x >= 224 || y >= 224 {
+                    return false;
+                }
+                vec![
+                    0x1b,
+                    b'[',
+                    b'M',
+                    32 + code,
+                    u8::try_from(32 + x).expect("mouse x is bounded above"),
+                    u8::try_from(32 + y).expect("mouse y is bounded above"),
+                ]
+            }
+            MouseProtocolEncoding::Utf8 => {
+                let mut bytes = vec![0x1b, b'[', b'M'];
+                for value in [u32::from(32 + code), u32::from(32 + x), u32::from(32 + y)] {
+                    let character = char::from_u32(value).expect("mouse coordinate is Unicode");
+                    let mut encoded = [0; 4];
+                    bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+                }
+                bytes
+            }
         };
         self.write_input(&bytes);
         true

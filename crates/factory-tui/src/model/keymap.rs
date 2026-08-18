@@ -350,29 +350,37 @@ impl Board {
             return Intent::None;
         }
         if self.view == View::Agent && self.pane_mode == PaneMode::Typing {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(content);
-            if columns[0].contains(Position {
+            let terminal_area = if self.terminal_maximized {
+                content
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                    .split(content)[0]
+            };
+            if terminal_area.contains(Position {
                 x: mouse.column,
                 y: mouse.row,
             }) && self.pane_ready
             {
                 return Intent::ForwardMouse {
                     event: mouse,
-                    origin_x: columns[0].x + 1,
-                    origin_y: columns[0].y + 1,
+                    origin_x: terminal_area.x + 1,
+                    origin_y: terminal_area.y + 1,
                 };
             }
             return Intent::None;
         }
         if self.view == View::Agent {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                .split(content);
-            if columns[0].contains(Position {
+            let terminal_area = if self.terminal_maximized {
+                content
+            } else {
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+                    .split(content)[0]
+            };
+            if terminal_area.contains(Position {
                 x: mouse.column,
                 y: mouse.row,
             }) {
@@ -458,6 +466,18 @@ impl Board {
     }
 
     fn handle_agent_click(&mut self, mouse: MouseEvent, area: Rect) -> Intent {
+        if self.terminal_maximized {
+            if area.contains(Position {
+                x: mouse.column,
+                y: mouse.row,
+            }) {
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) && self.pane_ready {
+                    self.pane_mode = PaneMode::Typing;
+                }
+                return Intent::Redraw;
+            }
+            return Intent::None;
+        }
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -1552,6 +1572,29 @@ mod tests {
             Some("later")
         );
         assert!(matches!(board.mode, Mode::TaskMenu(_)));
+    }
+
+    #[test]
+    fn maximized_terminal_forwards_mouse_from_the_full_content_area() {
+        let mut board = board();
+        board.view = View::Agent;
+        board.pane_mode = PaneMode::Typing;
+        board.pane_ready = true;
+        board.terminal_maximized = true;
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 110,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            board.handle_mouse(mouse, Rect::new(0, 0, 120, 24)),
+            Intent::ForwardMouse {
+                origin_x: 1,
+                origin_y: 1,
+                ..
+            }
+        ));
     }
 
     #[test]
