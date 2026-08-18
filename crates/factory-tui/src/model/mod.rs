@@ -683,10 +683,7 @@ impl Board {
             if let FactoryEvent::AgentDeleted { agent_id, .. } = &event.event {
                 self.activity.remove(agent_id);
             } else if let Some(agent_id) = event_agent(&event.event) {
-                self.activity
-                    .entry(agent_id.clone())
-                    .or_default()
-                    .record(event.occurred_at_ms);
+                self.record_activity(agent_id, event.occurred_at_ms);
             }
             let worth_announcing = match &event.event {
                 FactoryEvent::SessionChanged { session } => {
@@ -704,10 +701,7 @@ impl Board {
             return;
         }
         if let Some(agent_id) = event_agent(&event.event) {
-            self.activity
-                .entry(agent_id.clone())
-                .or_default()
-                .record(event.occurred_at_ms);
+            self.record_activity(agent_id, event.occurred_at_ms);
         }
 
         let worth_announcing = self.should_announce(&event);
@@ -907,6 +901,16 @@ impl Board {
         }
         self.seen_event_sequences.push(sequence);
         true
+    }
+
+    /// Records durable activity and immediately anchors the series to the board clock. This
+    /// keeps replayed history in its true recent bucket, or drops it if it is already outside the
+    /// horizon, without waiting for the next repaint tick.
+    fn record_activity(&mut self, agent_id: &AgentId, occurred_at_ms: i64) {
+        let now_ms = self.now_ms;
+        let series = self.activity.entry(agent_id.clone()).or_default();
+        series.record(occurred_at_ms);
+        series.roll_to(now_ms);
     }
 }
 

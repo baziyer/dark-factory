@@ -393,6 +393,31 @@ fn successive_durable_activity_events_are_visible_in_short_horizon_buckets() {
 }
 
 #[test]
+fn replayed_activity_is_aged_against_the_current_board_clock() {
+    let mut b = Board::new(false, 10_000, crate::theme::FORTRESS);
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![1, 0, 0],
+        "replay should preserve recent history instead of making old activity current"
+    );
+}
+
+#[test]
 fn apply_replay_drops_activity_for_an_agent_deleted_during_the_replay_window() {
     let mut b = board();
     let alice = AgentId::try_from("alice").unwrap();

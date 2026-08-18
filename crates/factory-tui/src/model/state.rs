@@ -282,6 +282,14 @@ mod tests {
     }
 
     #[test]
+    fn activity_series_folds_clock_skew_without_rolling_back() {
+        let mut series = ActivitySeries::default();
+        series.record(10_000);
+        series.record(5_000);
+        assert_eq!(series.counts(), vec![2]);
+    }
+
+    #[test]
     fn activity_series_collapses_long_idle_gaps() {
         let mut series = ActivitySeries::default();
         series.record(0);
