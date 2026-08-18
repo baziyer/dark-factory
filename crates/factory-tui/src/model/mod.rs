@@ -91,6 +91,14 @@ pub struct AttentionItem {
     pub since_ms: i64,
 }
 
+/// Durable ownership for an activity series. `None` is retained only for replay events received
+/// before a fleet snapshot supplies the agent generation; snapshots discard such unproven history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ActivityIdentity {
+    project_id: ProjectId,
+    created_at_ms: Option<i64>,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Board
 // ---------------------------------------------------------------------------------------------
@@ -125,7 +133,7 @@ pub struct Board {
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
-    activity_projects: BTreeMap<AgentId, ProjectId>,
+    activity_identities: BTreeMap<AgentId, ActivityIdentity>,
     seen_event_sequences: state::RingBuffer<i64>,
 
     pub view: View,
@@ -169,7 +177,7 @@ impl Board {
             messages: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
-            activity_projects: BTreeMap::new(),
+            activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             view: View::Building,
             selected_agent: None,
@@ -742,7 +750,7 @@ impl Board {
                 );
             }
             FactoryEvent::AgentChanged { agent } => {
-                self.agents.insert(agent.id.clone(), agent);
+                self.replace_agent(agent);
             }
             FactoryEvent::RunChanged { run } => {
                 self.runs.insert(run.id.clone(), run);
@@ -820,13 +828,12 @@ impl Board {
             }
             LocalResponse::AgentCreated { agent } => {
                 let id = agent.id.clone();
-                self.agents.insert(agent.id.clone(), agent);
+                self.replace_agent(agent);
                 format!("created agent {id}")
             }
             LocalResponse::Agent { agent } | LocalResponse::AgentProfileUpdated { agent } => {
                 let id = agent.snapshot.id.clone();
-                self.agents
-                    .insert(agent.snapshot.id.clone(), agent.snapshot.clone());
+                self.replace_agent(agent.snapshot.clone());
                 self.agent_details.insert(id.clone(), agent);
                 format!("agent {id} updated")
             }
@@ -906,8 +913,8 @@ impl Board {
             FactoryEvent::AgentDeleted { agent_id, .. } => self.remove_activity(agent_id),
             FactoryEvent::ProjectDeleted { project_id } => self.remove_project_activity(project_id),
             _ => {
-                if let Some((agent_id, project_id)) = self.event_agent_project(event) {
-                    self.record_activity(&agent_id, &project_id, occurred_at_ms);
+                if let Some((agent_id, identity)) = self.event_agent_identity(event) {
+                    self.record_activity(&agent_id, identity, occurred_at_ms);
                 }
             }
         }
@@ -917,16 +924,17 @@ impl Board {
     /// keeps replayed history in its true recent bucket, or drops it if it is already outside the
     /// horizon, without waiting for the next repaint tick. Future timestamps are clamped so a
     /// skewed provider cannot pin a live bucket ahead of the board clock.
-    fn record_activity(&mut self, agent_id: &AgentId, project_id: &ProjectId, occurred_at_ms: i64) {
-        if self
-            .activity_projects
-            .get(agent_id)
-            .is_some_and(|existing| existing != project_id)
-        {
+    fn record_activity(
+        &mut self,
+        agent_id: &AgentId,
+        identity: ActivityIdentity,
+        occurred_at_ms: i64,
+    ) {
+        if self.activity_identities.get(agent_id) != Some(&identity) {
             self.remove_activity(agent_id);
         }
-        self.activity_projects
-            .insert(agent_id.clone(), project_id.clone());
+        self.activity_identities
+            .insert(agent_id.clone(), identity.clone());
         let now_ms = self.now_ms;
         let occurred_at_ms = occurred_at_ms.min(now_ms);
         let series = self.activity.entry(agent_id.clone()).or_default();
@@ -934,21 +942,29 @@ impl Board {
         series.roll_to(now_ms);
     }
 
-    fn event_agent_project(&self, event: &FactoryEvent) -> Option<(AgentId, ProjectId)> {
+    fn event_agent_identity(&self, event: &FactoryEvent) -> Option<(AgentId, ActivityIdentity)> {
         match event {
-            FactoryEvent::TaskChanged { task } => task
-                .assigned_agent_id
-                .as_ref()
-                .map(|agent_id| (agent_id.clone(), task.project_id.clone())),
-            FactoryEvent::RunChanged { run } => {
-                Some((run.agent_id.clone(), run.project_id.clone()))
-            }
-            FactoryEvent::AgentChanged { agent } => {
-                Some((agent.id.clone(), agent.project_id.clone()))
-            }
-            FactoryEvent::SessionChanged { session } => {
-                Some((session.agent_id.clone(), session.project_id.clone()))
-            }
+            FactoryEvent::TaskChanged { task } => task.assigned_agent_id.as_ref().map(|agent_id| {
+                (
+                    agent_id.clone(),
+                    self.activity_identity(agent_id, &task.project_id),
+                )
+            }),
+            FactoryEvent::RunChanged { run } => Some((
+                run.agent_id.clone(),
+                self.activity_identity(&run.agent_id, &run.project_id),
+            )),
+            FactoryEvent::AgentChanged { agent } => Some((
+                agent.id.clone(),
+                ActivityIdentity {
+                    project_id: agent.project_id.clone(),
+                    created_at_ms: Some(agent.created_at_ms),
+                },
+            )),
+            FactoryEvent::SessionChanged { session } => Some((
+                session.agent_id.clone(),
+                self.activity_identity(&session.agent_id, &session.project_id),
+            )),
             FactoryEvent::PolicyDecision {
                 project_id,
                 agent_id,
@@ -963,7 +979,10 @@ impl Board {
                 project_id,
                 agent_id,
                 ..
-            } => Some((agent_id.clone(), project_id.clone())),
+            } => Some((
+                agent_id.clone(),
+                self.activity_identity(agent_id, project_id),
+            )),
             FactoryEvent::AgentDeleted { .. }
             | FactoryEvent::RepositoryAuthorityChanged { .. }
             | FactoryEvent::AutoModeChanged { .. }
@@ -975,14 +994,25 @@ impl Board {
 
     fn remove_activity(&mut self, agent_id: &AgentId) {
         self.activity.remove(agent_id);
-        self.activity_projects.remove(agent_id);
+        self.activity_identities.remove(agent_id);
+    }
+
+    fn replace_agent(&mut self, agent: AgentSnapshot) {
+        let generation_changed = self.agents.get(&agent.id).is_some_and(|current| {
+            current.project_id != agent.project_id || current.created_at_ms != agent.created_at_ms
+        });
+        if generation_changed {
+            let id = agent.id.clone();
+            self.remove_activity(&id);
+        }
+        self.agents.insert(agent.id.clone(), agent);
     }
 
     fn remove_project_activity(&mut self, project_id: &ProjectId) {
         let agent_ids: Vec<AgentId> = self
-            .activity_projects
+            .activity_identities
             .iter()
-            .filter(|(_, activity_project)| *activity_project == project_id)
+            .filter(|(_, identity)| identity.project_id == *project_id)
             .map(|(agent_id, _)| agent_id.clone())
             .collect();
         for agent_id in agent_ids {
@@ -993,16 +1023,32 @@ impl Board {
     fn prune_activity_to_current_agents(&mut self) {
         self.activity.retain(|agent_id, _| {
             self.agents.get(agent_id).is_some_and(|agent| {
-                self.activity_projects.get(agent_id) == Some(&agent.project_id)
+                self.activity_identities
+                    .get(agent_id)
+                    .is_some_and(|identity| {
+                        identity.project_id == agent.project_id
+                            && identity.created_at_ms == Some(agent.created_at_ms)
+                    })
             })
         });
-        self.activity_projects.retain(|agent_id, project_id| {
+        self.activity_identities.retain(|agent_id, identity| {
             self.activity.contains_key(agent_id)
-                && self
-                    .agents
-                    .get(agent_id)
-                    .is_some_and(|agent| &agent.project_id == project_id)
+                && self.agents.get(agent_id).is_some_and(|agent| {
+                    identity.project_id == agent.project_id
+                        && identity.created_at_ms == Some(agent.created_at_ms)
+                })
         });
+    }
+
+    fn activity_identity(&self, agent_id: &AgentId, project_id: &ProjectId) -> ActivityIdentity {
+        ActivityIdentity {
+            project_id: project_id.clone(),
+            created_at_ms: self
+                .agents
+                .get(agent_id)
+                .filter(|agent| agent.project_id == *project_id)
+                .map(|agent| agent.created_at_ms),
+        }
     }
 }
 

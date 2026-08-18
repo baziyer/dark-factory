@@ -124,6 +124,53 @@ fn fleet_snapshot_prunes_removed_agents_and_resets_reused_ids() {
 }
 
 #[test]
+fn fleet_snapshot_resets_same_project_agent_generation() {
+    let alice = AgentId::try_from("alice").unwrap();
+    let mut old_alice = agent("alice", "a", AgentRole::Worker, None);
+    old_alice.created_at_ms = 100;
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![old_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-old", "alice", "a", SessionState::Working),
+        },
+    });
+
+    let mut recreated_alice = agent("alice", "a", AgentRole::Worker, None);
+    recreated_alice.created_at_ms = 200;
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![recreated_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(
+        !b.activity.contains_key(&alice),
+        "a recreated agent must not inherit its predecessor's same-project history"
+    );
+
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-new", "alice", "a", SessionState::Working),
+        },
+    });
+    assert_eq!(b.activity[&alice].counts(), vec![1]);
+}
+
+#[test]
 fn project_deleted_removes_replayed_project_activity() {
     let mut b = board();
     b.apply_fleet_snapshot(
