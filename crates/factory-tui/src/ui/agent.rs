@@ -14,27 +14,36 @@ use ratatui::widgets::Paragraph;
 use tui_term::widget::PseudoTerminal;
 
 use crate::model::{Board, PaneMode};
+use crate::mouse::{HitMap, Target};
 use crate::pane::PaneMap;
 use crate::ui;
 
-pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
+pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, hits: &mut HitMap) {
     if board.terminal_maximized {
-        render_terminal(frame, area, board, panes);
+        render_terminal(frame, area, board, panes, hits);
         return;
     }
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(area);
-    render_terminal(frame, columns[0], board, panes);
-    render_context(frame, columns[1], board);
+    render_terminal(frame, columns[0], board, panes, hits);
+    render_context(frame, columns[1], board, hits);
 }
 
-fn render_terminal(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap) {
+fn render_terminal(
+    frame: &mut Frame,
+    area: Rect,
+    board: &Board,
+    panes: &mut PaneMap,
+    hits: &mut HitMap,
+) {
     let Some(session_id) = board.focus_target() else {
         render_placeholder(frame, area, board, "no agent selected");
         return;
     };
+    hits.add(area, Target::Pane(session_id.clone()));
+    hits.set_terminal(ui::block("").inner(area), session_id.clone());
     let Some(pane) = panes.get_mut(&session_id) else {
         render_placeholder(frame, area, board, "attaching…");
         return;
@@ -113,7 +122,7 @@ fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board, message: &st
     ui::dim(frame, inner, text);
 }
 
-fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
+fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     let Some(agent_id) = board.selected_agent.as_ref() else {
         ui::dim(frame, area, "no agent selected");
         return;
@@ -141,20 +150,22 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
         .constraints(constraints)
         .split(area);
 
-    let tasks: Vec<Line> = board
-        .tasks
-        .values()
-        .filter(|task| {
-            task.snapshot.assigned_agent_id.as_ref() == Some(agent_id)
-                && matches!(
-                    task.snapshot.status,
-                    factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
-                )
-        })
-        .map(|task| {
+    let active_tasks = board.active_tasks_for_agent(agent_id);
+    let task_area = ui::block("").inner(rows[0]);
+    let tasks: Vec<Line> = active_tasks
+        .iter()
+        .enumerate()
+        .map(|(row, task)| {
+            hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
             Line::from(format!(
-                "{:?}  {}",
-                task.snapshot.status, task.snapshot.title
+                "{} {:?}  {}",
+                if board.selected_task.as_ref() == Some(&task.snapshot.id) {
+                    ">"
+                } else {
+                    " "
+                },
+                task.snapshot.status,
+                task.snapshot.title
             ))
         })
         .collect();

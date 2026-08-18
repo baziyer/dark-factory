@@ -12,6 +12,7 @@ mod attach;
 mod client_state;
 mod keys;
 mod model;
+mod mouse;
 mod net;
 mod pane;
 mod query;
@@ -28,7 +29,10 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, MouseEvent,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -177,6 +181,7 @@ fn restore_terminal() {
     let _ = execute!(
         io::stdout(),
         DisableBracketedPaste,
+        DisableMouseCapture,
         LeaveAlternateScreen,
         cursor::Show
     );
@@ -196,7 +201,12 @@ fn main() -> anyhow::Result<()> {
     }));
 
     enable_raw_mode()?;
-    execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let _guard = TerminalGuard;
 
     let backend = CrosstermBackend::new(io::stdout());
@@ -276,10 +286,11 @@ fn run(
     let mut initial_project_applied = false;
     let mut remembered_project = board.focused_project.clone();
     let mut context_refresh = ContextRefresh::new();
+    let mut mouse_capture = mouse::Capture::default();
     net::spawn_update_check(tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, debug_log);
-    terminal.draw(|frame| ui::draw(frame, board, panes))?;
+    let mut hit_map = draw_board(terminal, board, panes)?;
 
     loop {
         if board.quit {
@@ -299,9 +310,18 @@ fn run(
                     needs_redraw = true;
                 }
                 Event::Resize(_, _) => needs_redraw = true,
-                // Mouse/focus are received but not acted on - see SPIKE.md "Mouse" for why
-                // (neither target app's mouse support is wired through this crate yet).
-                Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {}
+                Event::Mouse(event) => {
+                    needs_redraw |= handle_mouse(
+                        event,
+                        &hit_map,
+                        &mut mouse_capture,
+                        board,
+                        client,
+                        tx,
+                        panes,
+                    );
+                }
+                Event::FocusGained | Event::FocusLost => {}
             }
         }
 
@@ -346,11 +366,21 @@ fn run(
         }
 
         if needs_redraw {
-            terminal.draw(|frame| ui::draw(frame, board, panes))?;
+            hit_map = draw_board(terminal, board, panes)?;
         }
     }
 
     Ok(())
+}
+
+fn draw_board(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    board: &Board,
+    panes: &mut PaneMap,
+) -> io::Result<mouse::HitMap> {
+    let mut hits = mouse::HitMap::default();
+    terminal.draw(|frame| hits = ui::draw(frame, board, panes))?;
+    Ok(hits)
 }
 
 /// Reconciles `panes` against `Board::desired_sessions()`: attaches (or, under
@@ -495,6 +525,73 @@ fn forward_paste_if_applicable(board: &Board, panes: &PaneMap, text: &str) {
     }
 }
 
+fn handle_mouse(
+    event: MouseEvent,
+    hits: &mouse::HitMap,
+    capture: &mut mouse::Capture,
+    board: &mut Board,
+    client: &Client,
+    tx: &mpsc::Sender<NetMsg>,
+    panes: &PaneMap,
+) -> bool {
+    if !matches!(board.mode, model::Mode::Normal) {
+        capture.clear();
+        return false;
+    }
+    let terminal_context = (board.view == model::View::Agent
+        && board.pane_mode == model::PaneMode::Typing)
+        .then_some(hits.terminal.as_ref())
+        .flatten()
+        .filter(|terminal| board.focus_target().as_ref() == Some(&terminal.session_id))
+        .and_then(|terminal| panes.get(&terminal.session_id))
+        .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+        .map(Pane::mouse_context)
+        .filter(|context| context.enabled());
+
+    match mouse::route(event, hits, terminal_context, capture) {
+        mouse::Route::None => false,
+        mouse::Route::Board(target) => {
+            let intent = board.handle_mouse_target(target);
+            apply_intent(intent, board, client, tx, panes)
+        }
+        mouse::Route::Scroll { session_id, up } => {
+            let Some(pane) = panes
+                .get(&session_id)
+                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+            else {
+                return false;
+            };
+            const SCROLL_STEP_LINES: usize = 3;
+            if up {
+                pane.scroll_up(SCROLL_STEP_LINES);
+            } else {
+                pane.scroll_down(SCROLL_STEP_LINES);
+            }
+            true
+        }
+        mouse::Route::ResetScrollback { session_id } => {
+            let Some(pane) = panes
+                .get(&session_id)
+                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+            else {
+                return false;
+            };
+            pane.scroll_reset();
+            true
+        }
+        mouse::Route::Terminal { session_id, bytes } => {
+            let Some(pane) = panes
+                .get(&session_id)
+                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+            else {
+                return false;
+            };
+            pane.write_input(&bytes);
+            true
+        }
+    }
+}
+
 fn apply_intent(
     intent: Intent,
     board: &mut Board,
@@ -512,12 +609,6 @@ fn apply_intent(
         Intent::ForwardKey(key) => {
             if let Some(session_id) = forwarding_target(board) {
                 if let Some(pane) = panes.get(&session_id) {
-                    // Typing while scrolled back snaps to the live tail — matches common
-                    // terminal-emulator behavior and gives `scroll_reset` its one production
-                    // call site (scrolling itself only ever moves the offset forward/back).
-                    if pane.scroll_offset() > 0 {
-                        pane.scroll_reset();
-                    }
                     let bytes = keys::encode_key(key, pane.key_context());
                     pane.write_input(&bytes);
                 }
@@ -550,6 +641,7 @@ fn apply_intent(
                 io::stdout(),
                 EnterAlternateScreen,
                 EnableBracketedPaste,
+                EnableMouseCapture,
                 cursor::Hide
             );
             if let Err(error) = result {

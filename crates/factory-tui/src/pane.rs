@@ -27,6 +27,7 @@ use factoryctl::Client;
 
 use crate::attach::{self, AttachConnection};
 use crate::keys::KeyContext;
+use crate::mouse::TerminalMouseContext;
 use crate::query::QueryResponder;
 
 /// How long after a local-PTY spawn we keep appending raw PTY bytes to the debug log, per the
@@ -243,13 +244,27 @@ impl Pane {
         self.with_screen(vt100::Screen::bracketed_paste)
     }
 
+    /// Mouse mode and encoding requested by the child through DECSET. `main.rs` treats `None`
+    /// mode as a hard do-not-forward boundary, rather than inferring support from pane focus.
+    #[must_use]
+    pub fn mouse_context(&self) -> TerminalMouseContext {
+        self.with_screen(|screen| TerminalMouseContext {
+            mode: screen.mouse_protocol_mode(),
+            encoding: screen.mouse_protocol_encoding(),
+            scrolled_back: screen.scrollback() > 0,
+        })
+    }
+
     /// Writes raw, already-encoded terminal input to the child (local PTY) or forwards it to the
-    /// daemon as a `TerminalInput` request (daemon-attached) — best-effort either way; a failed
-    /// write here shows up to the operator as the pane simply not reacting, which matches how a
-    /// dropped keystroke over a flaky real terminal link would look too.
+    /// daemon as a `TerminalInput` request (daemon-attached) — best-effort either way. All input
+    /// first returns the pane to its live tail so key, paste, and mouse coordinates cannot act on
+    /// a live screen while the operator is looking at historical scrollback.
     pub fn write_input(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+        if self.scroll_offset() > 0 {
+            self.scroll_reset();
         }
         match &self.backend {
             Backend::LocalPty { writer, .. } => {
@@ -519,3 +534,24 @@ fn spawn_resize_worker(
 /// `Board::desired_sessions()` every loop iteration; `ui::terminals`/`ui::focus` render whatever's
 /// in it.
 pub type PaneMap = std::collections::HashMap<SessionId, Pane>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_nonempty_input_returns_scrollback_to_the_live_tail() {
+        let mut pane = Pane::spawn("test", &["/bin/cat".to_owned()], 2, 8, None).unwrap();
+        {
+            let mut parser = pane.parser.lock().unwrap();
+            parser.process(b"one\r\ntwo\r\nthree\r\n");
+            parser.set_scrollback(1);
+        }
+        assert_eq!(pane.scroll_offset(), 1);
+
+        pane.write_input(b"x");
+
+        assert_eq!(pane.scroll_offset(), 0);
+        pane.kill();
+    }
+}
