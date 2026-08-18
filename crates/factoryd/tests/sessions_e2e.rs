@@ -190,6 +190,13 @@ impl Drop for Daemon {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+            // A terminal database row precedes the runner's acknowledgement
+            // shutdown by a small but real interval. Keep the daemon alive for
+            // that final protocol step too; otherwise killing it here can strand
+            // a runner that has already disappeared from the live-session query.
+            if let Some(home) = self.socket.parent() {
+                wait_for_no_runners_under(home, Duration::from_secs(5));
+            }
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -337,6 +344,19 @@ fn live_runners_under(home: &Path) -> usize {
         .lines()
         .filter(|line| line.contains("factory-runner") && line.contains(&needle))
         .count()
+}
+
+fn wait_for_no_runners_under(home: &Path, deadline: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if live_runners_under(home) == 0 {
+            return true;
+        }
+        if start.elapsed() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn setup_project(home: &Path) -> Project {
@@ -625,19 +645,38 @@ fn wait_for_task_status(client: &Client, task_id: &str, status: TaskStatus) -> T
 /// before that in-flight background task completes, the runner is
 /// orphaned forever, still waiting for an acknowledgement nothing will
 /// ever send again.
-fn cleanup_session(client: &Client, agent_id: &str) {
-    if let Some(session) = session_by_agent(client, agent_id) {
-        if session.state.is_live() {
-            let _ = client.request(LocalRequest::StopSession {
-                project_id: project_id(),
-                session_id: session.id,
-                grace_ms: 2_000,
-            });
-            poll_until(DELIVERY_TIMEOUT, || {
-                session_by_agent(client, agent_id).filter(|session| !session.state.is_live())
-            });
-        }
+fn cleanup_session(daemon: &Daemon, agent_id: &str) {
+    let client = daemon.client();
+    let home = daemon.socket.parent().expect("daemon socket has a parent");
+    // Closing a session wakes its agent. Hold the queue first so pending
+    // fixture work cannot race cleanup by immediately spawning a successor.
+    client
+        .request(LocalRequest::PauseAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from(agent_id).unwrap(),
+        })
+        .unwrap();
+    if let Some(session) = list_sessions(&client)
+        .into_iter()
+        .find(|session| session.agent_id.as_str() == agent_id && session.state.is_live())
+    {
+        let _ = client.request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: session.id.clone(),
+            grace_ms: 2_000,
+        });
+        poll_until(DELIVERY_TIMEOUT, || {
+            list_sessions(&client)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .filter(|candidate| !candidate.state.is_live())
+        });
     }
+    assert!(
+        wait_for_no_runners_under(home, DELIVERY_TIMEOUT),
+        "runner under {} did not exit after its session became terminal",
+        home.display()
+    );
 }
 
 // --- (a) auto-delivery, real worktree, hook events, second task via
@@ -754,7 +793,7 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
         );
     }
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -814,7 +853,7 @@ fn a_standalone_message_delivers_without_opening_a_run() {
         "a standalone message must never open a run episode"
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -872,7 +911,7 @@ fn pausing_an_agent_holds_its_queue_until_resumed() {
 
     wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -926,6 +965,7 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
     assert_eq!(run.status, factory_core::RunStatus::Stopped);
     assert_eq!(run.closed_by, Some(factory_core::RunClosedBy::OperatorStop));
 
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -995,7 +1035,7 @@ fn factoryd_restart_does_not_lose_a_live_session() {
         "delivery after a restart must reuse the recovered session, not spawn a new one"
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1048,7 +1088,7 @@ fn factoryd_process_group_kill_does_not_take_sessions() {
         session_by_agent(&client, "curie").unwrap().id,
         session_before.id
     );
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1123,6 +1163,7 @@ fn terminal_input_reaches_the_live_process_through_attach() {
         "the typed `exit` keystroke should be echoed in the retained terminal output, got {replayed:?}"
     );
 
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1166,7 +1207,7 @@ fn session_start_hook_payload_session_id_persists_as_provider_session_id() {
         Some(FAKE_CODEX_THREAD_ID)
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1200,7 +1241,7 @@ while :; do sleep 3600; done"
     // daemon.
     wait_for_session_state(&client, "curie", SessionState::Idle);
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1333,7 +1374,7 @@ fn spawn_failure_is_visible_backs_off_and_recovers_with_a_single_delivery() {
         "task-1 must be delivered exactly once after recovery"
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1405,7 +1446,7 @@ fn task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_h
         "the drained outbox file must be deleted, found {outbox:?} non-empty"
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1518,7 +1559,7 @@ fn a_refused_delete_project_leaves_every_file_intact() {
          refused delete"
     );
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
@@ -1643,7 +1684,7 @@ while :; do sleep 3600; done"
     assert_eq!(working.id, session.id);
     assert_eq!(working.wait_reason, None);
 
-    cleanup_session(&client, "curie");
+    cleanup_session(&daemon, "curie");
     daemon.stop();
 }
 
