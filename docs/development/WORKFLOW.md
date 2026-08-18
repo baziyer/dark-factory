@@ -195,7 +195,9 @@ them.
    `x86_64-apple-darwin`; there is no release-writing matrix to race shared
    state. One `scripts/package-release.sh` transaction stages both flat
    four-binary archives, `SHA256SUMS`, `latest.json`, and a
-   `dark-factory.rb` candidate before exposing `dist/`.
+   `dark-factory.rb` candidate before exposing `dist/`. It normalizes archive
+   member order, mode, ownership, and timestamps so rebuilding byte-identical
+   binaries produces the same resumable asset set.
    `scripts/publish-release.sh` binds the remote tag to the workflow commit,
    creates a draft, uploads only missing assets, and publishes only when the
    remote asset names and digests exactly match that build. GitHub 5xx and
@@ -280,6 +282,12 @@ them.
    sole active-runtime updater so live-session preservation, atomic switch,
    health verification, and rollback stay in one implementation. The
    formula caveats state the same split.
+   Accordingly, `brew uninstall dark-factory` removes only the Homebrew
+   bootstrap commands; it leaves the launchd job, active runtime, database,
+   worktrees, logs, and installed versions under `~/.dark-factory`. Follow
+   [the service uninstall procedure](../../launchd/README.md#uninstall) to
+   stop live sessions and unload the job safely before removing anything
+   else. State deletion remains a separate irreversible choice.
 8. **npm remains deferred** until non-macOS demand is demonstrated. A wrapper
    would add Node as an installation dependency while reintroducing the same
    bootstrap-versus-active-runtime update split; it does not simplify the

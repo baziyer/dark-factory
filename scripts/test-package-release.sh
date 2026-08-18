@@ -26,6 +26,8 @@ arm_dir="$temporary/arm"
 intel_dir="$temporary/intel"
 make_binaries arm "$arm_dir"
 make_binaries intel "$intel_dir"
+chmod 0700 "$arm_dir/factoryd"
+chmod 0711 "$intel_dir/factory-tui"
 output="$temporary/dist"
 "$packager" v1.2.3 "$output" example/project \
     x86_64-apple-darwin "$intel_dir" \
@@ -41,6 +43,11 @@ factoryctl
 factoryd" ] || fail "$target archive has unexpected contents: $listing"
     gzip_mtime=$(od -An -tu1 -j4 -N4 "$archive" | tr -d '[:space:]')
     [ "$gzip_mtime" = "0000" ] || fail "$target archive embeds its packaging time"
+    LC_ALL=C tar -tvzf "$archive" | awk '
+      $1 != "-rwxr-xr-x" || $2 != 0 || $3 != "root" || $4 != "wheel" ||
+        $6 != "Jan" || $7 != 1 || $8 != 2000 { exit 1 }
+      END { exit NR == 4 ? 0 : 1 }
+    ' || fail "$target archive metadata is not normalized"
 done
 (cd "$output" && shasum -a 256 -c SHA256SUMS >/dev/null) || fail "archive checksums failed"
 
@@ -66,9 +73,19 @@ done
 for binary in factoryd factory-runner factoryctl factory-tui; do
     grep -Fq "$binary" "$formula" || fail "formula omitted $binary"
 done
-grep -Fq 'if Hardware::CPU.arm?' "$formula" || fail "formula does not select the host architecture"
+grep -Fq 'resource("binaries").stage' "$formula" || fail "formula does not install its selected resource"
+grep -Fq 'on_arm do' "$formula" || fail "formula omitted the arm architecture block"
+grep -Fq 'on_intel do' "$formula" || fail "formula omitted the Intel architecture block"
+if grep -Fq 'Hardware::CPU' "$formula"; then
+    fail "formula bypasses Homebrew architecture blocks"
+fi
 grep -Fq 'factoryctl update --install' "$formula" || fail "formula omitted runtime updater"
 grep -Fq 'Do not use `brew services`' "$formula" || fail "formula permits competing service ownership"
+grep -Fq '`brew uninstall dark-factory` removes only the bootstrap commands' "$formula" \
+    || fail "formula hides bootstrap-only uninstall behavior"
+grep -Fq 'launchd job, active runtime, and state under ~/.dark-factory remain' "$formula" \
+    || fail "formula hides state retained by brew uninstall"
+grep -Fq 'launchd/README.md#uninstall' "$formula" || fail "formula omits safe removal guidance"
 if grep -Eq '^[[:space:]]*service do' "$formula"; then
     fail "formula defines a Homebrew service"
 fi
@@ -77,8 +94,10 @@ second_formula="$temporary/second.rb"
 "$renderer" v1.2.3 "$output/SHA256SUMS" example/project >"$second_formula"
 cmp -s "$formula" "$second_formula" || fail "formula rendering is not deterministic"
 
-# Reversing the requested target order cannot change any published byte.
-# The packager owns one canonical target order for archives and metadata.
+# Reversing target order and changing only every source mtime cannot change
+# any published byte. The packager owns one canonical archive representation.
+TZ=UTC0 touch -t 203001010000.00 "$arm_dir"/*
+TZ=UTC0 touch -t 204001010000.00 "$intel_dir"/*
 second_output="$temporary/second-dist"
 "$packager" v1.2.3 "$second_output" example/project \
     aarch64-apple-darwin "$arm_dir" \
@@ -89,7 +108,7 @@ for artifact in \
     SHA256SUMS latest.json dark-factory.rb
 do
     cmp -s "$output/$artifact" "$second_output/$artifact" \
-        || fail "target order changed $artifact"
+        || fail "target order or source mtime changed $artifact"
 done
 
 # Validation finishes before the output transaction begins. A missing binary

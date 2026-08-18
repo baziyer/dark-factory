@@ -74,16 +74,21 @@ class DarkFactory < Formula
 
   depends_on :macos
 
-  if Hardware::CPU.arm?
-    url "https://github.com/$repository/releases/download/$tag/$arm_archive"
-    sha256 "$arm_sha"
-  else
-    url "https://github.com/$repository/releases/download/$tag/$intel_archive"
-    sha256 "$intel_sha"
+  resource "binaries" do
+    on_arm do
+      url "https://github.com/$repository/releases/download/$tag/$arm_archive"
+      sha256 "$arm_sha"
+    end
+    on_intel do
+      url "https://github.com/$repository/releases/download/$tag/$intel_archive"
+      sha256 "$intel_sha"
+    end
   end
 
   def install
-    bin.install "factoryd", "factory-runner", "factoryctl", "factory-tui"
+    resource("binaries").stage do
+      bin.install "factoryd", "factory-runner", "factoryctl", "factory-tui"
+    end
   end
 
   def caveats
@@ -95,6 +100,11 @@ class DarkFactory < Formula
       \`brew upgrade\` updates this bootstrap copy. Use
       \`factoryctl update --install\` to atomically update the active runtime while
       preserving live sessions and rollback binaries.
+
+      \`brew uninstall dark-factory\` removes only the bootstrap commands. The
+      launchd job, active runtime, and state under ~/.dark-factory remain. Follow
+      https://github.com/$repository/blob/$tag/launchd/README.md#uninstall to stop
+      sessions and unload the service safely before removing anything else.
     EOS
   end
 

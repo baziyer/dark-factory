@@ -8,6 +8,8 @@
 # The output directory must not exist. Everything is built in a sibling
 # staging directory and renamed into place only after both archives, their
 # checksums, the shared update manifest, and the tap formula candidate exist.
+# Archive members have one fixed order, mode, owner, and timestamp so rebuilding
+# byte-identical binaries can resume the same partially published release.
 # The result is two `dark-factory-<tag>-<target>.tar.gz` files plus
 # `SHA256SUMS`, `latest.json`, and `dark-factory.rb`.
 set -eu
@@ -93,8 +95,19 @@ package_target() {
     package_target_name=$1
     package_bin_dir=$2
     package_archive="dark-factory-$tag-$package_target_name.tar.gz"
-    COPYFILE_DISABLE=1 tar --options gzip:!timestamp -czf "$staging/$package_archive" \
-        -C "$package_bin_dir" factoryd factory-runner factoryctl factory-tui
+    package_payload="$staging/.payload-$package_target_name"
+    mkdir "$package_payload"
+    # `ustar` plus a copied payload prevents source mtimes, permissions, IDs,
+    # ACLs, xattrs, or file flags from changing the published bytes.
+    for binary in factoryd factory-runner factoryctl factory-tui; do
+        install -m 0755 "$package_bin_dir/$binary" "$package_payload/$binary"
+        TZ=UTC0 touch -t 200001010000.00 "$package_payload/$binary"
+    done
+    COPYFILE_DISABLE=1 tar --format ustar --uid 0 --gid 0 --uname root --gname wheel \
+        --no-acls --no-xattrs --no-fflags --options gzip:!timestamp \
+        -czf "$staging/$package_archive" -C "$package_payload" \
+        factoryd factory-runner factoryctl factory-tui
+    rm -r "$package_payload"
     package_sha=$(shasum -a 256 "$staging/$package_archive" | cut -d' ' -f1)
     printf '%s  %s\n' "$package_sha" "$package_archive" >>"$staging/SHA256SUMS"
 }
