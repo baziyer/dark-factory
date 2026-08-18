@@ -71,6 +71,10 @@ impl Daemon {
         Self::spawn(home, runner, false)
     }
 
+    fn start_with_provider_path(home: &Path, provider_path: &Path) -> Self {
+        Self::spawn_with_provider_path(home, &factory_runner_path(), false, Some(provider_path))
+    }
+
     /// Like [`Daemon::start`], but the daemon is the leader of its own
     /// process group, so [`Daemon::stop_process_group`] can do what
     /// launchd's `bootout`/`kickstart -k` (and a terminal's Ctrl-C) do:
@@ -80,6 +84,15 @@ impl Daemon {
     }
 
     fn spawn(home: &Path, runner: &Path, own_process_group: bool) -> Self {
+        Self::spawn_with_provider_path(home, runner, own_process_group, None)
+    }
+
+    fn spawn_with_provider_path(
+        home: &Path,
+        runner: &Path,
+        own_process_group: bool,
+        provider_path: Option<&Path>,
+    ) -> Self {
         let socket = home.join("f.sock");
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryd"));
         command
@@ -91,6 +104,10 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(provider_path) = provider_path {
+            let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", provider_path.display());
+            command.env("PATH", path);
+        }
         if own_process_group {
             command.process_group(0);
         }
@@ -399,6 +416,19 @@ fn shell_agent_path() -> String {
         .into_owned()
 }
 
+fn install_fake_codex(home: &Path) -> PathBuf {
+    let bin = home.join("fake-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex.sh"),
+        &codex,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
 /// Starts a daemon on `home`, creates a real git repo project at
 /// `home/repo`, and returns everything a test needs to drive it further.
 struct Project {
@@ -476,6 +506,28 @@ fn create_shell_agent(client: &Client, agent_id: &str) -> factory_core::AgentSna
             model: Some(shell_agent_path()),
             reasoning_effort: None,
             model_selection_reason: None,
+            worktree: None,
+        })
+        .unwrap();
+    let ServerFrame::Response {
+        response: LocalResponse::AgentCreated { agent },
+        ..
+    } = response
+    else {
+        panic!("expected AgentCreated, got {response:?}");
+    };
+    agent
+}
+
+fn create_codex_agent(client: &Client, agent_id: &str) -> factory_core::AgentSnapshot {
+    let response = client
+        .request(LocalRequest::CreateAgent {
+            id: AgentId::try_from(agent_id).unwrap(),
+            project_id: project_id(),
+            parent_agent_id: None,
+            role: AgentRole::Worker,
+            provider: Provider::Codex,
+            model: None,
             worktree: None,
         })
         .unwrap();
@@ -1075,7 +1127,141 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
     daemon.stop();
 }
 
-// --- (e) restart: a live session survives a daemon restart (D7) --------
+// --- (e) StopSession handoff: queued work must wait for the successor -----
+
+#[test]
+fn task_assigned_during_a_clean_stop_delivers_after_the_session_is_replaced() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    let delayed_agent = format!("SHELL_AGENT_STOP_DELAY=2 {}", shell_agent_path());
+    create_shell_agent_with_command(&client, "curie", delayed_agent);
+
+    create_task(&client, "task-1", "First", "complete before stopping");
+    assign_task(&client, "task-1", "curie");
+    let first_session = wait_for_stable_idle(&client, "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+
+    // The RPC only acknowledges the runner's stop request; the old session
+    // remains live and idle until its terminal event is observed. Assign the
+    // next task in exactly that window. It must never be typed into the
+    // session that is already being torn down.
+    let stopped = client
+        .request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: first_session.id.clone(),
+            grace_ms: 2_000,
+        })
+        .unwrap();
+    assert!(matches!(
+        stopped,
+        ServerFrame::Response {
+            response: LocalResponse::SessionStopped { .. },
+            ..
+        }
+    ));
+
+    create_task(&client, "task-2", "Second", "deliver after the clean stop");
+    assign_task(&client, "task-2", "curie");
+
+    let task = wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
+    assert!(
+        task.result
+            .as_deref()
+            .is_some_and(|result| result.starts_with("done: Task task-2: Second (task:task-2)")),
+        "the successor must receive the exact queued task, got {task:?}"
+    );
+    let successor = poll_until(DELIVERY_TIMEOUT, || {
+        list_sessions(&client).into_iter().find(|session| {
+            session.agent_id.as_str() == "curie"
+                && session.id != first_session.id
+                && session.state == SessionState::Idle
+        })
+    });
+    assert_ne!(
+        successor.id, first_session.id,
+        "a task assigned during clean stop must use a successor session"
+    );
+    let runs = list_runs(&client);
+    let task2_run = runs
+        .iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+        .expect("run for task-2");
+    assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
+
+    cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+#[test]
+fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
+    const FAKE_CODEX_THREAD_ID: &str = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+
+    let home = private_tempdir();
+    let fake_bin = install_fake_codex(home.path());
+    let daemon = Daemon::start_with_provider_path(home.path(), &fake_bin);
+    let project = setup_project_with(daemon, home.path());
+    let client = project.daemon.client();
+    create_codex_agent(&client, "curie");
+
+    create_task(&client, "task-1", "First", "complete before resuming");
+    assign_task(&client, "task-1", "curie");
+    let first_session = wait_for_stable_idle(&client, "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    assert_eq!(
+        first_session.provider_session_id.as_deref(),
+        Some(FAKE_CODEX_THREAD_ID)
+    );
+
+    let stopped = client
+        .request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: first_session.id.clone(),
+            grace_ms: 2_000,
+        })
+        .unwrap();
+    assert!(matches!(
+        stopped,
+        ServerFrame::Response {
+            response: LocalResponse::SessionStopped { .. },
+            ..
+        }
+    ));
+    poll_until(DELIVERY_TIMEOUT, || {
+        session_by_agent(&client, "curie").filter(|session| !session.state.is_live())
+    });
+
+    // The fake resumed thread drops the first two PTY submissions after
+    // `codex resume <thread-id>`, reproducing the observed no-run/no-prompt
+    // delivery loss. The shared dispatcher must make one delayed outer retry
+    // and deliver the still-queued task rather than leave it wedged forever.
+    create_task(&client, "task-2", "Second", "deliver after resuming");
+    assign_task(&client, "task-2", "curie");
+    wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
+
+    let successor = poll_until(DELIVERY_TIMEOUT, || {
+        list_sessions(&client).into_iter().find(|session| {
+            session.agent_id.as_str() == "curie"
+                && session.id != first_session.id
+                && session.state == SessionState::Idle
+        })
+    });
+    assert_eq!(
+        successor.provider_session_id.as_deref(),
+        Some(FAKE_CODEX_THREAD_ID),
+        "the successor must preserve provider-thread continuity"
+    );
+    let task2_run = list_runs(&client)
+        .into_iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+        .expect("run for task-2");
+    assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
+
+    cleanup_session(&project.daemon, "curie");
+    project.daemon.stop();
+}
+
+// --- (f) restart: a live session survives a daemon restart (D7) --------
 
 #[test]
 fn factoryd_restart_does_not_lose_a_live_session() {

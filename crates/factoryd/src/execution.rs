@@ -64,6 +64,12 @@ const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// How long PTY-typed delivery waits for a matching `UserPromptSubmit` hook
 /// before retrying once (TRACK5-DESIGN.md §3/A3).
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
+/// One outer retry after `type_and_await_ack` has already exhausted its two
+/// immediate attempts. A resumed provider can report its terminal as ready
+/// before it has restored the prior thread's input surface; retry once on the
+/// safety tick, then leave the exact durable wait reason for operator action.
+const MAX_AUTOMATIC_DELIVERY_FAILURES: u32 = 2;
+const DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
 /// Gap between a composed delivery's text and its submitting `\r`, sent as
 /// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
 /// has the why: real Claude Code's paste-vs-keystroke heuristic otherwise
@@ -331,7 +337,7 @@ impl Handle {
             })
             .await?
             .ok_or(Error::NoLiveSession)?;
-        if session.state != SessionState::Idle {
+        if session.state != SessionState::Idle || session.stop_requested_at_ms.is_some() {
             return Err(Error::SessionBusy);
         }
         // Single pending-delivery slot (this track's item 1): held for the
@@ -534,6 +540,7 @@ impl Handle {
     /// streak).
     pub fn resume_backoff(&self, agent_id: &AgentId) {
         self.backoff.record_success(agent_id);
+        self.backoff.reset_delivery_failures(agent_id);
     }
 
     /// Stops the dispatcher. Live sessions are untouched: closing/crashing
@@ -644,6 +651,12 @@ struct BackoffTiming {
     /// deadline failures since the last success", not "3 in an unbroken
     /// row with literally nothing else in between".
     consecutive_start_deadlines: u32,
+    /// Bounded recovery for a delivery whose provider never acknowledged the
+    /// typed prompt. Kept beside spawn pacing so the same agent-scoped gate
+    /// and operator resume reset apply, but it is deliberately not part of
+    /// the spawn-failure curve.
+    delivery_failures: u32,
+    next_delivery_attempt_at: Option<Instant>,
 }
 
 impl Default for BackoffTiming {
@@ -653,6 +666,8 @@ impl Default for BackoffTiming {
             delay: Duration::ZERO,
             consecutive_failures: 0,
             consecutive_start_deadlines: 0,
+            delivery_failures: 0,
+            next_delivery_attempt_at: None,
         }
     }
 }
@@ -747,7 +762,7 @@ impl SpawnBackoff {
         )
     }
 
-    /// Clears `agent_id`'s backoff bookkeeping entirely: delay,
+    /// Clears the spawn side of `agent_id`'s backoff bookkeeping: delay,
     /// `consecutive_failures`, and `consecutive_start_deadlines` all reset
     /// to a clean slate. Two callers, both a deliberate "start over": a
     /// spawn actually reaching `idle` (`dispatch_agent`'s `Idle` arm --
@@ -762,7 +777,68 @@ impl SpawnBackoff {
             .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        timing.remove(agent_id);
+        if let Some(entry) = timing.get_mut(agent_id) {
+            entry.next_attempt_at = Instant::now();
+            entry.delay = Duration::ZERO;
+            entry.consecutive_failures = 0;
+            entry.consecutive_start_deadlines = 0;
+            if entry.delivery_failures == 0 {
+                timing.remove(agent_id);
+            }
+        }
+    }
+
+    /// Whether the dispatcher may make the one bounded retry for a delivery
+    /// currently parked at `delivery unacknowledged`.
+    fn delivery_retry_ready(&self, agent_id: &AgentId) -> bool {
+        let timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        timing.get(agent_id).is_some_and(|entry| {
+            entry.delivery_failures < MAX_AUTOMATIC_DELIVERY_FAILURES
+                && entry
+                    .next_delivery_attempt_at
+                    .is_some_and(|at| Instant::now() >= at)
+        })
+    }
+
+    fn record_delivery_failure(&self, agent_id: &AgentId) {
+        let mut timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = timing.entry(agent_id.clone()).or_default();
+        entry.delivery_failures = entry.delivery_failures.saturating_add(1);
+        entry.next_delivery_attempt_at = Some(Instant::now() + DELIVERY_RETRY_DELAY);
+    }
+
+    fn record_delivery_success(&self, agent_id: &AgentId) {
+        let mut timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = timing.get_mut(agent_id) {
+            entry.delivery_failures = 0;
+            entry.next_delivery_attempt_at = None;
+            if entry.consecutive_failures == 0 {
+                timing.remove(agent_id);
+            }
+        }
+    }
+
+    fn reset_delivery_failures(&self, agent_id: &AgentId) {
+        let mut timing = self
+            .timing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = timing.get_mut(agent_id) {
+            entry.delivery_failures = 0;
+            // ResumeAgent is the operator's explicit retry decision. Keep
+            // the entry armed so the wake sent by local_api reaches the
+            // waiting-for-input dispatch arm immediately.
+            entry.next_delivery_attempt_at = Some(Instant::now());
+        }
     }
 
     fn try_begin_preparation(&self, agent_id: &AgentId) -> bool {
@@ -1091,6 +1167,31 @@ async fn dispatch_agent(
                         }
                     }
                 }
+            }
+            Ok(())
+        }
+        Some(session) if session.stop_requested_at_ms.is_some() => {
+            // StopSession acknowledges the runner's request before its
+            // process has actually exited. Keep queued work out of that
+            // dying session; end_session_now will wake the agent after the
+            // durable successor can be spawned (and, for resumable
+            // providers, resume the same provider thread).
+            Ok(())
+        }
+        Some(session)
+            if session.state == SessionState::WaitingForInput
+                && session.wait_reason.as_deref() == Some("delivery unacknowledged") =>
+        {
+            if backoff.delivery_retry_ready(agent_id) {
+                deliver_pending(
+                    config,
+                    state,
+                    backoff,
+                    project_id,
+                    agent_id,
+                    &session.snapshot(),
+                )
+                .await?;
             }
             Ok(())
         }
@@ -2120,6 +2221,7 @@ async fn deliver_pending(
     );
     let text = delivery.text.clone();
     if type_and_await_ack(state, &client, &session.id, &text).await {
+        backoff.record_delivery_success(agent_id);
         commit_delivery(
             state,
             project_id,
@@ -2130,6 +2232,7 @@ async fn deliver_pending(
         )
         .await?;
     } else {
+        backoff.record_delivery_failure(agent_id);
         let reason = "delivery unacknowledged".to_owned();
         let wait_session_id = session.id.clone();
         let wait_at_ms = now_ms()?;
@@ -3277,6 +3380,27 @@ mod tests {
             !backoff.try_begin_preparation(&agent_id),
             "the deleting mark must survive a concurrent record_success"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_retry_is_delayed_once_then_bounded_until_operator_resume() {
+        let backoff = SpawnBackoff::new();
+        let agent_id = AgentId::try_from("curie").unwrap();
+
+        assert!(!backoff.delivery_retry_ready(&agent_id));
+        backoff.record_delivery_failure(&agent_id);
+        assert!(!backoff.delivery_retry_ready(&agent_id));
+        tokio::time::advance(DELIVERY_RETRY_DELAY).await;
+        assert!(backoff.delivery_retry_ready(&agent_id));
+
+        backoff.record_delivery_failure(&agent_id);
+        tokio::time::advance(DELIVERY_RETRY_DELAY).await;
+        assert!(
+            !backoff.delivery_retry_ready(&agent_id),
+            "the automatic recovery must stop after one outer retry"
+        );
+        backoff.reset_delivery_failures(&agent_id);
+        assert!(backoff.delivery_retry_ready(&agent_id));
     }
 
     /// PR #50 review, blocking finding 2, reproduced verbatim: the retry

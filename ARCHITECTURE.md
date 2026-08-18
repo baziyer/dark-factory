@@ -303,3 +303,11 @@ the acceptance condition is the new task body entering a running task.
   to `cancelled`; retry is an explicit requeue. `agent pause`/`resume`
   durably holds a queue — no new spawn, no delivery into an idle session —
   without touching a session already live.
+- `StopSession` acknowledges the runner's stop request before its provider
+  process necessarily exits. While that stop intent is durable, queued work
+  is never typed into the still-live session; the dispatcher waits for the
+  terminal event and then starts the successor, resuming the provider thread
+  when its capabilities support that. A delivery with no provider hook is
+  retried once after a bounded delay; if it still cannot be acknowledged, the
+  session remains durably `waiting_for_input` with `delivery unacknowledged`
+  so recovery is truthful rather than an invisible queue wedge.
