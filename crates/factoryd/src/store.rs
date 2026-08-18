@@ -3737,11 +3737,7 @@ impl Store {
             .ok_or(StoreError::AgentNotFound)?;
         if let Some(mode) = input.permission_mode.as_deref() {
             let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
-            if !capabilities
-                .permission_modes
-                .iter()
-                .any(|supported| *supported == mode)
-            {
+            if !capabilities.permission_modes.contains(&mode) {
                 return Err(StoreError::UnsupportedAgentPermissionMode {
                     provider: agent.snapshot.provider,
                     mode: mode.to_owned(),
