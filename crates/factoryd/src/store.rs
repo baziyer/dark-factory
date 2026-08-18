@@ -25,7 +25,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 21;
+const SCHEMA_VERSION: i64 = 22;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -4948,6 +4948,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             ))?;
         }
         transaction.pragma_update(None, "user_version", 21)?;
+        transaction.commit()?;
+        current = 21;
+    }
+    if current == 21 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0022_repair_legacy_permission_modes.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 22)?;
         transaction.commit()?;
     }
     Ok(())

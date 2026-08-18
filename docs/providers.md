@@ -49,7 +49,9 @@ Profile permission modes are validated against this same provider capability
 declaration before the profile row is written. For example, Codex accepts only
 `on-request` and `never`; `bypass` is the factory-wide auto-mode launch posture,
 not a valid Codex profile value, and is rejected instead of being deferred to
-the next session launch.
+the next session launch. Upgrade migration 0022 also clears invalid
+provider-scoped values already present in older profile rows, restoring the
+provider default so they cannot reach a post-upgrade launch argv.
 
 Repository authority is provider-independent too. Provider processes do not
 inherit ambient Git/GitHub token variables or the SSH agent; the runner resets

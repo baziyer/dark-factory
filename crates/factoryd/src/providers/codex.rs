@@ -911,6 +911,29 @@ mod provider_tests {
     }
 
     #[test]
+    fn no_explicit_permission_uses_the_supported_default_when_auto_mode_is_off() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = context(directory.path());
+        ctx.auto_mode = false;
+        let launch = CodexProvider::with_source_home(directory.path().join("no-real-home"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        assert_eq!(
+            launch.args,
+            vec![
+                "--dangerously-bypass-hook-trust".to_owned(),
+                "-c".to_owned(),
+                "approval_policy=\"on-request\"".to_owned(),
+            ]
+        );
+        assert_eq!(
+            launch.runtime.permission_mode.as_deref(),
+            Some("on-request")
+        );
+    }
+
+    #[test]
     fn resume_launch_passes_model_approval_policy_and_thread_id_in_order() {
         let directory = tempfile::tempdir().unwrap();
         let mut ctx = context(directory.path());
