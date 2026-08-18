@@ -6,9 +6,17 @@
 
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
     os::unix::fs::PermissionsExt,
+    os::unix::net::UnixListener,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+};
+
+use factory_core::{
+    PROTOCOL_VERSION,
+    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 
 const SIBLINGS: [&str; 3] = ["factoryd", "factory-runner", "factory-tui"];
@@ -209,4 +217,118 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
         "{stdout}"
     );
     assert_eq!(status("update"), "warn");
+}
+
+#[test]
+fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("user-home")).unwrap();
+    let factoryctl = staged_factoryctl(root.path());
+    let home = root.path().join("home");
+    let (code, _, stderr) = run(&factoryctl, root.path(), &["init", "--yes", "--no-launchd"]);
+    assert_eq!(code, 0, "{stderr}");
+
+    let stale = home.join("bin/0.1.0");
+    fs::create_dir_all(&stale).unwrap();
+    for name in SIBLINGS.iter().chain(["factoryctl"].iter()) {
+        let binary = stale.join(name);
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::remove_file(home.join("bin/current")).unwrap();
+    std::os::unix::fs::symlink("0.1.0", home.join("bin/current")).unwrap();
+
+    let now_ms = factoryctl::update::now_ms();
+    let cache = serde_json::json!({
+        "checked_at_ms": now_ms,
+        "current": factoryctl::update::CURRENT_VERSION,
+        "latest": {
+            "version": factoryctl::update::CURRENT_VERSION,
+            "assets": {
+                factoryctl::update::platform_key(): {
+                    "url": "https://example.invalid/release.tar.gz",
+                    "sha256": "00"
+                }
+            }
+        }
+    });
+    fs::write(
+        home.join("update-check.json"),
+        serde_json::to_vec(&cache).unwrap(),
+    )
+    .unwrap();
+
+    let socket = home.join("f.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let replies = [
+            LocalResponse::Health {
+                runner_path: "/tmp/factory-runner".to_owned(),
+                factoryctl_path: "/tmp/factoryctl".to_owned(),
+                version: "0.1.0".to_owned(),
+            },
+            LocalResponse::Projects {
+                projects: Vec::new(),
+                next_after_id: None,
+            },
+        ];
+        for (index, response) in replies.into_iter().enumerate() {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
+            if index == 0 {
+                assert_eq!(request, RequestEnvelope::new(LocalRequest::Health));
+            } else {
+                assert!(matches!(request.request, LocalRequest::ListProjects { .. }));
+            }
+            serde_json::to_writer(
+                &mut stream,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+
+    let (code, stdout, stderr) = run(&factoryctl, root.path(), &["doctor", "--json"]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    server.join().unwrap();
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    let checks = report["checks"].as_array().unwrap();
+    let check = |name: &str| {
+        checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("missing {name}: {stdout}"))
+    };
+    assert_eq!(check("install")["status"], "warn");
+    assert!(
+        check("install")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("bin/current -> 0.1.0")
+    );
+    assert_eq!(check("daemon")["status"], "ok");
+    assert!(
+        check("daemon")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("matches active runtime")
+    );
+    assert_eq!(check("update")["status"], "warn");
+    assert!(
+        check("update")["detail"]
+            .as_str()
+            .unwrap()
+            .contains(&format!(
+                "v{} available",
+                factoryctl::update::CURRENT_VERSION
+            ))
+    );
 }

@@ -21,7 +21,7 @@
 use std::{
     fs, io,
     os::unix::fs::{PermissionsExt, symlink},
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     process::Command,
 };
 
@@ -55,38 +55,7 @@ pub fn current_link(home: &Path) -> PathBuf {
 /// runtime has been installed. The link must be the one-component relative
 /// shape [`activate`] writes, and its target must contain all four binaries.
 pub fn active_version(home: &Path) -> Result<Option<String>, String> {
-    let link = current_link(home);
-    let metadata = match fs::symlink_metadata(&link) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not inspect {}: {error}", link.display())),
-    };
-    if !metadata.file_type().is_symlink() {
-        return Err(format!("{} is not a symbolic link", link.display()));
-    }
-    let target = fs::read_link(&link)
-        .map_err(|error| format!("could not read {}: {error}", link.display()))?;
-    let mut components = target.components();
-    let version = match (components.next(), components.next()) {
-        (Some(Component::Normal(version)), None) => version
-            .to_str()
-            .filter(|version| !version.is_empty())
-            .ok_or_else(|| format!("{} has an invalid target", link.display()))?,
-        _ => return Err(format!("{} has an invalid target", link.display())),
-    };
-    if !update::is_valid_version(version) {
-        return Err(format!(
-            "{} names invalid version {version:?}",
-            link.display()
-        ));
-    }
-    verify_binaries(&version_dir(home, version)).map_err(|error| {
-        format!(
-            "{} points at an invalid active runtime: {error}",
-            link.display()
-        )
-    })?;
-    Ok(Some(version.to_owned()))
+    update::active_version(home)
 }
 
 /// Downloads this platform's asset from `manifest`, verifies its SHA-256,
@@ -105,7 +74,7 @@ pub fn install_release(
         .ok_or_else(|| format!("release {} has no asset for {key}", manifest.version))?;
     let destination = version_dir(home, &manifest.version);
     if destination.exists() {
-        verify_binaries(&destination).map_err(|error| {
+        update::validate_runtime(home, &manifest.version).map_err(|error| {
             format!(
                 "{error}; remove {} to download it again",
                 destination.display()
@@ -204,7 +173,7 @@ fn stage(
 /// renamed over the old one), so there is never a moment without a valid
 /// `current`. The target must already contain every binary.
 pub fn activate(home: &Path, version: &str) -> Result<(), String> {
-    verify_binaries(&version_dir(home, version))?;
+    update::validate_runtime(home, version)?;
     let link = current_link(home);
     let temp = bin_dir(home).join(".current.tmp");
     let _ = fs::remove_file(&temp);
@@ -218,10 +187,13 @@ pub fn activate(home: &Path, version: &str) -> Result<(), String> {
 pub fn verify_binaries(dir: &Path) -> Result<(), String> {
     for name in BINARIES {
         let path = dir.join(name);
-        let metadata = fs::metadata(&path)
+        let metadata = fs::symlink_metadata(&path)
             .map_err(|error| format!("{} is missing: {error}", path.display()))?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-            return Err(format!("{} is not an executable file", path.display()));
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "{} is not a direct executable file",
+                path.display()
+            ));
         }
     }
     Ok(())
@@ -287,6 +259,53 @@ mod tests {
         fake_binaries(&version_dir(home.path(), "not-a-version"));
         symlink("not-a-version", current_link(home.path())).unwrap();
         assert!(active_version(home.path()).is_err());
+    }
+
+    #[test]
+    fn active_runtime_rejects_directory_and_binary_symlink_indirection() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let external = root.path().join("external");
+        fake_binaries(&external);
+        fs::create_dir_all(bin_dir(&home)).unwrap();
+
+        symlink(&external, version_dir(&home, "0.3.0")).unwrap();
+        symlink("0.3.0", current_link(&home)).unwrap();
+        assert!(
+            active_version(&home)
+                .unwrap_err()
+                .contains("direct directory")
+        );
+        assert!(activate(&home, "0.3.0").is_err());
+
+        fs::remove_file(current_link(&home)).unwrap();
+        fs::remove_file(version_dir(&home, "0.3.0")).unwrap();
+        fake_binaries(&version_dir(&home, "0.3.0"));
+        fs::remove_file(version_dir(&home, "0.3.0/factoryd")).unwrap();
+        symlink(
+            external.join("factoryd"),
+            version_dir(&home, "0.3.0/factoryd"),
+        )
+        .unwrap();
+        symlink("0.3.0", current_link(&home)).unwrap();
+        assert!(
+            active_version(&home)
+                .unwrap_err()
+                .contains("direct executable file")
+        );
+        assert!(activate(&home, "0.3.0").is_err());
+
+        let indirect_home = root.path().join("indirect-home");
+        let external_bin = root.path().join("external-bin");
+        fake_binaries(&external_bin.join("0.3.0"));
+        symlink("0.3.0", external_bin.join("current")).unwrap();
+        fs::create_dir_all(&indirect_home).unwrap();
+        symlink(&external_bin, indirect_home.join("bin")).unwrap();
+        assert!(
+            active_version(&indirect_home)
+                .unwrap_err()
+                .contains("direct directory")
+        );
     }
 
     #[test]

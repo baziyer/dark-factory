@@ -16,7 +16,8 @@
 use std::{
     collections::BTreeMap,
     fs, io,
-    path::{Path, PathBuf},
+    os::unix::fs::PermissionsExt,
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
@@ -35,6 +36,8 @@ pub const MANIFEST_URL_ENV: &str = "DARK_FACTORY_UPDATE_URL";
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+/// Every binary in an installed release runtime.
+pub const RELEASE_BINARIES: [&str; 4] = ["factoryd", "factory-runner", "factoryctl", "factory-tui"];
 
 /// One release, as published by the release workflow (its `latest.json`
 /// also carries a `tag`, which nothing here needs).
@@ -80,6 +83,99 @@ impl UpdateCheck {
             manifest.assets.contains_key(platform_key()) && is_newer(&manifest.version, current)
         })
     }
+}
+
+/// The validated version `$DARK_FACTORY_HOME/bin/current` points at.
+///
+/// The active runtime is trusted only when `bin`, the version directory,
+/// and every release binary are real filesystem entries. Symlinked
+/// directories or binaries could otherwise escape the install home while
+/// retaining the expected-looking `current -> <version>` link.
+pub fn active_version(home: &Path) -> Result<Option<String>, String> {
+    let home_metadata = match fs::symlink_metadata(home) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", home.display())),
+    };
+    require_real_directory(home, &home_metadata)?;
+
+    let bin = home.join("bin");
+    let bin_metadata = match fs::symlink_metadata(&bin) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", bin.display())),
+    };
+    require_real_directory(&bin, &bin_metadata)?;
+
+    let link = bin.join("current");
+    let metadata = match fs::symlink_metadata(&link) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", link.display())),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Err(format!("{} is not a symbolic link", link.display()));
+    }
+    let target = fs::read_link(&link)
+        .map_err(|error| format!("could not read {}: {error}", link.display()))?;
+    let mut components = target.components();
+    let version = match (components.next(), components.next()) {
+        (Some(Component::Normal(version)), None) => version
+            .to_str()
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| format!("{} has an invalid target", link.display()))?,
+        _ => return Err(format!("{} has an invalid target", link.display())),
+    };
+    if !is_valid_version(version) {
+        return Err(format!(
+            "{} names invalid version {version:?}",
+            link.display()
+        ));
+    }
+    validate_runtime(home, version).map_err(|error| {
+        format!(
+            "{} points at an invalid active runtime: {error}",
+            link.display()
+        )
+    })?;
+    Ok(Some(version.to_owned()))
+}
+
+/// Verifies that one installed version cannot escape `<home>/bin/<version>`
+/// through directory or binary symlinks.
+pub fn validate_runtime(home: &Path, version: &str) -> Result<(), String> {
+    let home_metadata = fs::symlink_metadata(home)
+        .map_err(|error| format!("could not inspect {}: {error}", home.display()))?;
+    require_real_directory(home, &home_metadata)?;
+
+    let bin = home.join("bin");
+    let bin_metadata = fs::symlink_metadata(&bin)
+        .map_err(|error| format!("could not inspect {}: {error}", bin.display()))?;
+    require_real_directory(&bin, &bin_metadata)?;
+
+    let runtime = bin.join(version);
+    let runtime_metadata = fs::symlink_metadata(&runtime)
+        .map_err(|error| format!("could not inspect {}: {error}", runtime.display()))?;
+    require_real_directory(&runtime, &runtime_metadata)?;
+    for name in RELEASE_BINARIES {
+        let path = runtime.join(name);
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("{} is missing: {error}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+            return Err(format!(
+                "{} is not a direct executable file",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_real_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if !metadata.file_type().is_dir() {
+        return Err(format!("{} is not a direct directory", path.display()));
+    }
+    Ok(())
 }
 
 /// `<home>/update-check.json`.

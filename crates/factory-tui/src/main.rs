@@ -599,9 +599,20 @@ fn apply_net_msg(
         NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
-        NetMsg::UpdateCheck(check) => {
-            board.update_available = check.available().map(|manifest| manifest.version.clone());
-        }
+        NetMsg::UpdateCheck {
+            check,
+            active_version,
+        } => match active_version {
+            Ok(active_version) => {
+                board.update_available = check
+                    .available_from(active_version.as_deref().unwrap_or(&check.current))
+                    .map(|manifest| manifest.version.clone());
+            }
+            Err(error) => {
+                board.update_available = None;
+                board.note_error(format!("update check: {error}"));
+            }
+        },
         NetMsg::FleetStatus(status) => board.apply_fleet_status(status),
     }
 }
@@ -615,6 +626,7 @@ mod main_tests {
 
     use factory_core::local::{LocalResponse, ServerFrame};
     use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
+    use factoryctl::update::{Asset, Manifest, UpdateCheck};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::test_fixtures::{agent, project, session};
@@ -667,6 +679,40 @@ mod main_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn update_badge_compares_the_release_with_the_active_runtime() {
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let check = UpdateCheck {
+            checked_at_ms: 0,
+            current: "0.2.0".to_owned(),
+            latest: Some(Manifest {
+                version: "0.2.0".to_owned(),
+                assets: [(
+                    factoryctl::update::platform_key().to_owned(),
+                    Asset {
+                        url: "https://example.invalid/release.tar.gz".to_owned(),
+                        sha256: "00".to_owned(),
+                    },
+                )]
+                .into(),
+            }),
+            error: None,
+        };
+        let mut initial_project_applied = false;
+
+        apply_net_msg(
+            NetMsg::UpdateCheck {
+                check,
+                active_version: Ok(Some("0.1.0".to_owned())),
+            },
+            &mut board,
+            None,
+            &mut initial_project_applied,
+        );
+
+        assert_eq!(board.update_available.as_deref(), Some("0.2.0"));
     }
 
     #[test]
