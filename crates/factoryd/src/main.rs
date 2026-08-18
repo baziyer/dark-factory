@@ -148,23 +148,22 @@ async fn serve_control_planes(
     tokio::pin!(web);
 
     enum Completed {
-        Shutdown(io::Result<()>),
+        Shutdown,
         Local(io::Result<()>),
         Webhooks(io::Result<()>),
     }
 
     let completed = tokio::select! {
-        () = shutdown.recv() => Completed::Shutdown(Ok(())),
+        () = shutdown.recv() => Completed::Shutdown,
         result = &mut local => Completed::Local(result),
         result = &mut web => Completed::Webhooks(result),
     };
     let _ = stop_tx.send(true);
     match completed {
-        Completed::Shutdown(signal) => {
+        Completed::Shutdown => {
             let (local, web) = tokio::join!(local, web);
             local?;
             web?;
-            signal?;
             tracing::info!("shutdown requested");
             Ok(())
         }
