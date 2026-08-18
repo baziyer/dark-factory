@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -499,6 +499,53 @@ impl Store {
         )?;
         migrate(&mut connection)?;
         Ok(Self { connection })
+    }
+
+    pub fn auto_mode(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT auto_mode FROM factory_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn set_auto_mode(&mut self, enabled: bool, now_ms: i64) -> Result<EventEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "UPDATE factory_settings SET auto_mode = ?1, updated_at_ms = ?2 WHERE singleton = 1",
+            params![enabled, now_ms],
+        )?;
+        let event = FactoryEvent::AutoModeChanged { enabled };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        })
+    }
+
+    pub fn record_policy_decision(
+        &mut self,
+        event: FactoryEvent,
+        now_ms: i64,
+    ) -> Result<EventEnvelope> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        })
     }
 
     pub fn create_project(
@@ -4364,6 +4411,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0016_task_incarnations.sql"))?;
         transaction.pragma_update(None, "user_version", 16)?;
         transaction.commit()?;
+        current = 16;
+    }
+    if current == 16 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0017_auto_mode.sql"))?;
+        transaction.pragma_update(None, "user_version", 17)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -4466,6 +4520,22 @@ struct EventMetadata<'a> {
 
 fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
     match event {
+        FactoryEvent::AutoModeChanged { .. } => EventMetadata {
+            project_id: None,
+            task_id: None,
+            agent_id: None,
+            run_id: None,
+        },
+        FactoryEvent::PolicyDecision {
+            project_id,
+            agent_id,
+            ..
+        } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: Some(agent_id),
+            run_id: None,
+        },
         FactoryEvent::ProjectChanged { project } => EventMetadata {
             project_id: Some(&project.id),
             task_id: None,
@@ -4720,6 +4790,19 @@ const fn provider_hook_event_value(value: ProviderHookEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_defaults_on_and_changes_with_an_audit_event() {
+        let mut store = Store::open_in_memory().unwrap();
+        assert!(store.auto_mode().unwrap());
+        let event = store.set_auto_mode(false, 42).unwrap();
+        assert!(!store.auto_mode().unwrap());
+        assert_eq!(
+            event.event,
+            FactoryEvent::AutoModeChanged { enabled: false }
+        );
+        assert_eq!(store.events_after(0, 10).unwrap(), vec![event]);
+    }
 
     #[test]
     fn rejects_a_newer_schema() {

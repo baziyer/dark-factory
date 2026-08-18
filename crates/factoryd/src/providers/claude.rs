@@ -131,6 +131,9 @@ impl Provider for ClaudeProvider {
         if let Some(permission_mode) = &ctx.permission_mode {
             args.push("--permission-mode".to_owned());
             args.push(permission_mode.clone());
+        } else if ctx.auto_mode {
+            args.push("--permission-mode".to_owned());
+            args.push("bypassPermissions".to_owned());
         }
 
         Ok(InteractiveLaunch {
@@ -240,11 +243,9 @@ fn try_pretrust_worktree(worktree: &Path, path: &Path) -> Result<(), String> {
 /// A resident session's own `factoryctl` calls (the composed delivery
 /// text's "when finished, run: `factoryctl task done ...`", and every
 /// generated hook command) are themselves `Bash` tool calls from Claude's
-/// own point of view -- without this, Claude's default interactive
-/// permission posture (TRACK5-DESIGN.md §5: no `--permission-mode` is
-/// passed, the native prompt is the human-in-the-loop gate) would stop and
-/// ask the operator to approve every single one, defeating "task done"
-/// ever completing unattended. `Bash(factoryctl *)` is the exact rule shape
+/// own point of view. This allow rule matters when auto mode is off or an
+/// explicit per-agent mode restores native prompts; it is inert under
+/// `bypassPermissions`. `Bash(factoryctl *)` is the exact rule shape
 /// Claude Code's own `--allowedTools`/`settings.json` documentation and
 /// this machine's real `~/.claude/settings.local.json` files use for a
 /// command-prefix allow rule (e.g. `"Bash(git fetch *)"`) -- verified
@@ -306,6 +307,7 @@ mod provider_tests {
             worktree: directory.join("worktree"),
             model: None,
             permission_mode: None,
+            auto_mode: true,
             resume: None,
             hook_token_path: directory.join("runtime").join("hook.token"),
             factoryctl_path: PathBuf::from("/abs/factoryctl"),
@@ -342,6 +344,8 @@ mod provider_tests {
                     .into_owned(),
                 "--session-id".to_owned(),
                 "2f5a1e2e-2222-4444-8888-0123456789ab".to_owned(),
+                "--permission-mode".to_owned(),
+                "bypassPermissions".to_owned(),
             ]
         );
         assert!(launch.env.is_empty());

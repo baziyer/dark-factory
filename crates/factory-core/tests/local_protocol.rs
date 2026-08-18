@@ -775,6 +775,10 @@ fn health_version_is_additive_so_a_new_client_reads_an_old_daemon() {
 
 #[test]
 fn status_requests_have_stable_shapes() {
+    assert_eq!(
+        serde_json::to_value(LocalRequest::SetAutoMode { enabled: false }).unwrap(),
+        serde_json::json!({"type":"set_auto_mode","data":{"enabled":false}})
+    );
     let fleet = serde_json::to_value(LocalRequest::FleetStatus).unwrap();
     assert_eq!(fleet["type"], "fleet_status");
     let agent = serde_json::to_value(LocalRequest::AgentStatus {
@@ -787,6 +791,7 @@ fn status_requests_have_stable_shapes() {
     assert_eq!(agent["data"]["agent_id"], "agent-1");
 
     let status = factory_core::status::FleetStatus {
+        auto_mode: true,
         generated_at_ms: 7,
         live_session_cap: 4,
         live_sessions: 1,
@@ -799,6 +804,7 @@ fn status_requests_have_stable_shapes() {
     .unwrap();
     assert_eq!(value["type"], "fleet_status");
     assert_eq!(value["data"]["status"]["live_session_cap"], 4);
+    assert_eq!(value["data"]["status"]["auto_mode"], true);
     assert_eq!(value["data"]["status"]["live_sessions"], 1);
     assert_eq!(value["data"]["status"]["projects"], serde_json::json!([]));
     assert_eq!(

@@ -45,9 +45,10 @@ pub struct SpawnContext {
     pub model: Option<String>,
     /// A provider-scoped permission/approval mode string (Claude:
     /// `acceptEdits`/`plan`/...; Codex: `on-request`/`never`), or `None` to
-    /// use the provider's own interactive default — the native
-    /// permission/approval prompt is the human-in-the-loop gate.
+    /// override the factory-wide auto-mode default.
     pub permission_mode: Option<String>,
+    /// Factory-wide bypass default. An explicit `permission_mode` wins.
+    pub auto_mode: bool,
     /// The provider's own prior session/thread identity to resume (e.g. a
     /// Claude session UUID or Codex thread UUID previously observed from
     /// this agent's last session), or `None` to launch fresh.

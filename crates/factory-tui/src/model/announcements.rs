@@ -122,7 +122,23 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             let text = format!("{time} {} removed", truncate_id(agent_id.as_str(), 10));
             (text, Attention::Routine)
         }
-        FactoryEvent::ProjectChanged { .. } | FactoryEvent::ProjectDeleted { .. } => return None,
+        FactoryEvent::PolicyDecision {
+            agent_id,
+            decision,
+            rule,
+            ..
+        } if decision == "deny" => (
+            format!(
+                "{time} {:<10} denied {}",
+                truncate_id(agent_id.as_str(), 10),
+                rule.as_deref().unwrap_or("policy")
+            ),
+            Attention::Routine,
+        ),
+        FactoryEvent::AutoModeChanged { .. }
+        | FactoryEvent::PolicyDecision { .. }
+        | FactoryEvent::ProjectChanged { .. }
+        | FactoryEvent::ProjectDeleted { .. } => return None,
     };
     Some(Announcement {
         at_ms: event.occurred_at_ms,

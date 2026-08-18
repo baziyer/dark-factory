@@ -110,6 +110,10 @@ impl RequestEnvelope {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum LocalRequest {
     Health,
+    /// Changes the durable factory-wide provider bypass default.
+    SetAutoMode {
+        enabled: bool,
+    },
     /// The whole daemon at one instant (`factoryctl status`): every
     /// project's agents with their sessions, runs, and queues, plus the
     /// attention list and the live-session cap. See [`crate::status`].
@@ -390,6 +394,9 @@ pub enum LocalResponse {
         factoryctl_path: String,
         #[serde(default)]
         version: String,
+    },
+    AutoModeSet {
+        enabled: bool,
     },
     FleetStatus {
         status: crate::status::FleetStatus,

@@ -1386,6 +1386,7 @@ async fn spawn_session_for_agent(
     let agent = state
         .with_store(move |store| store.get_agent_detail(&detail_project_id, &detail_agent_id))
         .await?;
+    let auto_mode = state.with_store(|store| store.auto_mode()).await?;
     let worktree = agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?;
     let worktree_path = PathBuf::from(&worktree);
 
@@ -1428,6 +1429,7 @@ async fn spawn_session_for_agent(
         worktree: worktree_path.clone(),
         model: agent.profile.model.clone(),
         permission_mode: agent.profile.permission_mode.clone(),
+        auto_mode,
         resume: resume.clone(),
         hook_token_path: hook_token_path.clone(),
         factoryctl_path: config.factoryctl_path.clone(),

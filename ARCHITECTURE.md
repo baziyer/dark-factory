@@ -170,6 +170,11 @@ catalogue.
      never have covered through the agent-scoped gate above, since that id
      didn't exist yet for it to mark.
 
+10. Autonomy posture is factory-wide durable state. Auto mode defaults on;
+    an explicit per-agent provider mode overrides it. Provider bypass never
+    bypasses Dark Factory's authenticated `PreToolUse` decision path, whose
+    allow and deny answers are appended to the event ledger before reply.
+
 ## First launch
 
 `factoryd` starts from an empty database. A human creates a project, an agent,
