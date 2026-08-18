@@ -38,15 +38,28 @@ operator from their own agents. Concretely:
   permission mode wins for that agent.
 - **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
   tool call reaches an authenticated `PreToolUse` hook. The daemon denies
-  recognizable force-push/branch-delete/reset-hard commands. It permits
-  `rm -rf` only as a simple, unquoted invocation whose literal normalized
-  targets are inside the agent worktree; changed cwd, shell control flow,
-  expansion, and other ambiguity are denied rather than interpreted. It
-  also denies reads/writes of
+  recognizable force-push, pushed-ref deletion, branch-delete, and
+  reset-hard commands. It permits
+  `rm -rf` only when every literal normalized target is inside the agent
+  worktree; changed cwd and compound destructive deletion are denied. It
+  also denies direct structured file-tool access, recognized file commands,
+  and redirections involving
   named secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, Codex `auth.json`,
-  credentials, and gcloud config). It fails closed if the daemon cannot
-  answer and records each decision as an append-only event. This is not a
-  shell parser: interpreters, generated scripts, MCP tools, provider bugs, or direct
+  credentials, and gcloud config). Bash commands use an intentionally small
+  accepted grammar: simple commands, assignments, `env`/`command`/`builtin`/
+  `exec` and plain `sudo` wrappers, quotes and backslash escapes, separators,
+  pipelines, syntactic redirections, and heredocs. Quoted metacharacters are
+  ordinary arguments, not shell operators. Quoted heredoc bodies are literal;
+  unquoted bodies are accepted only without expansion characters. Variable
+  and command substitution, backticks, process substitution, globs,
+  malformed quoting/redirection, and wrapper options whose operands are
+  ambiguous deny the whole tool call as `unsupported_shell_syntax`. Auto
+  mode remains on by default because ordinary GitHub review/comment commands
+  fit this grammar (including quoted bodies and quoted heredocs); a denied
+  command must be rewritten into the accepted form or run with auto mode off.
+  The hook fails closed if the daemon cannot answer and records each decision
+  as an append-only event. This narrow parser is still not a sandbox:
+  interpreters, generated scripts, MCP tools, provider bugs, or direct
   syscalls can evade a string-level hook policy; it does not protect the
   operator from a malicious agent. Worktrees provide collision isolation,
   not filesystem or credential isolation. A separate OS user remains the
