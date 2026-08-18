@@ -146,9 +146,9 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
         .unwrap();
     assert_eq!(detail.profile.permission_mode, None);
 
-    // Codex's existing fresh-launch test proves that this repaired None value
-    // produces its supported on-request posture when auto mode is off, rather
-    // than an approval_policy="bypass" argv entry.
+    // Codex's provider launch regression test proves that this repaired None
+    // value produces its supported on-request posture when auto mode is off,
+    // rather than an approval_policy="bypass" argv entry.
 }
 
 #[test]
