@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId, ObserverHealth,
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunClosedBy,
-    RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId, SessionSnapshot,
-    SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
+    ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
+    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::agent_attention,
-    status::{AgentStatus, MAX_QUEUE_PREVIEW},
+    status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -403,6 +403,10 @@ pub enum StoreError {
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
+    #[error("agent budget is invalid or exceeds its bound")]
+    InvalidAgentBudget,
+    #[error("agent budget is exhausted; reset it before resuming")]
+    AgentBudgetExhausted,
     #[error("agent message is invalid or exceeds its bound")]
     InvalidAgentMessage,
     #[error("task is not queued in the requested project")]
@@ -714,10 +718,162 @@ impl Store {
              VALUES (?1, ?2, ?3)",
             params![agent.id.as_str(), model, agent.updated_at_ms],
         )?;
+        transaction.execute(
+            "INSERT INTO agent_budgets (agent_id, max_tool_calls, reset_at_ms, updated_at_ms)
+             VALUES (?1, 1000, ?2, ?2)",
+            params![agent.id.as_str(), now_ms],
+        )?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
         Ok((
             agent,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    pub fn agent_budget(&self, project_id: &ProjectId, agent_id: &AgentId) -> Result<AgentBudget> {
+        self.connection
+            .query_row(
+                "SELECT b.max_tool_calls, b.tool_calls, b.exhausted, b.reset_at_ms, b.updated_at_ms
+             FROM agent_budgets b JOIN agents a ON a.id = b.agent_id
+             WHERE b.agent_id = ?1 AND a.project_id = ?2",
+                params![agent_id.as_str(), project_id.as_str()],
+                budget_from_row,
+            )
+            .optional()?
+            .ok_or(StoreError::AgentNotFound)
+    }
+
+    pub fn set_agent_budget(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        max_tool_calls: Option<u64>,
+        now_ms: i64,
+    ) -> Result<(AgentBudget, EventEnvelope)> {
+        let max_tool_calls = max_tool_calls
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::InvalidAgentBudget)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE agent_budgets SET max_tool_calls = ?1, updated_at_ms = ?2
+             WHERE agent_id = ?3 AND EXISTS (SELECT 1 FROM agents WHERE id = ?3 AND project_id = ?4)",
+            params![max_tool_calls, now_ms, agent_id.as_str(), project_id.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::AgentNotFound);
+        }
+        let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
+        let event = FactoryEvent::AgentBudgetChanged {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            budget: budget.clone(),
+            action: "configured".into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            budget,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    pub fn reset_agent_budget(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<(AgentBudget, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE agent_budgets SET tool_calls = 0, exhausted = 0, reset_at_ms = ?1, updated_at_ms = ?1
+             WHERE agent_id = ?2 AND EXISTS (SELECT 1 FROM agents WHERE id = ?2 AND project_id = ?3)",
+            params![now_ms, agent_id.as_str(), project_id.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::AgentNotFound);
+        }
+        let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
+        let event = FactoryEvent::AgentBudgetChanged {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            budget: budget.clone(),
+            action: "reset".into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            budget,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    /// Counts one authenticated tool-call attempt. Returns `true` when the
+    /// provider must deny it. The first `max_tool_calls` attempts are allowed;
+    /// the next one exhausts and durably pauses the agent.
+    pub fn observe_tool_call(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<(AgentBudget, bool, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let before = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1 AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2)", params![agent_id.as_str(), project_id.as_str()], budget_from_row).optional()?.ok_or(StoreError::AgentNotFound)?;
+        let denied = before.exhausted
+            || before
+                .max_tool_calls
+                .is_some_and(|limit| before.tool_calls >= limit);
+        if denied {
+            transaction.execute(
+                "UPDATE agent_budgets SET exhausted = 1, updated_at_ms = ?1 WHERE agent_id = ?2",
+                params![now_ms, agent_id.as_str()],
+            )?;
+        } else {
+            transaction.execute("UPDATE agent_budgets SET tool_calls = tool_calls + 1, updated_at_ms = ?1 WHERE agent_id = ?2", params![now_ms, agent_id.as_str()])?;
+        }
+        let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
+        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
+        let event = FactoryEvent::AgentBudgetChanged {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            budget: budget.clone(),
+            action: if denied { "denied" } else { "observed" }.into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            budget,
+            denied,
             EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 sequence,
@@ -744,7 +900,16 @@ impl Store {
         agent_id: &AgentId,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        if self.agent_budget(project_id, agent_id)?.exhausted {
+            return Err(StoreError::AgentBudgetExhausted);
+        }
         self.set_agent_paused(project_id, agent_id, false, now_ms)
+    }
+
+    /// Effective durable hold, composing the ordinary agent hold with the
+    /// independent budget circuit breaker.
+    pub fn agent_is_held(&self, project_id: &ProjectId, agent_id: &AgentId) -> Result<bool> {
+        Ok(!agent_pause_reasons(&self.connection, project_id, agent_id)?.is_empty())
     }
 
     fn set_agent_paused(
@@ -831,18 +996,7 @@ impl Store {
         project_id: &ProjectId,
         agent_id: &AgentId,
     ) -> Result<Option<TaskId>> {
-        let paused: Option<bool> = self
-            .connection
-            .query_row(
-                "SELECT paused FROM agents WHERE id = ?1 AND project_id = ?2",
-                params![agent_id.as_str(), project_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(paused) = paused else {
-            return Err(StoreError::AgentNotFound);
-        };
-        if paused {
+        if self.agent_is_held(project_id, agent_id)? {
             return Ok(None);
         }
         let id: Option<String> = self
@@ -3250,6 +3404,8 @@ impl Store {
         let rated = agent_attention(session.as_ref(), latest_run.as_ref());
         Ok(AgentStatus {
             agent,
+            budget: self.agent_budget(project_id, agent_id)?,
+            pause_reasons: agent_pause_reasons(&self.connection, project_id, agent_id)?,
             // Git is inspected asynchronously by the local API after the
             // consistent store snapshot has been released.
             worktree: None,
@@ -3879,7 +4035,8 @@ fn load_agent(connection: &Connection, agent_id: &AgentId) -> Result<Option<Agen
     connection
         .query_row(
             "SELECT a.id, a.project_id, a.parent_agent_id, a.role, a.provider,
-                    a.paused, a.worktree, a.created_at_ms, a.updated_at_ms,
+                    (a.paused OR COALESCE((SELECT b.exhausted FROM agent_budgets b WHERE b.agent_id = a.id), 0)),
+                    a.worktree, a.created_at_ms, a.updated_at_ms,
                     (SELECT r.id FROM runs r
                      WHERE r.agent_id = a.id
                        AND r.ended_at_ms IS NULL
@@ -4148,6 +4305,52 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         stop_requested_at_ms: row.get(25)?,
         current_run_id: parse_optional_id(current_run_id, 26)?,
     })
+}
+
+fn budget_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentBudget> {
+    let max_tool_calls: Option<i64> = row.get(0)?;
+    let tool_calls: i64 = row.get(1)?;
+    Ok(AgentBudget {
+        max_tool_calls: max_tool_calls
+            .map(|value| {
+                u64::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Integer, Box::new(error))
+                })
+            })
+            .transpose()?,
+        tool_calls: u64::try_from(tool_calls).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(1, Type::Integer, Box::new(error))
+        })?,
+        exhausted: row.get(2)?,
+        reset_at_ms: row.get(3)?,
+        updated_at_ms: row.get(4)?,
+        monetary_spend: None,
+    })
+}
+
+fn agent_pause_reasons(
+    connection: &Connection,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<Vec<AgentPauseReason>> {
+    let holds: Option<(bool, bool)> = connection
+        .query_row(
+            "SELECT a.paused, b.exhausted FROM agents a
+             JOIN agent_budgets b ON b.agent_id = a.id
+             WHERE a.id = ?1 AND a.project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (agent_hold, budget_exhausted) = holds.ok_or(StoreError::AgentNotFound)?;
+    let mut reasons = Vec::with_capacity(2);
+    if agent_hold {
+        reasons.push(AgentPauseReason::AgentHold);
+    }
+    if budget_exhausted {
+        reasons.push(AgentPauseReason::BudgetExhausted);
+    }
+    Ok(reasons)
 }
 
 fn load_agent_message(
@@ -4421,6 +4624,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0017_auto_mode.sql"))?;
         transaction.pragma_update(None, "user_version", 17)?;
         transaction.commit()?;
+        current = 17;
+    }
+    if current == 17 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0018_agent_budgets.sql"))?;
+        transaction.pragma_update(None, "user_version", 18)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -4530,6 +4740,16 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             run_id: None,
         },
         FactoryEvent::PolicyDecision {
+            project_id,
+            agent_id,
+            ..
+        } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: Some(agent_id),
+            run_id: None,
+        },
+        FactoryEvent::AgentBudgetChanged {
             project_id,
             agent_id,
             ..

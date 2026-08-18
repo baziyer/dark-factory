@@ -178,6 +178,16 @@ pub enum LocalRequest {
         instructions: String,
         memory: String,
     },
+    SetAgentBudget {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_tool_calls: Option<u64>,
+    },
+    ResetAgentBudget {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
     SendAgentMessage {
         id: MessageId,
         project_id: ProjectId,
@@ -460,6 +470,9 @@ pub enum LocalResponse {
     },
     AgentProfileUpdated {
         agent: AgentDetail,
+    },
+    AgentBudgetUpdated {
+        budget: crate::AgentBudget,
     },
     AgentMessageSent {
         message: AgentMessage,

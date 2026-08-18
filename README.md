@@ -124,7 +124,7 @@ identity.
 | `init`, `doctor`, `update`, `version` | guided install; read-only checks; check/install a newer release; print the version |
 | `project` | `add` `list` `delete` `get` `guidance set` |
 | `task` | `add` `list` `get` `start` `retry` `assign` `cancel` `update` `delete` `done` `blocked` |
-| `agent` | `add` `list` `delete` `get` `status` `profile set` `message` `inbox` `pause` `resume` |
+| `agent` | `add` `list` `delete` `get` `status` `profile set` `budget status/set/reset` `message` `inbox` `pause` `resume` |
 | `run` | `list` `stop` |
 | `session` | `list` `stop` |
 | `attach` | attach to a session's PTY by `--session` or `--agent` |
@@ -147,6 +147,18 @@ resolve a dirty worktree before any recovery action. The TUI refreshes this
 shared status in the background every five seconds; git probes are
 deadline-bounded, and an unavailable result is shown explicitly rather
 than reported as clean.
+
+Each agent starts with a durable 1,000 tool-call budget. Authenticated
+`PreToolUse` hooks count calls; once spent, the daemon denies continuation,
+pauses new delivery, and adds operator attention. Inspect it with `agent
+budget status`, change it with `agent budget set --max-tool-calls N` (or
+`unlimited`), and explicitly reopen the circuit with `agent budget reset`.
+Budget observations and operator changes are append-only events. Claude and
+Codex do not expose trustworthy per-agent monetary accounting to this
+runtime, so spend is reported as unavailable, never as zero or an estimate.
+The ordinary `agent pause` hold and budget hold are independent: `resume`
+is rejected while the budget is exhausted, and `budget reset` never removes
+an ordinary hold. Status exposes both effective `paused` and `pause_reasons`.
 
 ## The TUI
 

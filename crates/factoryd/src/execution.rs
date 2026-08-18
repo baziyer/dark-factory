@@ -1007,17 +1007,17 @@ async fn dispatch_agent(
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<(), Error> {
-    let lookup_project_id = project_id.clone();
-    let lookup_agent_id = agent_id.clone();
-    let agent = match state
-        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
+    let hold_project_id = project_id.clone();
+    let hold_agent_id = agent_id.clone();
+    let held = match state
+        .with_store(move |store| store.agent_is_held(&hold_project_id, &hold_agent_id))
         .await
     {
-        Ok(agent) => agent,
+        Ok(held) => held,
         Err(DaemonStateError::Store(StoreError::AgentNotFound)) => return Ok(()),
         Err(error) => return Err(error.into()),
     };
-    if agent.snapshot.paused {
+    if held {
         return Ok(());
     }
 
@@ -1316,6 +1316,14 @@ async fn has_pending_work(
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<bool, Error> {
+    let hold_project_id = project_id.clone();
+    let hold_agent_id = agent_id.clone();
+    if state
+        .with_store(move |store| store.agent_is_held(&hold_project_id, &hold_agent_id))
+        .await?
+    {
+        return Ok(false);
+    }
     let task_project_id = project_id.clone();
     let task_agent_id = agent_id.clone();
     let task = state
@@ -1844,6 +1852,9 @@ async fn compose_delivery(
     let session_id = session_id.clone();
     state
         .with_store(move |store| {
+            if store.agent_is_held(&project_id, &agent_id)? {
+                return Ok(None);
+            }
             let task_id = store.next_deliverable(&project_id, &agent_id)?;
             let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
             if task_id.is_none() && messages.is_empty() {
@@ -3064,6 +3075,97 @@ mod tests {
         assert!(
             backoff.try_begin_preparation(&agent_id),
             "clearing the mark must restore normal dispatch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_agent_never_spawns_for_an_exhausted_budget() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("worker").unwrap();
+        let task_id = TaskId::try_from("task-1").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: worktree.clone(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .set_agent_worktree(&project_id, &agent_id, worktree, 3)
+            .unwrap();
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Task".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 5)
+            .unwrap();
+        store
+            .set_agent_budget(&project_id, &agent_id, Some(1), 6)
+            .unwrap();
+        assert!(
+            !store
+                .observe_tool_call(&project_id, &agent_id, 7)
+                .unwrap()
+                .1
+        );
+        assert!(
+            store
+                .observe_tool_call(&project_id, &agent_id, 8)
+                .unwrap()
+                .1
+        );
+
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        dispatch_agent(
+            &config(directory.path()),
+            &state,
+            &wake_tx,
+            &SpawnBackoff::new(),
+            &project_id,
+            &agent_id,
+        )
+        .await
+        .unwrap();
+        let sessions = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.list_sessions(&project_id, None, 10)
+            })
+            .await
+            .unwrap();
+        assert!(
+            sessions.is_empty(),
+            "budget hold must prevent even a failed spawn attempt"
         );
     }
 

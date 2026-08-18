@@ -92,7 +92,7 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 17 as of 0017's
+/// which always migrates to the current `SCHEMA_VERSION`, 18 as of 0018's
 /// task-incarnation addition (0015 widened `last_hook_event` for
 /// `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
@@ -184,14 +184,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0017.
+    // Opening through the real store runs migrations 0014 through 0018.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -313,14 +313,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0017 migrations.
+    // Opening through the real store runs the 0015 through 0018 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 17);
+    assert_eq!(version, 18);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

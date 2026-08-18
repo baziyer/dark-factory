@@ -390,7 +390,7 @@ Options:
   -h, --help              Show this help";
 
 const AGENT_HELP: &str =
-    "usage: factoryctl agent <add|list|delete|get|status|profile|message|inbox|pause|resume> [options]
+    "usage: factoryctl agent <add|list|delete|get|status|profile|budget|message|inbox|pause|resume> [options]
 
 Manage agents within a project and their durable messages.
 
@@ -401,6 +401,7 @@ Actions:
   get       Fetch one agent, including its guidance file paths
   status    One agent's live picture: session, run, last hook, queue, inbox, worktree git state
   profile   Manage an agent's model, permission mode, and guidance files
+  budget    Show, set, or reset the agent's durable provider budget
   message   Send a durable message from one agent to another
   inbox     List an agent's durable messages
   pause     Durably hold an agent's queue: stop delivering new work into it
@@ -478,6 +479,11 @@ Required:
 
 Options:
   -h, --help              Show this help";
+const AGENT_BUDGET_HELP: &str = "usage: factoryctl agent budget <status|set|reset> --project ID --agent ID [--max-tool-calls N|unlimited]
+
+Tool calls are counted from authenticated PreToolUse hooks. The default is
+1000 per agent. Monetary spend is unavailable because shipped providers do
+not report trustworthy per-agent cost; Dark Factory never estimates it.";
 const AGENT_PROFILE_HELP: &str =
     "usage: factoryctl agent profile set --project ID --agent ID [options]
 
@@ -797,6 +803,15 @@ enum CliCommand {
         agent_id: String,
     },
     AgentStatus {
+        project_id: String,
+        agent_id: String,
+    },
+    AgentBudgetSet {
+        project_id: String,
+        agent_id: String,
+        max_tool_calls: Option<u64>,
+    },
+    AgentBudgetReset {
         project_id: String,
         agent_id: String,
     },
@@ -1620,6 +1635,7 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             "get" => AGENT_GET_HELP,
             "status" => AGENT_STATUS_HELP,
             "profile" => AGENT_PROFILE_HELP,
+            "budget" => AGENT_BUDGET_HELP,
             "message" => AGENT_MESSAGE_HELP,
             "inbox" => AGENT_INBOX_HELP,
             "pause" => AGENT_PAUSE_HELP,
@@ -1684,6 +1700,48 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 project_id,
                 agent_id,
             })
+        }
+        "budget" => {
+            let sub_action = take_action(&mut args, "agent budget")?;
+            let project_id = required_project(&mut args)?;
+            let agent_id = required_option(&mut args, "--agent")?;
+            match sub_action.as_str() {
+                "status" => {
+                    require_empty(&args)?;
+                    Ok(CliCommand::AgentStatus {
+                        project_id,
+                        agent_id,
+                    })
+                }
+                "set" => {
+                    let value = required_option(&mut args, "--max-tool-calls")?;
+                    let max_tool_calls = if value == "unlimited" {
+                        None
+                    } else {
+                        let parsed = parse_number(&value, "--max-tool-calls")?;
+                        if parsed == 0 {
+                            return Err(
+                                "--max-tool-calls must be greater than zero or unlimited".into()
+                            );
+                        }
+                        Some(parsed)
+                    };
+                    require_empty(&args)?;
+                    Ok(CliCommand::AgentBudgetSet {
+                        project_id,
+                        agent_id,
+                        max_tool_calls,
+                    })
+                }
+                "reset" => {
+                    require_empty(&args)?;
+                    Ok(CliCommand::AgentBudgetReset {
+                        project_id,
+                        agent_id,
+                    })
+                }
+                _ => Err(format!("unknown agent budget action {sub_action:?}")),
+            }
         }
         "profile" => {
             let sub_action = take_action(&mut args, "agent profile")?;
@@ -2022,6 +2080,22 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id,
             agent_id,
         } => Ok(LocalRequest::AgentStatus {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+        }),
+        CliCommand::AgentBudgetSet {
+            project_id,
+            agent_id,
+            max_tool_calls,
+        } => Ok(LocalRequest::SetAgentBudget {
+            project_id: parse_id(project_id, "project")?,
+            agent_id: parse_id(agent_id, "agent")?,
+            max_tool_calls,
+        }),
+        CliCommand::AgentBudgetReset {
+            project_id,
+            agent_id,
+        } => Ok(LocalRequest::ResetAgentBudget {
             project_id: parse_id(project_id, "project")?,
             agent_id: parse_id(agent_id, "agent")?,
         }),
@@ -3557,6 +3631,61 @@ mod tests {
                 session_id: "session-1".try_into().unwrap(),
                 grace_ms: 1500,
             }
+        );
+    }
+
+    #[test]
+    fn agent_budget_commands_are_cli_first_and_explicit() {
+        let (_, command) = parse_args(args(&[
+            "agent",
+            "budget",
+            "set",
+            "--project",
+            "project-1",
+            "--agent",
+            "agent-1",
+            "--max-tool-calls",
+            "25",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::SetAgentBudget {
+                project_id: "project-1".try_into().unwrap(),
+                agent_id: "agent-1".try_into().unwrap(),
+                max_tool_calls: Some(25),
+            }
+        );
+        let (_, command) = parse_args(args(&[
+            "agent",
+            "budget",
+            "reset",
+            "--project",
+            "project-1",
+            "--agent",
+            "agent-1",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(command).unwrap(),
+            LocalRequest::ResetAgentBudget {
+                project_id: "project-1".try_into().unwrap(),
+                agent_id: "agent-1".try_into().unwrap(),
+            }
+        );
+        assert!(
+            parse_args(args(&[
+                "agent",
+                "budget",
+                "set",
+                "--project",
+                "project-1",
+                "--agent",
+                "agent-1",
+                "--max-tool-calls",
+                "0"
+            ]))
+            .is_err()
         );
     }
 
