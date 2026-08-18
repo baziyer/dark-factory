@@ -597,18 +597,18 @@ pub fn restore_with_rollback_for(
     plist: &Path,
     home: &Path,
     content: &str,
-    mut rollback_runtime: impl FnMut() -> Result<(), String>,
+    rollback_runtime: impl FnMut() -> Result<(), String>,
 ) -> Result<(), MutationError> {
     let current = if plist.exists() {
         Some(match fs::read_to_string(plist) {
             Ok(content) => content,
             Err(error) => {
-                return Err(rollback_after_activation(
+                return Err(MutationError::job_failed(
                     format!(
-                        "could not read the current launchd plist {}: {error}",
+                        "could not read the current launchd plist {} after runtime rollback: {error}",
                         plist.display()
                     ),
-                    &mut rollback_runtime,
+                    error.to_string(),
                 ));
             }
         })
