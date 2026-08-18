@@ -123,7 +123,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     ) {
         let recovery = error
             .contains("launchd plist and job rolled back")
-            .then(|| previous_version.as_deref())
+            .then_some(previous_version.as_deref())
             .flatten()
             .map(|previous| {
                 probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
