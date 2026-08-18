@@ -69,11 +69,12 @@ Read-only context unless a task explicitly asks you to edit them:
 9. **Docs and issue state are load-bearing.** A change that alters behavior updates
    `README.md`/`ARCHITECTURE.md`/`docs/` in the same PR, not later, and a
    fix resolves every issue it was meant to solve rather than leaving stale
-   work behind. For GitHub, use `Closes #N` in the PR when possible and verify
-   the issue closed after merge. For an external tracker or backlog, update its
-   item to the equivalent resolved/closed state and link the change. The source
-   of the issue does not matter. A doc or issue describing work that no longer
-   exists is worse than no record at all.
+   work behind. For GitHub, use `Closes #N` in the PR when possible. For an
+   external tracker or backlog, update its item to the equivalent
+   resolved/closed state and link the change. The source of the issue does not
+   matter: after the change lands, verify every tracked item is actually closed
+   at its source. A doc or issue describing work that no longer exists is worse
+   than no record at all.
 10. **Never touch the operator's live install from a task.** `~/.dark-factory`,
     the installed `launchd` job, and the running daemon behind them are the
     owner's real system. Use a temporary `$DARK_FACTORY_HOME` and `--socket`
