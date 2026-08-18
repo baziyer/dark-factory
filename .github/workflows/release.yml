@@ -78,10 +78,4 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        # A tag with a pre-release suffix (v0.2.0-rc.1) is published as a
-        # pre-release, so `releases/latest` -- and every `factoryctl update`
-        # -- keeps pointing at the newest full release.
-        run: |
-          prerelease=
-          case "$TAG" in *-*) prerelease=--prerelease ;; esac
-          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes $prerelease dist/*
+        run: ./scripts/publish-release.sh "$TAG" "$GITHUB_SHA" "$GITHUB_REPOSITORY" dist/*

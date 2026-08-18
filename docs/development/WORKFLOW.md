@@ -193,18 +193,21 @@ them.
    `.github/workflows/release.yml` on the self-hosted Mac: `cargo build
    --locked --release`, then `scripts/package-release.sh` produces
    `dark-factory-<tag>-aarch64-apple-darwin.tar.gz` (the four binaries,
-   flat), `SHA256SUMS`, and `latest.json`, and `gh release create` attaches
-   all three; a tag with a pre-release suffix (`v0.2.0-rc.1`) is published
-   as a pre-release so `releases/latest` keeps pointing at the newest full
-   release. `latest.json` is `{version, tag, assets: {<target>: {url,
+   flat), `SHA256SUMS`, and `latest.json`. `scripts/publish-release.sh`
+   binds the remote tag to the workflow commit, creates a draft, uploads
+   only missing assets, and publishes only when the remote asset names and
+   digests exactly match that build. GitHub 5xx and transport failures get
+   four attempts with 2/4/8-second backoff. After any failed write, the
+   publisher reads the release once and accepts an already-committed exact
+   result; deterministic client errors are not retried. A tag with a
+   pre-release suffix (`v0.2.0-rc.1`) is published as a pre-release so
+   `releases/latest` keeps pointing at the newest full release. `latest.json`
+   is `{version, tag, assets: {<target>: {url,
    sha256}}}`; the newest one is always at
    `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
    (a static URL, so no Vercel mirror is needed unless GitHub is
    unreachable from somewhere that matters). Only macOS arm64 is built
-   today. **While the repository is private that URL 404s anonymously**, so
-   `factoryctl update` reports an error and the board's check fails
-   quietly — the update path starts working the moment the repository is
-   public.
+   today.
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
    and prints JSON: `current`, `latest`, `update_available`, the platform
