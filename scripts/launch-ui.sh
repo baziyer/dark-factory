@@ -8,7 +8,7 @@ factory_tui="$repository_root/target/release/factory-tui"
 
 if [ ! -x "$factoryctl" ] || [ ! -x "$factory_tui" ]; then
     echo "Dark Factory release binaries are missing." >&2
-    echo "Run: cargo +1.85.0 build --locked --workspace --release" >&2
+    echo "Run: cargo +1.86.0 build --locked --workspace --release" >&2
     exit 1
 fi
 
