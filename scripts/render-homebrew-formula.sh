@@ -1,5 +1,5 @@
 #!/bin/sh
-# Render the exact Formula/dark-factory.rb candidate for a future custom tap.
+# Render the exact Formula/dark-factory.rb candidate for the custom tap.
 # This repository does not publish the tap; #102 stays open until the formula
 # has been installed and tested against a real release from that tap.
 set -eu
@@ -57,9 +57,17 @@ checksum_for() {
 
 arm_archive="dark-factory-$tag-aarch64-apple-darwin.tar.gz"
 intel_archive="dark-factory-$tag-x86_64-apple-darwin.tar.gz"
+manifest="latest.json"
 arm_sha=$(checksum_for "$arm_archive")
 intel_sha=$(checksum_for "$intel_archive")
-version=${tag#v}
+manifest_sha=$(checksum_for "$manifest")
+version_stanza=
+case "$tag" in
+    *-*)
+        version_stanza="  version \"${tag#v}\"
+"
+        ;;
+esac
 
 cat <<RUBY
 # typed: strict
@@ -69,7 +77,8 @@ cat <<RUBY
 class DarkFactory < Formula
   desc "Terminal-first runtime for persistent coding-agent teams"
   homepage "https://github.com/$repository"
-  version "$version"
+  url "https://github.com/$repository/releases/download/$tag/$manifest"
+${version_stanza}  sha256 "$manifest_sha"
   license "MIT"
 
   depends_on :macos
@@ -110,7 +119,7 @@ class DarkFactory < Formula
 
   test do
     %w[factoryd factory-runner factoryctl factory-tui].each do |name|
-      assert_match version.to_s, shell_output("#{bin}/#{name} --version")
+      assert_equal "#{name} #{version}", shell_output("#{bin}/#{name} --version").strip
     end
   end
 end
