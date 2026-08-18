@@ -138,7 +138,9 @@ const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project v
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
 agent add --role worker --provider <claude|codex|shell>`, `factoryctl task assign --task <id> \
 --agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, `factoryctl session \
-list`, `factoryctl session stop --session <id>`.";
+list`. A worker in `waiting_for_input` needs operator attention: message it or surface its request; \
+do not stop, restart, replace, or duplicate it. Before stopping or replacing any worker, inspect \
+`factoryctl agent status --agent <agent>` and preserve or explicitly resolve any dirty worktree.";
 
 /// Fixed process and durability bounds for the dispatcher.
 pub struct Config {
@@ -4048,6 +4050,10 @@ mod tests {
         );
         assert!(text.contains("As the orchestrator"));
         assert!(text.contains("factoryctl agent add"));
+        assert!(text.contains("waiting_for_input"));
+        assert!(text.contains("do not stop, restart, replace, or duplicate it"));
+        assert!(text.contains("factoryctl agent status"));
+        assert!(text.contains("dirty worktree"));
     }
 
     #[test]

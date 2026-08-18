@@ -120,7 +120,7 @@ identity.
 | Group | Actions |
 |---|---|
 | `health`, `usage` | check the daemon; probe Codex subscription headroom on demand |
-| `status` | the whole fleet at one instant: per-project agents with session/run/queue/inbox, unassigned queues, live sessions vs. cap, and an attention list — one store read, one JSON frame |
+| `status` | the whole fleet at one instant: per-project agents with session/run/queue/inbox/worktree state, unassigned queues, live sessions vs. cap, and an attention list — one store read, one JSON frame |
 | `init`, `doctor`, `update`, `version` | guided install; read-only checks; check/install a newer release; print the version |
 | `project` | `add` `list` `delete` `get` `guidance set` |
 | `task` | `add` `list` `get` `start` `retry` `assign` `cancel` `update` `delete` `done` `blocked` |
@@ -139,8 +139,11 @@ itself can close out its own work.
 status surface — `factory-tui` reads the same requests (the live-session
 cap in its status line comes from `status`), and the attention taxonomy
 both use lives in one place, `factory_core::attention`. `agent status`
-adds the agent's profile and its worktree's `git status` (branch, changed
-files, dirty).
+also exposes each agent's worktree `git status` (branch, changed files,
+dirty); `agent status` adds the agent's profile and guidance paths. A
+`waiting_for_input` worker should be routed to the operator, not restarted
+or replaced. Inspect that worker's status and preserve or explicitly
+resolve a dirty worktree before any recovery action.
 
 ## The TUI
 

@@ -4,6 +4,8 @@
 
 use super::*;
 use crate::test_fixtures::{agent, project, run, session, task};
+use factory_core::attention::Attention;
+use factory_core::status::{AgentStatus, FleetStatus, ProjectStatus, WorktreeStatus};
 use factory_core::{RunStatus, SessionState};
 
 fn board() -> Board {
@@ -23,6 +25,45 @@ fn apply_fleet_snapshot_focuses_the_oldest_project_by_default() {
         Vec::new(),
     );
     assert_eq!(b.focused_project.unwrap().as_str(), "a");
+}
+
+#[test]
+fn fleet_status_projects_worktree_state_into_the_board() {
+    let snapshot = agent("alice", "a", AgentRole::Worker, None);
+    let mut b = board();
+    b.apply_fleet_status(FleetStatus {
+        generated_at_ms: 0,
+        live_session_cap: 4,
+        live_sessions: 0,
+        projects: vec![ProjectStatus {
+            project: project("a", 0),
+            agents: vec![AgentStatus {
+                agent: snapshot.clone(),
+                worktree: Some(WorktreeStatus {
+                    path: "/work/alice".into(),
+                    branch: Some("agent/alice".into()),
+                    changed_files: 2,
+                    dirty: true,
+                    error: None,
+                }),
+                session: None,
+                current_run: None,
+                queue_depth: 0,
+                queue: Vec::new(),
+                inbox_pending: 0,
+                attention: Attention::Routine,
+                attention_inferred: true,
+            }],
+            unassigned_queue_depth: 0,
+            unassigned_queue: Vec::new(),
+        }],
+        attention: Vec::new(),
+    });
+
+    assert_eq!(b.live_session_cap, Some(4));
+    let worktree = b.worktree_for(&snapshot.id).unwrap();
+    assert!(worktree.dirty);
+    assert_eq!(worktree.changed_files, 2);
 }
 
 #[test]

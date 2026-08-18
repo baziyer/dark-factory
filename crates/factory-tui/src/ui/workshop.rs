@@ -445,6 +445,16 @@ fn agent_detail_lines(board: &Board, project_id: &ProjectId) -> Vec<Line<'static
     if let Some(worktree) = &agent.worktree {
         lines.push(Line::from(format!("worktree: {worktree}")));
     }
+    if let Some(worktree) = board.worktree_for(&agent.id) {
+        let state = if let Some(error) = &worktree.error {
+            format!("git state unavailable: {error}")
+        } else if worktree.dirty {
+            format!("git: DIRTY ({} changed)", worktree.changed_files)
+        } else {
+            "git: clean".to_owned()
+        };
+        lines.push(Line::from(state));
+    }
     if let Some(session) = board.session_for(agent) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
