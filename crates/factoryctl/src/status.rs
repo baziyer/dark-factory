@@ -5,6 +5,11 @@ use factory_core::{
     status::{AttentionKind, FleetStatus, WorktreeStatus},
 };
 
+/// Keeps each operator-controlled value to one terminal-safe, scannable row.
+/// IDs and enum labels are validated/fixed elsewhere; every free-form field
+/// rendered by this module passes through [`display_text`].
+const MAX_DISPLAY_CHARS: usize = 160;
+
 pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String> {
     writeln!(
         output,
@@ -21,7 +26,7 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
         writeln!(
             output,
             "\n{} ({}) | agents {} | unassigned {}",
-            one_line(&project.project.name),
+            display_text(&project.project.name),
             project.project.id,
             project.agents.len(),
             project.unassigned_queue_depth
@@ -60,7 +65,7 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                 "  {} | {} | {}",
                 attention_label(item.kind),
                 subject,
-                one_line(&item.detail)
+                display_text(&item.detail)
             )
             .map_err(|error| error.to_string())?;
         }
@@ -86,7 +91,7 @@ fn worktree_label(worktree: Option<&WorktreeStatus>) -> String {
         return "no worktree".to_owned();
     };
     if let Some(error) = &worktree.error {
-        return format!("worktree unavailable: {}", one_line(error));
+        return format!("worktree unavailable: {}", display_text(error));
     }
     let state = if worktree.dirty {
         format!("dirty ({} files)", worktree.changed_files)
@@ -94,7 +99,7 @@ fn worktree_label(worktree: Option<&WorktreeStatus>) -> String {
         "clean".to_owned()
     };
     match &worktree.branch {
-        Some(branch) => format!("{state} on {}", one_line(branch)),
+        Some(branch) => format!("{state} on {}", display_text(branch)),
         None => format!("{state} on detached HEAD"),
     }
 }
@@ -110,8 +115,41 @@ const fn attention_label(kind: AttentionKind) -> &'static str {
     }
 }
 
-fn one_line(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
+fn display_text(value: &str) -> String {
+    let mut output = String::new();
+    let mut length = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if character.is_control() {
+            continue;
+        }
+        let separator = usize::from(pending_space && !output.is_empty());
+        if length + separator + 1 > MAX_DISPLAY_CHARS {
+            truncated = true;
+            break;
+        }
+        if separator == 1 {
+            output.push(' ');
+            length += 1;
+        }
+        output.push(character);
+        length += 1;
+        pending_space = false;
+    }
+
+    if truncated {
+        if length == MAX_DISPLAY_CHARS {
+            output.pop();
+        }
+        output.push('…');
+    }
+    output
 }
 
 #[cfg(test)]
@@ -205,7 +243,7 @@ mod tests {
                 ProjectStatus {
                     project: ProjectSnapshot {
                         id: project_id.clone(),
-                        name: "Dark\nFactory".into(),
+                        name: "Dark\nFactory \u{1b}[2J 東京🛠️e\u{301}".into(),
                         root: "/work/factory".into(),
                         created_at_ms: 1,
                         updated_at_ms: 1,
@@ -218,7 +256,7 @@ mod tests {
                             1,
                             Some(WorktreeStatus {
                                 path: "/tmp/author".into(),
-                                branch: Some("feature/status".into()),
+                                branch: Some("feature/\u{9}status\u{1b}]0;forged\u{7}".into()),
                                 changed_files: 3,
                                 dirty: true,
                                 error: None,
@@ -234,7 +272,7 @@ mod tests {
                                 branch: None,
                                 changed_files: 0,
                                 dirty: false,
-                                error: Some("git timed\nout".into()),
+                                error: Some("git timed\nout\u{85}\u{0}".into()),
                             }),
                         ),
                         agent(
@@ -276,7 +314,7 @@ mod tests {
                     task_id: None,
                     session_id: Some(SessionId::try_from("session-reviewer").unwrap()),
                     since_ms: 1,
-                    detail: "approve\ncommand".into(),
+                    detail: "approve\ncommand \u{1b}[2JFORGED".into(),
                 },
                 AttentionItem {
                     kind: AttentionKind::TaskBlocked,
@@ -293,20 +331,38 @@ mod tests {
 
         let mut output = Vec::new();
         write(&mut output, &status).unwrap();
+        let output = String::from_utf8(output).unwrap();
         assert_eq!(
-            String::from_utf8(output).unwrap(),
+            output,
             concat!(
                 "Dark Factory: auto on | sessions 2/4 | projects 2 | attention 2\n",
-                "\nDark Factory (factory) | agents 3 | unassigned 5\n",
-                "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/status\n",
+                "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | unassigned 5\n",
+                "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
                 "\nEmpty (empty) | agents 0 | unassigned 0\n",
                 "\nAttention:\n",
-                "  needs input | factory/reviewer | approve command\n",
+                "  needs input | factory/reviewer | approve command [2JFORGED\n",
                 "  task blocked | factory task task-7 | dependency missing\n",
             )
         );
+        assert!(
+            output
+                .chars()
+                .all(|character| character == '\n' || !character.is_control()),
+            "human output contains a terminal control: {output:?}"
+        );
+        assert!(output.contains("東京🛠️e\u{301}"));
+    }
+
+    #[test]
+    fn display_text_is_bounded_after_normalizing_and_removing_controls() {
+        let value = format!("  safe\t\u{1b}[2J\u{9b}{}  ", "界".repeat(200));
+        let rendered = display_text(&value);
+        assert_eq!(rendered.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(rendered.starts_with("safe [2J"));
+        assert!(rendered.ends_with('…'));
+        assert!(rendered.chars().all(|character| !character.is_control()));
     }
 
     #[test]
