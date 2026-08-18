@@ -190,24 +190,25 @@ them.
 1. **Build and publish**: pushing a semver tag (`git tag v0.1.1 && git push
    origin v0.1.1`, on a commit whose `Cargo.toml` workspace version is
    `0.1.1` — the workflow refuses a mismatch) runs
-   `.github/workflows/release.yml` on the self-hosted Mac: `cargo build
-   --locked --release`, then `scripts/package-release.sh` produces
-   `dark-factory-<tag>-aarch64-apple-darwin.tar.gz` (the four binaries,
-   flat), `SHA256SUMS`, and `latest.json`. `scripts/publish-release.sh`
-   binds the remote tag to the workflow commit, creates a draft, uploads
-   only missing assets, and publishes only when the remote asset names and
-   digests exactly match that build. GitHub 5xx and transport failures get
-   four attempts with 2/4/8-second backoff. After any failed write, the
-   publisher reads the release once and accepts an already-committed exact
-   result; deterministic client errors are not retried. A tag with a
-   pre-release suffix (`v0.2.0-rc.1`) is published as a pre-release so
-   `releases/latest` keeps pointing at the newest full release. `latest.json`
-   is `{version, tag, assets: {<target>: {url,
-   sha256}}}`; the newest one is always at
+   `.github/workflows/release.yml` on the trusted self-hosted arm Mac. One
+   serialized job builds `aarch64-apple-darwin` and then
+   `x86_64-apple-darwin`; there is no release-writing matrix to race shared
+   state. One `scripts/package-release.sh` transaction stages both flat
+   four-binary archives, `SHA256SUMS`, `latest.json`, and a
+   `dark-factory.rb` candidate before exposing `dist/`.
+   `scripts/publish-release.sh` binds the remote tag to the workflow commit,
+   creates a draft, uploads only missing assets, and publishes only when the
+   remote asset names and digests exactly match that build. GitHub 5xx and
+   transport failures get four attempts with 2/4/8-second backoff. After any
+   failed write, the publisher reads the release once and accepts an
+   already-committed exact result; deterministic client errors are not
+   retried. A tag with a pre-release suffix (`v0.2.0-rc.1`) is published as
+   a pre-release so `releases/latest` keeps pointing at the newest full
+   release. `latest.json` is `{version, tag, assets: {<target>: {url,
+   sha256}}}` with both macOS targets; the newest one is always at
    `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
    (a static URL, so no Vercel mirror is needed unless GitHub is
-   unreachable from somewhere that matters). Only macOS arm64 is built
-   today.
+   unreachable from somewhere that matters).
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
    and prints JSON: `current`, `latest`, `update_available`, the platform
@@ -255,8 +256,34 @@ them.
    (or repoint it the same atomic way) and `launchctl kickstart -k
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
    so a rollback never re-downloads.
-7. **Later**: a Homebrew tap and an npm wrapper, both consuming the exact
-   same release assets and manifest — no separate build path.
+7. **Homebrew bootstrap substrate**: this repository renders the exact
+   custom-tap formula from the same two archive checksums and publishes it
+   as `dark-factory.rb`. The tap does not exist yet; #102 remains open until
+   a real published release passes install/audit/test from the future
+   `baziyer/homebrew-tap` repository. To update that tap after a release:
+
+   ```sh
+   tap_dir=$(brew --repository baziyer/tap)
+   gh release download "$TAG" --repo baziyer/dark-factory \
+     --pattern dark-factory.rb --dir "$tap_dir/Formula" --clobber
+   ruby -c "$tap_dir/Formula/dark-factory.rb"
+   brew style "$tap_dir/Formula/dark-factory.rb"
+   brew audit --strict --formula baziyer/tap/dark-factory
+   brew install --formula baziyer/tap/dark-factory
+   brew test baziyer/tap/dark-factory
+   ```
+
+   The formula checksums the selected arm or Intel archive and installs all
+   four binaries. It deliberately defines no `service` block. Homebrew owns
+   only the bootstrap copy: `factoryctl init` installs the active versioned
+   runtime and launchd job, and `factoryctl update --install` remains the
+   sole active-runtime updater so live-session preservation, atomic switch,
+   health verification, and rollback stay in one implementation. The
+   formula caveats state the same split.
+8. **npm remains deferred** until non-macOS demand is demonstrated. A wrapper
+   would add Node as an installation dependency while reintroducing the same
+   bootstrap-versus-active-runtime update split; it does not simplify the
+   supported macOS product today.
 
 Add `$DARK_FACTORY_HOME/bin/current` to your shell `PATH` to run the
 installed `factoryctl`/`factory-tui`; `launchd/README.md` covers the job
@@ -290,4 +317,6 @@ looks like.
 - [x] `factoryctl update` (check-only) and `factory-tui` status-line signal
 - [x] `factoryctl update --install` (download, verify, repoint, reload, restart)
 - [x] `factoryctl init` and `factoryctl doctor`
-- [ ] Homebrew tap, npm wrapper (after the above is proven)
+- [ ] Publish and real-install-test the Homebrew tap (#102; renderer and dual
+      release substrate are in this repository)
+- [ ] Reconsider an npm wrapper after demonstrated non-macOS demand

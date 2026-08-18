@@ -9,8 +9,8 @@ their sessions, tasks, messages, and history. Sessions continue when you close
 the terminal UI. Use `factoryctl` to control the factory. Use `factory-tui` to
 watch it and respond when an agent needs you.
 
-Dark Factory currently supports macOS on Apple silicon. It supports Claude
-Code, Codex CLI, and a shell provider for tests.
+Dark Factory currently supports macOS on Apple silicon and Intel. It supports
+Claude Code, Codex CLI, and a shell provider for tests.
 
 ## Install
 
@@ -37,8 +37,13 @@ download and verify the latest Dark Factory release:
 work_dir=$(mktemp -d /tmp/dark-factory-install.XXXXXX)
 curl -fsSL https://github.com/baziyer/dark-factory/releases/latest/download/latest.json \
   -o "$work_dir/latest.json"
-asset_url=$(plutil -extract assets.aarch64-apple-darwin.url raw -o - "$work_dir/latest.json")
-asset_sha=$(plutil -extract assets.aarch64-apple-darwin.sha256 raw -o - "$work_dir/latest.json")
+case "$(uname -m)" in
+  arm64) platform_key=aarch64-apple-darwin ;;
+  x86_64) platform_key=x86_64-apple-darwin ;;
+  *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+asset_url=$(plutil -extract "assets.$platform_key.url" raw -o - "$work_dir/latest.json")
+asset_sha=$(plutil -extract "assets.$platform_key.sha256" raw -o - "$work_dir/latest.json")
 curl -fL "$asset_url" -o "$work_dir/dark-factory.tar.gz"
 printf '%s  %s\n' "$asset_sha" "$work_dir/dark-factory.tar.gz" | shasum -a 256 -c -
 tar -xzf "$work_dir/dark-factory.tar.gz" -C "$work_dir"

@@ -1,8 +1,9 @@
 name: Release
 
 # A semver tag (`v0.1.0`) pushed by a maintainer builds the macOS arm64
-# binaries and publishes them, a SHA256SUMS file, and the `latest.json`
-# manifest as a GitHub Release. `factoryctl update` reads that manifest at
+# and Intel binaries serially and publishes them, a SHA256SUMS file, a tap
+# formula candidate, and the `latest.json` manifest as a GitHub Release.
+# `factoryctl update` reads that manifest at
 # https://github.com/baziyer/dark-factory/releases/latest/download/latest.json;
 # see docs/development/WORKFLOW.md, "Release and update".
 on:
@@ -19,12 +20,14 @@ jobs:
     # as CI's `push` to `main`, the only other trigger that reaches the
     # persistent Mac — every pull request, same-repository or a fork, runs
     # on a hosted runner instead; see ci.yml): the persistent Mac, warm
-    # cache, real macOS arm64.
+    # cache, real macOS arm64. The same trusted job cross-compiles Intel; a
+    # matrix would allow two jobs to race one release and shared manifest.
     runs-on: dark-factory-mac
     timeout-minutes: 60
     env:
       TAG: ${{ github.ref_name }}
-      TARGET: aarch64-apple-darwin
+      ARM_TARGET: aarch64-apple-darwin
+      INTEL_TARGET: x86_64-apple-darwin
     steps:
       # No actions/checkout: codeload.github.com (which serves an action's
       # tarball) can 429 independently of git itself, so this job never
@@ -59,7 +62,9 @@ jobs:
           git clean -ffdx
 
       - name: Install the pinned toolchain
-        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal --no-self-update
+          rustup target add --toolchain 1.88.0 "$ARM_TARGET" "$INTEL_TARGET"
 
       - name: Check that the tag matches the workspace version
         run: |
@@ -70,10 +75,16 @@ jobs:
           fi
 
       - name: Build release binaries
-        run: cargo +1.88.0 build --locked --release --workspace
+        run: |
+          cargo +1.88.0 build --locked --release --workspace --target "$ARM_TARGET"
+          cargo +1.88.0 build --locked --release --workspace --target "$INTEL_TARGET"
 
       - name: Package
-        run: ./scripts/package-release.sh "$TAG" "$TARGET" "${CARGO_TARGET_DIR:-target}/release" dist "$GITHUB_REPOSITORY"
+        run: |
+          target_dir="${CARGO_TARGET_DIR:-target}"
+          ./scripts/package-release.sh "$TAG" dist "$GITHUB_REPOSITORY" \
+            "$ARM_TARGET" "$target_dir/$ARM_TARGET/release" \
+            "$INTEL_TARGET" "$target_dir/$INTEL_TARGET/release"
 
       - name: Publish the GitHub release
         env:

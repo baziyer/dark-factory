@@ -90,15 +90,19 @@ pub fn manifest_url() -> String {
         .unwrap_or_else(|| MANIFEST_URL.to_owned())
 }
 
-/// The asset key for the running binary's platform. Only macOS arm64 is
-/// released today (`.github/workflows/release.yml`); any other build
-/// simply never sees an available update.
+/// The asset key for the running binary's platform. Release builds cover both
+/// Apple silicon and Intel macOS; any other build never sees an available
+/// update.
 #[must_use]
-pub const fn platform_key() -> &'static str {
-    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
-        "aarch64-apple-darwin"
-    } else {
-        "unsupported"
+pub fn platform_key() -> &'static str {
+    platform_key_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn platform_key_for(os: &str, arch: &str) -> &'static str {
+    match (os, arch) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        _ => "unsupported",
     }
 }
 
@@ -318,6 +322,13 @@ mod tests {
                 .is_none()
         );
         assert!(check(None).available().is_none());
+    }
+
+    #[test]
+    fn both_released_macos_architectures_have_manifest_keys() {
+        assert_eq!(platform_key_for("macos", "aarch64"), "aarch64-apple-darwin");
+        assert_eq!(platform_key_for("macos", "x86_64"), "x86_64-apple-darwin");
+        assert_eq!(platform_key_for("linux", "x86_64"), "unsupported");
     }
 
     #[test]
