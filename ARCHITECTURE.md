@@ -180,6 +180,13 @@ catalogue.
     bypasses Dark Factory's authenticated `PreToolUse` decision path, whose
     allow and deny answers are appended to the event ledger before reply.
 
+11. Provider budgets are daemon-owned durable state, never provider- or
+    client-inferred state. Every authenticated `PreToolUse` observation is
+    counted and audited transactionally. Exhaustion pauses dispatch and
+    makes subsequent tool hooks fail closed until an explicit reset. A
+    provider metric the daemon cannot observe authoritatively is unavailable,
+    not zero and not estimated.
+
 ## First launch
 
 `factoryd` starts from an empty database. A human creates a project, an agent,

@@ -353,6 +353,35 @@ pub struct AgentSnapshot {
     pub updated_at_ms: i64,
 }
 
+/// Durable provider budget. Tool calls are counted from authenticated
+/// `PreToolUse` hooks. Providers do not currently expose trustworthy
+/// per-agent monetary spend, so it is explicitly unavailable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentBudget {
+    pub max_tool_calls: Option<u64>,
+    pub tool_calls: u64,
+    pub exhausted: bool,
+    pub reset_at_ms: i64,
+    pub updated_at_ms: i64,
+    /// Always `null` on the wire until a provider exposes authoritative
+    /// per-agent monetary accounting.
+    #[serde(default)]
+    pub monetary_spend: Option<u64>,
+}
+
+impl Default for AgentBudget {
+    fn default() -> Self {
+        Self {
+            max_tool_calls: Some(1000),
+            tool_calls: 0,
+            exhausted: false,
+            reset_at_ms: 0,
+            updated_at_ms: 0,
+            monetary_spend: None,
+        }
+    }
+}
+
 /// One process attempt. Terminal runs remain durable after the agent goes idle.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RunSnapshot {
@@ -455,6 +484,13 @@ pub enum FactoryEvent {
         decision: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         rule: Option<String>,
+    },
+    /// A budget was configured, observed, exhausted, or reset.
+    AgentBudgetChanged {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        budget: AgentBudget,
+        action: String,
     },
     ProjectChanged {
         project: ProjectSnapshot,

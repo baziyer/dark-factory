@@ -15,8 +15,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId, SessionSnapshot,
-    TaskId, TaskSnapshot,
+    AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
+    SessionSnapshot, TaskId, TaskSnapshot,
     attention::{Attention, session_attention, task_attention},
     local::AgentDetail,
 };
@@ -57,6 +57,8 @@ pub struct ProjectStatus {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentStatus {
     pub agent: AgentSnapshot,
+    #[serde(default)]
+    pub budget: AgentBudget,
     /// Current git state of the agent's working directory. Fleet status
     /// includes this so an orchestrator can inspect work before deciding
     /// whether a stopped or blocked worker is safe to recover.
@@ -112,6 +114,8 @@ pub struct WorktreeStatus {
 pub enum AttentionKind {
     /// A session is waiting for a human answer.
     NeedsInput,
+    /// The agent's durable provider budget must be reset or raised.
+    BudgetExhausted,
     /// A session ended in failure and its agent is not running.
     SessionFailed,
     /// A task was marked blocked by its agent.
@@ -153,6 +157,21 @@ pub fn attention_items(
     let mut items = Vec::new();
     for status in agents {
         let agent = &status.agent;
+        if status.budget.exhausted {
+            items.push(AttentionItem {
+                kind: AttentionKind::BudgetExhausted,
+                level: Attention::NeedsInput,
+                project_id: project_id.clone(),
+                agent_id: Some(agent.id.clone()),
+                task_id: status.queue.first().map(|task| task.id.clone()),
+                session_id: agent.current_session_id.clone(),
+                since_ms: status.budget.updated_at_ms,
+                detail: format!(
+                    "tool-call budget exhausted at {}; `factoryctl agent budget reset`",
+                    status.budget.tool_calls
+                ),
+            });
+        }
         if let Some(session) = &status.session {
             match session_attention(session.state) {
                 Attention::NeedsInput => items.push(AttentionItem {
@@ -316,6 +335,7 @@ mod tests {
         queue: Vec<TaskSnapshot>,
     ) -> AgentStatus {
         AgentStatus {
+            budget: AgentBudget::default(),
             queue_depth: u32::try_from(queue.len()).unwrap(),
             attention: session
                 .as_ref()

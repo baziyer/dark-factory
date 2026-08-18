@@ -591,6 +591,42 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::AutoModeSet { enabled })
         }
+        LocalRequest::SetAgentBudget {
+            project_id,
+            agent_id,
+            max_tool_calls,
+        } => {
+            if max_tool_calls == Some(0) {
+                return Err(ApiFailure::Invalid(
+                    "max tool calls must be greater than zero".into(),
+                ));
+            }
+            let budget = state
+                .commit_and_publish(move |store| {
+                    let (budget, event) = store.set_agent_budget(
+                        &project_id,
+                        &agent_id,
+                        max_tool_calls,
+                        now_ms()?,
+                    )?;
+                    Ok((budget, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentBudgetUpdated { budget })
+        }
+        LocalRequest::ResetAgentBudget {
+            project_id,
+            agent_id,
+        } => {
+            let budget = state
+                .commit_and_publish(move |store| {
+                    let (budget, event) =
+                        store.reset_agent_budget(&project_id, &agent_id, now_ms()?)?;
+                    Ok((budget, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::AgentBudgetUpdated { budget })
+        }
         LocalRequest::FleetStatus => {
             let live_session_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
             let (projects, live_sessions, generated_at_ms, auto_mode) = state
@@ -1406,6 +1442,22 @@ async fn handle_request(
             let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
             let policy_decision = (event == ProviderHookEvent::PreToolUse)
                 .then(|| crate::policy::decide(&payload, Path::new(&session.worktree)));
+            let budget_denied = if event == ProviderHookEvent::PreToolUse {
+                let budget_project_id = project_id.clone();
+                let budget_agent_id = agent_id.clone();
+                state
+                    .commit_and_publish(move |store| {
+                        let (_, denied, event) = store.observe_tool_call(
+                            &budget_project_id,
+                            &budget_agent_id,
+                            now_ms()?,
+                        )?;
+                        Ok((denied, vec![event]))
+                    })
+                    .await?
+            } else {
+                false
+            };
             let record_session_id = session_id.clone();
             let updated_session = state
                 .commit_and_publish(move |store| {
@@ -1420,23 +1472,31 @@ async fn handle_request(
                     Ok((session, vec![event_envelope]))
                 })
                 .await?;
-            let reply =
-                if let Some(decision) = policy_decision {
-                    let denied_by = decision.denied_by.map(str::to_owned);
-                    let policy_event = FactoryEvent::PolicyDecision {
-                        project_id: project_id.clone(),
-                        agent_id: agent_id.clone(),
-                        session_id: session_id.clone(),
-                        tool_name: decision.tool_name,
-                        decision: if denied_by.is_some() { "deny" } else { "allow" }.to_owned(),
-                        rule: denied_by.clone(),
-                    };
-                    state
-                        .commit_and_publish(move |store| {
-                            let event = store.record_policy_decision(policy_event, now_ms()?)?;
-                            Ok(((), vec![event]))
-                        })
-                        .await?;
+            let reply = if let Some(decision) = policy_decision {
+                let denied_by = decision.denied_by.map(str::to_owned);
+                let policy_event = FactoryEvent::PolicyDecision {
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    tool_name: decision.tool_name,
+                    decision: if denied_by.is_some() { "deny" } else { "allow" }.to_owned(),
+                    rule: denied_by.clone(),
+                };
+                state
+                    .commit_and_publish(move |store| {
+                        let event = store.record_policy_decision(policy_event, now_ms()?)?;
+                        Ok(((), vec![event]))
+                    })
+                    .await?;
+                if budget_denied {
+                    serde_json::json!({
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": "Dark Factory budget exhausted; run factoryctl agent budget reset"
+                        }
+                    })
+                } else {
                     denied_by.map_or_else(
                     || serde_json::json!({}),
                     |rule| serde_json::json!({
@@ -1447,40 +1507,41 @@ async fn handle_request(
                         }
                     }),
                 )
-                } else if matches!(
-                    event,
-                    ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
-                ) {
-                    let stop_hook_active = payload
-                        .get("stop_hook_active")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false);
-                    // Deletion invariant (ARCHITECTURE.md #9, PR #50 re-review
-                    // correction): `stop_hook_reply` calls `compose_delivery`,
-                    // which can lazily recreate this agent's guidance files
-                    // the same way `deliver_pending`'s does -- gated the same
-                    // way, at this call site, since `execution` and `agent_id`
-                    // are already in scope here. A decline replies `{}`,
-                    // matching `stop_hook_active`'s own silent reply just
-                    // above: this is a live provider process's own hook call,
-                    // not an operator request it can retry, so nothing here
-                    // surfaces as an error into it.
-                    if execution.try_begin_agent_write(&agent_id) {
-                        let result = execution::stop_hook_reply(
-                            state,
-                            guidance_root,
-                            &updated_session,
-                            stop_hook_active,
-                        )
-                        .await;
-                        execution.end_agent_write(&agent_id);
-                        result?
-                    } else {
-                        serde_json::json!({})
-                    }
+                }
+            } else if matches!(
+                event,
+                ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
+            ) {
+                let stop_hook_active = payload
+                    .get("stop_hook_active")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                // Deletion invariant (ARCHITECTURE.md #9, PR #50 re-review
+                // correction): `stop_hook_reply` calls `compose_delivery`,
+                // which can lazily recreate this agent's guidance files
+                // the same way `deliver_pending`'s does -- gated the same
+                // way, at this call site, since `execution` and `agent_id`
+                // are already in scope here. A decline replies `{}`,
+                // matching `stop_hook_active`'s own silent reply just
+                // above: this is a live provider process's own hook call,
+                // not an operator request it can retry, so nothing here
+                // surfaces as an error into it.
+                if execution.try_begin_agent_write(&agent_id) {
+                    let result = execution::stop_hook_reply(
+                        state,
+                        guidance_root,
+                        &updated_session,
+                        stop_hook_active,
+                    )
+                    .await;
+                    execution.end_agent_write(&agent_id);
+                    result?
                 } else {
                     serde_json::json!({})
-                };
+                }
+            } else {
+                serde_json::json!({})
+            };
             if event == ProviderHookEvent::UserPromptSubmit {
                 // Commit any pending PTY-typed delivery *now*, before this
                 // hook request's own reply reaches the client -- closes a
@@ -1729,6 +1790,7 @@ mod worktree_status_tests {
         for index in 0..12 {
             let id = AgentId::try_from(format!("worker-{index}")).unwrap();
             agents.push(status::AgentStatus {
+                budget: factory_core::AgentBudget::default(),
                 agent: AgentSnapshot {
                     id,
                     project_id: project_id.clone(),
@@ -2948,6 +3010,74 @@ mod deletion_gate_tests {
             FactoryEvent::PolicyDecision { decision, rule: Some(rule), .. }
                 if decision == "deny" && rule == "destructive_git"
         )));
+        execution.shutdown().await.unwrap();
+        join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exhausted_budget_denies_hook_and_reset_reopens_it() {
+        let directory = private_tempdir();
+        let (state, execution, join, project_id, agent_id, _) = setup(directory.path()).await;
+        handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::SetAgentBudget {
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                max_tool_calls: Some(1),
+            },
+        )
+        .await
+        .unwrap();
+        let hook = || LocalRequest::ProviderHook {
+            token: "a".repeat(HOOK_TOKEN_LEN),
+            event: ProviderHookEvent::PreToolUse,
+            payload: serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"README.md"}}),
+        };
+        let first = handle_request(&state, &execution, directory.path(), hook())
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, LocalResponse::ProviderHookReply { ref reply } if *reply == serde_json::json!({}))
+        );
+        let second = handle_request(&state, &execution, directory.path(), hook())
+            .await
+            .unwrap();
+        assert_eq!(
+            match second {
+                LocalResponse::ProviderHookReply { reply } =>
+                    reply["hookSpecificOutput"]["permissionDecision"].clone(),
+                _ => unreachable!(),
+            },
+            "deny"
+        );
+        let status = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| store.agent_status(&project_id, &agent_id)
+            })
+            .await
+            .unwrap();
+        assert!(status.budget.exhausted && status.agent.paused);
+        handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ResetAgentBudget {
+                project_id,
+                agent_id,
+            },
+        )
+        .await
+        .unwrap();
+        let third = handle_request(&state, &execution, directory.path(), hook())
+            .await
+            .unwrap();
+        assert!(
+            matches!(third, LocalResponse::ProviderHookReply { ref reply } if *reply == serde_json::json!({}))
+        );
         execution.shutdown().await.unwrap();
         join.await.unwrap().unwrap();
     }

@@ -135,8 +135,25 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             ),
             Attention::Routine,
         ),
+        FactoryEvent::AgentBudgetChanged {
+            agent_id,
+            budget,
+            action,
+            ..
+        } if action == "denied" => (
+            format!(
+                "{time} {:<10} budget exhausted ({}/{})",
+                truncate_id(agent_id.as_str(), 10),
+                budget.tool_calls,
+                budget
+                    .max_tool_calls
+                    .map_or_else(|| "unlimited".into(), |n| n.to_string())
+            ),
+            Attention::NeedsInput,
+        ),
         FactoryEvent::AutoModeChanged { .. }
         | FactoryEvent::PolicyDecision { .. }
+        | FactoryEvent::AgentBudgetChanged { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
     };

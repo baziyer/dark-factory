@@ -19,6 +19,73 @@ fn agent_id(value: &str) -> AgentId {
     AgentId::try_from(value).unwrap()
 }
 
+#[test]
+fn tool_call_budget_is_durable_exhausts_and_requires_reset() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("worker"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        let (configured, _) = store
+            .set_agent_budget(&project_id("factory"), &agent_id("worker"), Some(1), 3)
+            .unwrap();
+        assert_eq!(configured.max_tool_calls, Some(1));
+        let (_, denied, _) = store
+            .observe_tool_call(&project_id("factory"), &agent_id("worker"), 4)
+            .unwrap();
+        assert!(!denied);
+    }
+    let mut store = Store::open(&database).unwrap();
+    let (exhausted, denied, event) = store
+        .observe_tool_call(&project_id("factory"), &agent_id("worker"), 5)
+        .unwrap();
+    assert!(denied);
+    assert!(exhausted.exhausted);
+    assert!(
+        store
+            .agent_status(&project_id("factory"), &agent_id("worker"))
+            .unwrap()
+            .agent
+            .paused
+    );
+    assert!(
+        matches!(event.event, FactoryEvent::AgentBudgetChanged { action, .. } if action == "denied")
+    );
+    let (reset, _) = store
+        .reset_agent_budget(&project_id("factory"), &agent_id("worker"), 6)
+        .unwrap();
+    assert_eq!(reset.tool_calls, 0);
+    assert!(!reset.exhausted);
+    assert!(
+        !store
+            .agent_status(&project_id("factory"), &agent_id("worker"))
+            .unwrap()
+            .agent
+            .paused
+    );
+}
+
 /// Creates a live session for `agent` and opens a task-episode for `task`
 /// inside it, mirroring what the old `reserve_task_run` helper below used
 /// to do in one call. `seed` must be unique per call within a test (it
