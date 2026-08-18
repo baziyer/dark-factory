@@ -151,9 +151,25 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             ),
             Attention::NeedsInput,
         ),
+        FactoryEvent::RepositoryOperation {
+            agent_id,
+            operation,
+            phase,
+            success,
+            ..
+        } if phase == "finished" => (
+            format!(
+                "{time} {:<10} {} {}",
+                truncate_id(agent_id.as_str(), 10),
+                operation,
+                if *success == Some(true) { "done" } else { "failed" }
+            ),
+            if *success == Some(true) { Attention::Routine } else { Attention::Failed },
+        ),
         FactoryEvent::AutoModeChanged { .. }
         | FactoryEvent::PolicyDecision { .. }
         | FactoryEvent::AgentBudgetChanged { .. }
+        | FactoryEvent::RepositoryOperation { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
     };

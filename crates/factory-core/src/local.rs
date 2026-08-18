@@ -331,6 +331,38 @@ pub enum LocalRequest {
         event: ProviderHookEvent,
         payload: serde_json::Value,
     },
+    /// Read-only git state for the calling authenticated session's exact
+    /// daemon-managed worktree. `token` is read from the session token file
+    /// by `factoryctl`; callers never select an agent, project, or path.
+    GitStatus {
+        token: String,
+    },
+    GitDiff {
+        token: String,
+        staged: bool,
+    },
+    /// Stage every change in the session worktree and create one commit.
+    GitCommit {
+        token: String,
+        message: String,
+    },
+    /// Push only the session's current `agent/<id>` branch, without force.
+    GitPush {
+        token: String,
+    },
+    /// Open a PR from the session branch to the repository's default base.
+    PrOpen {
+        token: String,
+        title: String,
+        body: String,
+    },
+    /// Update only a PR whose head is the calling session's branch.
+    PrUpdate {
+        token: String,
+        number: u64,
+        title: String,
+        body: String,
+    },
     /// Attaches to a terminal-mode session's retained-then-live PTY output
     /// on this connection. The connection commits to terminal-proxy mode:
     /// after the first `AttachTerminal`, only more `AttachTerminal` requests
@@ -384,6 +416,7 @@ pub enum LocalRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
+    Unauthorized,
     UnsupportedProtocol,
     NotFound,
     Conflict,
@@ -415,6 +448,10 @@ pub enum LocalResponse {
     },
     AgentStatus {
         status: Box<crate::status::AgentStatusDetail>,
+    },
+    GitOutput {
+        operation: String,
+        output: String,
     },
     ProjectCreated {
         project: ProjectSnapshot,

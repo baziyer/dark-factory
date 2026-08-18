@@ -43,15 +43,59 @@ use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
     guidance::{self, GuidanceError},
+    repository,
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, SessionControlTarget,
-        StoreError, UpdateAgentProfile,
+        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
+        SessionControlTarget, StoreError, UpdateAgentProfile,
     },
 };
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
+
+enum RepositoryRequest {
+    Status,
+    Diff {
+        staged: bool,
+    },
+    Commit {
+        message: String,
+    },
+    Push,
+    PrOpen {
+        title: String,
+        body: String,
+    },
+    PrUpdate {
+        number: u64,
+        title: String,
+        body: String,
+    },
+}
+
+struct RepositoryAudit {
+    project_id: ProjectId,
+    agent_id: factory_core::AgentId,
+    session_id: SessionId,
+    operation: String,
+    phase: String,
+    success: Option<bool>,
+    reference: Option<String>,
+}
+
+impl RepositoryRequest {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Status => "git_status",
+            Self::Diff { .. } => "git_diff",
+            Self::Commit { .. } => "git_commit",
+            Self::Push => "git_push",
+            Self::PrOpen { .. } => "pr_open",
+            Self::PrUpdate { .. } => "pr_update",
+        }
+    }
+}
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
@@ -69,6 +113,7 @@ type LimitedReader = Take<BufReader<OwnedReadHalf>>;
 #[derive(Debug)]
 enum ApiFailure {
     Invalid(String),
+    Unauthorized(String),
     Conflict(String),
     Store(StoreError),
     Internal(String),
@@ -89,6 +134,7 @@ impl ApiFailure {
     fn into_response(self) -> LocalResponse {
         let (code, message) = match self {
             Self::Invalid(message) => (ErrorCode::InvalidRequest, message),
+            Self::Unauthorized(message) => (ErrorCode::Unauthorized, message),
             Self::Conflict(message) => (ErrorCode::Conflict, message),
             Self::Store(StoreError::InvalidEventLimit) => (
                 ErrorCode::InvalidRequest,
@@ -681,6 +727,38 @@ async fn handle_request(
                     attention,
                 },
             })
+        }
+        LocalRequest::GitStatus { token } => {
+            repository_request(state, token, RepositoryRequest::Status).await
+        }
+        LocalRequest::GitDiff { token, staged } => {
+            repository_request(state, token, RepositoryRequest::Diff { staged }).await
+        }
+        LocalRequest::GitCommit { token, message } => {
+            repository_request(state, token, RepositoryRequest::Commit { message }).await
+        }
+        LocalRequest::GitPush { token } => {
+            repository_request(state, token, RepositoryRequest::Push).await
+        }
+        LocalRequest::PrOpen { token, title, body } => {
+            repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
+        }
+        LocalRequest::PrUpdate {
+            token,
+            number,
+            title,
+            body,
+        } => {
+            repository_request(
+                state,
+                token,
+                RepositoryRequest::PrUpdate {
+                    number,
+                    title,
+                    body,
+                },
+            )
+            .await
         }
         LocalRequest::AgentStatus {
             project_id,
@@ -1864,6 +1942,146 @@ mod worktree_status_tests {
     }
 }
 
+async fn repository_request(
+    state: &ApiState,
+    token: String,
+    request: RepositoryRequest,
+) -> Result<LocalResponse, ApiFailure> {
+    let session = state
+        .with_store(move |store| store.find_session_by_hook_token(&token))
+        .await?
+        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
+    let project_id = session.project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&project_id))
+        .await?;
+    let _slot = state.repository_slot().await;
+    let operation = request.name().to_owned();
+    let returns_reference = matches!(
+        request,
+        RepositoryRequest::Commit { .. }
+            | RepositoryRequest::Push
+            | RepositoryRequest::PrOpen { .. }
+            | RepositoryRequest::PrUpdate { .. }
+    );
+    record_repository_audit(
+        state,
+        RepositoryAudit {
+            project_id: session.project_id.clone(),
+            agent_id: session.agent_id.clone(),
+            session_id: session.id.clone(),
+            operation: operation.clone(),
+            phase: "requested".into(),
+            success: None,
+            reference: None,
+        },
+    )
+    .await?;
+    let audit_project_id = session.project_id.clone();
+    let audit_agent_id = session.agent_id.clone();
+    let audit_session_id = session.id.clone();
+    let result = match repository::Target::validate(session, project).await {
+        Ok(target) => {
+            let command = match request {
+                RepositoryRequest::Status => target.status().await,
+                RepositoryRequest::Diff { staged } => target.diff(staged).await,
+                RepositoryRequest::Commit { message } => target.commit(&message).await,
+                RepositoryRequest::Push => target.push().await,
+                RepositoryRequest::PrOpen { title, body } => target.pr_open(&title, &body).await,
+                RepositoryRequest::PrUpdate {
+                    number,
+                    title,
+                    body,
+                } => target.pr_update(number, &title, &body).await,
+            };
+            (target, command)
+        }
+        Err(error) => {
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: audit_project_id,
+                    agent_id: audit_agent_id,
+                    session_id: audit_session_id,
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(false),
+                    reference: None,
+                },
+            )
+            .await?;
+            return Err(repository_failure(error));
+        }
+    };
+    let (target, command) = result;
+    match command {
+        Ok(output) => {
+            let reference = returns_reference.then(|| output.clone());
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: target.project_id.clone(),
+                    agent_id: target.agent_id.clone(),
+                    session_id: target.session_id.clone(),
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(true),
+                    reference,
+                },
+            )
+            .await?;
+            Ok(LocalResponse::GitOutput { operation, output })
+        }
+        Err(error) => {
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: target.project_id,
+                    agent_id: target.agent_id,
+                    session_id: target.session_id,
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(false),
+                    reference: None,
+                },
+            )
+            .await?;
+            Err(repository_failure(error))
+        }
+    }
+}
+
+async fn record_repository_audit(
+    state: &ApiState,
+    audit: RepositoryAudit,
+) -> Result<(), ApiFailure> {
+    state
+        .commit_and_publish(move |store| {
+            let event = store.record_repository_operation(NewRepositoryOperation {
+                project_id: audit.project_id,
+                agent_id: audit.agent_id,
+                session_id: audit.session_id,
+                operation: audit.operation,
+                phase: audit.phase,
+                success: audit.success,
+                reference: audit.reference,
+                occurred_at_ms: now_ms()?,
+            })?;
+            Ok(((), vec![event]))
+        })
+        .await?;
+    Ok(())
+}
+
+fn repository_failure(error: repository::Error) -> ApiFailure {
+    match error {
+        repository::Error::Rejected(_) => ApiFailure::Invalid(error.to_string()),
+        repository::Error::Command(_) | repository::Error::Timeout => {
+            ApiFailure::Conflict(error.to_string())
+        }
+    }
+}
+
 /// Absolute guidance-file paths for one agent, computed from the daemon's
 /// state root; never touches the filesystem itself.
 struct AgentGuidancePaths {
@@ -2794,6 +3012,7 @@ fn is_constraint_error(error: &StoreError) -> bool {
 fn api_failure_to_io(error: ApiFailure) -> io::Error {
     io::Error::other(match error {
         ApiFailure::Invalid(message)
+        | ApiFailure::Unauthorized(message)
         | ApiFailure::Conflict(message)
         | ApiFailure::Internal(message) => message,
         ApiFailure::Store(error) => error.to_string(),

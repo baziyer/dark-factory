@@ -4813,6 +4813,16 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
             agent_id: None,
             run_id: None,
         },
+        FactoryEvent::RepositoryOperation {
+            project_id,
+            agent_id,
+            ..
+        } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
+            agent_id: Some(agent_id),
+            run_id: None,
+        },
     }
 }
 

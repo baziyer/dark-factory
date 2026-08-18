@@ -41,6 +41,10 @@ pub struct DaemonState {
     /// agent's lifetime (one `Arc<AsyncMutex<()>>` reused for every
     /// delivery attempt).
     delivery_slots: Arc<Mutex<HashMap<AgentId, Arc<AsyncMutex<()>>>>>,
+    /// All repository mutations pass through one daemon-owned committer.
+    /// Read-only status/diff operations share this lock too, so their output
+    /// is never captured halfway through a commit or push.
+    repository_slot: Arc<AsyncMutex<()>>,
 }
 
 /// Held for the duration of one delivery attempt (compose through commit,
@@ -69,7 +73,12 @@ impl DaemonState {
             store: Arc::new(Mutex::new(store)),
             events,
             delivery_slots: Arc::new(Mutex::new(HashMap::new())),
+            repository_slot: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    pub async fn repository_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.repository_slot).lock_owned().await
     }
 
     /// Attempts to claim `agent_id`'s single pending-delivery slot,

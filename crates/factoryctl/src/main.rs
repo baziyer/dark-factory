@@ -34,10 +34,11 @@ const AGENT_DIR_ENV: &str = "DARK_FACTORY_AGENT_DIR";
 /// socket's permissions. Checked only by the outbox-eligible commands
 /// (`task done`/`task blocked`/`agent message`).
 const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
+const SESSION_TOKEN_FILE_ENV: &str = "DARK_FACTORY_SESSION_TOKEN_FILE";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|init|doctor|update|version|usage|project|task|agent|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -56,6 +57,8 @@ Commands:
                                                Manage and run tasks
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
+  git status|diff|commit|push                  Session-authenticated daemon-owned Git operations
+  pr open|update                               Session-authenticated daemon-owned pull requests
   run list|stop                               List and stop process attempts
   session list|stop                           List and stop resident provider sessions
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
@@ -164,6 +167,26 @@ Options:
   --limit N                 Page size (default and max: 100; not with --follow)
   --follow                   Stream events as they occur
   -h, --help                  Show this help";
+
+const GIT_HELP: &str = "usage: factoryctl git <status|diff|commit|push> [options]
+
+Run Git through factoryd for the calling session's exact managed worktree and
+agent/<id> branch. Identity comes only from DARK_FACTORY_SESSION_TOKEN_FILE.
+The daemon serializes operations and never accepts a path, branch, or remote.
+
+Actions:
+  status                    Show short branch/worktree status
+  diff [--staged]           Show an unstaged or staged diff
+  commit --message TEXT     Stage all worktree changes and commit them
+  push                      Push the managed branch to origin without force";
+const PR_HELP: &str = "usage: factoryctl pr <open|update> [options]
+
+Open or update a pull request through factoryd for the calling session branch.
+The daemon verifies an updated PR has that exact head branch.
+
+Actions:
+  open --title TEXT (--body TEXT | --body-file PATH)
+  update --number N --title TEXT (--body TEXT | --body-file PATH)";
 
 const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete|get|guidance> [options]
 
@@ -848,6 +871,23 @@ enum CliCommand {
         project_id: String,
         agent_id: String,
     },
+    GitStatus,
+    GitDiff {
+        staged: bool,
+    },
+    GitCommit {
+        message: String,
+    },
+    GitPush,
+    PrOpen {
+        title: String,
+        body: String,
+    },
+    PrUpdate {
+        number: u64,
+        title: String,
+        body: String,
+    },
     RunList {
         project_id: String,
         after_id: Option<String>,
@@ -1302,6 +1342,8 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             parse_attach(args).map(|command| (socket, command))
         }
         "agent" => parse_agent(args).map(|command| (socket, command)),
+        "git" => parse_git(args).map(|command| (socket, command)),
+        "pr" => parse_pr(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
         "session" => parse_session(args).map(|command| (socket, command)),
         "hook" => {
@@ -1317,6 +1359,75 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             parse_events(args).map(|command| (socket, command))
         }
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
+    }
+}
+
+fn parse_git(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(GIT_HELP));
+    }
+    let action = take_action(&mut args, "git")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(GIT_HELP));
+    }
+    match action.as_str() {
+        "status" => {
+            require_empty(&args)?;
+            Ok(CliCommand::GitStatus)
+        }
+        "diff" => {
+            let staged = take_flag(&mut args, "--staged")?;
+            require_empty(&args)?;
+            Ok(CliCommand::GitDiff { staged })
+        }
+        "commit" => {
+            let message = required_option(&mut args, "--message")?;
+            require_empty(&args)?;
+            Ok(CliCommand::GitCommit { message })
+        }
+        "push" => {
+            require_empty(&args)?;
+            Ok(CliCommand::GitPush)
+        }
+        _ => Err(format!("unknown git action {action:?}")),
+    }
+}
+
+fn parse_pr(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(PR_HELP));
+    }
+    let action = take_action(&mut args, "pr")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(PR_HELP));
+    }
+    let title = required_option(&mut args, "--title")?;
+    let body = take_option(&mut args, "--body")?;
+    let body_file = take_option(&mut args, "--body-file")?;
+    let body = match (body, body_file) {
+        (Some(body), None) => body,
+        (None, Some(path)) => read_guidance_file(&path)?,
+        (Some(_), Some(_)) => return Err("--body and --body-file are mutually exclusive".into()),
+        (None, None) => return Err("--body or --body-file is required".into()),
+    };
+    match action.as_str() {
+        "open" => {
+            require_empty(&args)?;
+            Ok(CliCommand::PrOpen { title, body })
+        }
+        "update" => {
+            let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
+            if number == 0 {
+                return Err("--number must be positive".into());
+            }
+            require_empty(&args)?;
+            Ok(CliCommand::PrUpdate {
+                number,
+                title,
+                body,
+            })
+        }
+        _ => Err(format!("unknown pr action {action:?}")),
     }
 }
 
@@ -2154,6 +2265,35 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             agent_id: parse_id(agent_id, "agent")?,
         }),
+        CliCommand::GitStatus => Ok(LocalRequest::GitStatus {
+            token: session_token()?,
+        }),
+        CliCommand::GitDiff { staged } => Ok(LocalRequest::GitDiff {
+            token: session_token()?,
+            staged,
+        }),
+        CliCommand::GitCommit { message } => Ok(LocalRequest::GitCommit {
+            token: session_token()?,
+            message,
+        }),
+        CliCommand::GitPush => Ok(LocalRequest::GitPush {
+            token: session_token()?,
+        }),
+        CliCommand::PrOpen { title, body } => Ok(LocalRequest::PrOpen {
+            token: session_token()?,
+            title,
+            body,
+        }),
+        CliCommand::PrUpdate {
+            number,
+            title,
+            body,
+        } => Ok(LocalRequest::PrUpdate {
+            token: session_token()?,
+            number,
+            title,
+            body,
+        }),
         CliCommand::RunList {
             project_id,
             after_id,
@@ -2206,6 +2346,19 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             }
         }),
     }
+}
+
+fn session_token() -> Result<String, String> {
+    let path = env::var(SESSION_TOKEN_FILE_ENV).map_err(|_| {
+        format!("{SESSION_TOKEN_FILE_ENV} is required; this command only works inside a session")
+    })?;
+    let token = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read session token file: {error}"))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err("session token file is empty".into());
+    }
+    Ok(token)
 }
 
 fn generated_id<T>() -> Result<T, String>
@@ -2361,6 +2514,51 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    #[test]
+    fn repository_commands_expose_no_target_or_force_selectors() {
+        let (_, command) = parse_args(vec![
+            "git".into(),
+            "commit".into(),
+            "--message".into(),
+            "small fix".into(),
+        ])
+        .unwrap();
+        assert!(matches!(command, CliCommand::GitCommit { ref message } if message == "small fix"));
+
+        let (_, command) = parse_args(vec![
+            "pr".into(),
+            "update".into(),
+            "--number".into(),
+            "7".into(),
+            "--title".into(),
+            "Revised".into(),
+            "--body".into(),
+            "Details".into(),
+        ])
+        .unwrap();
+        assert!(matches!(command, CliCommand::PrUpdate { number: 7, .. }));
+
+        assert!(parse_args(vec!["git".into(), "push".into(), "--force".into()]).is_err());
+        assert!(
+            parse_args(vec![
+                "git".into(),
+                "push".into(),
+                "--branch".into(),
+                "main".into()
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_args(vec![
+                "pr".into(),
+                "open".into(),
+                "--repo".into(),
+                "other/repo".into()
+            ])
+            .is_err()
+        );
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()

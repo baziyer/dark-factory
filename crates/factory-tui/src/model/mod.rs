@@ -709,6 +709,7 @@ impl Board {
                     agent.paused = paused;
                 }
             }
+            FactoryEvent::RepositoryOperation { .. } => {}
             FactoryEvent::ProjectChanged { project } => {
                 if let Some(existing) = self.projects.iter_mut().find(|p| p.id == project.id) {
                     *existing = project;
@@ -889,6 +890,7 @@ fn event_agent(event: &FactoryEvent) -> Option<&AgentId> {
         FactoryEvent::SessionChanged { session } => Some(&session.agent_id),
         FactoryEvent::PolicyDecision { agent_id, .. } => Some(agent_id),
         FactoryEvent::AgentBudgetChanged { agent_id, .. } => Some(agent_id),
+        FactoryEvent::RepositoryOperation { agent_id, .. } => Some(agent_id),
         FactoryEvent::AutoModeChanged { .. }
         | FactoryEvent::TaskDeleted { .. }
         | FactoryEvent::ProjectChanged { .. }
