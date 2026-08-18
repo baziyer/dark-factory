@@ -39,16 +39,31 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 }
 
 fn destructive_git(command: &str) -> bool {
-    let normalized = command.split_whitespace().collect::<Vec<_>>();
-    normalized.contains(&"git")
-        && (normalized.windows(2).any(|w| w == ["reset", "--hard"])
-            || (normalized.contains(&"push")
-                && normalized
-                    .iter()
-                    .any(|arg| matches!(*arg, "--force" | "-f") || arg.starts_with("--force=")))
-            || normalized
-                .windows(2)
-                .any(|w| w[0] == "branch" && matches!(w[1], "-D" | "-d" | "--delete")))
+    let words = command.split_whitespace().collect::<Vec<_>>();
+    let simple_git = words.first().is_some_and(|word| {
+        Path::new(word.trim_matches(|c| matches!(c, '\'' | '"')))
+            .file_name()
+            .is_some_and(|name| name == "git")
+    });
+    let chained_git = contains_shell_control(command) && words.iter().any(|word| *word == "git");
+    if !simple_git && !chained_git {
+        return false;
+    }
+    words.windows(2).any(|w| w == ["reset", "--hard"])
+        || (words.contains(&"push") && words.iter().any(|arg| force_push_option(arg)))
+        || words
+            .windows(2)
+            .any(|w| w[0] == "branch" && matches!(w[1], "-D" | "-d" | "--delete"))
+}
+
+fn force_push_option(argument: &str) -> bool {
+    argument.starts_with("--force") || (argument.starts_with("-f") && !argument.starts_with("--"))
+}
+
+fn contains_shell_control(command: &str) -> bool {
+    command
+        .chars()
+        .any(|character| matches!(character, ';' | '&' | '|' | '\n' | '\r'))
 }
 
 fn recursive_force_delete_outside(command: &str, worktree: &Path) -> bool {
@@ -59,12 +74,26 @@ fn recursive_force_delete_outside(command: &str, worktree: &Path) -> bool {
     let args = &words[rm + 1..];
     let recursive = args
         .iter()
-        .any(|arg| arg.starts_with('-') && arg.contains('r'));
+        .any(|arg| arg.starts_with('-') && (arg.contains('r') || arg.contains('R')));
     let force = args
         .iter()
         .any(|arg| arg.starts_with('-') && arg.contains('f'));
     if !recursive || !force {
         return false;
+    }
+    // We intentionally recognize only one simple `rm` invocation. Shell
+    // control flow, a changed cwd, quoting, expansion, and indirection are
+    // ambiguous at this boundary and therefore denied, not interpreted.
+    if rm != 0
+        || contains_shell_control(command)
+        || command.chars().any(|character| {
+            matches!(
+                character,
+                '\'' | '"' | '\\' | '$' | '`' | '*' | '?' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+        })
+    {
+        return true;
     }
     let targets = args
         .iter()
@@ -72,16 +101,23 @@ fn recursive_force_delete_outside(command: &str, worktree: &Path) -> bool {
         .collect::<Vec<_>>();
     targets.is_empty()
         || !targets.iter().all(|target| {
-            let target = target.trim_matches(|c| matches!(c, '\'' | '"'));
             let path = Path::new(target);
             if path.is_absolute() {
                 path.starts_with(worktree)
+                    && path.components().all(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::RootDir | std::path::Component::Normal(_)
+                        )
+                    })
             } else {
                 !target.starts_with('~')
-                    && !target.contains('$')
-                    && !path
-                        .components()
-                        .any(|part| part == std::path::Component::ParentDir)
+                    && !path.components().any(|part| {
+                        matches!(
+                            part,
+                            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                        )
+                    })
             }
         })
 }
@@ -117,6 +153,20 @@ mod tests {
             decide(&bash("git push --force origin main"), root).denied_by,
             Some("destructive_git")
         );
+        for command in [
+            "git push --force-with-lease origin main",
+            "git push --force-with-lease=main origin main",
+            "git push --force-if-includes origin main",
+            "git push -fHEAD origin main",
+            "/usr/bin/git push --force origin main",
+            "cd repo && git push --force origin main",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("destructive_git"),
+                "{command}"
+            );
+        }
         assert_eq!(
             decide(&bash("rm -rf /tmp/other"), root).denied_by,
             Some("recursive_delete_outside_worktree")
@@ -136,6 +186,11 @@ mod tests {
         let root = Path::new("/tmp/worktree");
         assert_eq!(decide(&bash("git status --short"), root).denied_by, None);
         assert_eq!(
+            decide(&bash("git push origin feature"), root).denied_by,
+            None
+        );
+        assert_eq!(decide(&bash("echo git push --force"), root).denied_by, None);
+        assert_eq!(
             decide(&bash("rm -rf /tmp/worktree/target"), root).denied_by,
             None
         );
@@ -144,5 +199,17 @@ mod tests {
             decide(&bash("rm -rf ../other"), root).denied_by,
             Some("recursive_delete_outside_worktree")
         );
+        for command in [
+            "rm -rf /tmp/worktree/../other",
+            "cd /tmp && rm -rf other",
+            "rm -rf target && echo done",
+            "rm -rf $TARGET",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("recursive_delete_outside_worktree"),
+                "{command}"
+            );
+        }
     }
 }
