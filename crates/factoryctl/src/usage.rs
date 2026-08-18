@@ -91,7 +91,7 @@ struct CodexCollectorConfig {
 /// `{"ok":true,"provider":"codex","usedPercent":42,"limitWindow":"primary","resetsAtMs":1234,"exhausted":false}`
 /// or on failure: `{"ok":false,"provider":"codex","category":"timeout"}`.
 pub fn run() -> i32 {
-    let outcome = match crate::probes::locate_on_path("codex") {
+    let outcome = match factoryctl::probes::locate_on_path("codex") {
         Some(codex_program) => {
             let config = CodexCollectorConfig {
                 codex_program,

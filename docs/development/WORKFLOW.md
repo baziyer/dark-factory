@@ -337,6 +337,15 @@ of probes (`crates/factoryctl/src/probes.rs`) and one launchd path
 (`launchd::apply`), so they cannot disagree about what a healthy install looks
 like.
 
+The live-session capacity is also launchd-owned durable state. New jobs receive
+the finite default of 4; `factoryctl capacity set N` and the TUI's `C` setting
+surface use the same shared operation, which accepts 1 through 64, requires a
+loaded managed job, serializes concurrent changes, reports restart/subscription
+impact, reloads only `factoryd`, waits for health, and restores the prior plist
+on failure. `init`, `update --install`, re-init, and a binary rollback carry the
+chosen `--max-active-runs` value forward. A manual daemon or agent-originated
+request cannot mutate it.
+
 ## Task list for whoever picks this up
 
 - [x] GitHub Actions release workflow (tag → build → attach binaries + manifest)

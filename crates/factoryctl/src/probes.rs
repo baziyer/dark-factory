@@ -12,8 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::Client;
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
-use factoryctl::Client;
 
 use crate::launchd;
 

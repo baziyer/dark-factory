@@ -91,6 +91,15 @@ delivery and needs operator action. Use `factoryctl agent budget status` to
 inspect it and `factoryctl agent budget reset` to reopen it. Run either command
 with `--help` for the required project and agent arguments.
 
+The daemon keeps a finite factory-wide live-session bound. New installs use a
+conservative capacity of 4. Operators can inspect or change the managed
+launchd setting with `factoryctl capacity status` and `factoryctl capacity set
+8`; valid values are 1 through 64. Only `factoryd` restarts, while runner
+processes, live session IDs, queued work, and durable state are preserved. A
+higher value can increase concurrent provider/subscription use; a lower value
+leaves saturated work queued. A failed reload or health check restores the
+prior setting; agent sessions cannot change capacity.
+
 The TUI has two screens:
 
 - **BUILDING** shows all projects, agents, work, and items that need you.

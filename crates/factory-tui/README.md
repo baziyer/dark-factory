@@ -41,6 +41,7 @@ project queue.
 | `t` | Manage the active task. |
 | `I` / `M` | Edit the agent instructions or memory in `$EDITOR`. |
 | `v` / `a` | Edit the agent model or permission mode. |
+| `C` | Edit the factory-wide live-session capacity (operator setting). |
 | `z` | Maximize or restore the terminal. |
 | `PgUp` / `PgDn` | Scroll the terminal. |
 | `Ctrl-]` | Stop sending keys to the terminal and control the board. |
@@ -48,8 +49,10 @@ project queue.
 | `?` | Show all keys. |
 | `q` | Detach from the factory. |
 
-All actions use daemon requests. There is no TUI-only control path. See the
-[main README](../../README.md) for setup and first use.
+Board actions use daemon requests. `C` uses the same shared launchd capacity
+operation as `factoryctl capacity set`; it restarts only `factoryd` and keeps
+runner sessions alive. See the [main README](../../README.md) for setup and
+first use.
 
 ## Development
 

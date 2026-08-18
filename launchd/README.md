@@ -53,12 +53,19 @@ launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd
 ```
 
 `--max-active-runs` (default 4, enforced by the dispatcher as a hard cap on
-live sessions) and any other `factoryd` flag go into `ProgramArguments` as
-further `<string>` elements; `factoryctl update --install` carries them and
-the environment over when it rewrites the job (only `--runner`/
-`--factoryctl` are dropped, since they must point at the newly activated
-binaries, and `PATH` gains the provider CLIs' directories if it lacks
-them). A rewritten job must be `bootout`/`bootstrap`ed, not just
+live sessions) is the operator-owned capacity setting. Inspect or change it
+with `factoryctl capacity status` or `factoryctl capacity set N`; values from
+1 through 64 are accepted. The managed operation shows its process and
+subscription impact, reloads only `factoryd`, waits for health, and restores
+the previous plist if reload/health fails. Higher values can increase concurrent
+provider/subscription use; lower values leave saturated work queued. It refuses agent-session origins,
+manual daemons, and an unloaded/missing launchd job. `factoryctl init` and
+`factoryctl update --install` preserve the setting when they rewrite the job.
+Any other `factoryd` flag goes into `ProgramArguments` as further `<string>`
+elements; `factoryctl update --install` carries them and the environment over
+when it rewrites the job (only `--runner`/`--factoryctl` are dropped, since
+they must point at the newly activated binaries, and `PATH` gains the provider
+CLIs' directories if it lacks them). A rewritten job must be `bootout`/`bootstrap`ed, not just
 `kickstart`ed — launchd caches `ProgramArguments`. The template sets
 `AbandonProcessGroup`: without it launchd would kill every runner — every
 session — with the daemon on `bootout`/`kickstart -k`.

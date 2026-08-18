@@ -87,6 +87,7 @@ pub enum Action {
     ManageTask,
     EditModel,
     EditPermission,
+    EditCapacity,
     /// `PgUp`/`PgDn`: AGENT terminal scrollback.
     ScrollUp,
     ScrollDown,
@@ -122,6 +123,7 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('t') => Some(Action::ManageTask),
         KeyCode::Char('v') => Some(Action::EditModel),
         KeyCode::Char('a') => Some(Action::EditPermission),
+        KeyCode::Char('C') => Some(Action::EditCapacity),
         KeyCode::PageUp => Some(Action::ScrollUp),
         KeyCode::PageDown => Some(Action::ScrollDown),
         _ => None,
@@ -140,6 +142,7 @@ pub enum PromptKind {
     EditTaskTitle(TaskId),
     EditModel(AgentId),
     EditPermission(AgentId),
+    Capacity,
 }
 
 /// A minimal in-TUI multi-field text prompt. `Tab`/`Enter` advance fields; `Enter` on the last
@@ -209,6 +212,16 @@ impl PromptState {
             field: 0,
         }
     }
+
+    #[must_use]
+    fn capacity(current: String) -> Self {
+        Self {
+            kind: PromptKind::Capacity,
+            labels: vec!["live-session capacity"],
+            values: vec![current],
+            field: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,6 +285,7 @@ pub enum Intent {
     Redraw,
     Quit,
     Send(LocalRequest),
+    SetCapacity(usize),
     /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
     /// `main.rs` encodes and forwards to whichever pane is currently focused.
     ForwardKey(KeyEvent),
@@ -377,6 +391,7 @@ impl Board {
             Action::ManageTask => self.manage_task(),
             Action::EditModel => self.begin_profile_edit(false),
             Action::EditPermission => self.begin_profile_edit(true),
+            Action::EditCapacity => self.begin_capacity_edit(),
             Action::ScrollUp if self.view == View::Agent => Intent::ScrollFocus { up: true },
             Action::ScrollDown if self.view == View::Agent => Intent::ScrollFocus { up: false },
             Action::ScrollUp | Action::ScrollDown => Intent::None,
@@ -498,6 +513,14 @@ impl Board {
         }
         .unwrap_or_default();
         self.mode = Mode::Prompt(PromptState::edit_profile(agent_id, permission, current));
+        Intent::Redraw
+    }
+
+    fn begin_capacity_edit(&mut self) -> Intent {
+        let current = self
+            .live_session_cap
+            .map_or_else(|| "4".to_owned(), |capacity| capacity.to_string());
+        self.mode = Mode::Prompt(PromptState::capacity(current));
         Intent::Redraw
     }
 
@@ -848,6 +871,21 @@ impl Board {
                     memory: detail.profile.memory.clone(),
                 })
             }
+            PromptKind::Capacity => {
+                let value = prompt
+                    .values
+                    .first()
+                    .and_then(|value| value.trim().parse::<usize>().ok());
+                let Some(value) = value else {
+                    self.set_status("capacity must be a positive integer", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                if let Err(error) = factoryctl::capacity::validate(value) {
+                    self.set_status(error, StatusLevel::Error);
+                    return Intent::Redraw;
+                }
+                Intent::SetCapacity(value)
+            }
         }
     }
 
@@ -1121,6 +1159,20 @@ mod tests {
         assert!(matches!(
             board.handle_key(key(KeyCode::Char(' '))),
             Intent::Send(LocalRequest::PauseAgent { .. })
+        ));
+    }
+
+    #[test]
+    fn capacity_setting_is_an_operator_prompt_and_shared_intent() {
+        let mut board = board();
+        board.live_session_cap = Some(8);
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('C'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Enter)),
+            Intent::SetCapacity(8)
         ));
     }
 
