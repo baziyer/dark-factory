@@ -429,6 +429,18 @@ pub struct SessionSnapshot {
     pub project_id: ProjectId,
     pub agent_id: AgentId,
     pub provider: Provider,
+    /// The exact values Dark Factory could establish for this session at
+    /// launch. `None` is deliberately unreported, not a guessed provider
+    /// default. These fields are session-owned so ended sessions retain the
+    /// values they actually used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_control_mode: Option<String>,
     pub state: SessionState,
     pub state_since_ms: i64,
     pub worktree: String,

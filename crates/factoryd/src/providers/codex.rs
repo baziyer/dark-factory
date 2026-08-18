@@ -23,7 +23,7 @@ use std::{
 use uuid::Uuid;
 
 use crate::providers::{
-    Capabilities, InteractiveLaunch, Provider, ProviderError, SpawnContext, hooks,
+    Capabilities, InteractiveLaunch, Provider, ProviderError, RuntimeMetadata, SpawnContext, hooks,
 };
 
 fn validate_thread_id(value: &str) -> Result<(), ()> {
@@ -236,6 +236,18 @@ impl Provider for CodexProvider {
         rewrite_config_block(&codex_home, &ctx.agent_dir, &ctx.socket_path, &ctx.worktree)?;
         ensure_factoryctl_rule_present(&codex_home)?;
 
+        // Codex's copied-forward config is an actual runtime source when no
+        // launch override is present. Read only root-level scalar keys; a
+        // malformed or absent value remains unreported rather than becoming
+        // a guessed marketing default.
+        let config = fs::read_to_string(codex_home.join("config.toml")).ok();
+        let configured_model = config
+            .as_deref()
+            .and_then(|value| root_config_string(value, "model"));
+        let reasoning_effort = config
+            .as_deref()
+            .and_then(|value| root_config_string(value, "model_reasoning_effort"));
+
         let mut args = vec!["--dangerously-bypass-hook-trust".to_owned()];
         if let Some(model) = &ctx.model {
             args.push("--model".to_owned());
@@ -271,6 +283,29 @@ impl Provider for CodexProvider {
                 codex_home.to_string_lossy().into_owned(),
             )],
             generated_files: vec![codex_home.join("config.toml")],
+            runtime: RuntimeMetadata {
+                model: ctx.model.clone().or(configured_model),
+                reasoning_effort,
+                permission_mode: if ctx.permission_mode.is_none() && ctx.auto_mode {
+                    None
+                } else {
+                    Some(
+                        ctx.permission_mode
+                            .clone()
+                            .unwrap_or_else(|| DEFAULT_APPROVAL_POLICY.to_owned()),
+                    )
+                },
+                control_mode: Some(if ctx.permission_mode.is_none() && ctx.auto_mode {
+                    "dangerously-bypass-approvals-and-sandbox".to_owned()
+                } else {
+                    format!(
+                        "approval_policy={}",
+                        ctx.permission_mode
+                            .as_deref()
+                            .unwrap_or(DEFAULT_APPROVAL_POLICY)
+                    )
+                }),
+            },
         })
     }
 
@@ -281,6 +316,34 @@ impl Provider for CodexProvider {
             permission_modes: &PERMISSION_MODES,
         }
     }
+}
+
+/// Reads a quoted root-table string from Codex's config without treating a
+/// nested table value as the global setting. This intentionally handles only
+/// the scalar shape Codex writes for these two keys; if the file uses a shape
+/// we cannot establish safely, the caller reports it as unreported.
+fn root_config_string(document: &str, key: &str) -> Option<String> {
+    for line in document.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break;
+        }
+        let Some((candidate, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if candidate.trim() != key {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .map(|value| value.replace("\\\"", "\"").replace("\\\\", "\\"));
+        return value.filter(|value| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        });
+    }
+    None
 }
 
 /// Idempotently seeds `codex_home` (mode `0700`, created if missing) the
@@ -1153,7 +1216,8 @@ mod provider_tests {
 
         let ctx = context(directory.path());
         let provider = CodexProvider::with_source_home(real_home.clone());
-        provider.spawn_spec(&ctx).unwrap();
+        let first_launch = provider.spawn_spec(&ctx).unwrap();
+        assert_eq!(first_launch.runtime.model.as_deref(), Some("gpt-5.6"));
 
         let codex_home = directory.path().join("agent-dir").join("codex-home");
         let config_contents = fs::read_to_string(codex_home.join("config.toml")).unwrap();
@@ -1171,9 +1235,13 @@ mod provider_tests {
             format!("{base}\nmodel_reasoning_effort = \"xhigh\"\n"),
         )
         .unwrap();
-        provider.spawn_spec(&ctx).unwrap();
+        let second_launch = provider.spawn_spec(&ctx).unwrap();
         let after_second_spawn = fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(after_second_spawn.contains("model_reasoning_effort = \"xhigh\""));
+        assert_eq!(
+            second_launch.runtime.reasoning_effort.as_deref(),
+            Some("xhigh")
+        );
         assert_eq!(after_second_spawn.matches(HOOKS_BEGIN_MARKER).count(), 1);
 
         // A different seed home (another Codex account) re-points the auth
@@ -1645,6 +1713,16 @@ mod provider_tests {
             Some("model_providers".to_owned())
         );
         assert_eq!(table_header_top_level_key("not a header"), None);
+    }
+
+    #[test]
+    fn runtime_metadata_reads_only_authoritative_root_config_values() {
+        let config = "# comment\nmodel = \"gpt-5.6\"\nmodel_reasoning_effort = \"xhigh\"\n\n[projects.\\\"/work\\\"]\nmodel = \"nested-is-not-global\"\n";
+        assert_eq!(root_config_string(config, "model"), Some("gpt-5.6".into()));
+        assert_eq!(
+            root_config_string(config, "model_reasoning_effort"),
+            Some("xhigh".into())
+        );
     }
 
     #[test]

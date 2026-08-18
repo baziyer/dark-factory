@@ -25,7 +25,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 20;
+const SCHEMA_VERSION: i64 = 21;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -49,6 +49,7 @@ const MAX_WEBHOOK_TEXT_BYTES: usize = 4_000;
 const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AGENT_MODEL_BYTES: usize = 256;
 const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
+const MAX_RUNTIME_METADATA_BYTES: usize = 256;
 /// Mirrors the `sessions.wait_reason`/`activity` CHECK bounds (migration
 /// 0014): the operator-facing explanation the hook state machine records.
 const MAX_WAIT_REASON_BYTES: usize = 512;
@@ -91,8 +92,8 @@ pub struct NewAgent {
 /// instructions and memory used to live here as TEXT columns; they are now
 /// operator- and agent-editable files under the state directory (see
 /// `factoryd::guidance` and `factory_core::paths`), composed at launch by
-/// the execution track. `permission_mode` is stored and shown but not yet
-/// consumed by launch.
+/// the execution track. `permission_mode` is consumed by provider launch and
+/// retained separately from each session's resolved runtime metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
@@ -299,6 +300,10 @@ pub struct SessionRow {
     pub project_id: ProjectId,
     pub agent_id: AgentId,
     pub provider: Provider,
+    pub runtime_model: Option<String>,
+    pub runtime_reasoning_effort: Option<String>,
+    pub runtime_permission_mode: Option<String>,
+    pub runtime_control_mode: Option<String>,
     pub provider_session_id: Option<String>,
     pub worktree: String,
     pub codex_home: Option<String>,
@@ -338,6 +343,10 @@ impl SessionRow {
             project_id: self.project_id.clone(),
             agent_id: self.agent_id.clone(),
             provider: self.provider,
+            runtime_model: self.runtime_model.clone(),
+            runtime_reasoning_effort: self.runtime_reasoning_effort.clone(),
+            runtime_permission_mode: self.runtime_permission_mode.clone(),
+            runtime_control_mode: self.runtime_control_mode.clone(),
             state: self.state,
             state_since_ms: self.state_since_ms,
             worktree: self.worktree.clone(),
@@ -365,6 +374,10 @@ pub struct NewSession {
     pub project_id: ProjectId,
     pub agent_id: AgentId,
     pub provider: Provider,
+    pub runtime_model: Option<String>,
+    pub runtime_reasoning_effort: Option<String>,
+    pub runtime_permission_mode: Option<String>,
+    pub runtime_control_mode: Option<String>,
     pub provider_session_id: Option<String>,
     pub worktree: String,
     pub codex_home: Option<String>,
@@ -447,6 +460,8 @@ pub enum StoreError {
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
+    #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
+    UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
     InvalidAgentBudget,
     #[error("agent budget is exhausted; reset it before resuming")]
@@ -1167,6 +1182,7 @@ impl Store {
         }
         validate_provider_session(input.provider_session_id.as_deref())?;
         validate_hook_token(&input.hook_token)?;
+        validate_runtime_metadata(&input)?;
 
         let transaction = self
             .connection
@@ -1187,7 +1203,9 @@ impl Store {
         }
         transaction.execute(
             "INSERT INTO sessions (
-                id, project_id, agent_id, provider, provider_session_id, worktree,
+                id, project_id, agent_id, provider, runtime_model,
+                runtime_reasoning_effort, runtime_permission_mode, runtime_control_mode,
+                provider_session_id, worktree,
                 codex_home, hook_token, state, state_since_ms, activity,
                 activity_inferred, wait_reason, observer_health,
                 observer_health_since_ms, runner_instance_id, runner_runtime,
@@ -1195,15 +1213,19 @@ impl Store {
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
                 stop_requested_at_ms
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'starting', ?9, NULL, 0, NULL,
-                ?10, ?9, ?11, ?12, ?13, NULL, NULL, ?9, ?9, NULL, NULL, NULL,
-                NULL
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
+                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, ?13, ?13,
+                NULL, NULL, NULL, NULL
              )",
             params![
                 input.id.as_str(),
                 input.project_id.as_str(),
                 input.agent_id.as_str(),
                 provider_value(input.provider),
+                input.runtime_model,
+                input.runtime_reasoning_effort,
+                input.runtime_permission_mode,
+                input.runtime_control_mode,
                 input.provider_session_id,
                 input.worktree,
                 input.codex_home,
@@ -3710,9 +3732,22 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_agent(&transaction, agent_id)?
+        let agent = load_agent(&transaction, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
+        if let Some(mode) = input.permission_mode.as_deref() {
+            let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
+            if !capabilities
+                .permission_modes
+                .iter()
+                .any(|supported| *supported == mode)
+            {
+                return Err(StoreError::UnsupportedAgentPermissionMode {
+                    provider: agent.snapshot.provider,
+                    mode: mode.to_owned(),
+                });
+            }
+        }
         transaction.execute(
             "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4)
@@ -4168,6 +4203,26 @@ fn validate_agent_profile(input: &UpdateAgentProfile) -> Result<()> {
     validate_agent_permission_mode(input.permission_mode.as_deref())
 }
 
+fn validate_runtime_metadata(input: &NewSession) -> Result<()> {
+    for value in [
+        &input.runtime_model,
+        &input.runtime_reasoning_effort,
+        &input.runtime_permission_mode,
+        &input.runtime_control_mode,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if value.is_empty()
+            || value.len() > MAX_RUNTIME_METADATA_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+    }
+    Ok(())
+}
+
 fn validate_agent_message(body: &str, created_at_ms: i64) -> Result<()> {
     if created_at_ms < 0
         || body.is_empty()
@@ -4195,7 +4250,7 @@ fn validate_agent_model(model: Option<&str>) -> Result<()> {
 
 /// Provider-scoped, free-form permission mode (e.g. Claude's `acceptEdits`
 /// or `plan`; Codex's `on-request` or `never`); `None` means the provider
-/// default. Validated the same way as `model`; not yet consumed by launch.
+/// default. Validated the same way as `model`; provider launch consumes it.
 fn validate_agent_permission_mode(permission_mode: Option<&str>) -> Result<()> {
     if permission_mode.is_some_and(|value| {
         value.is_empty()
@@ -4476,8 +4531,11 @@ fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapsho
 fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Option<SessionRow>> {
     connection
         .query_row(
-            "SELECT s.id, s.project_id, s.agent_id, s.provider, s.provider_session_id,
-                    s.worktree, s.codex_home, s.hook_token, s.state, s.state_since_ms,
+            "SELECT s.id, s.project_id, s.agent_id, s.provider,
+                    s.runtime_model, s.runtime_reasoning_effort,
+                    s.runtime_permission_mode, s.runtime_control_mode,
+                    s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
+                    s.state, s.state_since_ms,
                     s.activity, s.activity_inferred, s.wait_reason, s.observer_health,
                     s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
                     s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
@@ -4495,43 +4553,47 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
-    let state: String = row.get(8)?;
-    let observer_health: String = row.get(13)?;
-    let protocol: i64 = row.get(17)?;
-    let last_hook_event: Option<String> = row.get(18)?;
-    let current_run_id: Option<String> = row.get(26)?;
+    let state: String = row.get(12)?;
+    let observer_health: String = row.get(17)?;
+    let protocol: i64 = row.get(21)?;
+    let last_hook_event: Option<String> = row.get(22)?;
+    let current_run_id: Option<String> = row.get(30)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
         agent_id: parse_id(row.get(2)?, 2)?,
         provider: parse_provider(&provider, 3)?,
-        provider_session_id: row.get(4)?,
-        worktree: row.get(5)?,
-        codex_home: row.get(6)?,
-        hook_token: row.get(7)?,
-        state: parse_session_state(&state, 8)?,
-        state_since_ms: row.get(9)?,
-        activity: row.get(10)?,
-        activity_inferred: row.get(11)?,
-        wait_reason: row.get(12)?,
-        observer_health: parse_observer_health(&observer_health, 13)?,
-        observer_health_since_ms: row.get(14)?,
-        runner_instance_id: parse_id(row.get(15)?, 15)?,
-        runner_runtime: row.get(16)?,
+        runtime_model: row.get(4)?,
+        runtime_reasoning_effort: row.get(5)?,
+        runtime_permission_mode: row.get(6)?,
+        runtime_control_mode: row.get(7)?,
+        provider_session_id: row.get(8)?,
+        worktree: row.get(9)?,
+        codex_home: row.get(10)?,
+        hook_token: row.get(11)?,
+        state: parse_session_state(&state, 12)?,
+        state_since_ms: row.get(13)?,
+        activity: row.get(14)?,
+        activity_inferred: row.get(15)?,
+        wait_reason: row.get(16)?,
+        observer_health: parse_observer_health(&observer_health, 17)?,
+        observer_health_since_ms: row.get(18)?,
+        runner_instance_id: parse_id(row.get(19)?, 19)?,
+        runner_runtime: row.get(20)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(17, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(21, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 18))
+            .map(|value| parse_provider_hook_event(&value, 22))
             .transpose()?,
-        last_hook_at_ms: row.get(19)?,
-        started_at_ms: row.get(20)?,
-        updated_at_ms: row.get(21)?,
-        ended_at_ms: row.get(22)?,
-        exit_code: row.get(23)?,
-        exit_signal: row.get(24)?,
-        stop_requested_at_ms: row.get(25)?,
-        current_run_id: parse_optional_id(current_run_id, 26)?,
+        last_hook_at_ms: row.get(23)?,
+        started_at_ms: row.get(24)?,
+        updated_at_ms: row.get(25)?,
+        ended_at_ms: row.get(26)?,
+        exit_code: row.get(27)?,
+        exit_signal: row.get(28)?,
+        stop_requested_at_ms: row.get(29)?,
+        current_run_id: parse_optional_id(current_run_id, 30)?,
     })
 }
 
@@ -4872,6 +4934,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0020_connector_events.sql"))?;
         transaction.pragma_update(None, "user_version", 20)?;
+        transaction.commit()?;
+        current = 20;
+    }
+    if current == 20 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'runtime_model'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_present {
+            transaction.execute_batch(include_str!(
+                "../migrations/0021_session_runtime_metadata.sql"
+            ))?;
+        }
+        transaction.pragma_update(None, "user_version", 21)?;
         transaction.commit()?;
     }
     Ok(())

@@ -23,7 +23,7 @@ use factory_core::ProviderHookEvent;
 use serde_json::Value;
 
 use crate::providers::{
-    Capabilities, InteractiveLaunch, Provider, ProviderError, SpawnContext, hooks,
+    Capabilities, InteractiveLaunch, Provider, ProviderError, RuntimeMetadata, SpawnContext, hooks,
 };
 
 fn validate_uuid(value: &str) -> Result<(), ()> {
@@ -141,6 +141,18 @@ impl Provider for ClaudeProvider {
             args,
             env: Vec::new(),
             generated_files: vec![settings_path],
+            runtime: RuntimeMetadata {
+                model: ctx.model.clone(),
+                reasoning_effort: None,
+                permission_mode: ctx
+                    .permission_mode
+                    .clone()
+                    .or_else(|| ctx.auto_mode.then(|| "bypassPermissions".to_owned())),
+                control_mode: ctx
+                    .permission_mode
+                    .clone()
+                    .or_else(|| ctx.auto_mode.then(|| "bypassPermissions".to_owned())),
+            },
         })
     }
 
@@ -350,6 +362,16 @@ mod provider_tests {
         );
         assert!(launch.env.is_empty());
         assert_eq!(launch.generated_files.len(), 1);
+        assert_eq!(launch.runtime.model, None);
+        assert_eq!(launch.runtime.reasoning_effort, None);
+        assert_eq!(
+            launch.runtime.permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
+        assert_eq!(
+            launch.runtime.control_mode.as_deref(),
+            Some("bypassPermissions")
+        );
     }
 
     #[test]
@@ -378,6 +400,11 @@ mod provider_tests {
                 "--permission-mode".to_owned(),
                 "acceptEdits".to_owned(),
             ]
+        );
+        assert_eq!(launch.runtime.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(
+            launch.runtime.permission_mode.as_deref(),
+            Some("acceptEdits")
         );
     }
 
