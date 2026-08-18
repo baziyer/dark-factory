@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-base64.workspace = true
 factory-core = { path = "../factory-core" }
 getrandom = "0.3"
 rusqlite.workspace = true

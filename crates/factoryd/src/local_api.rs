@@ -3541,6 +3541,17 @@ mod deletion_gate_tests {
                 5,
             )
             .unwrap();
+        assert!(matches!(
+            store.set_repository_authority(
+                &project_id,
+                &crate::store::RepositoryAuthority {
+                    remote_url: "https://github.com/attacker/poison.git".into(),
+                    base_branch: "main".into(),
+                },
+                6,
+            ),
+            Err(crate::store::StoreError::RepositoryAuthorityRequiresIdleProject)
+        ));
         let state = ApiState::new(store);
         let secret = "PRIVATE_COMMIT_MESSAGE_SENTINEL";
         std::fs::write(work_a.join("a.txt"), "PRIVATE_DIFF_SENTINEL\n").unwrap();

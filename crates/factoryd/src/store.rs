@@ -415,6 +415,8 @@ pub enum StoreError {
     AgentNotFound,
     #[error("project repository authority is not configured")]
     RepositoryAuthorityMissing,
+    #[error("project repository authority must be configured before any agent session starts")]
+    RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
     #[error("agent provider does not match the requested execution provider")]
@@ -566,6 +568,31 @@ impl Store {
             protocol_version: PROTOCOL_VERSION,
             sequence,
             occurred_at_ms: now_ms,
+            event,
+        })
+    }
+
+    /// Appends one credential- and content-free repository audit record.
+    pub fn record_repository_operation(
+        &mut self,
+        input: NewRepositoryOperation,
+    ) -> Result<EventEnvelope> {
+        let transaction = self.connection.transaction()?;
+        let event = FactoryEvent::RepositoryOperation {
+            project_id: input.project_id,
+            agent_id: input.agent_id,
+            session_id: input.session_id,
+            operation: input.operation,
+            phase: input.phase,
+            success: input.success,
+            reference: input.reference,
+        };
+        let sequence = append_event(&transaction, input.occurred_at_ms, &event)?;
+        transaction.commit()?;
+        Ok(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: input.occurred_at_ms,
             event,
         })
     }
@@ -2682,6 +2709,14 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_live_session: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE project_id = ?1 AND ended_at_ms IS NULL)",
+            params![project_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_live_session {
+            return Err(StoreError::RepositoryAuthorityRequiresIdleProject);
+        }
         transaction.execute(
             "INSERT INTO project_repository_authority (project_id, remote_url, base_branch, updated_at_ms)
              VALUES (?1, ?2, ?3, ?4)",

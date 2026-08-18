@@ -912,6 +912,7 @@ fn truncate_status(text: &str, max: usize) -> String {
 fn error_code_word(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::InvalidRequest => "invalid request",
+        ErrorCode::Unauthorized => "unauthorized",
         ErrorCode::UnsupportedProtocol => "unsupported protocol",
         ErrorCode::NotFound => "not found",
         ErrorCode::Conflict => "conflict",

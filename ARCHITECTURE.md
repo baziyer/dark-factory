@@ -138,10 +138,10 @@ catalogue.
    configuration. `factoryctl git commit`, `git push`, and `pr open|update`
    authenticate the live session token and carry no caller-selected project,
    agent, path, branch, or remote. `factoryd` re-resolves the exact managed
-   worktree and `agent/<id>` branch, uses an empty-config temporary
+   worktree, linked-worktree gitdir/common-dir identity, and `agent/<id>` branch, uses an empty-config temporary
    gitdir/index so repository hooks, filters, helpers, fsmonitor, and external
    drivers cannot execute, and publishes commits with a compare-and-swap ref
-   update. Remote and PR base come from operator-pinned durable state, never
+   update. Remote and PR base come from write-once operator-pinned durable state configured before any session, never
    mutable `origin` metadata. It serializes repository operations through one
    committer, rejects protected/detached/mismatched refs, and writes
    credential- and content-free request/result events. Review and merge remain

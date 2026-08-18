@@ -7,13 +7,12 @@
 
 use std::{
     env,
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
 use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
@@ -49,10 +48,15 @@ pub struct Target {
     pub session_id: SessionId,
     pub worktree: PathBuf,
     branch: String,
+    git_dir: PathBuf,
     common_dir: PathBuf,
     head: String,
     worktree_device: u64,
     worktree_inode: u64,
+    git_dir_device: u64,
+    git_dir_inode: u64,
+    common_dir_device: u64,
+    common_dir_inode: u64,
     authority: RepositoryAuthority,
     github_repo: Option<String>,
     gh_program: PathBuf,
@@ -92,6 +96,15 @@ impl Target {
                 "session path is not the Git worktree root".into(),
             ));
         }
+        let git_dir = safe_git(
+            &worktree,
+            None,
+            &["rev-parse", "--absolute-git-dir"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        let git_dir = canonical_directory(Path::new(git_dir.trim()), "Git directory")?;
         let common = safe_git(
             &worktree,
             None,
@@ -140,6 +153,10 @@ impl Target {
         .await?;
         let metadata = std::fs::metadata(&worktree)
             .map_err(|_| Error::Rejected("session worktree disappeared".into()))?;
+        let git_dir_metadata = std::fs::metadata(&git_dir)
+            .map_err(|_| Error::Rejected("session Git directory disappeared".into()))?;
+        let common_dir_metadata = std::fs::metadata(&common_dir)
+            .map_err(|_| Error::Rejected("common Git directory disappeared".into()))?;
         let github_repo = github_slug(&authority.remote_url);
         Ok(Self {
             project_id: session.project_id,
@@ -147,13 +164,18 @@ impl Target {
             session_id: session.id,
             worktree,
             branch,
+            git_dir,
             common_dir,
             head: head.trim().to_owned(),
             worktree_device: metadata.dev(),
             worktree_inode: metadata.ino(),
+            git_dir_device: git_dir_metadata.dev(),
+            git_dir_inode: git_dir_metadata.ino(),
+            common_dir_device: common_dir_metadata.dev(),
+            common_dir_inode: common_dir_metadata.ino(),
             authority,
             github_repo,
-            gh_program: PathBuf::from("gh"),
+            gh_program: trusted_program("gh")?,
         })
     }
 
@@ -163,10 +185,55 @@ impl Target {
         if metadata.dev() != self.worktree_device || metadata.ino() != self.worktree_inode {
             return Err(Error::Rejected("session worktree identity changed".into()));
         }
+        let actual_git_dir = safe_git(
+            &self.worktree,
+            None,
+            &["rev-parse", "--absolute-git-dir"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        let actual_git_dir =
+            canonical_directory(Path::new(actual_git_dir.trim()), "Git directory")?;
+        let actual_common = safe_git(
+            &self.worktree,
+            None,
+            &["rev-parse", "--git-common-dir"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        let actual_common = resolve_git_path(&self.worktree, actual_common.trim())?;
+        if actual_git_dir != self.git_dir || actual_common != self.common_dir {
+            return Err(Error::Rejected(
+                "session Git directory identity changed".into(),
+            ));
+        }
+        let git_metadata = std::fs::metadata(&actual_git_dir)
+            .map_err(|_| Error::Rejected("session Git directory disappeared".into()))?;
+        let common_metadata = std::fs::metadata(&actual_common)
+            .map_err(|_| Error::Rejected("common Git directory disappeared".into()))?;
+        if git_metadata.dev() != self.git_dir_device
+            || git_metadata.ino() != self.git_dir_inode
+            || common_metadata.dev() != self.common_dir_device
+            || common_metadata.ino() != self.common_dir_inode
+        {
+            return Err(Error::Rejected(
+                "session Git directory identity changed".into(),
+            ));
+        }
+        let git_dir = self.git_dir.to_string_lossy();
         let branch = safe_git(
             &self.worktree,
             None,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &[
+                "--git-dir",
+                &git_dir,
+                "symbolic-ref",
+                "--quiet",
+                "--short",
+                "HEAD",
+            ],
             None,
             READ_TIMEOUT,
         )
@@ -179,7 +246,7 @@ impl Target {
         let head = safe_git(
             &self.worktree,
             None,
-            &["rev-parse", "--verify", "HEAD"],
+            &["--git-dir", &git_dir, "rev-parse", "--verify", "HEAD"],
             None,
             READ_TIMEOUT,
         )
@@ -233,6 +300,8 @@ impl Target {
             &self.worktree,
             None,
             &[
+                "--git-dir",
+                &self.git_dir.to_string_lossy(),
                 "update-ref",
                 &format!("refs/heads/{}", self.branch),
                 oid.trim(),
@@ -242,7 +311,11 @@ impl Target {
             MUTATION_TIMEOUT,
         )
         .await?;
-        self.revalidate().await?;
+        if self.revalidate().await? != oid.trim() {
+            return Err(Error::Rejected(
+                "published HEAD did not match the committed object".into(),
+            ));
+        }
         Ok(oid.trim().to_owned())
     }
 
@@ -251,28 +324,17 @@ impl Target {
         let sandbox = self.sandbox().await?;
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", self.branch);
         if self.github_repo.is_some() {
-            let token = gh(
-                &self.gh_program,
-                &self.worktree,
-                &["auth", "token"],
-                READ_TIMEOUT,
-            )
-            .await?;
-            let token = token.trim();
-            if token.is_empty() || token.bytes().any(|byte| byte.is_ascii_control()) {
-                return Err(Error::Command("gh returned an invalid credential".into()));
-            }
-            let authorization = format!(
-                "Authorization: Basic {}",
-                STANDARD.encode(format!("x-access-token:{token}"))
+            let helper = format!(
+                "credential.https://github.com.helper=!{} auth git-credential",
+                self.gh_program.display()
             );
-            safe_git_with_header(
+            safe_git_with_trusted_helper(
                 &self.worktree,
                 Some(&sandbox),
                 &["push", "--porcelain", &self.authority.remote_url, &refspec],
                 None,
                 MUTATION_TIMEOUT,
-                &authorization,
+                &helper,
             )
             .await?;
         } else {
@@ -544,6 +606,48 @@ fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, Error> {
     }
     Ok(canonical)
 }
+
+fn trusted_program(name: &str) -> Result<PathBuf, Error> {
+    for directory in SAFE_PATH.split(':') {
+        let candidate = Path::new(directory).join(name);
+        let Ok(path) = std::fs::canonicalize(candidate) else {
+            continue;
+        };
+        let metadata = std::fs::metadata(&path)
+            .map_err(|_| Error::Rejected(format!("{name} executable disappeared")))?;
+        let safe_path = path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./-".contains(byte));
+        if safe_path && metadata.is_file() && !writable_by_daemon(&metadata) {
+            return Ok(path);
+        }
+    }
+    Err(Error::Rejected(format!(
+        "{name} must resolve to a non-writable executable in the daemon allowlist"
+    )))
+}
+
+fn writable_by_daemon(metadata: &std::fs::Metadata) -> bool {
+    let mode = metadata.permissions().mode();
+    mode & 0o002 != 0
+        || (metadata.uid() == rustix::process::getuid().as_raw() && mode & 0o200 != 0)
+        || (metadata.gid() == rustix::process::getgid().as_raw() && mode & 0o020 != 0)
+}
+
+fn validate_program(path: &Path) -> Result<(), Error> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| Error::Rejected("trusted executable disappeared".into()))?;
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|_| Error::Rejected("trusted executable disappeared".into()))?;
+    if canonical != path || !metadata.is_file() || writable_by_daemon(&metadata) {
+        return Err(Error::Rejected(
+            "trusted executable identity changed".into(),
+        ));
+    }
+    Ok(())
+}
 fn resolve_git_path(cwd: &Path, value: &str) -> Result<PathBuf, Error> {
     let path = Path::new(value);
     canonical_directory(
@@ -566,15 +670,15 @@ async fn safe_git(
     safe_git_inner(cwd, sandbox, args, stdin, deadline, None).await
 }
 
-async fn safe_git_with_header(
+async fn safe_git_with_trusted_helper(
     cwd: &Path,
     sandbox: Option<&GitSandbox>,
     args: &[&str],
     stdin: Option<&[u8]>,
     deadline: Duration,
-    authorization: &str,
+    helper: &str,
 ) -> Result<String, Error> {
-    safe_git_inner(cwd, sandbox, args, stdin, deadline, Some(authorization)).await
+    safe_git_inner(cwd, sandbox, args, stdin, deadline, Some(helper)).await
 }
 
 async fn safe_git_inner(
@@ -583,7 +687,7 @@ async fn safe_git_inner(
     args: &[&str],
     stdin: Option<&[u8]>,
     deadline: Duration,
-    authorization: Option<&str>,
+    trusted_helper: Option<&str>,
 ) -> Result<String, Error> {
     let mut fixed = vec![
         "-c",
@@ -603,6 +707,11 @@ async fn safe_git_inner(
         "-c",
         "protocol.https.allow=always",
     ];
+    if let Some(helper) = trusted_helper {
+        // This fixed daemon-selected helper exchanges credentials over its
+        // pipe. No token is placed in argv or a child environment.
+        fixed.extend_from_slice(&["-c", helper]);
+    }
     fixed.extend_from_slice(args);
     let mut envs = vec![
         ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -613,15 +722,6 @@ async fn safe_git_inner(
         ("GIT_ASKPASS", "/usr/bin/false"),
         ("GIT_SSH_COMMAND", "/usr/bin/false"),
     ];
-    if let Some(value) = authorization {
-        // The daemon-sourced credential stays out of argv. Repository and
-        // global config, helpers, askpass, SSH, filters, and hooks remain off.
-        envs.extend([
-            ("GIT_CONFIG_COUNT", "1"),
-            ("GIT_CONFIG_KEY_0", "http.extraHeader"),
-            ("GIT_CONFIG_VALUE_0", value),
-        ]);
-    }
     let owned;
     if let Some(s) = sandbox {
         owned = vec![
@@ -650,6 +750,7 @@ async fn gh(
     args: &[&str],
     deadline: Duration,
 ) -> Result<String, Error> {
+    validate_program(program)?;
     let home = env::var("HOME").unwrap_or_else(|_| "/var/empty".into());
     let config = format!("{home}/.config/gh");
     run_command(
@@ -666,7 +767,7 @@ async fn gh(
 async fn bounded_read(
     mut reader: impl AsyncRead + Unpin,
     overflow: oneshot::Sender<()>,
-) -> Vec<u8> {
+) -> (Vec<u8>, bool) {
     let mut output = Vec::new();
     let mut chunk = [0u8; 8192];
     let overflow = overflow;
@@ -676,11 +777,11 @@ async fn bounded_read(
             Ok(n) if output.len() + n <= MAX_OUTPUT_BYTES => output.extend_from_slice(&chunk[..n]),
             Ok(_) => {
                 let _ = overflow.send(());
-                break;
+                return (output, true);
             }
         }
     }
-    output
+    (output, false)
 }
 
 async fn wait_for_overflow(receiver: &mut oneshot::Receiver<()>) {
@@ -726,12 +827,12 @@ async fn run_command(
             .map_err(|_| Error::Command("command stdin failed".into()))?;
     }
     let (overflow_tx, mut overflow_rx) = oneshot::channel();
-    let stdout = tokio::spawn(bounded_read(
+    let mut stdout = tokio::spawn(bounded_read(
         child.stdout.take().expect("piped stdout"),
         overflow_tx,
     ));
     let (stderr_overflow_tx, mut stderr_overflow_rx) = oneshot::channel();
-    let stderr = tokio::spawn(bounded_read(
+    let mut stderr = tokio::spawn(bounded_read(
         child.stderr.take().expect("piped stderr"),
         stderr_overflow_tx,
     ));
@@ -748,17 +849,43 @@ async fn run_command(
         Ok(Ok(None)) => {
             let _ = kill_process_group(pid, Signal::KILL);
             let _ = child.wait().await;
+            stdout.abort();
+            stderr.abort();
             return Err(Error::Command("command output exceeded its bound".into()));
         }
         Ok(Err(e)) => return Err(Error::Command(e.to_string())),
         Err(_) => {
             let _ = kill_process_group(pid, Signal::KILL);
             let _ = child.wait().await;
+            stdout.abort();
+            stderr.abort();
             return Err(Error::Timeout);
         }
     };
-    let stdout = stdout.await.unwrap_or_default();
-    let stderr = stderr.await.unwrap_or_default();
+    // A successful direct child may leave a hostile descendant holding the
+    // pipes open. Terminate the now-orphaned process group, then bound reader
+    // completion independently instead of holding daemon work forever.
+    let _ = kill_process_group(pid, Signal::KILL);
+    let readers = timeout(Duration::from_secs(1), async {
+        (
+            (&mut stdout).await.unwrap_or_default(),
+            (&mut stderr).await.unwrap_or_default(),
+        )
+    })
+    .await;
+    let (stdout_result, stderr_result) = match readers {
+        Ok(output) => output,
+        Err(_) => {
+            stdout.abort();
+            stderr.abort();
+            return Err(Error::Command("command pipes did not close".into()));
+        }
+    };
+    let (stdout, stdout_overflowed) = stdout_result;
+    let (stderr, stderr_overflowed) = stderr_result;
+    if stdout_overflowed || stderr_overflowed {
+        return Err(Error::Command("command output exceeded its bound".into()));
+    }
     if !status.success() {
         let summary = String::from_utf8_lossy(&stderr);
         return Err(Error::Command(
@@ -816,25 +943,10 @@ mod tests {
                 worktree.to_str().unwrap(),
             ],
         );
-        let target_stub = Target {
+        let session = SessionRow {
+            id: "session".to_owned().try_into().unwrap(),
             project_id: "project".to_owned().try_into().unwrap(),
             agent_id: "worker".to_owned().try_into().unwrap(),
-            session_id: "session".to_owned().try_into().unwrap(),
-            worktree: worktree.clone(),
-            branch: "agent/worker".into(),
-            common_dir: repo.join(".git"),
-            head: String::new(),
-            worktree_device: 0,
-            worktree_inode: 0,
-            authority: validate_authority(remote.to_string_lossy().into_owned(), "main".into())
-                .unwrap(),
-            github_repo: None,
-            gh_program: "gh".into(),
-        };
-        let session = SessionRow {
-            id: target_stub.session_id.clone(),
-            project_id: target_stub.project_id.clone(),
-            agent_id: target_stub.agent_id.clone(),
             provider: Provider::Shell,
             provider_session_id: None,
             worktree: worktree.to_string_lossy().into_owned(),
@@ -861,15 +973,15 @@ mod tests {
             current_run_id: None,
         };
         let project = ProjectSnapshot {
-            id: target_stub.project_id,
+            id: "project".to_owned().try_into().unwrap(),
             name: "Test".into(),
             root: repo.to_string_lossy().into_owned(),
             created_at_ms: 1,
             updated_at_ms: 1,
         };
-        let target = Target::validate(session, project, target_stub.authority)
-            .await
-            .unwrap();
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let target = Target::validate(session, project, authority).await.unwrap();
         (temp, target, remote)
     }
 
@@ -971,6 +1083,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mutation_rejects_replaced_linked_worktree_gitdir() {
+        let (temp, target, _) = fixture().await;
+        let attacker = temp.path().join("attacker.git");
+        run(temp.path(), &["init", "--bare", attacker.to_str().unwrap()]);
+        fs::create_dir_all(attacker.join("objects/info")).unwrap();
+        fs::write(
+            attacker.join("objects/info/alternates"),
+            format!("{}\n", target.common_dir.join("objects").display()),
+        )
+        .unwrap();
+        run(
+            temp.path(),
+            &[
+                "--git-dir",
+                attacker.to_str().unwrap(),
+                "update-ref",
+                "refs/heads/agent/worker",
+                &target.head,
+            ],
+        );
+        fs::write(attacker.join("HEAD"), "ref: refs/heads/agent/worker\n").unwrap();
+        fs::write(
+            target.worktree.join(".git"),
+            format!("gitdir: {}\n", attacker.display()),
+        )
+        .unwrap();
+        fs::write(target.worktree.join("README"), "attacker\n").unwrap();
+
+        let error = target.commit("must fail closed").await.unwrap_err();
+        assert!(error.to_string().contains("Git directory identity changed"));
+    }
+
+    #[tokio::test]
     async fn bounded_runner_kills_an_output_flood_process_group() {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("flood");
@@ -998,6 +1143,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_runner_closes_pipes_retained_by_a_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("retained-pipe");
+        fs::write(&script, "#!/bin/sh\n(sleep 30) &\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let started = std::time::Instant::now();
+        run_command(
+            &script,
+            temp.path(),
+            &[],
+            &[],
+            None,
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
     async fn gh_is_pinned_to_configured_repo_base_and_reverified_after_mutation() {
         let (temp, mut target, _) = fixture().await;
         target.authority =
@@ -1006,8 +1171,8 @@ mod tests {
         let fake = temp.path().join("gh");
         let log = temp.path().join("gh.log");
         fs::write(&fake, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n 'pr view') printf 'agent/worker\\tmain\\thttps://github.com/owner/repo/pull/7\\n' ;;\nesac\n", log.display())).unwrap();
-        fs::set_permissions(&fake, fs::Permissions::from_mode(0o700)).unwrap();
-        target.gh_program = fake;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o500)).unwrap();
+        target.gh_program = std::fs::canonicalize(fake).unwrap();
         assert_eq!(
             target.pr_open("Title", "Body").await.unwrap(),
             "https://github.com/owner/repo/pull/7"
