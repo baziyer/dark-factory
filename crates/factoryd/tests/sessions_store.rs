@@ -30,6 +30,10 @@ fn new_session(seed: &str, project: &str, agent: &str) -> NewSession {
         project_id: project_id(project),
         agent_id: agent_id(agent),
         provider: Provider::Codex,
+        runtime_model: None,
+        runtime_reasoning_effort: None,
+        runtime_permission_mode: None,
+        runtime_control_mode: None,
         provider_session_id: None,
         worktree: format!("/work/{project}"),
         codex_home: None,
@@ -38,6 +42,38 @@ fn new_session(seed: &str, project: &str, agent: &str) -> NewSession {
         runner_runtime: format!("/private/runners/{seed}"),
         runner_protocol_version: 1,
     }
+}
+
+#[test]
+fn runtime_metadata_is_retained_after_a_session_ends() {
+    let mut store = fixture();
+    let mut session = new_session("runtime-session", "factory", "curie");
+    session.runtime_model = Some("gpt-5.6".into());
+    session.runtime_reasoning_effort = Some("xhigh".into());
+    session.runtime_permission_mode = Some("on-request".into());
+    session.runtime_control_mode = Some("approval_policy=on-request".into());
+    store.create_session(session, 5).unwrap();
+    store
+        .end_session(&session_id("runtime-session"), Some(0), None, 6)
+        .unwrap();
+
+    let sessions = store
+        .list_sessions(&project_id("factory"), None, 10)
+        .unwrap();
+    let session = sessions
+        .into_iter()
+        .find(|session| session.id == session_id("runtime-session"))
+        .unwrap();
+    assert_eq!(session.runtime_model.as_deref(), Some("gpt-5.6"));
+    assert_eq!(session.runtime_reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        session.runtime_permission_mode.as_deref(),
+        Some("on-request")
+    );
+    assert_eq!(
+        session.runtime_control_mode.as_deref(),
+        Some("approval_policy=on-request")
+    );
 }
 
 fn fixture() -> Store {
@@ -92,12 +128,14 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 20 as of the
-/// connector-event migration (0015 widened `last_hook_event` for
-/// `permission_request`) -- and
+/// which always migrates to the current `SCHEMA_VERSION`, 22 after the
+/// connector-event migration, runtime metadata, and legacy permission repair
+/// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
-/// chain including 0015's `sessions` rebuild and 0016's task incarnations.
+/// chain including 0015's `sessions` rebuild, 0016's task incarnations, and
+/// 0021's historical runtime metadata columns and 0022's legacy permission
+/// repair.
 #[test]
 fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let directory = tempfile::tempdir().unwrap();
@@ -191,7 +229,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 22);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -256,7 +294,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 22);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -356,7 +394,7 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 20);
+    assert_eq!(version, 22);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

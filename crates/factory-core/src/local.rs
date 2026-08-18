@@ -19,7 +19,8 @@ pub struct AgentProfile {
     pub model: Option<String>,
     /// Provider-scoped permission mode (Claude: `default`/`acceptEdits`/
     /// `plan`; Codex: `on-request`/`never`); `None` is the provider default.
-    /// Stored and shown; not yet consumed by launch.
+    /// Applied to future provider launches; the resulting runtime value is
+    /// recorded separately on each session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     pub instructions: String,

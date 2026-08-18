@@ -46,6 +46,7 @@ impl Provider for ShellProvider {
                 ctx.factoryctl_path.to_string_lossy().into_owned(),
             )],
             generated_files: Vec::new(),
+            runtime: Default::default(),
         })
     }
 

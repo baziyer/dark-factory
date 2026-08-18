@@ -568,6 +568,10 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         project_id: project_id("project-1"),
         agent_id: agent_id("agent-1"),
         provider: Provider::ClaudeCode,
+        runtime_model: None,
+        runtime_reasoning_effort: None,
+        runtime_permission_mode: None,
+        runtime_control_mode: None,
         state: SessionState::Idle,
         state_since_ms: 10,
         worktree: "/work/agent-1".into(),
@@ -622,12 +626,39 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
 }
 
 #[test]
+fn an_old_session_snapshot_without_runtime_metadata_is_still_readable() {
+    let old_wire = serde_json::json!({
+        "id": "session-1",
+        "project_id": "project-1",
+        "agent_id": "agent-1",
+        "provider": "codex",
+        "state": "stopped",
+        "state_since_ms": 10,
+        "worktree": "/work/agent-1",
+        "activity_inferred": false,
+        "observer_health": "unknown",
+        "observer_health_since_ms": 0,
+        "started_at_ms": 5,
+        "updated_at_ms": 10
+    });
+    let session: SessionSnapshot = serde_json::from_value(old_wire).unwrap();
+    assert_eq!(session.runtime_model, None);
+    assert_eq!(session.runtime_reasoning_effort, None);
+    assert_eq!(session.runtime_permission_mode, None);
+    assert_eq!(session.runtime_control_mode, None);
+}
+
+#[test]
 fn session_snapshot_carries_its_bounded_optionals_when_set() {
     let session = SessionSnapshot {
         id: session_id("session-1"),
         project_id: project_id("project-1"),
         agent_id: agent_id("agent-1"),
         provider: Provider::Codex,
+        runtime_model: None,
+        runtime_reasoning_effort: None,
+        runtime_permission_mode: None,
+        runtime_control_mode: None,
         state: SessionState::WaitingForInput,
         state_since_ms: 20,
         worktree: "/work/agent-1".into(),
