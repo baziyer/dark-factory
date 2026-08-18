@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::model::state::{self, AgentState};
-use crate::model::{AttentionTarget, Board, provider_letter};
+use crate::model::{Board, provider_letter};
 use crate::mouse::{HitMap, Target};
 use crate::ui;
 
@@ -100,7 +100,11 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
 }
 
 fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
-    let inner = ui::bordered(frame, area, ui::block(" NEEDS YOU — oldest first "));
+    let inner = ui::bordered(
+        frame,
+        area,
+        ui::block(" NEEDS YOU — priority, then oldest "),
+    );
     let items = board.attention_items();
     if items.is_empty() {
         ui::dim(frame, inner, "nothing needs you");
@@ -110,28 +114,28 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
         .into_iter()
         .enumerate()
         .map(|(row, item)| {
-            hits.add_row(inner, row, Target::Attention(item.target.clone()));
-            let inferred = if item.inferred { "~" } else { "" };
-            let (selected, label) = match item.target {
-                AttentionTarget::Agent(id) => (
-                    board.selected_agent.as_ref() == Some(&id) && board.selected_task.is_none(),
-                    format!("agent {id}"),
-                ),
-                AttentionTarget::Task(id) => (
-                    board.selected_task.as_ref() == Some(&id),
-                    board.tasks.get(&id).map_or_else(
-                        || format!("task#{id}"),
-                        |task| format!("task {}", task.snapshot.title),
-                    ),
-                ),
-            };
+            hits.add_row(inner, row, Target::Attention(item.clone()));
+            let selected = board.attention_focus.as_ref().is_some_and(|focus| {
+                !focus.resolved && crate::model::same_attention_source(&focus.item, &item)
+            });
+            let subject = item.agent_id.as_ref().map_or_else(
+                || {
+                    item.task_id
+                        .as_ref()
+                        .map_or_else(|| item.project_id.to_string(), |id| format!("task#{id}"))
+                },
+                |id| format!("agent {id}"),
+            );
             Line::from(vec![
                 Span::raw(if selected { "> " } else { "  " }),
                 Span::styled(
-                    format!("{inferred}{:?} ", item.attention),
+                    format!("{}: ", item.reason.kind.label()),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::raw(format!("{} :: {label}", item.project_id)),
+                Span::raw(format!(
+                    "{} :: {}/{subject}",
+                    item.reason.summary, item.project_id
+                )),
             ])
         })
         .collect::<Vec<_>>();
@@ -141,8 +145,8 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{agent, project, run, task};
-    use factory_core::{AgentRole, RunStatus, TaskStatus};
+    use crate::test_fixtures::{agent, attention, project, run, task};
+    use factory_core::{AgentRole, RunStatus, TaskStatus, status::AttentionReasonKind};
     use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
@@ -155,6 +159,13 @@ mod tests {
             vec![run("alice", "proj", RunStatus::Failed, 0)],
             Vec::new(),
         );
+        board.attention = vec![attention(
+            AttentionReasonKind::Inferred,
+            Some("alice"),
+            Some("task"),
+            None,
+            0,
+        )];
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
             .draw(|frame| draw(frame, frame.area(), &board, &mut HitMap::default()))
@@ -170,5 +181,7 @@ mod tests {
         assert!(text.contains("NEEDS YOU"));
         assert!(text.contains("alice"));
         assert!(text.contains("q:1"));
+        assert!(text.contains("inference"));
+        assert!(text.contains("lifecycle state"));
     }
 }

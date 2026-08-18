@@ -20,10 +20,21 @@ use crate::pane::PaneMap;
 use crate::ui;
 
 pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, hits: &mut HitMap) {
-    if board.terminal_maximized {
+    if board.terminal_maximized && board.attention_focus.is_none() {
         render_terminal(frame, area, board, panes, hits);
         return;
     }
+    let area = if let Some(focus) = &board.attention_focus {
+        let card_height = area.height.min(9);
+        let panels = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(card_height), Constraint::Min(0)])
+            .split(area);
+        render_attention_card(frame, panels[0], board, focus);
+        panels[1]
+    } else {
+        area
+    };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
@@ -124,6 +135,9 @@ fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board, message: &st
 }
 
 fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
     let Some(agent_id) = board.selected_agent.as_ref() else {
         ui::dim(frame, area, "no agent selected");
         return;
@@ -314,6 +328,117 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
             rows[3],
         );
     }
+}
+
+fn render_attention_card(
+    frame: &mut Frame,
+    area: Rect,
+    board: &Board,
+    focus: &crate::model::AttentionFocus,
+) {
+    let item = &focus.item;
+    let title = if focus.resolved {
+        " ACTION — STALE "
+    } else {
+        " ACTION — NEEDS YOU "
+    };
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let project = item.project_id.as_str();
+    let agent = item
+        .agent_id
+        .as_ref()
+        .map_or("—", factory_core::AgentId::as_str);
+    let task = item
+        .task_id
+        .as_ref()
+        .map_or("—", factory_core::TaskId::as_str);
+    let session = item
+        .session_id
+        .as_ref()
+        .map_or("—", factory_core::SessionId::as_str);
+    let run = item
+        .run_id
+        .as_ref()
+        .map_or("—", factory_core::RunId::as_str);
+    let age = factory_core::status::age_text(board.now_ms, item.since_ms);
+    let mut lines = vec![
+        Line::from(Span::styled(
+            if focus.resolved {
+                "stale attention".to_owned()
+            } else {
+                item.reason.kind.label().to_owned()
+            },
+            Style::default().fg(if focus.resolved {
+                Color::DarkGray
+            } else {
+                Color::Yellow
+            }),
+        )),
+        Line::from(ui::truncate(
+            if focus.resolved {
+                "changed or resolved; refresh NEEDS YOU before acting"
+            } else {
+                &item.reason.summary
+            },
+            inner_width,
+        )),
+        Line::from(compact_pair(
+            "project:",
+            project,
+            "agent:",
+            agent,
+            inner_width,
+        )),
+        Line::from(compact_pair(
+            "task:",
+            task,
+            "session:",
+            session,
+            inner_width,
+        )),
+        Line::from(compact_pair("run:", run, "age:", &age, inner_width)),
+    ];
+    if !focus.resolved {
+        lines.push(Line::from(ui::truncate(
+            &format!("safe action: {}", item.action_text()),
+            inner_width,
+        )));
+        lines.push(Line::from(ui::truncate(
+            "typing off; Ctrl-] to enter",
+            inner_width,
+        )));
+    } else {
+        lines.push(Line::from(ui::truncate(
+            "safe action: refresh NEEDS YOU",
+            inner_width,
+        )));
+        lines.push(Line::from("typing remains off"));
+    }
+    // Every field owns one row. Paragraph clipping therefore cannot let a
+    // bounded-but-long reason push source identity or the safe action below
+    // the nine-row full-width card at the tested 80-column board width.
+    frame.render_widget(Paragraph::new(lines).block(ui::block(title)), area);
+}
+
+fn compact_pair(
+    left_label: &str,
+    left: &str,
+    right_label: &str,
+    right: &str,
+    width: usize,
+) -> String {
+    let fixed = left_label.chars().count() + right_label.chars().count() + 4;
+    if width <= fixed {
+        return ui::truncate(&format!("{left_label} {left}"), width);
+    }
+    let available = width - fixed;
+    let left_width = available / 2;
+    let right_width = available - left_width;
+    format!(
+        "{left_label} {}  {right_label} {}",
+        ui::truncate_middle(left, left_width),
+        ui::truncate_middle(right, right_width)
+    )
 }
 
 fn orchestrator_backlog_tasks<'a>(

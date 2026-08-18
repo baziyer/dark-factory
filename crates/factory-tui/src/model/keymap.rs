@@ -12,9 +12,10 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use factory_core::local::LocalRequest;
+use factory_core::status::AttentionItem;
 use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId, TaskStatus};
 
-use super::{AttentionTarget, Board, StatusLevel};
+use super::{Board, StatusLevel};
 use crate::mouse::Target as MouseTarget;
 
 // ---------------------------------------------------------------------------------------------
@@ -402,11 +403,12 @@ impl Board {
                 };
                 self.focused_project = Some(task.snapshot.project_id.clone());
                 self.selected_task = Some(task_id);
+                self.attention_focus = None;
                 self.pane_mode = PaneMode::Board;
                 Intent::Redraw
             }
-            MouseTarget::Attention(target) => {
-                if self.select_attention_target(&target) {
+            MouseTarget::Attention(item) => {
+                if self.select_attention_item(&item) {
                     Intent::Redraw
                 } else {
                     Intent::None
@@ -509,6 +511,7 @@ impl Board {
             self.focused_project = Some(agent.project_id.clone());
         }
         self.selected_agent = Some(agent_id);
+        self.attention_focus = None;
         self.view = View::Agent;
         self.pane_mode = PaneMode::Board;
         Intent::Redraw
@@ -536,6 +539,7 @@ impl Board {
         self.focused_project = Some(agent.project_id.clone());
         self.selected_agent = Some(agent_id);
         self.selected_task = None;
+        self.attention_focus = None;
         true
     }
 
@@ -770,43 +774,49 @@ impl Board {
             self.set_status("nothing needs attention", StatusLevel::Info);
             return Intent::Redraw;
         }
-        let current = items.iter().position(|item| match &item.target {
-            AttentionTarget::Agent(id) => {
-                self.selected_task.is_none() && self.selected_agent.as_ref() == Some(id)
-            }
-            AttentionTarget::Task(id) => self.selected_task.as_ref() == Some(id),
+        let current = self.attention_focus.as_ref().and_then(|focus| {
+            (!focus.resolved).then_some(()).and_then(|()| {
+                items
+                    .iter()
+                    .position(|item| super::same_attention_source(item, &focus.item))
+            })
         });
         let next = &items[current.map_or(0, |index| (index + 1) % items.len())];
-        self.select_attention_target(&next.target);
+        self.select_attention_item(next);
         Intent::Redraw
     }
 
-    fn select_attention_target(&mut self, target: &AttentionTarget) -> bool {
-        let Some(item) = self
+    fn select_attention_item(&mut self, selected: &AttentionItem) -> bool {
+        let current = self
             .attention_items()
             .into_iter()
-            .find(|item| &item.target == target)
-        else {
-            return false;
-        };
-        self.focused_project = Some(item.project_id);
-        match target {
-            AttentionTarget::Agent(id) => {
-                self.selected_agent = Some(id.clone());
-                self.selected_task = None;
-                self.set_status(format!("attention: agent {id}"), StatusLevel::Info);
-            }
-            AttentionTarget::Task(id) => {
-                self.selected_task = Some(id.clone());
-                self.selected_agent = self
-                    .tasks
-                    .get(id)
-                    .and_then(|task| task.snapshot.assigned_agent_id.clone());
-                self.set_status(format!("attention: task#{id}"), StatusLevel::Info);
-            }
+            .find(|item| super::same_attention_source(item, selected));
+        let (item, resolved) =
+            current.map_or_else(|| (selected.clone(), true), |item| (item, false));
+        self.focused_project = Some(item.project_id.clone());
+        self.selected_task = item.task_id.clone();
+        self.selected_agent = item.agent_id.clone().or_else(|| {
+            item.task_id.as_ref().and_then(|task_id| {
+                self.tasks
+                    .get(task_id)
+                    .and_then(|task| task.snapshot.assigned_agent_id.clone())
+            })
+        });
+        self.attention_focus = Some(super::AttentionFocus {
+            item: item.clone(),
+            resolved,
+        });
+        if resolved {
+            self.set_status("attention resolved before selection", StatusLevel::Info);
+        } else {
+            self.set_status(
+                format!("attention: {}", item.reason.kind.label()),
+                StatusLevel::Info,
+            );
         }
-        self.view = View::Building;
+        self.view = View::Agent;
         self.pane_mode = PaneMode::Board;
+        self.terminal_maximized = false;
         true
     }
 
@@ -1246,8 +1256,8 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_fixtures::{agent, project, session, task};
-    use factory_core::{AgentRole, SessionState, TaskStatus};
+    use crate::test_fixtures::{agent, attention, project, session, task};
+    use factory_core::{AgentRole, SessionState, TaskStatus, status::AttentionReasonKind};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1399,28 +1409,29 @@ mod tests {
     }
 
     #[test]
-    fn attention_is_globally_oldest_and_g_selects_an_unassigned_task() {
+    fn g_selects_the_first_shared_attention_item_and_opens_its_action_card() {
         let mut board = board();
-        let mut waiting = session("waiting", "alice", "proj", SessionState::WaitingForInput);
-        waiting.updated_at_ms = 20;
-        waiting.state_since_ms = 20;
-        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
-        alice.current_session_id = Some(SessionId::try_from("waiting").unwrap());
-        board.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            vec![alice],
-            vec![
-                task("old-task", "proj", TaskStatus::Blocked, None, 10),
-                task("new-task", "proj", TaskStatus::Failed, None, 30),
-            ],
-            Vec::new(),
-            vec![waiting],
-        );
+        board.attention = vec![
+            attention(
+                AttentionReasonKind::WorkerBlocked,
+                None,
+                Some("old-task"),
+                None,
+                10,
+            ),
+            attention(
+                AttentionReasonKind::ProviderQuestion,
+                Some("alice"),
+                None,
+                Some("session"),
+                20,
+            ),
+        ];
         let items = board.attention_items();
-        assert!(matches!(&items[0].target, AttentionTarget::Task(id) if id.as_str() == "old-task"));
-        assert!(matches!(&items[1].target, AttentionTarget::Agent(id) if id.as_str() == "alice"));
-        assert!(matches!(&items[2].target, AttentionTarget::Task(id) if id.as_str() == "new-task"));
+        assert_eq!(items[0].reason.kind, AttentionReasonKind::WorkerBlocked);
+        assert_eq!(items[1].reason.kind, AttentionReasonKind::ProviderQuestion);
         board.selected_agent = None;
+        board.terminal_maximized = true;
         board.handle_key(key(KeyCode::Char('g')));
         assert_eq!(
             board.selected_task.as_ref().map(TaskId::as_str),
@@ -1430,6 +1441,45 @@ mod tests {
             board.focused_project.as_ref().map(ProjectId::as_str),
             Some("proj")
         );
+        assert_eq!(board.view, View::Agent);
+        assert_eq!(board.pane_mode, PaneMode::Board);
+        assert!(!board.terminal_maximized);
+        assert!(board.attention_focus.as_ref().is_some_and(|focus| {
+            !focus.resolved && focus.item.reason.kind == AttentionReasonKind::WorkerBlocked
+        }));
+    }
+
+    #[test]
+    fn ordinary_keyboard_and_mouse_navigation_clear_the_bound_attention_card() {
+        let item = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        );
+
+        let mut keyboard = board();
+        keyboard.attention = vec![item.clone()];
+        keyboard.handle_key(key(KeyCode::Char('g')));
+        assert!(keyboard.attention_focus.is_some());
+        keyboard.handle_key(key(KeyCode::Char(']')));
+        assert_eq!(
+            keyboard.selected_agent.as_ref().map(AgentId::as_str),
+            Some("bob")
+        );
+        assert!(keyboard.attention_focus.is_none());
+
+        let mut mouse = board();
+        mouse.attention = vec![item];
+        mouse.handle_key(key(KeyCode::Char('g')));
+        assert!(mouse.attention_focus.is_some());
+        mouse.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("bob").unwrap()));
+        assert_eq!(
+            mouse.selected_agent.as_ref().map(AgentId::as_str),
+            Some("bob")
+        );
+        assert!(mouse.attention_focus.is_none());
     }
 
     #[test]
@@ -1473,31 +1523,71 @@ mod tests {
         assert_eq!(mouse.view, keyboard.view);
         assert_eq!(mouse.pane_mode, keyboard.pane_mode);
 
-        let blocked = task("blocked", "proj", TaskStatus::Blocked, None, 1);
-        keyboard.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            Vec::new(),
-            vec![blocked.clone()],
-            Vec::new(),
-            Vec::new(),
+        let item = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            1,
         );
-        mouse.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            Vec::new(),
-            vec![blocked],
-            Vec::new(),
-            Vec::new(),
-        );
+        keyboard.attention = vec![item.clone()];
+        mouse.attention = vec![item.clone()];
         keyboard.selected_agent = None;
         mouse.selected_agent = None;
         keyboard.handle_key(key(KeyCode::Char('g')));
-        mouse.handle_mouse_target(MouseTarget::Attention(AttentionTarget::Task(
-            TaskId::try_from("blocked").unwrap(),
-        )));
+        mouse.handle_mouse_target(MouseTarget::Attention(item));
         assert_eq!(mouse.selected_agent, keyboard.selected_agent);
         assert_eq!(mouse.selected_task, keyboard.selected_task);
         assert_eq!(mouse.focused_project, keyboard.focused_project);
         assert_eq!(mouse.view, keyboard.view);
+        assert_eq!(mouse.pane_mode, keyboard.pane_mode);
+        assert_eq!(mouse.attention_focus, keyboard.attention_focus);
+    }
+
+    #[test]
+    fn concurrent_resolution_marks_the_card_resolved_and_stale_click_explains_itself() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            None,
+            Some("session"),
+            1,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 2,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::Working),
+            },
+        });
+        assert!(board.attention_items().is_empty());
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved)
+        );
+        assert!(
+            board
+                .status
+                .as_ref()
+                .is_some_and(|status| status.text.contains("resolved"))
+        );
+
+        board.attention_focus = None;
+        board.handle_mouse_target(MouseTarget::Attention(item));
+        assert_eq!(board.view, View::Agent);
+        assert_eq!(board.pane_mode, PaneMode::Board);
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved)
+        );
     }
 
     #[test]
@@ -1544,11 +1634,22 @@ mod tests {
         );
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("first").unwrap()));
+        board.attention_focus = Some(crate::model::AttentionFocus {
+            item: attention(
+                AttentionReasonKind::ProviderQuestion,
+                Some("alice"),
+                None,
+                Some("session"),
+                1,
+            ),
+            resolved: false,
+        });
+        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("second").unwrap()));
+        assert!(board.attention_focus.is_none());
         board.handle_key(key(KeyCode::Char('t')));
         assert!(matches!(
             &board.mode,
-            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "first"
+            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "second"
         ));
     }
 

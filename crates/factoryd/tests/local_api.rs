@@ -2382,8 +2382,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(status.attention.len(), 1);
         let item = &status.attention[0];
         assert_eq!(
-            item.kind,
-            factory_core::status::AttentionKind::PausedWithWork
+            item.reason.kind,
+            factory_core::status::AttentionReasonKind::PausedWithWork
         );
         assert_eq!(item.agent_id, Some(agent_id("curie")));
         assert_eq!(item.task_id, Some(task_id("t-assigned")));
@@ -2404,6 +2404,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         };
         assert_eq!(detail.status, *curie, "the same picture the fleet view had");
         assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert_eq!(detail.attention, vec![item.clone()]);
+        assert!(detail.generated_at_ms > 0);
         assert!(detail.detail.instructions_path.ends_with("instructions.md"));
         // The project root is not a git repository, so the agent runs in the
         // root itself; the status says so instead of pretending a clean tree.

@@ -109,10 +109,13 @@ catalogue.
    default exists, never the project root's current checkout; an
    operator may override it with an explicit `--worktree`.
    Fleet and per-agent status both expose the same live git summary for
-   that worktree. A worker waiting for input is an operator-attention
-   condition, not permission to stop or replace it; recovery begins by
-   inspecting that summary and preserving or explicitly resolving dirty
-   work.
+   that worktree and the same structured operator-attention reasons. Those
+   reasons separate provider questions/permissions from worker blocks,
+   delivery or observation failures, exhausted budgets, and lifecycle
+   inference; every client receives the same bounded control-safe summary,
+   source IDs, age, and safe action. Attention is not permission to stop or
+   replace a worker; recovery begins by preserving or explicitly resolving
+   dirty work.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
    environment additions, generated configuration) and what they can do

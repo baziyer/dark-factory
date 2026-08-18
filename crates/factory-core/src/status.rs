@@ -17,13 +17,15 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
     SessionSnapshot, TaskId, TaskSnapshot,
-    attention::{Attention, session_attention, task_attention},
+    attention::{Attention, task_attention},
     local::AgentDetail,
 };
 
 /// How many queued tasks an [`AgentStatus`]/[`ProjectStatus`] lists in full
 /// before falling back to the depth count alone.
 pub const MAX_QUEUE_PREVIEW: usize = 10;
+/// Maximum displayed characters in any operator-controlled attention summary.
+pub const MAX_ATTENTION_SUMMARY_CHARS: usize = 160;
 
 /// The whole daemon at one instant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -97,10 +99,17 @@ pub enum AgentPauseReason {
 /// with fleet status.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentStatusDetail {
+    /// The instant this projection was built, used to render stable ages.
+    #[serde(default)]
+    pub generated_at_ms: i64,
     pub status: AgentStatus,
     pub detail: AgentDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeStatus>,
+    /// The same structured projection returned in [`FleetStatus::attention`],
+    /// limited to this agent and its blocked tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<AttentionItem>,
 }
 
 /// `git status --porcelain --branch` of an agent's worktree, summarized.
@@ -122,15 +131,21 @@ pub struct WorktreeStatus {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AttentionKind {
-    /// A session is waiting for a human answer.
-    NeedsInput,
+pub enum AttentionReasonKind {
+    /// A provider surfaced a bounded question that can be answered in its terminal.
+    ProviderQuestion,
+    /// A provider is stopped at its own approval prompt.
+    ProviderPermission,
+    /// A worker explicitly blocked a durable task with a reason.
+    WorkerBlocked,
+    /// Delivery or resident-session recovery needs observation, not a human answer.
+    DeliveryRecovery,
+    /// The daemon cannot reliably observe the runner/session.
+    ObserverProblem,
     /// The agent's durable provider budget must be reset or raised.
     BudgetExhausted,
-    /// A session ended in failure and its agent is not running.
-    SessionFailed,
-    /// A task was marked blocked by its agent.
-    TaskBlocked,
+    /// Attention inferred from run lifecycle because no live session reported a cause.
+    Inferred,
     /// An agent has queued work but is paused.
     PausedWithWork,
     /// An agent has queued work and no session, and the daemon is at its
@@ -138,10 +153,49 @@ pub enum AttentionKind {
     WaitingForCapacity,
 }
 
+impl AttentionReasonKind {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ProviderQuestion => "provider question",
+            Self::ProviderPermission => "provider permission",
+            Self::WorkerBlocked => "worker blocked",
+            Self::DeliveryRecovery => "delivery/recovery",
+            Self::ObserverProblem => "observer problem",
+            Self::BudgetExhausted => "budget exhausted",
+            Self::Inferred => "inference",
+            Self::PausedWithWork => "paused with work",
+            Self::WaitingForCapacity => "waiting for capacity",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionAction {
+    AnswerInTerminal,
+    ReviewProviderPermission,
+    InspectRecovery,
+    InspectObserver,
+    ResetBudget,
+    RetryTask,
+    InspectInferredState,
+    ResumeAgent,
+    WaitForCapacity,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionReason {
+    pub kind: AttentionReasonKind,
+    /// Bounded and control-safe at projection time, so every client sees the
+    /// same operator-facing text.
+    pub summary: String,
+    pub action: AttentionAction,
+}
+
 /// One thing that needs the operator.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AttentionItem {
-    pub kind: AttentionKind,
     pub level: Attention,
     pub project_id: ProjectId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -150,9 +204,76 @@ pub struct AttentionItem {
     pub task_id: Option<TaskId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<crate::RunId>,
     /// When this condition began (session state change, task update, ...).
     pub since_ms: i64,
-    pub detail: String,
+    pub reason: AttentionReason,
+}
+
+impl AttentionItem {
+    /// A safe, shared action description. Commands contain only validated IDs.
+    #[must_use]
+    pub fn action_text(&self) -> String {
+        match self.reason.action {
+            AttentionAction::AnswerInTerminal => {
+                "review the question, then enter terminal typing".to_owned()
+            }
+            AttentionAction::ReviewProviderPermission => {
+                "review the provider prompt before entering terminal typing".to_owned()
+            }
+            AttentionAction::InspectRecovery => self.session_id.as_ref().map_or_else(
+                || "inspect daemon recovery; no human answer is pending".to_owned(),
+                |session_id| format!("inspect session {session_id}; no human answer is pending"),
+            ),
+            AttentionAction::InspectObserver => self.session_id.as_ref().map_or_else(
+                || "inspect observer health before taking control".to_owned(),
+                |session_id| format!("inspect observer health for session {session_id}"),
+            ),
+            AttentionAction::ResetBudget => self.agent_id.as_ref().map_or_else(
+                || "reset or raise the agent budget".to_owned(),
+                |agent_id| {
+                    format!(
+                        "factoryctl agent budget reset --project {} --agent {agent_id}",
+                        self.project_id
+                    )
+                },
+            ),
+            AttentionAction::RetryTask => self.task_id.as_ref().map_or_else(
+                || "retry the blocked task after resolving its reason".to_owned(),
+                |task_id| {
+                    format!(
+                        "factoryctl task retry --project {} --task {task_id}",
+                        self.project_id
+                    )
+                },
+            ),
+            AttentionAction::InspectInferredState => self.run_id.as_ref().map_or_else(
+                || "inspect the recorded run before choosing a recovery action".to_owned(),
+                |run_id| format!("inspect run {run_id} before choosing a recovery action"),
+            ),
+            AttentionAction::ResumeAgent => self.agent_id.as_ref().map_or_else(
+                || "resume the paused agent".to_owned(),
+                |agent_id| {
+                    format!(
+                        "factoryctl agent resume --project {} --agent {agent_id}",
+                        self.project_id
+                    )
+                },
+            ),
+            AttentionAction::WaitForCapacity => {
+                "wait for capacity or stop an unneeded live session".to_owned()
+            }
+        }
+    }
+}
+
+/// A blocked task and its durable worker-supplied reason. Kept separate
+/// from [`TaskSnapshot`] because full task detail is not part of fleet status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockedTaskStatus {
+    pub task: TaskSnapshot,
+    pub reason: Option<String>,
 }
 
 /// Derives the attention list for one project's agents and blocked tasks.
@@ -162,7 +283,7 @@ pub struct AttentionItem {
 pub fn attention_items(
     project_id: &ProjectId,
     agents: &[AgentStatus],
-    blocked_tasks: &[TaskSnapshot],
+    blocked_tasks: &[BlockedTaskStatus],
     at_capacity: bool,
 ) -> Vec<AttentionItem> {
     let mut items = Vec::new();
@@ -170,103 +291,328 @@ pub fn attention_items(
         let agent = &status.agent;
         if status.budget.exhausted {
             items.push(AttentionItem {
-                kind: AttentionKind::BudgetExhausted,
                 level: Attention::NeedsInput,
                 project_id: project_id.clone(),
                 agent_id: Some(agent.id.clone()),
-                task_id: status.queue.first().map(|task| task.id.clone()),
+                task_id: status
+                    .latest_run
+                    .as_ref()
+                    .and_then(|run| run.task_id.clone())
+                    .or_else(|| status.queue.first().map(|task| task.id.clone())),
                 session_id: agent.current_session_id.clone(),
+                run_id: status.latest_run.as_ref().map(|run| run.id.clone()),
                 since_ms: status.budget.updated_at_ms,
-                detail: format!(
-                    "tool-call budget exhausted at {}; `factoryctl agent budget reset`",
-                    status.budget.tool_calls
+                reason: reason(
+                    AttentionReasonKind::BudgetExhausted,
+                    format!("tool-call budget exhausted at {}", status.budget.tool_calls),
+                    "tool-call budget exhausted",
+                    AttentionAction::ResetBudget,
                 ),
             });
         }
         if let Some(session) = &status.session {
-            match session_attention(session.state) {
-                Attention::NeedsInput => items.push(AttentionItem {
-                    kind: AttentionKind::NeedsInput,
-                    level: Attention::NeedsInput,
+            if let Some((level, reason)) = session_reason(session) {
+                items.push(AttentionItem {
+                    level,
                     project_id: project_id.clone(),
                     agent_id: Some(agent.id.clone()),
-                    task_id: None,
+                    task_id: status
+                        .latest_run
+                        .as_ref()
+                        .and_then(|run| run.task_id.clone()),
                     session_id: Some(session.id.clone()),
-                    since_ms: session.state_since_ms,
-                    detail: session
-                        .wait_reason
-                        .clone()
-                        .unwrap_or_else(|| "session is waiting for input".to_owned()),
-                }),
-                Attention::Failed => items.push(AttentionItem {
-                    kind: AttentionKind::SessionFailed,
-                    level: Attention::Failed,
-                    project_id: project_id.clone(),
-                    agent_id: Some(agent.id.clone()),
-                    task_id: None,
-                    session_id: Some(session.id.clone()),
-                    since_ms: session.state_since_ms,
-                    detail: session
-                        .wait_reason
-                        .clone()
-                        .unwrap_or_else(|| "session failed".to_owned()),
-                }),
-                Attention::Routine | Attention::Completed => {}
+                    run_id: status.latest_run.as_ref().map(|run| run.id.clone()),
+                    since_ms: if session.observer_health == crate::ObserverHealth::Degraded {
+                        session.observer_health_since_ms
+                    } else {
+                        session.state_since_ms
+                    },
+                    reason,
+                });
             }
+        }
+        if status.attention_inferred && status.attention.needs_operator() {
+            let latest_run = status.latest_run.as_ref();
+            let (summary, fallback) = latest_run.map_or_else(
+                || (None, "lifecycle state needs attention"),
+                |run| {
+                    (
+                        run.wait_reason.clone(),
+                        if run.status == crate::RunStatus::Failed {
+                            "latest run failed without a live session report"
+                        } else {
+                            "latest run needs attention without a live session report"
+                        },
+                    )
+                },
+            );
+            items.push(AttentionItem {
+                level: status.attention,
+                project_id: project_id.clone(),
+                agent_id: Some(agent.id.clone()),
+                task_id: latest_run.and_then(|run| run.task_id.clone()),
+                session_id: latest_run.and_then(|run| run.session_id.clone()),
+                run_id: latest_run.map(|run| run.id.clone()),
+                since_ms: latest_run.map_or(agent.updated_at_ms, |run| run.status_since_ms),
+                reason: reason(
+                    AttentionReasonKind::Inferred,
+                    summary.unwrap_or_else(|| fallback.to_owned()),
+                    fallback,
+                    AttentionAction::InspectInferredState,
+                ),
+            });
         }
         if status.queue_depth > 0 {
             if agent.paused && !status.budget.exhausted {
                 items.push(AttentionItem {
-                    kind: AttentionKind::PausedWithWork,
                     level: Attention::NeedsInput,
                     project_id: project_id.clone(),
                     agent_id: Some(agent.id.clone()),
                     task_id: status.queue.first().map(|task| task.id.clone()),
                     session_id: None,
+                    run_id: None,
                     since_ms: status
                         .queue
                         .first()
                         .map_or(agent.updated_at_ms, |task| task.created_at_ms),
-                    detail: format!(
-                        "paused with {} queued task(s); `factoryctl agent resume`",
-                        status.queue_depth
+                    reason: reason(
+                        AttentionReasonKind::PausedWithWork,
+                        format!("paused with {} queued task(s)", status.queue_depth),
+                        "paused with queued work",
+                        AttentionAction::ResumeAgent,
                     ),
                 });
             } else if agent.current_session_id.is_none() && at_capacity {
                 items.push(AttentionItem {
-                    kind: AttentionKind::WaitingForCapacity,
                     level: Attention::Routine,
                     project_id: project_id.clone(),
                     agent_id: Some(agent.id.clone()),
                     task_id: status.queue.first().map(|task| task.id.clone()),
                     session_id: None,
+                    run_id: None,
                     since_ms: status
                         .queue
                         .first()
                         .map_or(agent.updated_at_ms, |task| task.updated_at_ms),
-                    detail: format!(
-                        "{} queued task(s) but the daemon is at its live-session cap",
-                        status.queue_depth
+                    reason: reason(
+                        AttentionReasonKind::WaitingForCapacity,
+                        format!(
+                            "{} queued task(s) but the daemon is at its live-session cap",
+                            status.queue_depth
+                        ),
+                        "queued work is waiting for live-session capacity",
+                        AttentionAction::WaitForCapacity,
                     ),
                 });
             }
         }
     }
-    for task in blocked_tasks {
+    for blocked in blocked_tasks {
+        let task = &blocked.task;
         if task_attention(task.status) == Attention::NeedsInput {
             items.push(AttentionItem {
-                kind: AttentionKind::TaskBlocked,
                 level: Attention::NeedsInput,
                 project_id: project_id.clone(),
                 agent_id: task.assigned_agent_id.clone(),
                 task_id: Some(task.id.clone()),
                 session_id: None,
+                run_id: None,
                 since_ms: task.updated_at_ms,
-                detail: format!("task \"{}\" is blocked", task.title),
+                reason: reason(
+                    AttentionReasonKind::WorkerBlocked,
+                    blocked
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| format!("task \"{}\" is blocked", task.title)),
+                    "worker blocked the task without a readable reason",
+                    AttentionAction::RetryTask,
+                ),
             });
         }
     }
     items
+}
+
+fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReason)> {
+    use crate::{ObserverHealth, ProviderHookEvent, SessionState};
+
+    if session.state == SessionState::WaitingForInput {
+        let summary = session.wait_reason.clone();
+        let lower = summary.as_deref().unwrap_or_default().to_ascii_lowercase();
+        // This exact reason is owned by the daemon's delivery dispatcher. The
+        // synthetic transition deliberately retains the preceding hook event,
+        // so it must outrank that stale provenance. Never infer this state from
+        // words in provider-controlled prompt text.
+        if summary.as_deref() == Some("delivery unacknowledged") {
+            return Some((
+                Attention::Failed,
+                reason(
+                    AttentionReasonKind::DeliveryRecovery,
+                    summary.unwrap(),
+                    "delivery recovery is pending",
+                    AttentionAction::InspectRecovery,
+                ),
+            ));
+        }
+        if session.last_hook_event == Some(ProviderHookEvent::PermissionRequest) {
+            return Some((
+                Attention::NeedsInput,
+                reason(
+                    AttentionReasonKind::ProviderPermission,
+                    summary.unwrap_or_else(|| "provider approval prompt".to_owned()),
+                    "provider approval prompt",
+                    AttentionAction::ReviewProviderPermission,
+                ),
+            ));
+        }
+        if session.last_hook_event == Some(ProviderHookEvent::Notification) {
+            return Some((
+                Attention::NeedsInput,
+                reason(
+                    AttentionReasonKind::ProviderQuestion,
+                    summary.unwrap_or_else(|| "provider is waiting for an answer".to_owned()),
+                    "provider is waiting for an answer",
+                    AttentionAction::AnswerInTerminal,
+                ),
+            ));
+        }
+        if lower.contains("permission") || lower.contains("approval") {
+            return Some((
+                Attention::NeedsInput,
+                reason(
+                    AttentionReasonKind::ProviderPermission,
+                    summary.unwrap_or_else(|| "provider approval prompt".to_owned()),
+                    "provider approval prompt",
+                    AttentionAction::ReviewProviderPermission,
+                ),
+            ));
+        }
+        if session.observer_health != ObserverHealth::Degraded {
+            return Some((
+                Attention::NeedsInput,
+                reason(
+                    AttentionReasonKind::Inferred,
+                    summary.unwrap_or_else(|| {
+                        "session is waiting without a reported question".to_owned()
+                    }),
+                    "session is waiting without a reported question",
+                    AttentionAction::InspectInferredState,
+                ),
+            ));
+        }
+    }
+    if session.observer_health == ObserverHealth::Degraded {
+        return Some((
+            Attention::Failed,
+            reason(
+                AttentionReasonKind::ObserverProblem,
+                session
+                    .wait_reason
+                    .clone()
+                    .unwrap_or_else(|| "runner observation is degraded".to_owned()),
+                "runner observation is degraded",
+                AttentionAction::InspectObserver,
+            ),
+        ));
+    }
+    (session.state == SessionState::Failed).then(|| {
+        (
+            Attention::Failed,
+            reason(
+                AttentionReasonKind::DeliveryRecovery,
+                session
+                    .wait_reason
+                    .clone()
+                    .unwrap_or_else(|| "session failed and needs recovery".to_owned()),
+                "session failed and needs recovery",
+                AttentionAction::InspectRecovery,
+            ),
+        )
+    })
+}
+
+fn reason(
+    kind: AttentionReasonKind,
+    summary: String,
+    fallback: &str,
+    action: AttentionAction,
+) -> AttentionReason {
+    let summary = display_text(&summary);
+    AttentionReason {
+        kind,
+        summary: if summary.is_empty() {
+            fallback.to_owned()
+        } else {
+            summary
+        },
+        action,
+    }
+}
+
+/// Normalizes whitespace, removes terminal and bidirectional display controls,
+/// and bounds operator-controlled text by displayed Unicode scalar count.
+#[must_use]
+pub fn display_text(value: &str) -> String {
+    let mut output = String::new();
+    let mut length = 0;
+    let mut pending_space = false;
+    let mut truncated = false;
+
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+            continue;
+        }
+        if character.is_control() || is_bidi_control(character) {
+            continue;
+        }
+        let separator = usize::from(pending_space && !output.is_empty());
+        if length + separator + 1 > MAX_ATTENTION_SUMMARY_CHARS {
+            truncated = true;
+            break;
+        }
+        if separator == 1 {
+            output.push(' ');
+            length += 1;
+        }
+        output.push(character);
+        length += 1;
+        pending_space = false;
+    }
+
+    if truncated {
+        if length == MAX_ATTENTION_SUMMARY_CHARS {
+            output.pop();
+        }
+        output.push('…');
+    }
+    output
+}
+
+const fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Compact stable age used by CLI and TUI action cards.
+#[must_use]
+pub fn age_text(now_ms: i64, since_ms: i64) -> String {
+    let seconds = now_ms.saturating_sub(since_ms).max(0) / 1_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
 }
 
 /// Most urgent first, then oldest first — the order `factoryctl status`
@@ -282,7 +628,10 @@ pub fn sort_attention(items: &mut [AttentionItem]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentRole, ObserverHealth, Provider, SessionState, TaskStatus};
+    use crate::{
+        AgentRole, ObserverHealth, Provider, ProviderHookEvent, RunId, RunStatus, SessionState,
+        TaskStatus, attention::session_attention,
+    };
 
     fn agent(id: &str, paused: bool) -> AgentSnapshot {
         AgentSnapshot {
@@ -361,6 +710,7 @@ mod tests {
             worktree: None,
             session,
             current_run: None,
+            latest_run: None,
             queue,
             inbox_pending: 0,
         }
@@ -391,25 +741,28 @@ mod tests {
                 vec![task("t2", TaskStatus::Queued, 40)],
             ),
         ];
-        let blocked = vec![task("t3", TaskStatus::Blocked, 20)];
+        let blocked = vec![BlockedTaskStatus {
+            task: task("t3", TaskStatus::Blocked, 20),
+            reason: Some("dependency is unavailable".to_owned()),
+        }];
         let mut items = attention_items(&project, &agents, &blocked, true);
         sort_attention(&mut items);
-        let kinds: Vec<AttentionKind> = items.iter().map(|item| item.kind).collect();
+        let kinds: Vec<AttentionReasonKind> = items.iter().map(|item| item.reason.kind).collect();
         assert_eq!(
             kinds,
             [
-                AttentionKind::PausedWithWork, // NeedsInput, since 0 (t1's created_at_ms)
-                AttentionKind::TaskBlocked,    // NeedsInput, since 20
-                AttentionKind::NeedsInput,     // NeedsInput, since 30
-                AttentionKind::SessionFailed,  // Failed, since 10
-                AttentionKind::WaitingForCapacity, // Routine
+                AttentionReasonKind::PausedWithWork,
+                AttentionReasonKind::WorkerBlocked,
+                AttentionReasonKind::Inferred,
+                AttentionReasonKind::DeliveryRecovery,
+                AttentionReasonKind::WaitingForCapacity,
             ]
         );
         // Not at capacity: no WaitingForCapacity item.
         assert!(
             attention_items(&project, &agents, &blocked, false)
                 .iter()
-                .all(|item| item.kind != AttentionKind::WaitingForCapacity)
+                .all(|item| item.reason.kind != AttentionReasonKind::WaitingForCapacity)
         );
     }
 
@@ -433,11 +786,12 @@ mod tests {
             Some(session(SessionState::Idle, 8)),
             vec![task("t2", TaskStatus::Queued, 9)],
         );
-        let kinds: Vec<AttentionKind> = attention_items(&project, &[waiting, live], &[], true)
-            .iter()
-            .map(|item| item.kind)
-            .collect();
-        assert_eq!(kinds, [AttentionKind::WaitingForCapacity]);
+        let kinds: Vec<AttentionReasonKind> =
+            attention_items(&project, &[waiting, live], &[], true)
+                .iter()
+                .map(|item| item.reason.kind)
+                .collect();
+        assert_eq!(kinds, [AttentionReasonKind::WaitingForCapacity]);
     }
 
     #[test]
@@ -449,5 +803,142 @@ mod tests {
             vec![],
         )];
         assert!(attention_items(&project, &agents, &[], true).is_empty());
+    }
+
+    fn run(status: RunStatus, reason: Option<&str>) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::try_from("run-1").unwrap(),
+            project_id: ProjectId::try_from("p").unwrap(),
+            agent_id: AgentId::try_from("a").unwrap(),
+            parent_run_id: None,
+            task_id: Some(TaskId::try_from("t1").unwrap()),
+            session_id: None,
+            status,
+            activity: None,
+            wait_reason: reason.map(str::to_owned),
+            worktree: "/w".to_owned(),
+            observer_health: ObserverHealth::Unknown,
+            observer_health_since_ms: 0,
+            started_at_ms: 40,
+            status_since_ms: 50,
+            updated_at_ms: 50,
+            ended_at_ms: None,
+            exit_code: None,
+            exit_signal: None,
+            failure_reason: None,
+            closed_by: None,
+        }
+    }
+
+    #[test]
+    fn structured_reasons_distinguish_every_actionable_source_and_sanitize_text() {
+        let project = ProjectId::try_from("p").unwrap();
+        let mut question = session(SessionState::WaitingForInput, 10);
+        question.last_hook_event = Some(ProviderHookEvent::Notification);
+        question.wait_reason = Some("Which branch?".to_owned());
+        let mut permission = session(SessionState::WaitingForInput, 20);
+        permission.id = SessionId::try_from("s2").unwrap();
+        permission.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
+        permission.wait_reason = Some("Approve shell command?".to_owned());
+        let mut delivery = session(SessionState::WaitingForInput, 30);
+        delivery.id = SessionId::try_from("s3").unwrap();
+        delivery.wait_reason = Some("delivery unacknowledged".to_owned());
+        let mut observer = session(SessionState::Working, 40);
+        observer.id = SessionId::try_from("s4").unwrap();
+        observer.observer_health = ObserverHealth::Degraded;
+        observer.observer_health_since_ms = 35;
+
+        let mut agents = vec![
+            status(agent("a", false), Some(question), vec![]),
+            status(agent("b", false), Some(permission), vec![]),
+            status(agent("c", false), Some(delivery), vec![]),
+            status(agent("d", false), Some(observer), vec![]),
+        ];
+        agents[0].budget = AgentBudget {
+            exhausted: true,
+            tool_calls: 1_000,
+            updated_at_ms: 5,
+            ..AgentBudget::default()
+        };
+        let mut inferred = status(agent("e", false), None, vec![]);
+        inferred.attention = Attention::NeedsInput;
+        inferred.attention_inferred = true;
+        inferred.latest_run = Some(run(RunStatus::Waiting, Some("awaiting lifecycle evidence")));
+        agents.push(inferred);
+
+        let blocked = [BlockedTaskStatus {
+            task: task("t1", TaskStatus::Blocked, 60),
+            reason: Some(format!(
+                "blocked\n\u{1b}[2J{}",
+                "x".repeat(MAX_ATTENTION_SUMMARY_CHARS + 20)
+            )),
+        }];
+        let items = attention_items(&project, &agents, &blocked, false);
+        let kinds: Vec<_> = items.iter().map(|item| item.reason.kind).collect();
+        for expected in [
+            AttentionReasonKind::ProviderQuestion,
+            AttentionReasonKind::ProviderPermission,
+            AttentionReasonKind::WorkerBlocked,
+            AttentionReasonKind::DeliveryRecovery,
+            AttentionReasonKind::ObserverProblem,
+            AttentionReasonKind::BudgetExhausted,
+            AttentionReasonKind::Inferred,
+        ] {
+            assert!(kinds.contains(&expected), "missing {expected:?}: {kinds:?}");
+        }
+        let worker = items
+            .iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::WorkerBlocked)
+            .unwrap();
+        assert!(!worker.reason.summary.contains('\n'));
+        assert!(!worker.reason.summary.contains('\u{1b}'));
+        assert!(worker.reason.summary.chars().count() <= MAX_ATTENTION_SUMMARY_CHARS);
+        assert!(worker.reason.summary.ends_with('…'));
+        let inferred = items
+            .iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::Inferred)
+            .unwrap();
+        assert_eq!(
+            inferred.run_id.as_ref().map(crate::RunId::as_str),
+            Some("run-1")
+        );
+        assert!(inferred.action_text().contains("run run-1"));
+    }
+
+    #[test]
+    fn display_text_and_age_are_bounded_and_stable() {
+        assert_eq!(
+            display_text(" ask\n\u{1b}[31m\u{202e}  now\u{2066} "),
+            "ask [31m now"
+        );
+        assert_eq!(age_text(65_000, 5_000), "1m");
+        assert_eq!(age_text(1_000, 2_000), "0s");
+    }
+
+    #[test]
+    fn authoritative_human_hooks_outrank_delivery_words_in_the_prompt() {
+        let mut question = session(SessionState::WaitingForInput, 10);
+        question.last_hook_event = Some(ProviderHookEvent::Notification);
+        question.wait_reason = Some("Which recovery branch should I use?".to_owned());
+        let (_, question) = session_reason(&question).unwrap();
+        assert_eq!(question.kind, AttentionReasonKind::ProviderQuestion);
+        assert_eq!(question.action, AttentionAction::AnswerInTerminal);
+
+        let mut permission = session(SessionState::WaitingForInput, 20);
+        permission.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
+        permission.wait_reason = Some("Approve delivery to production?".to_owned());
+        let (_, permission) = session_reason(&permission).unwrap();
+        assert_eq!(permission.kind, AttentionReasonKind::ProviderPermission);
+        assert_eq!(permission.action, AttentionAction::ReviewProviderPermission);
+
+        let mut synthetic_delivery = session(SessionState::WaitingForInput, 30);
+        synthetic_delivery.last_hook_event = Some(ProviderHookEvent::Notification);
+        synthetic_delivery.wait_reason = Some("delivery unacknowledged".to_owned());
+        let (_, synthetic_delivery) = session_reason(&synthetic_delivery).unwrap();
+        assert_eq!(
+            synthetic_delivery.kind,
+            AttentionReasonKind::DeliveryRecovery
+        );
+        assert_eq!(synthetic_delivery.action, AttentionAction::InspectRecovery);
     }
 }

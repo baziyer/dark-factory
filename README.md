@@ -117,8 +117,11 @@ The TUI has two screens:
 
 Select an agent and press `Enter` to open AGENT. Press `i` or `Enter` to type
 in its terminal. Press `Ctrl-]` to return control to the board. Press `g` to
-jump to the next item in NEEDS YOU. Press `?` for all keys. Press `q` to
-detach. Detaching does not stop any agent.
+jump to the next item in NEEDS YOU and open its explicit action card before
+typing. The card distinguishes provider questions and permissions from worker
+blocks, delivery/recovery failures, observer problems, exhausted budgets, and
+inferred lifecycle state. Press `?` for all keys. Press `q` to detach.
+Detaching does not stop any agent.
 
 Mouse navigation uses the same selections as the keyboard: click the footer's
 screen tabs, help/detach controls, visible agent/task/NEEDS YOU rows, or the
@@ -136,8 +139,10 @@ factoryctl status
 factoryctl agent status --project my-project --agent worker-1
 ```
 
-`factoryctl status` is a concise fleet summary for people. Use
-`factoryctl status --json` when a script needs the complete protocol frame.
+`factoryctl status` is a concise fleet summary for people, including each
+bounded attention reason, its task/session/age, and a safe next action.
+`factoryctl agent status` exposes the same structured attention projection for
+one agent. Use `--json` when a script needs the complete protocol frame.
 
 You can answer an agent in its terminal or send a durable message:
 
