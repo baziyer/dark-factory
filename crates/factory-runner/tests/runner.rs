@@ -20,6 +20,14 @@ use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 const RUN_ID: &str = "run-1";
 const INSTANCE_ID: &str = "instance-1";
+// Repeated cargo-test runs under host contention measured the 1 MiB pipe
+// producer occasionally taking just over the old 2s ceiling. This is only a
+// harness deadline; writes still complete as soon as the child drains stdin.
+const STARTUP_INPUT_TIMEOUT: Duration = Duration::from_secs(8);
+// The cleanup fixture sleeps for 200ms in its TERM trap. A 1s runner grace was
+// observed expiring before that trap completed on a loaded host, so keep ample
+// test-only scheduling margin without changing the runner's production policy.
+const TERM_CLEANUP_GRACE_MS: u64 = 5_000;
 
 struct RunningRunner {
     child: Option<Child>,
@@ -92,7 +100,7 @@ impl RunningRunner {
             _directory: directory,
         };
         received
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(STARTUP_INPUT_TIMEOUT)
             .expect("startup input producer remained blocked")
             .unwrap();
         runner.wait_until_ready();
@@ -511,7 +519,7 @@ fn stop_with_unread_startup_input_allows_term_cleanup_and_records_exit() {
             INSTANCE_ID,
             RunnerRequest::Stop {
                 command_id: "stop-pending-input".into(),
-                grace_ms: 1000,
+                grace_ms: TERM_CLEANUP_GRACE_MS,
             },
         ),
         "stop-pending-input",
