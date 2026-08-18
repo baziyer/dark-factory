@@ -17,8 +17,9 @@ use factory_core::{
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail,
-        RequestEnvelope, RunTerminal, ServerFrame,
+        MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
+        ProjectDetail as LocalProjectDetail, RequestEnvelope, RunTerminal, ServerFrame,
+        normalize_task_title,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
@@ -155,6 +156,10 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidTaskResult) => (
                 ErrorCode::InvalidRequest,
                 "task result exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::InvalidTaskInput) => (
+                ErrorCode::InvalidRequest,
+                "task title or body is invalid or exceeds its bound".into(),
             ),
             Self::Store(StoreError::InvalidBlockedReason) => (
                 ErrorCode::InvalidRequest,
@@ -823,7 +828,11 @@ async fn handle_request(
             body,
             priority,
         } => {
-            let title = required_text("task title", title, 240)?;
+            let title = normalize_task_title(title).ok_or_else(|| {
+                ApiFailure::Invalid(format!(
+                    "task title must be between 1 and {MAX_TASK_TITLE_BYTES} bytes"
+                ))
+            })?;
             if body.len() > MAX_TASK_BODY_BYTES {
                 return Err(ApiFailure::Invalid(format!(
                     "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
@@ -1209,7 +1218,13 @@ async fn handle_request(
                 ));
             }
             let title = title
-                .map(|title| required_text("task title", title, 240))
+                .map(|title| {
+                    normalize_task_title(title).ok_or_else(|| {
+                        ApiFailure::Invalid(format!(
+                            "task title must be between 1 and {MAX_TASK_TITLE_BYTES} bytes"
+                        ))
+                    })
+                })
                 .transpose()?;
             if let Some(body) = body.as_ref() {
                 if body.len() > MAX_TASK_BODY_BYTES {

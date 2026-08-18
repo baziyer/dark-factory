@@ -49,6 +49,8 @@ const MAX_FROM_CHARS: usize = 240;
 const MAX_DOCUMENT_BYTES: usize = 128 * 1024;
 const ENDPOINT_RATE_LIMIT: u64 = 60;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
+const EVENT_MAX_AGE_MS: i64 = 5 * 60 * 1000;
+const EVENT_MAX_FUTURE_SKEW_MS: i64 = 30 * 1000;
 const LEGACY_SECRET_HEADER: &str = "x-md-webhook-secret";
 const LEGACY_TOKEN_HEADER: &str = "x-md-webhook-token";
 const SIGNATURE_HEADER: &str = "x-dark-factory-signature";
@@ -603,10 +605,11 @@ fn rate_limited(state: &HttpState, route: Route) -> Option<Response> {
         outcome = "rate_limited",
         status = 429_u16
     );
-    Some(json_response(
-        StatusCode::TOO_MANY_REQUESTS,
-        json!({ "ok": false, "error": "rate limited" }),
-    ))
+    let body = match route {
+        Route::Event => json!({"status":"rejected","error":"rate_limited"}),
+        _ => json!({"ok":false,"error":"rate limited"}),
+    };
+    Some(json_response(StatusCode::TOO_MANY_REQUESTS, body))
 }
 
 fn endpoint(state: &HttpState, id: &str) -> Option<RequestEndpoint> {
@@ -619,6 +622,7 @@ fn endpoint(state: &HttpState, id: &str) -> Option<RequestEndpoint> {
 struct ConnectorEnvelope {
     version: u16,
     event_id: String,
+    timestamp_ms: i64,
     project_id: ProjectId,
     #[serde(flatten)]
     payload: ConnectorPayload,
@@ -640,6 +644,7 @@ enum ConnectorPayload {
         priority: i32,
     },
     Message {
+        #[serde(rename = "agentId")]
         agent_id: AgentId,
         body: String,
     },
@@ -689,14 +694,21 @@ fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+fn event_timestamp_is_fresh(timestamp_ms: i64, now_ms: i64) -> bool {
+    timestamp_ms >= now_ms.saturating_sub(EVENT_MAX_AGE_MS)
+        && timestamp_ms <= now_ms.saturating_add(EVENT_MAX_FUTURE_SKEW_MS)
+}
+
 async fn accept_event(
     State(state): State<HttpState>,
     AxumPath(endpoint_id): AxumPath<String>,
     request: Request<Body>,
 ) -> Response {
-    if let Some(response) = rate_limited(&state, Route::Event) {
+    let route = Route::Event;
+    if let Some(response) = rate_limited(&state, route) {
         return response;
     }
+    let started = Instant::now();
     if state.endpoint.id != endpoint_id || state.endpoint.wire_profile != WireProfile::GenericV1 {
         return json_response(
             StatusCode::UNAUTHORIZED,
@@ -711,6 +723,10 @@ async fn accept_event(
     let bytes = match to_bytes(request.into_body(), MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
+            state
+                .metrics
+                .bounded_rejections
+                .fetch_add(1, Ordering::Relaxed);
             return json_response(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 json!({"status":"rejected","error":"payload_too_large"}),
@@ -727,23 +743,47 @@ async fn accept_event(
     let envelope: ConnectorEnvelope = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => {
-            return json_response(
+            return authenticated_response(
+                &state,
+                route,
+                started,
                 StatusCode::BAD_REQUEST,
+                "invalid_envelope",
                 json!({"status":"rejected","error":"invalid_envelope"}),
             );
         }
     };
     if envelope.version != 1 || envelope.event_id.is_empty() || envelope.event_id.len() > 128 {
-        return json_response(
+        return authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_envelope",
             json!({"status":"rejected","error":"invalid_envelope"}),
         );
     }
+    let received_at_ms = unix_time_ms();
+    if !event_timestamp_is_fresh(envelope.timestamp_ms, received_at_ms) {
+        return authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "timestamp_out_of_range",
+            json!({"status":"rejected","error":"timestamp_out_of_range"}),
+        );
+    }
+    let payload_digest: [u8; 32] = Sha256::digest(&bytes).into();
     let result_id = match random_hex::<12>() {
         Ok(id) => format!("connector-{id}"),
         Err(_) => {
-            return json_response(
+            return authenticated_response(
+                &state,
+                route,
+                started,
                 StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
                 json!({"status":"rejected","error":"internal"}),
             );
         }
@@ -787,32 +827,70 @@ async fn accept_event(
     match state
         .daemon
         .commit_and_publish(move |store| {
-            store.apply_connector_event(&endpoint_id, &event_id, input, unix_time_ms())
+            store.apply_connector_event(
+                &endpoint_id,
+                &event_id,
+                payload_digest,
+                input,
+                received_at_ms,
+            )
         })
         .await
     {
-        Ok(ConnectorEventResult::Accepted { kind, id }) => json_response(
+        Ok(ConnectorEventResult::Accepted { kind, id }) => authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::ACCEPTED,
+            "accepted",
             json!({"status":"accepted","kind":kind,"id":id}),
         ),
-        Ok(ConnectorEventResult::Duplicate { kind, id }) => json_response(
+        Ok(ConnectorEventResult::Duplicate { kind, id }) => authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::OK,
+            "duplicate",
             json!({"status":"duplicate","kind":kind,"id":id}),
         ),
         Err(DaemonStateError::Store(
             StoreError::WebhookProjectNotFound | StoreError::AgentNotFound,
-        )) => json_response(
+        )) => authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::NOT_FOUND,
+            "unknown_target",
             json!({"status":"rejected","error":"unknown_target"}),
         ),
         Err(DaemonStateError::Store(
-            StoreError::InvalidWebhookInput | StoreError::InvalidAgentMessage,
-        )) => json_response(
+            StoreError::InvalidWebhookInput
+            | StoreError::InvalidAgentMessage
+            | StoreError::InvalidTaskInput,
+        )) => authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_payload",
             json!({"status":"rejected","error":"invalid_payload"}),
         ),
-        Err(_) => json_response(
+        Err(DaemonStateError::Store(StoreError::ConnectorEventPayloadMismatch)) => {
+            authenticated_response(
+                &state,
+                route,
+                started,
+                StatusCode::CONFLICT,
+                "idempotency_mismatch",
+                json!({"status":"rejected","error":"idempotency_mismatch"}),
+            )
+        }
+        Err(_) => authenticated_response(
+            &state,
+            route,
+            started,
             StatusCode::CONFLICT,
+            "conflict",
             json!({"status":"rejected","error":"conflict"}),
         ),
     }
@@ -1599,4 +1677,30 @@ async fn method_not_allowed(State(state): State<HttpState>) -> Response {
         return response;
     }
     StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EVENT_MAX_AGE_MS, EVENT_MAX_FUTURE_SKEW_MS, event_timestamp_is_fresh};
+
+    #[test]
+    fn connector_timestamp_window_has_exact_past_and_future_boundaries() {
+        let now_ms = 1_800_000_000_000_i64;
+        assert!(event_timestamp_is_fresh(now_ms, now_ms));
+        assert!(event_timestamp_is_fresh(now_ms - EVENT_MAX_AGE_MS, now_ms));
+        assert!(!event_timestamp_is_fresh(
+            now_ms - EVENT_MAX_AGE_MS - 1,
+            now_ms
+        ));
+        assert!(event_timestamp_is_fresh(
+            now_ms + EVENT_MAX_FUTURE_SKEW_MS,
+            now_ms
+        ));
+        assert!(!event_timestamp_is_fresh(
+            now_ms + EVENT_MAX_FUTURE_SKEW_MS + 1,
+            now_ms
+        ));
+        assert!(!event_timestamp_is_fresh(i64::MIN, i64::MAX));
+        assert!(!event_timestamp_is_fresh(i64::MAX, i64::MIN));
+    }
 }

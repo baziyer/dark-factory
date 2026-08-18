@@ -1,11 +1,12 @@
 use factory_core::{
     AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, RunId, RunnerInstanceId,
-    SessionId, TaskId, TaskStatus,
+    SessionId, TaskId, TaskStatus, local::MAX_TASK_BODY_BYTES,
 };
 use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
     NewTask, Store, StoreError, UpdateAgentProfile,
 };
+use std::sync::{Arc, Barrier};
 
 #[test]
 fn connector_event_idempotency_is_atomic_and_survives_restart() {
@@ -32,7 +33,7 @@ fn connector_event_idempotency_is_atomic_and_survives_restart() {
             priority: 0,
         };
         let (result, events) = store
-            .apply_connector_event("monitor", "evt-1", input.clone(), 2)
+            .apply_connector_event("monitor", "evt-1", [1; 32], input.clone(), 2)
             .unwrap();
         let ConnectorEventResult::Accepted { id, .. } = result else {
             panic!("first event was not accepted")
@@ -40,7 +41,7 @@ fn connector_event_idempotency_is_atomic_and_survives_restart() {
         first_id = id;
         assert_eq!(events.len(), 1);
         let (duplicate, events) = store
-            .apply_connector_event("monitor", "evt-1", input, 3)
+            .apply_connector_event("monitor", "evt-1", [1; 32], input, 3)
             .unwrap();
         assert_eq!(
             duplicate,
@@ -56,11 +57,12 @@ fn connector_event_idempotency_is_atomic_and_survives_restart() {
         .apply_connector_event(
             "monitor",
             "evt-1",
+            [1; 32],
             ConnectorEventInput::Task {
-                id: task_id("different"),
+                id: task_id("connector-one"),
                 project_id: project_id("factory"),
-                title: "Ignored".into(),
-                body: "Ignored".into(),
+                title: "Imported".into(),
+                body: "Do it".into(),
                 priority: 0,
             },
             4,
@@ -74,6 +76,21 @@ fn connector_event_idempotency_is_atomic_and_survives_restart() {
         }
     );
     assert!(events.is_empty());
+    assert!(matches!(
+        reopened.apply_connector_event(
+            "monitor",
+            "evt-1",
+            [2; 32],
+            ConnectorEventInput::Message {
+                id: factory_core::MessageId::try_from("different").unwrap(),
+                project_id: project_id("factory"),
+                recipient_agent_id: agent_id("different-target"),
+                body: "Changed".into(),
+            },
+            5,
+        ),
+        Err(StoreError::ConnectorEventPayloadMismatch)
+    ));
 }
 
 #[test]
@@ -87,7 +104,7 @@ fn rejected_unknown_connector_target_does_not_consume_event_id() {
         priority: 0,
     };
     assert!(matches!(
-        store.apply_connector_event("monitor", "evt-later", input.clone(), 1),
+        store.apply_connector_event("monitor", "evt-later", [3; 32], input.clone(), 1),
         Err(StoreError::WebhookProjectNotFound)
     ));
     store
@@ -102,11 +119,139 @@ fn rejected_unknown_connector_target_does_not_consume_event_id() {
         .unwrap();
     assert!(matches!(
         store
-            .apply_connector_event("monitor", "evt-later", input, 3)
+            .apply_connector_event("monitor", "evt-later", [3; 32], input, 3)
             .unwrap()
             .0,
         ConnectorEventResult::Accepted { .. }
     ));
+}
+
+#[test]
+fn concurrent_mismatched_connector_events_keep_the_first_payload_only() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let mut setup = Store::open(&database).unwrap();
+    setup
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work".into(),
+            },
+            1,
+        )
+        .unwrap();
+    drop(setup);
+
+    let barrier = Arc::new(Barrier::new(2));
+    let results = std::thread::scope(|scope| {
+        let handles = [1_u8, 2_u8].map(|variant| {
+            let database = database.clone();
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                let mut store = Store::open(database).unwrap();
+                barrier.wait();
+                store.apply_connector_event(
+                    "monitor",
+                    "evt-race",
+                    [variant; 32],
+                    ConnectorEventInput::Task {
+                        id: task_id(&format!("connector-{variant}")),
+                        project_id: project_id("factory"),
+                        title: format!("Imported {variant}"),
+                        body: format!("Payload {variant}"),
+                        priority: 0,
+                    },
+                    i64::from(variant) + 1,
+                )
+            })
+        });
+        handles.map(|handle| handle.join().unwrap())
+    });
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Ok((ConnectorEventResult::Accepted { .. }, _))))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| matches!(result, Err(StoreError::ConnectorEventPayloadMismatch)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        Store::open(&database)
+            .unwrap()
+            .list_tasks(&project_id("factory"), None, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn connector_tasks_share_cli_title_normalization_and_body_bound() {
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: "/work".into(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .apply_connector_event(
+            "monitor",
+            "evt-boundary",
+            [4; 32],
+            ConnectorEventInput::Task {
+                id: task_id("connector-boundary"),
+                project_id: project_id("factory"),
+                title: "  Imported  ".into(),
+                body: "x".repeat(MAX_TASK_BODY_BYTES),
+                priority: 0,
+            },
+            2,
+        )
+        .unwrap();
+    let task = store
+        .get_task(&project_id("factory"), &task_id("connector-boundary"))
+        .unwrap();
+    assert_eq!(task.snapshot.title, "Imported");
+    assert_eq!(task.body.len(), MAX_TASK_BODY_BYTES);
+
+    for (event_id, digest, title, body) in [
+        ("evt-empty-title", [5; 32], "  ".to_owned(), String::new()),
+        (
+            "evt-large-body",
+            [6; 32],
+            "Imported".to_owned(),
+            "x".repeat(MAX_TASK_BODY_BYTES + 1),
+        ),
+    ] {
+        assert!(matches!(
+            store.apply_connector_event(
+                "monitor",
+                event_id,
+                digest,
+                ConnectorEventInput::Task {
+                    id: task_id(event_id),
+                    project_id: project_id("factory"),
+                    title,
+                    body,
+                    priority: 0,
+                },
+                3,
+            ),
+            Err(StoreError::InvalidTaskInput)
+        ));
+    }
 }
 
 fn project_id(value: &str) -> ProjectId {

@@ -6,6 +6,7 @@ use factory_core::{
     RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
     SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::agent_attention,
+    local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -462,6 +463,8 @@ pub enum StoreError {
     TaskNotRetryable,
     #[error("task result exceeds its bound")]
     InvalidTaskResult,
+    #[error("task title or body is invalid or exceeds its bound")]
+    InvalidTaskInput,
     #[error("task blocked reason is empty or exceeds its bound")]
     InvalidBlockedReason,
     #[error("agent already has a live session or open run")]
@@ -482,6 +485,8 @@ pub enum StoreError {
     InvalidExecutionMetadata,
     #[error("webhook input is invalid")]
     InvalidWebhookInput,
+    #[error("connector event ID was reused with a different payload")]
+    ConnectorEventPayloadMismatch,
     #[error("webhook project was not found")]
     WebhookProjectNotFound,
     #[error("webhook orchestrator was not found")]
@@ -533,6 +538,7 @@ impl Store {
         &mut self,
         endpoint_id: &str,
         event_id: &str,
+        payload_digest: [u8; 32],
         input: ConnectorEventInput,
         now_ms: i64,
     ) -> Result<(ConnectorEventResult, Vec<EventEnvelope>)> {
@@ -544,12 +550,21 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(existing) = transaction
             .query_row(
-                "SELECT event_kind, result_id FROM connector_events WHERE endpoint_id = ?1 AND event_id = ?2",
+                "SELECT event_kind, result_id, payload_digest FROM connector_events WHERE endpoint_id = ?1 AND event_id = ?2",
                 params![endpoint_id, event_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
             )
             .optional()?
         {
+            if !constant_time_eq(&existing.2, &payload_digest) {
+                return Err(StoreError::ConnectorEventPayloadMismatch);
+            }
             transaction.commit()?;
             return Ok((ConnectorEventResult::Duplicate { kind: existing.0, id: existing.1 }, Vec::new()));
         }
@@ -562,9 +577,6 @@ impl Store {
                 body,
                 priority,
             } => {
-                if title.is_empty() || title.len() > 240 || body.len() > 100_000 {
-                    return Err(StoreError::InvalidWebhookInput);
-                }
                 transaction
                     .query_row(
                         "SELECT 1 FROM projects WHERE id = ?1",
@@ -573,22 +585,18 @@ impl Store {
                     )
                     .optional()?
                     .ok_or(StoreError::WebhookProjectNotFound)?;
-                let snapshot = TaskSnapshot {
-                    id: id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    assigned_agent_id: None,
-                    title,
-                    status: TaskStatus::Queued,
-                    priority,
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
-                };
-                transaction.execute(
-                    "INSERT INTO tasks (id, project_id, parent_task_id, assigned_agent_id, title, body, status, priority, created_at_ms, updated_at_ms, incarnation_id) VALUES (?1, ?2, NULL, NULL, ?3, ?4, 'queued', ?5, ?6, ?6, ?7)",
-                    params![id.as_str(), project_id.as_str(), snapshot.title, body, priority, now_ms, Uuid::new_v4().hyphenated().to_string()],
+                let (_, event) = insert_task(
+                    &transaction,
+                    NewTask {
+                        id: id.clone(),
+                        project_id,
+                        parent_task_id: None,
+                        title,
+                        body,
+                        priority,
+                    },
+                    now_ms,
                 )?;
-                let event = FactoryEvent::TaskChanged { task: snapshot };
                 ("task", id.to_string(), Some(event))
             }
             ConnectorEventInput::Message {
@@ -609,8 +617,8 @@ impl Store {
             }
         };
         transaction.execute(
-            "INSERT INTO connector_events (endpoint_id, event_id, event_kind, result_id, received_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![endpoint_id, event_id, kind, id, now_ms],
+            "INSERT INTO connector_events (endpoint_id, event_id, payload_digest, event_kind, result_id, received_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![endpoint_id, event_id, payload_digest.as_slice(), kind, id, now_ms],
         )?;
         let events = if let Some(event) = event {
             let sequence = append_event(&transaction, now_ms, &event)?;
@@ -766,47 +774,10 @@ impl Store {
         input: NewTask,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
-        let record = TaskDetail {
-            snapshot: TaskSnapshot {
-                id: input.id,
-                project_id: input.project_id,
-                parent_task_id: input.parent_task_id,
-                assigned_agent_id: None,
-                title: input.title,
-                status: TaskStatus::Queued,
-                priority: input.priority,
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            },
-            body: input.body,
-            result: None,
-            blocked_reason: None,
-        };
-        let event = FactoryEvent::TaskChanged {
-            task: record.snapshot.clone(),
-        };
-        let incarnation_id = Uuid::new_v4().hyphenated().to_string();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        transaction.execute(
-            "INSERT INTO tasks (
-                id, project_id, parent_task_id, assigned_agent_id, title, body,
-                status, priority, created_at_ms, updated_at_ms, incarnation_id
-             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
-            params![
-                record.snapshot.id.as_str(),
-                record.snapshot.project_id.as_str(),
-                record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
-                record.snapshot.title,
-                record.body,
-                record.snapshot.priority,
-                record.snapshot.created_at_ms,
-                record.snapshot.updated_at_ms,
-                incarnation_id,
-            ],
-        )?;
+        let (record, event) = insert_task(&transaction, input, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
 
@@ -4374,6 +4345,54 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+fn insert_task(
+    transaction: &Transaction<'_>,
+    input: NewTask,
+    now_ms: i64,
+) -> Result<(TaskDetail, FactoryEvent)> {
+    let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
+    if input.body.len() > MAX_TASK_BODY_BYTES {
+        return Err(StoreError::InvalidTaskInput);
+    }
+    let record = TaskDetail {
+        snapshot: TaskSnapshot {
+            id: input.id,
+            project_id: input.project_id,
+            parent_task_id: input.parent_task_id,
+            assigned_agent_id: None,
+            title,
+            status: TaskStatus::Queued,
+            priority: input.priority,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        },
+        body: input.body,
+        result: None,
+        blocked_reason: None,
+    };
+    transaction.execute(
+        "INSERT INTO tasks (
+            id, project_id, parent_task_id, assigned_agent_id, title, body,
+            status, priority, created_at_ms, updated_at_ms, incarnation_id
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
+        params![
+            record.snapshot.id.as_str(),
+            record.snapshot.project_id.as_str(),
+            record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
+            &record.snapshot.title,
+            &record.body,
+            record.snapshot.priority,
+            record.snapshot.created_at_ms,
+            record.snapshot.updated_at_ms,
+            Uuid::new_v4().hyphenated().to_string(),
+        ],
+    )?;
+    let event = FactoryEvent::TaskChanged {
+        task: record.snapshot.clone(),
+    };
+    Ok((record, event))
 }
 
 fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDetail>> {

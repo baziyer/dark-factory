@@ -92,8 +92,8 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 20 as of 0020's
-/// task-incarnation addition (0015 widened `last_hook_event` for
+/// which always migrates to the current `SCHEMA_VERSION`, 20 as of the
+/// connector-event migration (0015 widened `last_hook_event` for
 /// `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -184,7 +184,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0019.
+    // Opening through the real store runs migrations 0014 through 0020.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
@@ -233,6 +233,42 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     store
         .create_session(new_session("run-2", "factory", "curie"), 5)
         .unwrap();
+}
+
+#[test]
+fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("schema-18.db");
+    drop(Store::open(&database).unwrap());
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE connector_events;
+                 DROP TABLE project_repository_authority;
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+    }
+
+    drop(Store::open(&database).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 20);
+    connection
+        .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
+        .unwrap();
+    connection
+        .prepare("SELECT payload_digest, event_kind FROM connector_events")
+        .unwrap();
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
 }
 
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s
