@@ -1729,6 +1729,21 @@ impl Store {
         })
     }
 
+    /// Whether this exact task has already been delivered into this exact
+    /// session. Used to distinguish an idempotent delivery commit from an
+    /// unrelated `TaskNotQueued`/`AgentUnavailable` failure.
+    pub fn has_run_episode(&self, session_id: &SessionId, task_id: &TaskId) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runs WHERE session_id = ?1 AND task_id = ?2
+                 )",
+                params![session_id.as_str(), task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
     /// `factoryctl task done`: closes the open episode `succeeded`,
     /// `closed_by = task_done`, the task `succeeded` with `result`.
     pub fn complete_task(
