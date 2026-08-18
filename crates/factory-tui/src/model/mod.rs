@@ -246,6 +246,24 @@ impl Board {
             .collect()
     }
 
+    /// Active work assigned to one agent, in the same stable order AGENT renders and targets it.
+    #[must_use]
+    pub fn active_tasks_for_agent(&self, agent_id: &AgentId) -> Vec<&TaskDetail> {
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.snapshot.assigned_agent_id.as_ref() == Some(agent_id)
+                    && matches!(
+                        task.snapshot.status,
+                        factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
+                    )
+            })
+            .collect();
+        tasks.sort_by_key(|task| (task.snapshot.created_at_ms, task.snapshot.id.clone()));
+        tasks
+    }
+
     // -- derived views: task detail (lazy `GetTask` fetch) ----------------------------------
 
     /// Whether `task_id`'s cached [`TaskDetail`] (`body`/`result`/`blocked_reason`) is missing or
@@ -440,7 +458,7 @@ impl Board {
     /// (no live session at all) always leaves every key acting on the board, never silently
     /// eating it as input for a pane that isn't there.
     #[must_use]
-    fn has_live_pane(&self) -> bool {
+    pub(crate) fn has_live_pane(&self) -> bool {
         self.view == View::Agent && self.pane_ready
     }
 
@@ -473,14 +491,9 @@ impl Board {
         self.set_status(text, StatusLevel::Error);
     }
 
-    pub fn note_info(&mut self, text: impl Into<String>) {
-        self.set_status(text, StatusLevel::Info);
-    }
-
-    /// The text the bottom status/help line should show right now: the key-help reminder for the
-    /// current mode/view *always* renders, so the operator never loses the "what keys work"
-    /// reference. A recent status/error follows the hint, so the non-wrapping renderer clips the
-    /// bounded status rather than the controls on narrow terminals.
+    /// The current mode/modal hint followed by a recent bounded status or error. The footer lays
+    /// this variable text between fixed tab and essential-control regions, so clipping cannot
+    /// move or hide controls that fit the rendered width.
     #[must_use]
     pub fn status_line_text(&self) -> String {
         let hint = self.help_text();
@@ -499,8 +512,8 @@ impl Board {
         })
     }
 
-    /// The key-help reminder for the current mode/view (used as the status line's default text,
-    /// and as a hint inside prompt overlays).
+    /// The current mode or modal safety hint. The footer renders the small permanent help and
+    /// detach controls separately instead of repeating the action catalog on every frame.
     #[must_use]
     pub fn help_text(&self) -> String {
         match &self.mode {
@@ -529,15 +542,12 @@ impl Board {
                 let target = self
                     .pane_target_agent()
                     .map_or_else(|| "pane".to_owned(), |id| id.to_string());
-                return format!("TYPING \u{2192} {target}   Ctrl-] board");
+                return format!("TYPING \u{2192} {target}");
             }
-            return "BOARD  i/Enter type  C capacity  [/] or j/k agent  z maximise  Esc back  ? help  q detach"
-                .to_owned();
+            return "BOARD".to_owned();
         }
         if self.view == View::Building {
-            return "j/k floors  Enter agent  C capacity  g needs-you  n new  m message  o orchestrator  \
-                    p project  x stop  ? help  q detach"
-                .to_owned();
+            return "BOARD".to_owned();
         }
         String::new()
     }

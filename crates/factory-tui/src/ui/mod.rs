@@ -9,15 +9,18 @@ mod help;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::model::{Board, Mode, View};
+use crate::mouse::{HitMap, Target};
 use crate::pane::PaneMap;
 
-pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) {
+pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) -> HitMap {
+    let mut hits = HitMap::default();
     let area = frame.area();
     if area.width == 0 || area.height == 0 {
-        return;
+        return hits;
     }
 
     let status_height = 1u16.min(area.height);
@@ -28,16 +31,61 @@ pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) {
     let (content_area, status_area) = (outer[0], outer[1]);
 
     match board.view {
-        View::Building => building::draw(frame, content_area, board),
-        View::Agent => agent::draw(frame, content_area, board, panes),
+        View::Building => building::draw(frame, content_area, board, &mut hits),
+        View::Agent => agent::draw(frame, content_area, board, panes, &mut hits),
     }
-    help::render_status_line(frame, status_area, board);
+    help::render_status_line(frame, status_area, board, &mut hits);
 
     if matches!(
         board.mode,
         Mode::Prompt(_) | Mode::Picker(_) | Mode::TaskMenu(_) | Mode::Confirm(_) | Mode::Help
     ) {
         help::render_overlay(frame, area, board);
+    }
+    hits
+}
+
+pub(super) fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    const BUILDING_WIDTH: u16 = 10;
+    const AGENT_START: u16 = 11;
+    const AGENT_WIDTH: u16 = 7;
+    let selected = Modifier::REVERSED | Modifier::BOLD;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("[{}]", View::Building.label()),
+                Style::default().add_modifier(if board.view == View::Building {
+                    selected
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}]", View::Agent.label()),
+                Style::default().add_modifier(if board.view == View::Agent {
+                    selected
+                } else {
+                    Modifier::empty()
+                }),
+            ),
+        ])),
+        area,
+    );
+    if area.width >= BUILDING_WIDTH {
+        hits.add(
+            Rect::new(area.x, area.y, BUILDING_WIDTH, 1),
+            Target::View(View::Building),
+        );
+    }
+    if area.width >= AGENT_START + AGENT_WIDTH {
+        hits.add(
+            Rect::new(area.x + AGENT_START, area.y, AGENT_WIDTH, 1),
+            Target::View(View::Agent),
+        );
     }
 }
 
@@ -128,6 +176,26 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mouse::{Route, Target, route};
+    use crate::test_fixtures::{agent, project, task};
+    use factory_core::{AgentId, AgentRole, TaskId, TaskStatus};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    fn render(board: &Board, width: u16, height: u16) -> HitMap {
+        render_frame(board, width, height).0
+    }
+
+    fn render_frame(board: &Board, width: u16, height: u16) -> (HitMap, Terminal<TestBackend>) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut panes = PaneMap::new();
+        let mut hits = HitMap::default();
+        terminal
+            .draw(|frame| hits = draw(frame, board, &mut panes))
+            .unwrap();
+        (hits, terminal)
+    }
 
     #[test]
     fn truncate_middle_passes_through_text_that_already_fits() {
@@ -159,5 +227,188 @@ mod tests {
             truncate("first-floor-worker", 12),
             truncate("first-floor-worker-2", 12)
         );
+    }
+
+    #[test]
+    fn rendered_building_rows_and_tabs_are_the_hit_authority() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![task("blocked", "proj", TaskStatus::Blocked, None, 0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        let hits = render(&board, 120, 24);
+        assert_eq!(hits.target_at(0, 23), Some(Target::View(View::Building)));
+        assert_eq!(hits.target_at(11, 23), Some(Target::View(View::Agent)));
+        assert_eq!(
+            hits.target_at(1, 2),
+            Some(Target::Agent(AgentId::try_from("alice").unwrap()))
+        );
+        assert_eq!(
+            hits.target_at(83, 1),
+            Some(Target::Attention(crate::model::AttentionTarget::Task(
+                TaskId::try_from("blocked").unwrap()
+            )))
+        );
+    }
+
+    #[test]
+    fn agent_task_and_unattached_pane_regions_are_clickable_but_not_terminal_input() {
+        let mut board = Board::new(true, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![task("task-1", "proj", TaskStatus::Queued, Some("alice"), 0)],
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        let hits = render(&board, 120, 24);
+        assert_eq!(
+            hits.target_at(83, 1),
+            Some(Target::Task(TaskId::try_from("task-1").unwrap()))
+        );
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            route(click, &hits, None, &mut crate::mouse::Capture::default()),
+            Route::Board(Target::Pane(_))
+        ));
+    }
+
+    #[test]
+    fn resize_replaces_clipped_and_empty_row_targets() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let full = render(&board, 120, 24);
+        assert!(matches!(full.target_at(1, 2), Some(Target::Agent(_))));
+
+        let clipped = render(&board, 30, 3);
+        assert_eq!(clipped.target_at(1, 1), None);
+        assert_eq!(clipped.target_at(0, 2), Some(Target::View(View::Building)));
+
+        let empty = render(&Board::new(false, 0, crate::theme::PLAIN), 120, 24);
+        assert_eq!(empty.target_at(1, 2), None);
+    }
+
+    #[test]
+    fn footer_tabs_are_clickable_only_when_their_complete_labels_fit() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+
+        let below_building = render(&board, 9, 1);
+        assert_eq!(below_building.target_at(0, 0), None);
+        assert_eq!(below_building.target_at(8, 0), None);
+
+        let building = render(&board, 10, 1);
+        assert_eq!(building.target_at(0, 0), Some(Target::View(View::Building)));
+        assert_eq!(building.target_at(9, 0), Some(Target::View(View::Building)));
+
+        let below_agent = render(&board, 17, 1);
+        assert_eq!(
+            below_agent.target_at(9, 0),
+            Some(Target::View(View::Building))
+        );
+        assert_eq!(below_agent.target_at(11, 0), None);
+        assert_eq!(below_agent.target_at(16, 0), None);
+        assert_eq!(
+            route(
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 11,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &below_agent,
+                None,
+                &mut crate::mouse::Capture::default(),
+            ),
+            Route::None
+        );
+
+        let complete = render(&board, 18, 1);
+        assert_eq!(complete.target_at(11, 0), Some(Target::View(View::Agent)));
+        assert_eq!(complete.target_at(17, 0), Some(Target::View(View::Agent)));
+
+        // Every redraw returns a fresh hit map, so shrinking below the threshold cannot retain
+        // the complete frame's AGENT target.
+        let resized = render(&board, 12, 1);
+        assert_eq!(resized.target_at(11, 0), None);
+    }
+
+    #[test]
+    fn footer_has_selected_tabs_and_only_stable_essential_controls() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+        let (hits, terminal) = render_frame(&board, 120, 24);
+        let footer_y = 23;
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+
+        assert!(footer.contains("[BUILDING] [AGENT]"));
+        assert!(footer.contains("BOARD"));
+        assert!(footer.contains("[? help]"));
+        assert!(footer.contains("[q detach]"));
+        for old_action in ["j/k", "Enter", "needs-you", "type"] {
+            assert!(!footer.contains(old_action));
+        }
+        let selected = terminal.backend().buffer()[(0, footer_y)].modifier;
+        let unselected = terminal.backend().buffer()[(11, footer_y)].modifier;
+        assert!(selected.contains(Modifier::REVERSED | Modifier::BOLD));
+        assert!(!unselected.contains(Modifier::REVERSED));
+
+        let help_x = (0..120)
+            .find(|x| hits.target_at(*x, footer_y) == Some(Target::Help))
+            .unwrap();
+        let detach_x = (0..120)
+            .find(|x| hits.target_at(*x, footer_y) == Some(Target::Detach))
+            .unwrap();
+        for (column, expected) in [(help_x, Target::Help), (detach_x, Target::Detach)] {
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: footer_y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(
+                route(click, &hits, None, &mut crate::mouse::Capture::default()),
+                Route::Board(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn footer_shows_terminal_escape_only_while_typing() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+        let (_, terminal) = render_frame(&board, 120, 24);
+        let footer_y = 23;
+        let board_footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(!board_footer.contains("Ctrl-]"));
+
+        let mut typing = board;
+        typing.view = View::Agent;
+        typing.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        typing.pane_mode = crate::model::PaneMode::Typing;
+        typing.pane_ready = true;
+        let (_, terminal) = render_frame(&typing, 120, 24);
+        let typing_footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(typing_footer.contains("Ctrl-] board"));
+        assert!(typing_footer.contains("[? help] [q detach]"));
     }
 }
