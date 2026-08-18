@@ -111,6 +111,8 @@ pub struct Board {
     pub focused_project: Option<ProjectId>,
 
     pub agents: BTreeMap<AgentId, AgentSnapshot>,
+    /// Git summaries received through the CLI-first fleet-status request.
+    pub worktrees: BTreeMap<AgentId, factory_core::status::WorktreeStatus>,
     pub tasks: BTreeMap<TaskId, TaskDetail>,
     pub runs: BTreeMap<RunId, RunSnapshot>,
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
@@ -153,6 +155,7 @@ impl Board {
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
+            worktrees: BTreeMap::new(),
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
             sessions: BTreeMap::new(),
@@ -171,6 +174,16 @@ impl Board {
             caught_up: false,
             quit: false,
         }
+    }
+
+    pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
+        self.live_session_cap = Some(status.live_session_cap);
+        self.worktrees = status
+            .projects
+            .into_iter()
+            .flat_map(|project| project.agents)
+            .filter_map(|agent| agent.worktree.map(|worktree| (agent.agent.id, worktree)))
+            .collect();
     }
 
     // -- derived views: projects/agents/tasks -----------------------------------------------
