@@ -58,7 +58,20 @@ pub fn status_from_environment() -> Result<CapacityStatus, String> {
 
 /// Reads the operator setting without requiring a daemon or a launchd job.
 pub fn status(_home: &Path, user_home: &Path) -> Result<CapacityStatus, String> {
-    let plist = launchd::plist_path(user_home);
+    status_for(
+        _home,
+        user_home,
+        &launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+    )
+}
+
+/// Reads capacity for an explicitly selected managed launchd service.
+pub fn status_for(
+    _home: &Path,
+    user_home: &Path,
+    target: &launchd::LaunchdTarget,
+) -> Result<CapacityStatus, String> {
+    let plist = launchd::plist_path_for(user_home, target);
     let configured = launchd::max_active_runs(
         launchd::read_existing(&plist)?
             .as_ref()
@@ -67,7 +80,7 @@ pub fn status(_home: &Path, user_home: &Path) -> Result<CapacityStatus, String> 
     .unwrap_or(DEFAULT_MAX_ACTIVE_RUNS);
     Ok(CapacityStatus {
         configured,
-        launchd_loaded: probes::launchd_loaded(),
+        launchd_loaded: probes::launchd_loaded_for(target),
     })
 }
 
@@ -80,10 +93,26 @@ pub fn set(
     socket: &Path,
     requested: usize,
 ) -> Result<CapacityChange, String> {
+    set_for(
+        home,
+        user_home,
+        socket,
+        requested,
+        &launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+    )
+}
+
+/// Applies capacity through an explicitly selected managed launchd service.
+pub fn set_for(
+    home: &Path,
+    user_home: &Path,
+    socket: &Path,
+    requested: usize,
+    target: &launchd::LaunchdTarget,
+) -> Result<CapacityChange, String> {
     let requested = validate(requested)?;
-    let _lock = runtime::MutationLock::acquire(home)?;
-    let plist = launchd::plist_path(user_home);
-    let snapshot = _lock.snapshot(home, &plist)?;
+    let plist = launchd::plist_path_for(user_home, target);
+    let (_lock, snapshot) = runtime::MutationLock::begin(home, &plist)?;
     let existing = launchd::read_existing(&plist)?
         .ok_or("no launchd job is installed; capacity changes require the managed daemon")?;
     let previous_plist = snapshot
@@ -91,7 +120,7 @@ pub fn set(
         .as_deref()
         .ok_or("the launchd plist disappeared while taking the mutation snapshot")?;
     launchd::check_home(&existing, home, user_home)?;
-    if !probes::launchd_loaded() {
+    if !probes::launchd_loaded_for(target) {
         if probes::daemon_answers(socket) {
             return Err(
                 "a daemon answers but its launchd job is not loaded; capacity changes require the managed daemon"
@@ -100,7 +129,7 @@ pub fn set(
         }
         return Err("the Dark Factory launchd job is not loaded".into());
     }
-    probes::wait_for_managed_daemon(socket, Duration::from_secs(2), None, home)
+    probes::wait_for_managed_daemon_for(target, socket, Duration::from_secs(2), None, home)
         .map_err(|error| format!("managed launchd health check failed: {error}"))?;
     let previous =
         launchd::max_active_runs(&existing.program_arguments)?.unwrap_or(DEFAULT_MAX_ACTIVE_RUNS);
@@ -111,26 +140,34 @@ pub fn set(
         });
     }
 
-    launchd::apply_with_rollback(
-        home,
-        &plist,
-        Some(&existing),
-        &probes::provider_directories(),
-        &std::collections::BTreeMap::new(),
-        Some(requested),
+    launchd::apply_with_rollback_for(
+        launchd::ApplyRequest {
+            target,
+            home,
+            plist: &plist,
+            existing: Some(&existing),
+            provider_directories: &probes::provider_directories(),
+            extra_environment: &std::collections::BTreeMap::new(),
+            capacity: Some(requested),
+        },
         || Ok(()),
-    )?;
-    if let Err(error) = probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
-        let rollback = launchd::restore_with_rollback(&plist, home, previous_plist, || Ok(()));
+    )
+    .map_err(|error| error.to_string())?;
+    if let Err(error) = probes::wait_for_managed_daemon_for(target, socket, HEALTH_WAIT, None, home)
+    {
+        let rollback =
+            launchd::restore_with_rollback_for(target, &plist, home, previous_plist, || Ok(()));
         return match rollback {
-            Ok(()) => match probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
-                Ok(_) => Err(format!(
-                    "managed daemon health failed after the capacity change ({error}); capacity rolled back to {previous}"
-                )),
-                Err(recovery) => Err(format!(
-                    "managed daemon health failed after the capacity change ({error}); capacity plist restored but rollback health failed: {recovery}"
-                )),
-            },
+            Ok(()) => {
+                match probes::wait_for_managed_daemon_for(target, socket, HEALTH_WAIT, None, home) {
+                    Ok(_) => Err(format!(
+                        "managed daemon health failed after the capacity change ({error}); capacity rolled back to {previous}"
+                    )),
+                    Err(recovery) => Err(format!(
+                        "managed daemon health failed after the capacity change ({error}); capacity plist restored but rollback health failed: {recovery}"
+                    )),
+                }
+            }
             Err(rollback) => Err(format!(
                 "managed daemon health failed after the capacity change ({error}); rollback to {previous} failed: {rollback}"
             )),

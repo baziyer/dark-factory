@@ -257,7 +257,7 @@ fn factoryctl_path() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn stage_managed_capacity_runtimes(home: &Path) {
     let bin = home.join("bin");
-    for version in ["4", "8"] {
+    for version in ["0.3.0", "0.4.0"] {
         let directory = bin.join(version);
         std::fs::create_dir_all(&directory).unwrap();
         for (name, source) in [
@@ -273,7 +273,7 @@ fn stage_managed_capacity_runtimes(home: &Path) {
         std::fs::write(&tui, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&tui, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::os::unix::fs::symlink("4", bin.join("current")).unwrap();
+    std::os::unix::fs::symlink("0.3.0", bin.join("current")).unwrap();
 }
 
 #[cfg(target_os = "macos")]
@@ -295,20 +295,24 @@ fn runner_pids_under(home: &Path) -> Vec<u32> {
 }
 
 #[cfg(target_os = "macos")]
-fn bootout_managed_fixture() {
-    let uid = rustix::process::getuid().as_raw().to_string();
+fn bootout_managed_fixture(target: &launchd::LaunchdTarget) {
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{}", launchd::LABEL)])
+        .args([
+            "bootout",
+            &format!("{}/{}", target.domain(), target.label()),
+        ])
         .status();
 }
 
 #[cfg(target_os = "macos")]
-struct ManagedLaunchdGuard;
+struct ManagedLaunchdGuard {
+    target: launchd::LaunchdTarget,
+}
 
 #[cfg(target_os = "macos")]
 impl Drop for ManagedLaunchdGuard {
     fn drop(&mut self) {
-        bootout_managed_fixture();
+        bootout_managed_fixture(&self.target);
     }
 }
 
@@ -1136,30 +1140,20 @@ fn factoryd_restart_does_not_lose_a_live_session() {
     daemon.stop();
 }
 
-// This is opt-in because launchd has one per-user label for factoryd. The
-// guard refuses to run over the operator's real job and always boots out the
-// temporary job afterward. CI can enable it on a disposable macOS runner with
-// DARK_FACTORY_RUN_MANAGED_LAUNCHD_TESTS=1.
 #[test]
 #[cfg(target_os = "macos")]
 fn managed_launchd_capacity_change_preserves_session_and_runner() {
-    if std::env::var_os("DARK_FACTORY_RUN_MANAGED_LAUNCHD_TESTS").as_deref() != Some("1".as_ref()) {
-        eprintln!(
-            "skipping managed launchd fixture; set DARK_FACTORY_RUN_MANAGED_LAUNCHD_TESTS=1 on a disposable host"
-        );
-        return;
-    }
-    assert!(
-        !probes::launchd_loaded(),
-        "refusing managed launchd fixture while the operator's factoryd job is loaded"
-    );
-
     let home = private_tempdir();
     let user_home = private_tempdir();
+    let target = launchd::LaunchdTarget::new(
+        format!("gui/{}", rustix::process::getuid().as_raw()),
+        format!("com.dark-factory.test.capacity-{}", std::process::id()),
+    );
+    assert!(!probes::launchd_loaded_for(&target));
     stage_managed_capacity_runtimes(home.path());
     std::fs::create_dir_all(home.path().join("logs")).unwrap();
     let socket = home.path().join("f.sock");
-    let plist = launchd::plist_path(user_home.path());
+    let plist = launchd::plist_path_for(user_home.path(), &target);
     let current = home.path().join("bin/current");
     let arguments = vec![
         "--runner".to_owned(),
@@ -1172,16 +1166,20 @@ fn managed_launchd_capacity_change_preserves_session_and_runner() {
         "--max-active-runs".to_owned(),
         "4".to_owned(),
     ];
-    let content = launchd::render(
+    let content = launchd::render_for(
+        &target,
         home.path(),
         &current.join("factoryd"),
         &arguments,
         &BTreeMap::new(),
     );
     launchd::install(&plist, &content, home.path()).unwrap();
-    let _guard = ManagedLaunchdGuard;
-    launchd::reload(rustix::process::getuid().as_raw(), &plist).unwrap();
-    probes::wait_for_managed_daemon(&socket, READY_TIMEOUT, None, home.path()).unwrap();
+    let _guard = ManagedLaunchdGuard {
+        target: target.clone(),
+    };
+    launchd::reload_for(&target, &plist).expect("isolated launchd must be available");
+    probes::wait_for_managed_daemon_for(&target, &socket, READY_TIMEOUT, None, home.path())
+        .expect("isolated managed launchd daemon must become healthy");
 
     let client = Client::new(&socket);
     let project_root = home.path().join("repo");
@@ -1214,21 +1212,22 @@ fn managed_launchd_capacity_change_preserves_session_and_runner() {
     );
 
     assert_eq!(
-        capacity::status(home.path(), user_home.path())
+        capacity::status_for(home.path(), user_home.path(), &target)
             .unwrap()
             .configured,
         4
     );
-    let change = capacity::set(home.path(), user_home.path(), &socket, 8).unwrap();
+    let change = capacity::set_for(home.path(), user_home.path(), &socket, 8, &target).unwrap();
     assert_eq!(change.previous, 4);
     assert_eq!(change.current, 8);
     assert_eq!(
-        capacity::status(home.path(), user_home.path())
+        capacity::status_for(home.path(), user_home.path(), &target)
             .unwrap()
             .configured,
         8
     );
-    probes::wait_for_managed_daemon(&socket, READY_TIMEOUT, None, home.path()).unwrap();
+    probes::wait_for_managed_daemon_for(&target, &socket, READY_TIMEOUT, None, home.path())
+        .unwrap();
 
     let after = session_by_agent(&client, "curie").expect("session after capacity restart");
     assert_eq!(
@@ -1243,6 +1242,12 @@ fn managed_launchd_capacity_change_preserves_session_and_runner() {
     );
 
     cleanup_session_without_daemon(&client, home.path(), "curie");
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn managed_launchd_capacity_change_requires_launchd() {
+    panic!("the managed launchd capacity fixture requires macOS launchd");
 }
 
 // --- (f) direct attach: operator keystrokes reach the real process -----

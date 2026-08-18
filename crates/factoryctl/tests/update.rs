@@ -162,6 +162,26 @@ impl Fixture {
         fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         (tools, log)
     }
+
+    fn fake_launchctl_first_reload_fails(&self) -> (PathBuf, PathBuf) {
+        let tools = self.root.path().join("tools-first-reload-fails");
+        fs::create_dir_all(&tools).unwrap();
+        let log = tools.join("launchctl.log");
+        let count = tools.join("bootstrap-count");
+        let program = tools.join("launchctl");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\ncase \"$1\" in\n  print) echo 'pid = 4242'; exit 0 ;;\n  bootout) exit 0 ;;\n  bootstrap) n=0; test -f \"{}\" && n=$(cat \"{}\"); n=$((n + 1)); echo \"$n\" > \"{}\"; test \"$n\" -gt 6; exit $? ;;\nesac\nexit 1\n",
+                count.display(),
+                count.display(),
+                count.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        (tools, log)
+    }
 }
 
 fn read_link(path: &Path) -> String {
@@ -188,6 +208,41 @@ fn serve_health_once(socket: &Path, version: &str) -> thread::JoinHandle<()> {
                 factoryctl_path: "/tmp/factoryctl".to_owned(),
                 version,
                 process_id: 0,
+            },
+        };
+        serde_json::to_writer(&mut stream, &frame).unwrap();
+        stream.write_all(b"\n").unwrap();
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn serve_managed_health_once(
+    socket: &Path,
+    version: &str,
+    home: &Path,
+    process_id: u32,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    let version = version.to_owned();
+    let runner = home.join("bin/current/factory-runner");
+    let factoryctl = home.join("bin/current/factoryctl");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::Health)
+        );
+        let frame = ServerFrame::Response {
+            protocol_version: PROTOCOL_VERSION,
+            response: LocalResponse::Health {
+                runner_path: runner.to_string_lossy().into_owned(),
+                factoryctl_path: factoryctl.to_string_lossy().into_owned(),
+                version,
+                process_id,
             },
         };
         serde_json::to_writer(&mut stream, &frame).unwrap();
@@ -296,6 +351,51 @@ fn launchd_reload_failure_rolls_back_the_active_runtime() {
     let calls = fs::read_to_string(log).unwrap();
     assert!(calls.contains("bootout"));
     assert!(calls.contains("bootstrap"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn update_failed_activation_restores_runtime_before_old_job_and_checks_managed_health() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    fixture.write_launchd_job();
+    let plist = fixture
+        .root
+        .path()
+        .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist");
+    let old_plist = fs::read_to_string(&plist).unwrap();
+    let latest = factoryctl::update::CURRENT_VERSION;
+    let url = fixture.publish(latest, None);
+    let (tools, log) = fixture.fake_launchctl_first_reload_fails();
+    let socket = fixture.home().join("f.sock");
+    let server = serve_managed_health_once(&socket, "0.1.0", &fixture.home(), 4242);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    prepend_path(&mut command, &tools);
+    let output = command
+        .env("FAKE_LAUNCHCTL_LOG", &log)
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("restored runtime is healthy"), "{stderr}");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.1.0");
+    assert_eq!(fs::read_to_string(plist).unwrap(), old_plist);
+    let calls = fs::read_to_string(log).unwrap();
+    assert_eq!(calls.matches("bootstrap").count(), 7);
+    assert_eq!(
+        fs::read_to_string(
+            fixture
+                .root
+                .path()
+                .join("tools-first-reload-fails/bootstrap-count")
+        )
+        .unwrap()
+        .trim(),
+        "7"
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -9,6 +9,39 @@ use std::{
 
 use rustix::fs::FlockOperation;
 
+use crate::launchd::{MutationError, RollbackOutcome};
+
+/// Formats the common init/update recovery report and performs the managed
+/// health check only when the typed launchd transaction says both plist and
+/// runtime were restored.
+pub fn rollback_report(
+    error: &MutationError,
+    previous_version: Option<&str>,
+    health: impl FnOnce(&str) -> Result<(), String>,
+) -> String {
+    let runtime_outcome = match (previous_version, error.outcome()) {
+        (Some(previous), RollbackOutcome::RuntimeFailed(_)) => {
+            format!("bin/current could NOT be rolled back to {previous}")
+        }
+        (Some(previous), _) => format!("bin/current rolled back to {previous}"),
+        (None, _) => "there was no previous managed runtime".to_owned(),
+    };
+    let recovery = match (error.outcome(), previous_version) {
+        (RollbackOutcome::Restored, Some(previous)) => Some(health(previous)),
+        _ => None,
+    };
+    match recovery {
+        Some(Ok(())) => format!("{error}; {runtime_outcome}; restored runtime is healthy"),
+        Some(Err(recovery)) => {
+            format!("{error}; {runtime_outcome}; restored runtime health failed: {recovery}")
+        }
+        None if matches!(error.outcome(), RollbackOutcome::Restored) => format!(
+            "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
+        ),
+        None => format!("{error}; {runtime_outcome}"),
+    }
+}
+
 /// The rollback authority captured while [`MutationLock`] is held.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct MutationSnapshot {
@@ -63,6 +96,15 @@ impl MutationLock {
             plist,
         })
     }
+
+    /// Acquires the production mutation lock and captures rollback authority
+    /// as one operation. Callers must keep the returned lock until their
+    /// mutation, health check, and any rollback are complete.
+    pub fn begin(home: &Path, plist: &Path) -> Result<(Self, MutationSnapshot), String> {
+        let lock = Self::acquire(home)?;
+        let snapshot = lock.snapshot(home, plist)?;
+        Ok((lock, snapshot))
+    }
 }
 
 #[cfg(test)]
@@ -70,7 +112,7 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
-        sync::mpsc,
+        sync::{Arc, Barrier, mpsc},
         thread,
     };
 
@@ -87,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_init_then_update_rollback_uses_the_new_active_snapshot() {
+    fn production_update_transaction_snapshots_after_a_competing_init() {
         let home = tempfile::tempdir().unwrap();
         let bin = home.path().join("bin");
         for version in ["0.1.0", "0.2.0", "0.3.0"] {
@@ -102,30 +144,31 @@ mod tests {
         }
         symlink("0.1.0", bin.join("current")).unwrap();
 
-        // A slow update has already downloaded its candidate and observed
-        // the old active version, but it has not yet acquired the mutation
-        // lock. A competing init wins the lock and activates 0.2.0. The
-        // update must snapshot 0.2.0, not stale 0.1.0, so a later failed
-        // 0.3.0 activation restores the competing mutation.
-        let stale_version = crate::install::active_version(home.path()).unwrap();
+        // The update has finished its download work and is waiting to enter
+        // the same production transaction used by init/update. A competing
+        // init wins first; the update must take its snapshot after waiting
+        // for the lock, or its failed activation would restore stale 0.1.0.
+        let barrier = Arc::new(Barrier::new(2));
         let (finished, wait) = mpsc::channel();
         let init_home = home.path().to_owned();
+        let init_barrier = Arc::clone(&barrier);
         let init = thread::spawn(move || {
-            let init_lock = MutationLock::acquire(&init_home).unwrap();
+            let (init_lock, _) =
+                MutationLock::begin(&init_home, &init_home.join("missing.plist")).unwrap();
+            init_barrier.wait();
             crate::install::activate(&init_home, "0.2.0").unwrap();
             drop(init_lock);
             finished.send(()).unwrap();
         });
+        barrier.wait();
         wait.recv().unwrap();
         init.join().unwrap();
-        assert_eq!(stale_version, Some("0.1.0".into()));
 
-        let update_lock = MutationLock::acquire(home.path()).unwrap();
-        let snapshot = update_lock
-            .snapshot(home.path(), &home.path().join("missing.plist"))
-            .unwrap();
+        let (update_lock, snapshot) =
+            MutationLock::begin(home.path(), &home.path().join("missing.plist")).unwrap();
         crate::install::activate(home.path(), "0.3.0").unwrap();
         crate::install::activate(home.path(), snapshot.active_version.as_deref().unwrap()).unwrap();
+        drop(update_lock);
         assert_eq!(
             crate::install::active_version(home.path()).unwrap(),
             Some("0.2.0".into())

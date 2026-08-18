@@ -80,8 +80,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     }
 
     let installed = install::install_release(&home, &manifest, &mut log)?;
-    let _runtime_lock = runtime::MutationLock::acquire(&home)?;
-    let snapshot = _runtime_lock.snapshot(&home, &plist)?;
+    let (_runtime_lock, snapshot) = runtime::MutationLock::begin(&home, &plist)?;
     let previous_version = snapshot.active_version;
     let previous_plist = snapshot.plist;
     let existing = launchd::read_existing(&plist)?;
@@ -121,36 +120,14 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             }
         },
     ) {
-        let recovery = error
-            .contains("launchd plist and job rolled back")
-            .then_some(previous_version.as_deref())
-            .flatten()
-            .map(|previous| {
+        return Err(runtime::rollback_report(
+            &error,
+            previous_version.as_deref(),
+            |previous| {
                 probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
                     .map(|_| ())
-            });
-        let runtime_outcome = match previous_version.as_deref() {
-            Some(previous) if error.contains("runtime rollback failed") => {
-                format!("bin/current could NOT be rolled back to {previous}")
-            }
-            Some(previous) => format!("bin/current rolled back to {previous}"),
-            None => format!(
-                "bin/current stays at {} (there was no previous version)",
-                manifest.version
-            ),
-        };
-        return Err(match recovery {
-            Some(Ok(())) => format!("{error}; {runtime_outcome}; restored runtime is healthy"),
-            Some(Err(recovery)) => {
-                format!("{error}; {runtime_outcome}; restored runtime health failed: {recovery}")
-            }
-            None if error.contains("launchd plist and job rolled back") => {
-                format!(
-                    "{error}; {runtime_outcome}; no previous managed runtime was available for health checking"
-                )
-            }
-            None => format!("{error}; {runtime_outcome}"),
-        });
+            },
+        ));
     }
     log(&format!("rewrote and reloaded {}", plist.display()));
     match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
@@ -176,6 +153,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                         launchd::restore_with_rollback(&plist, &home, previous_plist, move || {
                             install::activate(&rollback_home, &manifest_version)
                         })
+                        .map_err(|error| error.to_string())
                     })
                     .and_then(|()| {
                         probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
