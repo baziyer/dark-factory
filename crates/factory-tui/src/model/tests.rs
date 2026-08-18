@@ -139,7 +139,7 @@ fn fleet_snapshot_resets_same_project_agent_generation() {
     b.apply_event(EventEnvelope {
         protocol_version: 1,
         sequence: 1,
-        occurred_at_ms: 0,
+        occurred_at_ms: 100,
         event: FactoryEvent::SessionChanged {
             session: session("sess-old", "alice", "a", SessionState::Working),
         },
@@ -162,12 +162,50 @@ fn fleet_snapshot_resets_same_project_agent_generation() {
     b.apply_event(EventEnvelope {
         protocol_version: 1,
         sequence: 2,
-        occurred_at_ms: 0,
+        occurred_at_ms: 200,
         event: FactoryEvent::SessionChanged {
             session: session("sess-new", "alice", "a", SessionState::Working),
         },
     });
     assert_eq!(b.activity[&alice].counts(), vec![1]);
+}
+
+#[test]
+fn snapshot_then_replay_rejects_predecessor_generation_activity() {
+    let alice = AgentId::try_from("alice").unwrap();
+    let mut current_alice = agent("alice", "a", AgentRole::Worker, None);
+    current_alice.created_at_ms = 5_000;
+    let mut b = Board::new(false, 10_000, crate::theme::FORTRESS);
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![current_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1_000,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-old", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert!(
+        !b.activity.contains_key(&alice),
+        "predecessor replay activity must not be assigned to the current generation"
+    );
+
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 5_000,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-current", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert_eq!(b.activity[&alice].counts().iter().sum::<u64>(), 1);
 }
 
 #[test]

@@ -914,7 +914,13 @@ impl Board {
             FactoryEvent::ProjectDeleted { project_id } => self.remove_project_activity(project_id),
             _ => {
                 if let Some((agent_id, identity)) = self.event_agent_identity(event) {
-                    self.record_activity(&agent_id, identity, occurred_at_ms);
+                    if self.activity_event_is_current_generation(
+                        &agent_id,
+                        &identity,
+                        occurred_at_ms,
+                    ) {
+                        self.record_activity(&agent_id, identity, occurred_at_ms);
+                    }
                 }
             }
         }
@@ -1049,6 +1055,21 @@ impl Board {
                 .filter(|agent| agent.project_id == *project_id)
                 .map(|agent| agent.created_at_ms),
         }
+    }
+
+    fn activity_event_is_current_generation(
+        &self,
+        agent_id: &AgentId,
+        identity: &ActivityIdentity,
+        occurred_at_ms: i64,
+    ) -> bool {
+        self.agents.get(agent_id).is_none_or(|agent| {
+            agent.project_id == identity.project_id
+                && occurred_at_ms >= agent.created_at_ms
+                && identity
+                    .created_at_ms
+                    .is_none_or(|created_at_ms| created_at_ms == agent.created_at_ms)
+        })
     }
 }
 
