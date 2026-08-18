@@ -254,6 +254,20 @@ Required:
 
 Options:
   -h, --help                Show this help";
+const PROJECT_REPOSITORY_HELP: &str =
+    "usage: factoryctl project repository set --project ID --remote URL --base BRANCH
+
+Set the daemon-owned remote and PR base for a project. This authority is
+write-once and can be set only while the factory has no live sessions in any
+project; later retarget attempts are rejected.
+
+Required:
+  --project ID           Project to configure
+  --remote URL           Exact Git remote URL agents may push to
+  --base BRANCH          Pull-request base branch
+
+Options:
+  -h, --help              Show this help";
 
 const TASK_HELP: &str =
     "usage: factoryctl task <add|list|get|start|retry|assign|cancel|update|delete|done|blocked> [options]
@@ -266,7 +280,7 @@ Actions:
   get       Fetch one task
   start     Start a queued task on an agent
   retry     Requeue a failed or cancelled task
-  assign    Set or clear a task's queue owner without starting it
+  assign    Assign or return a queued task; assignment wakes delivery
   cancel    Cancel a queued or blocked task
   update    Edit a queued task's title or body
   delete    Delete a task that has no active run
@@ -336,8 +350,8 @@ Options:
   -h, --help              Show this help";
 const TASK_ASSIGN_HELP: &str = "usage: factoryctl task assign --project ID --task ID [--agent ID]
 
-Set or clear a queued task's queue owner without starting it. Omit --agent
-to clear the assignment back to the operator.
+Assigning to an agent wakes automatic delivery and may start its session.
+Omit --agent to return the task to the operator.
 
 Required:
   --project ID           Project the task belongs to
@@ -1451,6 +1465,7 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             "delete" => PROJECT_DELETE_HELP,
             "get" => PROJECT_GET_HELP,
             "guidance" => PROJECT_GUIDANCE_HELP,
+            "repository" => PROJECT_REPOSITORY_HELP,
             _ => PROJECT_HELP,
         }));
     }
@@ -2754,6 +2769,18 @@ mod tests {
                 .1,
             CliCommand::Help(PROJECT_GUIDANCE_HELP)
         );
+        assert_eq!(
+            parse_args(args(&["project", "repository", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_REPOSITORY_HELP)
+        );
+        assert_eq!(
+            parse_args(args(&["project", "repository", "set", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_REPOSITORY_HELP)
+        );
 
         assert_eq!(
             parse_args(args(&["task"])).unwrap().1,
@@ -2778,6 +2805,18 @@ mod tests {
                 "task {action} --help"
             );
         }
+
+        for required in ["--project ID", "--remote URL", "--base BRANCH"] {
+            assert!(
+                PROJECT_REPOSITORY_HELP.contains(required),
+                "repository help must name required flag {required}"
+            );
+        }
+        assert!(PROJECT_REPOSITORY_HELP.contains("write-once"));
+        assert!(PROJECT_REPOSITORY_HELP.contains("no live sessions in any\nproject"));
+        assert!(TASK_ASSIGN_HELP.contains("wakes automatic delivery"));
+        assert!(TASK_ASSIGN_HELP.contains("may start its session"));
+        assert!(!TASK_ASSIGN_HELP.contains("without starting"));
 
         assert_eq!(
             parse_args(args(&["agent"])).unwrap().1,
