@@ -114,14 +114,6 @@ fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board, message: &st
 }
 
 fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
-            Constraint::Percentage(35),
-        ])
-        .split(area);
     let Some(agent_id) = board.selected_agent.as_ref() else {
         ui::dim(frame, area, "no agent selected");
         return;
@@ -129,6 +121,25 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
     let Some(agent) = board.agents.get(agent_id) else {
         return;
     };
+    let orchestrator = agent.role == factory_core::AgentRole::Orchestrator;
+    let constraints = if orchestrator {
+        vec![
+            Constraint::Percentage(25),
+            Constraint::Percentage(20),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+        ]
+    } else {
+        vec![
+            Constraint::Percentage(40),
+            Constraint::Percentage(25),
+            Constraint::Percentage(35),
+        ]
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
 
     let tasks: Vec<Line> = board
         .tasks
@@ -178,24 +189,6 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
     } else {
         "running (pause via factoryctl)"
     };
-    let role_context = if agent.role == factory_core::AgentRole::Orchestrator {
-        let unassigned = board
-            .tasks
-            .values()
-            .filter(|task| {
-                task.snapshot.project_id == agent.project_id
-                    && task.snapshot.assigned_agent_id.is_none()
-            })
-            .count();
-        let workers = board
-            .agents
-            .values()
-            .filter(|child| child.parent_agent_id.as_ref() == Some(agent_id))
-            .count();
-        format!("\nproject queue: {unassigned} unassigned\ndelegation: {workers} direct workers")
-    } else {
-        String::new()
-    };
     let (model, permission, files) = board.agent_details.get(agent_id).map_or_else(
         || {
             (
@@ -222,10 +215,92 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board) {
     );
     frame.render_widget(
         Paragraph::new(format!(
-            "provider: {:?}\nmodel: {model}\npermission: {permission}\n{pause}\n{files}{role_context}",
+            "provider: {:?}\nmodel: {model}\npermission: {permission}\n{pause}\n{files}",
             agent.provider
         ))
         .block(ui::block(" settings ")),
         rows[2],
     );
+    if orchestrator {
+        frame.render_widget(
+            Paragraph::new(orchestrator_context_lines(board, &agent.project_id).join("\n"))
+                .block(ui::block(" project queue + delegation ")),
+            rows[3],
+        );
+    }
+}
+
+fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectId) -> Vec<String> {
+    let mut lines = vec!["project queue:".to_owned()];
+    let mut tasks: Vec<_> = board
+        .tasks
+        .values()
+        .filter(|task| {
+            &task.snapshot.project_id == project_id
+                && matches!(
+                    task.snapshot.status,
+                    factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
+                )
+        })
+        .collect();
+    tasks.sort_by_key(|task| (task.snapshot.created_at_ms, task.snapshot.id.clone()));
+    for task in tasks {
+        let owner = task
+            .snapshot
+            .assigned_agent_id
+            .as_ref()
+            .map_or("unassigned", factory_core::AgentId::as_str);
+        lines.push(format!("  {owner}: {}", task.snapshot.title));
+    }
+    lines.push("delegation:".to_owned());
+    let mut agents: Vec<_> = board
+        .agents
+        .values()
+        .filter(|agent| &agent.project_id == project_id)
+        .collect();
+    agents.sort_by_key(|agent| (agent.created_at_ms, agent.id.clone()));
+    for agent in agents {
+        if let Some(parent) = &agent.parent_agent_id {
+            lines.push(format!("  {parent} ═> {}", agent.id));
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_fixtures::{agent, project, task};
+    use factory_core::{AgentRole, ProjectId, TaskStatus};
+
+    #[test]
+    fn orchestrator_context_lists_unassigned_worker_queues_and_nested_edges() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        let mut worker = agent("worker", "proj", AgentRole::Worker, None);
+        worker.parent_agent_id = Some(factory_core::AgentId::try_from("orch").unwrap());
+        let mut child = agent("child", "proj", AgentRole::Worker, None);
+        child.parent_agent_id = Some(factory_core::AgentId::try_from("worker").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![
+                agent("orch", "proj", AgentRole::Orchestrator, None),
+                worker,
+                child,
+            ],
+            vec![
+                task("free", "proj", TaskStatus::Queued, None, 0),
+                task("owned", "proj", TaskStatus::Running, Some("worker"), 1),
+                task("done", "proj", TaskStatus::Succeeded, Some("child"), 2),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let text =
+            orchestrator_context_lines(&board, &ProjectId::try_from("proj").unwrap()).join("\n");
+        assert!(text.contains("unassigned: free"));
+        assert!(text.contains("worker: owned"));
+        assert!(!text.contains("done"));
+        assert!(text.contains("orch ═> worker"));
+        assert!(text.contains("worker ═> child"));
+    }
 }

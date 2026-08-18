@@ -438,7 +438,7 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "tempfile",
+ "shell-words",
  "tui-term",
  "uuid",
 ]

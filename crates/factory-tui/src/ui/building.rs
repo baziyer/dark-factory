@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::model::state::{self, AgentState};
-use crate::model::{Board, provider_letter};
+use crate::model::{AttentionTarget, Board, provider_letter};
 use crate::ui;
 
 pub fn draw(frame: &mut Frame, area: Rect, board: &Board) {
@@ -106,57 +106,38 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board) {
 
 fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board) {
     let inner = ui::bordered(frame, area, ui::block(" NEEDS YOU — oldest first "));
-    let mut agents: Vec<_> = board
-        .agents
-        .values()
-        .filter(|agent| board.agent_attention(agent).value.needs_operator())
-        .collect();
-    agents.sort_by_key(|agent| {
-        board
-            .session_for(agent)
-            .map_or(agent.updated_at_ms, |session| session.updated_at_ms)
-    });
-    let mut tasks: Vec<_> = board
-        .tasks
-        .values()
-        .filter(|task| {
-            factory_core::attention::task_attention(task.snapshot.status).needs_operator()
-        })
-        .collect();
-    tasks.sort_by_key(|task| task.snapshot.updated_at_ms);
-    if agents.is_empty() && tasks.is_empty() {
+    let items = board.attention_items();
+    if items.is_empty() {
         ui::dim(frame, inner, "nothing needs you");
         return;
     }
-    let mut lines = agents
+    let lines = items
         .into_iter()
-        .map(|agent| {
-            let attention = board.agent_attention(agent);
-            let inferred = if attention.inferred { "~" } else { "" };
+        .map(|item| {
+            let inferred = if item.inferred { "~" } else { "" };
+            let (selected, label) = match item.target {
+                AttentionTarget::Agent(id) => (
+                    board.selected_agent.as_ref() == Some(&id) && board.selected_task.is_none(),
+                    format!("agent {id}"),
+                ),
+                AttentionTarget::Task(id) => (
+                    board.selected_task.as_ref() == Some(&id),
+                    board.tasks.get(&id).map_or_else(
+                        || format!("task#{id}"),
+                        |task| format!("task {}", task.snapshot.title),
+                    ),
+                ),
+            };
             Line::from(vec![
+                Span::raw(if selected { "> " } else { "  " }),
                 Span::styled(
-                    format!("{inferred}{:?} ", attention.value),
+                    format!("{inferred}{:?} ", item.attention),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::raw(format!("{} :: {}", agent.project_id, agent.id)),
+                Span::raw(format!("{} :: {label}", item.project_id)),
             ])
         })
         .collect::<Vec<_>>();
-    lines.extend(tasks.into_iter().map(|task| {
-        Line::from(vec![
-            Span::styled(
-                format!(
-                    "{:?} ",
-                    factory_core::attention::task_attention(task.snapshot.status)
-                ),
-                Style::default().fg(Color::Yellow),
-            ),
-            Span::raw(format!(
-                "{} :: {}",
-                task.snapshot.project_id, task.snapshot.title
-            )),
-        ])
-    }));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 

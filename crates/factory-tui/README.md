@@ -31,7 +31,8 @@ and `x` stops the selected agent after confirmation.
 ## AGENT
 
 AGENT keeps one live terminal large, with the agent's active queue, private inbox, and settings
-alongside. An orchestrator also shows its unassigned project queue and direct delegation count.
+alongside. An orchestrator also lists the project queue by assignee (including unassigned work)
+and shows each parent-to-child delegation edge.
 
 Use `[`/`]` or `j`/`k` in BOARD mode to switch agents. `i` or Enter gives the terminal
 exclusive input; `Ctrl-]` returns to BOARD mode. `z` maximises the terminal and

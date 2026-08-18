@@ -52,6 +52,7 @@ enum Backend {
         input_tx: mpsc::Sender<Vec<u8>>,
         resize_tx: mpsc::Sender<(u16, u16)>,
         disconnected: Arc<AtomicBool>,
+        attached: Arc<AtomicBool>,
         attach_error: Arc<Mutex<Option<String>>>,
     },
 }
@@ -162,6 +163,7 @@ impl Pane {
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let dirty = Arc::new(AtomicBool::new(true));
         let disconnected = Arc::new(AtomicBool::new(false));
+        let attached = Arc::new(AtomicBool::new(false));
         let attach_error = Arc::new(Mutex::new(None));
 
         spawn_attach_reader_thread(
@@ -169,6 +171,7 @@ impl Pane {
             Arc::clone(&parser),
             Arc::clone(&dirty),
             Arc::clone(&disconnected),
+            Arc::clone(&attached),
             Arc::clone(&attach_error),
         );
 
@@ -197,6 +200,7 @@ impl Pane {
                 input_tx,
                 resize_tx,
                 disconnected,
+                attached,
                 attach_error,
             },
         })
@@ -313,6 +317,18 @@ impl Pane {
         }
     }
 
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        match &self.backend {
+            Backend::LocalPty { .. } => true,
+            Backend::Daemon {
+                attached,
+                disconnected,
+                ..
+            } => attached.load(Ordering::Acquire) && !disconnected.load(Ordering::Acquire),
+        }
+    }
+
     /// Ends this pane: kills the local child (`--dev-local-pty` only — never a real agent), or,
     /// for a daemon-attached pane, **only** detaches (shuts the attach socket down so its reader
     /// thread exits promptly). Detaching a daemon-attached pane must never stop the session it
@@ -423,6 +439,7 @@ fn spawn_attach_reader_thread(
     parser: Arc<Mutex<vt100::Parser>>,
     dirty: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
+    attached: Arc<AtomicBool>,
     attach_error: Arc<Mutex<Option<String>>>,
 ) {
     std::thread::spawn(move || {
@@ -430,6 +447,7 @@ fn spawn_attach_reader_thread(
             match frame {
                 ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
+                        attached.store(true, Ordering::Release);
                         if let Ok(mut parser) = parser.lock() {
                             parser.process(&decoded);
                             dirty.store(true, Ordering::Release);
