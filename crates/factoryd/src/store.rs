@@ -610,6 +610,7 @@ impl Store {
                         body,
                         priority,
                     },
+                    None,
                     now_ms,
                 )?;
                 ("task", id.to_string(), Some(event))
@@ -789,10 +790,28 @@ impl Store {
         input: NewTask,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
+        self.create_task_with_assignment(input, None, now_ms)
+    }
+
+    pub fn create_assigned_task(
+        &mut self,
+        input: NewTask,
+        agent_id: AgentId,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        self.create_task_with_assignment(input, Some(agent_id), now_ms)
+    }
+
+    fn create_task_with_assignment(
+        &mut self,
+        input: NewTask,
+        assigned_agent_id: Option<AgentId>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (record, event) = insert_task(&transaction, input, now_ms)?;
+        let (record, event) = insert_task(&transaction, input, assigned_agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
 
@@ -2893,22 +2912,55 @@ impl Store {
         after_id: Option<&TaskId>,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
+        self.list_tasks_filtered(project_id, after_id, None, limit)
+    }
+
+    pub fn list_tasks_filtered(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&TaskId>,
+        agent_id: Option<&AgentId>,
+        limit: usize,
+    ) -> Result<Vec<TaskDetail>> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
+        }
+        if let Some(agent_id) = agent_id {
+            let exists = load_agent(&self.connection, agent_id)?
+                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
+            if !exists {
+                return Err(StoreError::AgentNotFound);
+            }
+        }
+        if let Some(after_id) = after_id {
+            let cursor_exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id = ?1 AND id = ?2)",
+                params![project_id.as_str(), after_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !cursor_exists {
+                return Err(StoreError::TaskNotFound);
+            }
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
-             WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
-             ORDER BY id
-             LIMIT ?3",
+             WHERE project_id = ?1
+               AND (?2 IS NULL OR assigned_agent_id = ?2)
+               AND (?3 IS NULL OR (created_at_ms, id) > (
+                   SELECT created_at_ms, id FROM tasks
+                   WHERE project_id = ?1 AND id = ?3
+               ))
+             ORDER BY created_at_ms, id
+             LIMIT ?4",
         )?;
         let rows = statement.query_map(
             params![
                 project_id.as_str(),
+                agent_id.map(AgentId::as_str),
                 after_id.map(TaskId::as_str),
-                limit as i64
+                limit as i64,
             ],
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
@@ -4401,18 +4453,26 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
 fn insert_task(
     transaction: &Transaction<'_>,
     input: NewTask,
+    assigned_agent_id: Option<AgentId>,
     now_ms: i64,
 ) -> Result<(TaskDetail, FactoryEvent)> {
     let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
     if input.body.len() > MAX_TASK_BODY_BYTES {
         return Err(StoreError::InvalidTaskInput);
     }
+    if let Some(agent_id) = assigned_agent_id.as_ref() {
+        let valid = load_agent(transaction, agent_id)?
+            .is_some_and(|agent| agent.snapshot.project_id == input.project_id);
+        if !valid {
+            return Err(StoreError::AgentNotFound);
+        }
+    }
     let record = TaskDetail {
         snapshot: TaskSnapshot {
             id: input.id,
             project_id: input.project_id,
             parent_task_id: input.parent_task_id,
-            assigned_agent_id: None,
+            assigned_agent_id,
             title,
             status: TaskStatus::Queued,
             priority: input.priority,
@@ -4427,11 +4487,16 @@ fn insert_task(
         "INSERT INTO tasks (
             id, project_id, parent_task_id, assigned_agent_id, title, body,
             status, priority, created_at_ms, updated_at_ms, incarnation_id
-         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
         params![
             record.snapshot.id.as_str(),
             record.snapshot.project_id.as_str(),
             record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
+            record
+                .snapshot
+                .assigned_agent_id
+                .as_ref()
+                .map(AgentId::as_str),
             &record.snapshot.title,
             &record.body,
             record.snapshot.priority,

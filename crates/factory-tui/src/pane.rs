@@ -18,6 +18,9 @@ use portable_pty::{
 // Re-exported by tui-term rather than depended on directly, so we always use the exact vt100
 // version tui-term was built against (see the Cargo.toml comment on this crate's dependencies).
 use tui_term::vt100;
+use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
+use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
 use factory_core::local::{LocalRequest, ServerFrame};
 use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
@@ -33,6 +36,14 @@ use crate::query::QueryResponder;
 /// How long after a local-PTY spawn we keep appending raw PTY bytes to the debug log, per the
 /// spike's "detect which queries claude/codex actually send on startup" requirement.
 const DEBUG_LOG_WINDOW: Duration = Duration::from_secs(6);
+
+fn mouse_button_code(button: MouseButton) -> u8 {
+    match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    }
+}
 
 /// Which backend a [`Pane`] is reading from — surfaced so `ui/` can show a small "[dev-local-pty]"
 /// badge and README's "what's stubbed" story stays honest about which pane is real.
@@ -277,6 +288,79 @@ impl Pane {
                 let _ = input_tx.send(bytes.to_vec());
             }
         }
+    }
+
+    /// Encodes one crossterm event using the mode negotiated by the child.
+    /// Returning `false` leaves board scrolling available when the child has
+    /// not requested mouse input.
+    pub fn write_mouse(&self, event: MouseEvent, origin_x: u16, origin_y: u16) -> bool {
+        let (mode, encoding) = self.with_screen(|screen| {
+            (
+                screen.mouse_protocol_mode(),
+                screen.mouse_protocol_encoding(),
+            )
+        });
+        if mode == MouseProtocolMode::None {
+            return false;
+        }
+        let x = event.column.saturating_sub(origin_x).saturating_add(1);
+        let y = event.row.saturating_sub(origin_y).saturating_add(1);
+        let (mut code, suffix) = match event.kind {
+            MouseEventKind::Down(button) => (mouse_button_code(button), 'M'),
+            MouseEventKind::Up(button) => (mouse_button_code(button), 'm'),
+            MouseEventKind::Drag(button) => {
+                if !matches!(
+                    mode,
+                    MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion
+                ) {
+                    return false;
+                }
+                (mouse_button_code(button) + 32, 'M')
+            }
+            MouseEventKind::Moved => {
+                if mode != MouseProtocolMode::AnyMotion {
+                    return false;
+                }
+                (32, 'M')
+            }
+            MouseEventKind::ScrollUp => (64, 'M'),
+            MouseEventKind::ScrollDown => (65, 'M'),
+            MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => return false,
+        };
+        if event
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::SHIFT)
+        {
+            code += 4;
+        }
+        if event
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::ALT)
+        {
+            code += 8;
+        }
+        if event
+            .modifiers
+            .contains(ratatui::crossterm::event::KeyModifiers::CONTROL)
+        {
+            code += 16;
+        }
+        let bytes = if encoding == MouseProtocolEncoding::Sgr {
+            format!("\x1b[<{code};{x};{y}{suffix}").into_bytes()
+        } else if x < 224 && y < 224 {
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + code,
+                u8::try_from(32 + x).expect("mouse x is bounded above"),
+                u8::try_from(32 + y).expect("mouse y is bounded above"),
+            ]
+        } else {
+            return false;
+        };
+        self.write_input(&bytes);
+        true
     }
 
     /// Resizes both the PTY (local) or sends `ResizeTerminal` (daemon) and the `vt100` model. A

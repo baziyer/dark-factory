@@ -173,7 +173,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
 
 fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptState) {
     let title = match &prompt.kind {
-        PromptKind::NewTask => "new task".to_owned(),
+        PromptKind::NewTask(_) => "new task".to_owned(),
         PromptKind::MessageAgent(agent_id) => format!("message {agent_id}"),
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),

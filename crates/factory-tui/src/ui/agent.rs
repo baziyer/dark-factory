@@ -249,19 +249,20 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
     if orchestrator {
         frame.render_widget(
             Paragraph::new(orchestrator_context_lines(board, &agent.project_id).join("\n"))
-                .block(ui::block(" project queue + delegation ")),
+                .block(ui::block(" backlog + worker queues ")),
             rows[3],
         );
     }
 }
 
 fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectId) -> Vec<String> {
-    let mut lines = vec!["project queue:".to_owned()];
+    let mut lines = vec!["project backlog:".to_owned()];
     let mut tasks: Vec<_> = board
         .tasks
         .values()
         .filter(|task| {
             &task.snapshot.project_id == project_id
+                && task.snapshot.assigned_agent_id.is_none()
                 && matches!(
                     task.snapshot.status,
                     factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
@@ -277,7 +278,7 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
             .map_or("unassigned", factory_core::AgentId::as_str);
         lines.push(format!("  {owner}: {}", task.snapshot.title));
     }
-    lines.push("delegation:".to_owned());
+    lines.push("worker queues:".to_owned());
     let mut agents: Vec<_> = board
         .agents
         .values()
@@ -285,7 +286,18 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
         .collect();
     agents.sort_by_key(|agent| (agent.created_at_ms, agent.id.clone()));
     for agent in agents {
-        if let Some(parent) = &agent.parent_agent_id {
+        let queue = board.active_tasks_for_agent(&agent.id);
+        if !queue.is_empty() {
+            lines.push(format!(
+                "  {}: {}",
+                agent.id,
+                queue
+                    .iter()
+                    .map(|task| task.snapshot.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        } else if let Some(parent) = &agent.parent_agent_id {
             lines.push(format!("  {parent} ═> {}", agent.id));
         }
     }
@@ -322,7 +334,8 @@ mod tests {
         );
         let text =
             orchestrator_context_lines(&board, &ProjectId::try_from("proj").unwrap()).join("\n");
-        assert!(text.contains("unassigned: free"));
+        assert!(text.contains("project backlog:"));
+        assert!(text.contains("free"));
         assert!(text.contains("worker: owned"));
         assert!(!text.contains("done"));
         assert!(text.contains("orch ═> worker"));

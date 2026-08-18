@@ -164,6 +164,19 @@ pub enum LocalRequest {
         body: String,
         priority: i32,
     },
+    /// Creates a queued task and assigns it in the same durable transaction.
+    /// The daemon wakes only this agent after the commit, so a restart cannot
+    /// expose an intermediate backlog task or deliver it to another agent.
+    CreateAssignedTask {
+        id: TaskId,
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parent_task_id: Option<TaskId>,
+        title: String,
+        body: String,
+        priority: i32,
+        agent_id: AgentId,
+    },
     CreateAgent {
         id: AgentId,
         project_id: ProjectId,
@@ -239,6 +252,10 @@ pub enum LocalRequest {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<TaskId>,
+        /// When present, list only this agent's assigned tasks. The same
+        /// stable `(created_at_ms, id)` order is used for queue delivery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
         limit: u32,
     },
     GetTask {

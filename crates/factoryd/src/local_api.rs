@@ -861,6 +861,47 @@ async fn handle_request(
                 .await?;
             Ok(LocalResponse::TaskCreated { task })
         }
+        LocalRequest::CreateAssignedTask {
+            id,
+            project_id,
+            parent_task_id,
+            title,
+            body,
+            priority,
+            agent_id,
+        } => {
+            let title = normalize_task_title(title).ok_or_else(|| {
+                ApiFailure::Invalid(format!(
+                    "task title must be between 1 and {MAX_TASK_TITLE_BYTES} bytes"
+                ))
+            })?;
+            if body.len() > MAX_TASK_BODY_BYTES {
+                return Err(ApiFailure::Invalid(format!(
+                    "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
+                )));
+            }
+            let wake_project_id = project_id.clone();
+            let wake_agent_id = agent_id.clone();
+            let task = state
+                .commit_and_publish(move |store| {
+                    let (task, event) = store.create_assigned_task(
+                        NewTask {
+                            id,
+                            project_id,
+                            parent_task_id,
+                            title,
+                            body,
+                            priority,
+                        },
+                        agent_id,
+                        now_ms()?,
+                    )?;
+                    Ok((task, vec![event]))
+                })
+                .await?;
+            execution.wake(wake_project_id, wake_agent_id);
+            Ok(LocalResponse::TaskCreated { task })
+        }
         LocalRequest::CreateAgent {
             id,
             project_id,
@@ -1160,12 +1201,18 @@ async fn handle_request(
         LocalRequest::ListTasks {
             project_id,
             after_id,
+            agent_id,
             limit,
         } => {
             let limit = page_limit("task", limit, MAX_TASK_PAGE_ITEMS)?;
             let mut tasks = state
                 .with_store(move |store| {
-                    store.list_tasks(&project_id, after_id.as_ref(), limit + 1)
+                    store.list_tasks_filtered(
+                        &project_id,
+                        after_id.as_ref(),
+                        agent_id.as_ref(),
+                        limit + 1,
+                    )
                 })
                 .await?;
             let next_after_id = next_cursor(&mut tasks, limit, |task| task.snapshot.id.clone());

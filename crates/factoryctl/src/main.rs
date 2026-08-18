@@ -310,17 +310,19 @@ Required:
 Options:
   --id ID                 Explicit task ID (default: generated UUID)
   --parent PARENT_ID      Parent task ID
-  --priority N              Priority (default: 0)
+  --priority N             Priority (default: 0)
+  --agent ID               Create directly in this agent's queue (atomic)
   -h, --help                 Show this help";
 const TASK_LIST_HELP: &str = "usage: factoryctl task list --project ID [options]
 
-List tasks in a project, ordered by ID.
+List tasks in stable queue order (creation time, then task ID).
 
 Required:
   --project ID           Project to list tasks from
 
 Options:
   --after ID               Resume after this task ID
+  --agent ID               Show only tasks assigned to this agent
   --limit N                  Page size (default and max: 10)
   -h, --help                   Show this help";
 const TASK_GET_HELP: &str = "usage: factoryctl task get --project ID --task ID
@@ -789,10 +791,12 @@ enum CliCommand {
         title: String,
         body: String,
         priority: i32,
+        agent_id: Option<String>,
     },
     TaskList {
         project_id: String,
         after_id: Option<String>,
+        agent_id: Option<String>,
         limit: u32,
     },
     TaskStart {
@@ -1642,6 +1646,7 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 .map(|value| parse_number(&value, "--priority"))
                 .transpose()?
                 .unwrap_or(0);
+            let agent_id = take_option(&mut args, "--agent")?;
             require_empty(&args)?;
             Ok(CliCommand::TaskAdd {
                 id,
@@ -1650,16 +1655,19 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 title,
                 body,
                 priority,
+                agent_id,
             })
         }
         "list" => {
             let project_id = required_project(&mut args)?;
             let after_id = take_option(&mut args, "--after")?;
+            let agent_id = take_option(&mut args, "--agent")?;
             let (limit, _) = take_limit(&mut args, TASK_LIST_LIMIT, TASK_LIST_LIMIT)?;
             require_empty(&args)?;
             Ok(CliCommand::TaskList {
                 project_id,
                 after_id,
+                agent_id,
                 limit,
             })
         }
@@ -2179,26 +2187,49 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             title,
             body,
             priority,
-        } => Ok(LocalRequest::CreateTask {
-            id: id
-                .map(|id| parse_id(id, "task"))
-                .transpose()?
-                .unwrap_or(generated_id()?),
-            project_id: parse_id(project_id, "project")?,
-            parent_task_id: parent_task_id
-                .map(|id| parse_id(id, "parent task"))
-                .transpose()?,
-            title,
-            body,
-            priority,
-        }),
+            agent_id,
+        } => {
+            let request = if let Some(agent_id) = agent_id {
+                LocalRequest::CreateAssignedTask {
+                    id: id
+                        .map(|id| parse_id(id, "task"))
+                        .transpose()?
+                        .unwrap_or(generated_id()?),
+                    project_id: parse_id(project_id, "project")?,
+                    parent_task_id: parent_task_id
+                        .map(|id| parse_id(id, "parent task"))
+                        .transpose()?,
+                    title,
+                    body,
+                    priority,
+                    agent_id: parse_id(agent_id, "agent")?,
+                }
+            } else {
+                LocalRequest::CreateTask {
+                    id: id
+                        .map(|id| parse_id(id, "task"))
+                        .transpose()?
+                        .unwrap_or(generated_id()?),
+                    project_id: parse_id(project_id, "project")?,
+                    parent_task_id: parent_task_id
+                        .map(|id| parse_id(id, "parent task"))
+                        .transpose()?,
+                    title,
+                    body,
+                    priority,
+                }
+            };
+            Ok(request)
+        }
         CliCommand::TaskList {
             project_id,
             after_id,
+            agent_id,
             limit,
         } => Ok(LocalRequest::ListTasks {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
+            agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
             limit,
         }),
         CliCommand::TaskStart {
@@ -3042,6 +3073,7 @@ mod tests {
                     title: "Build client".into(),
                     body: "Use the socket".into(),
                     priority: 7,
+                    agent_id: None,
                 }
             )
         );
@@ -3579,6 +3611,47 @@ mod tests {
     }
 
     #[test]
+    fn task_add_agent_uses_atomic_assigned_create_and_task_list_filters_agent() {
+        let (_, add) = parse_args(args(&[
+            "task",
+            "add",
+            "--project",
+            "project-1",
+            "--agent",
+            "curie",
+            "--title",
+            "Work",
+            "--body",
+            "Do it",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            request_for(add).unwrap(),
+            LocalRequest::CreateAssignedTask { agent_id, .. }
+                if agent_id == "curie".try_into().unwrap()
+        ));
+
+        let (_, list) = parse_args(args(&[
+            "task",
+            "list",
+            "--project",
+            "project-1",
+            "--agent",
+            "curie",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request_for(list).unwrap(),
+            LocalRequest::ListTasks {
+                project_id: "project-1".try_into().unwrap(),
+                after_id: None,
+                agent_id: Some("curie".try_into().unwrap()),
+                limit: 10,
+            }
+        );
+    }
+
+    #[test]
     fn events_follow_is_an_explicit_subscription() {
         let (_, command) = parse_args(args(&["events", "--after", "12", "--follow"])).unwrap();
         assert_eq!(
@@ -3632,6 +3705,7 @@ mod tests {
                 CliCommand::TaskList {
                     project_id: "project-1".into(),
                     after_id: Some("task-9".into()),
+                    agent_id: None,
                     limit: 10,
                 }
             )

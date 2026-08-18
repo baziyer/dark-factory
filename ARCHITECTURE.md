@@ -221,9 +221,9 @@ catalogue.
 
 ## First launch
 
-`factoryd` starts from an empty database. A human creates a project, an agent,
-and a task through `factoryctl` or the `factory-tui` board and assigns the
-task to the agent; the daemon's dispatcher spawns that agent's resident
+`factoryd` starts from an empty database. A human creates a project and an
+agent, then creates work in the project backlog or directly in an agent queue
+through `factoryctl` or the `factory-tui` board; the daemon's dispatcher spawns that agent's resident
 session automatically if none is live, or delivers into it if one already is
 idle — there is no separate explicit "start" step in the common case. The
 daemon starts the session through `factory-runner`, drives its state entirely
@@ -231,6 +231,15 @@ from the provider's own hook invocations, and streams persisted state to
 disposable observers. A launch is proven only after a real provider command
 has run and an observer and daemon have both restarted without stopping or
 misidentifying it.
+
+Queue vocabulary is intentionally narrow: a queue is the stable ordered work
+assigned to one agent, using `(created_at_ms, id)` delivery order. Unassigned
+queued tasks form the project backlog; private messages form the inbox; and
+approval/proposal attention is review work. Creating directly for an agent is
+one SQLite transaction that inserts the assignment with the task, publishes
+one task event, and only then wakes that agent. Moving a queued task uses the
+same assignment field, including `NULL` for the backlog, so no other worker
+can observe a transient delivery.
 
 Each task row has an internal immutable incarnation identity, separate from
 its operator-facing task id. Delivery commits carry that identity plus the

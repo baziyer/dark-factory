@@ -46,7 +46,7 @@ pub struct FleetStatus {
 pub struct ProjectStatus {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
-    /// Queued tasks not assigned to any agent (the operator's or an
+    /// Project-backlog tasks not assigned to any agent (the operator's or an
     /// orchestrator's to hand out).
     pub unassigned_queue_depth: u32,
     pub unassigned_queue: Vec<TaskSnapshot>,

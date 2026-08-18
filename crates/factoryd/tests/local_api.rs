@@ -291,6 +291,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
             LocalRequest::ListTasks {
                 project_id: project_id("project-1"),
                 after_id: None,
+                agent_id: None,
                 limit: 10,
             },
         )
@@ -560,6 +561,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             LocalRequest::ListTasks {
                 project_id: project_id("bounded-project"),
                 after_id: None,
+                agent_id: None,
                 limit: 10,
             },
         )
@@ -583,6 +585,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             LocalRequest::ListTasks {
                 project_id: project_id("bounded-project"),
                 after_id: Some(next),
+                agent_id: None,
                 limit: 10,
             },
         )

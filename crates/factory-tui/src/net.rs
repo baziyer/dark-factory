@@ -207,6 +207,7 @@ fn load_tasks(client: &Client, project_id: &ProjectId) -> Result<Vec<TaskDetail>
         |after_id| LocalRequest::ListTasks {
             project_id: project_id.clone(),
             after_id,
+            agent_id: None,
             limit: MAX_TASK_PAGE_ITEMS,
         },
         |response| match response {

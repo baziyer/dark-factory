@@ -641,6 +641,28 @@ fn apply_intent(
             }
             true
         }
+        Intent::ForwardMouse {
+            event,
+            origin_x,
+            origin_y,
+        } => {
+            if let Some(session_id) = forwarding_target(board) {
+                if let Some(pane) = panes.get(&session_id) {
+                    if !pane.write_mouse(event, origin_x, origin_y) {
+                        match event.kind {
+                            ratatui::crossterm::event::MouseEventKind::ScrollUp => {
+                                pane.scroll_up(10);
+                            }
+                            ratatui::crossterm::event::MouseEventKind::ScrollDown => {
+                                pane.scroll_down(10);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            true
+        }
         Intent::ScrollFocus { up } => {
             if let Some(session_id) = board.focus_target() {
                 if let Some(pane) = panes.get(&session_id) {

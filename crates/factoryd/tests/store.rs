@@ -888,6 +888,131 @@ fn queued_tasks_can_be_assigned_unassigned_and_reopened() {
 }
 
 #[test]
+fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let alice = agent_id("alice");
+    let bob = agent_id("bob");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for id in [&alice, &bob] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: id.clone(),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        let (task, _) = store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id("alice-first"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "First".into(),
+                    body: String::new(),
+                    priority: 9,
+                },
+                alice.clone(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(task.snapshot.assigned_agent_id, Some(alice.clone()));
+        store
+            .create_task(
+                NewTask {
+                    id: task_id("backlog"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Backlog".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id("alice-second"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Second".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                alice.clone(),
+                5,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_assigned_task(
+                NewTask {
+                    id: task_id("bad-agent"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "No delivery".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                AgentId::try_from("deleted").unwrap(),
+                6,
+            ),
+            Err(StoreError::AgentNotFound)
+        ));
+        assert!(matches!(
+            store.get_task(&project_id("factory"), &task_id("bad-agent")),
+            Err(StoreError::TaskNotFound)
+        ));
+    }
+
+    let store = Store::open(&database).unwrap();
+    let first_page = store
+        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), 1)
+        .unwrap();
+    assert_eq!(first_page[0].snapshot.id, task_id("alice-first"));
+    let second_page = store
+        .list_tasks_filtered(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            10,
+        )
+        .unwrap();
+    assert_eq!(second_page[0].snapshot.id, task_id("alice-second"));
+    assert_eq!(
+        store
+            .list_tasks_filtered(&project_id("factory"), None, None, 10)
+            .unwrap()
+            .iter()
+            .map(|task| task.snapshot.id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            task_id("alice-first"),
+            task_id("backlog"),
+            task_id("alice-second")
+        ]
+    );
+    assert_eq!(bob, agent_id("bob"));
+}
+
+#[test]
 fn cancel_task_moves_queued_or_blocked_to_cancelled_and_keeps_assignment() {
     let mut store = Store::open_in_memory().unwrap();
     store

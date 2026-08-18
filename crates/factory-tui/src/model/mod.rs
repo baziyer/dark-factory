@@ -262,7 +262,8 @@ impl Board {
             .collect()
     }
 
-    /// Active work assigned to one agent, in the same stable order AGENT renders and targets it.
+    /// The canonical assigned queue for one agent, in the same stable order the AGENT view renders
+    /// and targets it.
     #[must_use]
     pub fn active_tasks_for_agent(&self, agent_id: &AgentId) -> Vec<&TaskDetail> {
         let mut tasks: Vec<_> = self

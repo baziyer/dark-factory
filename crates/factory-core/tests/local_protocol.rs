@@ -379,6 +379,7 @@ fn collection_requests_and_responses_have_stable_cursors() {
     let request = LocalRequest::ListTasks {
         project_id: project_id("project-1"),
         after_id: Some(task_id("task-9")),
+        agent_id: None,
         limit: 10,
     };
     let response = LocalResponse::Tasks {

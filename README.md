@@ -80,15 +80,21 @@ factoryctl agent add --id lead --project my-project \
 factoryctl agent add --id worker-1 --project my-project \
   --role worker --provider codex --parent lead
 
-factoryctl task add --id first-task --project my-project \
+factoryctl task add --id first-task --project my-project --agent worker-1 \
   --title "Make the first change" --body "Describe the result and its limits."
-factoryctl task assign --project my-project --task first-task --agent worker-1
 
 factory-tui --project my-project
 ```
 
 Assignment starts delivery. You do not need a separate start command. Each
 agent has a persistent session and its own worktree.
+
+The project backlog is unassigned queued work. A worker queue is the ordered
+work assigned to that worker; `factoryctl task add --agent ID` creates directly
+in it atomically, `factoryctl task list --agent ID` shows that worker's work in
+execution order, and `factoryctl task assign --task ID` moves queued work
+between workers or back to the backlog. The inbox is for messages, and review
+items remain separate from both.
 
 Each agent starts with a 1,000 tool-call budget. An exhausted budget stops new
 delivery and needs operator action. Use `factoryctl agent budget status` to
