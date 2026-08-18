@@ -13,7 +13,7 @@ body:
     id: proposal
     attributes:
       label: Proposed shape
-      description: "CLI first: what `factoryctl` request would this be? The TUI must call the same request path (AGENTS.md rule 5)."
+      description: "Local API first: what daemon operation owns this behavior, and how do the primary TUI flow and CLI parity reach the same request path (AGENTS.md rule 5)?"
   - type: textarea
     id: smaller
     attributes:

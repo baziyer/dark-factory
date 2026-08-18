@@ -88,7 +88,8 @@ operator from their own agents. Concretely:
   syscalls can evade a string-level hook policy; it does not protect the
   operator from a malicious agent. Worktrees provide collision isolation,
   not filesystem or credential isolation. A separate OS user remains the
-  planned outer boundary (#54).
+  planned outer boundary (#125). CI runner isolation is a separate boundary
+  tracked in #54.
 - **Budgets are a tool-call circuit breaker, not monetary accounting.** Each
   agent defaults to 1,000 authenticated `PreToolUse` calls per reset. The
   daemon durably counts observations, pauses delivery and denies subsequent
