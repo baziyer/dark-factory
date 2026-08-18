@@ -548,16 +548,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("factory.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let (starts_tx, starts_rx) = std::sync::mpsc::channel();
+        let (timing_tx, timing_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             for sequence in 1..=2 {
                 let (mut stream, _) = listener.accept().unwrap();
-                starts_tx.send(Instant::now()).unwrap();
+                let started = Instant::now();
                 let mut request = String::new();
                 BufReader::new(stream.try_clone().unwrap())
                     .read_line(&mut request)
                     .unwrap();
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_secs(2));
                 serde_json::to_writer(
                     &mut stream,
                     &ServerFrame::Response {
@@ -569,29 +569,33 @@ mod tests {
                 )
                 .unwrap();
                 stream.write_all(b"\n").unwrap();
+                timing_tx.send((started, Instant::now())).unwrap();
             }
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = spawn_fleet_status_refresh_with(
             Client::new(&socket),
             tx.clone(),
-            Duration::from_millis(200),
-            Duration::from_secs(1),
+            Duration::from_secs(4),
+            Duration::from_secs(3),
         );
         tx.send(NetMsg::CaughtUp).unwrap();
         assert!(matches!(
             rx.recv_timeout(Duration::from_millis(50)).unwrap(),
             NetMsg::CaughtUp
         ));
-        let first = rx.recv_timeout(Duration::from_millis(300)).unwrap();
-        let second = rx.recv_timeout(Duration::from_millis(300)).unwrap();
+        let first = rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(6)).unwrap();
         assert!(matches!(first, NetMsg::FleetStatus(status) if status.generated_at_ms == 1));
         assert!(matches!(second, NetMsg::FleetStatus(status) if status.generated_at_ms == 2));
-        let first_start = starts_rx.recv().unwrap();
-        let second_start = starts_rx.recv().unwrap();
+        let (first_start, first_response) = timing_rx.recv().unwrap();
+        let (second_start, _) = timing_rx.recv().unwrap();
+        let response_duration = first_response.duration_since(first_start);
+        let tolerated_scheduler_delay = response_duration.mul_f32(0.75);
         assert!(
-            second_start.duration_since(first_start) < Duration::from_millis(260),
-            "refresh interval drifted by response time"
+            second_start.duration_since(first_start)
+                < Duration::from_secs(4) + tolerated_scheduler_delay,
+            "refresh interval included the response duration"
         );
         drop(worker);
         server.join().unwrap();
