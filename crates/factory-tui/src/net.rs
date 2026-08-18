@@ -102,8 +102,12 @@ pub enum NetMsg {
     EventsReplay(Vec<EventEnvelope>),
     CaughtUp,
     OperationResult(Result<LocalResponse, String>),
-    /// The result of the hourly release-manifest check (`spawn_update_check`).
-    UpdateCheck(UpdateCheck),
+    /// The hourly release-manifest check and the validated installed runtime
+    /// it must be compared with (`spawn_update_check`).
+    UpdateCheck {
+        check: UpdateCheck,
+        active_version: Result<Option<String>, String>,
+    },
     /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — refreshed in a
     /// separate worker because worktree git state changes without durable events.
     FleetStatus(FleetStatus),
@@ -468,7 +472,11 @@ pub fn spawn_update_check(tx: Sender<NetMsg>, now_ms: i64) {
     };
     thread::spawn(move || {
         let check = update::check(&home, &update::manifest_url(), now_ms, false);
-        let _ = tx.send(NetMsg::UpdateCheck(check));
+        let active_version = update::active_version(&home);
+        let _ = tx.send(NetMsg::UpdateCheck {
+            check,
+            active_version,
+        });
     });
 }
 

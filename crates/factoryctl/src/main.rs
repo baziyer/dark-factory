@@ -129,10 +129,11 @@ Options:
   -h, --help                 Show this help";
 const UPDATE_HELP: &str = "usage: factoryctl update [--install]
 
-Fetch the newest release's manifest and report whether it is newer than
-this build (JSON on stdout; the result is also cached in
-$DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads
-at most hourly).
+Fetch the newest release's manifest and report the invoking factoryctl,
+the active bin/current runtime, and whether the release is newer than the
+active runtime (JSON on stdout; the manifest result is also cached in
+$DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads at
+most hourly). With no active runtime, compare with the invoking factoryctl.
 
 With --install: download that release for this platform, verify its SHA-256
 against the manifest, unpack it into $DARK_FACTORY_HOME/bin/<version>/, and
@@ -152,7 +153,7 @@ the new version; 1 when the manifest can't be fetched (private repository,
 offline) or the restarted daemon doesn't answer in time.
 
 Options:
-  --install                  Download, verify, install, and activate the newer release
+  --install                  Download, verify, and activate the latest needed release
   -h, --help                 Show this help";
 const USAGE_HELP: &str = "usage: factoryctl usage
 
