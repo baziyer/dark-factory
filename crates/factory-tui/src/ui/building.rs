@@ -66,7 +66,9 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
                 .unwrap_or_else(|| "        ".to_owned());
             let assigned = board.active_tasks_for_agent(&agent_id);
             let current = assigned
-                .first()
+                .iter()
+                .find(|task| task.snapshot.status == factory_core::TaskStatus::Running)
+                .or_else(|| assigned.first())
                 .map_or("idle", |task| task.snapshot.title.as_str());
             let route = if agent.parent_agent_id.is_some() {
                 "══ "

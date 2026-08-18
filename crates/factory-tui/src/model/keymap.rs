@@ -10,8 +10,6 @@
 //! raw-`KeyEvent` handlers below, same as the pre-Track-6c board's prompt/picker handling.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 
 use factory_core::local::LocalRequest;
 use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId};
@@ -299,13 +297,6 @@ pub enum Intent {
     /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
     /// `main.rs` encodes and forwards to whichever pane is currently focused.
     ForwardKey(KeyEvent),
-    /// Mouse input for the focused terminal. Board clicks never take this
-    /// route; `main.rs` checks the child's negotiated mouse mode first.
-    ForwardMouse {
-        event: MouseEvent,
-        origin_x: u16,
-        origin_y: u16,
-    },
     /// FOCUS only: scroll the focused pane's `vt100` scrollback up (`up: true`) or down.
     ScrollFocus {
         up: bool,
@@ -335,217 +326,6 @@ fn new_id() -> String {
 // ---------------------------------------------------------------------------------------------
 
 impl Board {
-    /// Routes board clicks through the same state transitions as keyboard
-    /// navigation. Terminal input is deliberately excluded here: the main
-    /// loop forwards it only while the selected pane is in typing mode.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> Intent {
-        if !matches!(self.mode, Mode::Normal) {
-            return Intent::None;
-        }
-        let content = Rect {
-            height: area.height.saturating_sub(1),
-            ..area
-        };
-        if content.height == 0 {
-            return Intent::None;
-        }
-        if self.view == View::Agent && self.pane_mode == PaneMode::Typing {
-            let terminal_area = if self.terminal_maximized {
-                content
-            } else {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                    .split(content)[0]
-            };
-            if terminal_area.contains(Position {
-                x: mouse.column,
-                y: mouse.row,
-            }) && self.pane_ready
-            {
-                return Intent::ForwardMouse {
-                    event: mouse,
-                    origin_x: terminal_area.x + 1,
-                    origin_y: terminal_area.y + 1,
-                };
-            }
-            return Intent::None;
-        }
-        if self.view == View::Agent {
-            let terminal_area = if self.terminal_maximized {
-                content
-            } else {
-                Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-                    .split(content)[0]
-            };
-            if terminal_area.contains(Position {
-                x: mouse.column,
-                y: mouse.row,
-            }) {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => return Intent::ScrollFocus { up: true },
-                    MouseEventKind::ScrollDown => return Intent::ScrollFocus { up: false },
-                    _ => {}
-                }
-            }
-        }
-        if mouse.row == area.y + area.height.saturating_sub(1) {
-            let view_x = area.x + 10;
-            if mouse.column >= view_x && mouse.column < view_x + 12 {
-                self.view = if self.view == View::Building {
-                    View::Agent
-                } else {
-                    View::Building
-                };
-                self.pane_mode = PaneMode::Board;
-                return Intent::Redraw;
-            }
-        }
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Intent::None;
-        }
-        match self.view {
-            View::Building => self.handle_building_click(mouse, content),
-            View::Agent => self.handle_agent_click(mouse, content),
-        }
-    }
-
-    fn handle_building_click(&mut self, mouse: MouseEvent, area: Rect) -> Intent {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(area);
-        if columns[0].contains(Position {
-            x: mouse.column,
-            y: mouse.row,
-        }) {
-            let y = columns[0].y + 1;
-            if mouse.row < y {
-                return Intent::None;
-            }
-            let mut row = y;
-            for project in self.projects_sorted() {
-                row += 1;
-                for (agent_id, _) in self.agent_tree(&project.id) {
-                    if mouse.row == row {
-                        self.selected_agent = Some(agent_id);
-                        self.focused_project = Some(project.id.clone());
-                        self.selected_task = None;
-                        return Intent::Redraw;
-                    }
-                    row += 1;
-                }
-            }
-        } else if columns[1].contains(Position {
-            x: mouse.column,
-            y: mouse.row,
-        }) {
-            let row = columns[1].y + 1;
-            let index = usize::from(mouse.row.saturating_sub(row));
-            if let Some(item) = self.attention_items().get(index) {
-                self.focused_project = Some(item.project_id.clone());
-                match &item.target {
-                    AttentionTarget::Agent(agent_id) => {
-                        self.selected_agent = Some(agent_id.clone());
-                        self.selected_task = None;
-                    }
-                    AttentionTarget::Task(task_id) => {
-                        self.selected_task = Some(task_id.clone());
-                        self.selected_agent = self
-                            .tasks
-                            .get(task_id)
-                            .and_then(|task| task.snapshot.assigned_agent_id.clone());
-                    }
-                }
-                return Intent::Redraw;
-            }
-        }
-        Intent::None
-    }
-
-    fn handle_agent_click(&mut self, mouse: MouseEvent, area: Rect) -> Intent {
-        if self.terminal_maximized {
-            if area.contains(Position {
-                x: mouse.column,
-                y: mouse.row,
-            }) {
-                if mouse.modifiers.contains(KeyModifiers::SHIFT) && self.pane_ready {
-                    self.pane_mode = PaneMode::Typing;
-                }
-                return Intent::Redraw;
-            }
-            return Intent::None;
-        }
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-            .split(area);
-        if columns[0].contains(Position {
-            x: mouse.column,
-            y: mouse.row,
-        }) {
-            if mouse.modifiers.contains(KeyModifiers::SHIFT) && self.pane_ready {
-                self.pane_mode = PaneMode::Typing;
-            }
-            return Intent::Redraw;
-        }
-        if !columns[1].contains(Position {
-            x: mouse.column,
-            y: mouse.row,
-        }) {
-            return Intent::Redraw;
-        }
-        let Some(agent_id) = self.selected_agent.clone() else {
-            return Intent::None;
-        };
-        let orchestrator = self
-            .agents
-            .get(&agent_id)
-            .is_some_and(|agent| agent.role == AgentRole::Orchestrator);
-        let constraints = if orchestrator {
-            [
-                Constraint::Percentage(25),
-                Constraint::Percentage(20),
-                Constraint::Percentage(25),
-                Constraint::Percentage(30),
-            ]
-        } else {
-            [
-                Constraint::Percentage(40),
-                Constraint::Percentage(25),
-                Constraint::Percentage(35),
-                Constraint::Percentage(0),
-            ]
-        };
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints(constraints)
-            .split(columns[1]);
-        if rows[0].contains(Position {
-            x: mouse.column,
-            y: mouse.row,
-        }) {
-            let row = rows[0].y + 1;
-            let index = usize::from(mouse.row.saturating_sub(row));
-            if let Some(task_id) = self
-                .active_tasks_for_agent(&agent_id)
-                .get(index)
-                .map(|task| task.snapshot.id.clone())
-            {
-                self.selected_task = Some(task_id.clone());
-                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
-                    && mouse.modifiers.contains(KeyModifiers::SHIFT)
-                {
-                    self.mode = Mode::TaskMenu(TaskMenuState { task_id, cursor: 0 });
-                }
-                return Intent::Redraw;
-            }
-        }
-        Intent::Redraw
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) -> Intent {
         match &self.mode {
             Mode::Normal => self.handle_normal_key(key),
@@ -1521,26 +1301,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_selects_the_same_agent_row_keyboard_navigation_reaches() {
-        let mut board = board();
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 2,
-            row: 2,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(matches!(
-            board.handle_mouse(mouse, Rect::new(0, 0, 120, 24)),
-            Intent::Redraw
-        ));
-        assert_eq!(
-            board.selected_agent.as_ref().map(AgentId::as_str),
-            Some("alice")
-        );
-    }
-
-    #[test]
-    fn queue_rows_are_stable_and_shift_click_opens_the_same_task_menu() {
+    fn queue_rows_are_stable_and_mouse_targets_the_same_assigned_queue() {
         let mut board = board();
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
@@ -1560,41 +1321,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "later"]
         );
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 100,
-            row: 2,
-            modifiers: KeyModifiers::SHIFT,
-        };
-        board.handle_mouse(mouse, Rect::new(0, 0, 120, 24));
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("later").unwrap())),
+            Intent::Redraw
+        ));
         assert_eq!(
             board.selected_task.as_ref().map(TaskId::as_str),
             Some("later")
         );
-        assert!(matches!(board.mode, Mode::TaskMenu(_)));
-    }
-
-    #[test]
-    fn maximized_terminal_forwards_mouse_from_the_full_content_area() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.pane_mode = PaneMode::Typing;
-        board.pane_ready = true;
-        board.terminal_maximized = true;
-        let mouse = MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: 110,
-            row: 10,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert!(matches!(
-            board.handle_mouse(mouse, Rect::new(0, 0, 120, 24)),
-            Intent::ForwardMouse {
-                origin_x: 1,
-                origin_y: 1,
-                ..
-            }
-        ));
     }
 
     #[test]
