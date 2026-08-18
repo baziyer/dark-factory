@@ -14,6 +14,7 @@
 use std::{path::Path, time::Duration};
 
 use factory_core::status::WorktreeStatus;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(1);
@@ -167,11 +168,35 @@ async fn status_command(
         dirty: false,
         error: Some(error),
     };
-    command.kill_on_drop(true);
-    let output = match tokio::time::timeout(deadline, command.output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => return failed(format!("could not run git: {error}")),
-        Err(_) => return failed("git status timed out".to_owned()),
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(format!("could not run git: {error}")),
+    };
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let status = match tokio::time::timeout(deadline, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => return failed(format!("could not wait for git: {error}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return failed("git status timed out".to_owned());
+        }
+    };
+    let mut stdout_bytes = Vec::new();
+    let mut stderr_bytes = Vec::new();
+    if let Err(error) = stdout.read_to_end(&mut stdout_bytes).await {
+        return failed(format!("could not read git output: {error}"));
+    }
+    if let Err(error) = stderr.read_to_end(&mut stderr_bytes).await {
+        return failed(format!("could not read git error: {error}"));
+    }
+    let output = std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
     };
     if !output.status.success() {
         return failed(String::from_utf8_lossy(&output.stderr).trim().to_owned());
@@ -355,14 +380,28 @@ mod tests {
     #[tokio::test]
     async fn status_reports_a_stalled_git_probe_as_unavailable() {
         let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
         let mut command = Command::new("sh");
-        command.args(["-c", "sleep 60"]);
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; exec sleep 60")
+            .arg("sh")
+            .arg(&pid_file);
 
         let status = status_command(directory.path(), command, Duration::from_millis(10)).await;
 
         assert_eq!(status.error.as_deref(), Some("git status timed out"));
         assert!(!status.dirty);
         assert_eq!(status.changed_files, 0);
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "timed-out git child was not reaped");
     }
 
     #[tokio::test]

@@ -29,5 +29,8 @@ serde_json.workspace = true
 tui-term = "=0.3.0"
 uuid.workspace = true
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true
