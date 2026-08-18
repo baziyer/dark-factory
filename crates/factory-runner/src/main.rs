@@ -8,6 +8,10 @@ use factory_runner::{Config, Error};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if version_requested(env::args().skip(1)) {
+        println!("factory-runner {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let result = match parse_arguments() {
         Ok(config) => run_config(config).await,
         Err(error) => Err(error),
@@ -16,6 +20,10 @@ async fn main() {
         eprintln!("factory-runner: {error}");
         process::exit(1);
     }
+}
+
+fn version_requested(mut arguments: impl Iterator<Item = String>) -> bool {
+    matches!(arguments.next().as_deref(), Some("--version" | "-V")) && arguments.next().is_none()
 }
 
 async fn run_config(config: Config) -> Result<(), Error> {
@@ -152,4 +160,19 @@ fn required(arguments: &mut impl Iterator<Item = String>, option: &str) -> Resul
 
 fn required_value<T>(value: Option<T>, name: &str) -> Result<T, Error> {
     value.ok_or_else(|| Error::InvalidArguments(format!("missing {name}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_requested;
+
+    #[test]
+    fn version_is_a_standalone_read_only_command() {
+        assert!(version_requested(["--version".to_owned()].into_iter()));
+        assert!(version_requested(["-V".to_owned()].into_iter()));
+        assert!(!version_requested(std::iter::empty()));
+        assert!(!version_requested(
+            ["--version".to_owned(), "extra".to_owned()].into_iter()
+        ));
+    }
 }
