@@ -93,7 +93,8 @@ fn fixture() -> Store {
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
 /// which always migrates to the current `SCHEMA_VERSION`, 16 as of 0016's
-/// `last_hook_event` CHECK widening for `permission_request` -- and
+/// task-incarnation addition (0015 widened `last_hook_event` for
+/// `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
 /// chain including 0015's `sessions` rebuild and 0016's task incarnations.
@@ -183,7 +184,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs the 0014 migration.
+    // Opening through the real store runs migrations 0014 through 0016.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
@@ -200,7 +201,10 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(violations, 0, "migration 0014 left a foreign key violation");
+    assert_eq!(
+        violations, 0,
+        "migration chain left a foreign key violation"
+    );
 
     let run = store
         .list_runs(&project_id("factory"), None, 10)
