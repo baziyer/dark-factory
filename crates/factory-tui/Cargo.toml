@@ -10,8 +10,8 @@ name = "factory-tui"
 path = "src/main.rs"
 
 [dependencies]
-# Pinned below the latest crates.io release: ratatui 0.30.2 / tui-term 0.3.4 need rustc 1.88 /
-# 1.86 respectively, and this workspace is pinned to rust-version 1.85 (see SPIKE.md "MSRV").
+# Pinned below the latest crates.io release: ratatui 0.30.2 needs rustc 1.88,
+# while this workspace is pinned to rust-version 1.86 (see SPIKE.md "MSRV").
 # `crossterm` and `vt100` are deliberately NOT direct dependencies: both ratatui and tui-term
 # re-export the exact crossterm/vt100 versions they were built against (`ratatui::crossterm`,
 # `tui_term::vt100`) specifically so downstream crates avoid a duplicate, version-mismatched
@@ -20,10 +20,13 @@ anyhow = "1.0"
 factory-core = { path = "../factory-core" }
 factoryctl = { path = "../factoryctl" }
 portable-pty = "0.9.0"
-ratatui = "=0.29.0"
+ratatui = { version = "=0.30.0", default-features = false, features = [
+    "crossterm",
+    "underline-color",
+] }
 serde.workspace = true
 serde_json.workspace = true
-tui-term = "=0.2.0"
+tui-term = "=0.3.0"
 uuid.workspace = true
 
 [lints]
