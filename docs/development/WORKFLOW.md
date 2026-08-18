@@ -172,7 +172,7 @@ CARGO_TARGET_DIR=/Users/<you>/actions-runner-dark-factory-repo/_cargo-target
 ```
 
 (`RUSTUP_HOME` is deliberately shared with the login user: `local-ci.sh`
-pins `cargo +1.86.0` explicitly and never changes the default toolchain,
+pins `cargo +1.88.0` explicitly and never changes the default toolchain,
 so sharing keeps it warm without repinning anything. `CARGO_TARGET_DIR`
 lives outside `_work` because the checkout step in `ci.yml`/`release.yml`
 runs `git clean -ffdx` each job — see the comment on that step in either
