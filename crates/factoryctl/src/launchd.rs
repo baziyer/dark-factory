@@ -315,7 +315,9 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// and environment; `PATH` merged with `provider_directories`), writes it
 /// at `plist`, and reloads it. The caller has already read and checked
 /// the existing job with [`read_existing`]/[`check_home`] — this is the
-/// mutating half. A failed reload restores the prior plist before returning.
+/// mutating half. A failed reload restores the prior runtime and plist before
+/// returning; `rollback_runtime` runs before the old plist is reloaded so the
+/// two always describe the same installed binaries.
 pub fn apply(
     home: &Path,
     plist: &Path,
@@ -323,6 +325,29 @@ pub fn apply(
     provider_directories: &[(&str, PathBuf)],
     extra_environment: &BTreeMap<String, String>,
     capacity: Option<usize>,
+) -> Result<(), String> {
+    apply_with_rollback(
+        home,
+        plist,
+        existing,
+        provider_directories,
+        extra_environment,
+        capacity,
+        || Ok(()),
+    )
+}
+
+/// Applies a managed launchd mutation with a caller-owned runtime rollback.
+/// Init and update use this to repoint `bin/current` before the old plist is
+/// restored when bootstrap fails.
+pub fn apply_with_rollback(
+    home: &Path,
+    plist: &Path,
+    existing: Option<&ExistingJob>,
+    provider_directories: &[(&str, PathBuf)],
+    extra_environment: &BTreeMap<String, String>,
+    capacity: Option<usize>,
+    rollback_runtime: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     let mut environment = existing
         .map(|job| job.environment.clone())
@@ -354,7 +379,7 @@ pub fn apply(
     } else {
         None
     };
-    install_and_reload(plist, home, &content, old_content, || {
+    install_and_reload(plist, home, &content, old_content, rollback_runtime, || {
         reload(rustix::process::getuid().as_raw(), plist)
     })
 }
@@ -363,6 +388,18 @@ pub fn apply(
 /// is used after a post-reload health failure, where merely repointing
 /// `bin/current` would leave launchd running the changed job state.
 pub fn restore(plist: &Path, home: &Path, content: &str) -> Result<(), String> {
+    restore_with_rollback(plist, home, content, || Ok(()))
+}
+
+/// Restores a saved plist. If that reload fails, `rollback_runtime` restores
+/// the runtime that belongs to the currently installed plist before that
+/// plist is reloaded as the recovery attempt.
+pub fn restore_with_rollback(
+    plist: &Path,
+    home: &Path,
+    content: &str,
+    rollback_runtime: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
     let current = if plist.exists() {
         Some(fs::read_to_string(plist).map_err(|error| {
             format!(
@@ -373,7 +410,7 @@ pub fn restore(plist: &Path, home: &Path, content: &str) -> Result<(), String> {
     } else {
         None
     };
-    install_and_reload(plist, home, content, current, || {
+    install_and_reload(plist, home, content, current, rollback_runtime, || {
         reload(rustix::process::getuid().as_raw(), plist)
     })
 }
@@ -383,12 +420,18 @@ fn install_and_reload(
     home: &Path,
     content: &str,
     old_content: Option<String>,
+    mut rollback_runtime: impl FnMut() -> Result<(), String>,
     mut reload: impl FnMut() -> Result<(), String>,
 ) -> Result<(), String> {
     install(plist, content, home)?;
     match reload() {
         Ok(()) => Ok(()),
         Err(error) => {
+            if let Err(runtime) = rollback_runtime() {
+                return Err(format!(
+                    "{error}; runtime rollback failed before restoring the launchd plist: {runtime}"
+                ));
+            }
             let rollback = match old_content {
                 Some(content) => {
                     install(plist, &content, home)?;
@@ -653,22 +696,39 @@ mod tests {
 
     #[test]
     fn failed_reload_restores_the_previous_plist() {
+        use std::{cell::RefCell, rc::Rc};
+
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("home");
         let plist = root.path().join("Library/LaunchAgents/job.plist");
         install(&plist, "old", &home).unwrap();
         let mut reloads = 0;
-        let error = install_and_reload(&plist, &home, "new", Some("old".to_owned()), || {
-            reloads += 1;
-            if reloads == 1 {
-                Err("reload failed".to_owned())
-            } else {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let runtime_events = Rc::clone(&events);
+        let reload_events = Rc::clone(&events);
+        let error = install_and_reload(
+            &plist,
+            &home,
+            "new",
+            Some("old".to_owned()),
+            move || {
+                runtime_events.borrow_mut().push("runtime");
                 Ok(())
-            }
-        })
+            },
+            || {
+                reload_events.borrow_mut().push("reload");
+                reloads += 1;
+                if reloads == 1 {
+                    Err("reload failed".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
         .unwrap_err();
         assert!(error.contains("plist and job rolled back"));
         assert_eq!(reloads, 2);
+        assert_eq!(*events.borrow(), ["reload", "runtime", "reload"]);
         assert_eq!(fs::read_to_string(plist).unwrap(), "old");
     }
 

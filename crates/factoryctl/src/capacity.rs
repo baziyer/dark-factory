@@ -83,10 +83,13 @@ pub fn set(
     let requested = validate(requested)?;
     let _lock = runtime::MutationLock::acquire(home)?;
     let plist = launchd::plist_path(user_home);
+    let snapshot = _lock.snapshot(home, &plist)?;
     let existing = launchd::read_existing(&plist)?
         .ok_or("no launchd job is installed; capacity changes require the managed daemon")?;
-    let previous_plist = std::fs::read_to_string(&plist)
-        .map_err(|error| format!("could not save the existing launchd plist: {error}"))?;
+    let previous_plist = snapshot
+        .plist
+        .as_deref()
+        .ok_or("the launchd plist disappeared while taking the mutation snapshot")?;
     launchd::check_home(&existing, home, user_home)?;
     if !probes::launchd_loaded() {
         if probes::daemon_answers(socket) {
@@ -108,16 +111,17 @@ pub fn set(
         });
     }
 
-    launchd::apply(
+    launchd::apply_with_rollback(
         home,
         &plist,
         Some(&existing),
         &probes::provider_directories(),
         &std::collections::BTreeMap::new(),
         Some(requested),
+        || Ok(()),
     )?;
     if let Err(error) = probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
-        let rollback = launchd::restore(&plist, home, &previous_plist);
+        let rollback = launchd::restore_with_rollback(&plist, home, previous_plist, || Ok(()));
         return match rollback {
             Ok(()) => match probes::wait_for_managed_daemon(socket, HEALTH_WAIT, None, home) {
                 Ok(_) => Err(format!(
