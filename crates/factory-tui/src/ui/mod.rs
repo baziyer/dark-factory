@@ -26,21 +26,15 @@ pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) -> HitMap {
     let status_height = 1u16.min(area.height);
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(status_height),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(status_height)])
         .split(area);
-    let (tabs_area, content_area, status_area) = (outer[0], outer[1], outer[2]);
-
-    render_tabs(frame, tabs_area, board, &mut hits);
+    let (content_area, status_area) = (outer[0], outer[1]);
 
     match board.view {
         View::Building => building::draw(frame, content_area, board, &mut hits),
         View::Agent => agent::draw(frame, content_area, board, panes, &mut hits),
     }
-    help::render_status_line(frame, status_area, board);
+    help::render_status_line(frame, status_area, board, &mut hits);
 
     if matches!(
         board.mode,
@@ -51,7 +45,7 @@ pub fn draw(frame: &mut Frame, board: &Board, panes: &mut PaneMap) -> HitMap {
     hits
 }
 
-fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+pub(super) fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -185,13 +179,17 @@ mod tests {
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     fn render(board: &Board, width: u16, height: u16) -> HitMap {
+        render_frame(board, width, height).0
+    }
+
+    fn render_frame(board: &Board, width: u16, height: u16) -> (HitMap, Terminal<TestBackend>) {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         let mut panes = PaneMap::new();
         let mut hits = HitMap::default();
         terminal
             .draw(|frame| hits = draw(frame, board, &mut panes))
             .unwrap();
-        hits
+        (hits, terminal)
     }
 
     #[test]
@@ -237,14 +235,14 @@ mod tests {
             Vec::new(),
         );
         let hits = render(&board, 120, 24);
-        assert_eq!(hits.target_at(0, 0), Some(Target::View(View::Building)));
-        assert_eq!(hits.target_at(11, 0), Some(Target::View(View::Agent)));
+        assert_eq!(hits.target_at(0, 23), Some(Target::View(View::Building)));
+        assert_eq!(hits.target_at(11, 23), Some(Target::View(View::Agent)));
         assert_eq!(
-            hits.target_at(1, 3),
+            hits.target_at(1, 2),
             Some(Target::Agent(AgentId::try_from("alice").unwrap()))
         );
         assert_eq!(
-            hits.target_at(83, 2),
+            hits.target_at(83, 1),
             Some(Target::Attention(crate::model::AttentionTarget::Task(
                 TaskId::try_from("blocked").unwrap()
             )))
@@ -265,7 +263,7 @@ mod tests {
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
         let hits = render(&board, 120, 24);
         assert_eq!(
-            hits.target_at(83, 2),
+            hits.target_at(83, 1),
             Some(Target::Task(TaskId::try_from("task-1").unwrap()))
         );
         let click = MouseEvent {
@@ -291,13 +289,77 @@ mod tests {
             Vec::new(),
         );
         let full = render(&board, 120, 24);
-        assert!(matches!(full.target_at(1, 3), Some(Target::Agent(_))));
+        assert!(matches!(full.target_at(1, 2), Some(Target::Agent(_))));
 
         let clipped = render(&board, 30, 3);
-        assert_eq!(clipped.target_at(1, 3), None);
-        assert_eq!(clipped.target_at(0, 0), Some(Target::View(View::Building)));
+        assert_eq!(clipped.target_at(1, 1), None);
+        assert_eq!(clipped.target_at(0, 2), Some(Target::View(View::Building)));
 
         let empty = render(&Board::new(false, 0, crate::theme::PLAIN), 120, 24);
-        assert_eq!(empty.target_at(1, 3), None);
+        assert_eq!(empty.target_at(1, 2), None);
+    }
+
+    #[test]
+    fn footer_has_selected_tabs_and_only_stable_essential_controls() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+        let (hits, terminal) = render_frame(&board, 120, 24);
+        let footer_y = 23;
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+
+        assert!(footer.contains("[BUILDING] [AGENT]"));
+        assert!(footer.contains("BOARD"));
+        assert!(footer.contains("[? help]"));
+        assert!(footer.contains("[q detach]"));
+        for old_action in ["j/k", "Enter", "needs-you", "type"] {
+            assert!(!footer.contains(old_action));
+        }
+        let selected = terminal.backend().buffer()[(0, footer_y)].modifier;
+        let unselected = terminal.backend().buffer()[(11, footer_y)].modifier;
+        assert!(selected.contains(Modifier::REVERSED | Modifier::BOLD));
+        assert!(!unselected.contains(Modifier::REVERSED));
+
+        let help_x = (0..120)
+            .find(|x| hits.target_at(*x, footer_y) == Some(Target::Help))
+            .unwrap();
+        let detach_x = (0..120)
+            .find(|x| hits.target_at(*x, footer_y) == Some(Target::Detach))
+            .unwrap();
+        for (column, expected) in [(help_x, Target::Help), (detach_x, Target::Detach)] {
+            let click = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: footer_y,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(
+                route(click, &hits, None, &mut crate::mouse::Capture::default()),
+                Route::Board(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn footer_shows_terminal_escape_only_while_typing() {
+        let board = Board::new(false, 0, crate::theme::PLAIN);
+        let (_, terminal) = render_frame(&board, 120, 24);
+        let footer_y = 23;
+        let board_footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(!board_footer.contains("Ctrl-]"));
+
+        let mut typing = board;
+        typing.view = View::Agent;
+        typing.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        typing.pane_mode = crate::model::PaneMode::Typing;
+        typing.pane_ready = true;
+        let (_, terminal) = render_frame(&typing, 120, 24);
+        let typing_footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, footer_y)].symbol())
+            .collect::<String>();
+        assert!(typing_footer.contains("Ctrl-] board"));
+        assert!(typing_footer.contains("[? help] [q detach]"));
     }
 }

@@ -328,6 +328,8 @@ impl Board {
         match target {
             MouseTarget::View(View::Building) => self.back_to_building(),
             MouseTarget::View(View::Agent) => self.open_agent(),
+            MouseTarget::Help => self.dispatch(Action::ToggleHelp),
+            MouseTarget::Detach => self.dispatch(Action::Detach),
             MouseTarget::Agent(agent_id) => {
                 if self.select_agent(agent_id) {
                     Intent::Redraw
@@ -1292,6 +1294,35 @@ mod tests {
         assert_eq!(mouse.selected_task, keyboard.selected_task);
         assert_eq!(mouse.focused_project, keyboard.focused_project);
         assert_eq!(mouse.view, keyboard.view);
+    }
+
+    #[test]
+    fn footer_help_and_detach_use_the_keyboard_action_paths() {
+        let mut keyboard = board();
+        let mut mouse = board();
+        assert!(matches!(
+            mouse.handle_mouse_target(MouseTarget::Help),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('?'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(mouse.mode, Mode::Help));
+        assert!(matches!(keyboard.mode, Mode::Help));
+
+        let mut keyboard = board();
+        let mut mouse = board();
+        assert!(matches!(
+            mouse.handle_mouse_target(MouseTarget::Detach),
+            Intent::Quit
+        ));
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('q'))),
+            Intent::Quit
+        ));
+        assert!(mouse.quit);
+        assert_eq!(mouse.quit, keyboard.quit);
     }
 
     #[test]

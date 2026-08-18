@@ -251,6 +251,7 @@ impl Pane {
         self.with_screen(|screen| TerminalMouseContext {
             mode: screen.mouse_protocol_mode(),
             encoding: screen.mouse_protocol_encoding(),
+            scrolled_back: screen.scrollback() > 0,
         })
     }
 

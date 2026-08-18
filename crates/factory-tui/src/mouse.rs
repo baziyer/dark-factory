@@ -15,6 +15,8 @@ use crate::model::{AttentionTarget, View};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
     View(View),
+    Help,
+    Detach,
     Agent(AgentId),
     Task(TaskId),
     Attention(AttentionTarget),
@@ -84,6 +86,7 @@ impl HitMap {
 pub struct TerminalMouseContext {
     pub mode: MouseProtocolMode,
     pub encoding: MouseProtocolEncoding,
+    pub scrolled_back: bool,
 }
 
 /// A terminal mouse press that must receive its matching drag/release even if the pointer leaves
@@ -114,6 +117,9 @@ pub enum Route {
         session_id: SessionId,
         up: bool,
     },
+    ResetScrollback {
+        session_id: SessionId,
+    },
     Terminal {
         session_id: SessionId,
         bytes: Vec<u8>,
@@ -129,6 +135,33 @@ pub fn route(
     terminal_context: Option<TerminalMouseContext>,
     capture: &mut Capture,
 ) -> Route {
+    let in_terminal = hits
+        .terminal
+        .as_ref()
+        .filter(|terminal| contains(terminal.area, event.column, event.row));
+
+    // Coordinates drawn from historical scrollback do not describe the child's live screen.
+    // Consume the first protocol event, clear any old press ownership, and force a redraw at the
+    // live tail. Only a later event against that newly rendered frame may reach the child.
+    if terminal_context.is_some_and(|context| context.enabled() && context.scrolled_back) {
+        capture.clear();
+        if let Some(terminal) = in_terminal {
+            return match event.kind {
+                MouseEventKind::ScrollUp => Route::Scroll {
+                    session_id: terminal.session_id.clone(),
+                    up: true,
+                },
+                MouseEventKind::ScrollDown => Route::Scroll {
+                    session_id: terminal.session_id.clone(),
+                    up: false,
+                },
+                _ => Route::ResetScrollback {
+                    session_id: terminal.session_id.clone(),
+                },
+            };
+        }
+    }
+
     if let Some(session_id) = capture.session_id.clone() {
         match event.kind {
             MouseEventKind::Drag(_) | MouseEventKind::Up(_) => {
@@ -161,11 +194,6 @@ pub fn route(
     if matches!(event.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
         return Route::None;
     }
-
-    let in_terminal = hits
-        .terminal
-        .as_ref()
-        .filter(|terminal| contains(terminal.area, event.column, event.row));
 
     if let Some(terminal) = in_terminal {
         if terminal_context.is_some_and(TerminalMouseContext::enabled) {
@@ -344,7 +372,11 @@ mod tests {
     }
 
     fn context(mode: MouseProtocolMode, encoding: MouseProtocolEncoding) -> TerminalMouseContext {
-        TerminalMouseContext { mode, encoding }
+        TerminalMouseContext {
+            mode,
+            encoding,
+            scrolled_back: false,
+        }
     }
 
     fn routed(
@@ -536,6 +568,46 @@ mod tests {
                 bytes: b"\x1b[<64;3;4M".to_vec(),
             }
         );
+    }
+
+    #[test]
+    fn scrolled_back_coordinate_is_consumed_without_bytes_or_capture_until_next_frame() {
+        let session_id = SessionId::try_from("session-1").unwrap();
+        let mut hits = HitMap::default();
+        hits.set_terminal(Rect::new(10, 5, 20, 10), session_id.clone());
+        let click = event(MouseEventKind::Down(MouseButton::Left), 12, 8);
+        let mut capture = Capture::default();
+        let mut scrolled = context(MouseProtocolMode::PressRelease, MouseProtocolEncoding::Sgr);
+        scrolled.scrolled_back = true;
+        let mut written = Vec::new();
+
+        let first = route(click, &hits, Some(scrolled), &mut capture);
+        if let Route::Terminal { bytes, .. } = &first {
+            written.extend_from_slice(bytes);
+        }
+        assert_eq!(
+            first,
+            Route::ResetScrollback {
+                session_id: session_id.clone()
+            }
+        );
+        assert!(written.is_empty());
+        assert!(capture.session_id.is_none());
+
+        let second = route(
+            click,
+            &hits,
+            Some(context(
+                MouseProtocolMode::PressRelease,
+                MouseProtocolEncoding::Sgr,
+            )),
+            &mut capture,
+        );
+        if let Route::Terminal { bytes, .. } = &second {
+            written.extend_from_slice(bytes);
+        }
+        assert_eq!(written, b"\x1b[<0;3;4M");
+        assert_eq!(capture.session_id, Some(session_id));
     }
 
     #[test]

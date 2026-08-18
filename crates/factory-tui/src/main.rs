@@ -569,6 +569,16 @@ fn handle_mouse(
             }
             true
         }
+        mouse::Route::ResetScrollback { session_id } => {
+            let Some(pane) = panes
+                .get(&session_id)
+                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+            else {
+                return false;
+            };
+            pane.scroll_reset();
+            true
+        }
         mouse::Route::Terminal { session_id, bytes } => {
             let Some(pane) = panes
                 .get(&session_id)
