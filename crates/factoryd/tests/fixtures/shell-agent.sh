@@ -37,6 +37,14 @@ set -eu
 FACTORYCTL="${DARK_FACTORY_FACTORYCTL:-factoryctl}"
 TOKEN_FILE="${DARK_FACTORY_SESSION_TOKEN_FILE:?DARK_FACTORY_SESSION_TOKEN_FILE not set}"
 
+# Some lifecycle tests deliberately leave the runner's stop request in flight
+# long enough to assign the next task. Keep the fixture alive while honoring
+# that signal so the daemon's stopping-session guard is exercised, without
+# changing the ordinary fixture timing.
+if [ -n "${SHELL_AGENT_STOP_DELAY:-}" ]; then
+    trap 'sleep "$SHELL_AGENT_STOP_DELAY"; exit 0' TERM INT
+fi
+
 # post_hook EVENT PAYLOAD_JSON: forwards one hook event, printing the
 # daemon's reply JSON (or `{}` on any local/daemon problem -- `factoryctl
 # hook` always fails open and always exits 0).

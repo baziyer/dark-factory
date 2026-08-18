@@ -139,6 +139,13 @@ them into `factory_core::ProviderHookEvent` values (see
      (Codex's `SessionStart` `session_id` field is the shipped example),
      that is a `local_api.rs`/`store.rs` concern, not this trait's — see
      `Store::set_provider_session_id`.
+   - A clean stop may be acknowledged by the runner before the provider
+     process has exited. The dispatcher holds queued work until that terminal
+     event, then launches the successor with `ctx.resume` when supported. If
+     the resumed provider does not acknowledge the first delivery, the shared
+     path makes one bounded delayed retry and leaves `delivery unacknowledged`
+     durably visible if it still fails; a provider must not silently consume a
+     prompt without its hook acknowledgement.
    - **Provider A1** — a session's own `factoryctl` calls (an agent's own
      `task done`/`task blocked`, or an operator typing one directly) use a
      bare `factoryctl`, not `ctx.factoryctl_path`: that trusted absolute
