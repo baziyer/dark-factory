@@ -219,8 +219,7 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
     assert_eq!(status("update"), "warn");
 }
 
-#[test]
-fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
+fn doctor_report(active_version: &str, daemon_version: &str) -> serde_json::Value {
     let root = tempfile::tempdir().unwrap();
     fs::create_dir_all(root.path().join("user-home")).unwrap();
     let factoryctl = staged_factoryctl(root.path());
@@ -228,15 +227,15 @@ fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
     let (code, _, stderr) = run(&factoryctl, root.path(), &["init", "--yes", "--no-launchd"]);
     assert_eq!(code, 0, "{stderr}");
 
-    let stale = home.join("bin/0.1.0");
-    fs::create_dir_all(&stale).unwrap();
+    let active = home.join("bin").join(active_version);
+    fs::create_dir_all(&active).unwrap();
     for name in SIBLINGS.iter().chain(["factoryctl"].iter()) {
-        let binary = stale.join(name);
+        let binary = active.join(name);
         fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     }
     fs::remove_file(home.join("bin/current")).unwrap();
-    std::os::unix::fs::symlink("0.1.0", home.join("bin/current")).unwrap();
+    std::os::unix::fs::symlink(active_version, home.join("bin/current")).unwrap();
 
     let now_ms = factoryctl::update::now_ms();
     let cache = serde_json::json!({
@@ -260,12 +259,13 @@ fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
 
     let socket = home.join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let daemon_version = daemon_version.to_owned();
     let server = thread::spawn(move || {
         let replies = [
             LocalResponse::Health {
                 runner_path: "/tmp/factory-runner".to_owned(),
                 factoryctl_path: "/tmp/factoryctl".to_owned(),
-                version: "0.1.0".to_owned(),
+                version: daemon_version,
             },
             LocalResponse::Projects {
                 projects: Vec::new(),
@@ -299,31 +299,38 @@ fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
     let (code, stdout, stderr) = run(&factoryctl, root.path(), &["doctor", "--json"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     server.join().unwrap();
-    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-    let checks = report["checks"].as_array().unwrap();
-    let check = |name: &str| {
-        checks
-            .iter()
-            .find(|check| check["name"] == name)
-            .unwrap_or_else(|| panic!("missing {name}: {stdout}"))
-    };
-    assert_eq!(check("install")["status"], "warn");
+    serde_json::from_str(stdout.trim()).unwrap()
+}
+
+fn named_check<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == name)
+        .unwrap_or_else(|| panic!("missing {name}: {report}"))
+}
+
+#[test]
+fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
+    let report = doctor_report("0.1.0", "0.1.0");
+    assert_eq!(named_check(&report, "install")["status"], "warn");
     assert!(
-        check("install")["detail"]
+        named_check(&report, "install")["detail"]
             .as_str()
             .unwrap()
             .contains("bin/current -> 0.1.0")
     );
-    assert_eq!(check("daemon")["status"], "ok");
+    assert_eq!(named_check(&report, "daemon")["status"], "ok");
     assert!(
-        check("daemon")["detail"]
+        named_check(&report, "daemon")["detail"]
             .as_str()
             .unwrap()
             .contains("matches active runtime")
     );
-    assert_eq!(check("update")["status"], "warn");
+    assert_eq!(named_check(&report, "update")["status"], "warn");
     assert!(
-        check("update")["detail"]
+        named_check(&report, "update")["detail"]
             .as_str()
             .unwrap()
             .contains(&format!(
@@ -331,4 +338,27 @@ fn doctor_compares_daemon_and_release_with_the_stale_active_runtime() {
                 factoryctl::update::CURRENT_VERSION
             ))
     );
+}
+
+#[test]
+fn doctor_accepts_a_newer_active_runtime_without_recommending_a_downgrade() {
+    let report = doctor_report("999.0.0", "999.0.0");
+    let install = named_check(&report, "install");
+    assert_eq!(install["status"], "ok");
+    assert!(
+        install["detail"]
+            .as_str()
+            .unwrap()
+            .contains("newer than this factoryctl")
+    );
+    assert!(
+        !install["detail"]
+            .as_str()
+            .unwrap()
+            .contains("update --install")
+    );
+    assert_eq!(named_check(&report, "daemon")["status"], "ok");
+    let update = named_check(&report, "update");
+    assert_eq!(update["status"], "ok");
+    assert_eq!(update["detail"], "999.0.0 is the latest installed release");
 }

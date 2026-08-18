@@ -154,6 +154,13 @@ fn check_install(home: &Path, active_version: &Result<Option<String>, String>) -
         Ok(Some(version)) if version == update::CURRENT_VERSION => {
             Check::ok("install", format!("bin/current -> {version}"))
         }
+        Ok(Some(version)) if update::is_newer(version, update::CURRENT_VERSION) => Check::ok(
+            "install",
+            format!(
+                "bin/current -> {version} (newer than this factoryctl {})",
+                update::CURRENT_VERSION
+            ),
+        ),
         Ok(Some(version)) => Check::warn(
             "install",
             format!(

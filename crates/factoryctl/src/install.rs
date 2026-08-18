@@ -25,11 +25,10 @@ use std::{
     process::Command,
 };
 
+pub use factoryctl::update::RELEASE_BINARIES as BINARIES;
 use factoryctl::update::{self, Manifest};
 use sha2::{Digest, Sha256};
 
-/// Every binary a release ships and an install must contain.
-pub const BINARIES: [&str; 4] = ["factoryd", "factory-runner", "factoryctl", "factory-tui"];
 /// Downloads larger than this are refused before verification even starts.
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
