@@ -94,7 +94,8 @@ transient_error() {
 }
 
 not_found() {
-    grep -Eiq 'HTTP[[:space:]]+404([^0-9]|$)' "$error"
+    grep -Eiq 'HTTP[[:space:]]+404([^0-9]|$)' "$error" ||
+        [ "$(cat "$error")" = "release not found" ]
 }
 
 # Refreshes `snapshot`: metadata on line one, then `<name><tab><digest>`.

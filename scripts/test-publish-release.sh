@@ -59,6 +59,27 @@ add_all_assets() {
     for path in "$temporary"/dist/*; do add_asset "$state" "$path"; done
 }
 
+# Both absence diagnostics emitted by supported `gh` versions create one new
+# release. Production `gh release view` currently uses the plain-text form.
+for missing_scenario in http-404 release-not-found; do
+    missing="$temporary/missing-$missing_scenario"
+    mkdir -p "$missing"
+    run_publisher "$missing_scenario" "$missing" "$missing.out" "$missing.err"
+    assert_equal 1 "$(count_log 'release create ' "$missing/log")" \
+        "$missing_scenario missing-release creates"
+    assert_equal 1 "$(count_log 'release edit ' "$missing/log")" \
+        "$missing_scenario missing-release publishes"
+done
+
+# Similar text from another failure is not proof that the release is absent.
+decorated="$temporary/decorated-not-found"
+mkdir -p "$decorated"
+if run_publisher decorated-not-found "$decorated" "$decorated.out" "$decorated.err"; then
+    fail "decorated not-found diagnostic was accepted"
+fi
+assert_equal 0 "$(count_log 'release create ' "$decorated/log")" \
+    "decorated not-found creates"
+
 # Three create-side 503s are retried. An upload and the final publication then
 # each commit remotely but lose their response; the state read observes
 # success and avoids a duplicate write.
