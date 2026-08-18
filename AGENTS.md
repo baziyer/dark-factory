@@ -96,5 +96,5 @@ Read-only context unless a task explicitly asks you to edit them:
   provider contract.
 - Known problems and their smallest fix: [GitHub issues labelled
   `known-issue`](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue).
-- Day-to-day workflow and the (unimplemented) release/update design:
+- Day-to-day workflow and the implemented release/update process:
   [docs/development/WORKFLOW.md](docs/development/WORKFLOW.md).
