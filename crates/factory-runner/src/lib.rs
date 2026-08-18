@@ -1350,6 +1350,13 @@ async fn attach_terminal_connection(
         )
         .await;
     }
+    send_frame(
+        write,
+        &RunnerFrame::AttachReady {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+        },
+    )
+    .await?;
     terminal_log
         .replay(write, snapshot, since_offset, snapshot.total_bytes)
         .await?;

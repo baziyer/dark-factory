@@ -139,6 +139,29 @@ mod tests {
         line
     }
 
+    fn ready_line(session_id: &str) -> Vec<u8> {
+        let frame = ServerFrame::AttachReady {
+            protocol_version: factory_core::PROTOCOL_VERSION,
+            session_id: SessionId::try_from(session_id).unwrap(),
+        };
+        let mut line = serde_json::to_vec(&frame).unwrap();
+        line.push(b'\n');
+        line
+    }
+
+    #[test]
+    fn empty_replay_has_an_explicit_ready_boundary_before_output() {
+        let mut bytes = ready_line("sess-1");
+        bytes.extend(frame_line("sess-1", 0, b"later"));
+        let mut frames = Vec::new();
+        read_frames(bytes.as_slice(), |frame| {
+            frames.push(frame);
+            true
+        });
+        assert!(matches!(frames[0], ServerFrame::AttachReady { .. }));
+        assert!(matches!(frames[1], ServerFrame::TerminalOutput { .. }));
+    }
+
     #[test]
     fn read_frame_decodes_a_terminal_output_frame() {
         let bytes = frame_line("sess-1", 0, b"hello");

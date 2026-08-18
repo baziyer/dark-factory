@@ -267,6 +267,10 @@ fn terminal_mode_attaches_replays_and_streams_written_input() {
         RunnerRequest::AttachTerminal { since_offset: 0 },
     );
     let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        read_frame(&mut reader),
+        RunnerFrame::AttachReady { .. }
+    ));
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !String::from_utf8_lossy(&collected).contains("hello") {
@@ -321,6 +325,53 @@ fn terminal_mode_attaches_replays_and_streams_written_input() {
         },
     ));
     runner.wait_for_clean_exit();
+}
+
+#[test]
+fn silent_terminal_acknowledges_attach_before_first_input_reaches_child() {
+    let runner = RunningTerminalRunner::spawn(
+        Path::new("/bin/sh"),
+        &["-c", "IFS= read -r line; printf 'got:%s' \"$line\"; cat"],
+        80,
+        24,
+    );
+    let mut stream = connect(&runner.socket());
+    write_request(
+        &mut stream,
+        RunnerRequest::AttachTerminal { since_offset: 0 },
+    );
+    let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        read_frame(&mut reader),
+        RunnerFrame::AttachReady { .. }
+    ));
+
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::TerminalInput {
+            bytes: encode_terminal_bytes(b"marco\n"),
+        },
+    ));
+    let mut collected = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !String::from_utf8_lossy(&collected).contains("got:marco") {
+        assert!(Instant::now() < deadline, "first input never reached child");
+        match read_frame(&mut reader) {
+            RunnerFrame::TerminalOutput { bytes, .. } => {
+                collected.extend(decode_terminal_bytes(&bytes).unwrap());
+            }
+            other => panic!("unexpected frame after ready: {other:?}"),
+        }
+    }
+
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::Stop {
+            command_id: "stop-silent-terminal".into(),
+            grace_ms: 1_000,
+        },
+    ));
+    runner.wait_for_terminal_spool();
 }
 
 #[test]
@@ -496,6 +547,10 @@ fn late_attach_replays_only_from_the_requested_offset() {
         RunnerRequest::AttachTerminal { since_offset: 0 },
     );
     let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        read_frame(&mut reader),
+        RunnerFrame::AttachReady { .. }
+    ));
     let mut collected = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while collected.len() < 10 {
@@ -519,6 +574,10 @@ fn late_attach_replays_only_from_the_requested_offset() {
         RunnerRequest::AttachTerminal { since_offset: 5 },
     );
     let mut reader = BufReader::new(stream);
+    assert!(matches!(
+        read_frame(&mut reader),
+        RunnerFrame::AttachReady { .. }
+    ));
     let frame = read_frame(&mut reader);
     let RunnerFrame::TerminalOutput { offset, bytes, .. } = frame else {
         panic!("expected terminal output, got {frame:?}");
@@ -593,8 +652,8 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     );
     let frame = read_frame(&mut BufReader::new(stream));
     assert!(
-        matches!(frame, RunnerFrame::TerminalOutput { offset: 0, .. }),
-        "expected a fresh reattach to replay from offset 0, got {frame:?}"
+        matches!(frame, RunnerFrame::AttachReady { .. }),
+        "expected a fresh reattach acknowledgement, got {frame:?}"
     );
 
     let _ = request(

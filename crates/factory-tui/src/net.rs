@@ -112,7 +112,9 @@ pub enum NetMsg {
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
         ServerFrame::Response { response, .. } => Ok(response),
-        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+        ServerFrame::Event { .. }
+        | ServerFrame::AttachReady { .. }
+        | ServerFrame::TerminalOutput { .. } => {
             Err("daemon returned a stream frame instead of a response".into())
         }
     }
@@ -367,7 +369,9 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
                                 }
                             }
                             Ok(
-                                ServerFrame::Response { .. } | ServerFrame::TerminalOutput { .. },
+                                ServerFrame::Response { .. }
+                                | ServerFrame::AttachReady { .. }
+                                | ServerFrame::TerminalOutput { .. },
                             ) => {}
                             Err(error) => {
                                 failure = error.to_string();
