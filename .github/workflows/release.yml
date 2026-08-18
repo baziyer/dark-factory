@@ -2,13 +2,21 @@ name: Release
 
 # A semver tag (`v0.2.0`) pushed by a maintainer builds the macOS arm64
 # and Intel binaries serially and publishes them, a SHA256SUMS file, a tap
-# formula candidate, and the `latest.json` manifest as a GitHub Release.
+# formula candidate, and the `latest.json` manifest as a GitHub Release. A
+# default-branch dispatch safely resumes an existing immutable tag after a
+# workflow defect is fixed.
 # `factoryctl update` reads that manifest at
 # https://github.com/baziyer/dark-factory/releases/latest/download/latest.json;
 # see docs/development/WORKFLOW.md, "Release and update".
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to recover
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,6 +24,7 @@ permissions:
 jobs:
   release:
     name: release
+    if: github.event_name == 'push' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     # Only maintainers can push tags, so this is a trusted ref (same boundary
     # as CI's `push` to `main`, the only other trigger that reaches the
     # persistent Mac — every pull request, same-repository or a fork, runs
@@ -25,7 +34,6 @@ jobs:
     runs-on: dark-factory-mac
     timeout-minutes: 60
     env:
-      TAG: ${{ github.ref_name }}
       ARM_TARGET: aarch64-apple-darwin
       INTEL_TARGET: x86_64-apple-darwin
     steps:
@@ -47,10 +55,11 @@ jobs:
       # cargo cache: CARGO_TARGET_DIR lives outside this workspace (see
       # docs/development/WORKFLOW.md, "The self-hosted runner").
       #
-      # For a tag push, $GITHUB_SHA is the commit the tag points at; GitHub
-      # serves `git fetch` by arbitrary commit SHA (verified against this
-      # repository). The repo is public, so the fetch is unauthenticated
-      # and nothing is written to .git/config that could leak a credential.
+      # $GITHUB_SHA is the tag commit for a push and the protected default-
+      # branch commit for a recovery dispatch. GitHub serves `git fetch` by
+      # arbitrary commit SHA (verified against this repository). The repo is
+      # public, so the fetch is unauthenticated and nothing is written to
+      # .git/config that could leak a credential.
       - name: Check out $GITHUB_SHA
         run: |
           set -euxo pipefail
@@ -60,6 +69,12 @@ jobs:
           git fetch --depth=1 origin "$GITHUB_SHA"
           git checkout --force --detach FETCH_HEAD
           git clean -ffdx
+
+      - name: Resolve the immutable release source
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          RELEASE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: ./scripts/prepare-release-source.sh "$REQUESTED_TAG"
 
       - name: Install the pinned toolchain
         run: |
@@ -89,4 +104,5 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/publish-release.sh "$TAG" "$GITHUB_SHA" "$GITHUB_REPOSITORY" dist/*
+        run: |
+          "$PUBLISHER" "$TAG" "$SOURCE_SHA" "$GITHUB_REPOSITORY" dist/*

@@ -211,6 +211,13 @@ them.
    `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
    (a static URL, so no Vercel mirror is needed unless GitHub is
    unreachable from somewhere that matters).
+   If a workflow defect stops publication, do not move or recreate the tag.
+   After its fix reaches `main`, dispatch the Release workflow from `main`
+   with the existing tag. Recovery resolves and builds that tagged commit,
+   but saves the publisher from the exact reviewed `main` commit that started
+   the run. The publisher revalidates the remote tag before any release write;
+   dispatches from other branches are rejected before the tagged source is
+   checked out.
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
    and prints JSON: `current`, `latest`, `update_available`, the platform

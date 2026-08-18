@@ -2,6 +2,7 @@
 set -eu
 
 ./scripts/check-toolchain-pins.sh
+./scripts/test-prepare-release-source.sh
 ./scripts/test-publish-release.sh
 ./scripts/test-package-release.sh
 cargo +1.88.0 fmt --all -- --check
