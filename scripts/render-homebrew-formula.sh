@@ -61,6 +61,13 @@ manifest="latest.json"
 arm_sha=$(checksum_for "$arm_archive")
 intel_sha=$(checksum_for "$intel_archive")
 manifest_sha=$(checksum_for "$manifest")
+version_stanza=
+case "$tag" in
+    *-*)
+        version_stanza="  version \"${tag#v}\"
+"
+        ;;
+esac
 
 cat <<RUBY
 # typed: strict
@@ -71,7 +78,7 @@ class DarkFactory < Formula
   desc "Terminal-first runtime for persistent coding-agent teams"
   homepage "https://github.com/$repository"
   url "https://github.com/$repository/releases/download/$tag/$manifest"
-  sha256 "$manifest_sha"
+${version_stanza}  sha256 "$manifest_sha"
   license "MIT"
 
   depends_on :macos
@@ -112,7 +119,7 @@ class DarkFactory < Formula
 
   test do
     %w[factoryd factory-runner factoryctl factory-tui].each do |name|
-      assert_match version.to_s, shell_output("#{bin}/#{name} --version")
+      assert_equal "#{name} #{version}", shell_output("#{bin}/#{name} --version").strip
     end
   end
 end

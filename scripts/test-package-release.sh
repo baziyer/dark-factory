@@ -77,8 +77,13 @@ grep -Fq 'on_arm do' "$formula" || fail "formula omitted the arm architecture bl
 grep -Fq 'on_intel do' "$formula" || fail "formula omitted the Intel architecture block"
 grep -Fq 'url "https://github.com/example/project/releases/download/v1.2.3/latest.json"' "$formula" \
     || fail "formula has no stable top-level source"
+if grep -Eq '^[[:space:]]+version ' "$formula"; then
+    fail "stable formula has a redundant or stale explicit version"
+fi
 grep -Fq 'resource("binaries").stage' "$formula" \
     || fail "formula does not install its selected resource"
+grep -Fq 'assert_equal "#{name} #{version}", shell_output("#{bin}/#{name} --version").strip' \
+    "$formula" || fail "formula does not test the exact binary version"
 if grep -Fq 'Hardware::CPU' "$formula"; then
     fail "formula bypasses Homebrew architecture blocks"
 fi
@@ -96,6 +101,16 @@ fi
 second_formula="$temporary/second.rb"
 "$renderer" v1.2.3 "$output/SHA256SUMS" example/project >"$second_formula"
 cmp -s "$formula" "$second_formula" || fail "formula rendering is not deterministic"
+
+prerelease_checksums="$temporary/prerelease-SHA256SUMS"
+sed 's/v1\.2\.3-/v1.2.3-rc.1-/' "$output/SHA256SUMS" >"$prerelease_checksums"
+prerelease_formula="$temporary/prerelease.rb"
+"$renderer" v1.2.3-rc.1 "$prerelease_checksums" example/project >"$prerelease_formula"
+[ "$(grep -Ec '^[[:space:]]+version ' "$prerelease_formula")" -eq 1 ] &&
+    grep -Fxq '  version "1.2.3-rc.1"' "$prerelease_formula" \
+    || fail "prerelease formula does not declare its exact version once"
+grep -Fq 'assert_equal "#{name} #{version}", shell_output("#{bin}/#{name} --version").strip' \
+    "$prerelease_formula" || fail "prerelease formula does not test its exact binary version"
 
 # Reversing target order and changing only every source mtime cannot change
 # any published byte. The packager owns one canonical archive representation.
