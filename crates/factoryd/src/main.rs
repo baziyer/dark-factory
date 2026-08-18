@@ -2,7 +2,7 @@ use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
-    lifecycle::{DaemonInstance, shutdown_signal},
+    lifecycle::{DaemonInstance, ShutdownSignals},
     local_api::{ApiState, serve},
     store::Store,
     webhook_http::{WebhookHttpMetrics, WebhookServer, bind_webhooks, load_webhook_config},
@@ -36,6 +36,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
+    let shutdown = ShutdownSignals::install()?;
     let (listener, socket_cleanup) = instance.bind_socket()?;
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
@@ -87,8 +88,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let control_planes =
-        serve_control_planes(listener, state, execution.clone(), guidance_root, webhooks);
+    let control_planes = serve_control_planes(
+        listener,
+        state,
+        execution.clone(),
+        guidance_root,
+        webhooks,
+        shutdown,
+    );
     tokio::pin!(control_planes);
     let result = tokio::select! {
         result = &mut control_planes => {
@@ -126,6 +133,7 @@ async fn serve_control_planes(
     execution: execution::Handle,
     guidance_root: PathBuf,
     webhooks: Option<WebhookServer>,
+    shutdown: ShutdownSignals,
 ) -> io::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
     let local = serve(
@@ -146,7 +154,7 @@ async fn serve_control_planes(
     }
 
     let completed = tokio::select! {
-        result = shutdown_signal() => Completed::Shutdown(result),
+        () = shutdown.recv() => Completed::Shutdown(Ok(())),
         result = &mut local => Completed::Local(result),
         result = &mut web => Completed::Webhooks(result),
     };
