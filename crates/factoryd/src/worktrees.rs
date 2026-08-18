@@ -59,6 +59,10 @@ pub async fn add(
             .map_err(|error| WorktreeError::Git(format!("directory worker panicked: {error}")))??;
     }
     let target = worktree_dir.to_string_lossy().into_owned();
+    let branch_ref = format!("refs/heads/{branch}");
+    if git_ref_exists(project_root, &branch_ref).await? {
+        return add_existing_branch(project_root, &target, branch).await;
+    }
     let base = if git_ref_exists(project_root, "refs/remotes/origin/HEAD").await? {
         "refs/remotes/origin/HEAD"
     } else if git_ref_exists(project_root, "refs/heads/main").await? {
@@ -80,7 +84,15 @@ pub async fn add(
     if !fresh_stderr.contains("already exists") {
         return Err(WorktreeError::Git(fresh_stderr));
     }
-    let reused = run_git(project_root, &["worktree", "add", &target, branch]).await?;
+    add_existing_branch(project_root, &target, branch).await
+}
+
+async fn add_existing_branch(
+    project_root: &Path,
+    target: &str,
+    branch: &str,
+) -> Result<(), WorktreeError> {
+    let reused = run_git(project_root, &["worktree", "add", target, branch]).await?;
     if reused.status.success() {
         return Ok(());
     }
@@ -339,6 +351,27 @@ mod tests {
             .unwrap();
 
         assert!(worktree_dir.join("README.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn add_reuses_an_existing_branch_without_default_branch_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        git(repo.path(), &["branch", "-m", "trunk"]).await;
+        git(repo.path(), &["branch", "agent/curie"]).await;
+        let worktree_dir = repo.path().join("worktrees").join("curie");
+
+        add(repo.path(), &worktree_dir, "agent/curie")
+            .await
+            .unwrap();
+
+        let branch = run_git(&worktree_dir, &["branch", "--show-current"])
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&branch.stdout).trim(),
+            "agent/curie"
+        );
     }
 
     #[tokio::test]
