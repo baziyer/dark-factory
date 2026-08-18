@@ -28,7 +28,9 @@ axes separate:
 - **Review**: explicit proposed actions whose preconditions are revalidated
   before execution.
 
-The local API is the product boundary. `factory-tui` is the primary operator
+The local API is the boundary for daemon-owned runtime actions. Bootstrap,
+service-lifecycle, and update actions that must work while the daemon is
+absent live in shared Rust library code. `factory-tui` is the primary operator
 client; `factoryctl` provides parity for recovery, diagnostics, scripting,
 and automation. Neither client owns hidden behavior.
 
@@ -40,8 +42,8 @@ and automation. Neither client owns hidden behavior.
   not a same-user authority boundary.
 - Add an optional hardened session runner with a separate OS/container
   boundary (#125). This is distinct from CI runner isolation (#54).
-- Make reviewed operation the explicit fresh-install default while preserving
-  existing installations (#128).
+- Default new factories to reviewed operation while preserving every existing
+  installation's durable setting (#139).
 
 Capability enforcement protects against mistaken or cooperative
 cross-boundary requests. Only the hardened runner can claim protection from a
@@ -50,10 +52,11 @@ the shell tripwire are not substitutes.
 
 ## Gate 2: TUI as the product
 
-- Add TUI-led first-run setup, project planning, doctor/update, budgets, and
-  normal administration (#128).
 - Complete project and agent creation in the TUI through the shared local API
   (#30).
+- Add TUI-led first-run setup, project planning, doctor/update, budgets, and
+  normal administration after the safe default and creation operations exist
+  (#128; depends on #139 and #30).
 - Keep the BUILDING/AGENT operator model focused; validate repository activity
   visualization before adding a new subsystem (#122).
 
@@ -94,8 +97,9 @@ second authority system or group-chat runtime.
 - Split fast contributor feedback from process-sensitive full CI without
   weakening `./scripts/local-ci.sh` as the authoritative gate (#132), alongside
   the concrete E2E fixture cleanup in #28.
-- Split Linux support (#120) into service management, paths/socket semantics,
-  packaging, CI, and provider-validation slices when work begins.
+- Execute the Linux epic (#120) through its existing mergeable slices: CI and
+  runtime parity (#140), paths/socket semantics (#142), systemd lifecycle
+  (#141), release packaging (#143), and provider validation (#144).
 - Consider pinned data-only packs after authority, project specs, and workflow
   versioning are stable. Executable third-party hooks/services wait for a
   deliberate signing and trust model.
