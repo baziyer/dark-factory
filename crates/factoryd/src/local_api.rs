@@ -43,15 +43,59 @@ use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
     guidance::{self, GuidanceError},
+    repository,
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewTask, SessionControlTarget,
-        StoreError, UpdateAgentProfile,
+        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
+        SessionControlTarget, StoreError, UpdateAgentProfile,
     },
 };
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
+
+enum RepositoryRequest {
+    Status,
+    Diff {
+        staged: bool,
+    },
+    Commit {
+        message: String,
+    },
+    Push,
+    PrOpen {
+        title: String,
+        body: String,
+    },
+    PrUpdate {
+        number: u64,
+        title: String,
+        body: String,
+    },
+}
+
+struct RepositoryAudit {
+    project_id: ProjectId,
+    agent_id: factory_core::AgentId,
+    session_id: SessionId,
+    operation: String,
+    phase: String,
+    success: Option<bool>,
+    reference: Option<String>,
+}
+
+impl RepositoryRequest {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Status => "git_status",
+            Self::Diff { .. } => "git_diff",
+            Self::Commit { .. } => "git_commit",
+            Self::Push => "git_push",
+            Self::PrOpen { .. } => "pr_open",
+            Self::PrUpdate { .. } => "pr_update",
+        }
+    }
+}
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
@@ -69,6 +113,7 @@ type LimitedReader = Take<BufReader<OwnedReadHalf>>;
 #[derive(Debug)]
 enum ApiFailure {
     Invalid(String),
+    Unauthorized(String),
     Conflict(String),
     Store(StoreError),
     Internal(String),
@@ -89,6 +134,7 @@ impl ApiFailure {
     fn into_response(self) -> LocalResponse {
         let (code, message) = match self {
             Self::Invalid(message) => (ErrorCode::InvalidRequest, message),
+            Self::Unauthorized(message) => (ErrorCode::Unauthorized, message),
             Self::Conflict(message) => (ErrorCode::Conflict, message),
             Self::Store(StoreError::InvalidEventLimit) => (
                 ErrorCode::InvalidRequest,
@@ -125,6 +171,11 @@ impl ApiFailure {
             Self::Store(StoreError::ProjectNotFound) => {
                 (ErrorCode::NotFound, "project was not found".into())
             }
+            Self::Store(StoreError::RepositoryAuthorityMissing) => (
+                ErrorCode::Conflict,
+                "project repository authority is not configured; set it as the operator first"
+                    .into(),
+            ),
             Self::Store(StoreError::TaskNotFound) => (
                 ErrorCode::NotFound,
                 "task was not found in the project".into(),
@@ -682,6 +733,38 @@ async fn handle_request(
                 },
             })
         }
+        LocalRequest::GitStatus { token } => {
+            repository_request(state, token, RepositoryRequest::Status).await
+        }
+        LocalRequest::GitDiff { token, staged } => {
+            repository_request(state, token, RepositoryRequest::Diff { staged }).await
+        }
+        LocalRequest::GitCommit { token, message } => {
+            repository_request(state, token, RepositoryRequest::Commit { message }).await
+        }
+        LocalRequest::GitPush { token } => {
+            repository_request(state, token, RepositoryRequest::Push).await
+        }
+        LocalRequest::PrOpen { token, title, body } => {
+            repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
+        }
+        LocalRequest::PrUpdate {
+            token,
+            number,
+            title,
+            body,
+        } => {
+            repository_request(
+                state,
+                token,
+                RepositoryRequest::PrUpdate {
+                    number,
+                    title,
+                    body,
+                },
+            )
+            .await
+        }
         LocalRequest::AgentStatus {
             project_id,
             agent_id,
@@ -948,6 +1031,25 @@ async fn handle_request(
             write_guidance_file(guidance_path.clone(), text.clone()).await?;
             Ok(LocalResponse::ProjectGuidanceUpdated {
                 project: local_project_detail(project, text, guidance_path),
+            })
+        }
+        LocalRequest::SetProjectRepositoryAuthority {
+            project_id,
+            remote_url,
+            base_branch,
+        } => {
+            let authority = repository::validate_authority(remote_url, base_branch)
+                .map_err(repository_failure)?;
+            let response_project_id = project_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let event =
+                        store.set_repository_authority(&project_id, &authority, now_ms()?)?;
+                    Ok(((), vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::ProjectRepositoryAuthoritySet {
+                project_id: response_project_id,
             })
         }
         LocalRequest::SendAgentMessage {
@@ -1861,6 +1963,156 @@ mod worktree_status_tests {
                     && worktree.error.as_deref() == Some("fleet git status deadline exceeded")
             })
         }));
+    }
+}
+
+async fn repository_request(
+    state: &ApiState,
+    token: String,
+    request: RepositoryRequest,
+) -> Result<LocalResponse, ApiFailure> {
+    let session = state
+        .with_store(move |store| store.find_session_by_hook_token(&token))
+        .await?
+        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
+    let project_id = session.project_id.clone();
+    let project = state
+        .with_store(move |store| store.get_project(&project_id))
+        .await?;
+    let authority_project_id = session.project_id.clone();
+    let authority = state
+        .with_store(move |store| store.repository_authority(&authority_project_id))
+        .await?;
+    // Reads use immutable snapshots and must not let a slow diff monopolize the
+    // process-wide mutation boundary. Every operation that can change local or
+    // remote state remains serialized until its final revalidation completes.
+    let _slot = match &request {
+        RepositoryRequest::Status | RepositoryRequest::Diff { .. } => None,
+        _ => Some(state.repository_slot().await),
+    };
+    let operation = request.name().to_owned();
+    let returns_reference = matches!(
+        request,
+        RepositoryRequest::Commit { .. }
+            | RepositoryRequest::Push
+            | RepositoryRequest::PrOpen { .. }
+            | RepositoryRequest::PrUpdate { .. }
+    );
+    record_repository_audit(
+        state,
+        RepositoryAudit {
+            project_id: session.project_id.clone(),
+            agent_id: session.agent_id.clone(),
+            session_id: session.id.clone(),
+            operation: operation.clone(),
+            phase: "requested".into(),
+            success: None,
+            reference: None,
+        },
+    )
+    .await?;
+    let audit_project_id = session.project_id.clone();
+    let audit_agent_id = session.agent_id.clone();
+    let audit_session_id = session.id.clone();
+    let result = match repository::Target::validate(session, project, authority).await {
+        Ok(target) => {
+            let command = match request {
+                RepositoryRequest::Status => target.status().await,
+                RepositoryRequest::Diff { staged } => target.diff(staged).await,
+                RepositoryRequest::Commit { message } => target.commit(&message).await,
+                RepositoryRequest::Push => target.push().await,
+                RepositoryRequest::PrOpen { title, body } => target.pr_open(&title, &body).await,
+                RepositoryRequest::PrUpdate {
+                    number,
+                    title,
+                    body,
+                } => target.pr_update(number, &title, &body).await,
+            };
+            (target, command)
+        }
+        Err(error) => {
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: audit_project_id,
+                    agent_id: audit_agent_id,
+                    session_id: audit_session_id,
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(false),
+                    reference: None,
+                },
+            )
+            .await?;
+            return Err(repository_failure(error));
+        }
+    };
+    let (target, command) = result;
+    match command {
+        Ok(output) => {
+            let reference = returns_reference.then(|| output.clone());
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: target.project_id.clone(),
+                    agent_id: target.agent_id.clone(),
+                    session_id: target.session_id.clone(),
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(true),
+                    reference,
+                },
+            )
+            .await?;
+            Ok(LocalResponse::GitOutput { operation, output })
+        }
+        Err(error) => {
+            record_repository_audit(
+                state,
+                RepositoryAudit {
+                    project_id: target.project_id,
+                    agent_id: target.agent_id,
+                    session_id: target.session_id,
+                    operation: operation.clone(),
+                    phase: "finished".into(),
+                    success: Some(false),
+                    reference: None,
+                },
+            )
+            .await?;
+            Err(repository_failure(error))
+        }
+    }
+}
+
+async fn record_repository_audit(
+    state: &ApiState,
+    audit: RepositoryAudit,
+) -> Result<(), ApiFailure> {
+    state
+        .commit_and_publish(move |store| {
+            let event = store.record_repository_operation(NewRepositoryOperation {
+                project_id: audit.project_id,
+                agent_id: audit.agent_id,
+                session_id: audit.session_id,
+                operation: audit.operation,
+                phase: audit.phase,
+                success: audit.success,
+                reference: audit.reference,
+                occurred_at_ms: now_ms()?,
+            })?;
+            Ok(((), vec![event]))
+        })
+        .await?;
+    Ok(())
+}
+
+fn repository_failure(error: repository::Error) -> ApiFailure {
+    match error {
+        repository::Error::Rejected(_) => ApiFailure::Invalid(error.to_string()),
+        repository::Error::Command(_) | repository::Error::Timeout => {
+            ApiFailure::Conflict(error.to_string())
+        }
     }
 }
 
@@ -2794,6 +3046,7 @@ fn is_constraint_error(error: &StoreError) -> bool {
 fn api_failure_to_io(error: ApiFailure) -> io::Error {
     io::Error::other(match error {
         ApiFailure::Invalid(message)
+        | ApiFailure::Unauthorized(message)
         | ApiFailure::Conflict(message)
         | ApiFailure::Internal(message) => message,
         ApiFailure::Store(error) => error.to_string(),
@@ -3166,5 +3419,201 @@ mod deletion_gate_tests {
         execution.end_delete(&agent_id);
         execution.shutdown().await.unwrap();
         join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn repository_api_binds_live_tokens_and_redacts_audit_content() {
+        use std::process::Command;
+        fn git(cwd: &Path, args: &[&str]) {
+            assert!(
+                Command::new("git")
+                    .current_dir(cwd)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let directory = private_tempdir();
+        let repo = directory.path().join("repo");
+        let remote = directory.path().join("remote.git");
+        let work_a = directory.path().join("a");
+        let work_b = directory.path().join("b");
+        git(
+            directory.path(),
+            &["init", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            directory.path(),
+            &["init", "-b", "main", repo.to_str().unwrap()],
+        );
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.invalid"]);
+        std::fs::write(repo.join("README"), "initial\n").unwrap();
+        git(&repo, &["add", "README"]);
+        git(&repo, &["commit", "-m", "initial"]);
+        git(
+            &repo,
+            &["worktree", "add", "-b", "agent/a", work_a.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["worktree", "add", "-b", "agent/b", work_b.to_str().unwrap()],
+        );
+        let project_id = ProjectId::try_from("project").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Project".into(),
+                    root: repo.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        let unconfigured_project_id = ProjectId::try_from("unconfigured-project").unwrap();
+        let unconfigured_root = directory.path().join("unconfigured-repo");
+        std::fs::create_dir(&unconfigured_root).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: unconfigured_project_id.clone(),
+                    name: "Unconfigured project".into(),
+                    root: unconfigured_root.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .set_repository_authority(
+                &project_id,
+                &crate::store::RepositoryAuthority {
+                    remote_url: remote.to_string_lossy().into_owned(),
+                    base_branch: "main".into(),
+                },
+                2,
+            )
+            .unwrap();
+        assert!(
+            store
+                .set_repository_authority(
+                    &project_id,
+                    &crate::store::RepositoryAuthority {
+                        remote_url: "https://github.com/attacker/retarget.git".into(),
+                        base_branch: "attacker".into(),
+                    },
+                    3,
+                )
+                .is_err(),
+            "repository authority must be write-once"
+        );
+        for (name, worktree, token, session) in [
+            ("a", &work_a, "a".repeat(64), "session-a"),
+            ("b", &work_b, "b".repeat(64), "session-b"),
+            ("stale", &work_a, "c".repeat(64), "session-stale"),
+        ] {
+            let agent_id = AgentId::try_from(name).unwrap();
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    3,
+                )
+                .unwrap();
+            store
+                .create_session(
+                    NewSession {
+                        id: SessionId::try_from(session).unwrap(),
+                        project_id: project_id.clone(),
+                        agent_id,
+                        provider: Provider::Shell,
+                        provider_session_id: None,
+                        worktree: worktree.to_string_lossy().into_owned(),
+                        codex_home: None,
+                        hook_token: token,
+                        runner_instance_id: RunnerInstanceId::try_from(format!("runner-{name}"))
+                            .unwrap(),
+                        runner_runtime: format!("/tmp/runner-{name}"),
+                        runner_protocol_version: 1,
+                    },
+                    4,
+                )
+                .unwrap();
+        }
+        store
+            .end_session(
+                &SessionId::try_from("session-stale").unwrap(),
+                Some(0),
+                None,
+                5,
+            )
+            .unwrap();
+        assert!(
+            matches!(
+                store.set_repository_authority(
+                    &unconfigured_project_id,
+                    &crate::store::RepositoryAuthority {
+                        remote_url: "https://github.com/attacker/poison.git".into(),
+                        base_branch: "main".into(),
+                    },
+                    6,
+                ),
+                Err(crate::store::StoreError::RepositoryAuthorityRequiresIdleProject)
+            ),
+            "a live session in project A must block first-write poisoning of project B"
+        );
+        let state = ApiState::new(store);
+        let secret = "PRIVATE_COMMIT_MESSAGE_SENTINEL";
+        std::fs::write(work_a.join("a.txt"), "PRIVATE_DIFF_SENTINEL\n").unwrap();
+        let response = repository_request(
+            &state,
+            "a".repeat(64),
+            RepositoryRequest::Commit {
+                message: secret.into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(response, LocalResponse::GitOutput { ref operation, .. } if operation == "git_commit")
+        );
+        assert!(matches!(
+            repository_request(&state, "c".repeat(64), RepositoryRequest::Status).await,
+            Err(ApiFailure::Unauthorized(_))
+        ));
+        std::fs::write(work_b.join("b.txt"), "b\n").unwrap();
+        repository_request(
+            &state,
+            "b".repeat(64),
+            RepositoryRequest::Commit {
+                message: "B commit".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !work_a.join("b.txt").exists(),
+            "agent B token crossed into agent A worktree"
+        );
+        let events = state
+            .with_store(|store| store.events_after(0, 100))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(!json.contains(secret));
+        assert!(!json.contains("PRIVATE_DIFF_SENTINEL"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, FactoryEvent::RepositoryOperation { .. }))
+                .count(),
+            4
+        );
     }
 }

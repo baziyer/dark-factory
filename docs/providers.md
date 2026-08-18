@@ -28,6 +28,18 @@ questions:
 That's the whole boundary. A provider never touches a PTY, never parses the
 provider's own terminal output, and never owns process lifecycle.
 
+Repository authority is provider-independent too. Provider processes do not
+inherit ambient Git/GitHub token variables or the SSH agent; the runner resets
+Git credential helpers, disables Git SSH and prompting, and hides the
+operator's `gh` configuration. Workers use the session-authenticated
+`factoryctl git ...` and `factoryctl pr ...` daemon capabilities instead. A
+provider adapter must not add a separate remote credential path. This is an
+authority and audit boundary, not OS isolation; #54 tracks the separate runner
+user that supplies that outer wall.
+Repository execution itself never consumes provider or repository config: the
+daemon uses an empty-config temporary gitdir/index and an operator-pinned
+remote/base, with compare-and-swap ref publication.
+
 ## The `Provider` trait
 
 Defined in `crates/factoryd/src/providers/mod.rs`:

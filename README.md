@@ -123,6 +123,19 @@ factoryctl agent message --project my-project --to worker-1 \
 Pause an agent before recovery work. Use `task retry` for failed or cancelled
 tasks. Use each command's `--help` option for its exact arguments.
 
+Before starting any agent session, pin the project's repository authority
+once; later configuration and retarget attempts are rejected:
+
+```sh
+factoryctl project repository set --project my-project \
+  --remote https://github.com/OWNER/REPOSITORY.git --base main
+```
+
+Inside a session, `factoryctl git status|diff|commit|push` and `factoryctl pr
+open|update` authenticate that exact session. They accept no caller-selected
+worktree, branch, remote, force, delete, merge, or release target. Review and
+merge remain independent operator actions.
+
 ## Update
 
 ```sh

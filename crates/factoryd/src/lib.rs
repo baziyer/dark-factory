@@ -7,6 +7,7 @@ pub mod lifecycle;
 pub mod local_api;
 pub mod policy;
 pub mod providers;
+pub mod repository;
 pub mod runner_client;
 pub mod runner_process;
 pub mod store;

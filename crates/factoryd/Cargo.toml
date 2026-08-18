@@ -15,6 +15,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "fmt"] }
@@ -29,7 +30,6 @@ uuid.workspace = true
 # dev-dependency cycle (it never participates in the normal build graph).
 factory-runner = { path = "../factory-runner" }
 factoryctl = { path = "../factoryctl" }
-tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 

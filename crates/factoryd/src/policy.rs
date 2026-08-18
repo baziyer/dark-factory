@@ -30,6 +30,8 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
+    } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
+        Some("repository_authority_operator_only")
     } else if destructive_git(commands.as_deref().unwrap_or_default()) {
         Some("destructive_git")
     } else if recursive_force_delete_outside(commands.as_deref().unwrap_or_default(), worktree) {
@@ -45,6 +47,18 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
         tool_name: tool_name.to_owned(),
         denied_by,
     }
+}
+
+fn changes_repository_authority(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        let Some((program, args)) = resolve_command(words) else {
+            return false;
+        };
+        program == "factoryctl"
+            && args
+                .windows(3)
+                .any(|words| words == ["project", "repository", "set"])
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

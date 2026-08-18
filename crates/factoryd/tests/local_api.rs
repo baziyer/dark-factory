@@ -104,6 +104,30 @@ fn execution_config(directory: &Path, socket: &Path) -> execution::Config {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repository_requests_require_a_live_session_token_and_accept_no_target_ids() {
+    with_server(|socket| async move {
+        let response = request(
+            &socket,
+            LocalRequest::GitPush {
+                token: "not-a-session-token".into(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Unauthorized,
+                    ref message,
+                },
+                ..
+            } if message == "session authentication failed"
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commands_and_live_events_share_the_persisted_cursor() {
     with_server(|socket| async move {
         let project_root = socket.parent().unwrap().join("project");

@@ -496,6 +496,23 @@ pub enum FactoryEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pause_reasons: Vec<crate::status::AgentPauseReason>,
     },
+    /// Request/result audit for a daemon-owned repository operation. This
+    /// deliberately contains neither credentials, commit messages, PR
+    /// bodies, nor diff output.
+    RepositoryOperation {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        session_id: SessionId,
+        operation: String,
+        phase: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        success: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+    RepositoryAuthorityChanged {
+        project_id: ProjectId,
+    },
     ProjectChanged {
         project: ProjectSnapshot,
     },

@@ -383,7 +383,20 @@ fn apply_runner_environment(
     } else {
         command.env("NO_COLOR", "1").env("TERM", "dumb");
     }
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    // Sessions may inspect and edit their worktree, but remote writes belong
+    // to factoryd. Reset credential helpers, disable SSH, hide the operator's
+    // gh configuration, and forbid prompts. The daemon itself does not run
+    // under this environment and retains its normal Git/GitHub identity.
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/usr/bin/false")
+        .env("GIT_SSH_COMMAND", "/usr/bin/false")
+        .env("GIT_CONFIG_COUNT", "2")
+        .env("GIT_CONFIG_KEY_0", "credential.helper")
+        .env("GIT_CONFIG_VALUE_0", "")
+        .env("GIT_CONFIG_KEY_1", "core.sshCommand")
+        .env("GIT_CONFIG_VALUE_1", "/usr/bin/false")
+        .env("GH_CONFIG_DIR", "/dev/null");
 }
 
 /// Prepends `directory` to a `PATH` value, keeping any existing entries
@@ -699,6 +712,23 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(output.lines().any(|line| line == "NO_COLOR=1"));
         assert!(output.lines().any(|line| line == "TERM=dumb"));
         assert!(output.lines().any(|line| line == "GIT_TERMINAL_PROMPT=0"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "GIT_ASKPASS=/usr/bin/false")
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "GIT_SSH_COMMAND=/usr/bin/false")
+        );
+        assert!(
+            output
+                .lines()
+                .any(|line| line == "GIT_CONFIG_KEY_0=credential.helper")
+        );
+        assert!(output.lines().any(|line| line == "GIT_CONFIG_VALUE_0="));
+        assert!(output.lines().any(|line| line == "GH_CONFIG_DIR=/dev/null"));
         assert!(!output.contains("GOOGLE_API_KEY"));
         assert!(!output.contains("OPENAI_API_KEY"));
         assert!(!output.contains("ANTHROPIC_API_KEY"));
