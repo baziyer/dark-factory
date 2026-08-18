@@ -24,7 +24,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 19;
+const SCHEMA_VERSION: i64 = 20;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -117,6 +117,29 @@ pub struct NewAgentMessage {
     pub recipient_agent_id: AgentId,
     pub body: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorEventInput {
+    Task {
+        id: TaskId,
+        project_id: ProjectId,
+        title: String,
+        body: String,
+        priority: i32,
+    },
+    Message {
+        id: MessageId,
+        project_id: ProjectId,
+        recipient_agent_id: AgentId,
+        body: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorEventResult {
+    Accepted { kind: &'static str, id: String },
+    Duplicate { kind: String, id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -506,6 +529,103 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn apply_connector_event(
+        &mut self,
+        endpoint_id: &str,
+        event_id: &str,
+        input: ConnectorEventInput,
+        now_ms: i64,
+    ) -> Result<(ConnectorEventResult, Vec<EventEnvelope>)> {
+        if endpoint_id.is_empty() || event_id.is_empty() || event_id.len() > 128 {
+            return Err(StoreError::InvalidWebhookInput);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = transaction
+            .query_row(
+                "SELECT event_kind, result_id FROM connector_events WHERE endpoint_id = ?1 AND event_id = ?2",
+                params![endpoint_id, event_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((ConnectorEventResult::Duplicate { kind: existing.0, id: existing.1 }, Vec::new()));
+        }
+
+        let (kind, id, event) = match input {
+            ConnectorEventInput::Task {
+                id,
+                project_id,
+                title,
+                body,
+                priority,
+            } => {
+                if title.is_empty() || title.len() > 240 || body.len() > 100_000 {
+                    return Err(StoreError::InvalidWebhookInput);
+                }
+                transaction
+                    .query_row(
+                        "SELECT 1 FROM projects WHERE id = ?1",
+                        [project_id.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .ok_or(StoreError::WebhookProjectNotFound)?;
+                let snapshot = TaskSnapshot {
+                    id: id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    assigned_agent_id: None,
+                    title,
+                    status: TaskStatus::Queued,
+                    priority,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                };
+                transaction.execute(
+                    "INSERT INTO tasks (id, project_id, parent_task_id, assigned_agent_id, title, body, status, priority, created_at_ms, updated_at_ms, incarnation_id) VALUES (?1, ?2, NULL, NULL, ?3, ?4, 'queued', ?5, ?6, ?6, ?7)",
+                    params![id.as_str(), project_id.as_str(), snapshot.title, body, priority, now_ms, Uuid::new_v4().hyphenated().to_string()],
+                )?;
+                let event = FactoryEvent::TaskChanged { task: snapshot };
+                ("task", id.to_string(), Some(event))
+            }
+            ConnectorEventInput::Message {
+                id,
+                project_id,
+                recipient_agent_id,
+                body,
+            } => {
+                validate_agent_message(&body, now_ms)?;
+                load_agent(&transaction, &recipient_agent_id)?
+                    .filter(|agent| agent.snapshot.project_id == project_id)
+                    .ok_or(StoreError::AgentNotFound)?;
+                transaction.execute(
+                    "INSERT INTO agent_messages (id, project_id, sender_agent_id, recipient_agent_id, body, created_at_ms, delivered_at_ms) VALUES (?1, ?2, NULL, ?3, ?4, ?5, NULL)",
+                    params![id.as_str(), project_id.as_str(), recipient_agent_id.as_str(), body, now_ms],
+                )?;
+                ("message", id.to_string(), None)
+            }
+        };
+        transaction.execute(
+            "INSERT INTO connector_events (endpoint_id, event_id, event_kind, result_id, received_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![endpoint_id, event_id, kind, id, now_ms],
+        )?;
+        let events = if let Some(event) = event {
+            let sequence = append_event(&transaction, now_ms, &event)?;
+            vec![EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            }]
+        } else {
+            Vec::new()
+        };
+        transaction.commit()?;
+        Ok((ConnectorEventResult::Accepted { kind, id }, events))
+    }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::from_connection(Connection::open(path)?)
     }
@@ -4726,6 +4846,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0019_repository_authority.sql"))?;
         transaction.pragma_update(None, "user_version", 19)?;
+        transaction.commit()?;
+        current = 19;
+    }
+    if current == 19 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0020_connector_events.sql"))?;
+        transaction.pragma_update(None, "user_version", 20)?;
         transaction.commit()?;
     }
     Ok(())

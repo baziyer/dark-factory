@@ -3,9 +3,111 @@ use factory_core::{
     SessionId, TaskId, TaskStatus,
 };
 use factoryd::store::{
-    NewAgent, NewAgentMessage, NewProject, NewSession, NewTask, Store, StoreError,
-    UpdateAgentProfile,
+    ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
+    NewTask, Store, StoreError, UpdateAgentProfile,
 };
+
+#[test]
+fn connector_event_idempotency_is_atomic_and_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let first_id;
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let input = ConnectorEventInput::Task {
+            id: task_id("connector-one"),
+            project_id: project_id("factory"),
+            title: "Imported".into(),
+            body: "Do it".into(),
+            priority: 0,
+        };
+        let (result, events) = store
+            .apply_connector_event("monitor", "evt-1", input.clone(), 2)
+            .unwrap();
+        let ConnectorEventResult::Accepted { id, .. } = result else {
+            panic!("first event was not accepted")
+        };
+        first_id = id;
+        assert_eq!(events.len(), 1);
+        let (duplicate, events) = store
+            .apply_connector_event("monitor", "evt-1", input, 3)
+            .unwrap();
+        assert_eq!(
+            duplicate,
+            ConnectorEventResult::Duplicate {
+                kind: "task".into(),
+                id: first_id.clone()
+            }
+        );
+        assert!(events.is_empty());
+    }
+    let mut reopened = Store::open(&database).unwrap();
+    let (duplicate, events) = reopened
+        .apply_connector_event(
+            "monitor",
+            "evt-1",
+            ConnectorEventInput::Task {
+                id: task_id("different"),
+                project_id: project_id("factory"),
+                title: "Ignored".into(),
+                body: "Ignored".into(),
+                priority: 0,
+            },
+            4,
+        )
+        .unwrap();
+    assert_eq!(
+        duplicate,
+        ConnectorEventResult::Duplicate {
+            kind: "task".into(),
+            id: first_id
+        }
+    );
+    assert!(events.is_empty());
+}
+
+#[test]
+fn rejected_unknown_connector_target_does_not_consume_event_id() {
+    let mut store = Store::open_in_memory().unwrap();
+    let input = ConnectorEventInput::Task {
+        id: task_id("connector-later"),
+        project_id: project_id("later"),
+        title: "Imported".into(),
+        body: "Do it".into(),
+        priority: 0,
+    };
+    assert!(matches!(
+        store.apply_connector_event("monitor", "evt-later", input.clone(), 1),
+        Err(StoreError::WebhookProjectNotFound)
+    ));
+    store
+        .create_project(
+            NewProject {
+                id: project_id("later"),
+                name: "Later".into(),
+                root: "/work".into(),
+            },
+            2,
+        )
+        .unwrap();
+    assert!(matches!(
+        store
+            .apply_connector_event("monitor", "evt-later", input, 3)
+            .unwrap()
+            .0,
+        ConnectorEventResult::Accepted { .. }
+    ));
+}
 
 fn project_id(value: &str) -> ProjectId {
     ProjectId::try_from(value).unwrap()
