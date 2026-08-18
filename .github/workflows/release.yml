@@ -78,4 +78,4 @@ jobs:
       - name: Publish the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: ./scripts/publish-release.sh "$TAG" "$GITHUB_REPOSITORY" dist/*
+        run: ./scripts/publish-release.sh "$TAG" "$GITHUB_SHA" "$GITHUB_REPOSITORY" dist/*

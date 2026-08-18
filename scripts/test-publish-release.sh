@@ -12,6 +12,8 @@ ln -s "$fake_gh" "$temporary/bin/sleep"
 for name in archive.tar.gz SHA256SUMS latest.json; do
     printf 'fixture %s\n' "$name" >"$temporary/dist/$name"
 done
+expected_commit=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+moved_commit=cccccccccccccccccccccccccccccccccccccccc
 
 fail() {
     echo "publish-release test failed: $*" >&2
@@ -39,12 +41,26 @@ run_publisher() {
     PATH="$temporary/bin:$PATH" \
         FAKE_GH_SCENARIO="$scenario" \
         FAKE_GH_STATE="$state" \
-        "$publisher" v1.2.3-rc.1 example/project "$temporary"/dist/* \
+        FAKE_GH_EXPECTED_COMMIT="$expected_commit" \
+        "$publisher" v1.2.3-rc.1 "$expected_commit" example/project "$temporary"/dist/* \
         >"$stdout" 2>"$stderr"
 }
 
+add_asset() {
+    state=$1
+    path=$2
+    mkdir -p "$state/assets"
+    printf 'sha256:%s\n' "$(shasum -a 256 "$path" | cut -d' ' -f1)" \
+        >"$state/assets/$(basename "$path")"
+}
+
+add_all_assets() {
+    state=$1
+    for path in "$temporary"/dist/*; do add_asset "$state" "$path"; done
+}
+
 # Three create-side 503s are retried. An upload and the final publication then
-# each commit remotely but lose their response; the next state read observes
+# each commit remotely but lose their response; the state read observes
 # success and avoids a duplicate write.
 transient="$temporary/transient"
 mkdir -p "$transient"
@@ -60,8 +76,8 @@ grep -Fq 'release creation received a retryable GitHub response (attempt 3/4)' \
     "$temporary/transient.err" || fail "third 5xx did not report its final backoff"
 grep -Fq -- '--prerelease' "$transient/log" || fail "prerelease flag was not preserved"
 
-# A completed rerun is read-only: no release creation, asset overwrite, or
-# second publication.
+# A completed rerun is read-only, but still revalidates the immutable tag.
+before_api=$(count_log 'api ' "$transient/log")
 before_create=$(count_log 'release create ' "$transient/log")
 before_upload=$(count_log 'release upload ' "$transient/log")
 before_edit=$(count_log 'release edit ' "$transient/log")
@@ -69,6 +85,34 @@ run_publisher normal "$transient" "$temporary/rerun.out" "$temporary/rerun.err"
 assert_equal "$before_create" "$(count_log 'release create ' "$transient/log")" "rerun creates"
 assert_equal "$before_upload" "$(count_log 'release upload ' "$transient/log")" "rerun uploads"
 assert_equal "$before_edit" "$(count_log 'release edit ' "$transient/log")" "rerun publishes"
+[ "$(count_log 'api ' "$transient/log")" -gt "$before_api" ] \
+    || fail "completed rerun did not verify its tag"
+
+# An annotated tag is peeled to the expected workflow commit.
+annotated="$temporary/annotated"
+mkdir -p "$annotated"
+: >"$annotated/tag-kind-annotated"
+run_publisher normal "$annotated" "$temporary/annotated.out" "$temporary/annotated.err"
+grep -Fq "api repos/example/project/git/tags/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" \
+    "$annotated/log" || fail "annotated tag was not peeled"
+
+# Missing and moved tags fail before a release lookup or write.
+for tag_case in absent moved; do
+    tag_state="$temporary/tag-$tag_case"
+    mkdir -p "$tag_state"
+    if [ "$tag_case" = absent ]; then
+        : >"$tag_state/tag-absent"
+    else
+        printf '%s\n' "$moved_commit" >"$tag_state/tag-sha"
+    fi
+    if run_publisher normal "$tag_state" "$temporary/tag-$tag_case.out" "$temporary/tag-$tag_case.err"; then
+        fail "$tag_case tag was accepted"
+    fi
+    assert_equal 0 "$(count_log 'release view ' "$tag_state/log")" "$tag_case tag release reads"
+    assert_equal 0 "$(count_log 'release create ' "$tag_state/log")" "$tag_case tag creates"
+done
+grep -Fq "points to $moved_commit, expected $expected_commit" "$temporary/tag-moved.err" \
+    || fail "moved tag failure was not explained"
 
 # A release left partially populated by an earlier job gets only its missing
 # assets; the existing asset is never clobbered.
@@ -76,8 +120,7 @@ partial="$temporary/partial"
 mkdir -p "$partial/assets"
 : >"$partial/release"
 : >"$partial/published"
-printf 'sha256:%s\n' "$(shasum -a 256 "$temporary/dist/archive.tar.gz" | cut -d' ' -f1)" \
-    >"$partial/assets/archive.tar.gz"
+add_asset "$partial" "$temporary/dist/archive.tar.gz"
 run_publisher normal "$partial" "$temporary/partial.out" "$temporary/partial.err"
 assert_equal 0 "$(count_log 'release create ' "$partial/log")" "partial release creates"
 assert_equal 2 "$(count_log 'release upload ' "$partial/log")" "missing asset uploads"
@@ -97,6 +140,83 @@ fi
 assert_equal 0 "$(count_log 'release upload ' "$mismatch/log")" "mismatch uploads"
 grep -Fq 'already exists with a different SHA-256 digest' "$temporary/mismatch.err" \
     || fail "asset digest mismatch was not explained"
+
+# Any extra remote asset rejects both a draft and a published rerun before a
+# mutation. A release is one exact build, not a superset of one.
+for release_state in draft published; do
+    extra="$temporary/extra-$release_state"
+    mkdir -p "$extra/assets"
+    : >"$extra/release"
+    if [ "$release_state" = published ]; then : >"$extra/published"; fi
+    add_all_assets "$extra"
+    printf 'sha256:wrong-build\n' >"$extra/assets/wrong-build.tar.gz"
+    if run_publisher normal "$extra" "$temporary/extra-$release_state.out" "$temporary/extra-$release_state.err"; then
+        fail "unexpected asset on $release_state release was accepted"
+    fi
+    assert_equal 0 "$(count_log 'release upload ' "$extra/log")" "$release_state extra uploads"
+    assert_equal 0 "$(count_log 'release edit ' "$extra/log")" "$release_state extra edits"
+    grep -Fq 'has unexpected asset: wrong-build.tar.gz' "$temporary/extra-$release_state.err" \
+        || fail "$release_state unexpected asset failure was not explained"
+done
+
+# Immutable release metadata is checked immediately after discovery, before
+# an upload can mutate a release created by a different run.
+wrong_state="$temporary/wrong-state"
+mkdir -p "$wrong_state"
+: >"$wrong_state/release"
+printf '%s\n' false >"$wrong_state/prerelease"
+if run_publisher normal "$wrong_state" "$temporary/wrong-state.out" "$temporary/wrong-state.err"; then
+    fail "incorrect prerelease state was accepted"
+fi
+assert_equal 0 "$(count_log 'release upload ' "$wrong_state/log")" "wrong-state uploads"
+grep -Fq 'has prerelease=false; expected true' "$temporary/wrong-state.err" \
+    || fail "prerelease mismatch was not explained"
+
+setup_failure_state() {
+    operation=$1
+    state=$2
+    mkdir -p "$state/assets"
+    case "$operation" in
+        create) ;;
+        upload) : >"$state/release" ;;
+        edit)
+            : >"$state/release"
+            add_all_assets "$state"
+            ;;
+    esac
+}
+
+# A 422 or lost transport response is always reconciled once. A committed
+# write succeeds without duplication; an uncommitted 422 fails immediately;
+# an uncommitted transport loss is the only case retried.
+for operation in create upload edit; do
+    for response in 422 transport; do
+        for result in commit no-commit; do
+            matrix="$temporary/matrix-$operation-$response-$result"
+            setup_failure_state "$operation" "$matrix"
+            printf '%s\n' "$response-$result" >"$matrix/$operation-failure"
+            expected_success=true
+            expected_attempts=1
+            if [ "$result" = no-commit ] && [ "$response" = 422 ]; then
+                expected_success=false
+            elif [ "$result" = no-commit ]; then
+                expected_attempts=2
+            fi
+            if [ "$operation" = upload ] && [ "$expected_success" = true ]; then
+                expected_attempts=$((expected_attempts + 2))
+            fi
+            if run_publisher normal "$matrix" "$matrix.out" "$matrix.err"; then
+                actual_success=true
+            else
+                actual_success=false
+            fi
+            assert_equal "$expected_success" "$actual_success" "$operation $response $result result"
+            assert_equal "$expected_attempts" \
+                "$(count_log "release $operation " "$matrix/log")" \
+                "$operation $response $result writes"
+        done
+    done
+done
 
 # A non-5xx authentication/permission failure is immediate and clear.
 fatal="$temporary/fatal"

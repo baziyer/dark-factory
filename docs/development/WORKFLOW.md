@@ -194,11 +194,12 @@ them.
    --locked --release`, then `scripts/package-release.sh` produces
    `dark-factory-<tag>-aarch64-apple-darwin.tar.gz` (the four binaries,
    flat), `SHA256SUMS`, and `latest.json`. `scripts/publish-release.sh`
-   creates a draft, uploads only missing assets, and publishes after all
-   three exist. GitHub 5xx responses get four attempts with 2/4/8-second
-   backoff; each retry reads the release first and verifies existing asset
-   digests, so a lost success response resumes without mixing or overwriting
-   build outputs. A tag with a
+   binds the remote tag to the workflow commit, creates a draft, uploads
+   only missing assets, and publishes only when the remote asset names and
+   digests exactly match that build. GitHub 5xx and transport failures get
+   four attempts with 2/4/8-second backoff. After any failed write, the
+   publisher reads the release once and accepts an already-committed exact
+   result; deterministic client errors are not retried. A tag with a
    pre-release suffix (`v0.2.0-rc.1`) is published as a pre-release so
    `releases/latest` keeps pointing at the newest full release. `latest.json`
    is `{version, tag, assets: {<target>: {url,
