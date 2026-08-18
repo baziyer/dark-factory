@@ -18,6 +18,8 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 const STATUS_DEADLINE: Duration = Duration::from_secs(1);
+const MAX_STATUS_HEADER_BYTES: usize = 1024;
+const MAX_STATUS_ERROR_BYTES: usize = 512;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorktreeError {
@@ -174,53 +176,43 @@ async fn status_command(
         Ok(child) => child,
         Err(error) => return failed(format!("could not run git: {error}")),
     };
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_task = tokio::spawn(summarize_status_output(stdout));
+    let stderr_task = tokio::spawn(capture_status_error(stderr));
     let status = match tokio::time::timeout(deadline, child.wait()).await {
         Ok(Ok(status)) => status,
-        Ok(Err(error)) => return failed(format!("could not wait for git: {error}")),
+        Ok(Err(error)) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return failed(format!("could not wait for git: {error}"));
+        }
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             return failed("git status timed out".to_owned());
         }
     };
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-    if let Err(error) = stdout.read_to_end(&mut stdout_bytes).await {
-        return failed(format!("could not read git output: {error}"));
-    }
-    if let Err(error) = stderr.read_to_end(&mut stderr_bytes).await {
-        return failed(format!("could not read git error: {error}"));
-    }
-    let output = std::process::Output {
-        status,
-        stdout: stdout_bytes,
-        stderr: stderr_bytes,
+    let (branch, changed_files) = match stdout_task.await {
+        Ok(Ok(summary)) => summary,
+        Ok(Err(error)) => return failed(format!("could not read git output: {error}")),
+        Err(error) => return failed(format!("git output reader failed: {error}")),
     };
-    if !output.status.success() {
-        return failed(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut branch = None;
-    let mut changed_files = 0u32;
-    for line in text.lines() {
-        if let Some(header) = line.strip_prefix("## ") {
-            // `main...origin/main [ahead 1]`, `HEAD (no branch)`, or
-            // `No commits yet on main`.
-            let name = header.split("...").next().unwrap_or(header).trim();
-            branch = if name.starts_with("HEAD") {
-                None
-            } else {
-                Some(
-                    name.strip_prefix("No commits yet on ")
-                        .unwrap_or(name)
-                        .to_owned(),
-                )
-            };
-        } else if !line.is_empty() {
-            changed_files += 1;
-        }
+    let stderr = match stderr_task.await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(error)) => return failed(format!("could not read git error: {error}")),
+        Err(error) => return failed(format!("git error reader failed: {error}")),
+    };
+    if !status.success() {
+        return failed(stderr);
     }
     WorktreeStatus {
         path,
@@ -229,6 +221,70 @@ async fn status_command(
         dirty: changed_files > 0,
         error: None,
     }
+}
+
+async fn summarize_status_output(
+    mut stdout: tokio::process::ChildStdout,
+) -> std::io::Result<(Option<String>, u32)> {
+    let mut buffer = [0u8; 8192];
+    let mut header = Vec::new();
+    let mut first_line = true;
+    let mut line_nonempty = false;
+    let mut changed_files = 0u32;
+    loop {
+        let read = stdout.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        for &byte in &buffer[..read] {
+            if byte == b'\n' {
+                if first_line {
+                    first_line = false;
+                } else if line_nonempty {
+                    changed_files = changed_files.saturating_add(1);
+                }
+                line_nonempty = false;
+            } else {
+                line_nonempty = true;
+                if first_line && header.len() < MAX_STATUS_HEADER_BYTES {
+                    header.push(byte);
+                }
+            }
+        }
+    }
+    if !first_line && line_nonempty {
+        changed_files = changed_files.saturating_add(1);
+    }
+    let header = String::from_utf8_lossy(&header);
+    let branch = header.strip_prefix("## ").and_then(|header| {
+        let name = header.split("...").next().unwrap_or(header).trim();
+        (!name.starts_with("HEAD")).then(|| {
+            name.strip_prefix("No commits yet on ")
+                .unwrap_or(name)
+                .to_owned()
+        })
+    });
+    Ok((branch, changed_files))
+}
+
+async fn capture_status_error(mut stderr: tokio::process::ChildStderr) -> std::io::Result<String> {
+    let mut captured = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let read = stderr.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_STATUS_ERROR_BYTES.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(remaining)]);
+        truncated |= read > remaining;
+    }
+    let mut text = String::from_utf8_lossy(&captured).trim().to_owned();
+    if truncated {
+        text.push_str("… (truncated)");
+    }
+    Ok(text)
 }
 
 async fn run_git(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -402,6 +458,36 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive, "timed-out git child was not reaped");
+    }
+
+    #[tokio::test]
+    async fn status_drains_large_porcelain_output_without_timing_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("awk");
+        command.arg(
+            "BEGIN { print \"## main\"; for (i = 0; i < 20000; i++) printf \" M file-%d\\n\", i }",
+        );
+
+        let status = status_command(directory.path(), command, Duration::from_secs(2)).await;
+
+        assert_eq!(status.error, None, "{status:?}");
+        assert_eq!(status.branch.as_deref(), Some("main"));
+        assert_eq!(status.changed_files, 20_000);
+        assert!(status.dirty);
+    }
+
+    #[tokio::test]
+    async fn status_drains_but_bounds_a_large_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new("awk");
+        command.arg("BEGIN { for (i = 0; i < 20000; i++) printf \"x\" > \"/dev/stderr\"; exit 1 }");
+
+        let status = status_command(directory.path(), command, Duration::from_secs(2)).await;
+
+        let error = status.error.unwrap();
+        assert!(error.ends_with("… (truncated)"));
+        assert!(error.len() <= MAX_STATUS_ERROR_BYTES + 20);
+        assert!(!status.dirty);
     }
 
     #[tokio::test]
