@@ -38,12 +38,15 @@ operator from their own agents. Concretely:
   permission mode wins for that agent.
 - **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
   tool call reaches an authenticated `PreToolUse` hook. The daemon denies
-  recognizable force-push/branch-delete/reset-hard commands, `rm -rf`
-  targets not literally rooted in the agent worktree, and reads/writes of
+  recognizable force-push/branch-delete/reset-hard commands. It permits
+  `rm -rf` only as a simple, unquoted invocation whose literal normalized
+  targets are inside the agent worktree; changed cwd, shell control flow,
+  expansion, and other ambiguity are denied rather than interpreted. It
+  also denies reads/writes of
   named secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, Codex `auth.json`,
   credentials, and gcloud config). It fails closed if the daemon cannot
-  answer and records each decision as an append-only event. Shell quoting,
-  interpreters, generated scripts, MCP tools, provider bugs, or direct
+  answer and records each decision as an append-only event. This is not a
+  shell parser: interpreters, generated scripts, MCP tools, provider bugs, or direct
   syscalls can evade a string-level hook policy; it does not protect the
   operator from a malicious agent. Worktrees provide collision isolation,
   not filesystem or credential isolation. A separate OS user remains the

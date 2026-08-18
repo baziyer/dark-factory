@@ -210,8 +210,9 @@ new sessions to native prompts, and an explicit per-agent permission mode
 always overrides the factory default. `factoryctl status` reports
 `auto_mode`. Every tool call still passes through the daemon's authenticated
 `PreToolUse` hook: a small deny policy blocks destructive git operations,
-recursive forced deletion outside the agent worktree, and named secret
-paths, and records allow/deny decisions in the durable event ledger. A
+permits recursive forced deletion only for simple literal targets confined
+to the agent worktree, and blocks named secret paths. It records allow/deny
+decisions in the durable event ledger. A
 file-based outbox
 (drained by the next hook) is still the fallback for an agent's own
 `factoryctl task done`/`task blocked`/`agent message` call if the daemon is
