@@ -59,8 +59,10 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board) {
             let spark = board
                 .activity
                 .get(&agent_id)
-                .map(|series| state::braille_sparkline(&series.counts(), 8))
-                .unwrap_or_else(|| "        ".to_owned());
+                .map(|series| {
+                    state::braille_sparkline(&series.counts(), state::ACTIVITY_VISIBLE_BUCKETS)
+                })
+                .unwrap_or_else(|| " ".repeat(state::ACTIVITY_VISIBLE_BUCKETS));
             let assigned: Vec<_> = board
                 .tasks
                 .values()

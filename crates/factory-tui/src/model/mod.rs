@@ -47,6 +47,10 @@ pub const ANNOUNCEMENT_CAPACITY: usize = 500;
 const STATUS_STICKY_MS: i64 = 6_000;
 /// Maximum length of a sticky status/error message in the non-wrapping footer.
 const STATUS_TEXT_MAX_CHARS: usize = 64;
+/// How many recent durable event sequence numbers are retained to prevent replay/live overlap
+/// from counting activity twice. This exceeds the connect-time replay batch while remaining
+/// bounded for a long-running board.
+const EVENT_DEDUPE_CAPACITY: usize = 1_024;
 
 // ---------------------------------------------------------------------------------------------
 // Small enums
@@ -121,6 +125,7 @@ pub struct Board {
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
+    seen_event_sequences: state::RingBuffer<i64>,
 
     pub view: View,
     /// The one agent selection shared by BUILDING and AGENT.
@@ -163,6 +168,7 @@ impl Board {
             messages: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
+            seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             view: View::Building,
             selected_agent: None,
             selected_task: None,
@@ -541,7 +547,8 @@ impl Board {
     // -- ticking --------------------------------------------------------------------------
 
     /// Called on every ~1s tick (and whenever `now_ms` otherwise needs bumping) so elapsed-time
-    /// displays and sparklines keep moving even for idle agents.
+    /// displays and activity series age even for idle agents. The series only gains counts from
+    /// durable events; this time-only path never invents activity.
     pub fn tick(&mut self, now_ms: i64) {
         self.now_ms = now_ms;
         for series in self.activity.values_mut() {
@@ -670,6 +677,9 @@ impl Board {
         // transition at the time.
         let mut last_session_state: HashMap<SessionId, SessionState> = HashMap::new();
         for event in events {
+            if !self.remember_event_sequence(event.sequence) {
+                continue;
+            }
             if let FactoryEvent::AgentDeleted { agent_id, .. } = &event.event {
                 self.activity.remove(agent_id);
             } else if let Some(agent_id) = event_agent(&event.event) {
@@ -690,6 +700,9 @@ impl Board {
     }
 
     pub fn apply_event(&mut self, event: EventEnvelope) {
+        if !self.remember_event_sequence(event.sequence) {
+            return;
+        }
         if let Some(agent_id) = event_agent(&event.event) {
             self.activity
                 .entry(agent_id.clone())
@@ -879,6 +892,21 @@ impl Board {
                 self.selected_task = None;
             }
         }
+    }
+
+    /// Returns false for a recently seen durable event. The event stream's sequence is the
+    /// stable identity shared by connect-time replay and live delivery, so this keeps both the
+    /// activity projection and the ordinary state fold idempotent across their handoff.
+    fn remember_event_sequence(&mut self, sequence: i64) -> bool {
+        if self
+            .seen_event_sequences
+            .iter()
+            .any(|seen| *seen == sequence)
+        {
+            return false;
+        }
+        self.seen_event_sequences.push(sequence);
+        true
     }
 }
 

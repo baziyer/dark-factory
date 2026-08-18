@@ -317,6 +317,14 @@ fn apply_replay_then_a_live_redelivery_of_the_same_event_does_not_duplicate() {
         1,
         "the same event id (sequence) must never announce twice"
     );
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()]
+            .counts()
+            .iter()
+            .sum::<u64>(),
+        1,
+        "the same event id must not inflate the activity signal"
+    );
 }
 
 #[test]
@@ -347,6 +355,40 @@ fn apply_replay_feeds_the_activity_sparkline() {
         counts.iter().sum::<u64>(),
         1,
         "the sparkline's data source must be fed from replayed events too (#70)"
+    );
+}
+
+#[test]
+fn successive_durable_activity_events_are_visible_in_short_horizon_buckets() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let event = |sequence, occurred_at_ms| EventEnvelope {
+        protocol_version: 1,
+        sequence,
+        occurred_at_ms,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    };
+    b.apply_event(event(1, 0));
+    b.apply_event(event(2, 4_999));
+    b.apply_event(event(3, 5_000));
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![2, 1],
+        "durable events should update adjacent five-second buckets immediately"
+    );
+    b.tick(65_000);
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![0],
+        "a silent agent should age out without invented activity"
     );
 }
 

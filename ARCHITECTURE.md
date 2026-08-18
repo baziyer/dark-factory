@@ -124,8 +124,10 @@ catalogue.
    message is a durable write before it wakes the orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals
    repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
-   for elapsed-time labels and activity sparklines while visible; no
-   background animation or state polling is a source of truth.
+   for elapsed-time labels and to age the bounded five-second activity
+   sparklines while visible; durable hook/tool events are the only source of
+   activity counts, with no background animation or state polling as a source
+   of truth.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
