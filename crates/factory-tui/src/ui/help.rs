@@ -1,5 +1,5 @@
-//! The bottom status/help line, and the modal overlays for prompts, pickers, the WORKSHOP task
-//! menu, confirmations, and the `?` help reference — rendered centered over everything else.
+//! The bottom tabs/status/essential-controls line and the modal overlays for prompts, pickers,
+//! the task menu, confirmations, and the `?` help reference.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -8,10 +8,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, ListItem, ListState, Paragraph};
 
 use crate::model::{
-    Board, Connection, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
-    TASK_MENU_ITEMS, TaskMenuState, View,
+    Board, Connection, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind,
+    PromptState, TASK_MENU_ITEMS, TaskMenuState,
 };
-use crate::ui::{self, centered_rect};
+use crate::mouse::{HitMap, Target};
+use crate::ui::{self, centered_rect, render_tabs};
 
 fn connection_badge(board: &Board) -> Span<'static> {
     match board.connection {
@@ -29,28 +30,41 @@ fn connection_badge(board: &Board) -> Span<'static> {
     }
 }
 
-fn view_badge(view: View) -> Span<'static> {
-    Span::styled(
-        format!(" {} ", view.label()),
-        Style::default().fg(Color::Black).bg(Color::Cyan),
-    )
-}
-
-pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
+pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     if area.height == 0 {
         return;
     }
+    const TABS_WIDTH: u16 = 18;
+    const HELP_LABEL: &str = "[? help]";
+    const DETACH_LABEL: &str = "[q detach]";
+    const TYPING_ESCAPE: &str = "Ctrl-] board  ";
+    let typing = board.pane_mode == PaneMode::Typing && board.has_live_pane();
+    let controls = format!(
+        "{}{HELP_LABEL} {DETACH_LABEL}",
+        if typing { TYPING_ESCAPE } else { "" }
+    );
+    let controls_width = u16::try_from(controls.len()).unwrap_or(u16::MAX);
+    let tabs_width = TABS_WIDTH.min(area.width);
+    let remaining = area.width.saturating_sub(tabs_width);
+    let controls_width = controls_width.min(remaining);
+    let status_width = remaining.saturating_sub(controls_width);
+    let tabs_area = Rect::new(area.x, area.y, tabs_width, 1);
+    let status_area = Rect::new(area.x.saturating_add(tabs_width), area.y, status_width, 1);
+    let controls_area = Rect::new(
+        status_area.x.saturating_add(status_width),
+        area.y,
+        controls_width,
+        1,
+    );
+
+    render_tabs(frame, tabs_area, board, hits);
+
     let text_color = if board.status_line_is_error() {
         Color::Red
     } else {
         Color::White
     };
-    let mut spans = vec![
-        connection_badge(board),
-        Span::raw(" "),
-        view_badge(board.view),
-        Span::raw(" "),
-    ];
+    let mut spans = vec![connection_badge(board), Span::raw(" ")];
     if let Some(cap) = board.live_session_cap {
         let live = board.live_session_count();
         spans.push(Span::styled(
@@ -83,7 +97,39 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+    frame.render_widget(
+        Paragraph::new(controls.clone()).style(Style::default().fg(Color::Cyan)),
+        controls_area,
+    );
+
+    let escape_width = if typing { TYPING_ESCAPE.len() } else { 0 };
+    let help_start = u16::try_from(escape_width).unwrap_or(u16::MAX);
+    let help_width = u16::try_from(HELP_LABEL.len()).unwrap_or(u16::MAX);
+    let detach_start = help_start.saturating_add(help_width).saturating_add(1);
+    let detach_width = u16::try_from(DETACH_LABEL.len()).unwrap_or(u16::MAX);
+    if help_start.saturating_add(help_width) <= controls_area.width {
+        hits.add(
+            Rect::new(
+                controls_area.x.saturating_add(help_start),
+                controls_area.y,
+                help_width,
+                1,
+            ),
+            Target::Help,
+        );
+    }
+    if detach_start.saturating_add(detach_width) <= controls_area.width {
+        hits.add(
+            Rect::new(
+                controls_area.x.saturating_add(detach_start),
+                controls_area.y,
+                detach_width,
+                1,
+            ),
+            Target::Detach,
+        );
+    }
 }
 
 pub fn render_overlay(frame: &mut Frame, area: Rect, board: &Board) {
@@ -271,6 +317,7 @@ const HELP_TEXT: &[&str] = &[
     "i/Enter    AGENT: type into the live terminal",
     "Ctrl-]     return terminal input to BOARD mode",
     "z          maximise/restore terminal     PgUp/PgDn scroll",
+    "mouse      click tabs/rows/pane; wheel scrolls terminal history",
     "Space      pause/resume agent            t manage active task",
     "I / M      edit instructions.md / memory.md in $EDITOR",
     "q          detach (quits the client only — never stops the factory)",

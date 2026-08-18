@@ -8,15 +8,16 @@ use ratatui::widgets::Paragraph;
 
 use crate::model::state::{self, AgentState};
 use crate::model::{AttentionTarget, Board, provider_letter};
+use crate::mouse::{HitMap, Target};
 use crate::ui;
 
-pub fn draw(frame: &mut Frame, area: Rect, board: &Board) {
+pub fn draw(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
         .split(area);
-    render_floors(frame, columns[0], board);
-    render_needs_you(frame, columns[1], board);
+    render_floors(frame, columns[0], board, hits);
+    render_needs_you(frame, columns[1], board, hits);
 }
 
 fn state_style(state: AgentState) -> Style {
@@ -29,18 +30,20 @@ fn state_style(state: AgentState) -> Style {
     }
 }
 
-fn render_floors(frame: &mut Frame, area: Rect, board: &Board) {
+fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     let inner = ui::bordered(frame, area, ui::block(" BUILDING "));
     if board.projects.is_empty() {
         ui::dim(frame, inner, "no projects — factoryctl project add");
         return;
     }
     let mut lines = Vec::new();
+    let mut row = 0;
     for project in board.projects_sorted() {
         lines.push(Line::from(Span::styled(
             format!(" {} ", project.name),
             Style::default().add_modifier(Modifier::BOLD),
         )));
+        row += 1;
         for (agent_id, depth) in board.agent_tree(&project.id) {
             let Some(agent) = board.agents.get(&agent_id) else {
                 continue;
@@ -101,12 +104,14 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board) {
                     ui::truncate(current, 28)
                 )),
             ]));
+            hits.add_row(inner, row, Target::Agent(agent_id));
+            row += 1;
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board) {
+fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     let inner = ui::bordered(frame, area, ui::block(" NEEDS YOU — oldest first "));
     let items = board.attention_items();
     if items.is_empty() {
@@ -115,7 +120,9 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board) {
     }
     let lines = items
         .into_iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(row, item)| {
+            hits.add_row(inner, row, Target::Attention(item.target.clone()));
             let inferred = if item.inferred { "~" } else { "" };
             let (selected, label) = match item.target {
                 AttentionTarget::Agent(id) => (
@@ -162,7 +169,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
         terminal
-            .draw(|frame| draw(frame, frame.area(), &board))
+            .draw(|frame| draw(frame, frame.area(), &board, &mut HitMap::default()))
             .unwrap();
         let text = terminal
             .backend()

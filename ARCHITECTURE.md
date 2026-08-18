@@ -127,7 +127,17 @@ catalogue.
    for elapsed-time labels and to age the bounded five-second activity
    sparklines while visible; durable hook/tool events are the only source of
    activity counts, with no background animation or state polling as a source
-   of truth.
+   of truth. Each repaint replaces the complete mouse hit map for footer
+   tabs/help/detach controls, visible rows, and pane
+   geometry; a click is revalidated against current model state before it can
+   select anything.
+   Board hit testing and terminal input are separate routes: only events inside
+   the rendered terminal content, while the pane is in typing mode, are encoded
+   for a child, and only when that child's parsed output has enabled an xterm
+   mouse protocol.
+   If local scrollback is nonzero, a child-bound coordinate event is consumed
+   while resetting to the live tail; forwarding can resume only from a later
+   event after that redraw, so historical coordinates never act on live state.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,

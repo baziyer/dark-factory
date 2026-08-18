@@ -836,3 +836,15 @@ fn a_long_status_message_is_truncated_and_the_hint_stays_intact() {
         "the combined line must be far shorter than the original 500-char message: {line}"
     );
 }
+
+#[test]
+fn normal_footer_status_omits_the_old_action_catalog() {
+    let mut b = board();
+    assert_eq!(b.help_text(), "BOARD");
+
+    b.view = View::Agent;
+    assert_eq!(b.help_text(), "BOARD");
+    for old_action in ["j/k", "Enter", "needs-you", "type"] {
+        assert!(!b.status_line_text().contains(old_action));
+    }
+}

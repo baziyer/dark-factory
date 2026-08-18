@@ -105,6 +105,15 @@ in its terminal. Press `Ctrl-]` to return control to the board. Press `g` to
 jump to the next item in NEEDS YOU. Press `?` for all keys. Press `q` to
 detach. Detaching does not stop any agent.
 
+Mouse navigation uses the same selections as the keyboard: click the footer's
+screen tabs, help/detach controls, visible agent/task/NEEDS YOU rows, or the
+terminal pane. A pane click only focuses it; `Enter` or `i` starts typing.
+Terminal mouse events are kept separate and reach the child only when its own
+output has enabled an xterm mouse protocol; otherwise the wheel scrolls local
+terminal history. If history is visible, the first child-bound coordinate event
+returns to the live screen and is consumed; only a later event against the
+redrawn live frame is forwarded.
+
 For a quick check outside the TUI, use:
 
 ```sh

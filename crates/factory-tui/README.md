@@ -30,6 +30,26 @@ AGENT shows the selected agent. It includes the live terminal, assigned and
 active work, durable messages, and settings. The orchestrator also shows the
 project queue.
 
+## Mouse
+
+Click the BUILDING or AGENT tab in the footer to change screens; the footer also
+has stable help and detach targets while the full action catalog remains in `?`
+help. In BUILDING, click an agent or a visible NEEDS YOU row to select it. In
+AGENT, click a visible queue row to select that task or click the terminal pane
+to focus it; press `Enter` or `i` to start typing, so a navigation click never
+becomes terminal input.
+
+The wheel scrolls terminal history while the child has mouse handling off. If
+the child enables an xterm mouse protocol, terminal mouse events are forwarded
+only while the pane is in TYPING mode and only from inside its content area.
+When local history is visible, the first coordinate event resets to the live
+tail without sending bytes or arming a mouse capture; a later event after the
+redraw may be forwarded.
+
+Tabs, list rows, pane borders, overlays, and unknown screen coordinates are
+always board territory and are never forwarded to the child. All keyboard
+controls below remain available.
+
 ## Main keys
 
 | Key | Action |
