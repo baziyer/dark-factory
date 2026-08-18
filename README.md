@@ -160,7 +160,7 @@ for rollback details. See the
 
 ## Build from source
 
-Rust 1.86 or later is required.
+Rust 1.88 or later is required.
 
 ```sh
 cargo build --release --workspace

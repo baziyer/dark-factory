@@ -19,8 +19,7 @@ pub struct Announcement {
 }
 
 fn clock(at_ms: i64) -> String {
-    // No calendar/timezone crate in the dependency tree (see SPIKE.md's MSRV-pinning care); a
-    // clock readout only needs time-of-day, which is a modulus, not a calendar. Shown in UTC.
+    // This clock needs only UTC time-of-day, so a modulus is enough.
     let ms_of_day = at_ms.rem_euclid(86_400_000);
     let hours = ms_of_day / 3_600_000;
     let minutes = (ms_of_day % 3_600_000) / 60_000;
