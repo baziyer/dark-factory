@@ -289,7 +289,7 @@ fn run(
     let mut mouse_capture = mouse::Capture::default();
     net::spawn_update_check(tx.clone(), now_ms());
 
-    sync_panes(board, panes, socket, debug_log);
+    sync_panes(board, panes, socket, client, tx, debug_log);
     let mut hit_map = draw_board(terminal, board, panes)?;
 
     loop {
@@ -341,7 +341,7 @@ fn run(
             needs_redraw = true;
         }
 
-        if sync_panes(board, panes, socket, debug_log) {
+        if sync_panes(board, panes, socket, client, tx, debug_log) {
             needs_redraw = true;
         }
         sync_agent_context(board, client, tx, &mut context_refresh);
@@ -395,6 +395,8 @@ fn sync_panes(
     board: &mut Board,
     panes: &mut PaneMap,
     socket: &std::path::Path,
+    client: &Client,
+    tx: &mpsc::Sender<NetMsg>,
     debug_log: Option<&std::path::Path>,
 ) -> bool {
     let desired: Vec<SessionId> = board.desired_sessions();
@@ -415,19 +417,26 @@ fn sync_panes(
 
     for session_id in desired {
         if let Some(pane) = panes.get_mut(&session_id) {
+            if let Some(refusal) = pane.attach_refusal() {
+                board.note_attach_refusal(&refusal);
+                if let Some(mut failed) = panes.remove(&session_id) {
+                    failed.kill();
+                }
+                net::spawn_fleet_snapshot(client.clone(), tx.clone());
+                changed = true;
+                continue;
+            }
             let failure = pane.attach_error().or_else(|| {
                 pane.has_exited()
                     .then(|| "terminal connection closed".to_owned())
             });
             if let Some(error) = failure {
                 board.note_local_attach_failure(&session_id, &error);
-                if !board.take_attach_retry(&session_id) {
-                    continue;
-                }
                 if let Some(mut failed) = panes.remove(&session_id) {
                     failed.kill();
                 }
                 changed = true;
+                continue;
             } else {
                 if pane.is_ready() {
                     board.clear_local_attach_failure(&session_id);
@@ -776,7 +785,7 @@ mod main_tests {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
 
-    use factory_core::local::{ErrorCode, LocalResponse, ServerFrame};
+    use factory_core::local::{LocalResponse, ServerFrame};
     use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
     use factoryctl::update::{Asset, Manifest, UpdateCheck};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1011,11 +1020,13 @@ mod main_tests {
         board.view = model::View::Agent;
         board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
         let mut panes = PaneMap::new();
-        sync_panes(&mut board, &mut panes, &socket, None);
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !board.pane_ready && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         }
         assert!(
             board.pane_ready,
@@ -1040,22 +1051,48 @@ mod main_tests {
         let listener = UnixListener::bind(&socket).unwrap();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
-            for attempt in 0..2 {
+            let mut attempt = 0;
+            while attempt < 2 {
                 let (mut attach, _) = listener.accept().unwrap();
                 let mut request = String::new();
                 BufReader::new(attach.try_clone().unwrap())
                     .read_line(&mut request)
                     .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
-                    "attach_terminal"
-                );
+                let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+                if request["request"]["type"] != "attach_terminal" {
+                    let response = match request["request"]["type"].as_str().unwrap() {
+                        "latest_event_sequence" => LocalResponse::EventHead { sequence: 0 },
+                        "list_projects" => LocalResponse::Projects {
+                            projects: Vec::new(),
+                            next_after_id: None,
+                        },
+                        other => panic!("unexpected refresh request: {other}"),
+                    };
+                    serde_json::to_writer(
+                        &mut attach,
+                        &ServerFrame::Response {
+                            protocol_version: PROTOCOL_VERSION,
+                            response,
+                        },
+                    )
+                    .unwrap();
+                    attach.write_all(b"\n").unwrap();
+                    attach.flush().unwrap();
+                    continue;
+                }
                 let frame = if attempt == 0 {
                     ServerFrame::Response {
                         protocol_version: PROTOCOL_VERSION,
-                        response: LocalResponse::Error {
-                            code: ErrorCode::NotFound,
-                            message: "runner temporarily unavailable".into(),
+                        response: LocalResponse::AttachRefused {
+                            refusal: factory_core::local::AttachRefusal {
+                                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                                runner_instance_id: Some(
+                                    factory_core::RunnerInstanceId::try_from("runner-1").unwrap(),
+                                ),
+                                session_state: Some(SessionState::Idle),
+                                reason: factory_core::local::AttachRefusalReason::RunnerUnavailable,
+                            },
                         },
                     }
                 } else {
@@ -1072,6 +1109,7 @@ mod main_tests {
                 if attempt == 1 {
                     release_rx.recv().unwrap();
                 }
+                attempt += 1;
             }
         });
 
@@ -1088,17 +1126,24 @@ mod main_tests {
         board.view = model::View::Agent;
         board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
         let mut panes = PaneMap::new();
-        sync_panes(&mut board, &mut panes, &socket, None);
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while board.attention_items().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         }
         assert_eq!(
             board.attention_items()[0].reason.kind,
             factory_core::status::AttentionReasonKind::ObserverProblem
         );
+        assert!(
+            panes.is_empty(),
+            "refused pane must never remain renderable"
+        );
+        assert!(board.status_line_text().contains("runner unavailable"));
 
         board.apply_fleet_status(factory_core::status::FleetStatus {
             generated_at_ms: 1,
@@ -1114,7 +1159,7 @@ mod main_tests {
         board.tick(1_001);
         while !board.pane_ready && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         }
         assert!(board.pane_ready);
         assert!(board.attention_items().is_empty());

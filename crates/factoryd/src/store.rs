@@ -456,6 +456,8 @@ pub struct NewSession {
 pub struct SessionControlTarget {
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
+    pub state: SessionState,
+    pub ended_at_ms: Option<i64>,
 }
 
 /// Minimal private identity required to resume observing a durable
@@ -2381,13 +2383,16 @@ impl Store {
     ) -> Result<SessionControlTarget> {
         self.connection
             .query_row(
-                "SELECT runner_instance_id, runner_runtime FROM sessions
+                "SELECT runner_instance_id, runner_runtime, state, ended_at_ms FROM sessions
                  WHERE id = ?1 AND project_id = ?2",
                 params![session_id.as_str(), project_id.as_str()],
                 |row| {
+                    let state: String = row.get(2)?;
                     Ok(SessionControlTarget {
                         runner_instance_id: parse_id(row.get(0)?, 0)?,
                         runner_runtime: row.get(1)?,
+                        state: parse_session_state(&state, 2)?,
+                        ended_at_ms: row.get(3)?,
                     })
                 },
             )

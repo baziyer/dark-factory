@@ -3,7 +3,8 @@
 //! next to `keymap()` in `keymap.rs`.
 
 use super::*;
-use crate::test_fixtures::{agent, project, run, session};
+use crate::test_fixtures::{agent, project, run, session, task};
+use factory_core::local::{AttachRefusal, AttachRefusalReason};
 use factory_core::{RunStatus, SessionState};
 
 fn board() -> Board {
@@ -843,4 +844,47 @@ fn normal_footer_status_omits_the_old_action_catalog() {
     for old_action in ["j/k", "Enter", "needs-you", "type"] {
         assert!(!b.status_line_text().contains(old_action));
     }
+}
+
+#[test]
+fn ended_attach_refusal_keeps_task_state_and_disables_retry() {
+    let mut b = board();
+    let session_id = SessionId::try_from("sess-1").unwrap();
+    let agent_id = AgentId::try_from("alice").unwrap();
+    b.apply_fleet_snapshot(
+        vec![project("proj", 0)],
+        vec![agent("alice", "proj", AgentRole::Worker, None)],
+        vec![task(
+            "task-1",
+            "proj",
+            factory_core::TaskStatus::Running,
+            Some("alice"),
+            0,
+        )],
+        Vec::new(),
+        vec![session("sess-1", "alice", "proj", SessionState::Working)],
+    );
+    b.view = View::Agent;
+    b.selected_agent = Some(agent_id);
+
+    b.note_attach_refusal(&AttachRefusal {
+        project_id: ProjectId::try_from("proj").unwrap(),
+        session_id: session_id.clone(),
+        runner_instance_id: None,
+        session_state: Some(SessionState::Stopped),
+        reason: AttachRefusalReason::SessionEnded,
+    });
+
+    assert_eq!(
+        b.tasks[&TaskId::try_from("task-1").unwrap()]
+            .snapshot
+            .status,
+        factory_core::TaskStatus::Running
+    );
+    assert!(b.attach_retry_after.get(&session_id).is_none());
+    assert!(b.attention_items().iter().any(|item| {
+        item.session_id.as_ref() == Some(&session_id)
+            && item.reason.kind == factory_core::status::AttentionReasonKind::ObserverProblem
+    }));
+    assert!(b.status_line_text().contains("session ended"));
 }

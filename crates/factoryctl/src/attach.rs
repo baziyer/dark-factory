@@ -14,7 +14,7 @@ use std::{
 
 use factory_core::{
     AgentId, ProjectId, SessionId,
-    local::{LocalRequest, LocalResponse, ServerFrame},
+    local::{AttachRefusal, AttachRefusalReason, LocalRequest, LocalResponse, ServerFrame},
     runner::{decode_terminal_bytes, encode_terminal_bytes},
 };
 use factoryctl::Client;
@@ -59,7 +59,7 @@ pub fn run(
         AttachTarget::Agent(agent_id) => resolve_agent_session(client, &project_id, agent_id)?,
     };
 
-    let frames = client
+    let mut frames = client
         .attach_terminal(LocalRequest::AttachTerminal {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -67,11 +67,33 @@ pub fn run(
         })
         .map_err(|error| error.to_string())?;
 
+    let first_frame = frames
+        .next()
+        .ok_or_else(|| "daemon closed the attach connection before readiness".to_owned())?;
+    match &first_frame {
+        Ok(ServerFrame::TerminalOutput { .. }) => {}
+        Ok(ServerFrame::Response {
+            response: LocalResponse::AttachRefused { refusal },
+            ..
+        }) => return Err(format_attach_refusal(refusal)),
+        Ok(ServerFrame::Response {
+            response: LocalResponse::Error { message, .. },
+            ..
+        }) => return Err(message.clone()),
+        Ok(_) => return Err("daemon sent an unexpected attach readiness frame".into()),
+        Err(error) => return Err(error.to_string()),
+    }
+
     let raw_mode = RawMode::enable().map_err(|error| error.to_string())?;
 
     let failed = Arc::new(AtomicBool::new(false));
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let output_thread = spawn_output_thread(frames, Arc::clone(&failed), Arc::clone(&failure));
+    let output_thread = spawn_output_thread(
+        Some(first_frame),
+        frames,
+        Arc::clone(&failed),
+        Arc::clone(&failure),
+    );
 
     send_resize(client, &project_id, &session_id);
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
@@ -91,13 +113,14 @@ pub fn run(
 }
 
 fn spawn_output_thread(
+    first_frame: Option<Result<ServerFrame, factoryctl::ClientError>>,
     frames: factoryctl::TerminalFrames,
     done: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
-        for frame in frames {
+        for frame in first_frame.into_iter().chain(frames) {
             match frame {
                 Ok(ServerFrame::TerminalOutput { bytes, .. }) => {
                     match decode_terminal_bytes(&bytes) {
@@ -111,6 +134,13 @@ fn spawn_output_thread(
                             break;
                         }
                     }
+                }
+                Ok(ServerFrame::Response {
+                    response: LocalResponse::AttachRefused { refusal },
+                    ..
+                }) => {
+                    set_failure(&failure, format_attach_refusal(&refusal));
+                    break;
                 }
                 Ok(ServerFrame::Response {
                     response: LocalResponse::Error { message, .. },
@@ -128,6 +158,20 @@ fn spawn_output_thread(
         }
         done.store(true, Ordering::SeqCst);
     })
+}
+
+fn format_attach_refusal(refusal: &AttachRefusal) -> String {
+    let reason = match refusal.reason {
+        AttachRefusalReason::SessionNotFound => "session no longer exists",
+        AttachRefusalReason::SessionEnded => "session has ended",
+        AttachRefusalReason::RunnerRejected => "runner rejected terminal attach",
+        AttachRefusalReason::RunnerReplaced => "runner was replaced before attach",
+        AttachRefusalReason::RunnerUnavailable => "runner is unavailable",
+    };
+    format!(
+        "cannot attach session {} ({}); task/session state was not changed",
+        refusal.session_id, reason
+    )
 }
 
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {

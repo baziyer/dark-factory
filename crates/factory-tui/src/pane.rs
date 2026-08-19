@@ -19,7 +19,7 @@ use portable_pty::{
 // version tui-term was built against (see the Cargo.toml comment on this crate's dependencies).
 use tui_term::vt100;
 
-use factory_core::local::{LocalRequest, ServerFrame};
+use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
 use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
 use factory_core::{ProjectId, SessionId};
 
@@ -54,6 +54,7 @@ enum Backend {
         resize_tx: mpsc::Sender<(u16, u16)>,
         disconnected: Arc<AtomicBool>,
         attached: Arc<AtomicBool>,
+        attach_refusal: Arc<Mutex<Option<AttachRefusal>>>,
         attach_error: Arc<Mutex<Option<String>>>,
     },
 }
@@ -165,6 +166,7 @@ impl Pane {
         let dirty = Arc::new(AtomicBool::new(true));
         let disconnected = Arc::new(AtomicBool::new(false));
         let attached = Arc::new(AtomicBool::new(false));
+        let attach_refusal = Arc::new(Mutex::new(None));
         let attach_error = Arc::new(Mutex::new(None));
 
         spawn_attach_reader_thread(
@@ -173,6 +175,7 @@ impl Pane {
             Arc::clone(&dirty),
             Arc::clone(&disconnected),
             Arc::clone(&attached),
+            Arc::clone(&attach_refusal),
             Arc::clone(&attach_error),
         );
 
@@ -202,6 +205,7 @@ impl Pane {
                 resize_tx,
                 disconnected,
                 attached,
+                attach_refusal,
                 attach_error,
             },
         })
@@ -332,6 +336,18 @@ impl Pane {
         }
     }
 
+    /// The daemon's typed refusal, if the selected session lost attachability during the
+    /// handshake. The render loop removes that pane before it can show an empty exited terminal.
+    #[must_use]
+    pub fn attach_refusal(&self) -> Option<AttachRefusal> {
+        match &self.backend {
+            Backend::LocalPty { .. } => None,
+            Backend::Daemon { attach_refusal, .. } => {
+                attach_refusal.lock().ok().and_then(|guard| guard.clone())
+            }
+        }
+    }
+
     #[must_use]
     pub fn is_ready(&self) -> bool {
         match &self.backend {
@@ -455,6 +471,7 @@ fn spawn_attach_reader_thread(
     dirty: Arc<AtomicBool>,
     disconnected: Arc<AtomicBool>,
     attached: Arc<AtomicBool>,
+    attach_refusal: Arc<Mutex<Option<AttachRefusal>>>,
     attach_error: Arc<Mutex<Option<String>>>,
 ) {
     std::thread::spawn(move || {
@@ -474,14 +491,21 @@ fn spawn_attach_reader_thread(
                         }
                     }
                 },
-                ServerFrame::Response { response, .. } => {
-                    if let factory_core::local::LocalResponse::Error { message, .. } = response {
+                ServerFrame::Response { response, .. } => match response {
+                    factory_core::local::LocalResponse::AttachRefused { refusal } => {
+                        if let Ok(mut guard) = attach_refusal.lock() {
+                            *guard = Some(refusal);
+                        }
+                        return false;
+                    }
+                    factory_core::local::LocalResponse::Error { message, .. } => {
                         if let Ok(mut guard) = attach_error.lock() {
                             *guard = Some(message);
                         }
                         return false;
                     }
-                }
+                    _ => {}
+                },
                 ServerFrame::Event { .. } => {}
             }
             true

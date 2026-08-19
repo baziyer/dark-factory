@@ -24,7 +24,9 @@ pub mod state;
 
 use std::collections::{BTreeMap, HashMap};
 
-use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
+use factory_core::local::{
+    AgentDetail, AgentMessage, AttachRefusal, AttachRefusalReason, ErrorCode, LocalResponse,
+};
 use factory_core::status::{
     AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, display_text,
 };
@@ -464,12 +466,45 @@ impl Board {
     /// `factoryd`; this covers the only case it cannot record because the TUI
     /// could not reach it at all.
     pub fn note_local_attach_failure(&mut self, session_id: &SessionId, error: &str) {
+        self.note_attach_failure(session_id, error, true);
+    }
+
+    /// Folds the daemon's typed refusal into the board without changing task or session state.
+    /// Ended/missing sessions are not retried: refreshing the durable fleet is their recovery.
+    /// Runner replacement/unavailability may recover in place, so those retain the bounded retry.
+    pub fn note_attach_refusal(&mut self, refusal: &AttachRefusal) {
+        let message = match refusal.reason {
+            AttachRefusalReason::SessionNotFound => {
+                "terminal unavailable: session no longer exists; state refreshed"
+            }
+            AttachRefusalReason::SessionEnded => {
+                "terminal unavailable: session ended; task state unchanged"
+            }
+            AttachRefusalReason::RunnerRejected => {
+                "terminal unavailable: runner rejected attach; state refreshed"
+            }
+            AttachRefusalReason::RunnerReplaced => {
+                "terminal unavailable: runner replaced; retrying after refresh"
+            }
+            AttachRefusalReason::RunnerUnavailable => {
+                "terminal unavailable: runner unavailable; retrying after refresh"
+            }
+        };
+        self.note_attach_failure(&refusal.session_id, message, refusal.reason.retryable());
+        self.note_error(message);
+    }
+
+    fn note_attach_failure(&mut self, session_id: &SessionId, error: &str, retry: bool) {
         let Some(session) = self.sessions.get(session_id) else {
             return;
         };
-        self.attach_retry_after
-            .entry(session_id.clone())
-            .or_insert(self.now_ms.saturating_add(1_000));
+        if retry {
+            self.attach_retry_after
+                .entry(session_id.clone())
+                .or_insert(self.now_ms.saturating_add(1_000));
+        } else {
+            self.attach_retry_after.remove(session_id);
+        }
         if self.local_attention.contains_key(session_id) {
             return;
         }

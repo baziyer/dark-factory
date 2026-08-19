@@ -145,7 +145,10 @@ bounded attention reason, its task/session/age, and a safe next action.
 one agent. Terminal attach failures are durable observer problems in that same
 projection and disappear after a successful reattach without erasing an
 independent provider question, permission, or delivery wait. Use `--json` when a
-script needs the complete protocol frame.
+script needs the complete protocol frame. If a runner ends, is replaced, or
+refuses the attach during the selection race, AGENT keeps the board visible,
+reports the session/runner state in one concise message, and refreshes durable
+fleet state; it never presents an empty exited pane.
 
 You can answer an agent in its terminal or send a durable message:
 

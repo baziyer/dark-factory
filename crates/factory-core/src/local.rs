@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, SessionId, SessionSnapshot,
-    TaskDetail, TaskId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, RunnerInstanceId, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -507,6 +507,43 @@ pub enum LocalRequest {
     },
 }
 
+/// Why the daemon refused a terminal attach after resolving the requested session.
+///
+/// This is deliberately finite: clients can choose a safe recovery action without parsing
+/// runner or store error text, while the accompanying identities explain which stale selection
+/// lost the race.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachRefusalReason {
+    SessionNotFound,
+    SessionEnded,
+    RunnerRejected,
+    RunnerReplaced,
+    RunnerUnavailable,
+}
+
+impl AttachRefusalReason {
+    #[must_use]
+    pub const fn retryable(self) -> bool {
+        matches!(self, Self::RunnerReplaced | Self::RunnerUnavailable)
+    }
+}
+
+/// Typed, bounded attach refusal returned on the terminal-proxy connection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttachRefusal {
+    pub project_id: ProjectId,
+    /// The session selected by the client. When the session still exists, this is also the
+    /// current session identity the daemon checked.
+    pub session_id: SessionId,
+    /// The runner identity reserved by that session, when the session row still exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_instance_id: Option<RunnerInstanceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<SessionState>,
+    pub reason: AttachRefusalReason,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -600,6 +637,9 @@ pub enum LocalResponse {
     },
     RunTerminal {
         terminal: RunTerminal,
+    },
+    AttachRefused {
+        refusal: AttachRefusal,
     },
     AgentCreated {
         agent: AgentSnapshot,

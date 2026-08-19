@@ -1,10 +1,11 @@
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, SessionId, SessionSnapshot, SessionState,
-    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunnerInstanceId, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
-        AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
-        MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
+        AgentDetail, AgentMessage, AgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
+        LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope,
+        RunTerminal, ServerFrame,
     },
 };
 
@@ -773,6 +774,28 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
                 "bytes": ""
             }
         })
+    );
+}
+
+#[test]
+fn attach_refusal_is_a_bounded_typed_frame_with_session_and_runner_identity() {
+    let response = LocalResponse::AttachRefused {
+        refusal: AttachRefusal {
+            project_id: project_id("project-1"),
+            session_id: session_id("session-1"),
+            runner_instance_id: Some(RunnerInstanceId::try_from("runner-1").unwrap()),
+            session_state: Some(SessionState::Idle),
+            reason: AttachRefusalReason::RunnerReplaced,
+        },
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "attach_refused");
+    assert_eq!(value["data"]["refusal"]["reason"], "runner_replaced");
+    assert_eq!(value["data"]["refusal"]["session_id"], "session-1");
+    assert_eq!(value["data"]["refusal"]["runner_instance_id"], "runner-1");
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(value).unwrap(),
+        response
     );
 }
 
