@@ -5,20 +5,22 @@
 1. `./scripts/new-worktree.sh <slug>` — one worktree per task, never work
    directly on `main`.
 2. Build and iterate: `cargo build --workspace`.
-3. Before opening a PR: `./scripts/local-ci.sh` (fmt, clippy at
+3. Before opening a PR: `./scripts/local-ci.sh` on macOS, or
+   `./scripts/local-ci.sh --linux-source` on Ubuntu (fmt, clippy at
    `-D warnings`, the full test suite, `git diff --check`) — this is the
-   authoritative gate; CI runs the exact same script (see "CI and GitHub"
-   below).
+   authoritative source gate. macOS additionally runs its release-source,
+   publisher, and package fixtures; Linux source preview deliberately does
+   not claim archive support (see "CI and GitHub" below).
 
-`local-ci.sh` takes a repository-common-directory kernel lease before running
-any release probe, compiler, or test. This serializes linked worktrees while
-leaving independent clones independent. Acquisition first creates the lock
-object as an atomic directory; symlinked, substituted, or otherwise
-unverifiable objects fail closed rather than letting contenders lock different
-inodes. The child obtains the `lockf` descriptor before publishing its
-`.starting` marker, then inherits that descriptor into the owned command, so
-no live starter can race stale-marker recovery and a killed wrapper cannot
-release the gate while an owned descendant remains. A second invocation waits
+The default macOS `local-ci.sh` path takes a repository-common-directory kernel
+lease before running any release probe, compiler, or test. This serializes
+linked worktrees while leaving independent clones independent. Acquisition
+first creates the lock object as an atomic directory; symlinked, substituted,
+or otherwise unverifiable objects fail closed rather than letting contenders
+lock different inodes. The child obtains the `lockf` descriptor before
+publishing its `.starting` marker, then inherits that descriptor into the owned
+command, so no live starter can race stale-marker recovery and a killed wrapper
+cannot release the gate while an owned descendant remains. A second invocation waits
 and prints
 one bounded, field-validated owner record (PID, exact head, worktree, start
 time, lock identity, and safe agent/task labels); set
@@ -36,7 +38,9 @@ must not bypass it. The focused lease checks run as the first step inside the
 authoritative gate. The CI workflow's `always()` step-summary writer is
 reporting-only and runs after that single gate command; it does not invoke,
 bypass, or release the lease. The summary contract is checked by
-`local-ci.sh` while the lease is held.
+`local-ci.sh` while the lease is held. The Ubuntu `--linux-source` preview skips
+this macOS-specific lease harness and its release fixtures; GitHub runs that
+mode in an isolated hosted job.
 4. Push the branch, open a PR (the template carries the review checklist).
 5. **Adversarial review before merge**: a second agent or person reads the
    diff cold and tries to break it — correctness, missed simplification,
@@ -117,9 +121,14 @@ cargo +1.88.0 build --workspace
 The smoke always creates a throwaway `DARK_FACTORY_HOME` and socket. It starts
 the source-built `factoryd`, checks socket mode and health with `factoryctl`,
 launches `factory-tui --version`, and completes a task through the
-deterministic shell provider. The full workspace suite supplies the deeper
-PTY attach/detach, task completion/blocking, process-group cleanup, and daemon
-restart-recovery evidence.
+deterministic shell provider. Before daemon shutdown, it stops the exact
+resident session through `factoryctl session stop`, waits with a finite bound
+for the session and its exact runner descendants to exit, verifies the socket
+is gone, and only then removes the scratch home. Its interrupted-cleanup
+regression runs the same owned teardown after deliberate failure and proves no
+scratch home remains. The full workspace suite supplies the deeper PTY
+attach/detach, task completion/blocking, process-group cleanup, and
+daemon-restart recovery evidence.
 
 This preview does not claim a Linux archive, installer, systemd integration,
 or real-provider support. Claude Code and Codex are explicitly **unverified on
@@ -130,8 +139,11 @@ authoritative on both platforms.
 
 ## CI and GitHub
 
-`.github/workflows/ci.yml` runs `./scripts/local-ci.sh` — nothing else —
-as one job, `checks`, on every pull request and every push to `main`.
+`.github/workflows/ci.yml` runs the macOS source gate as one job, `checks`, on
+every pull request and every push to `main`; its Ubuntu preview job invokes
+the shared Rust gate with `--linux-source`, the source smoke, and its bounded
+interrupted-teardown regression. Linux does not invoke the macOS
+release-source, publisher, or package fixtures.
 
 **Going public is one step**: flip the repository, then immediately run
 `scripts/github-repo-settings.sh` — the rulesets, the security features,

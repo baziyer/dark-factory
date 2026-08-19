@@ -208,7 +208,8 @@ target/release/factoryctl init
 ```
 
 Contributors must follow [AGENTS.md](AGENTS.md) and run
-`./scripts/local-ci.sh` before they open a pull request.
+`./scripts/local-ci.sh` on macOS, or `./scripts/local-ci.sh --linux-source`
+on Ubuntu, before they open a pull request.
 
 ### Linux contributor preview
 
@@ -223,6 +224,11 @@ cargo +1.88.0 build --workspace
 The smoke uses a throwaway `DARK_FACTORY_HOME`, starts the source-built
 `factoryd`, checks the private local socket, invokes `factoryctl` and
 `factory-tui --version`, and completes one deterministic shell-provider task.
+It then stops the exact resident session through `factoryctl`, proves its
+runner descendants exit within a finite bound, shuts down the scratch daemon,
+and removes the home only after the private socket is gone. An interrupted
+cleanup regression exercises the same path and proves the scratch home is
+removed without scanning or signaling unrelated processes.
 The workspace tests additionally cover PTY attach/detach, process-group
 cleanup, and daemon-restart recovery. Claude Code and Codex are not validated
 by this preview and must not be treated as supported Linux providers yet.
