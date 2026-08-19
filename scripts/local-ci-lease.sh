@@ -424,7 +424,7 @@ local_ci_lease_run() {
     # command descendant's lease.
     (
         local_ci_lease_enter_lock_object || exit 1
-        lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c '
+        exec lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c '
         set -eu
         helper=$1
         common_dir=$2
