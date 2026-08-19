@@ -6,7 +6,342 @@ use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
     NewTask, Store, StoreError, UpdateAgentProfile,
 };
-use std::sync::{Arc, Barrier};
+use rusqlite::Connection;
+use std::{
+    cell::RefCell,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc, Barrier, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+    time::Duration,
+};
+
+const CHILD_MODE: &str = "DARK_FACTORY_STORE_RACE_CHILD";
+const CHILD_TRACE: &str = "DARK_FACTORY_STORE_RACE_TRACE";
+const CHILD_TIMEOUT: Duration = Duration::from_secs(5);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+const OVERLAP_TIMEOUT: Duration = Duration::from_secs(10);
+
+thread_local! {
+    static SQLITE_BUSY_PROBE: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+}
+
+type StoreSetup = Box<dyn FnOnce() -> Result<Store, String> + Send>;
+type StoreRaceOperation = Box<dyn FnOnce(Store, usize) -> Result<String, String> + Send>;
+
+#[derive(Clone)]
+struct RaceTrace {
+    path: Arc<std::path::PathBuf>,
+}
+
+impl RaceTrace {
+    fn new(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            path: Arc::new(path.into()),
+        }
+    }
+
+    fn record(&self, phase: &str) {
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&*self.path)
+        else {
+            return;
+        };
+        let _ = writeln!(file, "{phase}");
+    }
+}
+
+#[derive(Debug)]
+enum ParticipantOutcome {
+    SetupFailed(String),
+    Cancelled,
+    Completed(Result<String, String>),
+}
+
+enum SetupMessage {
+    Ready(usize),
+    Failed(usize, String),
+}
+
+#[derive(Clone, Copy)]
+enum Admission {
+    Pending,
+    Run,
+    Cancel,
+}
+
+fn run_two_party_race(
+    database: &Path,
+    setup: [StoreSetup; 2],
+    operations: [StoreRaceOperation; 2],
+    trace: RaceTrace,
+) -> Vec<ParticipantOutcome> {
+    let (setup_tx, setup_rx) = mpsc::channel();
+    let busy_probes = Arc::new([Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))]);
+    let admission = Arc::new((Mutex::new(Admission::Pending), Condvar::new()));
+    let barrier = Arc::new(Barrier::new(2));
+    thread::scope(|scope| {
+        let handles = setup
+            .into_iter()
+            .zip(operations)
+            .enumerate()
+            .map(|(index, (open, operation))| {
+                let setup_tx = setup_tx.clone();
+                let admission = Arc::clone(&admission);
+                let barrier = Arc::clone(&barrier);
+                let trace = trace.clone();
+                let database = database.to_owned();
+                let busy_probes = Arc::clone(&busy_probes);
+                scope.spawn(move || {
+                    trace.record(&format!("participant-{index}:setup-start"));
+                    let store = match open() {
+                        Ok(store) => store,
+                        Err(error) => {
+                            trace.record(&format!("participant-{index}:setup-failed:{error}"));
+                            setup_tx
+                                .send(SetupMessage::Failed(index, error.clone()))
+                                .unwrap();
+                            return ParticipantOutcome::SetupFailed(error);
+                        }
+                    };
+                    trace.record(&format!("participant-{index}:setup-ready"));
+                    setup_tx.send(SetupMessage::Ready(index)).unwrap();
+
+                    let (state, wake) = &*admission;
+                    let mut state = state.lock().unwrap();
+                    while matches!(*state, Admission::Pending) {
+                        state = wake.wait(state).unwrap();
+                    }
+                    if matches!(*state, Admission::Cancel) {
+                        trace.record(&format!("participant-{index}:cancelled"));
+                        return ParticipantOutcome::Cancelled;
+                    }
+                    drop(state);
+
+                    trace.record(&format!("participant-{index}:admitted"));
+                    barrier.wait();
+                    trace.record(&format!("participant-{index}:sqlite-probe-start"));
+                    if let Err(error) = sqlite_overlap_probe(&database, index, &busy_probes) {
+                        trace.record(&format!("participant-{index}:sqlite-probe-failed:{error}"));
+                        return ParticipantOutcome::Completed(Err(error));
+                    }
+                    trace.record(&format!("participant-{index}:operation-start"));
+                    let result = operation(store, index);
+                    trace.record(&format!("participant-{index}:operation-finished"));
+                    ParticipantOutcome::Completed(result)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        drop(setup_tx);
+        let mut failed = false;
+        for _ in 0..2 {
+            match setup_rx.recv_timeout(SETUP_TIMEOUT).unwrap() {
+                SetupMessage::Ready(index) => trace.record(&format!("parent:ready:{index}")),
+                SetupMessage::Failed(index, error) => {
+                    failed = true;
+                    trace.record(&format!("parent:failed:{index}:{error}"));
+                }
+            }
+        }
+
+        let mut lock_holder = None;
+        if !failed {
+            let connection = Connection::open(database).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            trace.record("parent:lock-held");
+            lock_holder = Some(connection);
+        }
+        let (state, wake) = &*admission;
+        *state.lock().unwrap() = if failed {
+            trace.record("parent:cancel");
+            Admission::Cancel
+        } else {
+            trace.record("parent:run");
+            Admission::Run
+        };
+        wake.notify_all();
+
+        if let Some(lock_holder) = lock_holder {
+            let deadline = std::time::Instant::now() + OVERLAP_TIMEOUT;
+            while busy_probes
+                .iter()
+                .any(|probe| probe.load(Ordering::SeqCst) == 0)
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "SQLite overlap probe timed out; phases: {}",
+                    fs::read_to_string(&*trace.path).unwrap_or_default()
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            trace.record("parent:sqlite-attempts:2");
+            drop(lock_holder);
+            trace.record("parent:lock-released");
+        }
+
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn sqlite_overlap_probe(
+    database: &Path,
+    index: usize,
+    busy_probes: &Arc<[Arc<AtomicUsize>; 2]>,
+) -> Result<(), String> {
+    let connection = Connection::open(database).map_err(|error| error.to_string())?;
+    SQLITE_BUSY_PROBE.with(|probe| {
+        *probe.borrow_mut() = Some(Arc::clone(&busy_probes[index]));
+    });
+    connection
+        .busy_handler(Some(sqlite_overlap_busy_handler))
+        .map_err(|error| error.to_string())?;
+    let result = connection
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK;")
+        .map_err(|error| error.to_string());
+    SQLITE_BUSY_PROBE.with(|probe| {
+        probe.borrow_mut().take();
+    });
+    result
+}
+
+fn sqlite_overlap_busy_handler(_: i32) -> bool {
+    SQLITE_BUSY_PROBE.with(|probe| {
+        if let Some(counter) = probe.borrow().as_ref() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    true
+}
+
+fn connector_race_operation(mut store: Store, index: usize) -> Result<String, String> {
+    let variant = u8::try_from(index + 1).unwrap();
+    let result = store.apply_connector_event(
+        "monitor",
+        "evt-race",
+        [variant; 32],
+        ConnectorEventInput::Task {
+            id: task_id(&format!("connector-{variant}")),
+            project_id: project_id("factory"),
+            title: format!("Imported {variant}"),
+            body: format!("Payload {variant}"),
+            priority: 0,
+        },
+        i64::from(variant) + 1,
+    );
+    match result {
+        Ok((ConnectorEventResult::Accepted { .. }, _)) => Ok("accepted".into()),
+        Ok((ConnectorEventResult::Duplicate { .. }, _)) => Ok("duplicate".into()),
+        Err(StoreError::ConnectorEventPayloadMismatch) => Ok("mismatch".into()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn tool_observation_race_operation(mut store: Store, index: usize) -> Result<String, String> {
+    let denied = store
+        .observe_tool_call(
+            &project_id("factory"),
+            &agent_id("worker"),
+            4 + i64::try_from(index).unwrap(),
+        )
+        .map_err(|error| error.to_string())?
+        .1;
+    Ok(denied.to_string())
+}
+
+fn wait_for_child(mut child: Child, trace: &Path) -> Output {
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + CHILD_TIMEOUT;
+    loop {
+        match child.try_wait().unwrap() {
+            Some(_) => return child.wait_with_output().unwrap(),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                let phases = fs::read_to_string(trace).unwrap_or_else(|error| error.to_string());
+                panic!(
+                    "store race child {pid} timed out after {CHILD_TIMEOUT:?}; phases: {phases}; stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
+#[test]
+fn concurrent_store_setup_failure_is_reported_before_barrier_admission() {
+    if std::env::var_os(CHILD_MODE).is_some() {
+        let trace_path = std::env::var_os(CHILD_TRACE).expect("child trace path");
+        let trace = RaceTrace::new(trace_path);
+        let directory = tempfile::tempdir().unwrap();
+        let valid_database = directory.path().join("valid.db");
+        let invalid_database = directory.path().join("missing").join("factory.db");
+        let setup: [StoreSetup; 2] = [
+            Box::new({
+                let valid_database = valid_database.clone();
+                move || Store::open(valid_database).map_err(|error| error.to_string())
+            }),
+            Box::new(move || Store::open(invalid_database).map_err(|error| error.to_string())),
+        ];
+        let operations: [StoreRaceOperation; 2] = [
+            Box::new(|_, _| Ok("not-run".into())),
+            Box::new(|_, _| Ok("not-run".into())),
+        ];
+        let outcomes = run_two_party_race(&valid_database, setup, operations, trace);
+        assert!(matches!(outcomes[0], ParticipantOutcome::Cancelled));
+        assert!(matches!(
+            &outcomes[1],
+            ParticipantOutcome::SetupFailed(error) if error.contains("SQLite error")
+        ));
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let trace = directory.path().join("store-race.trace");
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "concurrent_store_setup_failure_is_reported_before_barrier_admission",
+            "--nocapture",
+        ])
+        .env(CHILD_MODE, "1")
+        .env(CHILD_TRACE, &trace)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    let output = wait_for_child(child, &trace);
+    assert!(
+        output.status.success(),
+        "store race child {child_pid} failed: stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let phases = fs::read_to_string(trace).unwrap();
+    assert!(phases.contains("parent:cancel"), "phases: {phases}");
+    assert!(
+        phases.contains("participant-0:cancelled"),
+        "phases: {phases}"
+    );
+    assert!(
+        phases.contains("participant-1:setup-failed"),
+        "phases: {phases}"
+    );
+}
 
 #[test]
 fn connector_event_idempotency_is_atomic_and_survives_restart() {
@@ -143,42 +478,35 @@ fn concurrent_mismatched_connector_events_keep_the_first_payload_only() {
         .unwrap();
     drop(setup);
 
-    let barrier = Arc::new(Barrier::new(2));
-    let results = std::thread::scope(|scope| {
-        let handles = [1_u8, 2_u8].map(|variant| {
-            let database = database.clone();
-            let barrier = Arc::clone(&barrier);
-            scope.spawn(move || {
-                let mut store = Store::open(database).unwrap();
-                barrier.wait();
-                store.apply_connector_event(
-                    "monitor",
-                    "evt-race",
-                    [variant; 32],
-                    ConnectorEventInput::Task {
-                        id: task_id(&format!("connector-{variant}")),
-                        project_id: project_id("factory"),
-                        title: format!("Imported {variant}"),
-                        body: format!("Payload {variant}"),
-                        priority: 0,
-                    },
-                    i64::from(variant) + 1,
-                )
-            })
-        });
-        handles.map(|handle| handle.join().unwrap())
-    });
+    let first_database = database.clone();
+    let second_database = database.clone();
+    let setup: [StoreSetup; 2] = [
+        Box::new(move || Store::open(first_database).map_err(|error| error.to_string())),
+        Box::new(move || Store::open(second_database).map_err(|error| error.to_string())),
+    ];
+    let operations: [StoreRaceOperation; 2] = [
+        Box::new(connector_race_operation),
+        Box::new(connector_race_operation),
+    ];
+    let trace = RaceTrace::new(directory.path().join("connector-race.trace"));
+    let results = run_two_party_race(&database, setup, operations, trace)
+        .into_iter()
+        .map(|outcome| match outcome {
+            ParticipantOutcome::Completed(Ok(result)) => result,
+            outcome => panic!("connector race participant did not complete: {outcome:?}"),
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         results
             .iter()
-            .filter(|result| matches!(result, Ok((ConnectorEventResult::Accepted { .. }, _))))
+            .filter(|result| result.as_str() == "accepted")
             .count(),
         1
     );
     assert_eq!(
         results
             .iter()
-            .filter(|result| matches!(result, Err(StoreError::ConnectorEventPayloadMismatch)))
+            .filter(|result| result.as_str() == "mismatch")
             .count(),
         1
     );
@@ -405,23 +733,23 @@ fn concurrent_tool_observations_cannot_cross_the_limit() {
         .unwrap();
     drop(store);
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let mut joins = Vec::new();
-    for now in [4, 5] {
-        let database = database.clone();
-        let barrier = barrier.clone();
-        joins.push(std::thread::spawn(move || {
-            let mut store = Store::open(database).unwrap();
-            barrier.wait();
-            store
-                .observe_tool_call(&project_id("factory"), &agent_id("worker"), now)
-                .unwrap()
-                .1
-        }));
-    }
-    let denied = joins
+    let first_database = database.clone();
+    let second_database = database.clone();
+    let setup: [StoreSetup; 2] = [
+        Box::new(move || Store::open(first_database).map_err(|error| error.to_string())),
+        Box::new(move || Store::open(second_database).map_err(|error| error.to_string())),
+    ];
+    let operations: [StoreRaceOperation; 2] = [
+        Box::new(tool_observation_race_operation),
+        Box::new(tool_observation_race_operation),
+    ];
+    let trace = RaceTrace::new(directory.path().join("tool-observation-race.trace"));
+    let denied = run_two_party_race(&database, setup, operations, trace)
         .into_iter()
-        .map(|join| join.join().unwrap())
+        .map(|outcome| match outcome {
+            ParticipantOutcome::Completed(Ok(denied)) => denied == "true",
+            outcome => panic!("tool observation participant did not complete: {outcome:?}"),
+        })
         .filter(|denied| *denied)
         .count();
     assert_eq!(denied, 1);
