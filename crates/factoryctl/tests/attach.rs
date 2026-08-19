@@ -63,6 +63,11 @@ impl FakeDaemon {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        // macOS can carry the listener's nonblocking mode onto accepted
+                        // sockets. The handler performs a blocking request handshake; treating
+                        // its initial WouldBlock as EOF closes the socket before AttachTerminal
+                        // readiness and makes the child report Broken pipe.
+                        stream.set_nonblocking(false).unwrap();
                         let inputs = Arc::clone(&thread_inputs);
                         let gate = Arc::clone(&thread_gate);
                         let cancelled = Arc::clone(&thread_cancelled);
