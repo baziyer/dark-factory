@@ -69,3 +69,29 @@ jobs:
 
       - name: Run the gate
         run: ./scripts/local-ci.sh
+
+      - name: Publish bounded workflow summary
+        if: always()
+        env:
+          DF_SUMMARY_KIND: CI
+          DF_SUMMARY_REF: ${{ github.ref }}
+          DF_SUMMARY_SHA: ${{ github.sha }}
+          DF_SUMMARY_RESULT: ${{ job.status }}
+          DF_SUMMARY_TARGET: ${{ github.event.pull_request.milestone.title || 'unassigned' }}
+          DF_SUMMARY_TARGET_URL: ${{ github.event.pull_request.milestone.html_url || format('{0}/{1}/milestones', github.server_url, github.repository) }}
+          DF_SUMMARY_RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+        run: |
+          if [ -x ./scripts/github-step-summary.sh ]; then
+            ./scripts/github-step-summary.sh
+          else
+            # The checkout can fail before repository files exist. Keep this
+            # immutable fallback static: no untrusted value is interpolated.
+            {
+              printf '%s\n' '### Dark Factory workflow summary'
+              printf '%s\n' '- Result: <code>failure</code>'
+              printf '%s\n' '- Ref: <code>unavailable before checkout</code>'
+              printf '%s\n' '- SHA: <code>unavailable before checkout</code>'
+              printf '%s\n' '- Release target: <code>unavailable before checkout</code>'
+              printf '%s\n' '- Links: workflow run summary'
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi

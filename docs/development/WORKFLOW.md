@@ -143,6 +143,37 @@ ephemeral self-hosted runner — tracked as
 Known problems are GitHub issues labelled `known-issue`, see
 `CONTRIBUTING.md`.
 
+### Public work and release visibility
+
+Milestones are the only release-target field. The operator-maintained
+convention for a participating issue or pull request is exactly one of these
+public state labels:
+
+| State label | Meaning |
+| --- | --- |
+| `state:queued` | Accepted work has not started. |
+| `state:in-progress` | Work is actively being executed. |
+| `state:blocked` | Work needs a bounded resolution before it can continue. |
+| `state:review` | A change is awaiting independent review or recheck. |
+| `state:release-ready` | Exact integration or release preconditions are satisfied. |
+
+`area:*`, `size:*`, `security`, and `known-issue` remain orthogonal labels.
+The repository setup script defines the five state labels but does not yet
+validate or reconcile conflicting labels. That enforcement is deferred to
+the GitHub App reconciliation contract in #188 and #208; a human must correct
+conflicting labels in the meantime.
+Use GitHub checks, workflow summaries, and release notes for evidence; do not
+post a comment for every state transition. The first bounded projection is
+specified in [#208](https://github.com/baziyer/dark-factory/issues/208).
+
+Public projections contain only state, release target, exact ref/SHA, checks,
+links, and the next operator action. Queue contents, agent/session identity,
+prompts, guidance, transcripts, raw provider output, credentials, and private
+review deliberation stay inside Dark Factory. A future GitHub App must update
+existing projections by a stable installation/repository/source/revision key
+and reconcile after retries, restarts, duplicate deliveries, edits, reopen,
+timeouts, or permission loss; it must never create transition-comment spam.
+
 ### The self-hosted runner
 
 `~/actions-runner-dark-factory-repo` on the maintainer's Mac, registered
