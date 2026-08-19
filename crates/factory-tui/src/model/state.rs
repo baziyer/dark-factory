@@ -116,8 +116,6 @@ pub const ACTIVITY_BUCKET_MS: i64 = 5_000;
 const ACTIVITY_WINDOW: usize = 12;
 /// Number of recent buckets shown in BUILDING. At five seconds per bucket this is a 40-second
 /// visible horizon, while the series retains another four buckets for smooth aging at the edge.
-pub const ACTIVITY_VISIBLE_BUCKETS: usize = 8;
-
 /// A rolling five-second event count for one agent, rendered as a braille sparkline. A stand-in
 /// for a real tokens/turns series until session-level per-turn accounting exists.
 #[derive(Debug, Default)]

@@ -208,6 +208,10 @@ fn load_tasks(client: &Client, project_id: &ProjectId) -> Result<Vec<TaskDetail>
             project_id: project_id.clone(),
             after_id,
             agent_id: None,
+            // The board keeps history separately in the task map so failed
+            // and cancelled rows remain actionable; the visible worker
+            // queue still comes only from Board::active_tasks_for_agent.
+            history: true,
             limit: MAX_TASK_PAGE_ITEMS,
         },
         |response| match response {

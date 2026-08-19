@@ -289,7 +289,10 @@ fn validate_frame(frame: &ServerFrame) -> Result<(), ClientError> {
         });
     }
     if let ServerFrame::Event { event, .. } = frame {
-        if event.protocol_version != protocol_version {
+        // Durable events retain the schema version with which they were
+        // written. A v1 event replayed by the v2 daemon is valid; only an
+        // event newer than the frame can be unsafe to decode.
+        if event.protocol_version > protocol_version {
             return Err(ClientError::InconsistentEventProtocol {
                 frame: protocol_version,
                 event: event.protocol_version,
@@ -297,4 +300,32 @@ fn validate_frame(frame: &ServerFrame) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use factory_core::{FactoryEvent, ProjectId, ProjectSnapshot};
+
+    #[test]
+    fn v1_durable_event_is_accepted_inside_a_v2_replay_frame() {
+        let frame = ServerFrame::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event: factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 1,
+                occurred_at_ms: 1,
+                event: FactoryEvent::ProjectChanged {
+                    project: ProjectSnapshot {
+                        id: ProjectId::try_from("project").unwrap(),
+                        name: "Project".into(),
+                        root: "/tmp/project".into(),
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                    },
+                },
+            },
+        };
+        assert!(validate_frame(&frame).is_ok());
+    }
 }

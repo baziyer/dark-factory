@@ -292,6 +292,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
                 project_id: project_id("project-1"),
                 after_id: None,
                 agent_id: None,
+                history: false,
                 limit: 10,
             },
         )
@@ -562,6 +563,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 project_id: project_id("bounded-project"),
                 after_id: None,
                 agent_id: None,
+                history: false,
                 limit: 10,
             },
         )
@@ -586,6 +588,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 project_id: project_id("bounded-project"),
                 after_id: Some(next),
                 agent_id: None,
+                history: false,
                 limit: 10,
             },
         )
@@ -1047,6 +1050,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 task_id: task_id("task-1"),
                 title: None,
                 body: None,
+                priority: None,
             },
         )
         .await;
@@ -1068,6 +1072,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 task_id: task_id("task-1"),
                 title: Some("Updated title".into()),
                 body: None,
+                priority: None,
             },
         )
         .await;

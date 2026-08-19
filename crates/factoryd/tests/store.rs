@@ -547,6 +547,35 @@ fn project_task_and_events_survive_reopen() {
 }
 
 #[test]
+fn v1_durable_events_replay_with_the_current_store_protocol() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("legacy"),
+                    name: "Legacy".into(),
+                    root: "/work/legacy".into(),
+                },
+                1,
+            )
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE events SET schema_version = 1", [])
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&database).unwrap();
+    let events = store.events_after(0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].protocol_version, 1);
+}
+
+#[test]
 fn a_rejected_state_change_does_not_append_an_event() {
     let mut store = Store::open_in_memory().unwrap();
     let input = NewProject {
@@ -984,7 +1013,7 @@ fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
 
     let store = Store::open(&database).unwrap();
     let first_page = store
-        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), 1)
+        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), false, 1)
         .unwrap();
     assert_eq!(first_page[0].snapshot.id, task_id("alice-first"));
     let second_page = store
@@ -992,13 +1021,14 @@ fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
             &project_id("factory"),
             Some(&first_page[0].snapshot.id),
             Some(&alice),
+            false,
             10,
         )
         .unwrap();
     assert_eq!(second_page[0].snapshot.id, task_id("alice-second"));
     assert_eq!(
         store
-            .list_tasks_filtered(&project_id("factory"), None, None, 10)
+            .list_tasks_filtered(&project_id("factory"), None, None, false, 10)
             .unwrap()
             .iter()
             .map(|task| task.snapshot.id.clone())
@@ -1140,6 +1170,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &task_id("task-1"),
             Some("New title".into()),
             None,
+            None,
             4,
         )
         .unwrap();
@@ -1153,6 +1184,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &task_id("task-1"),
             None,
             Some("New body".into()),
+            None,
             5,
         )
         .unwrap();
@@ -1165,6 +1197,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &project_id("factory"),
             &task_id("task-1"),
             Some("Too late".into()),
+            None,
             None,
             7,
         ),

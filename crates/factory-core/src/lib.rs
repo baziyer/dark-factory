@@ -4,7 +4,7 @@
 //! daemon owns behavior, while runners, the CLI, and the UI exchange snapshots
 //! and events defined here.
 
-use std::{error::Error, fmt};
+use std::{cmp::Ordering, error::Error, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -290,6 +290,18 @@ impl TaskStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
+}
+
+/// The one active assigned-queue order shared by the daemon scheduler and
+/// every client projection: a currently running task first, then queued
+/// work by descending priority and finally creation time/id.
+#[must_use]
+pub fn active_task_cmp(a: &TaskSnapshot, b: &TaskSnapshot) -> Ordering {
+    (a.status != TaskStatus::Running)
+        .cmp(&(b.status != TaskStatus::Running))
+        .then_with(|| b.priority.cmp(&a.priority))
+        .then_with(|| a.created_at_ms.cmp(&b.created_at_ms))
+        .then_with(|| a.id.as_str().cmp(b.id.as_str()))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

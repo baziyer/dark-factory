@@ -290,6 +290,7 @@ Actions:
   get       Fetch one task
   start     Start a queued task on an agent
   retry     Requeue a failed or cancelled task
+  reorder   Change a queued task's priority/order
   assign    Assign or return a queued task; assignment wakes delivery
   cancel    Cancel a queued or blocked task
   update    Edit a queued task's title or body
@@ -316,7 +317,8 @@ Options:
   -h, --help                 Show this help";
 const TASK_LIST_HELP: &str = "usage: factoryctl task list --project ID [options]
 
-List tasks in stable queue order (creation time, then task ID).
+List the active assigned queue in daemon-defined order. Use --history to
+show terminal task history as a separate view.
 
 Required:
   --project ID           Project to list tasks from
@@ -324,6 +326,7 @@ Required:
 Options:
   --after ID               Resume after this task ID
   --agent ID               Show only tasks assigned to this agent
+  --history                Include terminal task history
   --limit N                  Page size (default and max: 10)
   -h, --help                   Show this help";
 const TASK_GET_HELP: &str = "usage: factoryctl task get --project ID --task ID
@@ -798,6 +801,7 @@ enum CliCommand {
         project_id: String,
         after_id: Option<String>,
         agent_id: Option<String>,
+        history: bool,
         limit: u32,
     },
     TaskStart {
@@ -815,6 +819,11 @@ enum CliCommand {
     TaskRetry {
         project_id: String,
         task_id: String,
+    },
+    TaskReorder {
+        project_id: String,
+        task_id: String,
+        priority: i32,
     },
     TaskAssign {
         project_id: String,
@@ -1663,12 +1672,14 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             let project_id = required_project(&mut args)?;
             let after_id = take_option(&mut args, "--after")?;
             let agent_id = take_option(&mut args, "--agent")?;
+            let history = take_flag(&mut args, "--history")?;
             let (limit, _) = take_limit(&mut args, TASK_LIST_LIMIT, TASK_LIST_LIMIT)?;
             require_empty(&args)?;
             Ok(CliCommand::TaskList {
                 project_id,
                 after_id,
                 agent_id,
+                history,
                 limit,
             })
         }
@@ -1694,6 +1705,19 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             Ok(CliCommand::TaskRetry {
                 project_id,
                 task_id,
+            })
+        }
+        "reorder" => {
+            let project_id = required_project(&mut args)?;
+            let task_id = required_option(&mut args, "--task")?;
+            let priority = required_option(&mut args, "--priority")?
+                .parse::<i32>()
+                .map_err(|_| "--priority must be a signed integer".to_owned())?;
+            require_empty(&args)?;
+            Ok(CliCommand::TaskReorder {
+                project_id,
+                task_id,
+                priority,
             })
         }
         "assign" => {
@@ -2226,11 +2250,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id,
             after_id,
             agent_id,
+            history,
             limit,
         } => Ok(LocalRequest::ListTasks {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
             agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
+            history,
             limit,
         }),
         CliCommand::TaskStart {
@@ -2255,6 +2281,17 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         } => Ok(LocalRequest::RetryTask {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
+        }),
+        CliCommand::TaskReorder {
+            project_id,
+            task_id,
+            priority,
+        } => Ok(LocalRequest::UpdateTask {
+            project_id: parse_id(project_id, "project")?,
+            task_id: parse_id(task_id, "task")?,
+            title: None,
+            body: None,
+            priority: Some(priority),
         }),
         CliCommand::TaskAssign {
             project_id,
@@ -2289,6 +2326,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             task_id: parse_id(task_id, "task")?,
             title,
             body,
+            priority: None,
         }),
         CliCommand::TaskDelete {
             project_id,
@@ -3647,6 +3685,7 @@ mod tests {
                 project_id: "project-1".try_into().unwrap(),
                 after_id: None,
                 agent_id: Some("curie".try_into().unwrap()),
+                history: false,
                 limit: 10,
             }
         );
@@ -3707,6 +3746,7 @@ mod tests {
                     project_id: "project-1".into(),
                     after_id: Some("task-9".into()),
                     agent_id: None,
+                    history: false,
                     limit: 10,
                 }
             )
@@ -3826,6 +3866,7 @@ mod tests {
                 task_id: "task-1".try_into().unwrap(),
                 title: Some("New".into()),
                 body: None,
+                priority: None,
             }
         );
 

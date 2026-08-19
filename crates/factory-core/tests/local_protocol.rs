@@ -380,6 +380,7 @@ fn collection_requests_and_responses_have_stable_cursors() {
         project_id: project_id("project-1"),
         after_id: Some(task_id("task-9")),
         agent_id: None,
+        history: false,
         limit: 10,
     };
     let response = LocalResponse::Tasks {

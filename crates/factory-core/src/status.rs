@@ -71,8 +71,8 @@ pub struct AgentStatus {
     pub session: Option<SessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run: Option<RunSnapshot>,
-    /// Queued tasks assigned to this agent, oldest first (see
-    /// [`MAX_QUEUE_PREVIEW`]).
+    /// Active tasks assigned to this agent in the canonical queue order (see
+    /// [`MAX_QUEUE_PREVIEW`]): running first, then priority/creation order.
     pub queue_depth: u32,
     pub queue: Vec<TaskSnapshot>,
     /// Inbox messages not yet delivered into a session.

@@ -11,6 +11,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use factory_core::TaskDetail;
 use tui_term::widget::PseudoTerminal;
 
 use crate::model::{Board, PaneMode};
@@ -158,22 +159,36 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         .map(|(row, task)| {
             hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
             Line::from(format!(
-                "{} {:?}  {}",
+                "{} {:?} p={}  {}",
                 if board.selected_task.as_ref() == Some(&task.snapshot.id) {
                     ">"
                 } else {
                     " "
                 },
                 task.snapshot.status,
+                task.snapshot.priority,
                 task.snapshot.title
             ))
         })
         .collect();
-    let queue = if tasks.is_empty() {
+    let history = board.task_history_for_agent(agent_id);
+    let mut queue = if tasks.is_empty() {
         vec![Line::from("nothing assigned")]
     } else {
         tasks
     };
+    if !history.is_empty() {
+        let history_header = queue.len();
+        queue.push(Line::from("history:"));
+        for (offset, task) in history.iter().enumerate() {
+            let row = history_header + 1 + offset;
+            hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
+            queue.push(Line::from(format!(
+                "  {:?} p={}  {}",
+                task.snapshot.status, task.snapshot.priority, task.snapshot.title
+            )));
+        }
+    }
     frame.render_widget(Paragraph::new(queue).block(ui::block(" queue ")), rows[0]);
 
     let inbox = board.messages.get(agent_id).map_or_else(
@@ -247,6 +262,28 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         rows[2],
     );
     if orchestrator {
+        let context_area = ui::block("").inner(rows[3]);
+        for (row, task) in orchestrator_backlog_tasks(board, &agent.project_id)
+            .into_iter()
+            .enumerate()
+        {
+            hits.add_row(
+                context_area,
+                row + 1,
+                Target::Task(task.snapshot.id.clone()),
+            );
+        }
+        let backlog_rows = orchestrator_backlog_tasks(board, &agent.project_id).len();
+        for (offset, task) in orchestrator_history_tasks(board, &agent.project_id)
+            .into_iter()
+            .enumerate()
+        {
+            hits.add_row(
+                context_area,
+                backlog_rows + 2 + offset,
+                Target::Task(task.snapshot.id.clone()),
+            );
+        }
         frame.render_widget(
             Paragraph::new(orchestrator_context_lines(board, &agent.project_id).join("\n"))
                 .block(ui::block(" backlog + worker queues ")),
@@ -255,8 +292,10 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
     }
 }
 
-fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectId) -> Vec<String> {
-    let mut lines = vec!["project backlog:".to_owned()];
+fn orchestrator_backlog_tasks<'a>(
+    board: &'a Board,
+    project_id: &factory_core::ProjectId,
+) -> Vec<&'a TaskDetail> {
     let mut tasks: Vec<_> = board
         .tasks
         .values()
@@ -269,14 +308,58 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
                 )
         })
         .collect();
-    tasks.sort_by_key(|task| (task.snapshot.created_at_ms, task.snapshot.id.clone()));
+    tasks.sort_by(|a, b| factory_core::active_task_cmp(&a.snapshot, &b.snapshot));
+    tasks
+}
+
+fn orchestrator_history_tasks<'a>(
+    board: &'a Board,
+    project_id: &factory_core::ProjectId,
+) -> Vec<&'a TaskDetail> {
+    let mut tasks: Vec<_> = board
+        .tasks
+        .values()
+        .filter(|task| {
+            &task.snapshot.project_id == project_id
+                && task.snapshot.assigned_agent_id.is_none()
+                && !matches!(
+                    task.snapshot.status,
+                    factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
+                )
+        })
+        .collect();
+    tasks.sort_by(|a, b| {
+        a.snapshot
+            .updated_at_ms
+            .cmp(&b.snapshot.updated_at_ms)
+            .then_with(|| a.snapshot.id.as_str().cmp(b.snapshot.id.as_str()))
+    });
+    tasks
+}
+
+fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectId) -> Vec<String> {
+    let mut lines = vec!["project backlog:".to_owned()];
+    let tasks = orchestrator_backlog_tasks(board, project_id);
     for task in tasks {
         let owner = task
             .snapshot
             .assigned_agent_id
             .as_ref()
             .map_or("unassigned", factory_core::AgentId::as_str);
-        lines.push(format!("  {owner}: {}", task.snapshot.title));
+        lines.push(format!(
+            "  {owner}: {:?} p={} {}",
+            task.snapshot.status, task.snapshot.priority, task.snapshot.title
+        ));
+    }
+    let history = orchestrator_history_tasks(board, project_id);
+    if !history.is_empty() {
+        lines.push("history:".to_owned());
+        for task in history {
+            lines.push(format!(
+                "  {:?} p={} {}",
+                task.snapshot.status, task.snapshot.priority, task.snapshot.title
+            ));
+        }
     }
     lines.push("worker queues:".to_owned());
     let mut agents: Vec<_> = board

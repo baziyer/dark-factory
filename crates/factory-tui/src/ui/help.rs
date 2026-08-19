@@ -9,7 +9,7 @@ use ratatui::widgets::{Clear, ListItem, ListState, Paragraph};
 
 use crate::model::{
     Board, Connection, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind,
-    PromptState, TASK_MENU_ITEMS, TaskMenuState,
+    PromptState, TaskMenuState,
 };
 use crate::mouse::{HitMap, Target};
 use crate::ui::{self, centered_rect, render_tabs};
@@ -177,6 +177,7 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageAgent(agent_id) => format!("message {agent_id}"),
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
+        PromptKind::ReorderTask(task_id) => format!("reorder — task#{task_id}"),
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
         PromptKind::Capacity => "live-session capacity".to_owned(),
@@ -287,15 +288,8 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
         || format!("task#{}", menu.task_id),
         |task| format!("task#{} — {}", menu.task_id, task.snapshot.title),
     );
-    let items: Vec<ListItem> = TASK_MENU_ITEMS
-        .iter()
-        .map(|item| ListItem::new(*item))
-        .collect();
-    let rect = centered_rect(
-        area,
-        40,
-        u16::try_from(TASK_MENU_ITEMS.len()).unwrap_or(6) + 3,
-    );
+    let items: Vec<ListItem> = menu.items.iter().map(|item| ListItem::new(*item)).collect();
+    let rect = centered_rect(area, 40, u16::try_from(menu.items.len()).unwrap_or(6) + 3);
     frame.render_widget(Clear, rect);
     let block = ui::block(title).border_style(Style::default().fg(Color::Cyan));
     let list = ui::styled_list(items, block);

@@ -1158,9 +1158,8 @@ impl Store {
         ))
     }
 
-    /// The oldest queued task assigned to `agent_id`, in delivery order
-    /// (`created_at_ms, id`), or `None` when the agent is paused or has no
-    /// queued work.
+    /// The next queued task assigned to `agent_id`, in the canonical active
+    /// queue order, or `None` when the agent is paused or has no queued work.
     pub fn next_deliverable(
         &self,
         project_id: &ProjectId,
@@ -1174,7 +1173,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM tasks
                  WHERE project_id = ?1 AND assigned_agent_id = ?2 AND status = 'queued'
-                 ORDER BY created_at_ms, id
+                 ORDER BY priority DESC, created_at_ms, id
                  LIMIT 1",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get(0),
@@ -2912,7 +2911,7 @@ impl Store {
         after_id: Option<&TaskId>,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
-        self.list_tasks_filtered(project_id, after_id, None, limit)
+        self.list_tasks_filtered(project_id, after_id, None, true, limit)
     }
 
     pub fn list_tasks_filtered(
@@ -2920,6 +2919,7 @@ impl Store {
         project_id: &ProjectId,
         after_id: Option<&TaskId>,
         agent_id: Option<&AgentId>,
+        include_history: bool,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
@@ -2946,19 +2946,31 @@ impl Store {
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
-             WHERE project_id = ?1
+            WHERE project_id = ?1
                AND (?2 IS NULL OR assigned_agent_id = ?2)
-               AND (?3 IS NULL OR (created_at_ms, id) > (
-                   SELECT created_at_ms, id FROM tasks
-                   WHERE project_id = ?1 AND id = ?3
-               ))
-             ORDER BY created_at_ms, id
-             LIMIT ?4",
+               AND (?3 OR status IN ('queued', 'running'))
+               AND (?4 IS NULL OR
+                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
+                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                        FROM tasks WHERE project_id = ?1 AND id = ?4
+                    ) OR (
+                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
+                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                            FROM tasks WHERE project_id = ?1 AND id = ?4
+                        )
+                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
+                                                             WHERE project_id = ?1 AND id = ?4)))
+                    ))
+             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
+             LIMIT ?5",
         )?;
         let rows = statement.query_map(
             params![
                 project_id.as_str(),
                 agent_id.map(AgentId::as_str),
+                include_history,
                 after_id.map(TaskId::as_str),
                 limit as i64,
             ],
@@ -3174,6 +3186,7 @@ impl Store {
         task_id: &TaskId,
         title: Option<String>,
         body: Option<String>,
+        priority: Option<i32>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
@@ -3185,9 +3198,16 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks
              SET title = COALESCE(?1, title), body = COALESCE(?2, body),
-                 updated_at_ms = ?3
-             WHERE id = ?4 AND project_id = ?5 AND status = 'queued'",
-            params![title, body, now_ms, task_id.as_str(), project_id.as_str()],
+                 priority = COALESCE(?3, priority), updated_at_ms = ?4
+             WHERE id = ?5 AND project_id = ?6 AND status = 'queued'",
+            params![
+                title,
+                body,
+                priority,
+                now_ms,
+                task_id.as_str(),
+                project_id.as_str()
+            ],
         )?;
         if changed != 1 {
             return Err(StoreError::TaskNotEditable);
@@ -3619,7 +3639,7 @@ impl Store {
                 .iter()
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
-            let backlog = self.queued_tasks(&project.id, None)?;
+            let backlog = self.active_tasks(&project.id, None)?;
             let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
@@ -3644,7 +3664,7 @@ impl Store {
             Some(run_id) => load_run(&self.connection, run_id)?,
             None => None,
         };
-        let queue = self.queued_tasks(project_id, Some(agent_id))?;
+        let queue = self.active_tasks(project_id, Some(agent_id))?;
         let inbox_pending: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM agent_messages
              WHERE project_id = ?1 AND recipient_agent_id = ?2 AND delivered_at_ms IS NULL",
@@ -3720,9 +3740,10 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
-    /// Queued tasks assigned to `agent_id` (or unassigned when `None`),
-    /// oldest first -- the same order the dispatcher delivers them.
-    fn queued_tasks(
+    /// Active tasks assigned to `agent_id` (or unassigned when `None`): the
+    /// canonical queue projection used by status and the TUI. Running work
+    /// is first, followed by queued work in priority/creation order.
+    fn active_tasks(
         &self,
         project_id: &ProjectId,
         agent_id: Option<&AgentId>,
@@ -3731,9 +3752,9 @@ impl Store {
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
                     created_at_ms, updated_at_ms
              FROM tasks
-             WHERE project_id = ?1 AND status = 'queued'
+             WHERE project_id = ?1 AND status IN ('queued', 'running')
                AND ((?2 IS NULL AND assigned_agent_id IS NULL) OR assigned_agent_id = ?2)
-             ORDER BY created_at_ms, id",
+             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id",
         )?;
         let rows = statement.query_map(
             params![project_id.as_str(), agent_id.map(AgentId::as_str)],

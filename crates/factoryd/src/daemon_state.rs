@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use factory_core::{AgentId, EventEnvelope};
+use factory_core::{AgentId, EventEnvelope, TaskId};
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast};
 
@@ -41,6 +41,11 @@ pub struct DaemonState {
     /// agent's lifetime (one `Arc<AsyncMutex<()>>` reused for every
     /// delivery attempt).
     delivery_slots: Arc<Mutex<HashMap<AgentId, Arc<AsyncMutex<()>>>>>,
+    /// Serializes assignment changes for one task. The delivery slot below
+    /// is still the owner-side delivery barrier; this second, task-scoped
+    /// lock prevents two moves that observed different owners from
+    /// overwriting one another out of order.
+    assignment_slots: Arc<Mutex<HashMap<TaskId, Arc<AsyncMutex<()>>>>>,
     /// All repository mutations pass through one daemon-owned committer.
     /// Read-only status/diff operations share this lock too, so their output
     /// is never captured halfway through a commit or push.
@@ -73,6 +78,7 @@ impl DaemonState {
             store: Arc::new(Mutex::new(store)),
             events,
             delivery_slots: Arc::new(Mutex::new(HashMap::new())),
+            assignment_slots: Arc::new(Mutex::new(HashMap::new())),
             repository_slot: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -91,20 +97,48 @@ impl DaemonState {
     /// that arrives while the dispatcher is already busy with that agent.
     #[must_use]
     pub fn try_delivery_slot(&self, agent_id: &AgentId) -> Option<DeliverySlot> {
+        let lock = self.delivery_lock(agent_id);
+        lock.try_lock_owned()
+            .ok()
+            .map(|guard| DeliverySlot { _guard: guard })
+    }
+
+    /// Waits for the owner-side delivery barrier. Assignment changes use
+    /// this blocking form so a task cannot be moved while the old worker's
+    /// delivery is composing, typing, awaiting its hook, or committing.
+    pub async fn lock_delivery_slot(&self, agent_id: &AgentId) -> DeliverySlot {
+        DeliverySlot {
+            _guard: self.delivery_lock(agent_id).lock_owned().await,
+        }
+    }
+
+    /// Serializes all assignment mutations for one task, including moves
+    /// between two workers and moves to the project backlog.
+    pub async fn lock_assignment_slot(&self, task_id: &TaskId) -> OwnedMutexGuard<()> {
         let lock = {
             let mut slots = self
-                .delivery_slots
+                .assignment_slots
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Arc::clone(
                 slots
-                    .entry(agent_id.clone())
+                    .entry(task_id.clone())
                     .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
             )
         };
-        lock.try_lock_owned()
-            .ok()
-            .map(|guard| DeliverySlot { _guard: guard })
+        lock.lock_owned().await
+    }
+
+    fn delivery_lock(&self, agent_id: &AgentId) -> Arc<AsyncMutex<()>> {
+        let mut slots = self
+            .delivery_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            slots
+                .entry(agent_id.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 
     /// `true` if another delivery attempt currently holds `agent_id`'s
@@ -178,5 +212,36 @@ impl DaemonState {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_core::{AgentId, TaskId};
+
+    #[tokio::test]
+    async fn reassignment_barrier_waits_for_old_owner_delivery() {
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let old_owner = AgentId::try_from("worker-1").unwrap();
+        let task = TaskId::try_from("task-1").unwrap();
+        let delivery = state.try_delivery_slot(&old_owner).unwrap();
+        let assignment = state.lock_assignment_slot(&task).await;
+
+        let state_for_move = state.clone();
+        let old_owner_for_move = old_owner.clone();
+        let waiter = tokio::spawn(async move {
+            let _assignment = state_for_move.lock_assignment_slot(&task).await;
+            state_for_move.lock_delivery_slot(&old_owner_for_move).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "move crossed the in-flight delivery");
+        drop(assignment);
+        // The move still cannot pass until the old worker's prompt/commit
+        // has released its delivery barrier.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(delivery);
+        waiter.await.unwrap();
     }
 }

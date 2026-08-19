@@ -75,6 +75,32 @@ enum RepositoryRequest {
     },
 }
 
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn protocol_version_is_rejected_before_unknown_request_variants_are_parsed() {
+        let payload = serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION - 1,
+            "request": {
+                "type": "create_assigned_task",
+                "data": {"future_field": "future-shape"}
+            }
+        });
+        let Err(response) = parse_envelope(&serde_json::to_vec(&payload).unwrap()) else {
+            panic!("unsupported protocol was accepted");
+        };
+        assert!(matches!(
+            *response,
+            LocalResponse::Error {
+                code: ErrorCode::UnsupportedProtocol,
+                ..
+            }
+        ));
+    }
+}
+
 struct RepositoryAudit {
     project_id: ProjectId,
     agent_id: factory_core::AgentId,
@@ -430,21 +456,40 @@ async fn handle_connection(
 }
 
 fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
-    let envelope: RequestEnvelope = serde_json::from_slice(payload).map_err(|_| {
+    // Read the version discriminator before deserializing the request enum.
+    // A newer client may contain a request variant this daemon does not know;
+    // that must still produce UnsupportedProtocol, not a misleading invalid
+    // request from enum deserialization.
+    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
         Box::new(LocalResponse::Error {
             code: ErrorCode::InvalidRequest,
             message: "request is not valid local protocol JSON".into(),
         })
     })?;
-    if envelope.protocol_version != PROTOCOL_VERSION {
+    let protocol_version = value
+        .get("protocol_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u16::try_from(version).ok())
+        .ok_or_else(|| {
+            Box::new(LocalResponse::Error {
+                code: ErrorCode::InvalidRequest,
+                message: "request is missing a valid protocol_version".into(),
+            })
+        })?;
+    if protocol_version != PROTOCOL_VERSION {
         return Err(Box::new(LocalResponse::Error {
             code: ErrorCode::UnsupportedProtocol,
             message: format!(
-                "protocol {} is unsupported; this daemon speaks {}",
-                envelope.protocol_version, PROTOCOL_VERSION
+                "protocol {protocol_version} is unsupported; this daemon speaks {PROTOCOL_VERSION}",
             ),
         }));
     }
+    let envelope: RequestEnvelope = serde_json::from_value(value).map_err(|_| {
+        Box::new(LocalResponse::Error {
+            code: ErrorCode::InvalidRequest,
+            message: "request is not valid local protocol JSON".into(),
+        })
+    })?;
     Ok(envelope.request)
 }
 
@@ -1202,6 +1247,7 @@ async fn handle_request(
             project_id,
             after_id,
             agent_id,
+            history,
             limit,
         } => {
             let limit = page_limit("task", limit, MAX_TASK_PAGE_ITEMS)?;
@@ -1211,6 +1257,7 @@ async fn handle_request(
                         &project_id,
                         after_id.as_ref(),
                         agent_id.as_ref(),
+                        history,
                         limit + 1,
                     )
                 })
@@ -1263,8 +1310,9 @@ async fn handle_request(
             task_id,
             title,
             body,
+            priority,
         } => {
-            if title.is_none() && body.is_none() {
+            if title.is_none() && body.is_none() && priority.is_none() {
                 return Err(ApiFailure::Invalid(
                     "task update must include title or body".into(),
                 ));
@@ -1287,8 +1335,14 @@ async fn handle_request(
             }
             let task = state
                 .commit_and_publish(move |store| {
-                    let (task, event) =
-                        store.update_task(&project_id, &task_id, title, body, now_ms()?)?;
+                    let (task, event) = store.update_task(
+                        &project_id,
+                        &task_id,
+                        title,
+                        body,
+                        priority,
+                        now_ms()?,
+                    )?;
                     Ok((task, vec![event]))
                 })
                 .await?;
@@ -1326,6 +1380,11 @@ async fn handle_request(
             // flight, so nothing can still be writing into its guidance
             // directory below.
             execution.begin_delete(&agent_id).await?;
+            // Assignment changes and delivery share the owner-side barrier.
+            // Hold it while the delete transaction unassigns every task so
+            // no in-flight prompt can escape to an agent that is being
+            // removed.
+            let _delivery_slot = execution.lock_delivery_slot(&agent_id).await;
             let result = delete_agent_locked(state, guidance_root, project_id, agent_id).await;
             execution.end_delete(&response_agent_id);
             result?;
@@ -1357,10 +1416,20 @@ async fn handle_request(
                     }
                 }
             }
+            let delivery_slots = if begin_error.is_none() {
+                let mut slots = Vec::with_capacity(begun.len());
+                for agent_id in &begun {
+                    slots.push(execution.lock_delivery_slot(agent_id).await);
+                }
+                slots
+            } else {
+                Vec::new()
+            };
             let result = match begin_error {
                 Some(error) => Err(ApiFailure::from(error)),
                 None => delete_project_locked(state, guidance_root, project_id).await,
             };
+            drop(delivery_slots);
             for agent_id in &begun {
                 execution.end_delete(agent_id);
             }
@@ -1375,6 +1444,28 @@ async fn handle_request(
             task_id,
             agent_id,
         } => {
+            let _assignment_slot = execution.lock_assignment_slot(&task_id).await;
+            let lookup_project_id = project_id.clone();
+            let lookup_task_id = task_id.clone();
+            let previous_owner = state
+                .with_store(move |store| {
+                    Ok(store
+                        .get_task(&lookup_project_id, &lookup_task_id)?
+                        .snapshot
+                        .assigned_agent_id)
+                })
+                .await?;
+            // The task-scoped lock orders competing moves. This owner-side
+            // barrier orders the move against delivery itself: when the
+            // move commits, the old worker's delivery slot is definitely
+            // free, and a later delivery observes the new assignment.
+            let _delivery_slot = previous_owner
+                .as_ref()
+                .map(|owner| execution.lock_delivery_slot(owner));
+            let _delivery_slot = match _delivery_slot {
+                Some(future) => Some(future.await),
+                None => None,
+            };
             let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {

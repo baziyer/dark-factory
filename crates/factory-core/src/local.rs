@@ -256,6 +256,10 @@ pub enum LocalRequest {
         /// stable `(created_at_ms, id)` order is used for queue delivery.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<AgentId>,
+        /// Include terminal/history rows. The default is the active queue
+        /// only; active work is never hidden by a history view.
+        #[serde(default)]
+        history: bool,
         limit: u32,
     },
     GetTask {
@@ -277,6 +281,9 @@ pub enum LocalRequest {
         title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         body: Option<String>,
+        /// Queue priority. Updating it is the shared reorder operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<i32>,
     },
     DeleteTask {
         project_id: ProjectId,
