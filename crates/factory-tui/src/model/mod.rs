@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
 use factory_core::status::{
-    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, display_text,
+    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, age_text, display_text,
 };
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
@@ -103,6 +103,9 @@ pub struct Board {
 
     pub connection: Connection,
     pub connection_detail: Option<String>,
+    /// Version reported by the connected daemon's health response. An empty
+    /// value means an older daemon that cannot identify itself.
+    pub daemon_version: Option<String>,
     /// A newer release's version, once the hourly manifest check has found one
     /// (`net::spawn_update_check`); shown in the status line.
     pub update_available: Option<String>,
@@ -130,6 +133,7 @@ pub struct Board {
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
+    activity_last_at_ms: BTreeMap<AgentId, i64>,
     activity_identities: BTreeMap<AgentId, ActivityIdentity>,
     seen_event_sequences: state::RingBuffer<i64>,
     /// Causal revision of the currently displayed attention projection.
@@ -171,6 +175,7 @@ impl Board {
             theme,
             connection: Connection::Connecting,
             connection_detail: None,
+            daemon_version: None,
             update_available: None,
             live_session_cap: None,
             projects: Vec::new(),
@@ -186,6 +191,7 @@ impl Board {
             local_attention: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
+            activity_last_at_ms: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             attention_revision: 0,
@@ -706,6 +712,59 @@ impl Board {
         self.connection_detail = None;
     }
 
+    pub fn set_daemon_version(&mut self, version: impl Into<String>) {
+        self.daemon_version = Some(version.into());
+    }
+
+    /// A stale client must be explicit and actionable. The daemon version is
+    /// also the active runtime version because health is answered by the
+    /// running factoryd binary, so relaunching only this TUI is sufficient.
+    #[must_use]
+    pub fn version_mismatch(&self) -> Option<String> {
+        let daemon = self.daemon_version.as_deref()?;
+        if daemon.is_empty() {
+            return Some("STALE TUI — daemon version unknown; detach + relaunch".to_owned());
+        }
+        (daemon != env!("CARGO_PKG_VERSION")).then(|| {
+            format!(
+                "STALE TUI v{} / active runtime v{} — detach + relaunch",
+                env!("CARGO_PKG_VERSION"),
+                daemon
+            )
+        })
+    }
+
+    /// Current activity is deliberately separate from durable lifecycle state.
+    /// A recent named hook is useful; an old hook is explicitly stale, and no
+    /// sample is explicitly reported rather than rendered as evidence of inactivity.
+    #[must_use]
+    pub fn activity_label(&self, agent: &AgentSnapshot) -> String {
+        let session = self
+            .sessions
+            .values()
+            .filter(|session| session.agent_id == agent.id)
+            .max_by_key(|session| (session.updated_at_ms, session.id.clone()));
+        let Some(session) = session else {
+            return "no recent activity".to_owned();
+        };
+        let Some(at_ms) = session
+            .last_hook_at_ms
+            .or_else(|| self.activity_last_at_ms.get(&agent.id).copied())
+        else {
+            return "no recent activity".to_owned();
+        };
+        let age = age_text(self.now_ms, at_ms);
+        if self.now_ms.saturating_sub(at_ms) > 60_000 {
+            return format!("stale activity {age} ago");
+        }
+        let activity = session
+            .activity
+            .as_deref()
+            .map(display_text)
+            .unwrap_or_else(|| "recent activity".to_owned());
+        format!("{activity} {age} ago")
+    }
+
     /// Sessions that have not ended, fleet-wide — what the daemon's live-session cap counts.
     #[must_use]
     pub fn live_session_count(&self) -> usize {
@@ -1118,11 +1177,12 @@ impl Board {
         }
         self.activity_identities
             .insert(agent_id.clone(), identity.clone());
-        let now_ms = self.now_ms;
-        let occurred_at_ms = occurred_at_ms.min(now_ms);
+        let occurred_at_ms = occurred_at_ms.min(self.now_ms);
+        self.activity_last_at_ms
+            .insert(agent_id.clone(), occurred_at_ms);
         let series = self.activity.entry(agent_id.clone()).or_default();
         series.record(occurred_at_ms);
-        series.roll_to(now_ms);
+        series.roll_to(self.now_ms);
     }
 
     fn event_agent_identity(&self, event: &FactoryEvent) -> Option<(AgentId, ActivityIdentity)> {
@@ -1177,6 +1237,7 @@ impl Board {
 
     fn remove_activity(&mut self, agent_id: &AgentId) {
         self.activity.remove(agent_id);
+        self.activity_last_at_ms.remove(agent_id);
         self.activity_identities.remove(agent_id);
     }
 

@@ -31,7 +31,7 @@ fn state_style(state: AgentState) -> Style {
 }
 
 fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
-    let inner = ui::bordered(frame, area, ui::block(" BUILDING "));
+    let inner = ui::bordered(frame, area, ui::block(" BUILDING · activity last 40s "));
     if board.projects.is_empty() {
         ui::dim(frame, inner, "no projects — factoryctl project add");
         return;
@@ -69,7 +69,9 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
                 .iter()
                 .find(|task| task.snapshot.status == factory_core::TaskStatus::Running)
                 .or_else(|| assigned.first())
-                .map_or("idle", |task| task.snapshot.title.as_str());
+                .map(|task| ui::truncate(&task.snapshot.title, 24));
+            let queue = (!assigned.is_empty()).then(|| format!(" queue {}", assigned.len()));
+            let activity = board.activity_label(agent);
             let route = if agent.parent_agent_id.is_some() {
                 "══ "
             } else {
@@ -85,11 +87,14 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
                     state_style(state),
                 ),
                 Span::raw(format!(
-                    " {:?} {:<8} {spark} q:{}  {}",
+                    " {:?} {:<8} {spark} {}{}{}",
                     agent.provider,
                     state.label(),
-                    assigned.len(),
-                    ui::truncate(current, 28)
+                    activity,
+                    queue.as_deref().unwrap_or(""),
+                    current
+                        .as_deref()
+                        .map_or(String::new(), |title| format!(" task {title}"))
                 )),
             ]));
             hits.add_row(inner, row, Target::Agent(agent_id));
@@ -180,7 +185,8 @@ mod tests {
         assert!(text.contains("BUILDING"));
         assert!(text.contains("NEEDS YOU"));
         assert!(text.contains("alice"));
-        assert!(text.contains("q:1"));
+        assert!(text.contains("queue 1"));
+        assert!(text.contains("no recent activity"));
         assert!(text.contains("inference"));
         assert!(text.contains("lifecycle state"));
     }

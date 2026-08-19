@@ -723,6 +723,7 @@ fn apply_net_msg(
     match msg {
         NetMsg::ConnectionRetrying(detail) => board.set_retrying(detail),
         NetMsg::ConnectionLive => board.set_live(),
+        NetMsg::DaemonHealth { version } => board.set_daemon_version(version),
         NetMsg::FleetSnapshot {
             projects,
             agents,

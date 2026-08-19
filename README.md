@@ -112,7 +112,11 @@ prior setting; the provider-session shell policy denies capacity mutation.
 
 The TUI has two screens:
 
-- **BUILDING** shows all projects, agents, work, and items that need you.
+- **BUILDING** shows all projects, agents, work, and items that need you. Agent
+  rows separate durable lifecycle from named current activity and age, show
+  assigned work as `queue N`, and explicitly label missing or stale activity.
+  A client/daemon version mismatch is called out with detach-and-relaunch
+  guidance; relaunching the TUI never restarts the daemon or agents.
 - **AGENT** shows one agent's terminal, queue, inbox, and settings.
 
 Select an agent and press `Enter` to open AGENT. Press `i` or `Enter` to type
