@@ -128,8 +128,9 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 24 after the
-/// connector-event migration, runtime metadata, and legacy permission repair
+/// which always migrates to the current `SCHEMA_VERSION`, 25 after the
+/// connector-event, runtime metadata, legacy permission repair, durable
+/// delivery-attempt, and provider-resume recovery migrations
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -222,14 +223,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0024.
+    // Opening through the real store runs migrations 0014 through 0025.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -282,7 +283,9 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE delivery_attempts;
+                "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
+                 ALTER TABLE sessions DROP COLUMN resumed_provider_session;
+                 DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
@@ -297,7 +300,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -390,14 +393,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0024 migrations.
+    // Opening through the real store runs the 0015 through 0025 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -543,6 +546,69 @@ fn set_provider_session_id_is_a_no_op_once_already_set() {
     assert_eq!(
         stored.as_deref(),
         Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+    );
+}
+
+#[test]
+fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() {
+    let mut store = fixture();
+    let old_thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+    let new_thread = "f31a566f-544b-46f0-bd03-9c9ec3231c90";
+    let mut initial = new_session("initial", "factory", "curie");
+    initial.provider_session_id = Some(old_thread.to_owned());
+    let (initial, _) = store.create_session(initial, 5).unwrap();
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &initial.id)
+            .unwrap()
+    );
+    store.end_session(&initial.id, Some(0), None, 6).unwrap();
+
+    let mut resumed = new_session("resumed", "factory", "curie");
+    resumed.provider_session_id = Some(old_thread.to_owned());
+    let (resumed, _) = store.create_session(resumed, 7).unwrap();
+    assert!(
+        store
+            .session_resumed_provider_thread(&project_id("factory"), &resumed.id)
+            .unwrap()
+    );
+
+    store
+        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, 8)
+        .unwrap();
+    assert_eq!(
+        store
+            .last_provider_session_id(&project_id("factory"), &agent_id("curie"))
+            .unwrap(),
+        None,
+        "the poisoned provider thread must not be selected again"
+    );
+
+    store.end_session(&resumed.id, Some(0), None, 9).unwrap();
+    let (fresh, _) = store
+        .create_session(new_session("fresh", "factory", "curie"), 10)
+        .unwrap();
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &fresh.id)
+            .unwrap()
+    );
+    store
+        .set_provider_session_id(&fresh.id, new_thread, 11)
+        .unwrap()
+        .expect("fresh Codex session confirms a new thread");
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &fresh.id)
+            .unwrap(),
+        "SessionStart identity assignment must not rewrite launch provenance"
+    );
+    assert_eq!(
+        store
+            .last_provider_session_id(&project_id("factory"), &agent_id("curie"))
+            .unwrap()
+            .as_deref(),
+        Some(new_thread)
     );
 }
 

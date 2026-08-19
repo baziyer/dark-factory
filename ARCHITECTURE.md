@@ -68,9 +68,15 @@ catalogue.
    attempt nonce that the acknowledgement must echo, binding the hook to the
    immutable attempt even when task ids are deleted and recreated. Retry state is durable: a daemon
    restart consumes an interrupted in-flight attempt, and only an explicit
-   operator resume resets a terminal attempt. Recovery submits a bare CR to
-   the existing provider buffer and waits the normal acknowledgement bound;
-   it never retypes a body whose submission may already have been accepted.
+   operator resume resets a terminal attempt. Recovery never retypes a body
+   whose submission may already have been accepted. A resumed Codex composer
+   that does not acknowledge its first delivery is retired: the daemon blocks
+   that exact provider thread from future resume, stops its runner, and sends
+   the still-queued task once in a fresh conversation after the runner's exit
+   is durable. Resumed-vs-fresh launch provenance is recorded at session
+   creation; a fresh Codex `SessionStart` assigning a thread id cannot turn it
+   into a resumed launch or cause fresh-conversation churn. Other recoveries may
+   submit a bare CR to an existing provider buffer and wait the normal bound.
    The hook must match that
    stored prompt exactly before acknowledging it, so a stale hook cannot
    recompose a newer queue head. A single pending-delivery slot per agent

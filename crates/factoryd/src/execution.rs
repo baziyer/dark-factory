@@ -2423,6 +2423,60 @@ async fn deliver_pending(
         )
         .await?;
     } else {
+        // A resumed Codex TUI can consume the submit CR as recovery from its
+        // "Conversation interrupted" screen while discarding the composer.
+        // Its input state is not observable through the PTY, so a bare-CR
+        // retry is guesswork and replaying the body risks duplicate model
+        // work. Retire that poisoned provider thread instead: stop this
+        // runner, block this exact thread identity from future resume, and
+        // let the still-queued task deliver once into a fresh conversation.
+        let resumed_codex = if session.provider == Provider::Codex {
+            state
+                .with_store({
+                    let project_id = project_id.clone();
+                    let session_id = session.id.clone();
+                    move |store| store.session_resumed_provider_thread(&project_id, &session_id)
+                })
+                .await?
+        } else {
+            false
+        };
+        if resumed_codex {
+            let recovery_project_id = project_id.clone();
+            let recovery_session_id = session.id.clone();
+            let recovery_at_ms = now_ms()?;
+            state
+                .commit_and_publish(move |store| {
+                    let (snapshot, event) = store.request_fresh_provider_recovery(
+                        &recovery_project_id,
+                        &recovery_session_id,
+                        recovery_at_ms,
+                    )?;
+                    Ok((snapshot, vec![event]))
+                })
+                .await?;
+            if let Err(error) = client.stop(2_000).await {
+                tracing::error!(
+                    %error,
+                    %project_id,
+                    %agent_id,
+                    session_id = %session.id,
+                    "could not stop a Codex session whose resumed input state rejected delivery"
+                );
+                let failed_session_id = session.id.clone();
+                let failed_at_ms = now_ms()?;
+                let reason =
+                    "automatic delivery recovery could not stop the Codex runner".to_owned();
+                state
+                    .commit_and_publish(move |store| {
+                        let (_, event) =
+                            store.mark_session_waiting(&failed_session_id, reason, failed_at_ms)?;
+                        Ok(((), vec![event]))
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let attempt_id = attempt.id.clone();
         let failure = state
             .commit_and_publish(move |store| {

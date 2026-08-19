@@ -26,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -1311,6 +1311,23 @@ impl Store {
         if already_live {
             return Err(StoreError::SessionAlreadyLive);
         }
+        let resumed_provider_session = match input.provider_session_id.as_deref() {
+            Some(provider_session_id) => transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sessions
+                    WHERE project_id = ?1 AND agent_id = ?2 AND provider = ?3
+                      AND provider_session_id = ?4
+                 )",
+                params![
+                    input.project_id.as_str(),
+                    input.agent_id.as_str(),
+                    provider_value(input.provider),
+                    provider_session_id,
+                ],
+                |row| row.get::<_, bool>(0),
+            )?,
+            None => false,
+        };
         transaction.execute(
             "INSERT INTO sessions (
                 id, project_id, agent_id, provider, runtime_model,
@@ -1321,11 +1338,11 @@ impl Store {
                 observer_health_since_ms, runner_instance_id, runner_runtime,
                 runner_protocol_version, last_hook_event, last_hook_at_ms,
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
-                stop_requested_at_ms
+                stop_requested_at_ms, resumed_provider_session
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
                 NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, ?13, ?13,
-                NULL, NULL, NULL, NULL
+                NULL, NULL, NULL, NULL, ?18
              )",
             params![
                 input.id.as_str(),
@@ -1345,6 +1362,7 @@ impl Store {
                 input.runner_instance_id.as_str(),
                 input.runner_runtime,
                 i64::from(input.runner_protocol_version),
+                resumed_provider_session,
             ],
         )?;
         let session = load_session(&transaction, &input.id)?.ok_or(StoreError::SessionNotFound)?;
@@ -1626,6 +1644,29 @@ impl Store {
         session_id: &SessionId,
         now_ms: i64,
     ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        self.request_session_stop_inner(project_id, session_id, now_ms, false)
+    }
+
+    /// Stops a Codex session whose resumed composer could not acknowledge a
+    /// delivery and durably excludes the failed provider thread from future
+    /// resume selection. Its uncommitted task remains queued for the fresh
+    /// conversation the dispatcher starts after the runner exits.
+    pub fn request_fresh_provider_recovery(
+        &mut self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        self.request_session_stop_inner(project_id, session_id, now_ms, true)
+    }
+
+    fn request_session_stop_inner(
+        &mut self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        now_ms: i64,
+        block_provider_resume: bool,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1634,6 +1675,32 @@ impl Store {
             .ok_or(StoreError::SessionNotFound)?;
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
+        }
+        if block_provider_resume {
+            let resumed_provider_session: bool = transaction.query_row(
+                "SELECT resumed_provider_session FROM sessions WHERE id = ?1",
+                params![session_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !resumed_provider_session {
+                return Err(StoreError::InvalidExecutionMetadata);
+            }
+            let provider_session_id = session
+                .provider_session_id
+                .as_deref()
+                .filter(|_| session.provider == Provider::Codex)
+                .ok_or(StoreError::InvalidExecutionMetadata)?;
+            transaction.execute(
+                "UPDATE sessions
+                 SET provider_resume_blocked_at_ms = ?1
+                 WHERE project_id = ?2 AND agent_id = ?3 AND provider_session_id = ?4",
+                params![
+                    now_ms,
+                    project_id.as_str(),
+                    session.agent_id.as_str(),
+                    provider_session_id
+                ],
+            )?;
         }
         transaction.execute(
             "UPDATE sessions
@@ -1998,6 +2065,7 @@ impl Store {
             .query_row(
                 "SELECT provider_session_id FROM sessions
                  WHERE project_id = ?1 AND agent_id = ?2 AND provider_session_id IS NOT NULL
+                   AND provider_resume_blocked_at_ms IS NULL
                  ORDER BY started_at_ms DESC, id DESC
                  LIMIT 1",
                 params![project_id.as_str(), agent_id.as_str()],
@@ -2005,6 +2073,26 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// Whether this session was launched with a prior provider thread id.
+    /// Stored at creation time so a later SessionStart cannot make a fresh
+    /// Codex conversation look like a resumed one merely by assigning it an
+    /// identity before its first delivery.
+    pub fn session_resumed_provider_thread(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT resumed_provider_session FROM sessions
+                 WHERE project_id = ?1 AND id = ?2",
+                params![project_id.as_str(), session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::SessionNotFound)
     }
 
     /// Marks a live session `waiting_for_input` outside the hook state
@@ -5656,6 +5744,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0024_delivery_attempts.sql"))?;
         transaction.pragma_update(None, "user_version", 24)?;
+        transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0025_provider_resume_recovery.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 25)?;
         transaction.commit()?;
     }
     Ok(())
