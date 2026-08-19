@@ -128,8 +128,10 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 24 after the
-/// connector-event migration, runtime metadata, and legacy permission repair
+/// which always migrates to the current `SCHEMA_VERSION`, 26 after the
+/// connector-event migration, runtime metadata, legacy permission repair,
+/// model policy, delivery attempts, observer reason, and typed notification
+/// cause
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -274,7 +276,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0024_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -287,6 +289,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN observer_reason;
                  PRAGMA user_version = 18;",
             )
             .unwrap();
@@ -870,6 +873,133 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
 }
 
 #[test]
+fn terminal_attach_failure_is_durable_actionable_and_clears_on_recovery() {
+    use factory_core::status::{AttentionAction, AttentionReasonKind, attention_items};
+
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let (failed, _) = store
+        .record_terminal_attach_health(
+            &snapshot.id,
+            Some("terminal attach failed: runner socket unavailable".into()),
+            6,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.observer_health,
+        factory_core::ObserverHealth::Degraded
+    );
+    assert_eq!(failed.observer_health_since_ms, 6);
+    assert_eq!(
+        failed.observer_reason.as_deref(),
+        Some("terminal attach failed: runner socket unavailable")
+    );
+
+    let agent = store
+        .agent_status(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    let item = attention_items(&project_id("factory"), &[agent], &[], false)
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(item.reason.kind, AttentionReasonKind::ObserverProblem);
+    assert_eq!(item.reason.action, AttentionAction::InspectObserver);
+    assert_eq!(item.session_id.as_ref(), Some(&snapshot.id));
+    assert_eq!(item.since_ms, 6);
+
+    let (healthy, _) = store
+        .record_terminal_attach_health(&snapshot.id, None, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        healthy.observer_health,
+        factory_core::ObserverHealth::Healthy
+    );
+    assert!(healthy.wait_reason.is_none());
+    assert!(healthy.observer_reason.is_none());
+    let agent = store
+        .agent_status(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    assert!(attention_items(&project_id("factory"), &[agent], &[], false).is_empty());
+}
+
+#[test]
+fn terminal_attach_health_preserves_independent_wait_causes() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let cases = [
+        (
+            ProviderHookEvent::Notification,
+            "provider question: Which branch?",
+        ),
+        (
+            ProviderHookEvent::PermissionRequest,
+            "Approve shell command?",
+        ),
+    ];
+    let mut now = 6;
+    for (hook, reason) in cases {
+        store
+            .record_hook_event(
+                &snapshot.id,
+                hook,
+                None,
+                false,
+                Some(reason.to_owned()),
+                now,
+            )
+            .unwrap();
+        now += 1;
+        let (failed, _) = store
+            .record_terminal_attach_health(
+                &snapshot.id,
+                Some("terminal attach failed: runner unavailable".into()),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.wait_reason.as_deref(), Some(reason));
+        now += 1;
+        let (recovered, _) = store
+            .record_terminal_attach_health(&snapshot.id, None, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.wait_reason.as_deref(), Some(reason));
+        assert!(recovered.observer_reason.is_none());
+        now += 1;
+    }
+
+    store
+        .mark_session_waiting(&snapshot.id, "delivery unacknowledged".to_owned(), now)
+        .unwrap();
+    let (failed, _) = store
+        .record_terminal_attach_health(
+            &snapshot.id,
+            Some("terminal attach failed: runner unavailable".into()),
+            now + 1,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.wait_reason.as_deref(),
+        Some("delivery unacknowledged")
+    );
+    let (recovered, _) = store
+        .record_terminal_attach_health(&snapshot.id, None, now + 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered.wait_reason.as_deref(),
+        Some("delivery unacknowledged")
+    );
+}
+
+#[test]
 fn permission_request_wait_ends_on_the_next_activity_hook() {
     // Codex 0.147's own approval-prompt hook (docs/dogfood/2026-08-17.md,
     // "a session blocked on a provider approval prompt still shows
@@ -1201,7 +1331,7 @@ fn complete_task_without_an_open_episode_is_a_conflict() {
 }
 
 #[test]
-fn block_task_closes_the_episode_stopped_with_a_blocked_reason() {
+fn block_task_closes_the_episode_and_retry_requeues_it_after_resolution() {
     let mut store = fixture();
     let (snapshot, _) = store
         .create_session(new_session("s1", "factory", "curie"), 5)
@@ -1229,6 +1359,19 @@ fn block_task_closes_the_episode_stopped_with_a_blocked_reason() {
     assert_eq!(blocked.len(), 1);
     assert_eq!(blocked[0].task.id, task_id("task-1"));
     assert_eq!(blocked[0].reason.as_deref(), Some("needs input"));
+
+    let (retried, event) = store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 8)
+        .unwrap();
+    assert_eq!(retried.snapshot.status, TaskStatus::Queued);
+    assert_eq!(retried.blocked_reason, None);
+    assert!(matches!(event.event, FactoryEvent::TaskChanged { .. }));
+    assert!(
+        store
+            .blocked_tasks(&project_id("factory"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

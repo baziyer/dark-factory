@@ -961,6 +961,7 @@ mod tests {
             activity: None,
             activity_inferred: false,
             wait_reason: None,
+            observer_reason: None,
             observer_health: ObserverHealth::Healthy,
             observer_health_since_ms: 1,
             runner_instance_id: RunnerInstanceId::try_from("runner".to_owned()).unwrap(),

@@ -119,6 +119,8 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
                 "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  DROP TABLE delivery_attempts;
+                 ALTER TABLE sessions DROP COLUMN observer_reason;
+                 ALTER TABLE sessions DROP COLUMN notification_kind;
                  UPDATE events SET schema_version = 1;
                  PRAGMA user_version = 22;",
             )

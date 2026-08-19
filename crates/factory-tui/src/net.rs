@@ -95,6 +95,7 @@ pub enum NetMsg {
         tasks: Vec<TaskDetail>,
         runs: Vec<RunSnapshot>,
         sessions: Vec<SessionSnapshot>,
+        event_sequence: i64,
     },
     Event(EventEnvelope),
     /// The bounded connect-time backfill (`REPLAY_BACKFILL_EVENTS`), oldest first — fed through
@@ -356,6 +357,7 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
                 tasks,
                 runs,
                 sessions,
+                event_sequence: after_sequence,
             })
             .is_err()
         {
@@ -546,6 +548,7 @@ mod tests {
     fn empty_fleet(generated_at_ms: i64) -> FleetStatus {
         FleetStatus {
             generated_at_ms,
+            event_sequence: 0,
             auto_mode: false,
             live_session_cap: 4,
             live_sessions: 0,

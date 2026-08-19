@@ -1591,6 +1591,236 @@ mod tests {
     }
 
     #[test]
+    fn delayed_fleet_status_cannot_resurrect_attention_after_a_newer_event() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            None,
+            Some("session"),
+            1,
+        );
+        board.attention = vec![item.clone()];
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 12,
+            occurred_at_ms: 2,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::Working),
+            },
+        });
+        assert!(board.attention.is_empty());
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 11,
+            occurred_at_ms: 1,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::WaitingForInput),
+            },
+        });
+        assert_eq!(
+            board
+                .sessions
+                .get(&SessionId::try_from("session").unwrap())
+                .map(|session| session.state),
+            Some(SessionState::Working)
+        );
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 3,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![item],
+        });
+        assert!(board.attention.is_empty());
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 4,
+            event_sequence: 13,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert!(board.attention.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_high_water_rejects_an_older_delayed_status_after_replay() {
+        let mut board = board();
+        let stale = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            None,
+            Some("session"),
+            1,
+        );
+        board.note_fleet_snapshot_sequence(100);
+        board.apply_replay(vec![factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 100,
+            occurred_at_ms: 2,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::Working),
+            },
+        }]);
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 3,
+            event_sequence: 90,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![stale],
+        });
+        assert!(board.attention_items().is_empty());
+    }
+
+    #[test]
+    fn legacy_unsequenced_status_remains_live_after_an_event() {
+        let mut board = board();
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 1,
+            event_sequence: -1,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 12,
+            occurred_at_ms: 2,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::Working),
+            },
+        });
+        let fresh = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            3,
+        );
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 3,
+            event_sequence: -1,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![fresh.clone()],
+        });
+        assert_eq!(board.attention_items(), vec![fresh]);
+    }
+
+    #[test]
+    fn client_local_attach_failure_uses_action_focus_and_clears_on_recovery() {
+        let mut board = board();
+        let session_id = SessionId::try_from("session").unwrap();
+        board.attention = vec![attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            99,
+        )];
+        board.handle_key(key(KeyCode::Char('g')));
+        assert_eq!(
+            board.attention_focus.as_ref().unwrap().item.reason.action,
+            factory_core::status::AttentionAction::AnswerInTerminal
+        );
+        board.note_local_attach_failure(&session_id, "socket refused\n\u{1b}[2J");
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved),
+            "the previously focused provider action must become stale immediately"
+        );
+        let items = board.attention_items();
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.reason.kind, AttentionReasonKind::ObserverProblem);
+        assert!(
+            item.reason
+                .summary
+                .starts_with("local terminal attach failed: ")
+        );
+        assert!(!item.reason.summary.contains('\n'));
+        assert!(!item.reason.summary.contains('\u{1b}'));
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 1,
+            event_sequence: 1,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert_eq!(
+            board.attention_items()[0].reason.kind,
+            AttentionReasonKind::ObserverProblem
+        );
+
+        let mut daemon_observer = attention(
+            AttentionReasonKind::ObserverProblem,
+            Some("alice"),
+            None,
+            Some("session"),
+            2,
+        );
+        daemon_observer.reason.summary = "daemon terminal attach failed".to_owned();
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 2,
+            event_sequence: 2,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![daemon_observer],
+        });
+        let items = board.attention_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].reason.summary, "daemon terminal attach failed");
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 3,
+            event_sequence: 3,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert!(
+            board.attention_items()[0]
+                .reason
+                .summary
+                .starts_with("local terminal attach failed: ")
+        );
+
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| !focus.resolved)
+        );
+        assert_eq!(board.pane_mode, PaneMode::Board);
+
+        board.clear_local_attach_failure(&session_id);
+        assert!(board.attention_items().is_empty());
+        assert!(board.attention_focus.is_some_and(|focus| focus.resolved));
+    }
+
+    #[test]
     fn footer_help_and_detach_use_the_keyboard_action_paths() {
         let mut keyboard = board();
         let mut mouse = board();
@@ -1644,12 +1874,12 @@ mod tests {
             ),
             resolved: false,
         });
-        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("second").unwrap()));
+        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("first").unwrap()));
         assert!(board.attention_focus.is_none());
         board.handle_key(key(KeyCode::Char('t')));
         assert!(matches!(
             &board.mode,
-            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "second"
+            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "first"
         ));
     }
 

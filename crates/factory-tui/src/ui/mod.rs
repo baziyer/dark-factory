@@ -376,10 +376,11 @@ mod tests {
             &run_fragment,
             "age:",
             "safe action: factoryctl task retry",
-            "Ctrl-]",
+            "terminal typing is not an action",
         ] {
             assert!(text.contains(visible), "missing {visible:?}: {text}");
         }
+        assert!(!text.contains("typing off; Ctrl-] to enter"));
     }
 
     #[test]

@@ -103,7 +103,9 @@ catalogue.
    inference; every client receives the same bounded control-safe summary,
    source IDs, age, and safe action. Attention is not permission to stop or
    replace a worker; recovery begins by preserving or explicitly resolving
-   dirty work.
+   dirty work. Fleet attention snapshots carry the durable event high-water
+   mark from the same store read, so a delayed snapshot cannot overwrite a
+   resolution already observed on the event stream.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
    environment additions, generated configuration) and what they can do

@@ -291,7 +291,7 @@ Actions:
   list      List tasks in a project
   get       Fetch one task
   start     Start a queued task on an agent
-  retry     Requeue a failed or cancelled task
+  retry     Requeue a blocked, failed, or cancelled task
   reorder   Change a queued task's priority/order
   assign    Assign or return a queued task; assignment wakes delivery
   cancel    Cancel a queued or blocked task
@@ -358,7 +358,7 @@ Options:
   -h, --help                 Show this help";
 const TASK_RETRY_HELP: &str = "usage: factoryctl task retry --project ID --task ID
 
-Requeue a failed or cancelled task.
+Requeue a blocked, failed, or cancelled task.
 
 Required:
   --project ID           Project the task belongs to

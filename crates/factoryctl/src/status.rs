@@ -148,6 +148,7 @@ mod tests {
             last_hook_event: None,
             last_hook_at_ms: None,
             wait_reason: None,
+            observer_reason: None,
             observer_health: Default::default(),
             observer_health_since_ms: 1,
             started_at_ms: 1,
@@ -198,6 +199,7 @@ mod tests {
         let project_id: ProjectId = id("factory");
         let status = FleetStatus {
             generated_at_ms: 1,
+            event_sequence: 0,
             auto_mode: true,
             live_session_cap: 4,
             live_sessions: 2,
@@ -341,6 +343,7 @@ mod tests {
     fn empty_fleet_is_one_concise_line() {
         let status = FleetStatus {
             generated_at_ms: 1,
+            event_sequence: 0,
             auto_mode: false,
             live_session_cap: 3,
             live_sessions: 0,
