@@ -5,8 +5,13 @@ A "provider" is one supported coding-agent CLI: today, Claude Code
 implementation (`sh -lc <command>`, no resume, no generated config) that
 exercises the exact same `Provider` boundary as the real two, and is what
 `crates/factoryd/tests/sessions_e2e.rs` drives instead of a real provider
-CLI (see `tests/fixtures/shell-agent.sh`, a POSIX-`sh` fixture speaking the
-same hook/`task done`/`task blocked` protocol a real session would). Start
+CLI (see `tests/fixtures/shell-agent.sh`, a small POSIX-`sh` launcher around
+the byte-oriented `shell-agent.py` fixture, speaking the same
+hook/`task done`/`task blocked` protocol a real session would). Its PTY
+fixture buffers bytes through the complete prompt and emits one
+`UserPromptSubmit` at the CR submission boundary, including for multiline
+prompts; this keeps the test provider faithful to the exact durable attempt
+acknowledgement contract. Start
 there if you want a working example to copy before reading the rest of this
 file. Dark Factory runs each provider as one
 resident interactive process per agent, under a PTY, visible and typeable
