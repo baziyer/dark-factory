@@ -102,6 +102,9 @@ Orchestrators additionally inspect and delegate within their descendant tree.
 Their status and event-loop reads are limited to their configured project;
 event replay advances the global cursor while omitting events from other
 projects and global operator policy events.
+The status envelope's `live_sessions`, `live_session_cap`, `auto_mode`, and
+`event_sequence` remain intentionally global, bounded control-loop metadata;
+they contain no other project's task, agent, attention, or event payload.
 Global policy, agent profile and budget changes, cross-agent mutation, session
 control, and operator actions remain operator-only. HTTP webhook requests are
 separately resolved as HMAC-authenticated integration principals with their

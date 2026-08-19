@@ -948,36 +948,8 @@ async fn handle_request_as(
                 .await?;
             let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
             let at_capacity = live_sessions >= live_session_cap;
-            let mut attention = Vec::new();
-            let mut projects: Vec<status::ProjectStatus> = projects
-                .into_iter()
-                .map(|rows| {
-                    let crate::store::ProjectStatusRows {
-                        project,
-                        agents,
-                        backlog,
-                        blocked,
-                    } = rows;
-                    attention.extend(status::attention_items(
-                        &project.id,
-                        &agents,
-                        &blocked,
-                        at_capacity,
-                    ));
-                    status::ProjectStatus {
-                        project,
-                        agents,
-                        backlog_depth: u32::try_from(backlog.len()).unwrap_or(u32::MAX),
-                        backlog: backlog
-                            .into_iter()
-                            .take(status::MAX_QUEUE_PREVIEW)
-                            .collect(),
-                    }
-                })
-                .collect();
-            if let Principal::Session(session) = principal {
-                projects.retain(|project| project.project.id == session.project_id);
-            }
+            let (mut projects, attention) =
+                scoped_fleet_status(principal, projects, at_capacity);
             populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
@@ -2223,6 +2195,49 @@ async fn handle_request_as(
     }
 }
 
+/// Projects and attention are scoped before projection. This ordering is
+/// security-critical: attention reasons contain task/agent identifiers and
+/// operator actions, so filtering only the rendered project list is too late.
+fn scoped_fleet_status(
+    principal: &Principal,
+    projects: Vec<crate::store::ProjectStatusRows>,
+    at_capacity: bool,
+) -> (Vec<status::ProjectStatus>, Vec<status::AttentionItem>) {
+    let project_scope = match principal {
+        Principal::Session(session) => Some(&session.project_id),
+        Principal::Operator | Principal::Integration(_) => None,
+    };
+    let mut attention = Vec::new();
+    let projects = projects
+        .into_iter()
+        .filter(|rows| project_scope.is_none_or(|project| &rows.project.id == project))
+        .map(|rows| {
+            let crate::store::ProjectStatusRows {
+                project,
+                agents,
+                backlog,
+                blocked,
+            } = rows;
+            attention.extend(status::attention_items(
+                &project.id,
+                &agents,
+                &blocked,
+                at_capacity,
+            ));
+            status::ProjectStatus {
+                project,
+                agents,
+                backlog_depth: u32::try_from(backlog.len()).unwrap_or(u32::MAX),
+                backlog: backlog
+                    .into_iter()
+                    .take(status::MAX_QUEUE_PREVIEW)
+                    .collect(),
+            }
+        })
+        .collect();
+    (projects, attention)
+}
+
 async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
     populate_fleet_worktrees_with(
         projects,
@@ -2386,6 +2401,66 @@ mod worktree_status_tests {
                     && worktree.error.as_deref() == Some("fleet git status deadline exceeded")
             })
         }));
+    }
+}
+
+#[cfg(test)]
+mod fleet_status_scope_tests {
+    use super::*;
+    use factory_core::{AgentRole, ProjectSnapshot, TaskSnapshot, TaskStatus};
+
+    fn rows(project: &str, task: &str, reason: &str) -> crate::store::ProjectStatusRows {
+        let project_id = ProjectId::try_from(project).unwrap();
+        crate::store::ProjectStatusRows {
+            project: ProjectSnapshot {
+                id: project_id.clone(),
+                name: project.to_owned(),
+                root: format!("/tmp/{project}"),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            agents: Vec::new(),
+            backlog: Vec::new(),
+            blocked: vec![factory_core::status::BlockedTaskStatus {
+                task: TaskSnapshot {
+                    id: TaskId::try_from(task).unwrap(),
+                    project_id,
+                    parent_task_id: None,
+                    assigned_agent_id: Some(AgentId::try_from("worker").unwrap()),
+                    title: task.to_owned(),
+                    status: TaskStatus::Blocked,
+                    priority: 0,
+                    created_at_ms: 0,
+                    updated_at_ms: 1,
+                },
+                reason: Some(reason.to_owned()),
+            }],
+        }
+    }
+
+    #[test]
+    fn orchestrator_attention_is_filtered_before_projection() {
+        let principal = Principal::Session(auth::SessionPrincipal {
+            project_id: ProjectId::try_from("project-a").unwrap(),
+            agent_id: AgentId::try_from("orchestrator").unwrap(),
+            session_id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+            parent_agent_id: None,
+            role: AgentRole::Orchestrator,
+        });
+        let (projects, attention) = scoped_fleet_status(
+            &principal,
+            vec![
+                rows("project-a", "task-a", "visible reason"),
+                rows("project-b", "task-b", "secret other-project reason"),
+            ],
+            false,
+        );
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project.id, ProjectId::try_from("project-a").unwrap());
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].project_id, ProjectId::try_from("project-a").unwrap());
+        assert_eq!(attention[0].reason.summary, "visible reason");
     }
 }
 
