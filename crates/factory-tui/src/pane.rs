@@ -457,26 +457,62 @@ fn spawn_attach_reader_thread(
     attach_error: Arc<Mutex<Option<String>>>,
 ) {
     std::thread::spawn(move || {
+        let mut next_offset = None;
         attach::read_frames(reader, |frame| {
             match frame {
-                ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
-                    Ok(decoded) => {
-                        attached.store(true, Ordering::Release);
-                        if let Ok(mut parser) = parser.lock() {
-                            parser.process(&decoded);
-                            dirty.store(true, Ordering::Release);
+                ServerFrame::TerminalOutput { offset, bytes, .. } => {
+                    match decode_terminal_bytes(&bytes) {
+                        Ok(decoded) => {
+                            if next_offset.is_some_and(|expected| expected != offset) {
+                                if let Ok(mut guard) = attach_error.lock() {
+                                    *guard = Some(format!(
+                                        "terminal output continuity broke at offset {offset}"
+                                    ));
+                                }
+                                return false;
+                            }
+                            next_offset = Some(offset.saturating_add(decoded.len() as u64));
+                            attached.store(true, Ordering::Release);
+                            if let Ok(mut parser) = parser.lock() {
+                                parser.process(&decoded);
+                                dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut guard) = attach_error.lock() {
+                                *guard = Some(format!("invalid terminal bytes: {error}"));
+                            }
+                            return false;
                         }
                     }
-                    Err(error) => {
-                        if let Ok(mut guard) = attach_error.lock() {
-                            *guard = Some(format!("invalid terminal bytes: {error}"));
+                }
+                ServerFrame::TerminalAttachReady {
+                    initial_state,
+                    start_offset,
+                    ..
+                } => {
+                    next_offset = Some(start_offset);
+                    match decode_terminal_bytes(&initial_state) {
+                        Ok(decoded) => {
+                            attached.store(true, Ordering::Release);
+                            if let Ok(mut parser) = parser.lock() {
+                                parser.process(&decoded);
+                                dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut guard) = attach_error.lock() {
+                                *guard = Some(format!("invalid terminal state: {error}"));
+                            }
+                            return false;
                         }
                     }
-                },
-                ServerFrame::TerminalAttachReady { .. } => {}
+                }
                 ServerFrame::TerminalAttachGap {
                     generation,
+                    base_generation,
                     base_offset,
+                    start_offset,
                     end_offset,
                     requested_offset,
                     reason,
@@ -484,7 +520,7 @@ fn spawn_attach_reader_thread(
                 } => {
                     if let Ok(mut guard) = attach_error.lock() {
                         *guard = Some(format!(
-                            "attach cursor unavailable: {reason}; retained offsets {base_offset}..{end_offset}, requested {requested_offset}, generation {generation}"
+                            "attach cursor unavailable: {reason}; retained generation {base_generation} offsets {base_offset}..{end_offset}, requested {requested_offset}, generation {generation}, replay start {start_offset}"
                         ));
                     }
                     return false;

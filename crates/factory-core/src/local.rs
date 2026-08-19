@@ -685,8 +685,12 @@ pub enum ServerFrame {
         protocol_version: u16,
         session_id: SessionId,
         generation: u64,
+        base_generation: u64,
         base_offset: u64,
+        start_offset: u64,
         end_offset: u64,
+        #[serde(default)]
+        initial_state: String,
     },
     /// Actionable recovery metadata when a requested cursor is no longer
     /// available or is ahead of the runner's live head.
@@ -694,7 +698,9 @@ pub enum ServerFrame {
         protocol_version: u16,
         session_id: SessionId,
         generation: u64,
+        base_generation: u64,
         base_offset: u64,
+        start_offset: u64,
         end_offset: u64,
         requested_generation: Option<u64>,
         requested_offset: u64,

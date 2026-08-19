@@ -632,8 +632,11 @@ fn spawn_terminal_attach(
                     protocol_version: PROTOCOL_VERSION,
                     session_id: session_id.clone(),
                     generation: info.generation,
+                    base_generation: info.base_generation,
                     base_offset: info.base_offset,
+                    start_offset: info.start_offset,
                     end_offset: info.end_offset,
+                    initial_state: info.initial_state,
                 })
                 .await
                 .is_err()
@@ -668,7 +671,9 @@ fn spawn_terminal_attach(
                 Err(error) => {
                     if let RunnerClientError::TerminalAttachGap {
                         generation,
+                        base_generation,
                         base_offset,
+                        start_offset,
                         end_offset,
                         requested_generation,
                         requested_offset,
@@ -680,7 +685,9 @@ fn spawn_terminal_attach(
                                 protocol_version: PROTOCOL_VERSION,
                                 session_id: session_id.clone(),
                                 generation,
+                                base_generation,
                                 base_offset,
+                                start_offset,
                                 end_offset,
                                 requested_generation,
                                 requested_offset,
@@ -2901,6 +2908,9 @@ fn runner_control_failure(error: RunnerClientError, action: &'static str) -> Api
         RunnerClientError::RunnerRejected {
             code: RunnerErrorCode::InvalidRequest,
         } => ApiFailure::Invalid(format!("runner rejected the {action} request")),
+        RunnerClientError::BoundedAttachUnsupported => ApiFailure::Invalid(
+            "runner does not support bounded terminal attach; use --full-history during the rolling upgrade".into(),
+        ),
         RunnerClientError::InvalidStopGrace { found } => ApiFailure::Invalid(format!(
             "runner stop grace must be at most 60000 ms, got {found}"
         )),

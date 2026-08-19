@@ -77,6 +77,16 @@ fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
     }
 }
 
+fn attach_capabilities() -> RunnerFrame {
+    RunnerFrame::TerminalAttachCapabilities {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 4,
+        base_generation: 3,
+        base_offset: 100,
+        end_offset: 200,
+    }
+}
+
 struct FakeRunner {
     _directory: tempfile::TempDir,
     runtime_dir: PathBuf,
@@ -691,6 +701,76 @@ async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
                 mode: factory_core::runner::TerminalAttachMode::Legacy,
             }
         )]
+    );
+}
+
+#[tokio::test]
+async fn bounded_attach_refuses_an_old_runner_instead_of_falling_back_to_full_replay() {
+    let fake = fake_runner(vec![vec![encoded(RunnerFrame::Error {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        code: RunnerErrorCode::InvalidRequest,
+        message: "unknown terminal capability request".into(),
+    })]])
+    .await;
+    let result = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
+        .await;
+    assert!(matches!(
+        result,
+        Err(RunnerClientError::BoundedAttachUnsupported)
+    ));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![RequestEnvelope::new(
+            run_id(),
+            instance_id(),
+            RunnerRequest::TerminalAttachCapabilities,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn bounded_attach_negotiates_exact_generation_and_replay_start() {
+    let fake = fake_runner(vec![
+        vec![encoded(attach_capabilities())],
+        vec![
+            encoded(RunnerFrame::TerminalAttachReady {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                generation: 4,
+                base_generation: 3,
+                base_offset: 100,
+                start_offset: 150,
+                end_offset: 200,
+                initial_state: factory_core::runner::encode_terminal_bytes(b"\x1bc"),
+            }),
+            encoded(terminal_output(150, "")),
+        ],
+    ])
+    .await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
+        .await
+        .unwrap();
+    assert_eq!(subscription.info().unwrap().base_generation, 3);
+    assert_eq!(subscription.info().unwrap().start_offset, 150);
+    assert_eq!(subscription.next_chunk().await.unwrap(), (150, "".into()));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::TerminalAttachCapabilities,
+            ),
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::AttachTerminal {
+                    since_offset: 0,
+                    mode: factory_core::runner::TerminalAttachMode::Tail,
+                },
+            ),
+        ]
     );
 }
 

@@ -140,6 +140,11 @@ pub enum RunnerRequest {
         #[serde(default, skip_serializing_if = "TerminalAttachMode::is_legacy")]
         mode: TerminalAttachMode,
     },
+    /// Negotiates the retained-terminal attach contract before a daemon uses
+    /// bounded replay or an offset/generation cursor. Older runners reject
+    /// this request explicitly, so a new daemon never mistakes an unknown
+    /// mode for an unbounded legacy replay.
+    TerminalAttachCapabilities,
     /// Writes operator input to the PTY master. `bytes` is
     /// [`encode_terminal_bytes`]-encoded and at most
     /// [`MAX_TERMINAL_INPUT_BYTES`] once decoded.
@@ -201,18 +206,33 @@ pub enum RunnerFrame {
         offset: u64,
         bytes: String,
     },
+    /// Retained-log bounds advertised before a bounded attach is attempted.
+    TerminalAttachCapabilities {
+        protocol_version: u16,
+        generation: u64,
+        base_generation: u64,
+        base_offset: u64,
+        end_offset: u64,
+    },
     /// Metadata for an explicit attach contract. It precedes retained bytes.
     TerminalAttachReady {
         protocol_version: u16,
         generation: u64,
+        base_generation: u64,
         base_offset: u64,
+        start_offset: u64,
         end_offset: u64,
+        /// Base64 terminal reset/state prefix, not included in byte offsets.
+        #[serde(default)]
+        initial_state: String,
     },
     /// The requested cursor cannot be replayed from the retained generation.
     TerminalAttachGap {
         protocol_version: u16,
         generation: u64,
+        base_generation: u64,
         base_offset: u64,
+        start_offset: u64,
         end_offset: u64,
         requested_generation: Option<u64>,
         requested_offset: u64,
@@ -240,6 +260,9 @@ impl RunnerFrame {
                 protocol_version, ..
             }
             | Self::TerminalOutput {
+                protocol_version, ..
+            }
+            | Self::TerminalAttachCapabilities {
                 protocol_version, ..
             }
             | Self::TerminalAttachReady {

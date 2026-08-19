@@ -7,6 +7,7 @@ use factory_core::{
     runner::{
         MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
         RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode,
+        decode_terminal_bytes,
     },
 };
 use thiserror::Error;
@@ -160,6 +161,27 @@ impl RunnerClient {
         since_offset: u64,
         mode: TerminalAttachMode,
     ) -> Result<TerminalSubscription, RunnerClientError> {
+        let requested_mode = mode.clone();
+        let mut legacy_fallback = false;
+        let mode = match mode {
+            TerminalAttachMode::Legacy => TerminalAttachMode::Legacy,
+            requested @ (TerminalAttachMode::Tail | TerminalAttachMode::Offset { .. }) => {
+                if !self.terminal_attach_capabilities().await? {
+                    return Err(RunnerClientError::BoundedAttachUnsupported);
+                }
+                requested
+            }
+            TerminalAttachMode::FullHistory => {
+                if self.terminal_attach_capabilities().await? {
+                    TerminalAttachMode::FullHistory
+                } else {
+                    // This mode is exactly the old since_offset=0 contract.
+                    // Bounded modes never silently become legacy replay.
+                    legacy_fallback = true;
+                    TerminalAttachMode::Legacy
+                }
+            }
+        };
         let mut reader = self
             .request(RunnerRequest::AttachTerminal { since_offset, mode })
             .await?;
@@ -174,20 +196,28 @@ impl RunnerClient {
                     }
                     RunnerFrame::TerminalAttachReady {
                         generation,
+                        base_generation,
                         base_offset,
+                        start_offset,
                         end_offset,
+                        initial_state,
                         ..
                     } => (
                         Some(TerminalAttachInfo {
                             generation,
+                            base_generation,
                             base_offset,
+                            start_offset,
                             end_offset,
+                            initial_state,
                         }),
                         None,
                     ),
                     RunnerFrame::TerminalAttachGap {
                         generation,
+                        base_generation,
                         base_offset,
+                        start_offset,
                         end_offset,
                         requested_generation,
                         requested_offset,
@@ -196,7 +226,9 @@ impl RunnerClient {
                     } => {
                         return Err(RunnerClientError::TerminalAttachGap {
                             generation,
+                            base_generation,
                             base_offset,
+                            start_offset,
                             end_offset,
                             requested_generation,
                             requested_offset,
@@ -209,15 +241,43 @@ impl RunnerClient {
                     frame => return Err(frame_error(frame)),
                 }
             }
-            // v1 runners had no empty-replay acknowledgement. A silent surviving
-            // runner is still a valid attachment; retain its reader for later output.
-            Err(_) => (None, None),
+            // A timeout is not evidence that an old runner can honor bounded
+            // replay. Capability negotiation above has already decided this.
+            Err(_) if matches!(requested_mode, TerminalAttachMode::Legacy) || legacy_fallback => {
+                (None, None)
+            }
+            Err(_) => return Err(RunnerClientError::BoundedAttachUnsupported),
         };
         Ok(TerminalSubscription {
             reader,
+            next_offset: info.as_ref().map(|attach| attach.start_offset),
             info,
             pending,
         })
+    }
+
+    async fn terminal_attach_capabilities(&self) -> Result<bool, RunnerClientError> {
+        let mut reader = self
+            .request(RunnerRequest::TerminalAttachCapabilities)
+            .await?;
+        match timeout(CONTROL_TIMEOUT, reader.read_frame()).await {
+            Ok(Ok(frame)) => {
+                validate_protocol(frame.protocol_version())?;
+                match frame {
+                    RunnerFrame::TerminalAttachCapabilities { .. } => Ok(true),
+                    RunnerFrame::Error {
+                        code: RunnerErrorCode::InvalidRequest | RunnerErrorCode::UnsupportedProtocol,
+                        ..
+                    } => Ok(false),
+                    RunnerFrame::Error { code, .. } => {
+                        Err(RunnerClientError::RunnerRejected { code })
+                    }
+                    frame => Err(frame_error(frame)),
+                }
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(false),
+        }
     }
 
     /// Writes operator input to a terminal-mode run's PTY. `bytes` is
@@ -317,36 +377,46 @@ pub struct TerminalSubscription {
     reader: FrameReader,
     info: Option<TerminalAttachInfo>,
     pending: Option<(u64, String)>,
+    next_offset: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerminalAttachInfo {
     pub generation: u64,
+    pub base_generation: u64,
     pub base_offset: u64,
+    pub start_offset: u64,
     pub end_offset: u64,
+    pub initial_state: String,
 }
 
 impl TerminalSubscription {
     #[must_use]
-    pub const fn info(&self) -> Option<TerminalAttachInfo> {
-        self.info
+    pub fn info(&self) -> Option<TerminalAttachInfo> {
+        self.info.clone()
     }
 
     /// Returns the next chunk's byte-stream offset and base64-encoded bytes.
     pub async fn next_chunk(&mut self) -> Result<(u64, String), RunnerClientError> {
         if let Some(chunk) = self.pending.take() {
+            self.validate_chunk(&chunk)?;
             return Ok(chunk);
         }
         let frame = self.reader.read_frame().await?;
         validate_protocol(frame.protocol_version())?;
         match frame {
-            RunnerFrame::TerminalOutput { offset, bytes, .. } => Ok((offset, bytes)),
+            RunnerFrame::TerminalOutput { offset, bytes, .. } => {
+                self.validate_chunk(&(offset, bytes.clone()))?;
+                Ok((offset, bytes))
+            }
             RunnerFrame::TerminalAttachReady { .. } => Err(RunnerClientError::UnexpectedFrame {
                 expected: "terminal output",
             }),
             RunnerFrame::TerminalAttachGap {
                 generation,
+                base_generation,
                 base_offset,
+                start_offset,
                 end_offset,
                 requested_generation,
                 requested_offset,
@@ -354,7 +424,9 @@ impl TerminalSubscription {
                 ..
             } => Err(RunnerClientError::TerminalAttachGap {
                 generation,
+                base_generation,
                 base_offset,
+                start_offset,
                 end_offset,
                 requested_generation,
                 requested_offset,
@@ -363,6 +435,21 @@ impl TerminalSubscription {
             RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
             frame => Err(frame_error(frame)),
         }
+    }
+
+    fn validate_chunk(&mut self, chunk: &(u64, String)) -> Result<(), RunnerClientError> {
+        let (offset, encoded) = chunk;
+        let bytes = decode_terminal_bytes(encoded).map_err(|_| RunnerClientError::InvalidJson)?;
+        if let Some(expected) = self.next_offset
+            && *offset != expected
+        {
+            return Err(RunnerClientError::TerminalAttachContinuity {
+                expected,
+                found: *offset,
+            });
+        }
+        self.next_offset = Some(offset.saturating_add(bytes.len() as u64));
+        Ok(())
     }
 }
 
@@ -527,6 +614,9 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
                 expected: "runner command acknowledgement",
             }
         }
+        RunnerFrame::TerminalAttachCapabilities { .. } => RunnerClientError::UnexpectedFrame {
+            expected: "runner command acknowledgement",
+        },
     }
 }
 
@@ -627,12 +717,18 @@ pub enum RunnerClientError {
     UnexpectedFrame { expected: &'static str },
     #[error("runner rejected the request with {code:?}")]
     RunnerRejected { code: RunnerErrorCode },
+    #[error("runner does not advertise bounded terminal attach")]
+    BoundedAttachUnsupported,
+    #[error("terminal output continuity broke: expected offset {expected}, found {found}")]
+    TerminalAttachContinuity { expected: u64, found: u64 },
     #[error(
         "terminal attach cursor is unavailable ({reason}); retained generation {generation}, offsets {base_offset}..{end_offset}"
     )]
     TerminalAttachGap {
         generation: u64,
+        base_generation: u64,
         base_offset: u64,
+        start_offset: u64,
         end_offset: u64,
         requested_generation: Option<u64>,
         requested_offset: u64,
