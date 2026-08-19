@@ -462,9 +462,6 @@ fn sync_panes(
                 changed = true;
                 continue;
             } else {
-                if pane.is_ready() {
-                    board.clear_local_attach_failure(&session_id);
-                }
                 continue;
             }
         }
@@ -508,12 +505,24 @@ fn sync_panes(
         }
     }
 
-    let ready = board.focus_target().is_some_and(|session_id| {
-        panes
-            .get(&session_id)
-            .is_some_and(|pane| pane.is_ready() && pane.attach_error().is_none())
+    let ready_session = board.focus_target().and_then(|session_id| {
+        panes.get(&session_id).and_then(|pane| {
+            (pane.is_ready() && pane.attach_error().is_none()).then_some(session_id)
+        })
     });
-    changed |= board.pane_ready != ready;
+    changed |= reconcile_pane_readiness(board, ready_session);
+    changed
+}
+
+/// Applies the final readiness observation for the focused pane and its coupled local refusal
+/// state. Keeping this transition together makes a late-ready pane unable to leave `pane_ready`
+/// true while stale refusal attention remains visible.
+fn reconcile_pane_readiness(board: &mut Board, ready_session: Option<SessionId>) -> bool {
+    let ready = ready_session.is_some();
+    if let Some(session_id) = ready_session {
+        board.clear_local_attach_failure(&session_id);
+    }
+    let mut changed = board.pane_ready != ready;
     board.pane_ready = ready;
     if !ready && board.pane_mode == model::PaneMode::Typing {
         board.pane_mode = model::PaneMode::Board;
@@ -1198,6 +1207,42 @@ mod main_tests {
         assert!(board.attention_items().is_empty());
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn late_ready_reconciliation_clears_refusal_with_readiness_transition() {
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(session_id.clone());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        assert!(
+            board.note_attach_refusal(&factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: session_id.clone(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Stopped),
+                reason: factory_core::local::AttachRefusalReason::SessionEnded,
+            })
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+
+        assert!(!reconcile_pane_readiness(&mut board, None));
+        assert!(!board.pane_ready);
+        assert!(!board.attention_items().is_empty());
+
+        assert!(reconcile_pane_readiness(&mut board, Some(session_id)));
+        assert!(board.pane_ready);
+        assert!(board.attention_items().is_empty());
     }
 
     #[test]
