@@ -165,12 +165,20 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
 }
 
 fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+    if let Some(focus) = board
+        .attention_focus
+        .as_ref()
+        .filter(|focus| !focus.resolved)
+    {
+        crate::ui::agent::render_attention_card(frame, area, board, focus, hits);
+        return;
+    }
     let inner = ui::bordered(
         frame,
         area,
         ui::block(" NEEDS YOU — priority, then oldest "),
     );
-    let items = board.attention_items();
+    let items = board.decision_items();
     if items.is_empty() {
         ui::dim(frame, inner, "nothing needs you");
         return;
@@ -199,7 +207,8 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
                 ),
                 Span::raw(format!(
                     "{} :: {}/{subject}",
-                    item.reason.summary, item.project_id
+                    factory_core::status::display_text(&item.reason.summary),
+                    item.project_id
                 )),
             ])
         })
@@ -267,7 +276,7 @@ mod tests {
             Vec::new(),
         );
         board.attention = vec![attention(
-            AttentionReasonKind::Inferred,
+            AttentionReasonKind::BudgetExhausted,
             Some("alice"),
             Some("task"),
             None,
@@ -293,8 +302,52 @@ mod tests {
             text.contains("no rece"),
             "activity should remain visible after priority text"
         );
-        assert!(text.contains("inference"));
-        assert!(text.contains("lifecycle state"));
+        assert!(text.contains("budget exhausted"));
+    }
+
+    #[test]
+    fn selected_needs_you_row_keeps_building_visible_and_renders_decision_card() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![task(
+                "blocked",
+                "proj",
+                TaskStatus::Blocked,
+                Some("alice"),
+                0,
+            )],
+            Vec::new(),
+            Vec::new(),
+        );
+        let item = attention(
+            AttentionReasonKind::BudgetExhausted,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            0,
+        );
+        board.attention = vec![item.clone()];
+        board.attention_focus = Some(crate::model::AttentionFocus {
+            item,
+            resolved: false,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &board, &mut HitMap::default()))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("BUILDING"));
+        assert!(text.contains("ACTION — NEEDS YOU"));
+        assert!(text.contains("Reset budget"));
+        assert!(text.contains("task: blocked"));
     }
 
     #[test]

@@ -119,11 +119,20 @@ catalogue.
    reasons separate provider questions/permissions from worker blocks,
    delivery or observation failures, exhausted budgets, and lifecycle
    inference; every client receives the same bounded control-safe summary,
-   source IDs, age, and safe action. Attention is not permission to stop or
-   replace a worker; recovery begins by preserving or explicitly resolving
-   dirty work. Fleet attention snapshots carry the durable event high-water
-   mark from the same store read, so a delayed snapshot cannot overwrite a
-   resolution already observed on the event stream.
+   source IDs, age, and safe action. NEEDS YOU is a decision inbox: only
+   reasons with a valid typed operator decision enter it. Unproven lifecycle
+   inference has no valid typed operator action and remains a control-plane
+   concern alongside delivery, observer, capacity, and other deterministic
+   recovery. Selecting a row keeps BUILDING visible and shows
+   the same bounded cause, exact evidence, typed choices, optional safe
+   recommendation, and consequences in both `factoryctl status` and the TUI.
+   Permission and budget choices have no default and require explicit selection;
+   budget reset also requires a second stale-safe confirmation.
+   Attention is not permission to stop or replace a worker; recovery begins by
+   preserving or explicitly resolving dirty work. Fleet attention snapshots carry the
+   durable event high-water mark from the same store read, so a delayed
+   snapshot cannot overwrite a resolution already observed on the event
+   stream.
    The agent's `current_session_id` is the exact live-session relation used
    by BUILDING activity: it is derived from sessions whose `ended_at_ms` is
    null, and session create/end transactions publish the matching

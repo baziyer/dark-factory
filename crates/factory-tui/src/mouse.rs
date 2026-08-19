@@ -21,6 +21,7 @@ pub enum Target {
     Agent(AgentId),
     Task(TaskId),
     Attention(AttentionItem),
+    AttentionChoice(AttentionItem, usize),
     Pane(SessionId),
 }
 

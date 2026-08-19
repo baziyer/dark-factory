@@ -274,8 +274,8 @@ mod tests {
             Vec::new(),
         );
         let attention = attention(
-            AttentionReasonKind::WorkerBlocked,
-            None,
+            AttentionReasonKind::BudgetExhausted,
+            Some("alice"),
             Some("blocked"),
             None,
             0,
@@ -337,7 +337,7 @@ mod tests {
         assert!(text.contains("session: session-1"));
         assert!(text.contains("age: 1m"));
         assert!(text.contains("safe action:"));
-        assert!(text.contains("typing off; Ctrl-] to enter"));
+        assert!(text.contains("terminal typing is not an action"));
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
             )],
         );
         let mut item = attention(
-            AttentionReasonKind::WorkerBlocked,
+            AttentionReasonKind::BudgetExhausted,
             Some(&agent_id),
             Some(&task_id),
             Some(&session_id),
@@ -393,7 +393,7 @@ mod tests {
         let session_fragment = truncate_middle(&session_id, 31);
         let run_fragment = truncate_middle(&run_id, 33);
         for visible in [
-            "worker blocked",
+            "budget exhausted",
             "project:",
             &project_fragment,
             "agent:",
@@ -405,7 +405,7 @@ mod tests {
             "run:",
             &run_fragment,
             "age:",
-            "safe action: factoryctl task retry",
+            "safe action: factoryctl agent budget reset",
             "terminal typing is not an action",
         ] {
             assert!(text.contains(visible), "missing {visible:?}: {text}");

@@ -18,9 +18,10 @@ project unless `--project` selects one.
 ## Screens
 
 BUILDING shows the full factory. Each project is a building. Each agent has a
-floor. The NEEDS YOU list includes agents and tasks. It lists attention items
-globally, most urgent and then oldest first. Each row names the actionable
-reason instead of collapsing every condition into a generic input request.
+floor. NEEDS YOU is the decision subset of fleet attention, globally sorted
+most urgent and then oldest first. Free-form worker blocks and deterministic
+recovery remain diagnostics until the daemon can prove a typed human choice;
+they do not become operator decisions merely because work stopped.
 
 BUILDING separates durable lifecycle from current activity. Each row names the
 most recent bounded hook/tool activity and its age; it says `no recent activity`
@@ -42,11 +43,12 @@ active work, durable messages, and settings. Settings distinguish the
 configured model/reasoning tier and durable selection reason from the
 historical runtime-resolved session values. The orchestrator also shows the
 project backlog and worker queues; messages remain the inbox and review
-attention remains separate. `g` or a NEEDS YOU click opens the
-same reason card here, with task/session/age and a safe action, while terminal
-typing remains off until explicitly entered. If the reason resolves
-concurrently, the stale row disappears and an already-open card says it
-changed before action.
+attention remains separate. `g` or a NEEDS YOU click keeps BUILDING visible
+and opens the shared decision card in its right pane, with bounded cause,
+exact source identities, typed choices, and consequences. Provider permission
+and budget reset have no default; budget reset also requires confirmation.
+If the reason resolves concurrently, the stale row disappears and an
+already-open card says it changed before action.
 
 ## Mouse
 

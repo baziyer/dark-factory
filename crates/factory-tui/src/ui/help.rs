@@ -155,6 +155,16 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
         PendingAction::DeleteTask(task_id) => {
             ("delete task?".to_owned(), format!("delete task#{task_id}?"))
         }
+        PendingAction::ResetBudget { source, .. } => (
+            "reset budget?".to_owned(),
+            format!(
+                "reset the durable budget for {}?",
+                source
+                    .agent_id
+                    .as_ref()
+                    .map_or("this agent", factory_core::AgentId::as_str)
+            ),
+        ),
         PendingAction::StopSession { session_id, .. } => (
             "stop agent?".to_owned(),
             format!("stop session {session_id}?"),
@@ -185,6 +195,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
         PromptKind::ReorderTask(task_id) => format!("reorder — task#{task_id}"),
+        PromptKind::AttentionAnswer { session_id, .. } => {
+            format!("decision answer — session#{session_id}")
+        }
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
         PromptKind::Capacity => "live-session capacity".to_owned(),
@@ -315,7 +328,7 @@ const HELP_TEXT: &[&str] = &[
     "o          message the orchestrator (picks by Tab if more than one)",
     "p          focus a project (remembered for next time)",
     "x          stop the selected agent — 2-press confirm",
-    "g          jump to the next agent in NEEDS YOU",
+    "g          jump to the next decision in NEEDS YOU",
     "i/Enter    AGENT: type into the live terminal",
     "Ctrl-]     return terminal input to BOARD mode",
     "z          maximise/restore terminal     PgUp/PgDn scroll",

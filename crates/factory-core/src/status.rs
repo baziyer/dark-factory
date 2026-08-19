@@ -26,6 +26,8 @@ use crate::{
 pub const MAX_QUEUE_PREVIEW: usize = 10;
 /// Maximum displayed characters in any operator-controlled attention summary.
 pub const MAX_ATTENTION_SUMMARY_CHARS: usize = 160;
+/// Maximum displayed characters in the compact decision evidence line.
+pub const MAX_ATTENTION_EVIDENCE_CHARS: usize = 240;
 
 const fn legacy_event_sequence() -> i64 {
     -1
@@ -202,6 +204,8 @@ impl AttentionReasonKind {
 pub enum AttentionAction {
     AnswerInTerminal,
     ReviewProviderPermission,
+    ApproveProviderPermission,
+    RejectProviderPermission,
     InspectRecovery,
     InspectObserver,
     ResetBudget,
@@ -232,6 +236,26 @@ pub struct AttentionItem {
     /// When this condition began (session state change, task update, ...).
     pub since_ms: i64,
     pub reason: AttentionReason,
+}
+
+/// One safe, typed choice in the BUILDING decision inbox. The daemon remains
+/// the authority for validating and applying the corresponding request; this
+/// is only the shared projection used by `factoryctl` and the TUI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionChoice {
+    pub label: String,
+    pub action: AttentionAction,
+    pub consequence: String,
+}
+
+/// The bounded operator decision shown for one NEEDS YOU item.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionDecision {
+    pub cause: String,
+    pub evidence: String,
+    pub choices: Vec<AttentionChoice>,
+    /// `None` is fail-closed: the operator must choose explicitly.
+    pub recommended: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -315,6 +339,82 @@ impl<'de> Deserialize<'de> for AttentionItem {
 }
 
 impl AttentionItem {
+    /// Machine recovery belongs to the daemon/control plane, not the
+    /// operator's decision inbox. Inferred state and free-form worker blocks
+    /// are retained for diagnostics, but neither proves that only a human can
+    /// resolve the condition, so both stay out of NEEDS YOU.
+    #[must_use]
+    pub const fn needs_operator_decision(&self) -> bool {
+        matches!(
+            self.reason.kind,
+            AttentionReasonKind::ProviderQuestion
+                | AttentionReasonKind::ProviderPermission
+                | AttentionReasonKind::BudgetExhausted
+                | AttentionReasonKind::PausedWithWork
+        )
+    }
+
+    /// Builds the same bounded card data for CLI and TUI. Choices are typed
+    /// `AttentionAction`s, so neither client invents a terminal-side action.
+    #[must_use]
+    pub fn decision(&self) -> AttentionDecision {
+        let evidence = display_text(&format!(
+            "project: {} agent: {} task: {} session: {} run: {}",
+            self.project_id,
+            self.agent_id.as_ref().map_or("—", AgentId::as_str),
+            self.task_id.as_ref().map_or("—", TaskId::as_str),
+            self.session_id.as_ref().map_or("—", SessionId::as_str),
+            self.run_id.as_ref().map_or("—", crate::RunId::as_str),
+        ));
+        let choices = match self.reason.kind {
+            AttentionReasonKind::WorkerBlocked => Vec::new(),
+            AttentionReasonKind::PausedWithWork => vec![AttentionChoice {
+                label: "Resume agent".to_owned(),
+                action: AttentionAction::ResumeAgent,
+                consequence: "allows queued work to be delivered to this agent".to_owned(),
+            }],
+            AttentionReasonKind::BudgetExhausted => vec![AttentionChoice {
+                label: "Reset budget".to_owned(),
+                action: AttentionAction::ResetBudget,
+                consequence: "resets the durable tool-call budget before more work runs".to_owned(),
+            }],
+            AttentionReasonKind::ProviderQuestion => vec![AttentionChoice {
+                label: "Answer question".to_owned(),
+                action: AttentionAction::AnswerInTerminal,
+                consequence: "sends the answer to the waiting provider session".to_owned(),
+            }],
+            AttentionReasonKind::ProviderPermission => vec![
+                AttentionChoice {
+                    label: "Approve".to_owned(),
+                    action: AttentionAction::ApproveProviderPermission,
+                    consequence: "allows the exact provider request to continue".to_owned(),
+                },
+                AttentionChoice {
+                    label: "Reject".to_owned(),
+                    action: AttentionAction::RejectProviderPermission,
+                    consequence: "denies the exact provider request".to_owned(),
+                },
+            ],
+            AttentionReasonKind::Inferred => Vec::new(),
+            AttentionReasonKind::DeliveryRecovery
+            | AttentionReasonKind::ObserverProblem
+            | AttentionReasonKind::WaitingForCapacity => Vec::new(),
+        };
+        AttentionDecision {
+            cause: display_text(&self.reason.summary),
+            evidence: evidence
+                .chars()
+                .take(MAX_ATTENTION_EVIDENCE_CHARS)
+                .collect(),
+            choices,
+            recommended: matches!(
+                self.reason.kind,
+                AttentionReasonKind::ProviderQuestion | AttentionReasonKind::PausedWithWork
+            )
+            .then_some(0),
+        }
+    }
+
     fn legacy_kind(&self) -> AttentionKind {
         match self.reason.kind {
             AttentionReasonKind::ProviderQuestion | AttentionReasonKind::ProviderPermission => {
@@ -342,7 +442,13 @@ impl AttentionItem {
                 "review the question, then enter terminal typing".to_owned()
             }
             AttentionAction::ReviewProviderPermission => {
-                "review the provider prompt before entering terminal typing".to_owned()
+                "choose Approve or Reject for the exact provider request".to_owned()
+            }
+            AttentionAction::ApproveProviderPermission => {
+                "approve the provider request with the exact yes decision".to_owned()
+            }
+            AttentionAction::RejectProviderPermission => {
+                "reject the provider request with the exact no decision".to_owned()
             }
             AttentionAction::InspectRecovery => self.session_id.as_ref().map_or_else(
                 || "inspect daemon recovery; no human answer is pending".to_owned(),
@@ -1135,6 +1241,84 @@ mod tests {
     }
 
     #[test]
+    fn decision_inbox_requires_a_typed_human_decision_and_fails_closed_on_budget() {
+        let project = ProjectId::try_from("p").unwrap();
+        let agents = vec![status(
+            agent("a", true),
+            None,
+            vec![task("t1", TaskStatus::Queued, 1)],
+        )];
+        let mut items = attention_items(&project, &agents, &[], false);
+        let worker = AttentionItem {
+            level: Attention::NeedsInput,
+            project_id: project.clone(),
+            agent_id: Some(AgentId::try_from("a").unwrap()),
+            task_id: Some(TaskId::try_from("t1").unwrap()),
+            session_id: None,
+            run_id: None,
+            since_ms: 1,
+            reason: reason(
+                AttentionReasonKind::WorkerBlocked,
+                "needs a human choice\u{1b}[2J".to_owned(),
+                "worker blocked",
+                AttentionAction::RetryTask,
+            ),
+        };
+        let delivery = AttentionItem {
+            level: Attention::Failed,
+            project_id: project,
+            agent_id: None,
+            task_id: None,
+            session_id: None,
+            run_id: None,
+            since_ms: 2,
+            reason: reason(
+                AttentionReasonKind::DeliveryRecovery,
+                "delivery unacknowledged".to_owned(),
+                "delivery recovery",
+                AttentionAction::InspectRecovery,
+            ),
+        };
+        assert!(!worker.needs_operator_decision());
+        assert!(!delivery.needs_operator_decision());
+        let mut inferred = worker.clone();
+        inferred.reason = reason(
+            AttentionReasonKind::Inferred,
+            "lifecycle state".to_owned(),
+            "inferred lifecycle state",
+            AttentionAction::InspectInferredState,
+        );
+        assert!(!inferred.needs_operator_decision());
+        let decision = worker.decision();
+        assert!(decision.choices.is_empty());
+        assert_eq!(decision.recommended, None);
+        assert!(decision.evidence.contains("project: p"));
+        assert!(!decision.cause.contains('\u{1b}'));
+        let mut budget = worker.clone();
+        budget.reason = reason(
+            AttentionReasonKind::BudgetExhausted,
+            "durable tool-call budget exhausted".to_owned(),
+            "agent budget is exhausted",
+            AttentionAction::ResetBudget,
+        );
+        assert!(budget.needs_operator_decision());
+        assert_eq!(
+            budget.decision().choices[0].action,
+            AttentionAction::ResetBudget
+        );
+        assert_eq!(budget.decision().recommended, None);
+        items.push(worker);
+        items.push(budget);
+        items.push(delivery);
+        let inbox: Vec<_> = items
+            .into_iter()
+            .filter(AttentionItem::needs_operator_decision)
+            .collect();
+        assert_eq!(inbox.len(), 2); // paused work plus the explicit budget decision
+        assert!(inbox.iter().all(AttentionItem::needs_operator_decision));
+    }
+
+    #[test]
     fn authoritative_wait_causes_do_not_infer_answers_from_notification_text() {
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
@@ -1150,6 +1334,31 @@ mod tests {
         let (_, permission) = session_reason(&permission).unwrap();
         assert_eq!(permission.kind, AttentionReasonKind::ProviderPermission);
         assert_eq!(permission.action, AttentionAction::ReviewProviderPermission);
+        let permission_item = AttentionItem {
+            level: Attention::NeedsInput,
+            project_id: ProjectId::try_from("p").unwrap(),
+            agent_id: Some(AgentId::try_from("a").unwrap()),
+            task_id: None,
+            session_id: Some(SessionId::try_from("s").unwrap()),
+            run_id: None,
+            since_ms: 20,
+            reason: permission.clone(),
+        };
+        let decision = permission_item.decision();
+        assert_eq!(decision.recommended, None);
+        assert_eq!(
+            decision.choices[0].action,
+            AttentionAction::ApproveProviderPermission
+        );
+        assert_eq!(
+            decision.choices[1].action,
+            AttentionAction::RejectProviderPermission
+        );
+        assert!(
+            permission_item
+                .action_text()
+                .contains("choose Approve or Reject")
+        );
 
         let mut idle = session(SessionState::Idle, 25);
         idle.last_hook_event = Some(ProviderHookEvent::Notification);
