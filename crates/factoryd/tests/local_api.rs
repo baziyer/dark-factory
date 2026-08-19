@@ -1,8 +1,8 @@
 use std::{future::Future, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunnerInstanceId,
-    SessionId, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider,
+    RunnerInstanceId, SessionId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
@@ -16,7 +16,7 @@ use factoryd::{
         ManagedChangeRecord, NewAgent, NewProject, NewSession, NewTask, RepositoryAuthority, Store,
     },
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -535,40 +535,129 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
     let database = directory.path().join("factory.db");
     let project_id = project_id("factory");
     {
-        let mut store = Store::open(&database).unwrap();
-        store
-            .create_project(
-                NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".into(),
-                    root: directory.path().to_string_lossy().into_owned(),
-                },
-                1,
-            )
-            .unwrap();
-    }
-    {
         let connection = Connection::open(&database).unwrap();
         connection
-            .execute_batch(
-                "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
-                 ALTER TABLE sessions DROP COLUMN resumed_provider_session;
-                 ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
-                 ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
-                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
-                 DROP TABLE delivery_attempts;
-                 DROP TABLE managed_changes;
-                 ALTER TABLE sessions DROP COLUMN observer_reason;
-                 ALTER TABLE sessions DROP COLUMN notification_kind;
-                 DROP TABLE managed_changes;
-                 ALTER TABLE sessions DROP COLUMN observer_reason;
-                 ALTER TABLE sessions DROP COLUMN notification_kind;
-                 UPDATE events SET schema_version = 1;
-                 PRAGMA user_version = 22;",
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA journal_mode = WAL;")
+            .unwrap();
+        for migration in [
+            include_str!("../migrations/0001_state_and_events.sql"),
+            include_str!("../migrations/0002_execution_ledger.sql"),
+            include_str!("../migrations/0003_runner_reconciliation.sql"),
+            include_str!("../migrations/0004_observer_health.sql"),
+            include_str!("../migrations/0005_provider_session_context.sql"),
+            include_str!("../migrations/0006_webhooks.sql"),
+            include_str!("../migrations/0007_subscription_usage.sql"),
+            include_str!("../migrations/0008_subscription_windows.sql"),
+            include_str!("../migrations/0009_agent_profiles.sql"),
+            include_str!("../migrations/0010_agent_messages.sql"),
+            include_str!("../migrations/0011_run_stop_intent.sql"),
+            include_str!("../migrations/0012_drop_subscription_usage_and_task_dependencies.sql"),
+            include_str!("../migrations/0013_agent_profile_files.sql"),
+            include_str!("../migrations/0014_sessions.sql"),
+            include_str!("../migrations/0015_permission_request_hook_event.sql"),
+            include_str!("../migrations/0016_task_incarnations.sql"),
+            include_str!("../migrations/0017_auto_mode.sql"),
+            include_str!("../migrations/0018_agent_budgets.sql"),
+            include_str!("../migrations/0019_repository_authority.sql"),
+            include_str!("../migrations/0020_connector_events.sql"),
+            include_str!("../migrations/0021_session_runtime_metadata.sql"),
+            include_str!("../migrations/0022_repair_legacy_permission_modes.sql"),
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![
+                    project_id.as_str(),
+                    "Factory",
+                    directory.path().to_string_lossy().into_owned(),
+                    1_i64
+                ],
             )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, project_id, parent_agent_id, role, provider,
+                    paused, worktree, created_at_ms, updated_at_ms
+                 ) VALUES ('curie', ?1, NULL, 'worker', 'shell', 0, NULL, 2, 2)",
+                params![project_id.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (
+                    id, project_id, agent_id, provider, worktree, hook_token, state,
+                    state_since_ms, observer_health, observer_health_since_ms,
+                    runner_instance_id, runner_runtime, runner_protocol_version,
+                    started_at_ms, updated_at_ms, ended_at_ms, exit_code
+                 ) VALUES (
+                    'legacy-session', ?1, 'curie', 'shell', '/work/factory', ?2, 'stopped',
+                    3, 'unknown', 3, 'legacy-runner', '/private/runners/legacy', 1,
+                    3, 4, 4, 0
+                 )",
+                params![project_id.as_str(), "a".repeat(64)],
+            )
+            .unwrap();
+        let payload = serde_json::to_string(&FactoryEvent::ProjectChanged {
+            project: ProjectSnapshot {
+                id: project_id.clone(),
+                name: "Factory".into(),
+                root: directory.path().to_string_lossy().into_owned(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        })
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO events (
+                    id, occurred_at_ms, project_id, kind, schema_version, payload_json
+                 ) VALUES (1, 1, ?1, 'project_changed', 1, ?2)",
+                params![project_id.as_str(), payload],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 22).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
             .unwrap();
     }
     let state = ApiState::new(Store::open(&database).unwrap());
+    {
+        let connection = Connection::open(&database).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 30, "ordered v22 fixture must reach current schema");
+        let violations: i64 = connection
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(violations, 0, "ordered migration left an FK violation");
+        let sessions: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'legacy-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sessions, 1,
+            "ordered migration lost populated session compatibility"
+        );
+        let managed_changes: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'managed_changes'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            managed_changes, 1,
+            "ordered migration must create managed_changes"
+        );
+    }
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let (execution, execution_join) =
