@@ -220,10 +220,12 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
     } else {
         "running (pause via factoryctl)"
     };
-    let (configured_model, configured_permission, files) =
+    let (configured_model, configured_reasoning, model_reason, configured_permission, files) =
         board.agent_details.get(agent_id).map_or_else(
             || {
                 (
+                    "loading…".to_owned(),
+                    "loading…".to_owned(),
                     "loading…".to_owned(),
                     "loading…".to_owned(),
                     "instructions.md  memory.md".to_owned(),
@@ -236,6 +238,16 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                         .model
                         .clone()
                         .unwrap_or_else(|| "provider default".to_owned()),
+                    detail
+                        .profile
+                        .reasoning_effort
+                        .clone()
+                        .unwrap_or_else(|| "provider default".to_owned()),
+                    detail
+                        .profile
+                        .model_selection_reason
+                        .clone()
+                        .unwrap_or_else(|| "unreported".to_owned()),
                     detail
                         .profile
                         .permission_mode
@@ -260,7 +272,7 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         .unwrap_or("unreported");
     frame.render_widget(
         Paragraph::new(format!(
-            "provider: {:?}\nconfigured model: {configured_model}\nrunning model: {running_model}\nconfigured permission: {configured_permission}\nrunning permission: {running_permission}\nrunning reasoning: {running_reasoning}\nrunning control: {running_control}\n{pause}\n{files}",
+            "provider: {:?}\nconfigured model: {configured_model}\nrunning model: {running_model}\nconfigured reasoning: {configured_reasoning}\nrunning reasoning: {running_reasoning}\nmodel selection: {model_reason}\nconfigured permission: {configured_permission}\nrunning permission: {running_permission}\nrunning control: {running_control}\n{pause}\n{files}",
             agent.provider,
         ))
         .block(ui::block(" settings ")),

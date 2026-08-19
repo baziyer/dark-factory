@@ -481,6 +481,8 @@ Options:
                                (shell provider: a command to run under
                                `sh -lc`, e.g. an absolute path to a script;
                                omitted means a plain interactive shell)
+  --reasoning-effort TIER      Codex reasoning tier (none|low|medium|high|xhigh|max)
+  --model-reason REASON        Auditable reason for an explicit model or escalation
   --worktree PATH              Absolute path to an existing git worktree,
                                overriding the daemon-managed default
   -h, --help                   Show this help";
@@ -554,6 +556,8 @@ Required:
 
 Options:
   --model MODEL                     Provider model identifier
+  --reasoning-effort TIER            Codex reasoning tier (none|low|medium|high|xhigh|max)
+  --model-reason REASON              Auditable reason for an explicit model or escalation
   --permission-mode MODE            Provider permission mode
   --instructions-file PATH          Local file to read new instructions.md contents from
   --memory-file PATH                Local file to read new memory.md contents from
@@ -867,6 +871,8 @@ enum CliCommand {
         role: AgentRole,
         provider: Provider,
         model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
         worktree: Option<String>,
     },
     AgentList {
@@ -895,6 +901,8 @@ enum CliCommand {
         project_id: String,
         agent_id: String,
         model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
         permission_mode: Option<String>,
         instructions_file: Option<String>,
         memory_file: Option<String>,
@@ -1074,6 +1082,8 @@ fn run() -> Result<i32, String> {
         project_id,
         agent_id,
         model,
+        reasoning_effort,
+        model_selection_reason,
         permission_mode,
         instructions_file,
         memory_file,
@@ -1083,10 +1093,14 @@ fn run() -> Result<i32, String> {
             &client,
             project_id,
             agent_id,
-            model,
-            permission_mode,
-            instructions_file,
-            memory_file,
+            AgentProfileSetOptions {
+                model,
+                reasoning_effort,
+                model_selection_reason,
+                permission_mode,
+                instructions_file,
+                memory_file,
+            },
         )?;
         write_frame(&mut output, &frame)?;
         return Ok(if is_error(&frame) { 2 } else { 0 });
@@ -1276,15 +1290,29 @@ fn read_bounded_stdin_json(limit: usize) -> Option<serde_json::Value> {
 /// left unset carries the currently stored value forward unchanged, so
 /// `agent profile set` cannot silently clear standing guidance or memory it
 /// was not asked to change.
+struct AgentProfileSetOptions {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    model_selection_reason: Option<String>,
+    permission_mode: Option<String>,
+    instructions_file: Option<String>,
+    memory_file: Option<String>,
+}
+
 fn agent_profile_set_frame(
     client: &Client,
     project_id: String,
     agent_id: String,
-    model: Option<String>,
-    permission_mode: Option<String>,
-    instructions_file: Option<String>,
-    memory_file: Option<String>,
+    options: AgentProfileSetOptions,
 ) -> Result<ServerFrame, String> {
+    let AgentProfileSetOptions {
+        model,
+        reasoning_effort,
+        model_selection_reason,
+        permission_mode,
+        instructions_file,
+        memory_file,
+    } = options;
     let project_id: factory_core::ProjectId = parse_id(project_id, "project")?;
     let agent_id: factory_core::AgentId = parse_id(agent_id, "agent")?;
     let current = client
@@ -1308,11 +1336,27 @@ fn agent_profile_set_frame(
         Some(path) => read_guidance_file(&path)?,
         None => agent.profile.memory,
     };
+    let selected_model = model.clone().or_else(|| agent.profile.model.clone());
+    if model.as_deref() == Some(factory_core::model_policy::ESCALATED_MODEL)
+        && model_selection_reason.is_none()
+    {
+        return Err(
+            "gpt-5.6-sol requires --model-reason describing the explicit high-risk escalation"
+                .into(),
+        );
+    }
+    let selection_reason = model_selection_reason.or_else(|| {
+        (model.is_some() && selected_model != agent.profile.model)
+            .then(|| "operator-selected model".to_owned())
+            .or(agent.profile.model_selection_reason.clone())
+    });
     client
         .request(LocalRequest::UpdateAgentProfile {
             project_id,
             agent_id,
-            model: model.or(agent.profile.model),
+            model: selected_model,
+            reasoning_effort: reasoning_effort.or(agent.profile.reasoning_effort),
+            model_selection_reason: selection_reason,
             permission_mode: permission_mode.or(agent.profile.permission_mode),
             instructions,
             memory,
@@ -1937,6 +1981,8 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 _ => return Err("--provider must be claude, codex, or shell".into()),
             };
             let model = take_option(&mut args, "--model")?;
+            let reasoning_effort = take_option(&mut args, "--reasoning-effort")?;
+            let model_selection_reason = take_option(&mut args, "--model-reason")?;
             let worktree = take_option(&mut args, "--worktree")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentAdd {
@@ -1946,6 +1992,8 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 role,
                 provider,
                 model,
+                reasoning_effort,
+                model_selection_reason,
                 worktree,
             })
         }
@@ -2027,6 +2075,8 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                     let project_id = required_project(&mut args)?;
                     let agent_id = required_option(&mut args, "--agent")?;
                     let model = take_option(&mut args, "--model")?;
+                    let reasoning_effort = take_option(&mut args, "--reasoning-effort")?;
+                    let model_selection_reason = take_option(&mut args, "--model-reason")?;
                     let permission_mode = take_option(&mut args, "--permission-mode")?;
                     let instructions_file = take_option(&mut args, "--instructions-file")?;
                     let memory_file = take_option(&mut args, "--memory-file")?;
@@ -2035,6 +2085,8 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                         project_id,
                         agent_id,
                         model,
+                        reasoning_effort,
+                        model_selection_reason,
                         permission_mode,
                         instructions_file,
                         memory_file,
@@ -2360,6 +2412,8 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             role,
             provider,
             model,
+            reasoning_effort,
+            model_selection_reason,
             worktree,
         } => Ok(LocalRequest::CreateAgent {
             id: id
@@ -2373,6 +2427,8 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             role,
             provider,
             model,
+            reasoning_effort,
+            model_selection_reason,
             worktree,
         }),
         CliCommand::AgentList {
@@ -3166,6 +3222,8 @@ mod tests {
                     role: AgentRole::Worker,
                     provider: Provider::Codex,
                     model: Some("gpt-5-codex".into()),
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 }
             )
@@ -3192,6 +3250,8 @@ mod tests {
                 role: AgentRole::Worker,
                 provider: Provider::Shell,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: Some("/abs/worktree".into()),
             }
         );
@@ -3475,6 +3535,41 @@ mod tests {
     }
 
     #[test]
+    fn model_policy_flags_are_carried_to_the_shared_request() {
+        let (_, command) = parse_args(args(&[
+            "agent",
+            "add",
+            "--project",
+            "factory",
+            "--role",
+            "worker",
+            "--provider",
+            "codex",
+            "--reasoning-effort",
+            "xhigh",
+            "--model-reason",
+            "release integration after a failed attempt",
+        ]))
+        .unwrap();
+        let request = request_for(command).unwrap();
+        let LocalRequest::CreateAgent {
+            model,
+            reasoning_effort,
+            model_selection_reason,
+            ..
+        } = request
+        else {
+            panic!("expected create agent request");
+        };
+        assert_eq!(model, None);
+        assert_eq!(reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            model_selection_reason.as_deref(),
+            Some("release integration after a failed attempt")
+        );
+    }
+
+    #[test]
     fn agent_profile_set_parses_every_optional_flag() {
         let instructions = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(instructions.path(), "Coordinate the team.").unwrap();
@@ -3505,6 +3600,8 @@ mod tests {
                     project_id: "factory".into(),
                     agent_id: "god".into(),
                     model: Some("gpt-5-codex".into()),
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     permission_mode: Some("on-request".into()),
                     instructions_file: Some(instructions.path().to_str().unwrap().into()),
                     memory_file: Some(memory.path().to_str().unwrap().into()),
@@ -3528,6 +3625,8 @@ mod tests {
                     project_id: "factory".into(),
                     agent_id: "god".into(),
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     permission_mode: None,
                     instructions_file: None,
                     memory_file: None,
@@ -3588,6 +3687,8 @@ mod tests {
             role: AgentRole::Orchestrator,
             provider: Provider::Codex,
             model: None,
+            reasoning_effort: None,
+            model_selection_reason: None,
             worktree: None,
         })
         .unwrap();

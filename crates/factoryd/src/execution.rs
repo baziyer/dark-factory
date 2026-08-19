@@ -138,7 +138,9 @@ const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project v
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
 agent add --role worker --provider <claude|codex|shell>`, `factoryctl task assign --task <id> \
 --agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, `factoryctl session \
-list`. A worker in `waiting_for_input` needs operator attention: message it or surface its request; \
+list`. New Codex workers and focused reviewers use the shared Luna routine default; pass \
+`--model-reason \"...\"` for an explicit high-risk integration/security/release or failed-attempt \
+escalation, which records Sol/xhigh. God remains Sol/xhigh. A worker in `waiting_for_input` needs operator attention: message it or surface its request; \
 do not stop, restart, replace, or duplicate it. Before stopping or replacing any worker, inspect \
 `factoryctl agent status --agent <agent>` and preserve or explicitly resolve any dirty worktree.";
 
@@ -1455,6 +1457,7 @@ async fn spawn_session_for_agent(
         session_id: session_id.clone(),
         worktree: worktree_path.clone(),
         model: agent.profile.model.clone(),
+        reasoning_effort: agent.profile.reasoning_effort.clone(),
         permission_mode: agent.profile.permission_mode.clone(),
         auto_mode,
         resume: resume.clone(),

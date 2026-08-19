@@ -55,6 +55,8 @@ pub struct SpawnContext {
     /// An explicit provider model, or `None` for the provider's own
     /// interactive default.
     pub model: Option<String>,
+    /// An explicit provider reasoning tier, when supported.
+    pub reasoning_effort: Option<String>,
     /// A provider-scoped permission/approval mode string (Claude:
     /// `acceptEdits`/`plan`/...; Codex: `on-request`/`never`), or `None` to
     /// override the factory-wide auto-mode default.

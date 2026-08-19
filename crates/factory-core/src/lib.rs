@@ -10,6 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod attention;
 pub mod local;
+pub mod model_policy;
 pub mod paths;
 pub mod runner;
 pub mod status;

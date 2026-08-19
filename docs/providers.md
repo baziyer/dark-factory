@@ -31,12 +31,15 @@ provider's own terminal output, and never owns process lifecycle.
 ## Runtime-resolved session settings
 
 The agent profile is the configured override and remains separate from the
-session's historical runtime metadata. At spawn, a provider may report the
-model, reasoning effort, permission mode, and control mode only when the
-launch argv or a configuration file it actually uses establishes them. Those
-values are stored on the session row and remain on ended sessions, so changing
-an agent profile cannot rewrite history. `None` is rendered as `unreported`;
-the daemon never fills a missing provider default from a plausible model name.
+session's historical runtime metadata. For new Codex agents, the shared
+project policy records the selected model, reasoning effort, and selection
+reason; it defaults routine workers/reviewers to Luna and keeps Sol/xhigh for
+God or an explicit escalation. At spawn, a provider may report the model,
+reasoning effort, permission mode, and control mode only when the launch argv
+or a configuration file it actually uses establishes them. Those values are
+stored on the session row and remain on ended sessions, so changing an agent
+profile cannot rewrite history. `None` is rendered as `unreported`; the daemon
+never fills a missing provider default from a plausible model name.
 
 Codex reports an explicit `--model`, root-level `model` and
 `model_reasoning_effort` from its isolated seeded `config.toml`, and the exact

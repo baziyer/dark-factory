@@ -244,14 +244,19 @@ impl Provider for CodexProvider {
         let configured_model = config
             .as_deref()
             .and_then(|value| root_config_string(value, "model"));
-        let reasoning_effort = config
+        let configured_reasoning_effort = config
             .as_deref()
             .and_then(|value| root_config_string(value, "model_reasoning_effort"));
+        let reasoning_effort = ctx.reasoning_effort.clone().or(configured_reasoning_effort);
 
         let mut args = vec!["--dangerously-bypass-hook-trust".to_owned()];
         if let Some(model) = &ctx.model {
             args.push("--model".to_owned());
             args.push(model.clone());
+        }
+        if let Some(reasoning_effort) = &ctx.reasoning_effort {
+            args.push("-c".to_owned());
+            args.push(format!("model_reasoning_effort=\"{reasoning_effort}\""));
         }
         // Always explicit -- never Codex's own un-set `on-request` default
         // -- so an unattended agent never silently inherits a native
@@ -873,6 +878,7 @@ mod provider_tests {
             session_id: SessionId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
             worktree: directory.join("worktree"),
             model: None,
+            reasoning_effort: None,
             permission_mode: None,
             auto_mode: true,
             resume: None,
@@ -956,6 +962,26 @@ mod provider_tests {
                 "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn profile_reasoning_effort_overrides_seeded_codex_config_and_is_projected() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut ctx = context(directory.path());
+        ctx.model = Some("gpt-5.6-luna".to_owned());
+        ctx.reasoning_effort = Some("medium".to_owned());
+        let launch = CodexProvider::with_source_home(directory.path().join("no-real-home"))
+            .spawn_spec(&ctx)
+            .unwrap();
+
+        assert!(launch.args.windows(2).any(|args| {
+            args == [
+                "-c".to_owned(),
+                "model_reasoning_effort=\"medium\"".to_owned(),
+            ]
+        }));
+        assert_eq!(launch.runtime.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(launch.runtime.reasoning_effort.as_deref(), Some("medium"));
     }
 
     #[test]

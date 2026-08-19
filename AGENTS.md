@@ -89,6 +89,12 @@ Read-only context unless a task explicitly asks you to edit them:
 12. **Report exactly what passed and failed.** State which commands you
     ran and their outcome; never imply a check passed that you didn't run.
 
+13. **Use the shared model policy.** New routine Codex workers and focused
+   reviewers use the Luna default; Sol/xhigh is reserved for an explicit
+   high-risk escalation with a durable reason. God remains Sol/xhigh. See
+   the project guidance for the one operator-facing policy and CLI examples;
+   existing profiles are not silently rewritten.
+
 ## Adding to the system
 
 - New provider, integration, or theme: see [CONTRIBUTING.md](CONTRIBUTING.md)

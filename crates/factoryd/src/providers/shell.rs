@@ -72,6 +72,7 @@ mod tests {
             session_id: SessionId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
             worktree: directory.join("worktree"),
             model: None,
+            reasoning_effort: None,
             permission_mode: None,
             auto_mode: true,
             resume: None,

@@ -7,6 +7,7 @@ use factory_core::{
     SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
+    model_policy,
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -25,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -48,6 +49,7 @@ const MAX_WEBHOOK_TITLE_BYTES: usize = 240;
 const MAX_WEBHOOK_TEXT_BYTES: usize = 4_000;
 const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AGENT_MODEL_BYTES: usize = 256;
+const MAX_AGENT_MODEL_REASON_BYTES: usize = 512;
 const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
 const MAX_RUNTIME_METADATA_BYTES: usize = 256;
 /// Mirrors the `sessions.wait_reason`/`activity` CHECK bounds (migration
@@ -97,6 +99,8 @@ pub struct NewAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
     pub updated_at_ms: i64,
 }
@@ -108,6 +112,8 @@ pub struct AgentDetail {
 
 pub struct UpdateAgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
 }
 
@@ -837,7 +843,7 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.insert_agent(input, None, now_ms)
+        self.insert_agent(input, None, None, None, now_ms)
     }
 
     pub fn create_agent_with_model(
@@ -847,13 +853,42 @@ impl Store {
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         validate_agent_model(model.as_deref())?;
-        self.insert_agent(input, model, now_ms)
+        self.insert_agent(input, model, None, None, now_ms)
+    }
+
+    pub fn create_agent_with_profile(
+        &mut self,
+        input: NewAgent,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        validate_agent_model(model.as_deref())?;
+        validate_agent_model_reason(model_selection_reason.as_deref())?;
+        let selection = model_policy::select(
+            input.provider,
+            input.role,
+            model.as_deref(),
+            reasoning_effort.as_deref(),
+            model_selection_reason.as_deref(),
+        )
+        .map_err(|_| StoreError::InvalidAgentProfile)?;
+        self.insert_agent(
+            input,
+            selection.model,
+            selection.reasoning_effort,
+            selection.reason,
+            now_ms,
+        )
     }
 
     fn insert_agent(
         &mut self,
         input: NewAgent,
         model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         let agent = AgentSnapshot {
@@ -890,9 +925,16 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, updated_at_ms)
-             VALUES (?1, ?2, ?3)",
-            params![agent.id.as_str(), model, agent.updated_at_ms],
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                agent.id.as_str(),
+                model,
+                reasoning_effort,
+                model_selection_reason,
+                agent.updated_at_ms
+            ],
         )?;
         transaction.execute(
             "INSERT INTO agent_budgets (agent_id, max_tool_calls, reset_at_ms, updated_at_ms)
@@ -3837,6 +3879,8 @@ impl Store {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 permission_mode: None,
                 updated_at_ms: 0,
             }),
@@ -3857,6 +3901,13 @@ impl Store {
         let agent = load_agent(&transaction, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
+        let current_profile = load_agent_profile(&transaction, agent_id)?.unwrap_or(AgentProfile {
+            model: None,
+            reasoning_effort: None,
+            model_selection_reason: None,
+            permission_mode: None,
+            updated_at_ms: 0,
+        });
         if let Some(mode) = input.permission_mode.as_deref() {
             let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
             if !capabilities.permission_modes.contains(&mode) {
@@ -3866,16 +3917,49 @@ impl Store {
                 });
             }
         }
+        model_policy::validate_reasoning_effort(input.reasoning_effort.as_deref())
+            .map_err(|_| StoreError::InvalidAgentProfile)?;
+        validate_agent_model_reason(input.model_selection_reason.as_deref())?;
+        if input.reasoning_effort.is_some() && agent.snapshot.provider != Provider::Codex {
+            return Err(StoreError::InvalidAgentProfile);
+        }
+        let model_changed = input.model != current_profile.model;
+        let mut reasoning_effort = input.reasoning_effort;
+        let mut model_selection_reason = input.model_selection_reason;
+        if model_changed
+            && input.model.as_deref() == Some(model_policy::ESCALATED_MODEL)
+            && model_selection_reason.is_none()
+        {
+            return Err(StoreError::InvalidAgentProfile);
+        }
+        if model_changed && model_selection_reason.is_none() {
+            model_selection_reason = Some("operator-selected model".to_owned());
+        }
+        if model_changed && input.model.as_deref() == Some(model_policy::ESCALATED_MODEL) {
+            if reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort != model_policy::ESCALATED_REASONING_EFFORT)
+            {
+                return Err(StoreError::InvalidAgentProfile);
+            }
+            reasoning_effort = Some(model_policy::ESCALATED_REASONING_EFFORT.to_owned());
+        }
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason,
+                permission_mode, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
+                reasoning_effort = excluded.reasoning_effort,
+                model_selection_reason = excluded.model_selection_reason,
                 permission_mode = excluded.permission_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
                 input.model,
+                reasoning_effort,
+                model_selection_reason,
                 input.permission_mode,
                 now_ms
             ],
@@ -4366,6 +4450,17 @@ fn validate_agent_model(model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+fn validate_agent_model_reason(reason: Option<&str>) -> Result<()> {
+    if reason.is_some_and(|value| {
+        value.is_empty()
+            || value.len() > MAX_AGENT_MODEL_REASON_BYTES
+            || value.chars().any(char::is_control)
+    }) {
+        return Err(StoreError::InvalidAgentProfile);
+    }
+    Ok(())
+}
+
 /// Provider-scoped, free-form permission mode (e.g. Claude's `acceptEdits`
 /// or `plan`; Codex's `on-request` or `never`); `None` means the provider
 /// default. Validated the same way as `model`; provider launch consumes it.
@@ -4505,14 +4600,17 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, permission_mode, updated_at_ms
+            "SELECT model, reasoning_effort, model_selection_reason,
+                    permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
                 Ok(AgentProfile {
                     model: row.get(0)?,
-                    permission_mode: row.get(1)?,
-                    updated_at_ms: row.get(2)?,
+                    reasoning_effort: row.get(1)?,
+                    model_selection_reason: row.get(2)?,
+                    permission_mode: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
                 })
             },
         )
@@ -5092,6 +5190,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             "../migrations/0022_repair_legacy_permission_modes.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 22)?;
+        transaction.commit()?;
+        current = 22;
+    }
+    if current == 22 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0023_agent_model_policy.sql"))?;
+        transaction.pragma_update(None, "user_version", 23)?;
         transaction.commit()?;
     }
     Ok(())

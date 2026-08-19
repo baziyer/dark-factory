@@ -257,6 +257,18 @@ The values remain historical after the session ends; missing evidence is
 explicitly unreported rather than inferred from a provider default. The local
 API, `factoryctl agent status`, and `factory-tui` all project the same fields.
 
+### Auditable model tiers
+
+The shared `factory_core::model_policy` applies only when a new Codex agent
+is created without an explicit model: routine workers and focused reviewers
+receive `gpt-5.6-luna` with `medium` reasoning, while the orchestrator/God
+receives `gpt-5.6-sol` with `xhigh`. A worker receives Sol/xhigh only for an
+explicit high-risk escalation reason (integration, security, release, or a
+failed cheaper attempt). The selected model, reasoning effort, and reason
+are durable profile fields and are projected through `factoryctl` and the
+TUI. Existing profiles remain unchanged; this is a bounded tier policy, not
+a live pricing engine.
+
 The separate resumed-Codex delivery failure remains tracked by
 [#158](https://github.com/baziyer/dark-factory/issues/158): live evidence shows
 that after a clean stop and provider-thread resume, a completed task followed

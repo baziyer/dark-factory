@@ -795,6 +795,8 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -891,6 +893,8 @@ async fn local_agent_messages_round_trip_without_public_events() {
                     role: factory_core::AgentRole::Orchestrator,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -982,6 +986,8 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1316,6 +1322,8 @@ async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Codex,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 )
@@ -1454,6 +1462,8 @@ async fn a_failed_guidance_removal_leaves_the_agent_retryable_not_half_deleted()
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1589,6 +1599,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1608,6 +1620,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1626,6 +1640,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     project_id: project_id("factory"),
                     agent_id: agent_id("boss"),
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     permission_mode: None,
                     instructions: MARKER.into(),
                     memory: String::new(),
@@ -1734,6 +1750,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Shell,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 )
@@ -1750,6 +1768,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         project_id: project_id("factory"),
                         agent_id: boss.clone(),
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         permission_mode: None,
                         instructions: MARKER.into(),
                         memory: String::new(),
@@ -1781,6 +1801,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Shell,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 ),
@@ -1868,6 +1890,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: Some("/nonexistent/curie-worktree".into()),
                 },
             )
@@ -1892,6 +1916,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: Some(worktree.clone()),
             },
         )
@@ -1938,6 +1964,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: None,
             },
         )
@@ -2147,6 +2175,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: None,
             },
             // Paused first, so assigning work never spawns a session: the
