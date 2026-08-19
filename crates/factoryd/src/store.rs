@@ -1992,11 +1992,7 @@ impl Store {
         let changed = FactoryEvent::SessionChanged {
             session: snapshot.clone(),
         };
-        let agent_event = append_agent_changed_event(
-            &transaction,
-            &session.agent_id,
-            now_ms,
-        )?;
+        let agent_event = append_agent_changed_event(&transaction, &session.agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &changed)?;
         events.push(agent_event);
         events.push(EventEnvelope {

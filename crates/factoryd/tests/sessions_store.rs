@@ -146,8 +146,7 @@ fn session_lifecycle_updates_and_projects_the_live_agent_relation() {
             && agent.current_session_id == Some(created.id.clone())
     ));
     assert_eq!(
-        store.list_agents(&project_id("factory"), None, 10).unwrap()[0]
-            .current_session_id,
+        store.list_agents(&project_id("factory"), None, 10).unwrap()[0].current_session_id,
         Some(created.id.clone())
     );
 
@@ -158,8 +157,7 @@ fn session_lifecycle_updates_and_projects_the_live_agent_relation() {
             if agent.id == agent_id("curie") && agent.current_session_id.is_none()
     )));
     assert_eq!(
-        store.list_agents(&project_id("factory"), None, 10).unwrap()[0]
-            .current_session_id,
+        store.list_agents(&project_id("factory"), None, 10).unwrap()[0].current_session_id,
         None
     );
 }

@@ -957,12 +957,15 @@ fn session_lifecycle_events_project_the_daemon_current_session_into_activity() {
         protocol_version: 1,
         sequence: 1,
         occurred_at_ms: 100_000,
-        event: FactoryEvent::AgentChanged {
-            agent: live_agent,
-        },
+        event: FactoryEvent::AgentChanged { agent: live_agent },
     });
     assert_eq!(
-        board.activity_label(board.agents.get(&AgentId::try_from("alice").unwrap()).unwrap()),
+        board.activity_label(
+            board
+                .agents
+                .get(&AgentId::try_from("alice").unwrap())
+                .unwrap()
+        ),
         "no recent activity"
     );
     board.apply_event(EventEnvelope {
@@ -988,9 +991,7 @@ fn session_lifecycle_events_project_the_daemon_current_session_into_activity() {
         protocol_version: 1,
         sequence: 3,
         occurred_at_ms: 120_001,
-        event: FactoryEvent::AgentChanged {
-            agent: ended_agent,
-        },
+        event: FactoryEvent::AgentChanged { agent: ended_agent },
     });
     assert_eq!(
         board.activity_label(board.agents.get(&alice_id).unwrap()),
