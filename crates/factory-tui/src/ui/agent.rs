@@ -366,6 +366,11 @@ pub(crate) fn render_attention_card(
         .map_or("—", factory_core::RunId::as_str);
     let age = factory_core::status::age_text(board.now_ms, item.since_ms);
     let decision = item.decision();
+    let explanation = if focus.resolved {
+        "changed or resolved; refresh NEEDS YOU before acting".to_owned()
+    } else {
+        format!("{} | evidence: {}", decision.cause, decision.evidence)
+    };
     let mut lines = vec![
         Line::from(Span::styled(
             if focus.resolved {
@@ -379,14 +384,7 @@ pub(crate) fn render_attention_card(
                 Color::Yellow
             }),
         )),
-        Line::from(ui::truncate(
-            if focus.resolved {
-                "changed or resolved; refresh NEEDS YOU before acting"
-            } else {
-                &format!("{} | evidence: {}", decision.cause, decision.evidence)
-            },
-            inner_width,
-        )),
+        Line::from(ui::truncate(&explanation, inner_width)),
         Line::from(compact_pair(
             "project:",
             project,
