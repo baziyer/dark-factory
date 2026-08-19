@@ -146,6 +146,12 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
             [],
         )
         .unwrap();
+    // Reconstruct a real pre-0023 database rather than merely rewinding the
+    // version marker: the changes tables did not exist at schema 21.
+    connection
+        .execute("DROP TABLE change_findings", [])
+        .unwrap();
+    connection.execute("DROP TABLE changes", []).unwrap();
     connection.pragma_update(None, "user_version", 21).unwrap();
     drop(connection);
 

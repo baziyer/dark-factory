@@ -23,9 +23,12 @@ Use `factoryctl change` to record the operator's durable review projection:
 source issue/task, author and run, branch/PR, exact head SHA, numbered
 findings and dispositions, reviewer satisfaction, explicit hosted-check
 reconciliation, current-base evidence, and an independent integration-ready
-claim. The daemon is the single transition authority. A force-push or rebase
+claim. The daemon is the single transition authority. Every review mutation
+must include the exact expected head SHA; a force-push or rebase
 invalidates every prior review/check/readiness claim, and no agent or prose
-comment can supply hosted credentials or satisfy its own change. This is the
+comment can supply hosted credentials or satisfy its own change. Connector
+evidence is accepted only through its authenticated webhook seam; the direct
+operator request accepts operator-labelled evidence only. This is the
 CLI-first #159 slice; connector ingestion and a larger change engine remain
 future work (#131/#153).
 

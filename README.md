@@ -85,9 +85,9 @@ factoryctl task add --id first-task --project my-project --agent worker-1 \
 
 # Record review/integration state durably; hosted checks come from an operator
 # or connector and are always tied to the exact head SHA.
-factoryctl change create --id first-change --issue 159 --author worker-1 \
+factoryctl change create --id first-change --project my-project --issue 159 --author worker-1 \
   --branch agent/worker-1 --head <commit-sha> --base main
-factoryctl change review-request --id first-change --reviewer lead
+factoryctl change review-request --id first-change --reviewer lead --head <commit-sha>
 
 factory-tui --project my-project
 ```

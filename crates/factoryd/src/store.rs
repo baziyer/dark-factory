@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -575,6 +575,7 @@ pub struct Store {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewChange {
     pub id: String,
+    pub project_id: ProjectId,
     pub source_issue: String,
     pub source_task_id: Option<TaskId>,
     pub author_agent_id: AgentId,
@@ -597,26 +598,31 @@ pub enum ChangeMutation {
         id: String,
         reviewer_agent_id: AgentId,
         reviewer_run_id: Option<RunId>,
+        expected_head_sha: String,
     },
     AddFinding {
         id: String,
         number: u32,
         description: String,
+        expected_head_sha: String,
     },
     RespondFinding {
         id: String,
         number: u32,
         disposition: String,
+        expected_head_sha: String,
     },
     ResolveFinding {
         id: String,
         number: u32,
         reviewer_agent_id: AgentId,
         resolution: String,
+        expected_head_sha: String,
     },
     Satisfy {
         id: String,
         reviewer_agent_id: AgentId,
+        expected_head_sha: String,
     },
     ReconcileChecks {
         id: String,
@@ -630,6 +636,14 @@ pub enum ChangeMutation {
     MarkIntegrationReady {
         id: String,
         integrator_agent_id: AgentId,
+    },
+    MarkIntegrated {
+        id: String,
+        expected_head_sha: String,
+    },
+    MarkReleased {
+        id: String,
+        expected_head_sha: String,
     },
     Abandon {
         id: String,
@@ -657,6 +671,8 @@ impl Store {
             | ChangeMutation::Satisfy { id, .. }
             | ChangeMutation::ReconcileChecks { id, .. }
             | ChangeMutation::MarkIntegrationReady { id, .. }
+            | ChangeMutation::MarkIntegrated { id, .. }
+            | ChangeMutation::MarkReleased { id, .. }
             | ChangeMutation::Abandon { id, .. } => id.clone(),
         };
         let transaction = self
@@ -672,18 +688,17 @@ impl Store {
                 if let Some(url) = &input.pr_url {
                     validate_change_text(url, 4096)?;
                 }
-                let agent_exists: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
-                    [input.author_agent_id.as_str()],
-                    |row| row.get(0),
+                ensure_agent_in_project(&transaction, &input.project_id, &input.author_agent_id)?;
+                ensure_run_in_project(
+                    &transaction,
+                    &input.project_id,
+                    &input.author_agent_id,
+                    input.author_run_id.as_ref(),
                 )?;
-                if !agent_exists {
-                    return Err(StoreError::AgentNotFound);
-                }
                 if let Some(task_id) = &input.source_task_id {
                     let task_exists: bool = transaction.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
-                        [task_id.as_str()],
+                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1 AND project_id = ?2)",
+                        params![task_id.as_str(), input.project_id.as_str()],
                         |row| row.get(0),
                     )?;
                     if !task_exists {
@@ -693,19 +708,21 @@ impl Store {
                 let inserted = transaction.execute(
                     "INSERT OR IGNORE INTO changes
                      (id, source_issue, source_task_id, author_agent_id, author_run_id,
+                      project_id,
                       branch, pr_number, pr_url, head_sha, base_branch, current_base_sha,
                       state, reviewer_agent_id, reviewer_run_id, reviewed_sha,
                       checks_status, checks_sha, checks_source, ready_by_agent_id,
                       ready_sha, abandoned_reason, created_at_ms, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL,
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
                              'authored', NULL, NULL, NULL, 'pending', NULL, NULL,
-                             NULL, NULL, NULL, ?11, ?11)",
+                             NULL, NULL, NULL, ?12, ?12)",
                     params![
                         input.id,
                         input.source_issue,
                         input.source_task_id.as_ref().map(TaskId::as_str),
                         input.author_agent_id.as_str(),
                         input.author_run_id.as_ref().map(RunId::as_str),
+                        input.project_id.as_str(),
                         input.branch,
                         input.pr_number.map(|number| number as i64),
                         input.pr_url,
@@ -716,10 +733,16 @@ impl Store {
                 )?;
                 if inserted == 0 {
                     let existing = load_change(&transaction, &input.id)?;
-                    if existing.source_issue != input.source_issue
+                    if existing.project_id != input.project_id
+                        || existing.source_issue != input.source_issue
+                        || existing.source_task_id != input.source_task_id
                         || existing.author_agent_id != input.author_agent_id
+                        || existing.author_run_id != input.author_run_id
                         || existing.branch != input.branch
+                        || existing.pr_number != input.pr_number
+                        || existing.pr_url != input.pr_url
                         || existing.head_sha != input.head_sha
+                        || existing.base_branch != input.base_branch
                     {
                         return Err(StoreError::InvalidChangeTransition(
                             "change id already names different source or author state".into(),
@@ -735,6 +758,7 @@ impl Store {
             ChangeMutation::SetHead { id, head_sha } => {
                 validate_change_text(&head_sha, 128)?;
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
                 if change.head_sha != head_sha {
                     change.invalidate_head(head_sha.clone(), now_ms);
                     for finding in &mut change.findings {
@@ -747,16 +771,25 @@ impl Store {
                 id,
                 reviewer_agent_id,
                 reviewer_run_id,
+                expected_head_sha,
             } => {
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
                 if change.author_agent_id == reviewer_agent_id {
                     return Err(StoreError::InvalidChangeTransition(
                         "the author cannot be the reviewer".into(),
                     ));
                 }
-                ensure_agent(&transaction, &reviewer_agent_id)?;
+                ensure_agent_in_project(&transaction, &change.project_id, &reviewer_agent_id)?;
+                ensure_run_in_project(
+                    &transaction,
+                    &change.project_id,
+                    &reviewer_agent_id,
+                    reviewer_run_id.as_ref(),
+                )?;
                 if change.reviewer_agent_id.as_ref() == Some(&reviewer_agent_id)
-                    && change.state == ChangeState::ReviewRequested
+                    && change.reviewer_run_id == reviewer_run_id
                 {
                     // Idempotent retry after a lost response.
                 } else {
@@ -779,10 +812,13 @@ impl Store {
                 id,
                 number,
                 description,
+                expected_head_sha,
             } => {
                 validate_finding(&description)?;
                 let mut change = load_change(&transaction, &id)?;
-                if let Some(existing) = change
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
+                let duplicate = if let Some(existing) = change
                     .findings
                     .iter()
                     .find(|finding| finding.number == number)
@@ -790,6 +826,7 @@ impl Store {
                     if existing.description != description {
                         return Err(StoreError::ChangeFindingExists);
                     }
+                    true
                 } else {
                     transaction.execute(
                         "INSERT INTO change_findings (change_id, number, description, author_disposition, reviewer_resolution) VALUES (?1, ?2, ?3, NULL, NULL)",
@@ -801,22 +838,28 @@ impl Store {
                         author_disposition: None,
                         reviewer_resolution: None,
                     });
+                    false
+                };
+                if !duplicate {
+                    change.state = ChangeState::Findings;
+                    change.reviewed_sha = None;
+                    change.ready_by_agent_id = None;
+                    change.ready_sha = None;
+                    change.integration_ready = false;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
                 }
-                change.state = ChangeState::Findings;
-                change.reviewed_sha = None;
-                change.ready_by_agent_id = None;
-                change.ready_sha = None;
-                change.integration_ready = false;
-                change.updated_at_ms = now_ms;
-                update_change_review(&transaction, &change)?;
             }
             ChangeMutation::RespondFinding {
                 id,
                 number,
                 disposition,
+                expected_head_sha,
             } => {
                 validate_finding(&disposition)?;
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
                 if !change
                     .findings
                     .iter()
@@ -824,38 +867,48 @@ impl Store {
                 {
                     return Err(StoreError::ChangeFindingNotFound);
                 }
-                transaction.execute(
+                let duplicate = change.findings.iter().any(|finding| {
+                    finding.number == number
+                        && finding.author_disposition.as_deref() == Some(disposition.as_str())
+                });
+                if !duplicate {
+                    transaction.execute(
                     "UPDATE change_findings SET author_disposition = ?3 WHERE change_id = ?1 AND number = ?2",
                     params![id, i64::from(number), disposition],
-                )?;
-                clear_finding_resolutions(&transaction, &id, Some(number))?;
-                for finding in &mut change.findings {
-                    if finding.number == number {
-                        finding.author_disposition = Some(disposition.clone());
-                        finding.reviewer_resolution = None;
+                    )?;
+                    clear_finding_resolutions(&transaction, &id, Some(number))?;
+                    for finding in &mut change.findings {
+                        if finding.number == number {
+                            finding.author_disposition = Some(disposition.clone());
+                            finding.reviewer_resolution = None;
+                        }
                     }
+                    change.state = ChangeState::AuthorResponding;
+                    change.reviewed_sha = None;
+                    change.ready_by_agent_id = None;
+                    change.ready_sha = None;
+                    change.integration_ready = false;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
                 }
-                change.state = ChangeState::AuthorResponding;
-                change.reviewed_sha = None;
-                change.ready_by_agent_id = None;
-                change.ready_sha = None;
-                change.integration_ready = false;
-                change.updated_at_ms = now_ms;
-                update_change_review(&transaction, &change)?;
             }
             ChangeMutation::ResolveFinding {
                 id,
                 number,
                 reviewer_agent_id,
                 resolution,
+                expected_head_sha,
             } => {
                 validate_finding(&resolution)?;
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
                 if change.reviewer_agent_id.as_ref() != Some(&reviewer_agent_id) {
                     return Err(StoreError::InvalidChangeTransition(
                         "only the assigned reviewer may resolve findings".into(),
                     ));
                 }
+                ensure_agent_in_project(&transaction, &change.project_id, &reviewer_agent_id)?;
                 if !change
                     .findings
                     .iter()
@@ -863,28 +916,37 @@ impl Store {
                 {
                     return Err(StoreError::ChangeFindingNotFound);
                 }
-                transaction.execute(
+                let duplicate = change.findings.iter().any(|finding| {
+                    finding.number == number
+                        && finding.reviewer_resolution.as_deref() == Some(resolution.as_str())
+                });
+                if !duplicate {
+                    transaction.execute(
                     "UPDATE change_findings SET reviewer_resolution = ?3 WHERE change_id = ?1 AND number = ?2",
                     params![id, i64::from(number), resolution],
-                )?;
-                for finding in &mut change.findings {
-                    if finding.number == number {
-                        finding.reviewer_resolution = Some(resolution.clone());
+                    )?;
+                    for finding in &mut change.findings {
+                        if finding.number == number {
+                            finding.reviewer_resolution = Some(resolution.clone());
+                        }
                     }
+                    change.state = ChangeState::ReReview;
+                    change.reviewed_sha = None;
+                    change.ready_by_agent_id = None;
+                    change.ready_sha = None;
+                    change.integration_ready = false;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
                 }
-                change.state = ChangeState::ReReview;
-                change.reviewed_sha = None;
-                change.ready_by_agent_id = None;
-                change.ready_sha = None;
-                change.integration_ready = false;
-                change.updated_at_ms = now_ms;
-                update_change_review(&transaction, &change)?;
             }
             ChangeMutation::Satisfy {
                 id,
                 reviewer_agent_id,
+                expected_head_sha,
             } => {
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
                 if change.reviewer_agent_id.as_ref() != Some(&reviewer_agent_id)
                     || change.author_agent_id == reviewer_agent_id
                 {
@@ -921,6 +983,7 @@ impl Store {
             } => {
                 validate_change_text(&provider, 128)?;
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
                 if change.head_sha != head_sha {
                     return Err(StoreError::InvalidChangeTransition(
                         "hosted checks refer to a stale head SHA".into(),
@@ -936,6 +999,13 @@ impl Store {
                 change.ready_by_agent_id = None;
                 change.ready_sha = None;
                 change.integration_ready = false;
+                if status != CheckStatus::Green || !base_current {
+                    change.state = if change.findings.is_empty() {
+                        ChangeState::Satisfied
+                    } else {
+                        ChangeState::ReReview
+                    };
+                }
                 change.updated_at_ms = now_ms;
                 update_change_checks(&transaction, &change)?;
             }
@@ -944,6 +1014,7 @@ impl Store {
                 integrator_agent_id,
             } => {
                 let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
                 if change.author_agent_id == integrator_agent_id
                     || change.reviewer_agent_id.as_ref() == Some(&integrator_agent_id)
                 {
@@ -951,7 +1022,7 @@ impl Store {
                         "the integration actor must be independent of author and reviewer".into(),
                     ));
                 }
-                ensure_agent(&transaction, &integrator_agent_id)?;
+                ensure_agent_in_project(&transaction, &change.project_id, &integrator_agent_id)?;
                 if change.reviewed_sha.as_deref() != Some(change.head_sha.as_str())
                     || change.checks_status != CheckStatus::Green
                     || change.checks_sha.as_deref() != Some(change.head_sha.as_str())
@@ -969,14 +1040,49 @@ impl Store {
                 change.updated_at_ms = now_ms;
                 update_change_review(&transaction, &change)?;
             }
-            ChangeMutation::Abandon { id, reason } => {
-                validate_finding(&reason)?;
+            ChangeMutation::MarkIntegrated {
+                id,
+                expected_head_sha,
+            } => {
                 let mut change = load_change(&transaction, &id)?;
-                change.abandoned_reason = Some(reason);
-                change.state = ChangeState::Abandoned;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
+                if change.state != ChangeState::IntegrationReady {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "only an integration-ready change can be integrated".into(),
+                    ));
+                }
+                change.state = ChangeState::Integrated;
                 change.integration_ready = false;
                 change.updated_at_ms = now_ms;
                 update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::MarkReleased {
+                id,
+                expected_head_sha,
+            } => {
+                let mut change = load_change(&transaction, &id)?;
+                ensure_change_active(&change)?;
+                ensure_expected_head(&change, &expected_head_sha)?;
+                if change.state != ChangeState::Integrated {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "only an integrated change can be released".into(),
+                    ));
+                }
+                change.state = ChangeState::Released;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::Abandon { id, reason } => {
+                validate_finding(&reason)?;
+                let mut change = load_change(&transaction, &id)?;
+                if change.state != ChangeState::Abandoned {
+                    change.abandoned_reason = Some(reason);
+                    change.state = ChangeState::Abandoned;
+                    change.integration_ready = false;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
+                }
             }
         }
         let snapshot = load_change(&transaction, &id)?;
@@ -1005,16 +1111,18 @@ impl Store {
 
     pub fn list_changes(
         &self,
+        project_id: &ProjectId,
         after_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ChangeSnapshot>> {
         let mut statement = self
             .connection
-            .prepare("SELECT id FROM changes WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2")?;
+            .prepare("SELECT id FROM changes WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2) ORDER BY id LIMIT ?3")?;
         let ids = statement
-            .query_map(params![after_id, limit as i64], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![project_id.as_str(), after_id, limit as i64],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         ids.into_iter().map(|id| self.get_change(&id)).collect()
     }
@@ -5423,13 +5531,51 @@ fn validate_finding(value: &str) -> Result<()> {
     validate_change_text(value, 4096)
 }
 
-fn ensure_agent(connection: &Connection, agent_id: &AgentId) -> Result<()> {
+fn ensure_change_active(change: &ChangeSnapshot) -> Result<()> {
+    if change.state == ChangeState::Abandoned {
+        return Err(StoreError::InvalidChangeTransition(
+            "abandoned changes cannot be mutated".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_expected_head(change: &ChangeSnapshot, expected: &str) -> Result<()> {
+    validate_change_text(expected, 128)?;
+    if change.head_sha != expected {
+        return Err(StoreError::InvalidChangeTransition(
+            "change head changed; retry with the current exact head SHA".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_agent_in_project(
+    connection: &Connection,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<()> {
     let exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
-        [agent_id.as_str()],
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2)",
+        params![agent_id.as_str(), project_id.as_str()],
         |row| row.get(0),
     )?;
     exists.then_some(()).ok_or(StoreError::AgentNotFound)
+}
+
+fn ensure_run_in_project(
+    connection: &Connection,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+    run_id: Option<&RunId>,
+) -> Result<()> {
+    let Some(run_id) = run_id else { return Ok(()) };
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM runs WHERE id = ?1 AND agent_id = ?2 AND project_id = ?3)",
+        params![run_id.as_str(), agent_id.as_str(), project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    exists.then_some(()).ok_or(StoreError::RunNotFound)
 }
 
 fn load_change(connection: &Connection, id: &str) -> Result<ChangeSnapshot> {
@@ -5439,7 +5585,7 @@ fn load_change(connection: &Connection, id: &str) -> Result<ChangeSnapshot> {
                     branch, pr_number, pr_url, head_sha, base_branch, current_base_sha,
                     state, reviewer_agent_id, reviewer_run_id, reviewed_sha,
                     checks_status, checks_sha, checks_source, ready_by_agent_id,
-                    ready_sha, abandoned_reason, updated_at_ms
+                    ready_sha, abandoned_reason, updated_at_ms, project_id
              FROM changes WHERE id = ?1",
             [id],
             |row| {
@@ -5466,12 +5612,15 @@ fn load_change(connection: &Connection, id: &str) -> Result<ChangeSnapshot> {
                     row.get::<_, Option<String>>(19)?,
                     row.get::<_, Option<String>>(20)?,
                     row.get::<_, i64>(21)?,
+                    row.get::<_, String>(22)?,
                 ))
             },
         )
         .optional()?
         .ok_or(StoreError::ChangeNotFound)?;
     let author_agent_id = AgentId::try_from(row.3).map_err(|_| StoreError::InvalidChangeInput)?;
+    let project_id =
+        ProjectId::try_from(row.22.clone()).map_err(|_| StoreError::InvalidChangeInput)?;
     let reviewer_agent_id = row
         .12
         .map(AgentId::try_from)
@@ -5533,6 +5682,7 @@ fn load_change(connection: &Connection, id: &str) -> Result<ChangeSnapshot> {
         && row.18.is_some();
     Ok(ChangeSnapshot {
         id: row.0,
+        project_id,
         source_issue: row.1,
         source_task_id,
         author_agent_id,
@@ -5645,13 +5795,18 @@ fn update_change_review(transaction: &Transaction<'_>, change: &ChangeSnapshot) 
 fn update_change_checks(transaction: &Transaction<'_>, change: &ChangeSnapshot) -> Result<()> {
     transaction.execute(
         "UPDATE changes SET current_base_sha = ?2, checks_status = ?3, checks_sha = ?4,
-             checks_source = ?5, updated_at_ms = ?6 WHERE id = ?1",
+             checks_source = ?5, state = ?6, ready_by_agent_id = ?7, ready_sha = ?8,
+             abandoned_reason = ?9, updated_at_ms = ?10 WHERE id = ?1",
         params![
             change.id,
             change.current_base_sha,
             check_status_name(change.checks_status),
             change.checks_sha,
             change.checks_source.map(check_source_name),
+            change_state_name(change.state),
+            change.ready_by_agent_id.as_ref().map(AgentId::as_str),
+            change.ready_sha,
+            change.abandoned_reason,
             change.updated_at_ms,
         ],
     )?;
@@ -5896,6 +6051,29 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0023_agent_model_policy.sql"))?;
         transaction.pragma_update(None, "user_version", 23)?;
+        transaction.commit()?;
+        current = 23;
+    }
+    if current == 23 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let has_project_id: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('changes') WHERE name = 'project_id')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_project_id {
+            transaction.execute_batch(
+                "ALTER TABLE changes ADD COLUMN project_id TEXT NOT NULL DEFAULT ''",
+            )?;
+        }
+        transaction.execute(
+            "UPDATE changes SET project_id = COALESCE(
+                 (SELECT project_id FROM agents WHERE agents.id = changes.author_agent_id), '')
+             WHERE project_id = ''",
+            [],
+        )?;
+        transaction.execute_batch(include_str!("../migrations/0024_change_scope.sql"))?;
+        transaction.pragma_update(None, "user_version", 24)?;
         transaction.commit()?;
     }
     Ok(())

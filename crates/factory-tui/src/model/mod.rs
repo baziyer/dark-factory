@@ -25,6 +25,7 @@ pub mod state;
 
 use std::collections::{BTreeMap, HashMap};
 
+use factory_core::change::ChangeSnapshot;
 use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
@@ -130,6 +131,9 @@ pub struct Board {
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
     pub agent_details: BTreeMap<AgentId, AgentDetail>,
     pub messages: BTreeMap<AgentId, Vec<AgentMessage>>,
+    /// Durable review projections keyed by change id. Change events are applied here so the
+    /// operator board never has to reconstruct review readiness from prose or GitHub state.
+    pub changes: BTreeMap<String, ChangeSnapshot>,
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
@@ -175,6 +179,7 @@ impl Board {
             sessions: BTreeMap::new(),
             agent_details: BTreeMap::new(),
             messages: BTreeMap::new(),
+            changes: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
@@ -333,6 +338,18 @@ impl Board {
             .collect();
         orchestrators.sort_by_key(|agent| agent.id.as_str());
         orchestrators
+    }
+
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn changes_for_project(&self, project_id: &ProjectId) -> Vec<&ChangeSnapshot> {
+        let mut changes: Vec<_> = self
+            .changes
+            .values()
+            .filter(|change| &change.project_id == project_id)
+            .collect();
+        changes.sort_by_key(|change| (change.updated_at_ms, change.id.clone()));
+        changes
     }
 
     // -- derived views: state/attention ------------------------------------------------------
@@ -756,9 +773,10 @@ impl Board {
         self.maybe_announce(&event, worth_announcing);
 
         match event.event {
-            FactoryEvent::AutoModeChanged { .. }
-            | FactoryEvent::PolicyDecision { .. }
-            | FactoryEvent::ChangeChanged { .. } => {}
+            FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
+            FactoryEvent::ChangeChanged { change } => {
+                self.changes.insert(change.id.clone(), change);
+            }
             FactoryEvent::AgentBudgetChanged {
                 agent_id, paused, ..
             } => {

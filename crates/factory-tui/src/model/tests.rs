@@ -4,10 +4,54 @@
 
 use super::*;
 use crate::test_fixtures::{agent, project, run, session};
+use factory_core::change::{ChangeSnapshot, ChangeState, CheckStatus};
 use factory_core::{RunStatus, SessionState};
 
 fn board() -> Board {
     Board::new(false, 0, crate::theme::FORTRESS)
+}
+
+#[test]
+fn change_events_project_and_replace_the_shared_review_projection() {
+    let mut b = board();
+    let project_id = ProjectId::try_from("project-a").unwrap();
+    let change = ChangeSnapshot {
+        id: "change-159".into(),
+        project_id: project_id.clone(),
+        source_issue: "159".into(),
+        source_task_id: None,
+        author_agent_id: AgentId::try_from("author").unwrap(),
+        author_run_id: None,
+        author_present: true,
+        branch: "agent/change-159".into(),
+        pr_number: Some(177),
+        pr_url: None,
+        head_sha: "sha-a".into(),
+        base_branch: "main".into(),
+        current_base_sha: None,
+        state: ChangeState::Authored,
+        reviewer_agent_id: None,
+        reviewer_run_id: None,
+        reviewed_sha: None,
+        checks_status: CheckStatus::Pending,
+        checks_sha: None,
+        checks_source: None,
+        ready_by_agent_id: None,
+        ready_sha: None,
+        integration_ready: false,
+        abandoned_reason: None,
+        findings: Vec::new(),
+        updated_at_ms: 1,
+    };
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1,
+        event: FactoryEvent::ChangeChanged {
+            change: change.clone(),
+        },
+    });
+    assert_eq!(b.changes_for_project(&project_id), vec![&change]);
 }
 
 // -- fleet snapshot / focus --------------------------------------------------------------------

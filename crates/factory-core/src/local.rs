@@ -417,6 +417,7 @@ pub enum LocalRequest {
     /// agent-held GitHub credential.
     CreateChange {
         id: String,
+        project_id: ProjectId,
         source_issue: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_task_id: Option<TaskId>,
@@ -432,6 +433,7 @@ pub enum LocalRequest {
         base_branch: String,
     },
     ListChanges {
+        project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<String>,
         limit: u32,
@@ -446,6 +448,7 @@ pub enum LocalRequest {
     RequestChangeReview {
         id: String,
         reviewer_agent_id: AgentId,
+        expected_head_sha: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reviewer_run_id: Option<RunId>,
     },
@@ -453,21 +456,25 @@ pub enum LocalRequest {
         id: String,
         number: u32,
         description: String,
+        expected_head_sha: String,
     },
     RespondToChangeFinding {
         id: String,
         number: u32,
         disposition: String,
+        expected_head_sha: String,
     },
     ResolveChangeFinding {
         id: String,
         number: u32,
         reviewer_agent_id: AgentId,
         resolution: String,
+        expected_head_sha: String,
     },
     SatisfyChangeReview {
         id: String,
         reviewer_agent_id: AgentId,
+        expected_head_sha: String,
     },
     ReconcileChangeChecks {
         id: String,
@@ -481,6 +488,14 @@ pub enum LocalRequest {
     MarkChangeIntegrationReady {
         id: String,
         integrator_agent_id: AgentId,
+    },
+    MarkChangeIntegrated {
+        id: String,
+        expected_head_sha: String,
+    },
+    MarkChangeReleased {
+        id: String,
+        expected_head_sha: String,
     },
     AbandonChange {
         id: String,

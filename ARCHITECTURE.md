@@ -291,21 +291,25 @@ the acceptance condition is the new task body entering a running task.
 change records its source issue and task, author agent/run, branch, PR
 identity, exact head SHA, base branch, numbered findings, assigned reviewer,
 hosted-check evidence, and independent integration actor. `factoryctl change`
-is the CLI-first operator projection; a TUI may request the same `ListChanges`
-and `GetChange` protocol records rather than rebuild readiness from GitHub
-comments.
+is the CLI-first operator projection; a TUI receives the same `ChangeChanged`
+projection and may request the scoped `ListChanges`/`GetChange` records rather
+than rebuild readiness from GitHub comments.
 
 Review satisfaction, check reconciliation, and integration readiness are
 always tied to the stored head SHA. A new head clears review, checks, current
-base evidence, and readiness in one transaction. Hosted checks enter only via
-the explicit operator/connector seam (`ReconcileChangeChecks`); agents do not
+base evidence, and readiness in one transaction. Hosted checks enter through an
+authenticated connector webhook seam or the explicit operator mutation; the
+local operator API rejects caller-labelled connector evidence. Agents do not
 hold GitHub credentials and prose cannot mark a gate green. Self-review and
 self-integration are rejected, and the author/reviewer/integrator must be
 distinct principals. `integration_ready` is projected only after exact-SHA
 review satisfaction, green checks, current-base evidence, and an independent
 integrator claim. Missing author rows remain visible as `author_present=false`.
 This is the small durable slice for #159 and is intentionally not the full
-#131 change engine or #153 ingestion service.
+#131 change engine or #153 ingestion service; it preserves the operator/review
+ownership boundaries from #38 and the repository/session evidence tracked by
+#130 and #154. The hosted projection remains compatible with the later #153
+ingestion work.
 
 ## Deliberately unresolved
 

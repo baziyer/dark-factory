@@ -1,4 +1,4 @@
-CREATE TABLE changes (
+CREATE TABLE IF NOT EXISTS changes (
     id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128),
     source_issue TEXT NOT NULL CHECK (length(source_issue) BETWEEN 1 AND 256),
     source_task_id TEXT,
@@ -26,7 +26,7 @@ CREATE TABLE changes (
     updated_at_ms INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE change_findings (
+CREATE TABLE IF NOT EXISTS change_findings (
     change_id TEXT NOT NULL REFERENCES changes(id) ON DELETE CASCADE,
     number INTEGER NOT NULL CHECK (number BETWEEN 1 AND 10000),
     description TEXT NOT NULL CHECK (length(description) BETWEEN 1 AND 4096),
@@ -35,4 +35,4 @@ CREATE TABLE change_findings (
     PRIMARY KEY (change_id, number)
 ) STRICT;
 
-CREATE INDEX changes_updated_id ON changes(updated_at_ms, id);
+CREATE INDEX IF NOT EXISTS changes_updated_id ON changes(updated_at_ms, id);

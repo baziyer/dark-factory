@@ -310,6 +310,7 @@ fn change_projection_survives_restart_and_head_invalidation() {
             .apply_change_mutation(
                 ChangeMutation::Create(NewChange {
                     id: "durable".into(),
+                    project_id: project_id("factory"),
                     source_issue: "159".into(),
                     source_task_id: None,
                     author_agent_id: agent_id("author"),

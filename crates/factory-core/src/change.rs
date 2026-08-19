@@ -52,6 +52,7 @@ pub struct ChangeFinding {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChangeSnapshot {
     pub id: String,
+    pub project_id: crate::ProjectId,
     pub source_issue: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_task_id: Option<TaskId>,

@@ -963,6 +963,7 @@ enum CliCommand {
     },
     ChangeCreate {
         id: String,
+        project: String,
         issue: String,
         task: Option<String>,
         author: String,
@@ -974,6 +975,7 @@ enum CliCommand {
         base: String,
     },
     ChangeList {
+        project: String,
         after_id: Option<String>,
         limit: u32,
     },
@@ -987,27 +989,32 @@ enum CliCommand {
     ChangeReviewRequest {
         id: String,
         reviewer: String,
+        head: String,
         run: Option<String>,
     },
     ChangeFinding {
         id: String,
         number: u32,
         description: String,
+        head: String,
     },
     ChangeRespond {
         id: String,
         number: u32,
         disposition: String,
+        head: String,
     },
     ChangeResolve {
         id: String,
         number: u32,
         reviewer: String,
         resolution: String,
+        head: String,
     },
     ChangeSatisfy {
         id: String,
         reviewer: String,
+        head: String,
     },
     ChangeChecks {
         id: String,
@@ -1021,6 +1028,14 @@ enum CliCommand {
     ChangeReady {
         id: String,
         integrator: String,
+    },
+    ChangeIntegrated {
+        id: String,
+        head: String,
+    },
+    ChangeReleased {
+        id: String,
+        head: String,
     },
     ChangeAbandon {
         id: String,
@@ -1660,6 +1675,7 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
     match action.as_str() {
         "create" => {
             let id = required_option(&mut args, "--id")?;
+            let project = required_option(&mut args, "--project")?;
             let issue = required_option(&mut args, "--issue")?;
             let task = take_option(&mut args, "--task")?;
             let author = required_option(&mut args, "--author")?;
@@ -1674,6 +1690,7 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
             require_empty(&args)?;
             Ok(CliCommand::ChangeCreate {
                 id,
+                project,
                 issue,
                 task,
                 author,
@@ -1686,10 +1703,15 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
             })
         }
         "list" => {
+            let project = required_option(&mut args, "--project")?;
             let after_id = take_option(&mut args, "--after")?;
             let (limit, _) = take_limit(&mut args, 100, 1000)?;
             require_empty(&args)?;
-            Ok(CliCommand::ChangeList { after_id, limit })
+            Ok(CliCommand::ChangeList {
+                project,
+                after_id,
+                limit,
+            })
         }
         "get" => {
             let id = required_option(&mut args, "--id")?;
@@ -1705,30 +1727,40 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
         "review-request" => {
             let id = required_option(&mut args, "--id")?;
             let reviewer = required_option(&mut args, "--reviewer")?;
+            let head = required_option(&mut args, "--head")?;
             let run = take_option(&mut args, "--run")?;
             require_empty(&args)?;
-            Ok(CliCommand::ChangeReviewRequest { id, reviewer, run })
+            Ok(CliCommand::ChangeReviewRequest {
+                id,
+                reviewer,
+                head,
+                run,
+            })
         }
         "finding" => {
             let id = required_option(&mut args, "--id")?;
             let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
             let description = required_option(&mut args, "--description")?;
+            let head = required_option(&mut args, "--head")?;
             require_empty(&args)?;
             Ok(CliCommand::ChangeFinding {
                 id,
                 number,
                 description,
+                head,
             })
         }
         "respond" => {
             let id = required_option(&mut args, "--id")?;
             let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
             let disposition = required_option(&mut args, "--disposition")?;
+            let head = required_option(&mut args, "--head")?;
             require_empty(&args)?;
             Ok(CliCommand::ChangeRespond {
                 id,
                 number,
                 disposition,
+                head,
             })
         }
         "resolve" => {
@@ -1736,19 +1768,22 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
             let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
             let reviewer = required_option(&mut args, "--reviewer")?;
             let resolution = required_option(&mut args, "--resolution")?;
+            let head = required_option(&mut args, "--head")?;
             require_empty(&args)?;
             Ok(CliCommand::ChangeResolve {
                 id,
                 number,
                 reviewer,
                 resolution,
+                head,
             })
         }
         "satisfy" => {
             let id = required_option(&mut args, "--id")?;
             let reviewer = required_option(&mut args, "--reviewer")?;
+            let head = required_option(&mut args, "--head")?;
             require_empty(&args)?;
-            Ok(CliCommand::ChangeSatisfy { id, reviewer })
+            Ok(CliCommand::ChangeSatisfy { id, reviewer, head })
         }
         "checks" => {
             let id = required_option(&mut args, "--id")?;
@@ -1774,6 +1809,18 @@ fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
             let integrator = required_option(&mut args, "--integrator")?;
             require_empty(&args)?;
             Ok(CliCommand::ChangeReady { id, integrator })
+        }
+        "integrated" => {
+            let id = required_option(&mut args, "--id")?;
+            let head = required_option(&mut args, "--head")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeIntegrated { id, head })
+        }
+        "released" => {
+            let id = required_option(&mut args, "--id")?;
+            let head = required_option(&mut args, "--head")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeReleased { id, head })
         }
         "abandon" => {
             let id = required_option(&mut args, "--id")?;
@@ -2782,6 +2829,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         }),
         CliCommand::ChangeCreate {
             id,
+            project,
             issue,
             task,
             author,
@@ -2793,6 +2841,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             base,
         } => Ok(LocalRequest::CreateChange {
             id,
+            project_id: parse_id(project, "project")?,
             source_issue: issue,
             source_task_id: task.map(|value| parse_id(value, "task")).transpose()?,
             author_agent_id: parse_id(author, "author agent")?,
@@ -2803,54 +2852,71 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             head_sha: head,
             base_branch: base,
         }),
-        CliCommand::ChangeList { after_id, limit } => {
-            Ok(LocalRequest::ListChanges { after_id, limit })
-        }
+        CliCommand::ChangeList {
+            project,
+            after_id,
+            limit,
+        } => Ok(LocalRequest::ListChanges {
+            project_id: parse_id(project, "project")?,
+            after_id,
+            limit,
+        }),
         CliCommand::ChangeGet { id } => Ok(LocalRequest::GetChange { id }),
         CliCommand::ChangeHead { id, head } => {
             Ok(LocalRequest::SetChangeHead { id, head_sha: head })
         }
-        CliCommand::ChangeReviewRequest { id, reviewer, run } => {
-            Ok(LocalRequest::RequestChangeReview {
-                id,
-                reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
-                reviewer_run_id: run
-                    .map(|value| parse_id(value, "reviewer run"))
-                    .transpose()?,
-            })
-        }
+        CliCommand::ChangeReviewRequest {
+            id,
+            reviewer,
+            head,
+            run,
+        } => Ok(LocalRequest::RequestChangeReview {
+            id,
+            reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
+            expected_head_sha: head,
+            reviewer_run_id: run
+                .map(|value| parse_id(value, "reviewer run"))
+                .transpose()?,
+        }),
         CliCommand::ChangeFinding {
             id,
             number,
             description,
+            head,
         } => Ok(LocalRequest::AddChangeFinding {
             id,
             number,
             description,
+            expected_head_sha: head,
         }),
         CliCommand::ChangeRespond {
             id,
             number,
             disposition,
+            head,
         } => Ok(LocalRequest::RespondToChangeFinding {
             id,
             number,
             disposition,
+            expected_head_sha: head,
         }),
         CliCommand::ChangeResolve {
             id,
             number,
             reviewer,
             resolution,
+            head,
         } => Ok(LocalRequest::ResolveChangeFinding {
             id,
             number,
             reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
             resolution,
+            expected_head_sha: head,
         }),
-        CliCommand::ChangeSatisfy { id, reviewer } => Ok(LocalRequest::SatisfyChangeReview {
+        CliCommand::ChangeSatisfy { id, reviewer, head } => Ok(LocalRequest::SatisfyChangeReview {
             id,
             reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
+            expected_head_sha: head,
         }),
         CliCommand::ChangeChecks {
             id,
@@ -2875,6 +2941,14 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 integrator_agent_id: parse_id(integrator, "integrator agent")?,
             })
         }
+        CliCommand::ChangeIntegrated { id, head } => Ok(LocalRequest::MarkChangeIntegrated {
+            id,
+            expected_head_sha: head,
+        }),
+        CliCommand::ChangeReleased { id, head } => Ok(LocalRequest::MarkChangeReleased {
+            id,
+            expected_head_sha: head,
+        }),
         CliCommand::ChangeAbandon { id, reason } => Ok(LocalRequest::AbandonChange { id, reason }),
         CliCommand::RunList {
             project_id,
@@ -3149,6 +3223,8 @@ mod tests {
             "create",
             "--id",
             "change-159",
+            "--project",
+            "project-159",
             "--issue",
             "159",
             "--author",
@@ -3794,7 +3870,12 @@ mod tests {
                 }
             )
         );
-        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
+        // The agent harness may intentionally provide the documented project
+        // environment fallback; only assert the missing-project error when
+        // that fallback is absent.
+        if std::env::var_os("DARK_FACTORY_PROJECT").is_none() {
+            assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
+        }
         assert!(
             request_for(CliCommand::Attach {
                 project_id: "project-1".into(),

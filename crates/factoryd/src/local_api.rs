@@ -12,6 +12,7 @@ use std::{
 use factory_core::{
     AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId,
     SessionId,
+    change::CheckSource,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
@@ -851,6 +852,7 @@ async fn handle_request(
         }
         LocalRequest::CreateChange {
             id,
+            project_id,
             source_issue,
             source_task_id,
             author_agent_id,
@@ -865,6 +867,7 @@ async fn handle_request(
                 state,
                 ChangeMutation::Create(NewChange {
                     id,
+                    project_id,
                     source_issue,
                     source_task_id,
                     author_agent_id,
@@ -878,10 +881,16 @@ async fn handle_request(
             )
             .await
         }
-        LocalRequest::ListChanges { after_id, limit } => {
+        LocalRequest::ListChanges {
+            project_id,
+            after_id,
+            limit,
+        } => {
             let limit = page_limit("change", limit, MAX_PROJECT_PAGE_ITEMS)?;
             let mut changes = state
-                .with_store(move |store| store.list_changes(after_id.as_deref(), limit + 1))
+                .with_store(move |store| {
+                    store.list_changes(&project_id, after_id.as_deref(), limit + 1)
+                })
                 .await?;
             let next_after_id = next_cursor(&mut changes, limit, |change| change.id.clone());
             Ok(LocalResponse::Changes {
@@ -898,6 +907,7 @@ async fn handle_request(
         LocalRequest::RequestChangeReview {
             id,
             reviewer_agent_id,
+            expected_head_sha,
             reviewer_run_id,
         } => {
             change_response(
@@ -906,6 +916,7 @@ async fn handle_request(
                     id,
                     reviewer_agent_id,
                     reviewer_run_id,
+                    expected_head_sha,
                 },
             )
             .await
@@ -914,6 +925,7 @@ async fn handle_request(
             id,
             number,
             description,
+            expected_head_sha,
         } => {
             change_response(
                 state,
@@ -921,6 +933,7 @@ async fn handle_request(
                     id,
                     number,
                     description,
+                    expected_head_sha,
                 },
             )
             .await
@@ -929,6 +942,7 @@ async fn handle_request(
             id,
             number,
             disposition,
+            expected_head_sha,
         } => {
             change_response(
                 state,
@@ -936,6 +950,7 @@ async fn handle_request(
                     id,
                     number,
                     disposition,
+                    expected_head_sha,
                 },
             )
             .await
@@ -945,6 +960,7 @@ async fn handle_request(
             number,
             reviewer_agent_id,
             resolution,
+            expected_head_sha,
         } => {
             change_response(
                 state,
@@ -953,6 +969,7 @@ async fn handle_request(
                     number,
                     reviewer_agent_id,
                     resolution,
+                    expected_head_sha,
                 },
             )
             .await
@@ -960,12 +977,14 @@ async fn handle_request(
         LocalRequest::SatisfyChangeReview {
             id,
             reviewer_agent_id,
+            expected_head_sha,
         } => {
             change_response(
                 state,
                 ChangeMutation::Satisfy {
                     id,
                     reviewer_agent_id,
+                    expected_head_sha,
                 },
             )
             .await
@@ -979,6 +998,11 @@ async fn handle_request(
             status,
             base_current,
         } => {
+            if source == CheckSource::Connector {
+                return Err(ApiFailure::Unauthorized(
+                    "connector checks require the authenticated connector webhook seam".into(),
+                ));
+            }
             change_response(
                 state,
                 ChangeMutation::ReconcileChecks {
@@ -1002,6 +1026,32 @@ async fn handle_request(
                 ChangeMutation::MarkIntegrationReady {
                     id,
                     integrator_agent_id,
+                },
+            )
+            .await
+        }
+        LocalRequest::MarkChangeIntegrated {
+            id,
+            expected_head_sha,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::MarkIntegrated {
+                    id,
+                    expected_head_sha,
+                },
+            )
+            .await
+        }
+        LocalRequest::MarkChangeReleased {
+            id,
+            expected_head_sha,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::MarkReleased {
+                    id,
+                    expected_head_sha,
                 },
             )
             .await
