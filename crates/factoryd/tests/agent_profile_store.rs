@@ -131,13 +131,14 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
 
     // Simulate the exact pre-#146 durable state, then let the next Store open
     // perform the 0022 repair as an upgrade would. The fixture was opened by
-    // the current binary, so remove only the later #155 columns before
+    // the current binary, so remove only the later #155/#165 columns before
     // rewinding its schema version.
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
             "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
-             ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
+             ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+             ALTER TABLE sessions DROP COLUMN cleanup_state;",
         )
         .unwrap();
     connection
