@@ -102,7 +102,11 @@ pub enum NetMsg {
     /// `Board::apply_replay`, never `apply_event` (see that method's doc comment for why).
     EventsReplay(Vec<EventEnvelope>),
     CaughtUp,
-    OperationResult(Result<LocalResponse, String>),
+    OperationResult {
+        operation_id: u64,
+        request: LocalRequest,
+        result: Result<LocalResponse, String>,
+    },
     CapacityResult(Result<factoryctl::capacity::CapacityChange, String>),
     /// The hourly release-manifest check and the validated installed runtime
     /// it must be compared with (`spawn_update_check`).
@@ -507,10 +511,15 @@ pub fn spawn_update_check(tx: Sender<NetMsg>, now_ms: i64) {
 
 /// Fires one request in the background and reports the result. Used for every operator action
 /// so the render loop is never blocked on the daemon.
-pub fn spawn_request(client: Client, tx: Sender<NetMsg>, request: LocalRequest) {
+pub fn spawn_request(client: Client, tx: Sender<NetMsg>, operation_id: u64, request: LocalRequest) {
     thread::spawn(move || {
+        let request_for_result = request.clone();
         let result = request_response(&client, request);
-        let _ = tx.send(NetMsg::OperationResult(result));
+        let _ = tx.send(NetMsg::OperationResult {
+            operation_id,
+            request: request_for_result,
+            result,
+        });
     });
 }
 

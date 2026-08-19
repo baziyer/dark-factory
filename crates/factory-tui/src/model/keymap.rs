@@ -341,6 +341,10 @@ pub enum Intent {
     Redraw,
     Quit,
     Send(LocalRequest),
+    SendWithIdentity {
+        operation_id: u64,
+        request: LocalRequest,
+    },
     SetCapacity(usize),
     /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
     /// `main.rs` encodes and forwards to whichever pane is currently focused.
@@ -902,8 +906,7 @@ impl Board {
                     project_id,
                     task_id,
                 };
-                self.begin_attention_request(&source, choice.action);
-                Intent::Send(request)
+                self.attention_request(&source, choice.action, request)
             }
             factory_core::status::AttentionAction::ResumeAgent => {
                 let Some(agent_id) = source.agent_id.clone() else {
@@ -914,8 +917,7 @@ impl Board {
                     project_id: source.project_id.clone(),
                     agent_id,
                 };
-                self.begin_attention_request(&source, choice.action);
-                Intent::Send(request)
+                self.attention_request(&source, choice.action, request)
             }
             factory_core::status::AttentionAction::ResetBudget => {
                 let Some(agent_id) = source.agent_id.clone() else {
@@ -926,8 +928,7 @@ impl Board {
                     project_id: source.project_id.clone(),
                     agent_id,
                 };
-                self.begin_attention_request(&source, choice.action);
-                Intent::Send(request)
+                self.attention_request(&source, choice.action, request)
             }
             factory_core::status::AttentionAction::AnswerInTerminal => {
                 let Some(session_id) = source.session_id.clone() else {
@@ -958,8 +959,7 @@ impl Board {
                     session_id,
                     bytes: factory_core::runner::encode_terminal_bytes(bytes),
                 };
-                self.begin_attention_request(&source, choice.action);
-                Intent::Send(request)
+                self.attention_request(&source, choice.action, request)
             }
             factory_core::status::AttentionAction::ReviewProviderPermission => {
                 self.set_status("choose approve or reject", StatusLevel::Info);
@@ -1161,6 +1161,11 @@ impl Board {
                 }
                 let mut bytes = answer.as_bytes().to_vec();
                 bytes.push(b'\n');
+                let request = LocalRequest::TerminalInput {
+                    project_id: project_id.clone(),
+                    session_id: session_id.clone(),
+                    bytes: factory_core::runner::encode_terminal_bytes(&bytes),
+                };
                 if let Some(source) = self
                     .attention_focus
                     .as_ref()
@@ -1170,16 +1175,13 @@ impl Board {
                             && source.session_id.as_ref() == Some(&session_id)
                     })
                 {
-                    self.begin_attention_request(
+                    return self.attention_request(
                         &source,
                         factory_core::status::AttentionAction::AnswerInTerminal,
+                        request,
                     );
                 }
-                Intent::Send(LocalRequest::TerminalInput {
-                    project_id,
-                    session_id,
-                    bytes: factory_core::runner::encode_terminal_bytes(&bytes),
-                })
+                Intent::Send(request)
             }
             PromptKind::EditModel(agent_id) => {
                 let Some(detail) = self.agent_details.get(&agent_id) else {
@@ -1658,10 +1660,14 @@ mod tests {
             board.handle_key(key(KeyCode::Char('g'))),
             Intent::Redraw
         ));
-        let Intent::Send(LocalRequest::RetryTask {
-            project_id,
-            task_id,
-        }) = board.handle_key(key(KeyCode::Enter))
+        let Intent::SendWithIdentity {
+            request:
+                LocalRequest::RetryTask {
+                    project_id,
+                    task_id,
+                },
+            ..
+        } = board.handle_key(key(KeyCode::Enter))
         else {
             panic!("recommended retry was not a typed local request");
         };
@@ -1694,7 +1700,10 @@ mod tests {
         );
         assert!(matches!(
             board.handle_key(key(KeyCode::Char('1'))),
-            Intent::Send(LocalRequest::TerminalInput { .. })
+            Intent::SendWithIdentity {
+                request: LocalRequest::TerminalInput { .. },
+                ..
+            }
         ));
         board.apply_response(Ok(LocalResponse::TerminalInputAccepted {
             session_id: SessionId::try_from("session").unwrap(),
@@ -1718,8 +1727,111 @@ mod tests {
         });
         assert!(matches!(
             board.handle_key(key(KeyCode::Char('2'))),
-            Intent::Send(LocalRequest::TerminalInput { .. })
+            Intent::SendWithIdentity {
+                request: LocalRequest::TerminalInput { .. },
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn delayed_success_and_error_cannot_clear_a_replaced_pending_source() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id: old_operation,
+            request: old_request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("first decision did not produce an identified request");
+        };
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        board.attention_focus = None;
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id: new_operation,
+            request: new_request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("replacement decision did not produce an identified request");
+        };
+        assert_ne!(old_operation, new_operation);
+        assert_eq!(old_request, new_request);
+
+        board.apply_operation_response(
+            old_operation,
+            old_request.clone(),
+            Err("late failure".into()),
+        );
+        assert_eq!(board.pending_attention_operation_id, Some(new_operation));
+        board.apply_operation_response(
+            old_operation,
+            old_request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 12),
+            }),
+        );
+        assert_eq!(board.pending_attention_operation_id, Some(new_operation));
+        assert_eq!(board.pending_attention_request.as_ref(), Some(&new_request));
+
+        board.apply_operation_response(
+            new_operation,
+            new_request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 13),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.pending_attention_operation_id.is_none());
+        assert!(board.pending_attention_request.is_none());
+    }
+
+    #[test]
+    fn deserialized_attention_reason_is_bounded_and_control_safe_before_rendering() {
+        let mut board = board();
+        let mut item = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        );
+        item.reason.summary = format!("\u{1b}[31m{}\u{202e}", "hostile ".repeat(80));
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![item],
+        });
+        let rendered = &board.attention[0].reason.summary;
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{202e}'));
+        assert!(rendered.chars().count() <= factory_core::status::MAX_ATTENTION_SUMMARY_CHARS);
+        assert!(
+            board.attention[0].decision().cause.chars().count()
+                <= factory_core::status::MAX_ATTENTION_SUMMARY_CHARS
+        );
     }
 
     #[test]
@@ -1741,11 +1853,15 @@ mod tests {
         for character in "use the stable branch".chars() {
             board.handle_key(key(KeyCode::Char(character)));
         }
-        let Intent::Send(LocalRequest::TerminalInput {
-            project_id,
-            session_id,
-            bytes,
-        }) = board.handle_key(key(KeyCode::Enter))
+        let Intent::SendWithIdentity {
+            request:
+                LocalRequest::TerminalInput {
+                    project_id,
+                    session_id,
+                    bytes,
+                },
+            ..
+        } = board.handle_key(key(KeyCode::Enter))
         else {
             panic!("provider decision did not become a typed local request");
         };
@@ -1770,7 +1886,7 @@ mod tests {
         )];
         board.handle_key(key(KeyCode::Char('g')));
         assert!(
-            matches!(board.handle_key(key(KeyCode::Char('1'))), Intent::Send(LocalRequest::ResumeAgent { project_id, agent_id }) if project_id.as_str() == "proj" && agent_id.as_str() == "alice")
+            matches!(board.handle_key(key(KeyCode::Char('1'))), Intent::SendWithIdentity { request: LocalRequest::ResumeAgent { project_id, agent_id }, .. } if project_id.as_str() == "proj" && agent_id.as_str() == "alice")
         );
         assert_eq!(board.view, View::Building);
     }
@@ -1786,8 +1902,10 @@ mod tests {
             10,
         );
         board.attention = vec![item.clone()];
-        let Intent::Send(LocalRequest::RetryTask { task_id, .. }) =
-            board.handle_mouse_target(MouseTarget::AttentionChoice(item, 0))
+        let Intent::SendWithIdentity {
+            request: LocalRequest::RetryTask { task_id, .. },
+            ..
+        } = board.handle_mouse_target(MouseTarget::AttentionChoice(item, 0))
         else {
             panic!("mouse choice did not use the typed retry request");
         };

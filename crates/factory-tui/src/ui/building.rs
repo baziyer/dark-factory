@@ -142,7 +142,8 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
                 ),
                 Span::raw(format!(
                     "{} :: {}/{subject}",
-                    item.reason.summary, item.project_id
+                    factory_core::status::display_text(&item.reason.summary),
+                    item.project_id
                 )),
             ])
         })

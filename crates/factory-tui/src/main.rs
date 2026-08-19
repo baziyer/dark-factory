@@ -509,7 +509,8 @@ fn sync_agent_context(
     };
     let project_id = agent.project_id.clone();
     for request in context_requests(project_id, agent_id) {
-        net::spawn_request(client.clone(), tx.clone(), request);
+        let operation_id = board.allocate_operation_id();
+        net::spawn_request(client.clone(), tx.clone(), operation_id, request);
     }
 }
 
@@ -647,7 +648,15 @@ fn apply_intent(
         Intent::None => false,
         Intent::Redraw | Intent::Quit => true,
         Intent::Send(request) => {
-            net::spawn_request(client.clone(), tx.clone(), request);
+            let operation_id = board.allocate_operation_id();
+            net::spawn_request(client.clone(), tx.clone(), operation_id, request);
+            true
+        }
+        Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } => {
+            net::spawn_request(client.clone(), tx.clone(), operation_id, request);
             true
         }
         Intent::SetCapacity(capacity) => {
@@ -743,7 +752,11 @@ fn apply_net_msg(
         NetMsg::Event(event) => board.apply_event(event),
         NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
-        NetMsg::OperationResult(result) => board.apply_response(result),
+        NetMsg::OperationResult {
+            operation_id,
+            request,
+            result,
+        } => board.apply_operation_response(operation_id, request, result),
         NetMsg::CapacityResult(result) => match result {
             Ok(change) => board.note_info(format!(
                 "capacity {} -> {} (runner sessions preserved)",

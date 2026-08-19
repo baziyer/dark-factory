@@ -406,7 +406,7 @@ impl AttentionItem {
             | AttentionReasonKind::WaitingForCapacity => Vec::new(),
         };
         AttentionDecision {
-            cause: self.reason.summary.clone(),
+            cause: display_text(&self.reason.summary),
             evidence: evidence
                 .chars()
                 .take(MAX_ATTENTION_EVIDENCE_CHARS)

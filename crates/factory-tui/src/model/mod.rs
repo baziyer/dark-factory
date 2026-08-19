@@ -24,7 +24,7 @@ pub mod state;
 
 use std::collections::{BTreeMap, HashMap};
 
-use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
+use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalRequest, LocalResponse};
 use factory_core::status::{
     AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, display_text,
 };
@@ -42,6 +42,14 @@ pub use keymap::{
 pub use state::AgentState;
 
 use crate::theme::Theme;
+
+fn sanitize_attention_item(mut item: AttentionItem) -> AttentionItem {
+    item.reason.summary = display_text(&item.reason.summary);
+    if item.reason.summary.is_empty() {
+        item.reason.summary = "operator attention required".to_owned();
+    }
+    item
+}
 
 /// How many announcement lines the ring buffer keeps. Old lines fall off the front.
 pub const ANNOUNCEMENT_CAPACITY: usize = 500;
@@ -152,6 +160,9 @@ pub struct Board {
     /// duplicate-action window between a successful request and its event.
     pending_attention: Option<AttentionItem>,
     pending_attention_action: Option<factory_core::status::AttentionAction>,
+    pending_attention_operation_id: Option<u64>,
+    pending_attention_request: Option<LocalRequest>,
+    next_operation_id: u64,
     /// Recently completed exact sources suppressed until a newer projection
     /// proves a new decision exists.
     completed_attention: Vec<AttentionItem>,
@@ -204,6 +215,9 @@ impl Board {
             attention_focus: None,
             pending_attention: None,
             pending_attention_action: None,
+            pending_attention_operation_id: None,
+            pending_attention_request: None,
+            next_operation_id: 1,
             completed_attention: Vec::new(),
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
@@ -224,7 +238,11 @@ impl Board {
             if status.event_sequence >= 0 {
                 self.attention_revision = self.attention_revision.max(status.event_sequence);
             }
-            self.attention = status.attention;
+            self.attention = status
+                .attention
+                .into_iter()
+                .map(sanitize_attention_item)
+                .collect();
             self.reconcile_pending_attention_projection();
             self.reconcile_attention_focus();
         }
@@ -469,14 +487,40 @@ impl Board {
         &mut self,
         item: &AttentionItem,
         action: factory_core::status::AttentionAction,
-    ) {
+        request: LocalRequest,
+    ) -> u64 {
+        let operation_id = self.allocate_operation_id();
         self.pending_attention = Some(item.clone());
         self.pending_attention_action = Some(action);
+        self.pending_attention_operation_id = Some(operation_id);
+        self.pending_attention_request = Some(request);
+        operation_id
     }
 
     pub(crate) fn clear_attention_request(&mut self) {
         self.pending_attention = None;
         self.pending_attention_action = None;
+        self.pending_attention_operation_id = None;
+        self.pending_attention_request = None;
+    }
+
+    pub(crate) fn allocate_operation_id(&mut self) -> u64 {
+        let operation_id = self.next_operation_id;
+        self.next_operation_id = self.next_operation_id.checked_add(1).unwrap_or(1);
+        operation_id
+    }
+
+    pub(crate) fn attention_request(
+        &mut self,
+        item: &AttentionItem,
+        action: factory_core::status::AttentionAction,
+        request: LocalRequest,
+    ) -> Intent {
+        let operation_id = self.begin_attention_request(item, action, request.clone());
+        Intent::SendWithIdentity {
+            operation_id,
+            request,
+        }
     }
 
     pub(crate) fn complete_attention_request(&mut self) {
@@ -484,6 +528,8 @@ impl Board {
             return;
         };
         self.pending_attention_action = None;
+        self.pending_attention_operation_id = None;
+        self.pending_attention_request = None;
         if item.reason.kind != AttentionReasonKind::ProviderPermission {
             self.completed_attention.push(item);
             if self.completed_attention.len() > 32 {
@@ -495,10 +541,14 @@ impl Board {
 
     fn complete_attention_request_if(
         &mut self,
+        operation_id: u64,
+        request: &LocalRequest,
         action: factory_core::status::AttentionAction,
         source_matches: impl FnOnce(&AttentionItem) -> bool,
     ) {
-        let matches = self.pending_attention_action == Some(action)
+        let matches = self.pending_attention_operation_id == Some(operation_id)
+            && self.pending_attention_request.as_ref() == Some(request)
+            && self.pending_attention_action == Some(action)
             && self.pending_attention.as_ref().is_some_and(source_matches);
         if matches {
             self.complete_attention_request();
@@ -1055,21 +1105,46 @@ impl Board {
     }
 
     pub fn apply_response(&mut self, result: Result<LocalResponse, String>) {
+        self.apply_operation_response(0, LocalRequest::Health, result);
+    }
+
+    pub fn apply_operation_response(
+        &mut self,
+        operation_id: u64,
+        request: LocalRequest,
+        result: Result<LocalResponse, String>,
+    ) {
+        let matches_pending = self.pending_attention_operation_id == Some(operation_id)
+            && self.pending_attention_request.as_ref() == Some(&request);
         match result {
             Ok(LocalResponse::Error { code, message }) => {
-                self.clear_attention_request();
-                self.set_status(
-                    format!("{}: {message}", error_code_word(code)),
-                    StatusLevel::Error,
-                );
+                if matches_pending || self.pending_attention.is_none() {
+                    if matches_pending {
+                        self.clear_attention_request();
+                    }
+                    self.set_status(
+                        format!("{}: {message}", error_code_word(code)),
+                        StatusLevel::Error,
+                    );
+                } else {
+                    self.set_status("ignored stale operation failure", StatusLevel::Info);
+                }
             }
             Ok(response) => {
-                let text = self.merge_response(response);
-                self.set_status(text, StatusLevel::Info);
+                let text = self.merge_response(operation_id, &request, response);
+                if matches_pending || self.pending_attention.is_none() {
+                    self.set_status(text, StatusLevel::Info);
+                }
             }
             Err(error) => {
-                self.clear_attention_request();
-                self.set_status(format!("request failed: {error}"), StatusLevel::Error);
+                if matches_pending || self.pending_attention.is_none() {
+                    if matches_pending {
+                        self.clear_attention_request();
+                    }
+                    self.set_status(format!("request failed: {error}"), StatusLevel::Error);
+                } else {
+                    self.set_status("ignored stale request failure", StatusLevel::Info);
+                }
             }
         }
         self.clamp_selection();
@@ -1079,7 +1154,12 @@ impl Board {
     /// the `TaskChanged`/`AgentChanged`/etc. event that will also arrive over the subscription;
     /// this just removes the round-trip latency for the client that made the request) and
     /// returns a short human-readable description for the status line.
-    fn merge_response(&mut self, response: LocalResponse) -> String {
+    fn merge_response(
+        &mut self,
+        operation_id: u64,
+        request: &LocalRequest,
+        response: LocalResponse,
+    ) -> String {
         match response {
             LocalResponse::TaskCreated { task } => {
                 let id = task.snapshot.id.clone();
@@ -1102,6 +1182,8 @@ impl Board {
                 let status = task.snapshot.status;
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 self.complete_attention_request_if(
+                    operation_id,
+                    request,
                     factory_core::status::AttentionAction::RetryTask,
                     |item| item.task_id.as_ref() == Some(&id),
                 );
@@ -1137,6 +1219,8 @@ impl Board {
                 let id = agent.id.clone();
                 self.agents.insert(agent.id.clone(), agent);
                 self.complete_attention_request_if(
+                    operation_id,
+                    request,
                     factory_core::status::AttentionAction::ResumeAgent,
                     |item| item.agent_id.as_ref() == Some(&id),
                 );
@@ -1167,6 +1251,8 @@ impl Board {
             }
             LocalResponse::TerminalInputAccepted { session_id } => {
                 self.complete_attention_request_if(
+                    operation_id,
+                    request,
                     factory_core::status::AttentionAction::AnswerInTerminal,
                     |item| item.session_id.as_ref() == Some(&session_id),
                 );
