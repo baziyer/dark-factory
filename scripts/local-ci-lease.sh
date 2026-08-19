@@ -184,7 +184,8 @@ local_ci_lease_clear_metadata() {
             echo "local-ci: refusing lease with invalid owner metadata at $LOCAL_CI_LEASE_PATH" >&2
             return 1
         }
-        rm -f "$LOCAL_CI_LEASE_PATH" "$local_ci_lease_record"
+        rm -f "$LOCAL_CI_LEASE_PATH"
+        rm -f "$local_ci_lease_record"
     fi
 }
 
@@ -218,14 +219,23 @@ local_ci_lease_prepare_lock_object() {
     )
 }
 
+local_ci_lease_remove_recovery_guard() {
+    local_ci_lease_expected_identity=$1
+    [ -n "$local_ci_lease_expected_identity" ] || return 0
+    [ -d "$LOCAL_CI_LEASE_RECOVERY_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_RECOVERY_NAME" ] || return 0
+    [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null)" = "$local_ci_lease_expected_identity" ] || return 0
+    rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
+}
+
 local_ci_lease_remove_lock_object() {
     local_ci_lease_lock_object_is_safe || return 0
     (
         local_ci_lease_enter_lock_object || exit 0
         local_ci_lease_object_identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 0
         rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME"
-        rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
-        CDPATH= cd .. || exit 0
+        # A holder never owns this guard; leave it for the contender that
+        # created and identity-checked it, so recovery cannot be split.
+        CDPATH= cd -- "$LOCAL_CI_LEASE_COMMON_DIR" || exit 0
         [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_LOCK" 2>/dev/null)" = "$local_ci_lease_object_identity" ] || exit 0
         rmdir "$(basename "$LOCAL_CI_LEASE_LOCK")" 2>/dev/null || true
     )
@@ -245,15 +255,19 @@ local_ci_lease_recover_lock_object() {
         local_ci_lease_enter_lock_object || exit 2
         local_ci_lease_object_identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 2
         mkdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || exit 1
+        local_ci_lease_recovery_identity=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null) || exit 2
         if lockf -s -k -t 0 "$LOCAL_CI_LEASE_LOCK_FILE_NAME" true; then
-            local_ci_lease_clear_metadata || exit 2
+            if ! local_ci_lease_clear_metadata; then
+                local_ci_lease_remove_recovery_guard "$local_ci_lease_recovery_identity"
+                exit 2
+            fi
             rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME"
-            rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
-            CDPATH= cd .. || exit 2
+            local_ci_lease_remove_recovery_guard "$local_ci_lease_recovery_identity"
+            CDPATH= cd -- "$LOCAL_CI_LEASE_COMMON_DIR" || exit 2
             [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_LOCK" 2>/dev/null)" = "$local_ci_lease_object_identity" ] || exit 2
             rmdir "$(basename "$LOCAL_CI_LEASE_LOCK")" 2>/dev/null
         else
-            rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
+            local_ci_lease_remove_recovery_guard "$local_ci_lease_recovery_identity"
             exit 1
         fi
     )
@@ -286,8 +300,25 @@ local_ci_lease_acquire_lock_object() {
             return 1
         fi
         if ! local_ci_lease_owner_matches_lock_object; then
-            echo "local-ci: refusing lock object replacement or invalid owner metadata at $LOCAL_CI_LEASE_LOCK; inspect and remove it manually" >&2
-            return 1
+            if [ "${DARK_FACTORY_LOCAL_CI_WAIT-1}" = 0 ]; then
+                echo "local-ci: refusing lock object replacement or invalid owner metadata at $LOCAL_CI_LEASE_LOCK; inspect and remove it manually" >&2
+                return 1
+            fi
+            if local_ci_lease_lock_probe; then
+                echo "local-ci: refusing lock object replacement or invalid owner metadata at $LOCAL_CI_LEASE_LOCK; inspect and remove it manually" >&2
+                return 1
+            fi
+            local_ci_lease_probe_status=$?
+            [ "$local_ci_lease_probe_status" -ne 2 ] || {
+                echo "local-ci: cannot validate the lock object while owner metadata is invalid" >&2
+                return 1
+            }
+            if [ "$local_ci_lease_reported_wait" -eq 0 ]; then
+                local_ci_lease_diagnostic
+                local_ci_lease_reported_wait=1
+            fi
+            sleep 1
+            continue
         fi
         if [ "$local_ci_lease_reported_wait" -eq 0 ]; then
             local_ci_lease_diagnostic
@@ -340,7 +371,8 @@ local_ci_lease_release_owner() {
     local_ci_lease_current_ref=$(local_ci_lease_owner_ref || true)
     local_ci_lease_expected_ref=$(basename "${LOCAL_CI_LEASE_OWNER_RECORD-}")
     if [ -n "$local_ci_lease_expected_ref" ] && [ "$local_ci_lease_current_ref" = "$local_ci_lease_expected_ref" ]; then
-        rm -f "$LOCAL_CI_LEASE_PATH" "$LOCAL_CI_LEASE_OWNER_RECORD"
+        rm -f "$LOCAL_CI_LEASE_PATH"
+        rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
     fi
 }
 

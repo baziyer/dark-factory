@@ -25,6 +25,7 @@ trap cleanup EXIT HUP INT TERM
 
 fail() {
     echo "local-ci lease test failed: $*" >&2
+    [ -f "${waiter_stderr-}" ] && cat "$waiter_stderr" >&2
     exit 1
 }
 
@@ -62,12 +63,13 @@ short_command="$temporary/short.sh"
 failure_command="$temporary/failure.sh"
 term_command="$temporary/term.sh"
 descendant_command="$temporary/descendant.sh"
+descendant_done="$temporary/descendant-done"
 nested_command="$temporary/nested.sh"
 printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' 'sleep "$2"' >"$holder_command"
 printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' >"$short_command"
 printf '%s\n' '#!/bin/sh' 'exit 17' >"$failure_command"
 printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' 'while :; do sleep 1; done' >"$term_command"
-printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' '(while [ ! -f "$2" ]; do sleep 0.05; done) &' 'child=$!' 'printf "%s\\n" "$child" >"$3"' 'wait "$child"' >"$descendant_command"
+printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' '(while [ ! -f "$2" ]; do sleep 0.05; done) &' 'child=$!' 'printf "%s\\n" "$child" >"$3"' 'wait "$child"' ': >"$4"' >"$descendant_command"
 printf '%s\n' '#!/bin/sh' 'set -eu' 'if ./scripts/with-local-ci-lease.sh true 2>"$1"; then exit 1; fi' >"$nested_command"
 chmod +x "$holder_command" "$short_command" "$failure_command" "$term_command" "$descendant_command" "$nested_command"
 
@@ -204,8 +206,8 @@ acquire_and_release "$second" "$temporary/term-recovered"
 descendant_marker="$temporary/descendant-held"
 descendant_release="$temporary/descendant-release"
 descendant_pid_file="$temporary/descendant.pid"
-sh -c 'cd "$1" && exec ./scripts/with-local-ci-lease.sh "$2" "$3" "$4" "$5"' \
-    local-ci-descendant "$first" "$descendant_command" "$descendant_marker" "$descendant_release" "$descendant_pid_file" &
+sh -c 'cd "$1" && exec ./scripts/with-local-ci-lease.sh "$2" "$3" "$4" "$5" "$6"' \
+    local-ci-descendant "$first" "$descendant_command" "$descendant_marker" "$descendant_release" "$descendant_pid_file" "$descendant_done" &
 descendant_wrapper_pid=$!
 background_pids="$background_pids $descendant_wrapper_pid"
 wait_for_file "$descendant_marker"
@@ -217,6 +219,7 @@ if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.s
     fail "waiter acquired while a killed-owner descendant survived"
 fi
 : >"$descendant_release"
+wait_for_file "$descendant_done"
 acquire_and_release "$second" "$temporary/descendant-recovered"
 
 # Two stale-recovery contenders cannot remove a new owner: recovery is guarded
@@ -241,7 +244,12 @@ wait_for_file "$temporary/stale-second"
 assert_absent "$stale_record"
 wait_for_file "$stale_first_done"
 wait_for_file "$stale_second_done"
-wait "$stale_first_pid" "$stale_second_pid"
+if ! wait "$stale_first_pid"; then
+    fail "first stale-recovery contender failed"
+fi
+if ! wait "$stale_second_pid"; then
+    fail "second stale-recovery contender failed"
+fi
 assert_absent "$lock_path/.recovery"
 assert_absent "$lease_path"
 assert_absent "$lock_path"
