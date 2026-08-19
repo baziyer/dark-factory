@@ -106,3 +106,28 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           "$PUBLISHER" "$TAG" "$SOURCE_SHA" "$GITHUB_REPOSITORY" dist/*
+
+      - name: Publish bounded workflow summary
+        if: always()
+        run: |
+          if [ -x ./scripts/github-step-summary.sh ]; then
+            DF_SUMMARY_KIND=release \
+            DF_SUMMARY_REF="refs/tags/$TAG" \
+            DF_SUMMARY_SHA="$SOURCE_SHA" \
+            DF_SUMMARY_RESULT="${{ job.status }}" \
+            DF_SUMMARY_TARGET="$TAG" \
+            DF_SUMMARY_TARGET_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            DF_SUMMARY_RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              ./scripts/github-step-summary.sh
+          else
+            # The checkout can fail before repository files exist. Keep this
+            # immutable fallback static: no untrusted value is interpolated.
+            {
+              printf '%s\n' '### Dark Factory workflow summary'
+              printf '%s\n' '- Result: <code>failure</code>'
+              printf '%s\n' '- Ref: <code>unavailable before checkout</code>'
+              printf '%s\n' '- SHA: <code>unavailable before checkout</code>'
+              printf '%s\n' '- Release target: <code>unavailable before checkout</code>'
+              printf '%s\n' '- Links: workflow run summary'
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
