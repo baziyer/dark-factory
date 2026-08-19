@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use factory_core::change::{ChangeFinding, ChangeSnapshot, ChangeState, CheckSource, CheckStatus};
 use factory_core::{
     AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
@@ -431,6 +432,16 @@ pub struct ClosedEpisode {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("change is invalid or exceeds its bound")]
+    InvalidChangeInput,
+    #[error("change was not found")]
+    ChangeNotFound,
+    #[error("change transition is invalid: {0}")]
+    InvalidChangeTransition(String),
+    #[error("change finding was not found")]
+    ChangeFindingNotFound,
+    #[error("change finding already exists")]
+    ChangeFindingExists,
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("event payload error: {0}")]
@@ -561,7 +572,453 @@ pub struct Store {
     connection: Connection,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewChange {
+    pub id: String,
+    pub source_issue: String,
+    pub source_task_id: Option<TaskId>,
+    pub author_agent_id: AgentId,
+    pub author_run_id: Option<RunId>,
+    pub branch: String,
+    pub pr_number: Option<u64>,
+    pub pr_url: Option<String>,
+    pub head_sha: String,
+    pub base_branch: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ChangeMutation {
+    Create(NewChange),
+    SetHead {
+        id: String,
+        head_sha: String,
+    },
+    RequestReview {
+        id: String,
+        reviewer_agent_id: AgentId,
+        reviewer_run_id: Option<RunId>,
+    },
+    AddFinding {
+        id: String,
+        number: u32,
+        description: String,
+    },
+    RespondFinding {
+        id: String,
+        number: u32,
+        disposition: String,
+    },
+    ResolveFinding {
+        id: String,
+        number: u32,
+        reviewer_agent_id: AgentId,
+        resolution: String,
+    },
+    Satisfy {
+        id: String,
+        reviewer_agent_id: AgentId,
+    },
+    ReconcileChecks {
+        id: String,
+        source: CheckSource,
+        provider: String,
+        head_sha: String,
+        base_sha: String,
+        status: CheckStatus,
+        base_current: bool,
+    },
+    MarkIntegrationReady {
+        id: String,
+        integrator_agent_id: AgentId,
+    },
+    Abandon {
+        id: String,
+        reason: String,
+    },
+}
+
 impl Store {
+    /// Applies every change/review transition under one SQLite transaction.
+    /// The snapshot is read again before commit and the same snapshot is
+    /// emitted as a durable event, so restart/replay cannot reconstruct a
+    /// readiness decision from comments or stale client state.
+    pub fn apply_change_mutation(
+        &mut self,
+        mutation: ChangeMutation,
+        now_ms: i64,
+    ) -> Result<(ChangeSnapshot, EventEnvelope)> {
+        let id = match &mutation {
+            ChangeMutation::Create(input) => input.id.clone(),
+            ChangeMutation::SetHead { id, .. }
+            | ChangeMutation::RequestReview { id, .. }
+            | ChangeMutation::AddFinding { id, .. }
+            | ChangeMutation::RespondFinding { id, .. }
+            | ChangeMutation::ResolveFinding { id, .. }
+            | ChangeMutation::Satisfy { id, .. }
+            | ChangeMutation::ReconcileChecks { id, .. }
+            | ChangeMutation::MarkIntegrationReady { id, .. }
+            | ChangeMutation::Abandon { id, .. } => id.clone(),
+        };
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        match mutation {
+            ChangeMutation::Create(input) => {
+                validate_change_text(&input.id, 128)?;
+                validate_change_text(&input.source_issue, 256)?;
+                validate_change_text(&input.branch, 255)?;
+                validate_change_text(&input.head_sha, 128)?;
+                validate_change_text(&input.base_branch, 255)?;
+                if let Some(url) = &input.pr_url {
+                    validate_change_text(url, 4096)?;
+                }
+                let agent_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+                    [input.author_agent_id.as_str()],
+                    |row| row.get(0),
+                )?;
+                if !agent_exists {
+                    return Err(StoreError::AgentNotFound);
+                }
+                if let Some(task_id) = &input.source_task_id {
+                    let task_exists: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                        [task_id.as_str()],
+                        |row| row.get(0),
+                    )?;
+                    if !task_exists {
+                        return Err(StoreError::TaskNotFound);
+                    }
+                }
+                let inserted = transaction.execute(
+                    "INSERT OR IGNORE INTO changes
+                     (id, source_issue, source_task_id, author_agent_id, author_run_id,
+                      branch, pr_number, pr_url, head_sha, base_branch, current_base_sha,
+                      state, reviewer_agent_id, reviewer_run_id, reviewed_sha,
+                      checks_status, checks_sha, checks_source, ready_by_agent_id,
+                      ready_sha, abandoned_reason, created_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL,
+                             'authored', NULL, NULL, NULL, 'pending', NULL, NULL,
+                             NULL, NULL, NULL, ?11, ?11)",
+                    params![
+                        input.id,
+                        input.source_issue,
+                        input.source_task_id.as_ref().map(TaskId::as_str),
+                        input.author_agent_id.as_str(),
+                        input.author_run_id.as_ref().map(RunId::as_str),
+                        input.branch,
+                        input.pr_number.map(|number| number as i64),
+                        input.pr_url,
+                        input.head_sha,
+                        input.base_branch,
+                        now_ms,
+                    ],
+                )?;
+                if inserted == 0 {
+                    let existing = load_change(&transaction, &input.id)?;
+                    if existing.source_issue != input.source_issue
+                        || existing.author_agent_id != input.author_agent_id
+                        || existing.branch != input.branch
+                        || existing.head_sha != input.head_sha
+                    {
+                        return Err(StoreError::InvalidChangeTransition(
+                            "change id already names different source or author state".into(),
+                        ));
+                    }
+                    if existing.source_issue != input.source_issue {
+                        return Err(StoreError::InvalidChangeTransition(
+                            "change id already names different source state".into(),
+                        ));
+                    }
+                }
+            }
+            ChangeMutation::SetHead { id, head_sha } => {
+                validate_change_text(&head_sha, 128)?;
+                let mut change = load_change(&transaction, &id)?;
+                if change.head_sha != head_sha {
+                    change.invalidate_head(head_sha.clone(), now_ms);
+                    for finding in &mut change.findings {
+                        finding.reviewer_resolution = None;
+                    }
+                    update_change_head(&transaction, &change)?;
+                }
+            }
+            ChangeMutation::RequestReview {
+                id,
+                reviewer_agent_id,
+                reviewer_run_id,
+            } => {
+                let mut change = load_change(&transaction, &id)?;
+                if change.author_agent_id == reviewer_agent_id {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "the author cannot be the reviewer".into(),
+                    ));
+                }
+                ensure_agent(&transaction, &reviewer_agent_id)?;
+                if change.reviewer_agent_id.as_ref() == Some(&reviewer_agent_id)
+                    && change.state == ChangeState::ReviewRequested
+                {
+                    // Idempotent retry after a lost response.
+                } else {
+                    clear_finding_resolutions(&transaction, &id, None)?;
+                    for finding in &mut change.findings {
+                        finding.reviewer_resolution = None;
+                    }
+                    change.reviewer_agent_id = Some(reviewer_agent_id);
+                    change.reviewer_run_id = reviewer_run_id;
+                    change.reviewed_sha = None;
+                    change.ready_by_agent_id = None;
+                    change.ready_sha = None;
+                    change.integration_ready = false;
+                    change.state = ChangeState::ReviewRequested;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
+                }
+            }
+            ChangeMutation::AddFinding {
+                id,
+                number,
+                description,
+            } => {
+                validate_finding(&description)?;
+                let mut change = load_change(&transaction, &id)?;
+                if let Some(existing) = change
+                    .findings
+                    .iter()
+                    .find(|finding| finding.number == number)
+                {
+                    if existing.description != description {
+                        return Err(StoreError::ChangeFindingExists);
+                    }
+                } else {
+                    transaction.execute(
+                        "INSERT INTO change_findings (change_id, number, description, author_disposition, reviewer_resolution) VALUES (?1, ?2, ?3, NULL, NULL)",
+                        params![id, i64::from(number), description],
+                    )?;
+                    change.findings.push(ChangeFinding {
+                        number,
+                        description,
+                        author_disposition: None,
+                        reviewer_resolution: None,
+                    });
+                }
+                change.state = ChangeState::Findings;
+                change.reviewed_sha = None;
+                change.ready_by_agent_id = None;
+                change.ready_sha = None;
+                change.integration_ready = false;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::RespondFinding {
+                id,
+                number,
+                disposition,
+            } => {
+                validate_finding(&disposition)?;
+                let mut change = load_change(&transaction, &id)?;
+                if !change
+                    .findings
+                    .iter()
+                    .any(|finding| finding.number == number)
+                {
+                    return Err(StoreError::ChangeFindingNotFound);
+                }
+                transaction.execute(
+                    "UPDATE change_findings SET author_disposition = ?3 WHERE change_id = ?1 AND number = ?2",
+                    params![id, i64::from(number), disposition],
+                )?;
+                clear_finding_resolutions(&transaction, &id, Some(number))?;
+                for finding in &mut change.findings {
+                    if finding.number == number {
+                        finding.author_disposition = Some(disposition.clone());
+                        finding.reviewer_resolution = None;
+                    }
+                }
+                change.state = ChangeState::AuthorResponding;
+                change.reviewed_sha = None;
+                change.ready_by_agent_id = None;
+                change.ready_sha = None;
+                change.integration_ready = false;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::ResolveFinding {
+                id,
+                number,
+                reviewer_agent_id,
+                resolution,
+            } => {
+                validate_finding(&resolution)?;
+                let mut change = load_change(&transaction, &id)?;
+                if change.reviewer_agent_id.as_ref() != Some(&reviewer_agent_id) {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "only the assigned reviewer may resolve findings".into(),
+                    ));
+                }
+                if !change
+                    .findings
+                    .iter()
+                    .any(|finding| finding.number == number)
+                {
+                    return Err(StoreError::ChangeFindingNotFound);
+                }
+                transaction.execute(
+                    "UPDATE change_findings SET reviewer_resolution = ?3 WHERE change_id = ?1 AND number = ?2",
+                    params![id, i64::from(number), resolution],
+                )?;
+                for finding in &mut change.findings {
+                    if finding.number == number {
+                        finding.reviewer_resolution = Some(resolution.clone());
+                    }
+                }
+                change.state = ChangeState::ReReview;
+                change.reviewed_sha = None;
+                change.ready_by_agent_id = None;
+                change.ready_sha = None;
+                change.integration_ready = false;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::Satisfy {
+                id,
+                reviewer_agent_id,
+            } => {
+                let mut change = load_change(&transaction, &id)?;
+                if change.reviewer_agent_id.as_ref() != Some(&reviewer_agent_id)
+                    || change.author_agent_id == reviewer_agent_id
+                {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "only the assigned independent reviewer may satisfy a change".into(),
+                    ));
+                }
+                if change.findings.iter().any(|finding| {
+                    finding.author_disposition.is_none() || finding.reviewer_resolution.is_none()
+                }) {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "every numbered finding needs an author disposition and reviewer resolution"
+                            .into(),
+                    ));
+                }
+                if change.reviewed_sha.as_deref() != Some(change.head_sha.as_str()) {
+                    change.reviewed_sha = Some(change.head_sha.clone());
+                    change.state = ChangeState::Satisfied;
+                    change.ready_by_agent_id = None;
+                    change.ready_sha = None;
+                    change.integration_ready = false;
+                    change.updated_at_ms = now_ms;
+                    update_change_review(&transaction, &change)?;
+                }
+            }
+            ChangeMutation::ReconcileChecks {
+                id,
+                source,
+                provider,
+                head_sha,
+                base_sha,
+                status,
+                base_current,
+            } => {
+                validate_change_text(&provider, 128)?;
+                let mut change = load_change(&transaction, &id)?;
+                if change.head_sha != head_sha {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "hosted checks refer to a stale head SHA".into(),
+                    ));
+                }
+                if base_sha.is_empty() || base_sha.len() > 128 {
+                    return Err(StoreError::InvalidChangeInput);
+                }
+                change.checks_status = status;
+                change.checks_sha = Some(head_sha);
+                change.checks_source = Some(source);
+                change.current_base_sha = base_current.then_some(base_sha);
+                change.ready_by_agent_id = None;
+                change.ready_sha = None;
+                change.integration_ready = false;
+                change.updated_at_ms = now_ms;
+                update_change_checks(&transaction, &change)?;
+            }
+            ChangeMutation::MarkIntegrationReady {
+                id,
+                integrator_agent_id,
+            } => {
+                let mut change = load_change(&transaction, &id)?;
+                if change.author_agent_id == integrator_agent_id
+                    || change.reviewer_agent_id.as_ref() == Some(&integrator_agent_id)
+                {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "the integration actor must be independent of author and reviewer".into(),
+                    ));
+                }
+                ensure_agent(&transaction, &integrator_agent_id)?;
+                if change.reviewed_sha.as_deref() != Some(change.head_sha.as_str())
+                    || change.checks_status != CheckStatus::Green
+                    || change.checks_sha.as_deref() != Some(change.head_sha.as_str())
+                    || change.current_base_sha.is_none()
+                {
+                    return Err(StoreError::InvalidChangeTransition(
+                        "exact satisfied review, green checks, and current base are required"
+                            .into(),
+                    ));
+                }
+                change.ready_by_agent_id = Some(integrator_agent_id);
+                change.ready_sha = Some(change.head_sha.clone());
+                change.integration_ready = true;
+                change.state = ChangeState::IntegrationReady;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+            ChangeMutation::Abandon { id, reason } => {
+                validate_finding(&reason)?;
+                let mut change = load_change(&transaction, &id)?;
+                change.abandoned_reason = Some(reason);
+                change.state = ChangeState::Abandoned;
+                change.integration_ready = false;
+                change.updated_at_ms = now_ms;
+                update_change_review(&transaction, &change)?;
+            }
+        }
+        let snapshot = load_change(&transaction, &id)?;
+        let sequence = append_event(
+            &transaction,
+            now_ms,
+            &FactoryEvent::ChangeChanged {
+                change: snapshot.clone(),
+            },
+        )?;
+        transaction.commit()?;
+        Ok((
+            snapshot.clone(),
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: FactoryEvent::ChangeChanged { change: snapshot },
+            },
+        ))
+    }
+
+    pub fn get_change(&self, id: &str) -> Result<ChangeSnapshot> {
+        load_change(&self.connection, id)
+    }
+
+    pub fn list_changes(
+        &self,
+        after_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ChangeSnapshot>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM changes WHERE (?1 IS NULL OR id > ?1) ORDER BY id LIMIT ?2")?;
+        let ids = statement
+            .query_map(params![after_id, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter().map(|id| self.get_change(&id)).collect()
+    }
+
     pub fn apply_connector_event(
         &mut self,
         endpoint_id: &str,
@@ -4955,6 +5412,282 @@ fn new_run_id() -> Result<RunId> {
         .map_err(|_| StoreError::InvalidExecutionMetadata)
 }
 
+fn validate_change_text(value: &str, max: usize) -> Result<()> {
+    if value.is_empty() || value.len() > max {
+        return Err(StoreError::InvalidChangeInput);
+    }
+    Ok(())
+}
+
+fn validate_finding(value: &str) -> Result<()> {
+    validate_change_text(value, 4096)
+}
+
+fn ensure_agent(connection: &Connection, agent_id: &AgentId) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+        [agent_id.as_str()],
+        |row| row.get(0),
+    )?;
+    exists.then_some(()).ok_or(StoreError::AgentNotFound)
+}
+
+fn load_change(connection: &Connection, id: &str) -> Result<ChangeSnapshot> {
+    let row = connection
+        .query_row(
+            "SELECT id, source_issue, source_task_id, author_agent_id, author_run_id,
+                    branch, pr_number, pr_url, head_sha, base_branch, current_base_sha,
+                    state, reviewer_agent_id, reviewer_run_id, reviewed_sha,
+                    checks_status, checks_sha, checks_source, ready_by_agent_id,
+                    ready_sha, abandoned_reason, updated_at_ms
+             FROM changes WHERE id = ?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, Option<String>>(19)?,
+                    row.get::<_, Option<String>>(20)?,
+                    row.get::<_, i64>(21)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::ChangeNotFound)?;
+    let author_agent_id = AgentId::try_from(row.3).map_err(|_| StoreError::InvalidChangeInput)?;
+    let reviewer_agent_id = row
+        .12
+        .map(AgentId::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidChangeInput)?;
+    let ready_by_agent_id = row
+        .18
+        .clone()
+        .map(AgentId::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidChangeInput)?;
+    let source_task_id = row
+        .2
+        .map(TaskId::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidChangeInput)?;
+    let author_run_id = row
+        .4
+        .map(RunId::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidChangeInput)?;
+    let reviewer_run_id = row
+        .13
+        .map(RunId::try_from)
+        .transpose()
+        .map_err(|_| StoreError::InvalidChangeInput)?;
+    let state = parse_change_state(&row.11)?;
+    let checks_status = parse_check_status(&row.15)?;
+    let checks_source = row.17.as_deref().map(parse_check_source).transpose()?;
+    let author_present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
+        [author_agent_id.as_str()],
+        |row| row.get(0),
+    )?;
+    let mut findings = Vec::new();
+    let mut finding_rows = connection.prepare(
+        "SELECT number, description, author_disposition, reviewer_resolution
+         FROM change_findings WHERE change_id = ?1 ORDER BY number",
+    )?;
+    let mapped = finding_rows.query_map([id], |row| {
+        Ok(ChangeFinding {
+            number: row.get::<_, i64>(0)?.try_into().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    Type::Integer,
+                    Box::new(std::fmt::Error),
+                )
+            })?,
+            description: row.get(1)?,
+            author_disposition: row.get(2)?,
+            reviewer_resolution: row.get(3)?,
+        })
+    })?;
+    for finding in mapped {
+        findings.push(finding?);
+    }
+    let integration_ready = state == ChangeState::IntegrationReady
+        && row.19.as_deref() == Some(row.8.as_str())
+        && row.18.is_some();
+    Ok(ChangeSnapshot {
+        id: row.0,
+        source_issue: row.1,
+        source_task_id,
+        author_agent_id,
+        author_run_id,
+        author_present,
+        branch: row.5,
+        pr_number: row.6.map(|value| value as u64),
+        pr_url: row.7,
+        head_sha: row.8,
+        base_branch: row.9,
+        current_base_sha: row.10,
+        state,
+        reviewer_agent_id,
+        reviewer_run_id,
+        reviewed_sha: row.14,
+        checks_status,
+        checks_sha: row.16,
+        checks_source,
+        ready_by_agent_id,
+        ready_sha: row.19,
+        integration_ready,
+        abandoned_reason: row.20,
+        findings,
+        updated_at_ms: row.21,
+    })
+}
+
+fn parse_change_state(value: &str) -> Result<ChangeState> {
+    match value {
+        "authored" => Ok(ChangeState::Authored),
+        "review_requested" => Ok(ChangeState::ReviewRequested),
+        "findings" => Ok(ChangeState::Findings),
+        "author_responding" => Ok(ChangeState::AuthorResponding),
+        "re_review" => Ok(ChangeState::ReReview),
+        "satisfied" => Ok(ChangeState::Satisfied),
+        "integration_ready" => Ok(ChangeState::IntegrationReady),
+        "integrated" => Ok(ChangeState::Integrated),
+        "released" => Ok(ChangeState::Released),
+        "abandoned" => Ok(ChangeState::Abandoned),
+        other => Err(StoreError::InvalidChangeTransition(format!(
+            "unknown change state {other:?}"
+        ))),
+    }
+}
+
+fn parse_check_status(value: &str) -> Result<CheckStatus> {
+    match value {
+        "pending" => Ok(CheckStatus::Pending),
+        "failed" => Ok(CheckStatus::Failed),
+        "green" => Ok(CheckStatus::Green),
+        other => Err(StoreError::InvalidChangeTransition(format!(
+            "unknown hosted-check status {other:?}"
+        ))),
+    }
+}
+
+fn parse_check_source(value: &str) -> Result<CheckSource> {
+    match value {
+        "operator" => Ok(CheckSource::Operator),
+        "connector" => Ok(CheckSource::Connector),
+        other => Err(StoreError::InvalidChangeTransition(format!(
+            "unknown hosted-check source {other:?}"
+        ))),
+    }
+}
+
+fn update_change_head(transaction: &Transaction<'_>, change: &ChangeSnapshot) -> Result<()> {
+    transaction.execute(
+        "UPDATE changes SET head_sha = ?2, updated_at_ms = ?3 WHERE id = ?1",
+        params![change.id, change.head_sha, change.updated_at_ms],
+    )?;
+    clear_finding_resolutions(transaction, &change.id, None)?;
+    update_change_review(transaction, change)?;
+    update_change_checks(transaction, change)
+}
+
+fn clear_finding_resolutions(
+    transaction: &Transaction<'_>,
+    change_id: &str,
+    number: Option<u32>,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE change_findings SET reviewer_resolution = NULL
+         WHERE change_id = ?1 AND (?2 IS NULL OR number = ?2)",
+        params![change_id, number.map(i64::from)],
+    )?;
+    Ok(())
+}
+
+fn update_change_review(transaction: &Transaction<'_>, change: &ChangeSnapshot) -> Result<()> {
+    transaction.execute(
+        "UPDATE changes SET state = ?2, reviewer_agent_id = ?3, reviewer_run_id = ?4,
+             reviewed_sha = ?5, ready_by_agent_id = ?6, ready_sha = ?7,
+             abandoned_reason = ?8, updated_at_ms = ?9 WHERE id = ?1",
+        params![
+            change.id,
+            change_state_name(change.state),
+            change.reviewer_agent_id.as_ref().map(AgentId::as_str),
+            change.reviewer_run_id.as_ref().map(RunId::as_str),
+            change.reviewed_sha,
+            change.ready_by_agent_id.as_ref().map(AgentId::as_str),
+            change.ready_sha,
+            change.abandoned_reason,
+            change.updated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn update_change_checks(transaction: &Transaction<'_>, change: &ChangeSnapshot) -> Result<()> {
+    transaction.execute(
+        "UPDATE changes SET current_base_sha = ?2, checks_status = ?3, checks_sha = ?4,
+             checks_source = ?5, updated_at_ms = ?6 WHERE id = ?1",
+        params![
+            change.id,
+            change.current_base_sha,
+            check_status_name(change.checks_status),
+            change.checks_sha,
+            change.checks_source.map(check_source_name),
+            change.updated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+fn change_state_name(value: ChangeState) -> &'static str {
+    match value {
+        ChangeState::Authored => "authored",
+        ChangeState::ReviewRequested => "review_requested",
+        ChangeState::Findings => "findings",
+        ChangeState::AuthorResponding => "author_responding",
+        ChangeState::ReReview => "re_review",
+        ChangeState::Satisfied => "satisfied",
+        ChangeState::IntegrationReady => "integration_ready",
+        ChangeState::Integrated => "integrated",
+        ChangeState::Released => "released",
+        ChangeState::Abandoned => "abandoned",
+    }
+}
+
+fn check_status_name(value: CheckStatus) -> &'static str {
+    match value {
+        CheckStatus::Pending => "pending",
+        CheckStatus::Failed => "failed",
+        CheckStatus::Green => "green",
+    }
+}
+
+fn check_source_name(value: CheckSource) -> &'static str {
+    match value {
+        CheckSource::Operator => "operator",
+        CheckSource::Connector => "connector",
+    }
+}
+
 fn migrate(connection: &mut Connection) -> Result<()> {
     let mut current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current < 0 {
@@ -5266,6 +5999,12 @@ struct EventMetadata<'a> {
 
 fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
     match event {
+        FactoryEvent::ChangeChanged { .. } => EventMetadata {
+            project_id: None,
+            task_id: None,
+            agent_id: None,
+            run_id: None,
+        },
         FactoryEvent::AutoModeChanged { .. } => EventMetadata {
             project_id: None,
             task_id: None,

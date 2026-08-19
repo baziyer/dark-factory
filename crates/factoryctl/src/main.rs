@@ -5,6 +5,7 @@ use std::{
     process,
 };
 
+use factory_core::change::{CheckSource, CheckStatus};
 use factory_core::local::{
     LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
     MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
@@ -36,7 +37,7 @@ const SESSION_TOKEN_FILE_ENV: &str = "DARK_FACTORY_SESSION_TOKEN_FILE";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|git|pr|change|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -58,6 +59,8 @@ Commands:
                                                Manage agents, their guidance files, and their durable messages
   git status|diff|commit|push                  Session-authenticated daemon-owned Git operations
   pr open|update                               Session-authenticated daemon-owned pull requests
+  change create|list|get|head|review-request|finding|respond|resolve|satisfy|checks|ready|abandon
+                                               Durable operator-owned change/review projection
   run list|stop                               List and stop process attempts
   session list|stop                           List and stop resident provider sessions
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
@@ -198,6 +201,15 @@ The daemon verifies an updated PR has that exact head branch.
 Actions:
   open --title TEXT (--body TEXT | --body-file PATH)
   update --number N --title TEXT (--body TEXT | --body-file PATH)";
+const CHANGE_HELP: &str = "usage: factoryctl change <action> [options]
+
+Durable operator-side change/review state. Every review, check, and readiness
+claim is tied to the exact head SHA; a new head invalidates prior satisfaction.
+Hosted checks are supplied by an operator or an explicit connector seam.
+
+Actions:
+  create, list, get, head, review-request, finding, respond, resolve,
+  satisfy, checks, ready, abandon";
 
 const PROJECT_HELP: &str =
     "usage: factoryctl project <add|list|delete|get|guidance|repository> [options]
@@ -949,6 +961,71 @@ enum CliCommand {
         title: String,
         body: String,
     },
+    ChangeCreate {
+        id: String,
+        issue: String,
+        task: Option<String>,
+        author: String,
+        run: Option<String>,
+        branch: String,
+        pr: Option<u64>,
+        pr_url: Option<String>,
+        head: String,
+        base: String,
+    },
+    ChangeList {
+        after_id: Option<String>,
+        limit: u32,
+    },
+    ChangeGet {
+        id: String,
+    },
+    ChangeHead {
+        id: String,
+        head: String,
+    },
+    ChangeReviewRequest {
+        id: String,
+        reviewer: String,
+        run: Option<String>,
+    },
+    ChangeFinding {
+        id: String,
+        number: u32,
+        description: String,
+    },
+    ChangeRespond {
+        id: String,
+        number: u32,
+        disposition: String,
+    },
+    ChangeResolve {
+        id: String,
+        number: u32,
+        reviewer: String,
+        resolution: String,
+    },
+    ChangeSatisfy {
+        id: String,
+        reviewer: String,
+    },
+    ChangeChecks {
+        id: String,
+        source: CheckSource,
+        provider: String,
+        head: String,
+        base_sha: String,
+        status: CheckStatus,
+        base_current: bool,
+    },
+    ChangeReady {
+        id: String,
+        integrator: String,
+    },
+    ChangeAbandon {
+        id: String,
+        reason: String,
+    },
     RunList {
         project_id: String,
         after_id: Option<String>,
@@ -1484,6 +1561,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "git" => parse_git(args).map(|command| (socket, command)),
         "pr" => parse_pr(args).map(|command| (socket, command)),
+        "change" => parse_change(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
         "session" => parse_session(args).map(|command| (socket, command)),
         "hook" => {
@@ -1568,6 +1646,159 @@ fn parse_pr(mut args: Vec<String>) -> Result<CliCommand, String> {
             })
         }
         _ => Err(format!("unknown pr action {action:?}")),
+    }
+}
+
+fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(CHANGE_HELP));
+    }
+    let action = take_action(&mut args, "change")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(CHANGE_HELP));
+    }
+    match action.as_str() {
+        "create" => {
+            let id = required_option(&mut args, "--id")?;
+            let issue = required_option(&mut args, "--issue")?;
+            let task = take_option(&mut args, "--task")?;
+            let author = required_option(&mut args, "--author")?;
+            let run = take_option(&mut args, "--run")?;
+            let branch = required_option(&mut args, "--branch")?;
+            let pr = take_option(&mut args, "--pr")?
+                .map(|value| parse_number(&value, "--pr"))
+                .transpose()?;
+            let pr_url = take_option(&mut args, "--pr-url")?;
+            let head = required_option(&mut args, "--head")?;
+            let base = required_option(&mut args, "--base")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeCreate {
+                id,
+                issue,
+                task,
+                author,
+                run,
+                branch,
+                pr,
+                pr_url,
+                head,
+                base,
+            })
+        }
+        "list" => {
+            let after_id = take_option(&mut args, "--after")?;
+            let (limit, _) = take_limit(&mut args, 100, 1000)?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeList { after_id, limit })
+        }
+        "get" => {
+            let id = required_option(&mut args, "--id")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeGet { id })
+        }
+        "head" => {
+            let id = required_option(&mut args, "--id")?;
+            let head = required_option(&mut args, "--head")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeHead { id, head })
+        }
+        "review-request" => {
+            let id = required_option(&mut args, "--id")?;
+            let reviewer = required_option(&mut args, "--reviewer")?;
+            let run = take_option(&mut args, "--run")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeReviewRequest { id, reviewer, run })
+        }
+        "finding" => {
+            let id = required_option(&mut args, "--id")?;
+            let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
+            let description = required_option(&mut args, "--description")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeFinding {
+                id,
+                number,
+                description,
+            })
+        }
+        "respond" => {
+            let id = required_option(&mut args, "--id")?;
+            let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
+            let disposition = required_option(&mut args, "--disposition")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeRespond {
+                id,
+                number,
+                disposition,
+            })
+        }
+        "resolve" => {
+            let id = required_option(&mut args, "--id")?;
+            let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
+            let reviewer = required_option(&mut args, "--reviewer")?;
+            let resolution = required_option(&mut args, "--resolution")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeResolve {
+                id,
+                number,
+                reviewer,
+                resolution,
+            })
+        }
+        "satisfy" => {
+            let id = required_option(&mut args, "--id")?;
+            let reviewer = required_option(&mut args, "--reviewer")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeSatisfy { id, reviewer })
+        }
+        "checks" => {
+            let id = required_option(&mut args, "--id")?;
+            let source = parse_check_source(&required_option(&mut args, "--source")?)?;
+            let provider = required_option(&mut args, "--provider")?;
+            let head = required_option(&mut args, "--head")?;
+            let base_sha = required_option(&mut args, "--base-sha")?;
+            let status = parse_check_status(&required_option(&mut args, "--status")?)?;
+            let base_current = take_flag(&mut args, "--base-current")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeChecks {
+                id,
+                source,
+                provider,
+                head,
+                base_sha,
+                status,
+                base_current,
+            })
+        }
+        "ready" => {
+            let id = required_option(&mut args, "--id")?;
+            let integrator = required_option(&mut args, "--integrator")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeReady { id, integrator })
+        }
+        "abandon" => {
+            let id = required_option(&mut args, "--id")?;
+            let reason = required_option(&mut args, "--reason")?;
+            require_empty(&args)?;
+            Ok(CliCommand::ChangeAbandon { id, reason })
+        }
+        _ => Err(format!("unknown change action {action:?}")),
+    }
+}
+
+fn parse_check_source(value: &str) -> Result<CheckSource, String> {
+    match value {
+        "operator" => Ok(CheckSource::Operator),
+        "connector" => Ok(CheckSource::Connector),
+        _ => Err("--source must be operator or connector".into()),
+    }
+}
+
+fn parse_check_status(value: &str) -> Result<CheckStatus, String> {
+    match value {
+        "pending" => Ok(CheckStatus::Pending),
+        "failed" | "red" => Ok(CheckStatus::Failed),
+        "green" => Ok(CheckStatus::Green),
+        _ => Err("--status must be pending, failed, or green".into()),
     }
 }
 
@@ -2549,6 +2780,102 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             title,
             body,
         }),
+        CliCommand::ChangeCreate {
+            id,
+            issue,
+            task,
+            author,
+            run,
+            branch,
+            pr,
+            pr_url,
+            head,
+            base,
+        } => Ok(LocalRequest::CreateChange {
+            id,
+            source_issue: issue,
+            source_task_id: task.map(|value| parse_id(value, "task")).transpose()?,
+            author_agent_id: parse_id(author, "author agent")?,
+            author_run_id: run.map(|value| parse_id(value, "author run")).transpose()?,
+            branch,
+            pr_number: pr,
+            pr_url,
+            head_sha: head,
+            base_branch: base,
+        }),
+        CliCommand::ChangeList { after_id, limit } => {
+            Ok(LocalRequest::ListChanges { after_id, limit })
+        }
+        CliCommand::ChangeGet { id } => Ok(LocalRequest::GetChange { id }),
+        CliCommand::ChangeHead { id, head } => {
+            Ok(LocalRequest::SetChangeHead { id, head_sha: head })
+        }
+        CliCommand::ChangeReviewRequest { id, reviewer, run } => {
+            Ok(LocalRequest::RequestChangeReview {
+                id,
+                reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
+                reviewer_run_id: run
+                    .map(|value| parse_id(value, "reviewer run"))
+                    .transpose()?,
+            })
+        }
+        CliCommand::ChangeFinding {
+            id,
+            number,
+            description,
+        } => Ok(LocalRequest::AddChangeFinding {
+            id,
+            number,
+            description,
+        }),
+        CliCommand::ChangeRespond {
+            id,
+            number,
+            disposition,
+        } => Ok(LocalRequest::RespondToChangeFinding {
+            id,
+            number,
+            disposition,
+        }),
+        CliCommand::ChangeResolve {
+            id,
+            number,
+            reviewer,
+            resolution,
+        } => Ok(LocalRequest::ResolveChangeFinding {
+            id,
+            number,
+            reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
+            resolution,
+        }),
+        CliCommand::ChangeSatisfy { id, reviewer } => Ok(LocalRequest::SatisfyChangeReview {
+            id,
+            reviewer_agent_id: parse_id(reviewer, "reviewer agent")?,
+        }),
+        CliCommand::ChangeChecks {
+            id,
+            source,
+            provider,
+            head,
+            base_sha,
+            status,
+            base_current,
+        } => Ok(LocalRequest::ReconcileChangeChecks {
+            id,
+            source,
+            provider,
+            head_sha: head,
+            base_sha,
+            status,
+            base_current,
+        }),
+        CliCommand::ChangeReady { id, integrator } => {
+            Ok(LocalRequest::MarkChangeIntegrationReady {
+                id,
+                integrator_agent_id: parse_id(integrator, "integrator agent")?,
+            })
+        }
+        CliCommand::ChangeAbandon { id, reason } => Ok(LocalRequest::AbandonChange { id, reason }),
         CliCommand::RunList {
             project_id,
             after_id,
@@ -2813,6 +3140,56 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn change_commands_parse_operator_review_lifecycle_and_check_source() {
+        let (_, command) = parse_args(args(&[
+            "change",
+            "create",
+            "--id",
+            "change-159",
+            "--issue",
+            "159",
+            "--author",
+            "author",
+            "--branch",
+            "agent/author",
+            "--head",
+            "sha-a",
+            "--base",
+            "main",
+        ]))
+        .unwrap();
+        assert!(matches!(command, CliCommand::ChangeCreate { ref id, .. } if id == "change-159"));
+
+        let (_, command) = parse_args(args(&[
+            "change",
+            "checks",
+            "--id",
+            "change-159",
+            "--source",
+            "connector",
+            "--provider",
+            "github",
+            "--head",
+            "sha-a",
+            "--base-sha",
+            "base-a",
+            "--status",
+            "green",
+            "--base-current",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            command,
+            CliCommand::ChangeChecks {
+                source: CheckSource::Connector,
+                status: CheckStatus::Green,
+                base_current: true,
+                ..
+            }
+        ));
     }
 
     fn args(values: &[&str]) -> Vec<String> {

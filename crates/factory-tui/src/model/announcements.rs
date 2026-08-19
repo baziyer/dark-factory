@@ -179,6 +179,7 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         | FactoryEvent::RepositoryOperation { .. }
         | FactoryEvent::RepositoryAuthorityChanged { .. }
         | FactoryEvent::ProjectChanged { .. }
+        | FactoryEvent::ChangeChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
     };
     Some(Announcement {

@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::change::{ChangeSnapshot, CheckSource, CheckStatus};
 use crate::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, SessionId, SessionSnapshot,
@@ -410,6 +411,81 @@ pub enum LocalRequest {
         title: String,
         body: String,
     },
+    /// Operator-owned durable change/review projection. These requests are
+    /// intentionally separate from session-authenticated repository writes:
+    /// hosted checks arrive through an operator or connector seam, never an
+    /// agent-held GitHub credential.
+    CreateChange {
+        id: String,
+        source_issue: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_task_id: Option<TaskId>,
+        author_agent_id: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        author_run_id: Option<RunId>,
+        branch: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_number: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pr_url: Option<String>,
+        head_sha: String,
+        base_branch: String,
+    },
+    ListChanges {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<String>,
+        limit: u32,
+    },
+    GetChange {
+        id: String,
+    },
+    SetChangeHead {
+        id: String,
+        head_sha: String,
+    },
+    RequestChangeReview {
+        id: String,
+        reviewer_agent_id: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reviewer_run_id: Option<RunId>,
+    },
+    AddChangeFinding {
+        id: String,
+        number: u32,
+        description: String,
+    },
+    RespondToChangeFinding {
+        id: String,
+        number: u32,
+        disposition: String,
+    },
+    ResolveChangeFinding {
+        id: String,
+        number: u32,
+        reviewer_agent_id: AgentId,
+        resolution: String,
+    },
+    SatisfyChangeReview {
+        id: String,
+        reviewer_agent_id: AgentId,
+    },
+    ReconcileChangeChecks {
+        id: String,
+        source: CheckSource,
+        provider: String,
+        head_sha: String,
+        base_sha: String,
+        status: CheckStatus,
+        base_current: bool,
+    },
+    MarkChangeIntegrationReady {
+        id: String,
+        integrator_agent_id: AgentId,
+    },
+    AbandonChange {
+        id: String,
+        reason: String,
+    },
     /// Attaches to a terminal-mode session's retained-then-live PTY output
     /// on this connection. The connection commits to terminal-proxy mode:
     /// after the first `AttachTerminal`, only more `AttachTerminal` requests
@@ -503,6 +579,14 @@ pub enum LocalResponse {
     GitOutput {
         operation: String,
         output: String,
+    },
+    Change {
+        change: ChangeSnapshot,
+    },
+    Changes {
+        changes: Vec<ChangeSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<String>,
     },
     ProjectCreated {
         project: ProjectSnapshot,

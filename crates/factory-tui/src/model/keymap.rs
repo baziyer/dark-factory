@@ -318,6 +318,7 @@ pub enum Mode {
 
 /// A side effect for `main.rs` to carry out. `Board` never touches a socket or a PTY itself.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Intent {
     None,
     Redraw,

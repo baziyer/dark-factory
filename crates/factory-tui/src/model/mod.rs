@@ -756,7 +756,9 @@ impl Board {
         self.maybe_announce(&event, worth_announcing);
 
         match event.event {
-            FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
+            FactoryEvent::AutoModeChanged { .. }
+            | FactoryEvent::PolicyDecision { .. }
+            | FactoryEvent::ChangeChanged { .. } => {}
             FactoryEvent::AgentBudgetChanged {
                 agent_id, paused, ..
             } => {
@@ -1037,6 +1039,7 @@ impl Board {
             | FactoryEvent::AutoModeChanged { .. }
             | FactoryEvent::TaskDeleted { .. }
             | FactoryEvent::ProjectChanged { .. }
+            | FactoryEvent::ChangeChanged { .. }
             | FactoryEvent::ProjectDeleted { .. } => None,
         }
     }

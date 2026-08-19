@@ -285,6 +285,28 @@ a run or typing the new task body. Its regression shape is completed task →
 stop resident session → resume the same provider thread → assign the next task;
 the acceptance condition is the new task body entering a running task.
 
+### Durable change and review projection
+
+`factoryd` owns one durable `changes`/`change_findings` state machine. A
+change records its source issue and task, author agent/run, branch, PR
+identity, exact head SHA, base branch, numbered findings, assigned reviewer,
+hosted-check evidence, and independent integration actor. `factoryctl change`
+is the CLI-first operator projection; a TUI may request the same `ListChanges`
+and `GetChange` protocol records rather than rebuild readiness from GitHub
+comments.
+
+Review satisfaction, check reconciliation, and integration readiness are
+always tied to the stored head SHA. A new head clears review, checks, current
+base evidence, and readiness in one transaction. Hosted checks enter only via
+the explicit operator/connector seam (`ReconcileChangeChecks`); agents do not
+hold GitHub credentials and prose cannot mark a gate green. Self-review and
+self-integration are rejected, and the author/reviewer/integrator must be
+distinct principals. `integration_ready` is projected only after exact-SHA
+review satisfaction, green checks, current-base evidence, and an independent
+integrator claim. Missing author rows remain visible as `author_present=false`.
+This is the small durable slice for #159 and is intentionally not the full
+#131 change engine or #153 ingestion service.
+
 ## Deliberately unresolved
 
 - Zero-downtime handoff between two daemon binaries is deferred (see

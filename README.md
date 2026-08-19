@@ -83,6 +83,12 @@ factoryctl agent add --id worker-1 --project my-project \
 factoryctl task add --id first-task --project my-project --agent worker-1 \
   --title "Make the first change" --body "Describe the result and its limits."
 
+# Record review/integration state durably; hosted checks come from an operator
+# or connector and are always tied to the exact head SHA.
+factoryctl change create --id first-change --issue 159 --author worker-1 \
+  --branch agent/worker-1 --head <commit-sha> --base main
+factoryctl change review-request --id first-change --reviewer lead
+
 factory-tui --project my-project
 ```
 

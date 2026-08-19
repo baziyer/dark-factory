@@ -17,6 +17,18 @@
    `AGENTS.md`'s "Critical rules" for the exact steps.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
+### Durable change readiness
+
+Use `factoryctl change` to record the operator's durable review projection:
+source issue/task, author and run, branch/PR, exact head SHA, numbered
+findings and dispositions, reviewer satisfaction, explicit hosted-check
+reconciliation, current-base evidence, and an independent integration-ready
+claim. The daemon is the single transition authority. A force-push or rebase
+invalidates every prior review/check/readiness claim, and no agent or prose
+comment can supply hosted credentials or satisfy its own change. This is the
+CLI-first #159 slice; connector ingestion and a larger change engine remain
+future work (#131/#153).
+
 ### Testing resident sessions
 
 An E2E harness must not stop `factoryd` immediately after a `StopSession`

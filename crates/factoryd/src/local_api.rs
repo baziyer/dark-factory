@@ -47,8 +47,8 @@ use crate::{
     repository,
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
-        SessionControlTarget, StoreError, UpdateAgentProfile,
+        AgentMessage, ChangeMutation, NewAgent, NewAgentMessage, NewChange, NewProject,
+        NewRepositoryOperation, NewTask, SessionControlTarget, StoreError, UpdateAgentProfile,
     },
 };
 
@@ -198,6 +198,23 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "task blocked reason is empty or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidChangeInput) => (
+                ErrorCode::InvalidRequest,
+                "change or finding text is empty or exceeds its bound".into(),
+            ),
+            Self::Store(StoreError::ChangeNotFound) => {
+                (ErrorCode::NotFound, "change was not found".into())
+            }
+            Self::Store(StoreError::ChangeFindingNotFound) => {
+                (ErrorCode::NotFound, "change finding was not found".into())
+            }
+            Self::Store(StoreError::ChangeFindingExists) => (
+                ErrorCode::Conflict,
+                "change finding number already exists with different text".into(),
+            ),
+            Self::Store(StoreError::InvalidChangeTransition(message)) => {
+                (ErrorCode::Conflict, message)
+            }
             Self::Store(StoreError::InvalidHookToken) => (
                 ErrorCode::InvalidRequest,
                 "hook token is not recognized".into(),
@@ -831,6 +848,166 @@ async fn handle_request(
                 },
             )
             .await
+        }
+        LocalRequest::CreateChange {
+            id,
+            source_issue,
+            source_task_id,
+            author_agent_id,
+            author_run_id,
+            branch,
+            pr_number,
+            pr_url,
+            head_sha,
+            base_branch,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::Create(NewChange {
+                    id,
+                    source_issue,
+                    source_task_id,
+                    author_agent_id,
+                    author_run_id,
+                    branch,
+                    pr_number,
+                    pr_url,
+                    head_sha,
+                    base_branch,
+                }),
+            )
+            .await
+        }
+        LocalRequest::ListChanges { after_id, limit } => {
+            let limit = page_limit("change", limit, MAX_PROJECT_PAGE_ITEMS)?;
+            let mut changes = state
+                .with_store(move |store| store.list_changes(after_id.as_deref(), limit + 1))
+                .await?;
+            let next_after_id = next_cursor(&mut changes, limit, |change| change.id.clone());
+            Ok(LocalResponse::Changes {
+                changes,
+                next_after_id,
+            })
+        }
+        LocalRequest::GetChange { id } => Ok(LocalResponse::Change {
+            change: state.with_store(move |store| store.get_change(&id)).await?,
+        }),
+        LocalRequest::SetChangeHead { id, head_sha } => {
+            change_response(state, ChangeMutation::SetHead { id, head_sha }).await
+        }
+        LocalRequest::RequestChangeReview {
+            id,
+            reviewer_agent_id,
+            reviewer_run_id,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::RequestReview {
+                    id,
+                    reviewer_agent_id,
+                    reviewer_run_id,
+                },
+            )
+            .await
+        }
+        LocalRequest::AddChangeFinding {
+            id,
+            number,
+            description,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::AddFinding {
+                    id,
+                    number,
+                    description,
+                },
+            )
+            .await
+        }
+        LocalRequest::RespondToChangeFinding {
+            id,
+            number,
+            disposition,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::RespondFinding {
+                    id,
+                    number,
+                    disposition,
+                },
+            )
+            .await
+        }
+        LocalRequest::ResolveChangeFinding {
+            id,
+            number,
+            reviewer_agent_id,
+            resolution,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::ResolveFinding {
+                    id,
+                    number,
+                    reviewer_agent_id,
+                    resolution,
+                },
+            )
+            .await
+        }
+        LocalRequest::SatisfyChangeReview {
+            id,
+            reviewer_agent_id,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::Satisfy {
+                    id,
+                    reviewer_agent_id,
+                },
+            )
+            .await
+        }
+        LocalRequest::ReconcileChangeChecks {
+            id,
+            source,
+            provider,
+            head_sha,
+            base_sha,
+            status,
+            base_current,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::ReconcileChecks {
+                    id,
+                    source,
+                    provider,
+                    head_sha,
+                    base_sha,
+                    status,
+                    base_current,
+                },
+            )
+            .await
+        }
+        LocalRequest::MarkChangeIntegrationReady {
+            id,
+            integrator_agent_id,
+        } => {
+            change_response(
+                state,
+                ChangeMutation::MarkIntegrationReady {
+                    id,
+                    integrator_agent_id,
+                },
+            )
+            .await
+        }
+        LocalRequest::AbandonChange { id, reason } => {
+            change_response(state, ChangeMutation::Abandon { id, reason }).await
         }
         LocalRequest::AgentStatus {
             project_id,
@@ -2112,6 +2289,19 @@ mod worktree_status_tests {
             })
         }));
     }
+}
+
+async fn change_response(
+    state: &ApiState,
+    mutation: ChangeMutation,
+) -> Result<LocalResponse, ApiFailure> {
+    let change = state
+        .commit_and_publish(move |store| {
+            let (change, event) = store.apply_change_mutation(mutation, now_ms()?)?;
+            Ok((change, vec![event]))
+        })
+        .await?;
+    Ok(LocalResponse::Change { change })
 }
 
 async fn repository_request(

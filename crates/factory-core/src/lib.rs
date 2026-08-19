@@ -9,6 +9,7 @@ use std::{cmp::Ordering, error::Error, fmt};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod attention;
+pub mod change;
 pub mod local;
 pub mod model_policy;
 pub mod paths;
@@ -499,6 +500,12 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum FactoryEvent {
+    /// One durable change/review projection changed.  The complete snapshot
+    /// is retained in the event so reconnecting TUI/CLI clients need no
+    /// prose reconstruction.
+    ChangeChanged {
+        change: crate::change::ChangeSnapshot,
+    },
     /// Factory-wide autonomy posture changed. Policy decisions are recorded
     /// separately so the event ledger explains both configuration and use.
     AutoModeChanged {

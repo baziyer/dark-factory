@@ -1,7 +1,7 @@
 use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
@@ -237,6 +237,323 @@ async fn repository_requests_require_a_live_session_token_and_accept_no_target_i
                 },
                 ..
             } if message == "session authentication failed"
+        ));
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn durable_change_review_lifecycle_rejects_stale_and_self_claims() {
+    with_server(|socket| async move {
+        let project_root = socket.parent().unwrap().join("change-project");
+        std::fs::create_dir(&project_root).unwrap();
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::CreateProject {
+                    id: project_id("change-project"),
+                    name: "Change project".into(),
+                    root: project_root.to_string_lossy().into_owned(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectCreated { .. },
+                ..
+            }
+        ));
+        for id in ["author", "reviewer", "replacement", "integrator"] {
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::CreateAgent {
+                        id: agent_id(id),
+                        project_id: project_id("change-project"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                        model: None,
+                        worktree: None,
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::AgentCreated { .. },
+                    ..
+                }
+            ));
+        }
+        let create = |id: &str, head: &str| LocalRequest::CreateChange {
+            id: id.into(),
+            source_issue: "159".into(),
+            source_task_id: None,
+            author_agent_id: agent_id("author"),
+            author_run_id: None,
+            branch: format!("agent/{id}"),
+            pr_number: None,
+            pr_url: None,
+            head_sha: head.into(),
+            base_branch: "main".into(),
+        };
+        assert!(matches!(
+            request(&socket, create("change", "sha-a")).await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.state == factory_core::change::ChangeState::Authored
+        ));
+        // Same create is a safe retry and does not create a parallel row.
+        assert!(matches!(
+            request(&socket, create("change", "sha-a")).await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::RequestChangeReview {
+                    id: "change".into(),
+                    reviewer_agent_id: agent_id("author"),
+                    reviewer_run_id: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::RequestChangeReview {
+                    id: "change".into(),
+                    reviewer_agent_id: agent_id("reviewer"),
+                    reviewer_run_id: None,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AddChangeFinding {
+                    id: "change".into(),
+                    number: 1,
+                    description: "numbered finding".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::RespondToChangeFinding {
+                    id: "change".into(),
+                    number: 1,
+                    disposition: "fixed".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::SetChangeHead {
+                    id: "change".into(),
+                    head_sha: "sha-b".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.reviewed_sha.is_none()
+                && change.checks_status == factory_core::change::CheckStatus::Pending
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ResolveChangeFinding {
+                    id: "change".into(),
+                    number: 1,
+                    reviewer_agent_id: agent_id("reviewer"),
+                    resolution: "accepted".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::SatisfyChangeReview {
+                    id: "change".into(),
+                    reviewer_agent_id: agent_id("reviewer"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.reviewed_sha.as_deref() == Some("sha-b")
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ReconcileChangeChecks {
+                    id: "change".into(),
+                    source: factory_core::change::CheckSource::Connector,
+                    provider: "github".into(),
+                    head_sha: "sha-old".into(),
+                    base_sha: "base".into(),
+                    status: factory_core::change::CheckStatus::Green,
+                    base_current: true,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ReconcileChangeChecks {
+                    id: "change".into(),
+                    source: factory_core::change::CheckSource::Connector,
+                    provider: "github".into(),
+                    head_sha: "sha-b".into(),
+                    base_sha: "base".into(),
+                    status: factory_core::change::CheckStatus::Failed,
+                    base_current: false,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.checks_status == factory_core::change::CheckStatus::Failed
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ReconcileChangeChecks {
+                    id: "change".into(),
+                    source: factory_core::change::CheckSource::Operator,
+                    provider: "local-ci".into(),
+                    head_sha: "sha-b".into(),
+                    base_sha: "base-2".into(),
+                    status: factory_core::change::CheckStatus::Green,
+                    base_current: true,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.checks_status == factory_core::change::CheckStatus::Green
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::MarkChangeIntegrationReady {
+                    id: "change".into(),
+                    integrator_agent_id: agent_id("reviewer"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Conflict,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::MarkChangeIntegrationReady {
+                    id: "change".into(),
+                    integrator_agent_id: agent_id("integrator"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.integration_ready
+        ));
+        assert!(matches!(
+            request(&socket, create("parallel", "parallel-sha")).await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::AbandonChange {
+                    id: "parallel".into(),
+                    reason: "superseded".into(),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if change.state == factory_core::change::ChangeState::Abandoned
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::DeleteAgent {
+                    project_id: project_id("change-project"),
+                    agent_id: agent_id("author"),
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentDeleted { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::GetChange { id: "change".into() },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Change { ref change },
+                ..
+            } if !change.author_present
         ));
     })
     .await;

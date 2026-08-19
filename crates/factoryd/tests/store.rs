@@ -3,8 +3,8 @@ use factory_core::{
     SessionId, TaskId, TaskStatus, local::MAX_TASK_BODY_BYTES,
 };
 use factoryd::store::{
-    ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
-    NewTask, Store, StoreError, UpdateAgentProfile,
+    ChangeMutation, ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage,
+    NewChange, NewProject, NewSession, NewTask, Store, StoreError, UpdateAgentProfile,
 };
 use std::sync::{Arc, Barrier};
 
@@ -264,6 +264,85 @@ fn task_id(value: &str) -> TaskId {
 
 fn agent_id(value: &str) -> AgentId {
     AgentId::try_from(value).unwrap()
+}
+
+#[test]
+fn change_projection_survives_restart_and_head_invalidation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("author"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("reviewer"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                3,
+            )
+            .unwrap();
+        let (change, _) = store
+            .apply_change_mutation(
+                ChangeMutation::Create(NewChange {
+                    id: "durable".into(),
+                    source_issue: "159".into(),
+                    source_task_id: None,
+                    author_agent_id: agent_id("author"),
+                    author_run_id: None,
+                    branch: "agent/author".into(),
+                    pr_number: Some(159),
+                    pr_url: None,
+                    head_sha: "sha-a".into(),
+                    base_branch: "main".into(),
+                }),
+                4,
+            )
+            .unwrap();
+        assert_eq!(change.head_sha, "sha-a");
+    }
+    let mut reopened = Store::open(&database).unwrap();
+    let durable = reopened.get_change("durable").unwrap();
+    assert_eq!(durable.source_issue, "159");
+    let (changed, _) = reopened
+        .apply_change_mutation(
+            ChangeMutation::SetHead {
+                id: "durable".into(),
+                head_sha: "sha-b".into(),
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(changed.head_sha, "sha-b");
+    assert_eq!(
+        changed.checks_status,
+        factory_core::change::CheckStatus::Pending
+    );
+    assert!(changed.reviewed_sha.is_none());
 }
 
 #[test]
