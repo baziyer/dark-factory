@@ -423,6 +423,27 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
     });
 }
 
+/// Refreshes the complete durable fleet snapshot after an attachability race. This is separate
+/// from the periodic `FleetStatus` projection because the current session link and ended-session
+/// state live in the session listings.
+pub fn spawn_fleet_snapshot(client: Client, tx: Sender<NetMsg>) {
+    thread::spawn(move || match load_consistent_fleet_snapshot(&client) {
+        Ok((projects, agents, tasks, runs, sessions, event_sequence)) => {
+            let _ = tx.send(NetMsg::FleetSnapshot {
+                projects,
+                agents,
+                tasks,
+                runs,
+                sessions,
+                event_sequence,
+            });
+        }
+        Err(error) => {
+            let _ = tx.send(NetMsg::ConnectionRetrying(error));
+        }
+    });
+}
+
 /// Refreshes non-event state without delaying subscription reads. Git worktree changes publish
 /// no daemon event, so connect-time-only status becomes stale as soon as an agent edits a file.
 pub struct FleetStatusRefresh {

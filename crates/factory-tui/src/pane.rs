@@ -9,7 +9,7 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use portable_pty::{
@@ -19,9 +19,9 @@ use portable_pty::{
 // version tui-term was built against (see the Cargo.toml comment on this crate's dependencies).
 use tui_term::vt100;
 
-use factory_core::local::{LocalRequest, ServerFrame};
+use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
 use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
-use factory_core::{ProjectId, SessionId};
+use factory_core::{ProjectId, RunnerInstanceId, SessionId};
 
 use factoryctl::Client;
 
@@ -42,20 +42,58 @@ pub enum PaneKind {
     Daemon,
 }
 
+/// Durable identity captured by one attach attempt. A session id alone is not sufficient: the
+/// daemon can replace the runner while retaining the session row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneIdentity {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub runner_instance_id: Option<RunnerInstanceId>,
+}
+
 enum Backend {
     LocalPty {
         writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
         master: Box<dyn MasterPty + Send>,
         child: Box<dyn Child + Send + Sync>,
+        exited: Arc<AtomicBool>,
     },
     Daemon {
         attach: AttachConnection,
         input_tx: mpsc::Sender<Vec<u8>>,
         resize_tx: mpsc::Sender<(u16, u16)>,
-        disconnected: Arc<AtomicBool>,
-        attached: Arc<AtomicBool>,
-        attach_error: Arc<Mutex<Option<String>>>,
+        observation: Arc<(Mutex<AttachState>, Condvar)>,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaneObservation {
+    Connecting,
+    Attached,
+    /// The local child reached EOF. This is a terminal pane state, not an attach
+    /// failure: the pane remains renderable and must not be respawned.
+    LocalPtyExited,
+    Disconnected,
+    AttachRefused(AttachRefusal),
+    Error(String),
+}
+
+impl PaneObservation {
+    #[must_use]
+    pub fn is_attached(&self) -> bool {
+        matches!(self, Self::Attached)
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn is_attach_refusal(&self) -> bool {
+        matches!(self, Self::AttachRefused(_))
+    }
+}
+
+struct AttachState {
+    observation: PaneObservation,
+    finished: bool,
 }
 
 pub struct Pane {
@@ -67,6 +105,7 @@ pub struct Pane {
     dirty: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
+    identity: Option<PaneIdentity>,
     backend: Backend,
 }
 
@@ -110,6 +149,7 @@ impl Pane {
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let writer = Arc::new(Mutex::new(writer));
+        let exited = Arc::new(AtomicBool::new(false));
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let dirty = Arc::new(AtomicBool::new(true));
@@ -119,6 +159,7 @@ impl Pane {
             Arc::clone(&parser),
             Arc::clone(&writer),
             Arc::clone(&dirty),
+            Arc::clone(&exited),
             debug_log,
         );
 
@@ -130,10 +171,12 @@ impl Pane {
             dirty,
             rows,
             cols,
+            identity: None,
             backend: Backend::LocalPty {
                 writer,
                 master: pair.master,
                 child,
+                exited,
             },
         })
     }
@@ -148,6 +191,7 @@ impl Pane {
         socket: PathBuf,
         project_id: ProjectId,
         session_id: SessionId,
+        runner_instance_id: Option<RunnerInstanceId>,
         title: impl Into<String>,
         rows: u16,
         cols: u16,
@@ -163,17 +207,19 @@ impl Pane {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10_000)));
         let dirty = Arc::new(AtomicBool::new(true));
-        let disconnected = Arc::new(AtomicBool::new(false));
-        let attached = Arc::new(AtomicBool::new(false));
-        let attach_error = Arc::new(Mutex::new(None));
+        let observation = Arc::new((
+            Mutex::new(AttachState {
+                observation: PaneObservation::Connecting,
+                finished: false,
+            }),
+            Condvar::new(),
+        ));
 
         spawn_attach_reader_thread(
             reader_half,
             Arc::clone(&parser),
             Arc::clone(&dirty),
-            Arc::clone(&disconnected),
-            Arc::clone(&attached),
-            Arc::clone(&attach_error),
+            Arc::clone(&observation),
         );
 
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
@@ -184,7 +230,7 @@ impl Pane {
             session_id.clone(),
             input_rx,
         );
-        spawn_resize_worker(socket, project_id, session_id, resize_rx);
+        spawn_resize_worker(socket, project_id.clone(), session_id.clone(), resize_rx);
 
         Ok(Self {
             title: title.into(),
@@ -196,13 +242,16 @@ impl Pane {
             // contract's "initial + on resize" — see that method's doc comment.
             rows: 0,
             cols: 0,
+            identity: Some(PaneIdentity {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                runner_instance_id,
+            }),
             backend: Backend::Daemon {
                 attach: attach_conn,
                 input_tx,
                 resize_tx,
-                disconnected,
-                attached,
-                attach_error,
+                observation,
             },
         })
     }
@@ -256,25 +305,43 @@ impl Pane {
     }
 
     /// Writes raw, already-encoded terminal input to the child (local PTY) or forwards it to the
-    /// daemon as a `TerminalInput` request (daemon-attached) — best-effort either way. All input
-    /// first returns the pane to its live tail so key, paste, and mouse coordinates cannot act on
-    /// a live screen while the operator is looking at historical scrollback.
-    pub fn write_input(&self, bytes: &[u8]) {
+    /// daemon as a `TerminalInput` request (daemon-attached) — best-effort either way. Daemon
+    /// input holds the observation lock across the readiness check and enqueue, so a refusal
+    /// already observed cannot leak bytes through a stale caller-side check.
+    pub fn write_input(&self, bytes: &[u8]) -> bool {
         if bytes.is_empty() {
-            return;
+            return false;
         }
-        if self.scroll_offset() > 0 {
-            self.scroll_reset();
+        if !self.observation().is_attached() {
+            return false;
         }
         match &self.backend {
             Backend::LocalPty { writer, .. } => {
+                if self.scroll_offset() > 0 {
+                    self.scroll_reset();
+                }
                 if let Ok(mut writer) = writer.lock() {
-                    let _ = writer.write_all(bytes);
-                    let _ = writer.flush();
+                    writer.write_all(bytes).is_ok() && writer.flush().is_ok()
+                } else {
+                    false
                 }
             }
-            Backend::Daemon { input_tx, .. } => {
-                let _ = input_tx.send(bytes.to_vec());
+            Backend::Daemon {
+                input_tx,
+                observation,
+                ..
+            } => {
+                let (state, _) = &**observation;
+                let Ok(state) = state.lock() else {
+                    return false;
+                };
+                if !state.observation.is_attached() {
+                    return false;
+                }
+                if self.scroll_offset() > 0 {
+                    self.scroll_reset();
+                }
+                input_tx.send(bytes.to_vec()).is_ok()
             }
         }
     }
@@ -309,39 +376,71 @@ impl Pane {
         Ok(())
     }
 
-    /// Whether the pane is no longer usable: the local child exited, or (daemon-attached) the
-    /// attach connection ended.
+    /// The one authoritative observation of daemon attach state. In particular, a typed refusal
+    /// replaces `Attached` even when it arrives after the first terminal frame.
     #[must_use]
-    pub fn has_exited(&mut self) -> bool {
-        match &mut self.backend {
-            Backend::LocalPty { child, .. } => matches!(child.try_wait(), Ok(Some(_))),
-            Backend::Daemon { disconnected, .. } => disconnected.load(Ordering::Acquire),
-        }
-    }
-
-    /// The last error the daemon sent back on this attach connection (e.g. "sessions are not
-    /// implemented yet" while 5A/5C haven't landed), if any — surfaced by `ui/terminals.rs`/
-    /// `ui/focus.rs` instead of a silent blank pane. Always `None` for a local-PTY pane.
-    #[must_use]
-    pub fn attach_error(&self) -> Option<String> {
+    pub fn observation(&self) -> PaneObservation {
         match &self.backend {
-            Backend::LocalPty { .. } => None,
-            Backend::Daemon { attach_error, .. } => {
-                attach_error.lock().ok().and_then(|guard| guard.clone())
+            Backend::LocalPty { exited, .. } => {
+                if exited.load(Ordering::Acquire) {
+                    PaneObservation::LocalPtyExited
+                } else {
+                    PaneObservation::Attached
+                }
             }
+            Backend::Daemon { observation, .. } => self_observation(observation),
         }
     }
 
     #[must_use]
-    pub fn is_ready(&self) -> bool {
-        match &self.backend {
-            Backend::LocalPty { .. } => true,
-            Backend::Daemon {
-                attached,
-                disconnected,
-                ..
-            } => attached.load(Ordering::Acquire) && !disconnected.load(Ordering::Acquire),
-        }
+    pub fn identity(&self) -> Option<&PaneIdentity> {
+        self.identity.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_attach_outcome(&self, timeout: Duration) -> bool {
+        let Backend::Daemon { observation, .. } = &self.backend else {
+            return true;
+        };
+        let (state, signal) = &**observation;
+        let state = state.lock().expect("attach state mutex poisoned");
+        signal
+            .wait_timeout_while(state, timeout, |state| !state.finished)
+            .expect("attach state mutex poisoned")
+            .0
+            .finished
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_ready(&self, timeout: Duration) -> bool {
+        let Backend::Daemon { observation, .. } = &self.backend else {
+            return self.observation().is_attached();
+        };
+        let (state, signal) = &**observation;
+        let state = state.lock().expect("attach state mutex poisoned");
+        signal
+            .wait_timeout_while(state, timeout, |state| !state.observation.is_attached())
+            .expect("attach state mutex poisoned")
+            .0
+            .observation
+            .is_attached()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_attach_refusal(&self, timeout: Duration) -> bool {
+        let Backend::Daemon { observation, .. } = &self.backend else {
+            return false;
+        };
+        let (state, signal) = &**observation;
+        let state = state.lock().expect("attach state mutex poisoned");
+        signal
+            .wait_timeout_while(state, timeout, |state| {
+                !state.observation.is_attach_refusal()
+            })
+            .expect("attach state mutex poisoned")
+            .0
+            .observation
+            .is_attach_refusal()
     }
 
     /// Ends this pane: kills the local child (`--dev-local-pty` only — never a real agent), or,
@@ -396,11 +495,20 @@ impl Pane {
     }
 }
 
+fn self_observation(observation: &Arc<(Mutex<AttachState>, Condvar)>) -> PaneObservation {
+    observation
+        .0
+        .lock()
+        .map(|state| state.observation.clone())
+        .unwrap_or(PaneObservation::Disconnected)
+}
+
 fn spawn_local_reader_thread(
     mut reader: Box<dyn std::io::Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
     dirty: Arc<AtomicBool>,
+    exited: Arc<AtomicBool>,
     debug_log: Option<PathBuf>,
 ) {
     std::thread::spawn(move || {
@@ -446,6 +554,7 @@ fn spawn_local_reader_thread(
                 }
             }
         }
+        exited.store(true, Ordering::Release);
     });
 }
 
@@ -453,41 +562,73 @@ fn spawn_attach_reader_thread(
     reader: std::os::unix::net::UnixStream,
     parser: Arc<Mutex<vt100::Parser>>,
     dirty: Arc<AtomicBool>,
-    disconnected: Arc<AtomicBool>,
-    attached: Arc<AtomicBool>,
-    attach_error: Arc<Mutex<Option<String>>>,
+    observation: Arc<(Mutex<AttachState>, Condvar)>,
 ) {
     std::thread::spawn(move || {
         attach::read_frames(reader, |frame| {
             match frame {
                 ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
-                        attached.store(true, Ordering::Release);
+                        let (state, signal) = &*observation;
+                        if let Ok(mut state) = state.lock() {
+                            if matches!(state.observation, PaneObservation::Connecting) {
+                                state.observation = PaneObservation::Attached;
+                            }
+                            state.finished = true;
+                            signal.notify_all();
+                        }
                         if let Ok(mut parser) = parser.lock() {
                             parser.process(&decoded);
                             dirty.store(true, Ordering::Release);
                         }
                     }
                     Err(error) => {
-                        if let Ok(mut guard) = attach_error.lock() {
-                            *guard = Some(format!("invalid terminal bytes: {error}"));
+                        let (state, signal) = &*observation;
+                        if let Ok(mut state) = state.lock() {
+                            state.observation =
+                                PaneObservation::Error(format!("invalid terminal bytes: {error}"));
+                            state.finished = true;
+                            signal.notify_all();
                         }
                     }
                 },
-                ServerFrame::Response { response, .. } => {
-                    if let factory_core::local::LocalResponse::Error { message, .. } = response {
-                        if let Ok(mut guard) = attach_error.lock() {
-                            *guard = Some(message);
+                ServerFrame::Response { response, .. } => match response {
+                    factory_core::local::LocalResponse::AttachRefused { refusal } => {
+                        let (state, signal) = &*observation;
+                        if let Ok(mut state) = state.lock() {
+                            state.observation = PaneObservation::AttachRefused(refusal);
+                            state.finished = true;
+                            signal.notify_all();
                         }
                         return false;
                     }
-                }
+                    factory_core::local::LocalResponse::Error { message, .. } => {
+                        let (state, signal) = &*observation;
+                        if let Ok(mut state) = state.lock() {
+                            state.observation = PaneObservation::Error(message);
+                            state.finished = true;
+                            signal.notify_all();
+                        }
+                        return false;
+                    }
+                    _ => {}
+                },
                 ServerFrame::Event { .. } => {}
             }
             true
         });
-        disconnected.store(true, Ordering::Release);
         dirty.store(true, Ordering::Release);
+        let (state, signal) = &*observation;
+        if let Ok(mut state) = state.lock() {
+            if matches!(
+                state.observation,
+                PaneObservation::Connecting | PaneObservation::Attached
+            ) {
+                state.observation = PaneObservation::Disconnected;
+            }
+            state.finished = true;
+            signal.notify_all();
+        }
     });
 }
 

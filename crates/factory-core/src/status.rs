@@ -870,6 +870,7 @@ mod tests {
             state_since_ms: since,
             worktree: "/w".to_owned(),
             provider_session_id: None,
+            runner_instance_id: Some(id("runner")),
             current_run_id: None,
             activity: None,
             activity_inferred: false,

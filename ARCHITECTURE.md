@@ -171,6 +171,11 @@ catalogue.
    the rendered terminal content, while the pane is in typing mode, are encoded
    for a child, and only when that child's parsed output has enabled an xterm
    mouse protocol.
+   Terminal attach is a CLI-first handshake: a session/runner race returns a
+   bounded typed refusal with the identities checked. The TUI removes the
+   refused pane before rendering, refreshes the durable fleet snapshot, and
+   stays on the board while preserving independent task, session, and runner
+   state; keyboard and mouse selection use the same path.
    If local scrollback is nonzero, a child-bound coordinate event is consumed
    while resetting to the live tail; forwarding can resume only from a later
    event after that redraw, so historical coordinates never act on live state.
