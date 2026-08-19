@@ -612,9 +612,13 @@ Two different test doubles exist at two different layers, easy to conflate:
 - They do not guess precise session state when the underlying CLI does not
   expose it. Codex's `PermissionRequest` hook (added in Codex 0.147.0) is an
   authoritative approval prompt. Claude reports permissions, elicitation,
-  and idle waits through `Notification`; the daemon retains its exact
-  `notification_type`, and an absent or unknown subtype remains an ambiguous
-  wait rather than being presented as a question. A provider
+  and idle waits through `Notification`; the daemon durably retains its typed
+  `notification_type`. Only `permission_prompt` and `elicitation_dialog`
+  enter `waiting_for_input` and the actionable attention projection;
+  `idle_prompt`, `auth_success`, `elicitation_complete`, and
+  `elicitation_response` return the session to routine idle state. An absent
+  or unknown subtype remains non-actionable rather than being presented as a
+  question. A provider
   does not answer `PermissionRequest` approval prompts; auto mode prevents
   those prompts. The separate `PreToolUse` hook always receives the
   factory's allow/deny policy answer and is durably audited.

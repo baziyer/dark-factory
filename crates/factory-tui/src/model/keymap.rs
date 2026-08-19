@@ -1650,6 +1650,60 @@ mod tests {
     }
 
     #[test]
+    fn fleet_status_then_same_sequence_event_still_folds_state() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            None,
+            Some("session"),
+            1,
+        );
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 2,
+            event_sequence: 12,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![item],
+        });
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 12,
+            occurred_at_ms: 3,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: session("session", "alice", "proj", SessionState::Working),
+            },
+        });
+        assert_eq!(
+            board
+                .sessions
+                .get(&SessionId::try_from("session").unwrap())
+                .map(|session| session.state),
+            Some(SessionState::Working)
+        );
+        assert!(board.attention.is_empty());
+    }
+
+    #[test]
+    fn routine_notification_projection_has_no_tui_action_card() {
+        let mut board = board();
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 2,
+            event_sequence: -1,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert!(board.attention_items().is_empty());
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(board.attention_focus.is_none());
+    }
+
+    #[test]
     fn bootstrap_high_water_rejects_an_older_delayed_status_after_replay() {
         let mut board = board();
         let stale = attention(

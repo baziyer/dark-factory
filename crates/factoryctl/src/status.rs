@@ -146,6 +146,7 @@ mod tests {
             activity: None,
             activity_inferred: false,
             last_hook_event: None,
+            notification_kind: None,
             last_hook_at_ms: None,
             wait_reason: None,
             observer_reason: None,

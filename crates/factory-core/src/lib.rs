@@ -209,6 +209,20 @@ pub enum ProviderHookEvent {
     SessionEnd,
 }
 
+/// Claude's typed `Notification` cause. The provider sends these as an
+/// opaque payload field; keeping the parsed cause beside the session state
+/// prevents operator-facing status from guessing answerability from prose.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderNotificationKind {
+    PermissionPrompt,
+    ElicitationDialog,
+    IdlePrompt,
+    AuthSuccess,
+    ElicitationComplete,
+    ElicitationResponse,
+}
+
 impl ProviderHookEvent {
     /// The exact event name Claude Code and Codex use in their own hook
     /// wire protocols and configuration files (`SessionStart`,
@@ -475,6 +489,10 @@ pub struct SessionSnapshot {
     pub activity_inferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_hook_event: Option<ProviderHookEvent>,
+    /// Parsed provider notification cause, when the last hook was a typed
+    /// Claude `Notification`. It is deliberately separate from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_kind: Option<ProviderNotificationKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_hook_at_ms: Option<i64>,
     /// Bounded operator-facing explanation of why the session is waiting,

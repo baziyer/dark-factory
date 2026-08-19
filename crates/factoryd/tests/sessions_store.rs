@@ -1,8 +1,8 @@
 //! Track 5A: sessions store, migration 0014, and the hook state machine.
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, ProviderHookEvent, RunId,
-    RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
+    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, ProviderHookEvent,
+    ProviderNotificationKind, RunId, RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
 use factoryd::store::{
     DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession,
@@ -306,14 +306,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0025.
+    // Opening through the real store runs migrations 0014 through 0027.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 27);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -358,7 +358,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_through_0024_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0026_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -375,6 +375,7 @@ fn migrations_0019_through_0024_follow_the_budget_schema_in_order() {
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  ALTER TABLE sessions DROP COLUMN observer_reason;
+                 ALTER TABLE sessions DROP COLUMN notification_kind;
                  PRAGMA user_version = 18;",
             )
             .unwrap();
@@ -385,7 +386,7 @@ fn migrations_0019_through_0024_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 27);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -478,14 +479,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0025 migrations.
+    // Opening through the real store runs the 0015 through 0027 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 27);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -1053,17 +1054,47 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
         .create_session(new_session("s1", "factory", "curie"), 5)
         .unwrap();
     let (session, _) = store
-        .record_hook_event(
+        .record_hook_event_with_notification(
             &snapshot.id,
             ProviderHookEvent::Notification,
             None,
             false,
             Some("permission prompt".into()),
+            Some(ProviderNotificationKind::PermissionPrompt),
             6,
         )
         .unwrap();
     assert_eq!(session.state, SessionState::WaitingForInput);
     assert_eq!(session.wait_reason.as_deref(), Some("permission prompt"));
+}
+
+#[test]
+fn routine_claude_notification_causes_do_not_create_attention_waits() {
+    for kind in [
+        ProviderNotificationKind::IdlePrompt,
+        ProviderNotificationKind::AuthSuccess,
+        ProviderNotificationKind::ElicitationComplete,
+        ProviderNotificationKind::ElicitationResponse,
+    ] {
+        let mut store = fixture();
+        let (snapshot, _) = store
+            .create_session(new_session("s1", "factory", "curie"), 5)
+            .unwrap();
+        let (session, _) = store
+            .record_hook_event_with_notification(
+                &snapshot.id,
+                ProviderHookEvent::Notification,
+                None,
+                false,
+                Some("Approve delivery?".into()),
+                Some(kind),
+                6,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::Idle);
+        assert_eq!(session.wait_reason, None);
+        assert_eq!(session.notification_kind, Some(kind));
+    }
 }
 
 #[test]
@@ -1129,22 +1160,25 @@ fn terminal_attach_health_preserves_independent_wait_causes() {
     let cases = [
         (
             ProviderHookEvent::Notification,
-            "provider question: Which branch?",
+            "Which branch?",
+            Some(ProviderNotificationKind::ElicitationDialog),
         ),
         (
             ProviderHookEvent::PermissionRequest,
             "Approve shell command?",
+            None,
         ),
     ];
     let mut now = 6;
-    for (hook, reason) in cases {
+    for (hook, reason, notification_kind) in cases {
         store
-            .record_hook_event(
+            .record_hook_event_with_notification(
                 &snapshot.id,
                 hook,
                 None,
                 false,
                 Some(reason.to_owned()),
+                notification_kind,
                 now,
             )
             .unwrap();

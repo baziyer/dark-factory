@@ -134,6 +134,10 @@ pub struct Board {
     seen_event_sequences: state::RingBuffer<i64>,
     /// Causal revision of the currently displayed attention projection.
     attention_revision: i64,
+    /// Highest live event sequence folded into the state maps. A FleetStatus
+    /// at the same sequence may have arrived first; it must not block the
+    /// corresponding live event from updating task/session state.
+    event_revision: i64,
     /// Bounded retry deadlines for client-side terminal attach failures.
     attach_retry_after: BTreeMap<SessionId, i64>,
 
@@ -185,6 +189,7 @@ impl Board {
             activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             attention_revision: 0,
+            event_revision: -1,
             attach_retry_after: BTreeMap::new(),
             view: View::Building,
             selected_agent: None,
@@ -202,7 +207,10 @@ impl Board {
 
     pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
         self.live_session_cap = Some(status.live_session_cap);
-        if status.event_sequence < 0 || status.event_sequence >= self.attention_revision {
+        if status.event_sequence < 0
+            || (status.event_sequence >= self.attention_revision
+                && status.event_sequence > self.event_revision)
+        {
             if status.event_sequence >= 0 {
                 self.attention_revision = status.event_sequence;
             }
@@ -1047,10 +1055,9 @@ impl Board {
         }
     }
 
-    /// Admits durable events through the one causal sequence boundary shared
-    /// by replay dedupe, live state folding, and fleet attention snapshots.
-    /// Replay may fill older activity history; live state must be newer than
-    /// the authoritative snapshot/event revision already applied.
+    /// Admits durable events through the live state-folding sequence boundary.
+    /// Attention snapshots use a separate boundary: a snapshot at sequence N
+    /// must not reject the live event N that carries the corresponding state.
     fn admit_event_sequence(&mut self, sequence: i64, advances_attention: bool) -> bool {
         if self
             .seen_event_sequences
@@ -1059,12 +1066,15 @@ impl Board {
         {
             return false;
         }
-        if advances_attention && sequence <= self.attention_revision {
+        if advances_attention
+            && (sequence < self.attention_revision || sequence <= self.event_revision)
+        {
             return false;
         }
         self.seen_event_sequences.push(sequence);
         if advances_attention {
-            self.attention_revision = sequence;
+            self.event_revision = sequence;
+            self.attention_revision = self.attention_revision.max(sequence);
         }
         true
     }
