@@ -1212,7 +1212,7 @@ fn terminal_acknowledgement_survives_a_lost_reply() {
 }
 
 #[test]
-fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
+fn insecure_or_symlinked_runtime_paths_are_rejected_without_spawning() {
     let directory = tempfile::tempdir().unwrap();
     let program = Path::new(env!("CARGO_BIN_EXE_fake-agent"));
     let marker = directory.path().join("spawned");
@@ -1220,6 +1220,7 @@ fn preexisting_or_symlinked_runtime_paths_are_rejected_without_spawning() {
 
     let occupied = directory.path().join("occupied");
     fs::create_dir(&occupied).unwrap();
+    fs::set_permissions(&occupied, fs::Permissions::from_mode(0o755)).unwrap();
     let sentinel = occupied.join("sentinel");
     fs::write(&sentinel, b"preserve").unwrap();
     let status = runner_command(
