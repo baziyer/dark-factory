@@ -258,6 +258,9 @@ async fn create_task(socket: &Path, id: &str, title: &str, body: &str) {
             body: body.into(),
             priority: 0,
             agent_id: None,
+            worktree: None,
+            branch: None,
+            starting_head: None,
         },
     )
     .await;

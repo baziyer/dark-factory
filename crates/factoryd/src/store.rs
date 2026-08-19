@@ -5,7 +5,7 @@ use factory_core::{
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
     ProviderNotificationKind, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
     RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
-    TaskStatus,
+    TaskStatus, WorktreeBinding,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     model_policy,
@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -685,6 +685,7 @@ impl Store {
                         priority,
                     },
                     None,
+                    None,
                     now_ms,
                 )?;
                 ("task", id.to_string(), Some(event))
@@ -885,10 +886,40 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (record, event) = insert_task(&transaction, input, assigned_agent_id, now_ms)?;
+        let (record, event) = insert_task(&transaction, input, assigned_agent_id, None, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
 
+        Ok((
+            record,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    pub fn create_task_with_assignment_and_binding(
+        &mut self,
+        input: NewTask,
+        assigned_agent_id: Option<AgentId>,
+        worktree_binding: Option<WorktreeBinding>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (record, event) = insert_task(
+            &transaction,
+            input,
+            assigned_agent_id,
+            worktree_binding,
+            now_ms,
+        )?;
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
         Ok((
             record,
             EventEnvelope {
@@ -2432,6 +2463,28 @@ impl Store {
         self.session_snapshot(project_id, &session_id)
     }
 
+    pub fn task_worktree_binding_for_session(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Option<WorktreeBinding>> {
+        let task_id: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT task_id FROM runs
+                 WHERE project_id = ?1 AND session_id = ?2 AND ended_at_ms IS NULL
+                 ORDER BY started_at_ms DESC LIMIT 1",
+                params![project_id.as_str(), session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(task_id) = task_id else {
+            return Ok(None);
+        };
+        Ok(load_task(&self.connection, &parse_id(task_id, 0)?)?
+            .and_then(|task| task.snapshot.worktree_binding))
+    }
+
     // --- Task episodes (runs) ------------------------------------------
 
     /// Opens a task-episode inside a live session: the task moves
@@ -3405,6 +3458,7 @@ impl Store {
             parent_task_id: None,
             assigned_agent_id: Some(input.orchestrator_agent_id),
             title: input.title.clone(),
+            worktree_binding: None,
             status: TaskStatus::Queued,
             priority: 1,
             created_at_ms: input.created_at_ms,
@@ -3559,6 +3613,7 @@ impl Store {
             parent_task_id: Some(input.task_id),
             assigned_agent_id: Some(input.orchestrator_agent_id),
             title: notification_title,
+            worktree_binding: None,
             status: TaskStatus::Queued,
             priority: 1,
             created_at_ms: input.answered_at_ms,
@@ -3828,7 +3883,11 @@ impl Store {
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
-                    status, priority, created_at_ms, updated_at_ms, blocked_reason
+                    status, priority, created_at_ms, updated_at_ms, blocked_reason,
+                    worktree_path, worktree_branch, worktree_starting_head, worktree_git_dir,
+                    worktree_common_dir, worktree_device, worktree_inode,
+                    worktree_git_dir_device, worktree_git_dir_inode,
+                    worktree_common_dir_device, worktree_common_dir_inode
              FROM tasks
             WHERE project_id = ?1
                AND (?2 IS NULL OR assigned_agent_id = ?2)
@@ -3862,6 +3921,7 @@ impl Store {
                 let parent_id: Option<String> = row.get(2)?;
                 let assigned_id: Option<String> = row.get(3)?;
                 let status: String = row.get(7)?;
+                let worktree_binding = task_binding_from_columns(row, 12)?;
                 Ok(TaskDetail {
                     snapshot: TaskSnapshot {
                         id: parse_id(row.get(0)?, 0)?,
@@ -3869,6 +3929,7 @@ impl Store {
                         parent_task_id: parse_optional_id(parent_id, 2)?,
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
+                        worktree_binding,
                         status: parse_task_status(&status, 7)?,
                         priority: row.get(8)?,
                         created_at_ms: row.get(9)?,
@@ -4076,6 +4137,20 @@ impl Store {
         priority: Option<i32>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
+        self.update_task_with_binding(project_id, task_id, title, body, priority, None, now_ms)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_task_with_binding(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        title: Option<String>,
+        body: Option<String>,
+        priority: Option<i32>,
+        worktree_binding: Option<WorktreeBinding>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4086,12 +4161,47 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks
              SET title = COALESCE(?1, title), body = COALESCE(?2, body),
-                 priority = COALESCE(?3, priority), updated_at_ms = ?4
-             WHERE id = ?5 AND project_id = ?6 AND status = 'queued'",
+                 priority = COALESCE(?3, priority),
+                 worktree_path = COALESCE(?4, worktree_path),
+                 worktree_branch = COALESCE(?5, worktree_branch),
+                 worktree_starting_head = COALESCE(?6, worktree_starting_head),
+                 worktree_git_dir = COALESCE(?7, worktree_git_dir),
+                 worktree_common_dir = COALESCE(?8, worktree_common_dir),
+                 worktree_device = COALESCE(?9, worktree_device),
+                 worktree_inode = COALESCE(?10, worktree_inode),
+                 worktree_git_dir_device = COALESCE(?11, worktree_git_dir_device),
+                 worktree_git_dir_inode = COALESCE(?12, worktree_git_dir_inode),
+                 worktree_common_dir_device = COALESCE(?13, worktree_common_dir_device),
+                 worktree_common_dir_inode = COALESCE(?14, worktree_common_dir_inode),
+                 updated_at_ms = ?15
+             WHERE id = ?16 AND project_id = ?17 AND status = 'queued'",
             params![
                 title,
                 body,
                 priority,
+                worktree_binding.as_ref().map(|b| b.path.as_str()),
+                worktree_binding.as_ref().map(|b| b.branch.as_str()),
+                worktree_binding.as_ref().map(|b| b.starting_head.as_str()),
+                worktree_binding.as_ref().map(|b| b.git_dir.as_str()),
+                worktree_binding.as_ref().map(|b| b.common_dir.as_str()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.worktree_device).ok()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.worktree_inode).ok()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.git_dir_device).ok()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.git_dir_inode).ok()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.common_dir_device).ok()),
+                worktree_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.common_dir_inode).ok()),
                 now_ms,
                 task_id.as_str(),
                 project_id.as_str()
@@ -4640,7 +4750,11 @@ impl Store {
     ) -> Result<Vec<TaskSnapshot>> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms,
+                    worktree_path, worktree_branch, worktree_starting_head, worktree_git_dir,
+                    worktree_common_dir, worktree_device, worktree_inode,
+                    worktree_git_dir_device, worktree_git_dir_inode,
+                    worktree_common_dir_device, worktree_common_dir_inode
              FROM tasks
              WHERE project_id = ?1 AND status IN ('queued', 'running')
                AND ((?2 IS NULL AND assigned_agent_id IS NULL) OR assigned_agent_id = ?2)
@@ -4660,7 +4774,11 @@ impl Store {
     ) -> Result<Vec<factory_core::status::BlockedTaskStatus>> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
-                    created_at_ms, updated_at_ms, blocked_reason
+                    created_at_ms, updated_at_ms,
+                    worktree_path, worktree_branch, worktree_starting_head, worktree_git_dir,
+                    worktree_common_dir, worktree_device, worktree_inode,
+                    worktree_git_dir_device, worktree_git_dir_inode,
+                    worktree_common_dir_device, worktree_common_dir_inode, blocked_reason
              FROM tasks
              WHERE project_id = ?1 AND status = 'blocked'
              ORDER BY updated_at_ms, id",
@@ -4668,7 +4786,7 @@ impl Store {
         let rows = statement.query_map(params![project_id.as_str()], |row| {
             Ok(factory_core::status::BlockedTaskStatus {
                 task: task_snapshot_from_row(row)?,
-                reason: row.get(9)?,
+                reason: row.get(20)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -5394,6 +5512,7 @@ fn insert_task(
     transaction: &Transaction<'_>,
     input: NewTask,
     assigned_agent_id: Option<AgentId>,
+    worktree_binding: Option<WorktreeBinding>,
     now_ms: i64,
 ) -> Result<(TaskDetail, FactoryEvent)> {
     let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
@@ -5414,6 +5533,7 @@ fn insert_task(
             parent_task_id: input.parent_task_id,
             assigned_agent_id,
             title,
+            worktree_binding: worktree_binding.clone(),
             status: TaskStatus::Queued,
             priority: input.priority,
             created_at_ms: now_ms,
@@ -5426,8 +5546,13 @@ fn insert_task(
     transaction.execute(
         "INSERT INTO tasks (
             id, project_id, parent_task_id, assigned_agent_id, title, body,
-            status, priority, created_at_ms, updated_at_ms, incarnation_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
+            status, priority, created_at_ms, updated_at_ms, incarnation_id,
+            worktree_path, worktree_branch, worktree_starting_head, worktree_git_dir,
+            worktree_common_dir, worktree_device, worktree_inode,
+            worktree_git_dir_device, worktree_git_dir_inode,
+            worktree_common_dir_device, worktree_common_dir_inode
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10,
+                   ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             record.snapshot.id.as_str(),
             record.snapshot.project_id.as_str(),
@@ -5443,6 +5568,29 @@ fn insert_task(
             record.snapshot.created_at_ms,
             record.snapshot.updated_at_ms,
             Uuid::new_v4().hyphenated().to_string(),
+            worktree_binding.as_ref().map(|b| b.path.as_str()),
+            worktree_binding.as_ref().map(|b| b.branch.as_str()),
+            worktree_binding.as_ref().map(|b| b.starting_head.as_str()),
+            worktree_binding.as_ref().map(|b| b.git_dir.as_str()),
+            worktree_binding.as_ref().map(|b| b.common_dir.as_str()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.worktree_device).ok()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.worktree_inode).ok()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.git_dir_device).ok()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.git_dir_inode).ok()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.common_dir_device).ok()),
+            worktree_binding
+                .as_ref()
+                .and_then(|b| i64::try_from(b.common_dir_inode).ok()),
         ],
     )?;
     let event = FactoryEvent::TaskChanged {
@@ -5455,13 +5603,18 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
     connection
         .query_row(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
-                    status, priority, created_at_ms, updated_at_ms, blocked_reason
+                    status, priority, created_at_ms, updated_at_ms, blocked_reason,
+                    worktree_path, worktree_branch, worktree_starting_head, worktree_git_dir,
+                    worktree_common_dir, worktree_device, worktree_inode,
+                    worktree_git_dir_device, worktree_git_dir_inode,
+                    worktree_common_dir_device, worktree_common_dir_inode
              FROM tasks WHERE id = ?1",
             params![task_id.as_str()],
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
                 let assigned_id: Option<String> = row.get(3)?;
                 let status: String = row.get(7)?;
+                let worktree_binding = task_binding_from_columns(row, 12)?;
                 Ok(TaskDetail {
                     snapshot: TaskSnapshot {
                         id: parse_id(row.get(0)?, 0)?,
@@ -5469,6 +5622,7 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
                         parent_task_id: parse_optional_id(parent_id, 2)?,
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
+                        worktree_binding,
                         status: parse_task_status(&status, 7)?,
                         priority: row.get(8)?,
                         created_at_ms: row.get(9)?,
@@ -6097,6 +6251,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_no_foreign_key_violations(connection)?;
+        current = 28;
+    }
+    if current == 28 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('tasks') WHERE name = 'worktree_path'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_present {
+            transaction.execute_batch(include_str!(
+                "../migrations/0029_task_worktree_bindings.sql"
+            ))?;
+        }
+        transaction.pragma_update(None, "user_version", 29)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6329,11 +6501,45 @@ fn task_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnaps
         parent_task_id: parse_optional_id(parent_id, 2)?,
         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
         title: row.get(4)?,
+        worktree_binding: task_binding_from_columns(row, 9)?,
         status: parse_task_status(&status, 5)?,
         priority: row.get(6)?,
         created_at_ms: row.get(7)?,
         updated_at_ms: row.get(8)?,
     })
+}
+
+fn task_binding_from_columns(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<Option<WorktreeBinding>> {
+    let path: Option<String> = row.get(offset)?;
+    let Some(path) = path else { return Ok(None) };
+    Ok(Some(WorktreeBinding {
+        path,
+        branch: row.get(offset + 1)?,
+        starting_head: row.get(offset + 2)?,
+        git_dir: row.get(offset + 3)?,
+        common_dir: row.get(offset + 4)?,
+        worktree_device: u64::try_from(row.get::<_, i64>(offset + 5)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 5, Type::Integer, Box::new(error))
+        })?,
+        worktree_inode: u64::try_from(row.get::<_, i64>(offset + 6)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 6, Type::Integer, Box::new(error))
+        })?,
+        git_dir_device: u64::try_from(row.get::<_, i64>(offset + 7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 7, Type::Integer, Box::new(error))
+        })?,
+        git_dir_inode: u64::try_from(row.get::<_, i64>(offset + 8)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 8, Type::Integer, Box::new(error))
+        })?,
+        common_dir_device: u64::try_from(row.get::<_, i64>(offset + 9)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 9, Type::Integer, Box::new(error))
+        })?,
+        common_dir_inode: u64::try_from(row.get::<_, i64>(offset + 10)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 10, Type::Integer, Box::new(error))
+        })?,
+    }))
 }
 
 fn parse_task_status(value: &str, column: usize) -> rusqlite::Result<TaskStatus> {

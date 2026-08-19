@@ -235,6 +235,8 @@ pub enum Error {
     DeliveryInProgress,
     #[error("agent has no worktree; create one first")]
     NoWorktree,
+    #[error("task worktree binding rejected: {0}")]
+    WorktreeBinding(String),
     #[error("system clock is before the Unix epoch")]
     InvalidClock,
     #[error("provider launch failed: {0}")]
@@ -390,6 +392,7 @@ impl Handle {
                 }
             })
             .await?;
+        ensure_task_target(&self.state, &task, &session.worktree).await?;
         let text = compose_text(
             &self.config.guidance_root,
             &project_id,
@@ -1522,6 +1525,49 @@ async fn enforce_start_deadline(
     Ok(())
 }
 
+async fn ensure_task_target(
+    state: &DaemonState,
+    task: &TaskDetail,
+    session_worktree: &str,
+) -> Result<(), Error> {
+    let Some(binding) = task.snapshot.worktree_binding.as_ref() else {
+        return Ok(());
+    };
+    let session_path = std::fs::canonicalize(session_worktree)
+        .map_err(|_| Error::WorktreeBinding("live session worktree disappeared".into()))?;
+    if session_path != Path::new(&binding.path) {
+        return Err(Error::WorktreeBinding(format!(
+            "live session worktree mismatch: expected {}, found {}",
+            binding.path,
+            session_path.display()
+        )));
+    }
+    let project_id = task.snapshot.project_id.clone();
+    let (project, authority) = state
+        .with_store(move |store| {
+            Ok((
+                store.get_project(&project_id)?,
+                store.repository_authority(&project_id)?,
+            ))
+        })
+        .await?;
+    let observed = crate::repository::validate_worktree_binding(
+        &project,
+        authority,
+        Path::new(&binding.path),
+        &binding.branch,
+        &binding.starting_head,
+    )
+    .await
+    .map_err(|error| Error::WorktreeBinding(error.to_string()))?;
+    if observed != *binding {
+        return Err(Error::WorktreeBinding(
+            "pinned task worktree changed; repair the target before retrying".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn has_pending_work(
     state: &DaemonState,
     project_id: &ProjectId,
@@ -1608,7 +1654,46 @@ async fn spawn_session_for_agent(
         .with_store(move |store| store.get_agent_detail(&detail_project_id, &detail_agent_id))
         .await?;
     let auto_mode = state.with_store(|store| store.auto_mode()).await?;
-    let worktree = agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?;
+    let pending_project_id = project_id.clone();
+    let pending_agent_id = agent_id.clone();
+    let pending = state
+        .with_store(move |store| {
+            store
+                .next_deliverable(&pending_project_id, &pending_agent_id)?
+                .map(|task_id| store.get_task(&pending_project_id, &task_id))
+                .transpose()
+        })
+        .await?;
+    let worktree = match pending.and_then(|task| task.snapshot.worktree_binding) {
+        Some(binding) => {
+            let authority_project_id = project_id.clone();
+            let (project, authority) = state
+                .with_store(move |store| {
+                    Ok((
+                        store.get_project(&authority_project_id)?,
+                        store.repository_authority(&authority_project_id)?,
+                    ))
+                })
+                .await?;
+            let observed = crate::repository::validate_worktree_binding(
+                &project,
+                authority,
+                Path::new(&binding.path),
+                &binding.branch,
+                &binding.starting_head,
+            )
+            .await
+            .map_err(|error| Error::WorktreeBinding(error.to_string()))?;
+            if observed != binding {
+                return Err(Error::WorktreeBinding(
+                    "pinned worktree identity changed; repair the task target before retrying"
+                        .into(),
+                ));
+            }
+            binding.path
+        }
+        None => agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?,
+    };
     let worktree_path = PathBuf::from(&worktree);
 
     let provider_impl = select_provider(agent.snapshot.provider);
@@ -2833,6 +2918,12 @@ fn compose_text(
              --result \"<summary>\"\nIf blocked, run: factoryctl task blocked --task {id} --reason \
              \"<why>\"\n\n{body}"
         ));
+        if let Some(binding) = task.snapshot.worktree_binding.as_ref() {
+            sections.push(format!(
+                "Daemon-pinned target (do not substitute a path or branch):\n  worktree: {}\n  branch: {}\n  starting HEAD: {}",
+                binding.path, binding.branch, binding.starting_head
+            ));
+        }
     }
     if !messages.is_empty() {
         let mut block = String::from("Messages:");
@@ -5224,6 +5315,7 @@ mod tests {
                 parent_task_id: None,
                 assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
                 title: title.to_owned(),
+                worktree_binding: None,
                 status: factory_core::TaskStatus::Running,
                 priority: 0,
                 created_at_ms: 0,

@@ -226,6 +226,7 @@ mod tests {
                     parent_task_id: None,
                     assigned_agent_id: Some(AgentId::try_from("alice").unwrap()),
                     title: "fix bug".into(),
+                    worktree_binding: None,
                     status,
                     priority: 0,
                     created_at_ms: at_ms,

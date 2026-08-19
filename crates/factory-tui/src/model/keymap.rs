@@ -928,6 +928,9 @@ impl Board {
                     body,
                     priority: 0,
                     agent_id,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 };
                 Intent::Send(request)
             }
@@ -969,6 +972,9 @@ impl Board {
                     title: Some(title),
                     body: None,
                     priority: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 })
             }
             PromptKind::ReorderTask(task_id) => {
@@ -988,6 +994,9 @@ impl Board {
                     title: None,
                     body: None,
                     priority: Some(priority),
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 })
             }
             PromptKind::EditModel(agent_id) => {

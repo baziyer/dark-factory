@@ -326,6 +326,9 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
                 body: "The observer should receive this without polling.".into(),
                 priority: 5,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -366,6 +369,9 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
                 body: "This event must replay after reconnect.".into(),
                 priority: 1,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -469,6 +475,9 @@ async fn live_task_detail_and_event_head_are_bounded_local_reads() {
                     body: "bounded live body".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await,
@@ -653,6 +662,9 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 body: "x".repeat(MAX_TASK_BODY_BYTES + 1),
                 priority: 0,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -679,6 +691,9 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                     body: "bounded".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await;
@@ -855,6 +870,9 @@ async fn retry_is_a_local_control_operation_and_does_not_change_queued_tasks() {
                     body: "Still queued".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await,
@@ -938,6 +956,9 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     body: "body".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await,
@@ -1129,6 +1150,9 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                     body: "body".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await,
@@ -1212,6 +1236,9 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 title: None,
                 body: None,
                 priority: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -1234,6 +1261,9 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 title: Some("Updated title".into()),
                 body: None,
                 priority: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -1308,6 +1338,9 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 body: "different body".into(),
                 priority: 0,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
         )
         .await;
@@ -1467,6 +1500,9 @@ async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
                         body: "body".into(),
                         priority: 0,
                         agent_id: None,
+                        worktree: None,
+                        branch: None,
+                        starting_head: None,
                     },
                 )
                 .await,
@@ -2063,6 +2099,9 @@ async fn session_shaped_requests_now_have_real_behavior() {
                     body: "body".into(),
                     priority: 0,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 },
             )
             .await,
@@ -2315,6 +2354,9 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 body: "b".to_owned(),
                 priority: 0,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
             LocalRequest::CreateTask {
                 id: task_id("t-loose"),
@@ -2324,6 +2366,9 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 body: "b".to_owned(),
                 priority: 0,
                 agent_id: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             },
             LocalRequest::AssignTask {
                 project_id: project_id("factory"),

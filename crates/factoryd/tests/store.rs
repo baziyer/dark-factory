@@ -1,6 +1,6 @@
 use factory_core::{
     AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, RunId, RunnerInstanceId,
-    SessionId, TaskId, TaskStatus, local::MAX_TASK_BODY_BYTES,
+    SessionId, TaskId, TaskStatus, WorktreeBinding, local::MAX_TASK_BODY_BYTES,
 };
 use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
@@ -544,6 +544,63 @@ fn project_task_and_events_survive_reopen() {
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].sequence, 1);
     assert_eq!(events[1].sequence, 2);
+}
+
+#[test]
+fn task_worktree_binding_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let binding = WorktreeBinding {
+        path: "/tmp/nested-pr".into(),
+        branch: "pr/nested".into(),
+        starting_head: "a".repeat(40),
+        git_dir: "/tmp/repo/.git/worktrees/nested-pr".into(),
+        common_dir: "/tmp/repo/.git".into(),
+        worktree_device: 1,
+        worktree_inode: 2,
+        git_dir_device: 3,
+        git_dir_inode: 4,
+        common_dir_device: 5,
+        common_dir_inode: 6,
+    };
+    let task_id = task_id("bound-task");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/tmp/repo".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_task_with_assignment_and_binding(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Bound".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+                None,
+                Some(binding.clone()),
+                2,
+            )
+            .unwrap();
+    }
+    let store = Store::open(&database).unwrap();
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task_id)
+            .unwrap()
+            .snapshot
+            .worktree_binding,
+        Some(binding)
+    );
 }
 
 #[test]

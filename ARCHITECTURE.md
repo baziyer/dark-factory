@@ -107,7 +107,11 @@ catalogue.
    keeps concurrent agents from colliding in the same working tree. New
    agent branches start from `origin/HEAD`, or local `main` when no remote
    default exists, never the project root's current checkout; an
-   operator may override it with an explicit `--worktree`.
+   operator may override it with an explicit `--worktree`. Existing-work
+   tasks carry a daemon-pinned canonical worktree, linked-worktree identity,
+   branch, and starting HEAD; dispatch and repository publication revalidate
+   that target before a provider starts or a result is claimed, so prose or a
+   parent-agent checkout cannot redirect the change.
    Fleet and per-agent status both expose the same live git summary for
    that worktree and the same structured operator-attention reasons. Those
    reasons separate provider questions/permissions from worker blocks,
@@ -182,7 +186,8 @@ catalogue.
    configuration. `factoryctl git commit`, `git push`, and `pr open|update`
    authenticate the live session token and carry no caller-selected project,
    agent, path, branch, or remote. `factoryd` re-resolves the exact managed
-   worktree, linked-worktree gitdir/common-dir identity, and `agent/<id>` branch, uses an empty-config temporary
+   worktree, linked-worktree gitdir/common-dir identity, and the task's pinned
+   branch (or `agent/<id>` for ordinary work), uses an empty-config temporary
    gitdir/index so repository hooks, filters, helpers, fsmonitor, and external
    drivers cannot execute, and publishes commits with a compare-and-swap ref
    update. Remote and PR base come from write-once operator-pinned durable state configured before any session, never

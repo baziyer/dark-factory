@@ -969,6 +969,9 @@ async fn handle_request(
             body,
             priority,
             agent_id,
+            worktree,
+            branch,
+            starting_head,
         } => {
             let title = normalize_task_title(title).ok_or_else(|| {
                 ApiFailure::Invalid(format!(
@@ -980,11 +983,13 @@ async fn handle_request(
                     "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
                 )));
             }
+            let worktree_binding =
+                task_worktree_binding(state, &project_id, worktree, branch, starting_head).await?;
             let wake_project_id = project_id.clone();
             let wake_agent_id = agent_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
-                    let (task, event) = store.create_task_with_assignment(
+                    let (task, event) = store.create_task_with_assignment_and_binding(
                         NewTask {
                             id,
                             project_id,
@@ -994,6 +999,7 @@ async fn handle_request(
                             priority,
                         },
                         agent_id,
+                        worktree_binding,
                         now_ms()?,
                     )?;
                     Ok((task, vec![event]))
@@ -1380,8 +1386,17 @@ async fn handle_request(
             title,
             body,
             priority,
+            worktree,
+            branch,
+            starting_head,
         } => {
-            if title.is_none() && body.is_none() && priority.is_none() {
+            if title.is_none()
+                && body.is_none()
+                && priority.is_none()
+                && worktree.is_none()
+                && branch.is_none()
+                && starting_head.is_none()
+            {
                 return Err(ApiFailure::Invalid(
                     "task update must include title or body".into(),
                 ));
@@ -1402,14 +1417,17 @@ async fn handle_request(
                     )));
                 }
             }
+            let worktree_binding =
+                task_worktree_binding(state, &project_id, worktree, branch, starting_head).await?;
             let task = state
                 .commit_and_publish(move |store| {
-                    let (task, event) = store.update_task(
+                    let (task, event) = store.update_task_with_binding(
                         &project_id,
                         &task_id,
                         title,
                         body,
                         priority,
+                        worktree_binding,
                         now_ms()?,
                     )?;
                     Ok((task, vec![event]))
@@ -1634,6 +1652,7 @@ async fn handle_request(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
                 )));
             }
+            validate_task_result_target(state, &project_id, &task_id).await?;
             let task = state
                 .commit_and_publish(move |store| {
                     let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
@@ -1652,6 +1671,7 @@ async fn handle_request(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
                 )));
             }
+            validate_task_result_target(state, &project_id, &task_id).await?;
             let task = state
                 .commit_and_publish(move |store| {
                     let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
@@ -2218,6 +2238,13 @@ async fn repository_request(
     let authority = state
         .with_store(move |store| store.repository_authority(&authority_project_id))
         .await?;
+    let binding_project_id = session.project_id.clone();
+    let binding_session_id = session.id.clone();
+    let task_binding = state
+        .with_store(move |store| {
+            store.task_worktree_binding_for_session(&binding_project_id, &binding_session_id)
+        })
+        .await?;
     // Reads use immutable snapshots and must not let a slow diff monopolize the
     // process-wide mutation boundary. Every operation that can change local or
     // remote state remains serialized until its final revalidation completes.
@@ -2249,7 +2276,12 @@ async fn repository_request(
     let audit_project_id = session.project_id.clone();
     let audit_agent_id = session.agent_id.clone();
     let audit_session_id = session.id.clone();
-    let result = match repository::Target::validate(session, project, authority).await {
+    let result = match match task_binding {
+        Some(binding) => {
+            repository::Target::validate_with_binding(session, project, authority, binding).await
+        }
+        None => repository::Target::validate(session, project, authority).await,
+    } {
         Ok(target) => {
             let command = match request {
                 RepositoryRequest::Status => target.status().await,
@@ -2852,6 +2884,91 @@ async fn validate_agent_worktree(worktree: String) -> Result<String, ApiFailure>
     })
     .await
     .map_err(|error| ApiFailure::Internal(format!("worktree check worker failed: {error}")))?
+}
+
+async fn task_worktree_binding(
+    state: &ApiState,
+    project_id: &ProjectId,
+    worktree: Option<String>,
+    branch: Option<String>,
+    starting_head: Option<String>,
+) -> Result<Option<factory_core::WorktreeBinding>, ApiFailure> {
+    if worktree.is_none() && branch.is_none() && starting_head.is_none() {
+        return Ok(None);
+    }
+    let (Some(worktree), Some(branch), Some(starting_head)) = (worktree, branch, starting_head)
+    else {
+        return Err(ApiFailure::Invalid(
+            "task worktree, branch, and starting-head must be supplied together".into(),
+        ));
+    };
+    if !Path::new(&worktree).is_absolute() {
+        return Err(ApiFailure::Invalid(
+            "task worktree must be an absolute path".into(),
+        ));
+    }
+    let project_lookup = project_id.clone();
+    let (project, authority) = state
+        .with_store(move |store| {
+            Ok((
+                store.get_project(&project_lookup)?,
+                store.repository_authority(&project_lookup)?,
+            ))
+        })
+        .await?;
+    repository::validate_worktree_binding(
+        &project,
+        authority,
+        Path::new(&worktree),
+        &branch,
+        &starting_head,
+    )
+    .await
+    .map(Some)
+    .map_err(|error| ApiFailure::Invalid(error.to_string()))
+}
+
+async fn validate_task_result_target(
+    state: &ApiState,
+    project_id: &ProjectId,
+    task_id: &factory_core::TaskId,
+) -> Result<(), ApiFailure> {
+    let lookup_project_id = project_id.clone();
+    let lookup_task_id = task_id.clone();
+    let task = state
+        .with_store(move |store| store.get_task(&lookup_project_id, &lookup_task_id))
+        .await?;
+    let Some(binding) = task.snapshot.worktree_binding else {
+        return Ok(());
+    };
+    let authority_project_id = project_id.clone();
+    let (project, authority) = state
+        .with_store(move |store| {
+            Ok((
+                store.get_project(&authority_project_id)?,
+                store.repository_authority(&authority_project_id)?,
+            ))
+        })
+        .await?;
+    let observed = repository::revalidate_worktree_binding(&project, authority, &binding)
+        .await
+        .map_err(|error| ApiFailure::Invalid(error.to_string()))?;
+    if observed.path != binding.path
+        || observed.branch != binding.branch
+        || observed.git_dir != binding.git_dir
+        || observed.common_dir != binding.common_dir
+        || observed.worktree_device != binding.worktree_device
+        || observed.worktree_inode != binding.worktree_inode
+        || observed.git_dir_device != binding.git_dir_device
+        || observed.git_dir_inode != binding.git_dir_inode
+        || observed.common_dir_device != binding.common_dir_device
+        || observed.common_dir_inode != binding.common_dir_inode
+    {
+        return Err(ApiFailure::Invalid(
+            "task result rejected: target worktree identity or branch changed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {

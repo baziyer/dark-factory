@@ -19,6 +19,20 @@ use crate::mouse::{HitMap, Target};
 use crate::pane::PaneMap;
 use crate::ui;
 
+fn task_context(task: &TaskDetail) -> String {
+    task.snapshot.worktree_binding.as_ref().map_or_else(
+        || task.snapshot.title.clone(),
+        |binding| {
+            format!(
+                "{} [{} @{}]",
+                task.snapshot.title,
+                binding.branch,
+                &binding.starting_head[..7.min(binding.starting_head.len())]
+            )
+        },
+    )
+}
+
 pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, hits: &mut HitMap) {
     if board.terminal_maximized && board.attention_focus.is_none() {
         render_terminal(frame, area, board, panes, hits);
@@ -181,7 +195,7 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                 },
                 task.snapshot.status,
                 task.snapshot.priority,
-                task.snapshot.title
+                task_context(task)
             ))
         })
         .collect();
@@ -505,7 +519,9 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
             .map_or("unassigned", factory_core::AgentId::as_str);
         lines.push(format!(
             "  {owner}: {:?} p={} {}",
-            task.snapshot.status, task.snapshot.priority, task.snapshot.title
+            task.snapshot.status,
+            task.snapshot.priority,
+            task_context(task)
         ));
     }
     let history = orchestrator_history_tasks(board, project_id);
@@ -514,7 +530,9 @@ fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectI
         for task in history {
             lines.push(format!(
                 "  {:?} p={} {}",
-                task.snapshot.status, task.snapshot.priority, task.snapshot.title
+                task.snapshot.status,
+                task.snapshot.priority,
+                task_context(task)
             ));
         }
     }

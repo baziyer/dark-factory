@@ -150,6 +150,7 @@ pub(crate) fn task(
             parent_task_id: None,
             assigned_agent_id: assigned.map(|a| AgentId::try_from(a).unwrap()),
             title: id.to_owned(),
+            worktree_binding: None,
             status,
             priority: 0,
             created_at_ms,

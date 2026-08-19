@@ -321,6 +321,7 @@ mod tests {
                 project_id: ProjectId::try_from("factory").unwrap(),
                 parent_task_id: None,
                 title: "Task".to_owned(),
+                worktree_binding: None,
                 priority: 0,
                 status: factory_core::TaskStatus::Succeeded,
                 assigned_agent_id: None,

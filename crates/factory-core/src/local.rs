@@ -173,6 +173,12 @@ pub enum LocalRequest {
         /// daemon wakes only this agent after the commit.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        starting_head: Option<String>,
     },
     CreateAgent {
         id: AgentId,
@@ -293,6 +299,12 @@ pub enum LocalRequest {
         /// Queue priority. Updating it is the shared reorder operation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         priority: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worktree: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        starting_head: Option<String>,
     },
     DeleteTask {
         project_id: ProjectId,

@@ -316,6 +316,9 @@ Options:
   --parent PARENT_ID      Parent task ID
   --priority N             Priority (default: 0)
   --agent ID               Create directly in this agent's queue (atomic)
+  --worktree PATH           Existing managed worktree to target
+  --branch NAME             Exact worktree branch
+  --starting-head SHA       Exact starting HEAD
   -h, --help                 Show this help";
 const TASK_LIST_HELP: &str = "usage: factoryctl task list --project ID [options]
 
@@ -402,6 +405,9 @@ Required:
 Options:
   --title TEXT              New title (1-240 bytes)
   --body TEXT                 New body
+  --worktree PATH             Existing managed worktree to target
+  --branch NAME               Exact worktree branch
+  --starting-head SHA         Exact starting HEAD
   -h, --help                    Show this help";
 const TASK_DELETE_HELP: &str = "usage: factoryctl task delete --project ID --task ID
 
@@ -805,6 +811,9 @@ enum CliCommand {
         body: String,
         priority: i32,
         agent_id: Option<String>,
+        worktree: Option<String>,
+        branch: Option<String>,
+        starting_head: Option<String>,
     },
     TaskList {
         project_id: String,
@@ -853,6 +862,9 @@ enum CliCommand {
         task_id: String,
         title: Option<String>,
         body: Option<String>,
+        worktree: Option<String>,
+        branch: Option<String>,
+        starting_head: Option<String>,
     },
     TaskDelete {
         project_id: String,
@@ -1701,6 +1713,9 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 .transpose()?
                 .unwrap_or(0);
             let agent_id = take_option(&mut args, "--agent")?;
+            let worktree = take_option(&mut args, "--worktree")?;
+            let branch = take_option(&mut args, "--branch")?;
+            let starting_head = take_option(&mut args, "--starting-head")?;
             require_empty(&args)?;
             Ok(CliCommand::TaskAdd {
                 id,
@@ -1710,6 +1725,9 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 body,
                 priority,
                 agent_id,
+                worktree,
+                branch,
+                starting_head,
             })
         }
         "list" => {
@@ -1805,8 +1823,16 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             let task_id = required_option(&mut args, "--task")?;
             let title = take_option(&mut args, "--title")?;
             let body = take_option(&mut args, "--body")?;
+            let worktree = take_option(&mut args, "--worktree")?;
+            let branch = take_option(&mut args, "--branch")?;
+            let starting_head = take_option(&mut args, "--starting-head")?;
             require_empty(&args)?;
-            if title.is_none() && body.is_none() {
+            if title.is_none()
+                && body.is_none()
+                && worktree.is_none()
+                && branch.is_none()
+                && starting_head.is_none()
+            {
                 return Err("task update requires --title or --body".into());
             }
             Ok(CliCommand::TaskUpdate {
@@ -1814,6 +1840,9 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 task_id,
                 title,
                 body,
+                worktree,
+                branch,
+                starting_head,
             })
         }
         "delete" => {
@@ -2272,6 +2301,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             body,
             priority,
             agent_id,
+            worktree,
+            branch,
+            starting_head,
         } => {
             let request = LocalRequest::CreateTask {
                 id: id
@@ -2286,6 +2318,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 body,
                 priority,
                 agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
+                worktree,
+                branch,
+                starting_head,
             };
             Ok(request)
         }
@@ -2342,6 +2377,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             title: None,
             body: None,
             priority: Some(priority),
+            worktree: None,
+            branch: None,
+            starting_head: None,
         }),
         CliCommand::TaskAssign {
             project_id,
@@ -2371,12 +2409,18 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             task_id,
             title,
             body,
+            worktree,
+            branch,
+            starting_head,
         } => Ok(LocalRequest::UpdateTask {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
             title,
             body,
             priority: None,
+            worktree,
+            branch,
+            starting_head,
         }),
         CliCommand::TaskDelete {
             project_id,
@@ -3191,6 +3235,9 @@ mod tests {
                     body: "Use the socket".into(),
                     priority: 7,
                     agent_id: None,
+                    worktree: None,
+                    branch: None,
+                    starting_head: None,
                 }
             )
         );
@@ -3214,6 +3261,42 @@ mod tests {
                     agent_id: Some("curie".into()),
                 }
             )
+        );
+    }
+
+    #[test]
+    fn task_target_flags_are_carried_to_the_daemon_request() {
+        let (_, command) = parse_args(args(&[
+            "task",
+            "add",
+            "--project",
+            "project-1",
+            "--title",
+            "Existing PR",
+            "--body",
+            "Use the pinned worktree",
+            "--worktree",
+            "/tmp/nested-pr",
+            "--branch",
+            "pr/issue-220",
+            "--starting-head",
+            "0123456789012345678901234567890123456789",
+        ]))
+        .unwrap();
+        let LocalRequest::CreateTask {
+            worktree,
+            branch,
+            starting_head,
+            ..
+        } = request_for(command).unwrap()
+        else {
+            panic!("expected task create request");
+        };
+        assert_eq!(worktree.as_deref(), Some("/tmp/nested-pr"));
+        assert_eq!(branch.as_deref(), Some("pr/issue-220"));
+        assert_eq!(
+            starting_head.as_deref(),
+            Some("0123456789012345678901234567890123456789")
         );
     }
 
@@ -4006,6 +4089,9 @@ mod tests {
                 title: Some("New".into()),
                 body: None,
                 priority: None,
+                worktree: None,
+                branch: None,
+                starting_head: None,
             }
         );
 

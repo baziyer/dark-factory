@@ -895,6 +895,7 @@ mod tests {
             parent_task_id: None,
             assigned_agent_id: Some(AgentId::try_from("a").unwrap()),
             title: format!("task {id}"),
+            worktree_binding: None,
             status,
             priority: 0,
             created_at_ms: 0,

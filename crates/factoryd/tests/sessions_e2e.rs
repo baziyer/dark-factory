@@ -592,6 +592,9 @@ fn create_task(client: &Client, id: &str, title: &str, body: &str) {
             body: body.into(),
             priority: 0,
             agent_id: None,
+            worktree: None,
+            branch: None,
+            starting_head: None,
         })
         .unwrap();
     assert!(

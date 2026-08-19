@@ -69,7 +69,22 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
                 .iter()
                 .find(|task| task.snapshot.status == factory_core::TaskStatus::Running)
                 .or_else(|| assigned.first())
-                .map_or("idle", |task| task.snapshot.title.as_str());
+                .map_or_else(
+                    || "idle".to_owned(),
+                    |task| {
+                        task.snapshot.worktree_binding.as_ref().map_or_else(
+                            || task.snapshot.title.clone(),
+                            |binding| {
+                                format!(
+                                    "{} [{} @{}]",
+                                    task.snapshot.title,
+                                    binding.branch,
+                                    &binding.starting_head[..7.min(binding.starting_head.len())]
+                                )
+                            },
+                        )
+                    },
+                );
             let route = if agent.parent_agent_id.is_some() {
                 "══ "
             } else {
@@ -89,7 +104,7 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
                     agent.provider,
                     state.label(),
                     assigned.len(),
-                    ui::truncate(current, 28)
+                    ui::truncate(&current, 28)
                 )),
             ]));
             hits.add_row(inner, row, Target::Agent(agent_id));

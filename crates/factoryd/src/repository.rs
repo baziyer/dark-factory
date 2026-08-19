@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId};
+use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId, WorktreeBinding};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -74,109 +74,222 @@ pub fn validate_authority(
     })
 }
 
+/// Pins an existing worktree to the repository authority. Callers provide
+/// only the intended path/branch/HEAD; all identities are observed here and
+/// persisted by the daemon.
+pub async fn validate_worktree_binding(
+    project: &ProjectSnapshot,
+    authority: RepositoryAuthority,
+    path: &Path,
+    branch: &str,
+    starting_head: &str,
+) -> Result<WorktreeBinding, Error> {
+    validate_worktree_binding_at(project, authority, path, branch, Some(starting_head)).await
+}
+
+pub async fn revalidate_worktree_binding(
+    project: &ProjectSnapshot,
+    authority: RepositoryAuthority,
+    binding: &WorktreeBinding,
+) -> Result<WorktreeBinding, Error> {
+    validate_worktree_binding_at(
+        project,
+        authority,
+        Path::new(&binding.path),
+        &binding.branch,
+        None,
+    )
+    .await
+}
+
+async fn validate_worktree_binding_at(
+    project: &ProjectSnapshot,
+    authority: RepositoryAuthority,
+    path: &Path,
+    branch: &str,
+    expected_head: Option<&str>,
+) -> Result<WorktreeBinding, Error> {
+    let authority = validate_authority(authority.remote_url, authority.base_branch)?;
+    validate_ref(branch, "worktree branch")?;
+    if branch == authority.base_branch {
+        return Err(Error::Rejected(
+            "task worktree must not target the project base branch".into(),
+        ));
+    }
+    let worktree = canonical_directory(path, "task worktree")?;
+    let project_root = canonical_directory(Path::new(&project.root), "project root")?;
+    let top = safe_git(
+        &worktree,
+        None,
+        &["rev-parse", "--show-toplevel"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    if canonical_directory(Path::new(top.trim()), "git worktree")? != worktree {
+        return Err(Error::Rejected(
+            "task path is not the Git worktree root".into(),
+        ));
+    }
+    let git_dir = safe_git(
+        &worktree,
+        None,
+        &["rev-parse", "--absolute-git-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let git_dir = canonical_directory(Path::new(git_dir.trim()), "Git directory")?;
+    let common = safe_git(
+        &worktree,
+        None,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let project_common = safe_git(
+        &project_root,
+        None,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let common_dir = resolve_git_path(&worktree, common.trim())?;
+    if common_dir != resolve_git_path(&project_root, project_common.trim())? {
+        return Err(Error::Rejected(
+            "task worktree does not belong to its project repository".into(),
+        ));
+    }
+    let actual_branch = safe_git(
+        &worktree,
+        None,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    if actual_branch.trim() != branch {
+        return Err(Error::Rejected(format!(
+            "task worktree branch mismatch: expected {branch}, found {}",
+            actual_branch.trim()
+        )));
+    }
+    let head = safe_git(
+        &worktree,
+        None,
+        &["rev-parse", "--verify", "HEAD"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let head = head.trim();
+    if expected_head.is_some_and(|expected| head != expected) {
+        return Err(Error::Rejected(format!(
+            "task worktree HEAD mismatch: expected {}, found {head}",
+            expected_head.unwrap_or_default()
+        )));
+    }
+    let worktree_metadata = std::fs::metadata(&worktree)
+        .map_err(|_| Error::Rejected("task worktree disappeared".into()))?;
+    let git_metadata = std::fs::metadata(&git_dir)
+        .map_err(|_| Error::Rejected("task Git directory disappeared".into()))?;
+    let common_metadata = std::fs::metadata(&common_dir)
+        .map_err(|_| Error::Rejected("task common Git directory disappeared".into()))?;
+    Ok(WorktreeBinding {
+        path: worktree.to_string_lossy().into_owned(),
+        branch: branch.to_owned(),
+        starting_head: head.to_owned(),
+        git_dir: git_dir.to_string_lossy().into_owned(),
+        common_dir: common_dir.to_string_lossy().into_owned(),
+        worktree_device: worktree_metadata.dev(),
+        worktree_inode: worktree_metadata.ino(),
+        git_dir_device: git_metadata.dev(),
+        git_dir_inode: git_metadata.ino(),
+        common_dir_device: common_metadata.dev(),
+        common_dir_inode: common_metadata.ino(),
+    })
+}
+
 impl Target {
     pub async fn validate(
         session: SessionRow,
         project: ProjectSnapshot,
         authority: RepositoryAuthority,
     ) -> Result<Self, Error> {
+        Self::validate_at(session, project, authority, None).await
+    }
+
+    pub async fn validate_with_binding(
+        session: SessionRow,
+        project: ProjectSnapshot,
+        authority: RepositoryAuthority,
+        binding: WorktreeBinding,
+    ) -> Result<Self, Error> {
+        Self::validate_at(session, project, authority, Some(binding)).await
+    }
+
+    async fn validate_at(
+        session: SessionRow,
+        project: ProjectSnapshot,
+        authority: RepositoryAuthority,
+        binding: Option<WorktreeBinding>,
+    ) -> Result<Self, Error> {
         let authority = validate_authority(authority.remote_url, authority.base_branch)?;
-        let worktree = canonical_directory(Path::new(&session.worktree), "session worktree")?;
-        let project_root = canonical_directory(Path::new(&project.root), "project root")?;
-        let top = safe_git(
-            &worktree,
+        let expected_path = binding
+            .as_ref()
+            .map_or_else(|| session.worktree.clone(), |binding| binding.path.clone());
+        let expected_branch = binding.as_ref().map_or_else(
+            || format!("agent/{}", session.agent_id),
+            |binding| binding.branch.clone(),
+        );
+        let observed = validate_worktree_binding_at(
+            &project,
+            authority.clone(),
+            Path::new(&expected_path),
+            &expected_branch,
             None,
-            &["rev-parse", "--show-toplevel"],
-            None,
-            READ_TIMEOUT,
         )
         .await?;
-        if canonical_directory(Path::new(top.trim()), "git worktree")? != worktree {
-            return Err(Error::Rejected(
-                "session path is not the Git worktree root".into(),
-            ));
+        if let Some(binding) = binding.as_ref() {
+            if observed.path != binding.path
+                || observed.branch != binding.branch
+                || observed.git_dir != binding.git_dir
+                || observed.common_dir != binding.common_dir
+                || observed.worktree_device != binding.worktree_device
+                || observed.worktree_inode != binding.worktree_inode
+                || observed.git_dir_device != binding.git_dir_device
+                || observed.git_dir_inode != binding.git_dir_inode
+                || observed.common_dir_device != binding.common_dir_device
+                || observed.common_dir_inode != binding.common_dir_inode
+            {
+                return Err(Error::Rejected(
+                    "task worktree identity changed since it was bound".into(),
+                ));
+            }
         }
-        let git_dir = safe_git(
-            &worktree,
-            None,
-            &["rev-parse", "--absolute-git-dir"],
-            None,
-            READ_TIMEOUT,
-        )
-        .await?;
-        let git_dir = canonical_directory(Path::new(git_dir.trim()), "Git directory")?;
-        let common = safe_git(
-            &worktree,
-            None,
-            &["rev-parse", "--git-common-dir"],
-            None,
-            READ_TIMEOUT,
-        )
-        .await?;
-        let project_common = safe_git(
-            &project_root,
-            None,
-            &["rev-parse", "--git-common-dir"],
-            None,
-            READ_TIMEOUT,
-        )
-        .await?;
-        let common_dir = resolve_git_path(&worktree, common.trim())?;
-        if common_dir != resolve_git_path(&project_root, project_common.trim())? {
-            return Err(Error::Rejected(
-                "session worktree does not belong to its project repository".into(),
-            ));
-        }
-        let branch = safe_git(
-            &worktree,
-            None,
-            &["symbolic-ref", "--quiet", "--short", "HEAD"],
-            None,
-            READ_TIMEOUT,
-        )
-        .await?;
-        let branch = branch.trim().to_owned();
-        let expected = format!("agent/{}", session.agent_id);
-        if branch != expected {
-            return Err(Error::Rejected(format!(
-                "session must be on its managed branch {expected}"
-            )));
-        }
-        validate_ref(&branch, "head branch")?;
-        let head = safe_git(
-            &worktree,
-            None,
-            &["rev-parse", "--verify", "HEAD"],
-            None,
-            READ_TIMEOUT,
-        )
-        .await?;
-        let metadata = std::fs::metadata(&worktree)
-            .map_err(|_| Error::Rejected("session worktree disappeared".into()))?;
-        let git_dir_metadata = std::fs::metadata(&git_dir)
-            .map_err(|_| Error::Rejected("session Git directory disappeared".into()))?;
-        let common_dir_metadata = std::fs::metadata(&common_dir)
-            .map_err(|_| Error::Rejected("common Git directory disappeared".into()))?;
         let github_repo = github_slug(&authority.remote_url);
-        Ok(Self {
+        let target = Self {
             project_id: session.project_id,
             agent_id: session.agent_id,
             session_id: session.id,
-            worktree,
-            branch,
-            git_dir,
-            common_dir,
-            head: head.trim().to_owned(),
-            worktree_device: metadata.dev(),
-            worktree_inode: metadata.ino(),
-            git_dir_device: git_dir_metadata.dev(),
-            git_dir_inode: git_dir_metadata.ino(),
-            common_dir_device: common_dir_metadata.dev(),
-            common_dir_inode: common_dir_metadata.ino(),
+            worktree: PathBuf::from(&observed.path),
+            branch: observed.branch,
+            git_dir: PathBuf::from(&observed.git_dir),
+            common_dir: PathBuf::from(&observed.common_dir),
+            head: observed.starting_head.clone(),
+            worktree_device: observed.worktree_device,
+            worktree_inode: observed.worktree_inode,
+            git_dir_device: observed.git_dir_device,
+            git_dir_inode: observed.git_dir_inode,
+            common_dir_device: observed.common_dir_device,
+            common_dir_inode: observed.common_dir_inode,
             authority,
             github_repo,
             gh_program: trusted_program("gh")?,
-        })
+        };
+        Ok(target)
     }
 
     async fn revalidate(&self) -> Result<String, Error> {
@@ -1040,6 +1153,64 @@ mod tests {
             !marker.exists(),
             "agent-controlled executable ran with daemon authority"
         );
+    }
+
+    #[tokio::test]
+    async fn task_binding_pins_nested_worktree_and_rejects_parent_or_changed_head() {
+        let (temp, target, remote) = fixture().await;
+        let nested = temp.path().join("nested-pr");
+        run(
+            temp.path(),
+            &[
+                "--git-dir",
+                &target.common_dir.to_string_lossy(),
+                "worktree",
+                "add",
+                "-b",
+                "pr/nested",
+                nested.to_str().unwrap(),
+                &target.head,
+            ],
+        );
+        let project = ProjectSnapshot {
+            id: "project".try_into().unwrap(),
+            name: "Test".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let binding = validate_worktree_binding(
+            &project,
+            authority.clone(),
+            &nested,
+            "pr/nested",
+            &target.head,
+        )
+        .await
+        .unwrap();
+        assert_eq!(binding.branch, "pr/nested");
+        assert!(
+            validate_worktree_binding(
+                &project,
+                authority.clone(),
+                &target.worktree,
+                "pr/nested",
+                &target.head,
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("branch mismatch")
+        );
+
+        run(&nested, &["branch", "-m", "pr/changed"]);
+        let error =
+            validate_worktree_binding(&project, authority, &nested, "pr/nested", &target.head)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("branch mismatch"));
     }
 
     #[tokio::test]

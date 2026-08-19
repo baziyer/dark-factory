@@ -335,10 +335,30 @@ pub struct TaskSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_agent_id: Option<AgentId>,
     pub title: String,
+    /// The daemon-pinned repository target for existing-work tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_binding: Option<WorktreeBinding>,
     pub status: TaskStatus,
     pub priority: i32,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+/// A repository target captured by the daemon, never inferred from task prose.
+/// Filesystem identities make a path replacement fail closed after restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorktreeBinding {
+    pub path: String,
+    pub branch: String,
+    pub starting_head: String,
+    pub git_dir: String,
+    pub common_dir: String,
+    pub worktree_device: u64,
+    pub worktree_inode: u64,
+    pub git_dir_device: u64,
+    pub git_dir_inode: u64,
+    pub common_dir_device: u64,
+    pub common_dir_inode: u64,
 }
 
 /// A task snapshot together with the instructions supplied to its agent.
