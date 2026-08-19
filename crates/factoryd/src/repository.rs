@@ -31,6 +31,10 @@ const MAX_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_PR_TEXT_BYTES: usize = 128 * 1024;
 const SAFE_PATH: &str = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin";
 
+#[cfg(test)]
+static RECOVERY_REF_RACE: std::sync::Mutex<Option<(PathBuf, String, String)>> =
+    std::sync::Mutex::new(None);
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("repository request rejected: {0}")]
@@ -246,14 +250,33 @@ pub async fn create_managed_change(
                 MUTATION_TIMEOUT,
             )
             .await?;
-            safe_git(
+            #[cfg(test)]
+            let recovery_race = { RECOVERY_REF_RACE.lock().unwrap().take() };
+            #[cfg(test)]
+            if let Some((race_root, race_branch, race_head)) = recovery_race {
+                let race_ref = format!("refs/heads/{race_branch}");
+                safe_git(
+                    &race_root,
+                    None,
+                    &["update-ref", &race_ref, &race_head],
+                    None,
+                    MUTATION_TIMEOUT,
+                )
+                .await?;
+            }
+            if let Err(error) = safe_git(
                 &project_root,
                 None,
-                &["branch", "-D", &branch],
+                &["update-ref", "-d", &branch_ref, existing_head.trim()],
                 None,
                 MUTATION_TIMEOUT,
             )
-            .await?;
+            .await
+            {
+                return Err(Error::Rejected(format!(
+                    "managed change branch changed during recovery; preserving it: {error}"
+                )));
+            }
             reuse_existing = false;
         }
     } else if safe_git(
@@ -1831,6 +1854,114 @@ mod tests {
         .unwrap();
         assert_eq!(branch_head.trim(), unique_head);
         assert_ne!(record.base_sha, unique_head);
+    }
+
+    #[tokio::test]
+    async fn managed_change_recovery_ref_race_preserves_a_new_unique_commit() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-recovery-race".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-recovery-race");
+        let record = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+
+        fs::write(path.join("old"), "old recovery state\n").unwrap();
+        run(&path, &["add", "old"]);
+        run(&path, &["commit", "-m", "old recovery state"]);
+        let old_head = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let old_head = old_head.trim();
+
+        run(&temp.path().join("repo"), &["checkout", "main"]);
+        run(&temp.path().join("repo"), &["merge", "--ff-only", old_head]);
+        fs::write(temp.path().join("repo").join("README"), "advanced\n").unwrap();
+        run(
+            &temp.path().join("repo"),
+            &["commit", "-am", "advance base"],
+        );
+        run(&temp.path().join("repo"), &["push", "origin", "main"]);
+
+        let tree = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&temp.path().join("repo"))
+                .args(["rev-parse", &format!("{old_head}^{{tree}}")])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let unique_head = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&temp.path().join("repo"))
+                .args([
+                    "commit-tree",
+                    tree.trim(),
+                    "-p",
+                    old_head,
+                    "-m",
+                    "concurrent unique",
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let unique_head = unique_head.trim().to_owned();
+        *RECOVERY_REF_RACE.lock().unwrap() = Some((
+            temp.path().join("repo"),
+            record.branch.clone(),
+            unique_head.clone(),
+        ));
+
+        let error = create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("changed during recovery"),
+            "{error}"
+        );
+        assert!(!path.exists(), "recovery removed the old worktree");
+
+        let branch_head = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(temp.path().join("repo"))
+                .args(["rev-parse", &record.branch])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(branch_head.trim(), unique_head);
+        assert!(
+            StdCommand::new("git")
+                .current_dir(temp.path().join("repo"))
+                .args(["cat-file", "-e", &format!("{unique_head}^{{commit}}")])
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     #[tokio::test]
