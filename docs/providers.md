@@ -412,8 +412,7 @@ gates were involved, and both had to change:
   (previously `false`). Confirmed live that `false` denies even a *local*
   Unix-socket connect — seatbelt has no "just localhost" exception — which
   blocked not only a worker's `git push`/`gh pr create` but the
-  orchestrator's own everyday `factoryctl agent add`/`task add`/`task
-  assign`/`session list` calls (only `task done`/`task blocked`/`agent
+  orchestrator's own everyday daemon calls (only `task done`/`task blocked`/`agent
   message` have the outbox fallback below; nothing else does). This is a
   real widening — reads are already unrestricted under `workspace-write`,
   so `network_access = true` means a Codex session can read anything the

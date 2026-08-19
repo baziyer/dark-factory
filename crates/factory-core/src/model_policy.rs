@@ -107,6 +107,13 @@ pub fn normalize_profile(
     let Some(model) = desired.model.as_deref() else {
         if desired.reason.is_some() {
             if apply_defaults && role != AgentRole::Orchestrator {
+                if desired
+                    .reasoning_effort
+                    .as_deref()
+                    .is_some_and(|effort| effort != ESCALATED_REASONING_EFFORT)
+                {
+                    return Err(ModelPolicyError::EscalationRequiresXhigh);
+                }
                 return Ok(ModelSelection {
                     model: Some(ESCALATED_MODEL.into()),
                     reasoning_effort: Some(ESCALATED_REASONING_EFFORT.into()),
@@ -117,6 +124,13 @@ pub fn normalize_profile(
         }
         if role == AgentRole::Orchestrator && (apply_defaults || desired.reasoning_effort.is_some())
         {
+            if desired
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|effort| effort != ESCALATED_REASONING_EFFORT)
+            {
+                return Err(ModelPolicyError::EscalationRequiresXhigh);
+            }
             return Ok(ModelSelection {
                 model: Some(ESCALATED_MODEL.into()),
                 reasoning_effort: Some(ESCALATED_REASONING_EFFORT.into()),
@@ -321,11 +335,21 @@ mod tests {
 
     #[test]
     fn worker_reason_always_escalates_to_sol_xhigh() {
+        assert_eq!(
+            select(
+                Provider::Codex,
+                AgentRole::Worker,
+                None,
+                Some("high"),
+                Some("security boundary integration"),
+            ),
+            Err(ModelPolicyError::EscalationRequiresXhigh)
+        );
         let selection = select(
             Provider::Codex,
             AgentRole::Worker,
             None,
-            Some("high"),
+            None,
             Some("security boundary integration"),
         )
         .unwrap();
@@ -348,14 +372,17 @@ mod tests {
             ),
             Err(ModelPolicyError::GodModelInvariant)
         );
-        let selection = select(
-            Provider::Codex,
-            AgentRole::Orchestrator,
-            None,
-            Some("medium"),
-            None,
-        )
-        .unwrap();
+        assert_eq!(
+            select(
+                Provider::Codex,
+                AgentRole::Orchestrator,
+                None,
+                Some("medium"),
+                None,
+            ),
+            Err(ModelPolicyError::EscalationRequiresXhigh)
+        );
+        let selection = select(Provider::Codex, AgentRole::Orchestrator, None, None, None).unwrap();
         assert_eq!(selection.model.as_deref(), Some(ESCALATED_MODEL));
         assert_eq!(
             selection.reasoning_effort.as_deref(),

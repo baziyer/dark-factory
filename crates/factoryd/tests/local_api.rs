@@ -7,11 +7,13 @@ use factory_core::{
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
     },
 };
+use factoryctl::Client;
 use factoryd::{
     execution,
     local_api::{ApiState, serve},
-    store::Store,
+    store::{NewProject, NewTask, Store},
 };
+use rusqlite::Connection;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -85,6 +87,119 @@ where
 
     test(socket).await;
 
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_events() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("factory.db");
+    let project_id = project_id("factory");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: directory.path().to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+    }
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 UPDATE events SET schema_version = 1;
+                 PRAGMA user_version = 22;",
+            )
+            .unwrap();
+    }
+    let state = ApiState::new(Store::open(&database).unwrap());
+    let socket = directory.path().join("f.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut subscription = Client::new(&socket).subscribe(0).unwrap();
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::Subscribed {
+                replay_through: 1,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event: factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 1,
+                ..
+            },
+        }
+    ));
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::CaughtUp { sequence: 1 },
+            ..
+        }
+    ));
+
+    let live_project_id = project_id.clone();
+    state
+        .commit_and_publish(move |store| {
+            let (_, event) = store.create_task(
+                NewTask {
+                    id: task_id("live-task"),
+                    project_id: live_project_id,
+                    parent_task_id: None,
+                    title: "Live".into(),
+                    body: "Live event".into(),
+                    priority: 0,
+                },
+                2,
+            )?;
+            Ok(((), vec![event]))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event: factory_core::EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                ..
+            },
+        }
+    ));
+
+    drop(subscription);
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
     execution.shutdown().await.unwrap();

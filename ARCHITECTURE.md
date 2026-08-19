@@ -145,8 +145,10 @@ catalogue.
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
    directly or via its own session's shell access to it). It may coordinate
-   and delegate work, but agent creation and profile/model changes require the
-   operator; it cannot bypass daemon-owned limits or reach SQLite directly.
+   and delegate work, but this local socket currently does not establish a
+   human caller or enforce operator-only agent creation/profile changes; that
+   principal boundary remains #133/#127. Prompt guidance must not be described
+   as authorization, and the orchestrator cannot reach SQLite directly.
 9. Remote repository mutation is a daemon boundary. A session may edit and
    inspect its worktree, but its environment disables Git credential helpers,
    SSH transport, interactive credential prompts, and the operator's `gh`
@@ -221,9 +223,11 @@ catalogue.
 
 ## First launch
 
-`factoryd` starts from an empty database. A human creates a project and an
-agent, then creates work in the project backlog or directly in an agent queue
-through `factoryctl` or the `factory-tui` board; the daemon's dispatcher spawns that agent's resident
+`factoryd` starts from an empty database. An operator normally creates a
+project and agent, then creates work in the project backlog or directly in an
+agent queue through `factoryctl` or the `factory-tui` board. The local socket
+currently does not prove that the caller is human (see #133/#127). The daemon's
+dispatcher spawns that agent's resident
 session automatically if none is live, or delivers into it if one already is
 idle — there is no separate explicit "start" step in the common case. The
 daemon starts the session through `factory-runner`, drives its state entirely
@@ -270,7 +274,8 @@ selected model, reasoning effort, and reason are durable profile fields and
 are projected through `factoryctl` and the TUI. Existing profiles remain
 unchanged; this is a bounded tier policy, not a live pricing engine. Local
 protocol version mismatches are rejected rather than silently dropping policy
-fields.
+fields. This PR does not implement the human authorization boundary for agent
+creation; that remains #133/#127.
 
 The separate resumed-Codex delivery failure remains tracked by
 [#158](https://github.com/baziyer/dark-factory/issues/158): live evidence shows

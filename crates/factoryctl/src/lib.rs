@@ -54,7 +54,7 @@ impl fmt::Display for ClientError {
             ),
             Self::InconsistentEventProtocol { frame, event } => write!(
                 formatter,
-                "server frame protocol version {frame} does not match event version {event}"
+                "server frame protocol version {frame} cannot carry newer event version {event}"
             ),
             Self::Disconnected { after_sequence } => write!(
                 formatter,
@@ -339,7 +339,7 @@ mod tests {
     };
 
     use factory_core::{
-        AgentId, ProjectId,
+        AgentId, EventEnvelope, FactoryEvent, ProjectId,
         local::{ErrorCode, LocalResponse},
     };
 
@@ -403,6 +403,103 @@ mod tests {
             error,
             ClientError::UnsupportedProtocol { found: 1, supported }
                 if supported == PROTOCOL_VERSION
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn subscription_accepts_stored_v1_replay_inside_v2_frames() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let envelope: factory_core::local::RequestEnvelope =
+                serde_json::from_str(&line).unwrap();
+            assert!(matches!(
+                envelope.request,
+                LocalRequest::Subscribe { after_sequence: 0 }
+            ));
+            let frames = [
+                ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::Subscribed {
+                        after_sequence: 0,
+                        replay_through: 1,
+                    },
+                },
+                ServerFrame::Event {
+                    protocol_version: PROTOCOL_VERSION,
+                    event: EventEnvelope {
+                        protocol_version: 1,
+                        sequence: 1,
+                        occurred_at_ms: 10,
+                        event: FactoryEvent::AutoModeChanged { enabled: true },
+                    },
+                },
+                ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::CaughtUp { sequence: 1 },
+                },
+                ServerFrame::Event {
+                    protocol_version: PROTOCOL_VERSION,
+                    event: EventEnvelope {
+                        protocol_version: PROTOCOL_VERSION,
+                        sequence: 2,
+                        occurred_at_ms: 11,
+                        event: FactoryEvent::AutoModeChanged { enabled: false },
+                    },
+                },
+            ];
+            for frame in frames {
+                serde_json::to_writer(&mut stream, &frame).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+
+        let mut subscription = Client::new(&socket).subscribe(0).unwrap();
+        assert!(matches!(
+            subscription.next().unwrap().unwrap(),
+            ServerFrame::Response {
+                response: LocalResponse::Subscribed {
+                    replay_through: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            subscription.next().unwrap().unwrap(),
+            ServerFrame::Event {
+                event: EventEnvelope {
+                    protocol_version: 1,
+                    sequence: 1,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            subscription.next().unwrap().unwrap(),
+            ServerFrame::Response {
+                response: LocalResponse::CaughtUp { sequence: 1 },
+                ..
+            }
+        ));
+        assert!(matches!(
+            subscription.next().unwrap().unwrap(),
+            ServerFrame::Event {
+                event: EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence: 2,
+                    ..
+                },
+                ..
+            }
         ));
         server.join().unwrap();
     }
