@@ -307,7 +307,7 @@ mod tests {
         assert!(text.contains("session: session-1"));
         assert!(text.contains("age: 1m"));
         assert!(text.contains("safe action:"));
-        assert!(text.contains("typing off; Ctrl-] to enter"));
+        assert!(text.contains("terminal typing is not an action"));
     }
 
     #[test]

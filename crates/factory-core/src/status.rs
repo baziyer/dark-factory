@@ -1280,6 +1280,14 @@ mod tests {
         };
         assert!(worker.needs_operator_decision());
         assert!(!delivery.needs_operator_decision());
+        let mut inferred = worker.clone();
+        inferred.reason = reason(
+            AttentionReasonKind::Inferred,
+            "lifecycle state".to_owned(),
+            "inferred lifecycle state",
+            AttentionAction::InspectInferredState,
+        );
+        assert!(!inferred.needs_operator_decision());
         let decision = worker.decision();
         assert_eq!(decision.choices[0].action, AttentionAction::RetryTask);
         assert_eq!(decision.recommended, 0);

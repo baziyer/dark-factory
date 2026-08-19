@@ -168,7 +168,7 @@ mod tests {
             Vec::new(),
         );
         board.attention = vec![attention(
-            AttentionReasonKind::Inferred,
+            AttentionReasonKind::WorkerBlocked,
             Some("alice"),
             Some("task"),
             None,
@@ -189,8 +189,7 @@ mod tests {
         assert!(text.contains("NEEDS YOU"));
         assert!(text.contains("alice"));
         assert!(text.contains("q:1"));
-        assert!(text.contains("inference"));
-        assert!(text.contains("lifecycle state"));
+        assert!(text.contains("worker blocked"));
     }
 
     #[test]
