@@ -156,6 +156,10 @@ open|update` authenticate that exact session. They accept no caller-selected
 worktree, branch, remote, force, delete, merge, or release target. Review and
 merge remain independent operator actions.
 
+For an assigned issue task, run `factoryctl change create` before committing.
+The daemon supplies the task-specific worktree and branch; later commit,
+push, and PR operations remain session-authenticated and review-only.
+
 ## Update
 
 ```sh

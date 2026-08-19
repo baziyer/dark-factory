@@ -120,6 +120,14 @@ pub fn agent_worktree_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentI
         .join(agent_id.as_str())
 }
 
+/// One daemon-registered issue-change worktree:
+/// `<project_dir>/changes/<task_id>`.  The task ID is selected from the
+/// authenticated session's current run; callers never supply this path.
+#[must_use]
+pub fn managed_change_worktree_dir(home: &Path, project_id: &ProjectId, task_id: &str) -> PathBuf {
+    project_dir(home, project_id).join("changes").join(task_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +163,15 @@ mod tests {
         assert_eq!(
             agent_worktree_dir(home, &project(), &agent()),
             Path::new("/home/user/.dark-factory/projects/factory/worktrees/god")
+        );
+    }
+
+    #[test]
+    fn managed_change_path_is_derived_from_project_and_task_only() {
+        let home = Path::new("/home/user/.dark-factory");
+        assert_eq!(
+            managed_change_worktree_dir(home, &project(), "issue-175"),
+            Path::new("/home/user/.dark-factory/projects/factory/changes/issue-175")
         );
     }
 

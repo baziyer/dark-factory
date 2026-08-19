@@ -18,8 +18,8 @@ use factory_core::{
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
         MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
-        ProjectDetail as LocalProjectDetail, RequestEnvelope, RunTerminal, ServerFrame,
-        normalize_task_title,
+        ManagedChange as LocalManagedChange, ProjectDetail as LocalProjectDetail, RequestEnvelope,
+        RunTerminal, ServerFrame, normalize_task_title,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
@@ -276,10 +276,19 @@ impl ApiFailure {
                 | StoreError::AgentHasLiveSession
                 | StoreError::AgentHasChildren
                 | StoreError::AgentRunHasDependents
+                | StoreError::AgentHasActiveChange
                 | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun
+                | StoreError::ProjectHasActiveChange
+                | StoreError::TaskHasActiveChange
                 | StoreError::RunNotStoppable
                 | StoreError::SessionStopping),
+            ) => (ErrorCode::Conflict, error.to_string()),
+            Self::Store(
+                error @ (StoreError::ManagedChangeWrongTask
+                | StoreError::ManagedChangeNeedsCurrentTask
+                | StoreError::ManagedChangeNotFound
+                | StoreError::ManagedChangeCollision),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -813,6 +822,12 @@ async fn handle_request(
         }
         LocalRequest::GitPush { token } => {
             repository_request(state, token, RepositoryRequest::Push).await
+        }
+        LocalRequest::CreateManagedChange { token } => {
+            create_managed_change_request(state, guidance_root, token).await
+        }
+        LocalRequest::AbandonManagedChange { token } => {
+            abandon_managed_change_request(state, token).await
         }
         LocalRequest::PrOpen { token, title, body } => {
             repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
@@ -2128,6 +2143,18 @@ async fn repository_request(
         .await?
         .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
     let project_id = session.project_id.clone();
+    let change_project_id = session.project_id.clone();
+    let change_agent_id = session.agent_id.clone();
+    let change_run_id = session.current_run_id.clone();
+    let registered_change = state
+        .with_store(move |store| {
+            store.managed_change_for_identity(
+                &change_project_id,
+                &change_agent_id,
+                change_run_id.as_ref(),
+            )
+        })
+        .await?;
     let project = state
         .with_store(move |store| store.get_project(&project_id))
         .await?;
@@ -2166,7 +2193,14 @@ async fn repository_request(
     let audit_project_id = session.project_id.clone();
     let audit_agent_id = session.agent_id.clone();
     let audit_session_id = session.id.clone();
-    let result = match repository::Target::validate(session, project, authority).await {
+    let result = match repository::Target::validate_with_change(
+        session,
+        project,
+        authority,
+        registered_change,
+    )
+    .await
+    {
         Ok(target) => {
             let command = match request {
                 RepositoryRequest::Status => target.status().await,
@@ -2202,6 +2236,31 @@ async fn repository_request(
     let (target, command) = result;
     match command {
         Ok(output) => {
+            if let Some(change) = target
+                .registered_change()
+                .cloned()
+                .filter(|_| operation == "git_push")
+            {
+                let project_id = change.project_id.clone();
+                let task_id = change.task_id.clone();
+                let agent_id = change.agent_id.clone();
+                let head = target
+                    .revalidate_head_for_audit()
+                    .await
+                    .map_err(repository_failure)?;
+                state
+                    .commit_and_publish(move |store| {
+                        let _ = store.publish_managed_change_head(
+                            &project_id,
+                            &task_id,
+                            &agent_id,
+                            &head,
+                            now_ms()?,
+                        )?;
+                        Ok(((), Vec::new()))
+                    })
+                    .await?;
+            }
             let reference = returns_reference.then(|| output.clone());
             record_repository_audit(
                 state,
@@ -2235,6 +2294,222 @@ async fn repository_request(
             Err(repository_failure(error))
         }
     }
+}
+
+fn managed_change_response(record: &crate::store::ManagedChangeRecord) -> LocalResponse {
+    LocalResponse::ManagedChange {
+        change: LocalManagedChange {
+            project_id: record.project_id.clone(),
+            task_id: record.task_id.clone(),
+            agent_id: record.agent_id.clone(),
+            worktree: record.worktree.clone(),
+            branch: record.branch.clone(),
+            base_sha: record.base_sha.clone(),
+            head_sha: record.head_sha.clone(),
+            published_head_sha: record.published_head_sha.clone(),
+        },
+    }
+}
+
+async fn create_managed_change_request(
+    state: &ApiState,
+    guidance_root: &Path,
+    token: String,
+) -> Result<LocalResponse, ApiFailure> {
+    let session = state
+        .with_store(move |store| store.find_session_by_hook_token(&token))
+        .await?
+        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
+    let project_id = session.project_id.clone();
+    let agent_id = session.agent_id.clone();
+    let run_id = session.current_run_id.clone();
+    let session_id = session.id.clone();
+    record_repository_audit(
+        state,
+        RepositoryAudit {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            session_id: session.id.clone(),
+            operation: "change_create".into(),
+            phase: "requested".into(),
+            success: None,
+            reference: None,
+        },
+    )
+    .await?;
+    let result: Result<crate::store::ManagedChangeRecord, ApiFailure> = async {
+        let (task, active) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let run_id = run_id.clone();
+                move |store| {
+                    let task =
+                        store.current_task_for_identity(&project_id, &agent_id, run_id.as_ref())?;
+                    let change = store.managed_change_for_identity(
+                        &project_id,
+                        &agent_id,
+                        run_id.as_ref(),
+                    )?;
+                    Ok((task, change))
+                }
+            })
+            .await?;
+        let Some(task) = task else {
+            return Err(ApiFailure::Invalid(
+                "managed change requires an assigned current task".into(),
+            ));
+        };
+        if let Some(active) = active {
+            return Ok(active);
+        }
+        let project = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.get_project(&project_id)
+            })
+            .await?;
+        let authority = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.repository_authority(&project_id)
+            })
+            .await?;
+        let path = factory_core::paths::managed_change_worktree_dir(
+            guidance_root,
+            &project_id,
+            task.snapshot.id.as_str(),
+        );
+        let _slot = state.repository_slot().await;
+        let record = repository::create_managed_change(
+            &project,
+            authority,
+            &task.snapshot.id,
+            &agent_id,
+            &path,
+        )
+        .await
+        .map_err(repository_failure)?;
+        let record_for_store = record.clone();
+        state
+            .commit_and_publish(move |store| {
+                let record = store.create_managed_change(record_for_store, now_ms()?)?;
+                Ok((record, Vec::new()))
+            })
+            .await
+            .map_err(ApiFailure::from)
+    }
+    .await;
+    let finished = RepositoryAudit {
+        project_id: project_id.clone(),
+        agent_id: agent_id.clone(),
+        session_id: session_id.clone(),
+        operation: "change_create".into(),
+        phase: "finished".into(),
+        success: Some(result.is_ok()),
+        reference: result.as_ref().ok().map(|change| change.branch.clone()),
+    };
+    record_repository_audit(state, finished).await?;
+    result.map(|record| managed_change_response(&record))
+}
+
+async fn abandon_managed_change_request(
+    state: &ApiState,
+    token: String,
+) -> Result<LocalResponse, ApiFailure> {
+    let session = state
+        .with_store(move |store| store.find_session_by_hook_token(&token))
+        .await?
+        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
+    let project_id = session.project_id.clone();
+    let agent_id = session.agent_id.clone();
+    let run_id = session.current_run_id.clone();
+    let session_id = session.id.clone();
+    record_repository_audit(
+        state,
+        RepositoryAudit {
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            session_id: session.id.clone(),
+            operation: "change_abandon".into(),
+            phase: "requested".into(),
+            success: None,
+            reference: None,
+        },
+    )
+    .await?;
+    let result: Result<crate::store::ManagedChangeRecord, ApiFailure> = async {
+        let change = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let run_id = run_id.clone();
+                move |store| {
+                    store.managed_change_for_identity(&project_id, &agent_id, run_id.as_ref())
+                }
+            })
+            .await
+            .map_err(ApiFailure::from)?
+            .ok_or_else(|| {
+                ApiFailure::Conflict("no active managed change for the current task".into())
+            })?;
+        let project = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.get_project(&project_id)
+            })
+            .await?;
+        let authority = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| store.repository_authority(&project_id)
+            })
+            .await?;
+        let _slot = state.repository_slot().await;
+        let target = repository::Target::validate_with_change(
+            session,
+            project.clone(),
+            authority,
+            Some(change.clone()),
+        )
+        .await
+        .map_err(repository_failure)?;
+        target
+            .ensure_abandonable()
+            .await
+            .map_err(repository_failure)?;
+        crate::worktrees::remove(Path::new(&project.root), Path::new(&change.worktree))
+            .await
+            .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    let change = store.abandon_managed_change(
+                        &project_id,
+                        &change.task_id,
+                        &agent_id,
+                        now_ms()?,
+                    )?;
+                    Ok((change, Vec::new()))
+                }
+            })
+            .await
+            .map_err(ApiFailure::from)
+    }
+    .await;
+    let finished = RepositoryAudit {
+        project_id,
+        agent_id,
+        session_id,
+        operation: "change_abandon".into(),
+        phase: "finished".into(),
+        success: Some(result.is_ok()),
+        reference: result.as_ref().ok().map(|change| change.branch.clone()),
+    };
+    record_repository_audit(state, finished).await?;
+    result.map(|record| managed_change_response(&record))
 }
 
 async fn record_repository_audit(

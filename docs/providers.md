@@ -71,7 +71,8 @@ Repository authority is provider-independent too. Provider processes do not
 inherit ambient Git/GitHub token variables or the SSH agent; the runner resets
 Git credential helpers, disables Git SSH and prompting, and hides the
 operator's `gh` configuration. Workers use the session-authenticated
-`factoryctl git ...` and `factoryctl pr ...` daemon capabilities instead. A
+`factoryctl change create` followed by `factoryctl git ...` and `factoryctl pr ...`
+daemon capabilities instead. A
 provider adapter must not add a separate remote credential path. This is an
 authority and audit boundary, not OS isolation; #54 tracks the separate runner
 user that supplies that outer wall.

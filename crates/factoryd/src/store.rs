@@ -332,6 +332,26 @@ pub struct RepositoryAuthority {
     pub remote_url: String,
     pub base_branch: String,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedChangeRecord {
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub agent_id: AgentId,
+    pub worktree: String,
+    pub branch: String,
+    pub git_dir: String,
+    pub common_dir: String,
+    pub worktree_device: u64,
+    pub worktree_inode: u64,
+    pub git_dir_device: u64,
+    pub git_dir_inode: u64,
+    pub common_dir_device: u64,
+    pub common_dir_inode: u64,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub published_head_sha: Option<String>,
+}
 // --- Sessions -------------------------------------------------------------
 //
 // One resident interactive provider process per agent (PTY-backed,
@@ -496,6 +516,20 @@ pub enum StoreError {
     EventSequenceGap { expected: i64, found: i64 },
     #[error("agent was not found in the requested project")]
     AgentNotFound,
+    #[error("agent has an active managed change")]
+    AgentHasActiveChange,
+    #[error("project has an active managed change")]
+    ProjectHasActiveChange,
+    #[error("managed change is owned by a different current task")]
+    ManagedChangeWrongTask,
+    #[error("managed change requires a current task")]
+    ManagedChangeNeedsCurrentTask,
+    #[error("managed change was not found")]
+    ManagedChangeNotFound,
+    #[error("managed change identity collides with durable state")]
+    ManagedChangeCollision,
+    #[error("task has an active managed change")]
+    TaskHasActiveChange,
     #[error("project repository authority is not configured")]
     RepositoryAuthorityMissing,
     #[error("project repository authority must be configured before any factory session starts")]
@@ -3334,6 +3368,242 @@ impl Store {
         ).optional()?.ok_or(StoreError::RepositoryAuthorityMissing)
     }
 
+    /// Resolves the task episode authenticated by a live provider session.
+    /// A caller cannot choose a project or task: both come from the session
+    /// and its current open run.
+    pub fn current_task_for_session(&self, session: &SessionRow) -> Result<Option<TaskDetail>> {
+        self.current_task_for_identity(
+            &session.project_id,
+            &session.agent_id,
+            session.current_run_id.as_ref(),
+        )
+    }
+
+    pub fn current_task_for_identity(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        current_run_id: Option<&RunId>,
+    ) -> Result<Option<TaskDetail>> {
+        let Some(run_id) = current_run_id else {
+            return Ok(None);
+        };
+        let Some(run) = load_run(&self.connection, run_id)? else {
+            return Err(StoreError::ManagedChangeNeedsCurrentTask);
+        };
+        let Some(task_id) = run.task_id else {
+            return Ok(None);
+        };
+        let task = load_task(&self.connection, &task_id)?.ok_or(StoreError::TaskNotFound)?;
+        if task.snapshot.project_id != *project_id
+            || task.snapshot.assigned_agent_id.as_ref() != Some(agent_id)
+        {
+            return Err(StoreError::ManagedChangeWrongTask);
+        }
+        Ok(Some(task))
+    }
+
+    pub fn managed_change_for_identity(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        current_run_id: Option<&RunId>,
+    ) -> Result<Option<ManagedChangeRecord>> {
+        let task = self.current_task_for_identity(project_id, agent_id, current_run_id)?;
+        let active = self
+            .connection
+            .query_row(
+                "SELECT task_id FROM managed_changes
+                 WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'",
+                params![project_id.as_str(), agent_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(active_task_id) = active else {
+            return Ok(None);
+        };
+        let Some(task) = task else {
+            return Err(StoreError::ManagedChangeWrongTask);
+        };
+        if active_task_id != task.snapshot.id.as_str() {
+            return Err(StoreError::ManagedChangeWrongTask);
+        }
+        self.managed_change(project_id, &task.snapshot.id).map(Some)
+    }
+
+    /// Returns the active registered change for this session's current task.
+    /// An active change for another task is deliberately an error rather than
+    /// a fallback to the ordinary agent worktree.
+    pub fn managed_change_for_session(
+        &self,
+        session: &SessionRow,
+    ) -> Result<Option<ManagedChangeRecord>> {
+        self.managed_change_for_identity(
+            &session.project_id,
+            &session.agent_id,
+            session.current_run_id.as_ref(),
+        )
+    }
+
+    pub fn managed_change(
+        &self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+    ) -> Result<ManagedChangeRecord> {
+        self.connection
+            .query_row(
+                "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
+                        common_dir, worktree_device, worktree_inode, git_dir_device,
+                        git_dir_inode, common_dir_device, common_dir_inode,
+                        base_sha, head_sha, published_head_sha
+                 FROM managed_changes
+                 WHERE project_id = ?1 AND task_id = ?2 AND state = 'active'",
+                params![project_id.as_str(), task_id.as_str()],
+                load_managed_change,
+            )
+            .optional()?
+            .ok_or(StoreError::ManagedChangeNotFound)
+    }
+
+    pub fn create_managed_change(
+        &mut self,
+        record: ManagedChangeRecord,
+        now_ms: i64,
+    ) -> Result<ManagedChangeRecord> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let task = load_task(&transaction, &record.task_id)?.ok_or(StoreError::TaskNotFound)?;
+        if task.snapshot.project_id != record.project_id
+            || task.snapshot.assigned_agent_id.as_ref() != Some(&record.agent_id)
+        {
+            return Err(StoreError::ManagedChangeWrongTask);
+        }
+        let existing = transaction
+            .query_row(
+                "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
+                        common_dir, worktree_device, worktree_inode, git_dir_device,
+                        git_dir_inode, common_dir_device, common_dir_inode,
+                        base_sha, head_sha, published_head_sha
+                 FROM managed_changes WHERE task_id = ?1 AND state = 'active'",
+                params![record.task_id.as_str()],
+                load_managed_change,
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing == record {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::ManagedChangeCollision);
+        }
+        let active_for_agent: Option<String> = transaction
+            .query_row(
+                "SELECT task_id FROM managed_changes
+                 WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'",
+                params![record.project_id.as_str(), record.agent_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active_for_agent.is_some() {
+            return Err(StoreError::AgentHasActiveChange);
+        }
+        transaction.execute(
+            "INSERT INTO managed_changes
+             (task_id, project_id, agent_id, worktree, branch, git_dir, common_dir,
+              worktree_device, worktree_inode, git_dir_device, git_dir_inode,
+              common_dir_device, common_dir_inode, base_sha, head_sha,
+              published_head_sha, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                     ?14, ?15, NULL, 'active', ?16, ?16)",
+            params![
+                record.task_id.as_str(),
+                record.project_id.as_str(),
+                record.agent_id.as_str(),
+                record.worktree,
+                record.branch,
+                record.git_dir,
+                record.common_dir,
+                i64::try_from(record.worktree_device)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                i64::try_from(record.worktree_inode)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                i64::try_from(record.git_dir_device)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                i64::try_from(record.git_dir_inode)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                i64::try_from(record.common_dir_device)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                i64::try_from(record.common_dir_inode)
+                    .map_err(|_| StoreError::ManagedChangeCollision)?,
+                record.base_sha,
+                record.head_sha,
+                now_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn publish_managed_change_head(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        head_sha: &str,
+        now_ms: i64,
+    ) -> Result<ManagedChangeRecord> {
+        let changed = self.connection.execute(
+            "UPDATE managed_changes SET head_sha = ?4, published_head_sha = ?4,
+                    updated_at_ms = ?5
+             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3 AND state = 'active'",
+            params![
+                project_id.as_str(),
+                task_id.as_str(),
+                agent_id.as_str(),
+                head_sha,
+                now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ManagedChangeNotFound);
+        }
+        self.managed_change(project_id, task_id)
+    }
+
+    pub fn abandon_managed_change(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<ManagedChangeRecord> {
+        let changed = self.connection.execute(
+            "UPDATE managed_changes SET state = 'abandoned', updated_at_ms = ?4
+             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3 AND state = 'active'",
+            params![
+                project_id.as_str(),
+                task_id.as_str(),
+                agent_id.as_str(),
+                now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ManagedChangeNotFound);
+        }
+        self.connection
+            .query_row(
+                "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
+                        common_dir, worktree_device, worktree_inode, git_dir_device,
+                        git_dir_inode, common_dir_device, common_dir_inode,
+                        base_sha, head_sha, published_head_sha
+                 FROM managed_changes WHERE project_id = ?1 AND task_id = ?2",
+                params![project_id.as_str(), task_id.as_str()],
+                load_managed_change,
+            )
+            .map_err(StoreError::from)
+    }
+
     pub fn list_projects(
         &self,
         after_id: Option<&ProjectId>,
@@ -4918,6 +5188,16 @@ fn check_agent_deletable(
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<()> {
+    let has_active_change: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM managed_changes WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'
+         )",
+        params![project_id.as_str(), agent_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_active_change {
+        return Err(StoreError::AgentHasActiveChange);
+    }
     let agent = load_agent(connection, agent_id)?
         .filter(|agent| agent.snapshot.project_id == *project_id)
         .ok_or(StoreError::AgentNotFound)?;
@@ -4962,6 +5242,16 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     )?;
     if !exists {
         return Err(StoreError::ProjectNotFound);
+    }
+    let has_active_change: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM managed_changes WHERE project_id = ?1 AND state = 'active'
+         )",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_active_change {
+        return Err(StoreError::ProjectHasActiveChange);
     }
     let has_active_run: bool = connection.query_row(
         "SELECT EXISTS(
@@ -5092,6 +5382,27 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+fn load_managed_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedChangeRecord> {
+    Ok(ManagedChangeRecord {
+        project_id: parse_id(row.get(0)?, 0)?,
+        task_id: parse_id(row.get(1)?, 1)?,
+        agent_id: parse_id(row.get(2)?, 2)?,
+        worktree: row.get(3)?,
+        branch: row.get(4)?,
+        git_dir: row.get(5)?,
+        common_dir: row.get(6)?,
+        worktree_device: parse_u64(row.get(7)?, 7)?,
+        worktree_inode: parse_u64(row.get(8)?, 8)?,
+        git_dir_device: parse_u64(row.get(9)?, 9)?,
+        git_dir_inode: parse_u64(row.get(10)?, 10)?,
+        common_dir_device: parse_u64(row.get(11)?, 11)?,
+        common_dir_inode: parse_u64(row.get(12)?, 12)?,
+        base_sha: row.get(13)?,
+        head_sha: row.get(14)?,
+        published_head_sha: row.get(15)?,
+    })
 }
 
 fn load_run(connection: &Connection, run_id: &RunId) -> Result<Option<RunSnapshot>> {
@@ -5657,6 +5968,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0024_delivery_attempts.sql"))?;
         transaction.pragma_update(None, "user_version", 24)?;
         transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0025_managed_changes.sql"))?;
+        transaction.pragma_update(None, "user_version", 25)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -5868,6 +6186,12 @@ where
     })
 }
 
+fn parse_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+    })
+}
+
 fn parse_optional_id<T>(value: Option<String>, column: usize) -> rusqlite::Result<Option<T>>
 where
     T: TryFrom<String>,
@@ -6073,6 +6397,90 @@ const fn provider_hook_event_value(value: ProviderHookEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn managed_fixture() -> (Store, ProjectId, AgentId, TaskId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("project").unwrap();
+        let agent_id = AgentId::try_from("worker").unwrap();
+        let task_id = TaskId::try_from("issue-175").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Project".into(),
+                    root: "/tmp/project".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Publish change".into(),
+                    body: "Publish change".into(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 4)
+            .unwrap();
+        (store, project_id, agent_id, task_id)
+    }
+
+    #[test]
+    fn managed_change_registration_is_durable_and_idempotent() {
+        let (mut store, project_id, agent_id, task_id) = managed_fixture();
+        let record = ManagedChangeRecord {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            worktree: "/state/projects/project/changes/issue-175".into(),
+            branch: "issue/issue-175".into(),
+            git_dir: "/repo/.git/worktrees/issue-175".into(),
+            common_dir: "/repo/.git".into(),
+            worktree_device: 1,
+            worktree_inode: 2,
+            git_dir_device: 3,
+            git_dir_inode: 4,
+            common_dir_device: 5,
+            common_dir_inode: 6,
+            base_sha: "a".repeat(40),
+            head_sha: "a".repeat(40),
+            published_head_sha: None,
+        };
+        assert_eq!(
+            store.create_managed_change(record.clone(), 4).unwrap(),
+            record
+        );
+        assert_eq!(
+            store.create_managed_change(record.clone(), 5).unwrap(),
+            record
+        );
+        assert_eq!(store.managed_change(&project_id, &task_id).unwrap(), record);
+        let events = store.events_after(0, 100).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| { !matches!(event.event, FactoryEvent::RepositoryOperation { .. }) })
+        );
+    }
 
     #[test]
     fn auto_mode_defaults_on_and_changes_with_an_audit_event() {
