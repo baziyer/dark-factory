@@ -723,12 +723,32 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
         project_id: project_id("project-1"),
         session_id: session_id("session-1"),
         since_offset: 4,
+        mode: factory_core::runner::TerminalAttachMode::Legacy,
     };
     assert_eq!(
         serde_json::to_value(attach).unwrap(),
         serde_json::json!({
             "type": "attach_terminal",
             "data": {"project_id": "project-1", "session_id": "session-1", "since_offset": 4}
+        })
+    );
+
+    let bounded = LocalRequest::AttachTerminal {
+        project_id: project_id("project-1"),
+        session_id: session_id("session-1"),
+        since_offset: 0,
+        mode: factory_core::runner::TerminalAttachMode::Tail,
+    };
+    assert_eq!(
+        serde_json::to_value(bounded).unwrap(),
+        serde_json::json!({
+            "type": "attach_terminal",
+            "data": {
+                "project_id": "project-1",
+                "session_id": "session-1",
+                "since_offset": 0,
+                "mode": {"kind": "tail"}
+            }
         })
     );
 
@@ -756,6 +776,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
     let frame = ServerFrame::TerminalOutput {
         protocol_version: PROTOCOL_VERSION,
         session_id: session_id("session-1"),
+        generation: 0,
         offset: 4,
         bytes: "aGk=".into(),
     };
@@ -767,6 +788,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
     let ready = ServerFrame::TerminalOutput {
         protocol_version: PROTOCOL_VERSION,
         session_id: session_id("session-1"),
+        generation: 0,
         offset: 4,
         bytes: String::new(),
     };
@@ -777,6 +799,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
             "data": {
                 "protocol_version": PROTOCOL_VERSION,
                 "session_id": "session-1",
+                "generation": 0,
                 "offset": 4,
                 "bytes": ""
             }

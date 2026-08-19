@@ -143,7 +143,30 @@ catalogue.
    normalized into `factory_core::ProviderHookEvent`), never by decoding raw
    terminal bytes; the local control API may still expose or attach live to
    a session's retained `terminal.log` for operator inspection — none of
-   this enters public events, webhook snapshots, or tracing.
+   this enters public events, webhook snapshots, or tracing. Terminal
+   attachment is a negotiated daemon/runner operation, never a client-side
+   read of `terminal.log`. The default `factoryctl attach` and TUI pane
+   request a bounded 256 KiB tail and receive retained generation plus byte
+   bounds before raw PTY frames. `--full-history` (or explicit
+   `--since-offset 0`) replays all bytes still retained; `--since-offset N
+   --generation G` resumes a negotiated cursor. A cursor beyond the live end
+   or outside retained generations is a structured gap containing the current
+   generation and valid offset range, so recovery is actionable rather than a
+   blank pane. Ready and gap frames include the generation owning the retained
+   base, the generation and exact byte offset at which replay starts, and
+   continuity metadata; every output chunk carries its owning generation.
+   Frames remain opaque base64 bytes, bounded to the runner frame limit,
+   preserving UTF-8 and ANSI bytes without interpreting provider output. A new
+   daemon explicitly probes runner attach capabilities: an old runner may
+   serve `Legacy` or explicit full history, but a bounded tail/cursor is
+   refused rather than silently becoming an unbounded replay. The bounded tail
+   is deliberately a reset-baseline view, not a reconstruction of an
+   application's mouse, paste, cursor, or alternate-screen state; use full
+   history when that state matters. Its suffix starts at safe UTF-8/ANSI
+   boundaries. Replay snapshots pin independent file descriptions and use
+   positional reads, so rotations and appends cannot move a replay cursor.
+   Ctrl-] closes only the client stream; Ctrl-C remains ordinary PTY input, and
+   output failure wakes blocked CLI input.
    Carve-out: Codex 0.147 does not dispatch its own `SessionStart` hook at
    TUI startup — only once its first turn begins, which the daemon cannot
    wait for without deadlocking every fresh Codex session (`docs/

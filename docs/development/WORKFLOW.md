@@ -463,6 +463,32 @@ binary rollback carry the chosen `--max-active-runs` value forward. The
 provider-session shell policy denies agent-originated mutation, and a manual
 daemon cannot satisfy managed health.
 
+## Terminal attach and retained history
+
+`factoryctl attach` and the TUI use the daemon's shared attach operation. A
+normal attach requests a bounded 256 KiB tail, keeping a long-running session
+useful without replaying its entire retained log. The daemon first negotiates
+the runner capability; an old preserved runner is never allowed to turn this
+request into an unbounded legacy replay. Use `--full-history` (or
+`--since-offset 0`) when a complete currently retained replay is intentional;
+that explicit mode can use the old runner's equivalent during a rolling
+upgrade. A resume cursor may include `--generation N`; Ready and gap frames
+carry the owning base generation, replay generation, and exact byte start/end
+bounds so a client can distinguish a retained cursor from compaction lag;
+every output chunk carries its generation when replay crosses a rotation.
+Clients never inspect `terminal.log` directly: the runner snapshots immutable
+file descriptions and uses positional reads. The bounded tail is a reset-
+baseline view, not a promise to reconstruct application mouse, bracketed
+paste, cursor, or alternate-screen state; use full history for that. Its
+suffix begins at a safe UTF-8/ANSI boundary. PTY bytes stay opaque and bounded
+on every wire frame. Ctrl-] closes only the attach stream, Ctrl-C is forwarded
+as ordinary PTY input, and output/socket failure wakes blocked CLI input;
+detaching does not stop the session.
+The TUI parses retained bytes as a real terminal stream, keeps a bounded
+scrollback page, and snapshots the visible state across narrow/wide resize so
+wrapped UTF-8/ANSI output and a live prompt do not disappear at the viewport
+edge.
+
 ## Task list for whoever picks this up
 
 - [x] GitHub Actions release workflow (tag → build → attach binaries + manifest)

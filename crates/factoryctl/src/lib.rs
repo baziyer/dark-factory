@@ -6,6 +6,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -139,9 +140,13 @@ impl Client {
     /// until the returned iterator is dropped or the daemon closes it.
     pub fn attach_terminal(&self, request: LocalRequest) -> Result<TerminalFrames, ClientError> {
         let stream = self.connect(request)?;
+        let cancellation = TerminalFramesCancellation {
+            stream: Arc::new(Mutex::new(stream.try_clone()?)),
+        };
         Ok(TerminalFrames {
             reader: BufReader::new(stream),
             finished: false,
+            cancellation,
         })
     }
 
@@ -205,6 +210,30 @@ impl Iterator for Subscription {
 pub struct TerminalFrames {
     reader: BufReader<UnixStream>,
     finished: bool,
+    cancellation: TerminalFramesCancellation,
+}
+
+/// A cancellation handle for a persistent terminal stream. Shutting down the
+/// cloned socket wakes a blocked reader immediately; dropping an iterator is
+/// therefore never required to wait for another output frame.
+#[derive(Clone)]
+pub struct TerminalFramesCancellation {
+    stream: Arc<Mutex<UnixStream>>,
+}
+
+impl TerminalFrames {
+    #[must_use]
+    pub fn cancellation(&self) -> TerminalFramesCancellation {
+        self.cancellation.clone()
+    }
+}
+
+impl TerminalFramesCancellation {
+    pub fn cancel(&self) {
+        if let Ok(stream) = self.stream.lock() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 impl Iterator for TerminalFrames {
@@ -306,6 +335,9 @@ fn validate_frame(frame: &ServerFrame) -> Result<(), ClientError> {
 mod protocol_tests {
     use super::*;
     use factory_core::{FactoryEvent, ProjectId, ProjectSnapshot};
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn v1_durable_event_is_accepted_inside_a_v2_replay_frame() {
@@ -327,6 +359,28 @@ mod protocol_tests {
             },
         };
         assert!(validate_frame(&frame).is_ok());
+    }
+
+    #[test]
+    fn terminal_attach_cancellation_wakes_a_blocked_reader() {
+        let (_server, client) = UnixStream::pair().unwrap();
+        let cancellation = TerminalFramesCancellation {
+            stream: Arc::new(Mutex::new(client.try_clone().unwrap())),
+        };
+        let frames = TerminalFrames {
+            reader: BufReader::new(client),
+            finished: false,
+            cancellation: cancellation.clone(),
+        };
+        let handle = thread::spawn(move || {
+            let mut frames = frames;
+            frames.next()
+        });
+        thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
+        cancellation.cancel();
+        assert!(handle.join().unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }
 

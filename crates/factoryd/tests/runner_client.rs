@@ -72,8 +72,33 @@ fn encoded(frame: RunnerFrame) -> Vec<u8> {
 fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
     RunnerFrame::TerminalOutput {
         protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 0,
         offset,
         bytes: bytes.to_owned(),
+    }
+}
+
+fn old_v1_terminal_output(offset: u64, bytes: &str) -> Vec<u8> {
+    let frame = serde_json::json!({
+        "type": "terminal_output",
+        "data": {
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "offset": offset,
+            "bytes": bytes,
+        },
+    });
+    let mut encoded = serde_json::to_vec(&frame).unwrap();
+    encoded.push(b'\n');
+    encoded
+}
+
+fn attach_capabilities() -> RunnerFrame {
+    RunnerFrame::TerminalAttachCapabilities {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 4,
+        base_generation: 3,
+        base_offset: 100,
+        end_offset: 200,
     }
 }
 
@@ -456,6 +481,31 @@ async fn live_stream_rejects_duplicates_gaps_and_all_non_event_frames() {
     ));
 }
 
+#[tokio::test]
+async fn terminal_stream_rejects_an_arbitrary_forward_generation_jump() {
+    let first = terminal_output(0, &factory_core::runner::encode_terminal_bytes(b"a"));
+    let second = RunnerFrame::TerminalOutput {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 2,
+        offset: 1,
+        bytes: factory_core::runner::encode_terminal_bytes(b"b"),
+    };
+    let fake = fake_runner(vec![vec![encoded(first), encoded(second)]]).await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
+    subscription.next_chunk().await.unwrap();
+    assert!(matches!(
+        subscription.next_chunk().await,
+        Err(RunnerClientError::TerminalAttachGenerationJump {
+            expected: 1,
+            found: 2
+        })
+    ));
+    fake.requests.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acknowledge_exit_uses_a_fresh_connection_and_an_exact_derived_command_id() {
     let fake = fake_runner(vec![vec![encoded(RunnerFrame::CommandAck {
@@ -675,16 +725,138 @@ async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_
 #[tokio::test]
 async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
     let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-output");
-    let fake = fake_runner(vec![vec![encoded(terminal_output(7, &bytes))]]).await;
-    let mut subscription = client(&fake.runtime_dir).attach_terminal(7).await.unwrap();
-    assert_eq!(subscription.next_chunk().await.unwrap(), (7, bytes));
+    let fake = fake_runner(vec![vec![old_v1_terminal_output(7, &bytes)]]).await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(7, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
+    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 7, bytes));
     assert_eq!(
         fake.requests.await.unwrap(),
         vec![RequestEnvelope::new(
             run_id(),
             instance_id(),
-            RunnerRequest::AttachTerminal { since_offset: 7 }
+            RunnerRequest::AttachTerminal {
+                since_offset: 7,
+                mode: factory_core::runner::TerminalAttachMode::Legacy,
+            }
         )]
+    );
+}
+
+#[tokio::test]
+async fn full_history_falls_back_and_decodes_a_literal_old_v1_output_frame() {
+    let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-full-history");
+    let fake = fake_runner(vec![
+        vec![encoded(RunnerFrame::Error {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            code: RunnerErrorCode::InvalidRequest,
+            message: "unknown terminal capability request".into(),
+        })],
+        vec![old_v1_terminal_output(0, &bytes)],
+    ])
+    .await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::FullHistory)
+        .await
+        .unwrap();
+    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 0, bytes));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::TerminalAttachCapabilities,
+            ),
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::AttachTerminal {
+                    since_offset: 0,
+                    mode: factory_core::runner::TerminalAttachMode::Legacy,
+                },
+            ),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn bounded_attach_refuses_an_old_runner_instead_of_falling_back_to_full_replay() {
+    let fake = fake_runner(vec![vec![encoded(RunnerFrame::Error {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        code: RunnerErrorCode::InvalidRequest,
+        message: "unknown terminal capability request".into(),
+    })]])
+    .await;
+    let result = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
+        .await;
+    assert!(matches!(
+        result,
+        Err(RunnerClientError::BoundedAttachUnsupported)
+    ));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![RequestEnvelope::new(
+            run_id(),
+            instance_id(),
+            RunnerRequest::TerminalAttachCapabilities,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn bounded_attach_negotiates_exact_generation_and_replay_start() {
+    let fake = fake_runner(vec![
+        vec![encoded(attach_capabilities())],
+        vec![
+            encoded(RunnerFrame::TerminalAttachReady {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                generation: 4,
+                base_generation: 3,
+                base_offset: 100,
+                start_generation: 3,
+                start_offset: 150,
+                end_offset: 200,
+                reset_prefix: factory_core::runner::encode_terminal_bytes(b"\x1bc"),
+            }),
+            encoded(RunnerFrame::TerminalOutput {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                generation: 3,
+                offset: 150,
+                bytes: String::new(),
+            }),
+        ],
+    ])
+    .await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
+        .await
+        .unwrap();
+    assert_eq!(subscription.info().unwrap().base_generation, 3);
+    assert_eq!(subscription.info().unwrap().start_offset, 150);
+    assert_eq!(
+        subscription.next_chunk().await.unwrap(),
+        (3, 150, "".into())
+    );
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::TerminalAttachCapabilities,
+            ),
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::AttachTerminal {
+                    since_offset: 0,
+                    mode: factory_core::runner::TerminalAttachMode::Tail,
+                },
+            ),
+        ]
     );
 }
 
@@ -711,12 +883,16 @@ async fn silent_old_v1_runner_has_a_bounded_fallback_without_losing_later_output
     });
 
     let started = tokio::time::Instant::now();
-    let mut subscription = client(&runtime_dir).attach_terminal(0).await.unwrap();
+    let mut subscription = client(&runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
     assert!(
         started.elapsed() < Duration::from_millis(350),
         "legacy silent attach stayed blocked"
     );
-    let (offset, bytes) = subscription.next_chunk().await.unwrap();
+    let (generation, offset, bytes) = subscription.next_chunk().await.unwrap();
+    assert_eq!(generation, 0);
     assert_eq!(offset, 0);
     assert_eq!(
         factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),

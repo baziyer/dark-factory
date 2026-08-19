@@ -121,7 +121,10 @@ pub enum NetMsg {
 fn request_response(client: &Client, request: LocalRequest) -> Result<LocalResponse, String> {
     match client.request(request).map_err(|error| error.to_string())? {
         ServerFrame::Response { response, .. } => Ok(response),
-        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+        ServerFrame::Event { .. }
+        | ServerFrame::TerminalOutput { .. }
+        | ServerFrame::TerminalAttachReady { .. }
+        | ServerFrame::TerminalAttachGap { .. } => {
             Err("daemon returned a stream frame instead of a response".into())
         }
     }
@@ -137,7 +140,10 @@ fn request_response_with_timeout(
         .map_err(|error| error.to_string())?
     {
         ServerFrame::Response { response, .. } => Ok(response),
-        ServerFrame::Event { .. } | ServerFrame::TerminalOutput { .. } => {
+        ServerFrame::Event { .. }
+        | ServerFrame::TerminalOutput { .. }
+        | ServerFrame::TerminalAttachReady { .. }
+        | ServerFrame::TerminalAttachGap { .. } => {
             Err("daemon returned a stream frame instead of a response".into())
         }
     }
@@ -150,7 +156,10 @@ fn subscription_message(frame: ServerFrame) -> Option<NetMsg> {
             response: LocalResponse::CaughtUp { .. },
             ..
         } => Some(NetMsg::CaughtUp),
-        ServerFrame::Response { .. } | ServerFrame::TerminalOutput { .. } => None,
+        ServerFrame::Response { .. }
+        | ServerFrame::TerminalOutput { .. }
+        | ServerFrame::TerminalAttachReady { .. }
+        | ServerFrame::TerminalAttachGap { .. } => None,
     }
 }
 

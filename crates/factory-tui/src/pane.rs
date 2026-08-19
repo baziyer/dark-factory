@@ -20,7 +20,9 @@ use portable_pty::{
 use tui_term::vt100;
 
 use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
-use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
+use factory_core::runner::{
+    decode_terminal_bytes, encode_terminal_bytes, terminal_generation_is_contiguous,
+};
 use factory_core::{ProjectId, RunnerInstanceId, SessionId};
 
 use factoryctl::Client;
@@ -202,6 +204,7 @@ impl Pane {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
                 since_offset: 0,
+                mode: factory_core::runner::TerminalAttachMode::Tail,
             },
         )?;
 
@@ -565,10 +568,36 @@ fn spawn_attach_reader_thread(
     observation: Arc<(Mutex<AttachState>, Condvar)>,
 ) {
     std::thread::spawn(move || {
+        let mut next_offset = None;
+        let mut next_generation = None;
         attach::read_frames(reader, |frame| {
             match frame {
-                ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
+                ServerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
+                        let generation_jump = next_generation.is_some_and(|expected| {
+                            !terminal_generation_is_contiguous(expected, generation)
+                        });
+                        if next_offset.is_some_and(|expected| expected != offset)
+                            || next_generation.is_some_and(|expected| generation < expected)
+                            || generation_jump
+                        {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                state.observation = PaneObservation::Error(format!(
+                                    "terminal output continuity broke at offset {offset}"
+                                ));
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            return false;
+                        }
+                        next_offset = Some(offset.saturating_add(decoded.len() as u64));
+                        next_generation = Some(generation);
                         let (state, signal) = &*observation;
                         if let Ok(mut state) = state.lock() {
                             if matches!(state.observation, PaneObservation::Connecting) {
@@ -592,6 +621,64 @@ fn spawn_attach_reader_thread(
                         }
                     }
                 },
+                ServerFrame::TerminalAttachReady {
+                    reset_prefix,
+                    start_generation,
+                    start_offset,
+                    ..
+                } => {
+                    next_offset = Some(start_offset);
+                    next_generation = Some(start_generation);
+                    match decode_terminal_bytes(&reset_prefix) {
+                        Ok(decoded) => {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                if matches!(state.observation, PaneObservation::Connecting) {
+                                    state.observation = PaneObservation::Attached;
+                                }
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            if let Ok(mut parser) = parser.lock() {
+                                parser.process(&decoded);
+                                dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                state.observation = PaneObservation::Error(format!(
+                                    "invalid terminal state: {error}"
+                                ));
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            return false;
+                        }
+                    }
+                }
+                ServerFrame::TerminalAttachGap {
+                    generation,
+                    base_generation,
+                    base_offset,
+                    start_generation,
+                    start_offset,
+                    end_offset,
+                    requested_generation,
+                    requested_offset,
+                    reason,
+                    ..
+                } => {
+                    let (state, signal) = &*observation;
+                    if let Ok(mut state) = state.lock() {
+                        state.observation = PaneObservation::Error(format!(
+                            "attach cursor unavailable: {reason}; retained generation {base_generation} offsets {base_offset}..{end_offset}, requested generation {requested_generation:?} offset {requested_offset}, generation {generation}, replay generation {start_generation} at {start_offset}"
+                        ));
+                        state.finished = true;
+                        signal.notify_all();
+                    }
+                    return false;
+                }
                 ServerFrame::Response { response, .. } => match response {
                     factory_core::local::LocalResponse::AttachRefused { refusal } => {
                         let (state, signal) = &*observation;
