@@ -632,37 +632,43 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     // per-subscriber buffer until the runner drops this connection.
     thread::sleep(Duration::from_secs(2));
     let mut reader = BufReader::new(stream);
-    let mut saw_conflict = false;
+    let mut gap_offset = None;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap() == 0 {
             break;
         }
-        if let Ok(RunnerFrame::Error {
-            code: RunnerErrorCode::Conflict,
+        if let Ok(RunnerFrame::TerminalAttachGap {
+            requested_offset,
+            reason,
             ..
         }) = serde_json::from_str::<RunnerFrame>(&line)
         {
-            saw_conflict = true;
+            assert!(
+                reason.contains("subscriber"),
+                "unexpected gap reason: {reason}"
+            );
+            gap_offset = Some(requested_offset);
             break;
         }
     }
-    assert!(saw_conflict, "expected the slow subscriber to be dropped");
+    let gap_offset =
+        gap_offset.expect("expected the slow subscriber to be dropped with a bounded gap");
 
-    // Reattach from offset 0 must still work.
+    // Reattach from the exact recovery cursor reported by the bounded gap.
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
         RunnerRequest::AttachTerminal {
-            since_offset: 0,
+            since_offset: gap_offset,
             mode: factory_core::runner::TerminalAttachMode::Legacy,
         },
     );
     let frame = read_frame(&mut BufReader::new(stream));
     assert!(
-        matches!(frame, RunnerFrame::TerminalOutput { offset: 0, .. }),
-        "expected a fresh v1 terminal-output replay, got {frame:?}"
+        matches!(frame, RunnerFrame::TerminalOutput { offset, .. } if offset == gap_offset),
+        "expected a v1 terminal-output replay from the gap cursor, got {frame:?}"
     );
 
     let _ = request(
