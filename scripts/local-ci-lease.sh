@@ -261,6 +261,10 @@ local_ci_lease_recover_lock_object() {
 
 local_ci_lease_acquire_lock_object() {
     while :; do
+        if [ ! -e "$LOCAL_CI_LEASE_LOCK" ] && [ -L "$LOCAL_CI_LEASE_PATH" ]; then
+            echo "local-ci: refusing owner metadata without its lock object; invalid owner metadata or lock-object replacement requires manual inspection" >&2
+            return 1
+        fi
         if mkdir "$LOCAL_CI_LEASE_LOCK" 2>/dev/null; then
             local_ci_lease_prepare_lock_object || {
                 rmdir "$LOCAL_CI_LEASE_LOCK" 2>/dev/null || true

@@ -226,9 +226,21 @@ wait
 assert_absent "$lease_path"
 assert_absent "$lock_path"
 
-# Replacing a live object with a symlink or another directory must fail closed
-# rather than locking a different inode.
+# Removing or replacing a live object with a symlink or another directory must
+# fail closed rather than locking a different inode.
 replacement_held="$temporary/replacement-held"
+start_holder "$first" "$replacement_held" 2
+wait_for_file "$replacement_held"
+mv "$lock_path" "$temporary/original-lock-object"
+if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) \
+    2>"$temporary/replacement-missing.stderr"; then
+    fail "live lock-object removal allowed a replacement lease"
+fi
+grep -Fq 'without its lock object' "$temporary/replacement-missing.stderr" || fail "live lock-object removal refusal was unexplained"
+mv "$temporary/original-lock-object" "$lock_path"
+wait
+
+replacement_held="$temporary/replacement-symlink-held"
 start_holder "$first" "$replacement_held" 2
 wait_for_file "$replacement_held"
 mv "$lock_path" "$temporary/original-lock-object"
