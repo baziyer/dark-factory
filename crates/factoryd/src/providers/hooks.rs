@@ -117,10 +117,6 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
         // daemon umask. Private-file callers still pass `0600` here.
         file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
-        // `OpenOptionsExt::mode` is filtered by the process umask. Apply the
-        // requested mode explicitly so rewriting an existing operator file
-        // really preserves its permissions (notably 0644 under umask 077).
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode))?;
         file.sync_all()
     })();
     if let Err(source) = write_result {
