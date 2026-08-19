@@ -445,14 +445,13 @@ fn runner_pid_for_runtime(runtime: &Path) -> Pid {
         .args(["-axo", "pid=,command="])
         .output()
         .expect("ps");
-    let raw = String::from_utf8_lossy(&output.stdout)
+    String::from_utf8_lossy(&output.stdout)
         .lines()
         .find(|line| line.contains("factory-runner") && line.contains(&needle))
         .and_then(|line| line.split_whitespace().next())
         .and_then(|value| value.parse::<i32>().ok())
         .and_then(Pid::from_raw)
-        .unwrap_or_else(|| panic!("no runner owned by {}", runtime.display()));
-    raw
+        .unwrap_or_else(|| panic!("no runner owned by {}", runtime.display()))
 }
 
 fn started_group_for_runtime(runtime: &Path) -> Pid {

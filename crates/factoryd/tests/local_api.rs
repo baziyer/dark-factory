@@ -118,6 +118,7 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
             .execute_batch(
                 "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN cleanup_state;
                  UPDATE events SET schema_version = 1;
                  PRAGMA user_version = 22;",
             )
@@ -2353,8 +2354,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(status.projects.len(), 1);
         let project = &status.projects[0];
         assert_eq!(project.project.id, project_id("factory"));
-        assert_eq!(project.backlog_depth, 1);
-        assert_eq!(project.backlog[0].id, task_id("t-loose"));
+        assert_eq!(project.unassigned_queue_depth, 1);
+        assert_eq!(project.unassigned_queue[0].id, task_id("t-loose"));
         assert_eq!(project.agents.len(), 1);
         let curie = &project.agents[0];
         assert_eq!(curie.agent.id, agent_id("curie"));
