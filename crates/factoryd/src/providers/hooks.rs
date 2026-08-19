@@ -110,6 +110,12 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
             .mode(mode)
             .custom_flags(nofollow_flag())
             .open(&temp_path)?;
+        // `OpenOptions::mode` is filtered by the process umask when the
+        // temporary file is created. Apply the explicit mode to the open
+        // file afterward so callers that are preserving an existing file's
+        // permissions do not silently tighten them under a restrictive
+        // daemon umask. Private-file callers still pass `0600` here.
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         // `OpenOptionsExt::mode` is filtered by the process umask. Apply the
         // requested mode explicitly so rewriting an existing operator file
