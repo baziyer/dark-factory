@@ -347,10 +347,13 @@ fn load_daemon_health(client: &Client) -> Result<String, String> {
 pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
     thread::spawn(move || {
         let mut delay = MIN_BACKOFF;
-        if let Ok(version) = load_daemon_health(&client) {
-            if tx.send(NetMsg::DaemonHealth { version }).is_err() {
-                return;
-            }
+        if tx
+            .send(NetMsg::DaemonHealth {
+                version: load_daemon_health(&client).unwrap_or_default(),
+            })
+            .is_err()
+        {
+            return;
         }
         let (projects, agents, tasks, runs, sessions, mut after_sequence) = loop {
             match load_consistent_fleet_snapshot(&client) {
@@ -398,10 +401,13 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
         loop {
             match client.subscribe(after_sequence) {
                 Ok(subscription) => {
-                    if let Ok(version) = load_daemon_health(&client) {
-                        if tx.send(NetMsg::DaemonHealth { version }).is_err() {
-                            return;
-                        }
+                    if tx
+                        .send(NetMsg::DaemonHealth {
+                            version: load_daemon_health(&client).unwrap_or_default(),
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
                     let _ = tx.send(NetMsg::ConnectionLive);
                     let mut failure = "event stream ended".to_owned();
