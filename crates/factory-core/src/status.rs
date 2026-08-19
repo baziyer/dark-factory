@@ -254,7 +254,8 @@ pub struct AttentionDecision {
     pub cause: String,
     pub evidence: String,
     pub choices: Vec<AttentionChoice>,
-    pub recommended: usize,
+    /// `None` is fail-closed: the operator must choose explicitly.
+    pub recommended: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -339,9 +340,9 @@ impl<'de> Deserialize<'de> for AttentionItem {
 
 impl AttentionItem {
     /// Machine recovery belongs to the daemon/control plane, not the
-    /// operator's decision inbox. An inferred state is deliberately retained:
-    /// it means automation lacks enough typed evidence and a human must
-    /// choose what to do.
+    /// operator's decision inbox. Inferred state is deliberately retained for
+    /// diagnostics, but has no safe typed operator action and stays out of
+    /// NEEDS YOU.
     #[must_use]
     pub const fn needs_operator_decision(&self) -> bool {
         matches!(
@@ -411,7 +412,11 @@ impl AttentionItem {
                 .take(MAX_ATTENTION_EVIDENCE_CHARS)
                 .collect(),
             choices,
-            recommended: 0,
+            recommended: (!matches!(
+                self.reason.kind,
+                AttentionReasonKind::ProviderPermission
+            ))
+            .then_some(0),
         }
     }
 
@@ -442,7 +447,7 @@ impl AttentionItem {
                 "review the question, then enter terminal typing".to_owned()
             }
             AttentionAction::ReviewProviderPermission => {
-                "review the provider prompt before entering terminal typing".to_owned()
+                "choose Approve or Reject for the exact provider request".to_owned()
             }
             AttentionAction::ApproveProviderPermission => {
                 "approve the provider request with the exact yes decision".to_owned()
@@ -1290,7 +1295,7 @@ mod tests {
         assert!(!inferred.needs_operator_decision());
         let decision = worker.decision();
         assert_eq!(decision.choices[0].action, AttentionAction::RetryTask);
-        assert_eq!(decision.recommended, 0);
+        assert_eq!(decision.recommended, Some(0));
         assert!(decision.evidence.contains("project: p"));
         assert!(!decision.cause.contains('\u{1b}'));
         items.push(worker);
@@ -1319,6 +1324,29 @@ mod tests {
         let (_, permission) = session_reason(&permission).unwrap();
         assert_eq!(permission.kind, AttentionReasonKind::ProviderPermission);
         assert_eq!(permission.action, AttentionAction::ReviewProviderPermission);
+        let permission_item = AttentionItem {
+            level: Attention::NeedsInput,
+            project_id: ProjectId::try_from("p").unwrap(),
+            agent_id: Some(AgentId::try_from("a").unwrap()),
+            task_id: None,
+            session_id: Some(SessionId::try_from("s").unwrap()),
+            run_id: None,
+            since_ms: 20,
+            reason: permission.clone(),
+        };
+        let decision = permission_item.decision();
+        assert_eq!(decision.recommended, None);
+        assert_eq!(
+            decision.choices[0].action,
+            AttentionAction::ApproveProviderPermission
+        );
+        assert_eq!(
+            decision.choices[1].action,
+            AttentionAction::RejectProviderPermission
+        );
+        assert!(permission_item
+            .action_text()
+            .contains("choose Approve or Reject"));
 
         let mut idle = session(SessionState::Idle, 25);
         idle.last_hook_event = Some(ProviderHookEvent::Notification);

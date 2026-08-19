@@ -466,7 +466,15 @@ impl Board {
                 .is_some_and(|focus| !focus.resolved)
         {
             if key.code == KeyCode::Enter {
-                return self.choose_attention(0);
+                let recommended = self
+                    .attention_focus
+                    .as_ref()
+                    .and_then(|focus| focus.item.decision().recommended);
+                let Some(recommended) = recommended else {
+                    self.set_status("choose an explicit decision with 1-9", StatusLevel::Info);
+                    return Intent::Redraw;
+                };
+                return self.choose_attention(recommended);
             }
             if let KeyCode::Char(choice @ '1'..='9') = key.code {
                 return self.choose_attention(usize::from(choice as u8 - b'1'));
@@ -894,7 +902,7 @@ impl Board {
                     project_id,
                     task_id,
                 };
-                self.begin_attention_request(&source);
+                self.begin_attention_request(&source, choice.action);
                 Intent::Send(request)
             }
             factory_core::status::AttentionAction::ResumeAgent => {
@@ -906,7 +914,7 @@ impl Board {
                     project_id: source.project_id.clone(),
                     agent_id,
                 };
-                self.begin_attention_request(&source);
+                self.begin_attention_request(&source, choice.action);
                 Intent::Send(request)
             }
             factory_core::status::AttentionAction::ResetBudget => {
@@ -918,7 +926,7 @@ impl Board {
                     project_id: source.project_id.clone(),
                     agent_id,
                 };
-                self.begin_attention_request(&source);
+                self.begin_attention_request(&source, choice.action);
                 Intent::Send(request)
             }
             factory_core::status::AttentionAction::AnswerInTerminal => {
@@ -950,7 +958,7 @@ impl Board {
                     session_id,
                     bytes: factory_core::runner::encode_terminal_bytes(bytes),
                 };
-                self.begin_attention_request(&source);
+                self.begin_attention_request(&source, choice.action);
                 Intent::Send(request)
             }
             factory_core::status::AttentionAction::ReviewProviderPermission => {
@@ -1162,7 +1170,10 @@ impl Board {
                             && source.session_id.as_ref() == Some(&session_id)
                     })
                 {
-                    self.begin_attention_request(&source);
+                    self.begin_attention_request(
+                        &source,
+                        factory_core::status::AttentionAction::AnswerInTerminal,
+                    );
                 }
                 Intent::Send(LocalRequest::TerminalInput {
                     project_id,
@@ -1657,6 +1668,55 @@ mod tests {
         assert_eq!(project_id.as_str(), "proj");
         assert_eq!(task_id.as_str(), "blocked");
         assert_eq!(board.view, View::Building);
+    }
+
+    #[test]
+    fn permission_decision_requires_explicit_choice_and_waits_for_authoritative_projection() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Enter)),
+            Intent::Redraw
+        ));
+        assert!(board.status.as_ref().is_some_and(|status| {
+            status.text.contains("explicit decision")
+        }));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('1'))),
+            Intent::Send(LocalRequest::TerminalInput { .. })
+        ));
+        board.apply_response(Ok(LocalResponse::TerminalInputAccepted {
+            session_id: SessionId::try_from("session").unwrap(),
+        }));
+        assert_eq!(board.decision_items().len(), 1);
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('2'))),
+            Intent::Redraw
+        ));
+
+        let mut changed = item;
+        changed.reason.summary = "approve a different command".to_owned();
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![changed],
+        });
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('2'))),
+            Intent::Send(LocalRequest::TerminalInput { .. })
+        ));
     }
 
     #[test]

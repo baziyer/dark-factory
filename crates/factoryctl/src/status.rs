@@ -75,7 +75,7 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                     "    {}. {}{} — {}",
                     index + 1,
                     choice.label,
-                    if index == decision.recommended {
+                    if decision.recommended == Some(index) {
                         " (recommended)"
                     } else {
                         ""
@@ -329,8 +329,8 @@ mod tests {
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
                 "\nEmpty (empty) | agents 0 | backlog 0\n",
                 "\nAttention:\n",
-                "  provider permission | factory/reviewer | age 0s | cause: approve command [2JFORGED | evidence: project: factory agent: reviewer task: — session: session-reviewer run: — | action: review the provider prompt before entering terminal typing\n",
-                "    1. Approve (recommended) — allows the exact provider request to continue\n",
+                "  provider permission | factory/reviewer | age 0s | cause: approve command [2JFORGED | evidence: project: factory agent: reviewer task: — session: session-reviewer run: — | action: choose Approve or Reject for the exact provider request\n",
+                "    1. Approve — allows the exact provider request to continue\n",
                 "    2. Reject — denies the exact provider request\n",
                 "  worker blocked | factory | age 0s | cause: dependency missing | evidence: project: factory agent: — task: task-7 session: — run: — | action: factoryctl task retry --project factory --task task-7\n",
                 "    1. Retry task (recommended) — requeues the task and lets the daemon deliver it again\n",

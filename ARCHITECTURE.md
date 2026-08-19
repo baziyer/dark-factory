@@ -119,8 +119,9 @@ catalogue.
    inference has no valid typed operator action and remains a control-plane
    concern alongside delivery, observer, capacity, and other deterministic
    recovery. Selecting a row keeps BUILDING visible and shows
-   the same bounded cause, exact evidence, typed choices, recommendation, and
-   consequences in both `factoryctl status` and the TUI. Attention is not
+   the same bounded cause, exact evidence, typed choices, optional safe
+   recommendation, and consequences in both `factoryctl status` and the TUI.
+   Permission choices have no default and require explicit selection. Attention is not
    permission to stop or replace a worker; recovery begins by preserving or
    explicitly resolving dirty work. Fleet attention snapshots carry the
    durable event high-water mark from the same store read, so a delayed

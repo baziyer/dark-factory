@@ -413,7 +413,7 @@ pub(crate) fn render_attention_card(
                     "{}. {}{} — {}",
                     index + 1,
                     choice.label,
-                    if index == decision.recommended {
+                    if decision.recommended == Some(index) {
                         " *"
                     } else {
                         ""

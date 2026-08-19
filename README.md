@@ -120,11 +120,12 @@ in its terminal. Press `Ctrl-]` to return control to the board. Press `g` to
 jump to the next item in NEEDS YOU and open its decision card in the BUILDING
 right pane; selection never detours into an agent terminal. The card contains
 the bounded cause, exact project/agent/task/session/run evidence, safe typed
-choices, the recommended choice, and its consequence. Press `Enter` for the
-recommended choice or `1`–`9` for a displayed choice. Provider questions use
-a bounded answer prompt; provider permissions offer typed Approve/Reject
-choices. Delivery, observer, capacity, and unproven deterministic recovery
-stays with the control plane. Press `?` for all keys. Press `q` to detach.
+choices, an optional safe default, and each consequence. Press `Enter` when a
+safe default is shown, or `1`–`9` for a displayed choice. Provider questions
+use a bounded answer prompt; provider permissions require an explicit typed
+Approve or Reject choice. Delivery, observer, capacity, and unproven
+deterministic recovery stays with the control plane. Press `?` for all keys.
+Press `q` to detach.
 Detaching does not stop any agent.
 
 Mouse navigation uses the same selections as the keyboard: click the footer's

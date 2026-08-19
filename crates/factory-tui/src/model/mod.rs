@@ -151,6 +151,7 @@ pub struct Board {
     /// Exact decision source awaiting a daemon response. This closes the
     /// duplicate-action window between a successful request and its event.
     pending_attention: Option<AttentionItem>,
+    pending_attention_action: Option<factory_core::status::AttentionAction>,
     /// Recently completed exact sources suppressed until a newer projection
     /// proves a new decision exists.
     completed_attention: Vec<AttentionItem>,
@@ -202,6 +203,7 @@ impl Board {
             selected_task: None,
             attention_focus: None,
             pending_attention: None,
+            pending_attention_action: None,
             completed_attention: Vec::new(),
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
@@ -223,6 +225,7 @@ impl Board {
                 self.attention_revision = self.attention_revision.max(status.event_sequence);
             }
             self.attention = status.attention;
+            self.reconcile_pending_attention_projection();
             self.reconcile_attention_focus();
         }
         self.worktrees = status
@@ -462,23 +465,60 @@ impl Board {
             .is_some_and(|pending| same_attention_source(pending, item))
     }
 
-    pub(crate) fn begin_attention_request(&mut self, item: &AttentionItem) {
+    pub(crate) fn begin_attention_request(
+        &mut self,
+        item: &AttentionItem,
+        action: factory_core::status::AttentionAction,
+    ) {
         self.pending_attention = Some(item.clone());
+        self.pending_attention_action = Some(action);
     }
 
     pub(crate) fn clear_attention_request(&mut self) {
         self.pending_attention = None;
+        self.pending_attention_action = None;
     }
 
     pub(crate) fn complete_attention_request(&mut self) {
         let Some(item) = self.pending_attention.take() else {
             return;
         };
-        self.completed_attention.push(item);
-        if self.completed_attention.len() > 32 {
-            self.completed_attention.remove(0);
+        self.pending_attention_action = None;
+        if item.reason.kind != AttentionReasonKind::ProviderPermission {
+            self.completed_attention.push(item);
+            if self.completed_attention.len() > 32 {
+                self.completed_attention.remove(0);
+            }
         }
         self.reconcile_attention_focus();
+    }
+
+    fn complete_attention_request_if(
+        &mut self,
+        action: factory_core::status::AttentionAction,
+        mut source_matches: impl FnMut(&AttentionItem) -> bool,
+    ) {
+        let matches = self.pending_attention_action == Some(action)
+            && self
+                .pending_attention
+                .as_ref()
+                .is_some_and(|item| source_matches(item));
+        if matches {
+            self.complete_attention_request();
+        }
+    }
+
+    fn reconcile_pending_attention_projection(&mut self) {
+        let Some(pending) = self.pending_attention.as_ref() else {
+            return;
+        };
+        let unchanged = self
+            .attention
+            .iter()
+            .any(|current| same_attention_source(current, pending) && current == pending);
+        if !unchanged {
+            self.clear_attention_request();
+        }
     }
 
     fn reconcile_attention_focus(&mut self) {
@@ -507,7 +547,14 @@ impl Board {
     }
 
     fn invalidate_attention(&mut self, mut invalid: impl FnMut(&AttentionItem) -> bool) {
+        let pending_invalid = self
+            .pending_attention
+            .as_ref()
+            .is_some_and(&mut invalid);
         self.attention.retain(|item| !invalid(item));
+        if pending_invalid {
+            self.clear_attention_request();
+        }
         self.reconcile_attention_focus();
     }
 
@@ -910,6 +957,21 @@ impl Board {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
             FactoryEvent::SessionChanged { session } => {
+                let provider_projection_changed = self
+                    .pending_attention
+                    .as_ref()
+                    .is_some_and(|item| {
+                        item.reason.kind == AttentionReasonKind::ProviderPermission
+                            && item.session_id.as_ref() == Some(&session.id)
+                            && self.sessions.get(&session.id).is_none_or(|previous| {
+                                previous.state != session.state
+                                    || previous.last_hook_event != session.last_hook_event
+                                    || previous.wait_reason != session.wait_reason
+                            })
+                    });
+                if provider_projection_changed {
+                    self.clear_attention_request();
+                }
                 let retain_reason = factory_core::status::session_attention_reason_kind(session);
                 self.invalidate_attention(|item| {
                     item.session_id.as_ref() == Some(&session.id)
@@ -1047,7 +1109,10 @@ impl Board {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
                 self.tasks.insert(task.snapshot.id.clone(), task);
-                self.complete_attention_request();
+                self.complete_attention_request_if(
+                    factory_core::status::AttentionAction::RetryTask,
+                    |item| item.task_id.as_ref() == Some(&id),
+                );
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
             LocalResponse::TaskDeleted { task_id, .. } => {
@@ -1079,11 +1144,13 @@ impl Board {
             LocalResponse::AgentResumed { agent } => {
                 let id = agent.id.clone();
                 self.agents.insert(agent.id.clone(), agent);
-                self.complete_attention_request();
+                self.complete_attention_request_if(
+                    factory_core::status::AttentionAction::ResumeAgent,
+                    |item| item.agent_id.as_ref() == Some(&id),
+                );
                 format!("agent {id} resumed")
             }
             LocalResponse::AgentBudgetUpdated { budget } => {
-                self.complete_attention_request();
                 format!("agent budget updated at {}", budget.updated_at_ms)
             }
             LocalResponse::AgentMessageSent { message } => {
@@ -1107,7 +1174,10 @@ impl Board {
                 format!("stop requested for session {session_id}")
             }
             LocalResponse::TerminalInputAccepted { session_id } => {
-                self.complete_attention_request();
+                self.complete_attention_request_if(
+                    factory_core::status::AttentionAction::AnswerInTerminal,
+                    |item| item.session_id.as_ref() == Some(&session_id),
+                );
                 format!("answer sent to session {session_id}")
             }
             LocalResponse::Sessions { sessions, .. } => {
