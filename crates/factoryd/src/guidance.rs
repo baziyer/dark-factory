@@ -141,7 +141,7 @@ impl DirectoryAuthority {
                 | rustix::fs::OFlags::EXCL
                 | rustix::fs::OFlags::CLOEXEC
                 | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::from_raw_mode(PRIVATE_FILE_MODE as u16),
+            rustix::fs::Mode::from_raw_mode(PRIVATE_FILE_MODE as rustix::fs::RawMode),
         )
         .map_err(Self::os_error)?;
         Ok(fd.into())

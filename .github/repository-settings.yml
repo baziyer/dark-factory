@@ -1,0 +1,23 @@
+# Declarative publication proposal for repository settings.
+#
+# This file is intentionally not an API mutator. An authorized maintainer may
+# reconcile it with GitHub after reviewing the exact prepared commit. The
+# `required` context is the CI workflow's aggregate job: it is green only
+# when both `checks` (hosted macOS) and `linux` (hosted Ubuntu) are green.
+repository: baziyer/dark-factory
+default_branch: main
+rulesets:
+  - name: main-protect
+    target: branch
+    enforcement: active
+    conditions:
+      ref_name:
+        include: ["~DEFAULT_BRANCH"]
+        exclude: []
+    rules:
+      - type: required_status_checks
+        parameters:
+          strict_required_status_checks_policy: true
+          required_status_checks:
+            - context: required
+              integration_id: 15368

@@ -21,6 +21,15 @@ that is the same for every provider (owning the PTY, `send_input`,
 by the daemon's session runner. A provider only has to answer two
 questions:
 
+### Linux contributor preview boundary
+
+The Ubuntu x86-64 contributor preview validates the source-built daemon,
+clients, PTY lifecycle, and this deterministic `shell` provider. Claude Code
+and Codex are explicitly **unverified on Linux** in this milestone; no paid
+provider run, archive install, or systemd support is implied. Contributors
+should report focused Linux fixes without treating either real provider as a
+preview prerequisite.
+
 1. **How do I launch you?** — an executable, argv, and any environment
    additions.
 2. **How do you tell me what's happening?** — for both shipped providers,
