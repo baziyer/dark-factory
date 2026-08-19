@@ -12,7 +12,7 @@
 //! thousands of open tasks would push one frame past
 //! `MAX_LOCAL_FRAME_BYTES`; that is where pagination would go.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
     AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
@@ -27,10 +27,19 @@ pub const MAX_QUEUE_PREVIEW: usize = 10;
 /// Maximum displayed characters in any operator-controlled attention summary.
 pub const MAX_ATTENTION_SUMMARY_CHARS: usize = 160;
 
+const fn legacy_event_sequence() -> i64 {
+    -1
+}
+
 /// The whole daemon at one instant.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FleetStatus {
     pub generated_at_ms: i64,
+    /// Durable event high-water mark from the same store read as this snapshot.
+    /// Old v1 daemons omit it; the negative sentinel keeps that legacy mode
+    /// distinguishable from a sequenced daemon whose durable head is zero.
+    #[serde(default = "legacy_event_sequence")]
+    pub event_sequence: i64,
     /// Factory-wide provider bypass. Explicit per-agent permission modes
     /// still override this default.
     #[serde(default)]
@@ -73,6 +82,10 @@ pub struct AgentStatus {
     pub session: Option<SessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run: Option<RunSnapshot>,
+    /// Most recently started run, including a terminal run used as the
+    /// source of inferred attention when there is no live session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_run: Option<RunSnapshot>,
     /// Active tasks assigned to this agent in the canonical queue order (see
     /// [`MAX_QUEUE_PREVIEW`]): running first, then priority/creation order.
     pub queue_depth: u32,
@@ -102,6 +115,9 @@ pub struct AgentStatusDetail {
     /// The instant this projection was built, used to render stable ages.
     #[serde(default)]
     pub generated_at_ms: i64,
+    /// Durable event high-water mark from the same store read as this status.
+    #[serde(default = "legacy_event_sequence")]
+    pub event_sequence: i64,
     pub status: AgentStatus,
     pub detail: AgentDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -127,6 +143,17 @@ pub struct WorktreeStatus {
     pub dirty: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionKind {
+    NeedsInput,
+    BudgetExhausted,
+    SessionFailed,
+    TaskBlocked,
+    PausedWithWork,
+    WaitingForCapacity,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -194,24 +221,119 @@ pub struct AttentionReason {
 }
 
 /// One thing that needs the operator.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttentionItem {
     pub level: Attention,
     pub project_id: ProjectId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<AgentId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<crate::RunId>,
     /// When this condition began (session state change, task update, ...).
     pub since_ms: i64,
     pub reason: AttentionReason,
 }
 
+#[derive(Serialize)]
+struct AttentionItemRef<'a> {
+    kind: AttentionKind,
+    level: Attention,
+    project_id: &'a ProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: &'a Option<AgentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: &'a Option<TaskId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_id: &'a Option<SessionId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: &'a Option<crate::RunId>,
+    since_ms: i64,
+    detail: &'a str,
+    reason: &'a AttentionReason,
+}
+
+#[derive(Deserialize)]
+struct AttentionItemWire {
+    kind: AttentionKind,
+    level: Attention,
+    project_id: ProjectId,
+    #[serde(default)]
+    agent_id: Option<AgentId>,
+    #[serde(default)]
+    task_id: Option<TaskId>,
+    #[serde(default)]
+    session_id: Option<SessionId>,
+    #[serde(default)]
+    run_id: Option<crate::RunId>,
+    since_ms: i64,
+    detail: String,
+    #[serde(default)]
+    reason: Option<AttentionReason>,
+}
+
+impl Serialize for AttentionItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        AttentionItemRef {
+            kind: self.legacy_kind(),
+            level: self.level,
+            project_id: &self.project_id,
+            agent_id: &self.agent_id,
+            task_id: &self.task_id,
+            session_id: &self.session_id,
+            run_id: &self.run_id,
+            since_ms: self.since_ms,
+            detail: &self.reason.summary,
+            reason: &self.reason,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AttentionItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AttentionItemWire::deserialize(deserializer)?;
+        let reason = wire
+            .reason
+            .unwrap_or_else(|| legacy_reason(wire.kind, wire.detail));
+        Ok(Self {
+            level: wire.level,
+            project_id: wire.project_id,
+            agent_id: wire.agent_id,
+            task_id: wire.task_id,
+            session_id: wire.session_id,
+            run_id: wire.run_id,
+            since_ms: wire.since_ms,
+            reason,
+        })
+    }
+}
+
 impl AttentionItem {
+    fn legacy_kind(&self) -> AttentionKind {
+        match self.reason.kind {
+            AttentionReasonKind::ProviderQuestion | AttentionReasonKind::ProviderPermission => {
+                AttentionKind::NeedsInput
+            }
+            AttentionReasonKind::WorkerBlocked => AttentionKind::TaskBlocked,
+            AttentionReasonKind::DeliveryRecovery | AttentionReasonKind::ObserverProblem => {
+                AttentionKind::SessionFailed
+            }
+            AttentionReasonKind::Inferred if self.level == Attention::NeedsInput => {
+                AttentionKind::NeedsInput
+            }
+            AttentionReasonKind::Inferred => AttentionKind::SessionFailed,
+            AttentionReasonKind::BudgetExhausted => AttentionKind::BudgetExhausted,
+            AttentionReasonKind::PausedWithWork => AttentionKind::PausedWithWork,
+            AttentionReasonKind::WaitingForCapacity => AttentionKind::WaitingForCapacity,
+        }
+    }
+
     /// A safe, shared action description. Commands contain only validated IDs.
     #[must_use]
     pub fn action_text(&self) -> String {
@@ -268,6 +390,42 @@ impl AttentionItem {
     }
 }
 
+fn legacy_reason(kind: AttentionKind, detail: String) -> AttentionReason {
+    let (kind, action, fallback) = match kind {
+        AttentionKind::NeedsInput => (
+            AttentionReasonKind::Inferred,
+            AttentionAction::InspectInferredState,
+            "session needs attention",
+        ),
+        AttentionKind::BudgetExhausted => (
+            AttentionReasonKind::BudgetExhausted,
+            AttentionAction::ResetBudget,
+            "agent budget is exhausted",
+        ),
+        AttentionKind::SessionFailed => (
+            AttentionReasonKind::DeliveryRecovery,
+            AttentionAction::InspectRecovery,
+            "session needs recovery",
+        ),
+        AttentionKind::TaskBlocked => (
+            AttentionReasonKind::WorkerBlocked,
+            AttentionAction::RetryTask,
+            "task is blocked",
+        ),
+        AttentionKind::PausedWithWork => (
+            AttentionReasonKind::PausedWithWork,
+            AttentionAction::ResumeAgent,
+            "agent is paused with queued work",
+        ),
+        AttentionKind::WaitingForCapacity => (
+            AttentionReasonKind::WaitingForCapacity,
+            AttentionAction::WaitForCapacity,
+            "queued work is waiting for capacity",
+        ),
+    };
+    reason(kind, detail, fallback, action)
+}
+
 /// A blocked task and its durable worker-supplied reason. Kept separate
 /// from [`TaskSnapshot`] because full task detail is not part of fleet status.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -289,18 +447,31 @@ pub fn attention_items(
     let mut items = Vec::new();
     for status in agents {
         let agent = &status.agent;
+        // Fleet status projects all active assigned work, running first. Keep
+        // queued-only attention derived from that shared projection so an old
+        // v1 daemon (whose queue contains only queued rows) remains compatible.
+        let running_depth = u32::try_from(
+            status
+                .queue
+                .iter()
+                .filter(|task| task.status == crate::TaskStatus::Running)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let queued_depth = status.queue_depth.saturating_sub(running_depth);
+        let next_queued = status
+            .queue
+            .iter()
+            .find(|task| task.status == crate::TaskStatus::Queued);
         if status.budget.exhausted {
+            let source_run = status.current_run.as_ref();
             items.push(AttentionItem {
                 level: Attention::NeedsInput,
                 project_id: project_id.clone(),
                 agent_id: Some(agent.id.clone()),
-                task_id: status
-                    .latest_run
-                    .as_ref()
-                    .and_then(|run| run.task_id.clone())
-                    .or_else(|| status.queue.first().map(|task| task.id.clone())),
-                session_id: agent.current_session_id.clone(),
-                run_id: status.latest_run.as_ref().map(|run| run.id.clone()),
+                task_id: source_run.and_then(|run| run.task_id.clone()),
+                session_id: source_run.and_then(|run| run.session_id.clone()),
+                run_id: source_run.map(|run| run.id.clone()),
                 since_ms: status.budget.updated_at_ms,
                 reason: reason(
                     AttentionReasonKind::BudgetExhausted,
@@ -310,26 +481,33 @@ pub fn attention_items(
                 ),
             });
         }
-        if let Some(session) = &status.session {
-            if let Some((level, reason)) = session_reason(session) {
-                items.push(AttentionItem {
-                    level,
-                    project_id: project_id.clone(),
-                    agent_id: Some(agent.id.clone()),
-                    task_id: status
-                        .latest_run
-                        .as_ref()
-                        .and_then(|run| run.task_id.clone()),
-                    session_id: Some(session.id.clone()),
-                    run_id: status.latest_run.as_ref().map(|run| run.id.clone()),
-                    since_ms: if session.observer_health == crate::ObserverHealth::Degraded {
-                        session.observer_health_since_ms
-                    } else {
-                        session.state_since_ms
-                    },
-                    reason,
-                });
-            }
+        if let Some(session) = &status.session
+            && let Some((level, reason)) = session_reason(session)
+        {
+            let source_run = status.current_run.as_ref().filter(|run| {
+                session.current_run_id.as_ref() == Some(&run.id)
+                    && run.session_id.as_ref() == Some(&session.id)
+            });
+            let queued_delivery = (session.state == crate::SessionState::WaitingForInput
+                && session.wait_reason.as_deref() == Some("delivery unacknowledged"))
+            .then_some(next_queued)
+            .flatten();
+            items.push(AttentionItem {
+                level,
+                project_id: project_id.clone(),
+                agent_id: Some(agent.id.clone()),
+                task_id: source_run
+                    .and_then(|run| run.task_id.clone())
+                    .or_else(|| queued_delivery.map(|task| task.id.clone())),
+                session_id: Some(session.id.clone()),
+                run_id: source_run.map(|run| run.id.clone()),
+                since_ms: if session.observer_health == crate::ObserverHealth::Degraded {
+                    session.observer_health_since_ms
+                } else {
+                    session.state_since_ms
+                },
+                reason,
+            });
         }
         if status.attention_inferred && status.attention.needs_operator() {
             let latest_run = status.latest_run.as_ref();
@@ -362,22 +540,23 @@ pub fn attention_items(
                 ),
             });
         }
-        if status.queue_depth > 0 {
+        if queued_depth > 0 {
             if agent.paused && !status.budget.exhausted {
                 items.push(AttentionItem {
                     level: Attention::NeedsInput,
                     project_id: project_id.clone(),
                     agent_id: Some(agent.id.clone()),
-                    task_id: status.queue.first().map(|task| task.id.clone()),
+                    task_id: next_queued.map(|task| task.id.clone()),
                     session_id: None,
                     run_id: None,
                     since_ms: status
                         .queue
-                        .first()
+                        .iter()
+                        .find(|task| task.status == crate::TaskStatus::Queued)
                         .map_or(agent.updated_at_ms, |task| task.created_at_ms),
                     reason: reason(
                         AttentionReasonKind::PausedWithWork,
-                        format!("paused with {} queued task(s)", status.queue_depth),
+                        format!("paused with {queued_depth} queued task(s)"),
                         "paused with queued work",
                         AttentionAction::ResumeAgent,
                     ),
@@ -387,18 +566,18 @@ pub fn attention_items(
                     level: Attention::Routine,
                     project_id: project_id.clone(),
                     agent_id: Some(agent.id.clone()),
-                    task_id: status.queue.first().map(|task| task.id.clone()),
+                    task_id: next_queued.map(|task| task.id.clone()),
                     session_id: None,
                     run_id: None,
                     since_ms: status
                         .queue
-                        .first()
+                        .iter()
+                        .find(|task| task.status == crate::TaskStatus::Queued)
                         .map_or(agent.updated_at_ms, |task| task.updated_at_ms),
                     reason: reason(
                         AttentionReasonKind::WaitingForCapacity,
                         format!(
-                            "{} queued task(s) but the daemon is at its live-session cap",
-                            status.queue_depth
+                            "{queued_depth} queued task(s) but the daemon is at its live-session cap"
                         ),
                         "queued work is waiting for live-session capacity",
                         AttentionAction::WaitForCapacity,
@@ -436,9 +615,22 @@ pub fn attention_items(
 fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReason)> {
     use crate::{ObserverHealth, ProviderHookEvent, SessionState};
 
+    if session.observer_health == ObserverHealth::Degraded {
+        return Some((
+            Attention::Failed,
+            reason(
+                AttentionReasonKind::ObserverProblem,
+                session
+                    .observer_reason
+                    .clone()
+                    .unwrap_or_else(|| "runner observation is degraded".to_owned()),
+                "runner observation is degraded",
+                AttentionAction::InspectObserver,
+            ),
+        ));
+    }
     if session.state == SessionState::WaitingForInput {
         let summary = session.wait_reason.clone();
-        let lower = summary.as_deref().unwrap_or_default().to_ascii_lowercase();
         // This exact reason is owned by the daemon's delivery dispatcher. The
         // synthetic transition deliberately retains the preceding hook event,
         // so it must outrank that stale provenance. Never infer this state from
@@ -465,53 +657,50 @@ fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReas
                 ),
             ));
         }
-        if session.last_hook_event == Some(ProviderHookEvent::Notification) {
-            return Some((
-                Attention::NeedsInput,
-                reason(
-                    AttentionReasonKind::ProviderQuestion,
-                    summary.unwrap_or_else(|| "provider is waiting for an answer".to_owned()),
-                    "provider is waiting for an answer",
-                    AttentionAction::AnswerInTerminal,
-                ),
-            ));
-        }
-        if lower.contains("permission") || lower.contains("approval") {
+        if session.last_hook_event == Some(ProviderHookEvent::Notification)
+            && summary
+                .as_deref()
+                .is_some_and(|value| value.starts_with("provider permission: "))
+        {
             return Some((
                 Attention::NeedsInput,
                 reason(
                     AttentionReasonKind::ProviderPermission,
-                    summary.unwrap_or_else(|| "provider approval prompt".to_owned()),
+                    summary
+                        .unwrap()
+                        .trim_start_matches("provider permission: ")
+                        .to_owned(),
                     "provider approval prompt",
                     AttentionAction::ReviewProviderPermission,
                 ),
             ));
         }
-        if session.observer_health != ObserverHealth::Degraded {
+        if session.last_hook_event == Some(ProviderHookEvent::Notification)
+            && summary
+                .as_deref()
+                .is_some_and(|value| value.starts_with("provider question: "))
+        {
             return Some((
                 Attention::NeedsInput,
                 reason(
-                    AttentionReasonKind::Inferred,
-                    summary.unwrap_or_else(|| {
-                        "session is waiting without a reported question".to_owned()
-                    }),
-                    "session is waiting without a reported question",
-                    AttentionAction::InspectInferredState,
+                    AttentionReasonKind::ProviderQuestion,
+                    summary
+                        .unwrap()
+                        .trim_start_matches("provider question: ")
+                        .to_owned(),
+                    "provider is waiting for an answer",
+                    AttentionAction::AnswerInTerminal,
                 ),
             ));
         }
-    }
-    if session.observer_health == ObserverHealth::Degraded {
         return Some((
-            Attention::Failed,
+            Attention::NeedsInput,
             reason(
-                AttentionReasonKind::ObserverProblem,
-                session
-                    .wait_reason
-                    .clone()
-                    .unwrap_or_else(|| "runner observation is degraded".to_owned()),
-                "runner observation is degraded",
-                AttentionAction::InspectObserver,
+                AttentionReasonKind::Inferred,
+                summary
+                    .unwrap_or_else(|| "session is waiting without a reported question".to_owned()),
+                "session is waiting without a reported question",
+                AttentionAction::InspectInferredState,
             ),
         ));
     }
@@ -669,6 +858,7 @@ mod tests {
             last_hook_event: None,
             last_hook_at_ms: None,
             wait_reason: None,
+            observer_reason: None,
             observer_health: ObserverHealth::Unknown,
             observer_health_since_ms: 0,
             started_at_ms: 0,
@@ -835,7 +1025,7 @@ mod tests {
         let project = ProjectId::try_from("p").unwrap();
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
-        question.wait_reason = Some("Which branch?".to_owned());
+        question.wait_reason = Some("provider question: Which branch?".to_owned());
         let mut permission = session(SessionState::WaitingForInput, 20);
         permission.id = SessionId::try_from("s2").unwrap();
         permission.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
@@ -916,10 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_human_hooks_outrank_delivery_words_in_the_prompt() {
+    fn authoritative_wait_causes_do_not_infer_answers_from_notification_text() {
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
-        question.wait_reason = Some("Which recovery branch should I use?".to_owned());
+        question.wait_reason =
+            Some("provider question: Which recovery branch should I use?".to_owned());
         let (_, question) = session_reason(&question).unwrap();
         assert_eq!(question.kind, AttentionReasonKind::ProviderQuestion);
         assert_eq!(question.action, AttentionAction::AnswerInTerminal);
@@ -931,6 +1122,19 @@ mod tests {
         assert_eq!(permission.kind, AttentionReasonKind::ProviderPermission);
         assert_eq!(permission.action, AttentionAction::ReviewProviderPermission);
 
+        let mut idle = session(SessionState::WaitingForInput, 25);
+        idle.last_hook_event = Some(ProviderHookEvent::Notification);
+        idle.wait_reason = Some("provider idle: waiting for operator".to_owned());
+        let (_, idle) = session_reason(&idle).unwrap();
+        assert_eq!(idle.kind, AttentionReasonKind::Inferred);
+        assert_eq!(idle.action, AttentionAction::InspectInferredState);
+
+        let mut old_notification = session(SessionState::WaitingForInput, 26);
+        old_notification.last_hook_event = Some(ProviderHookEvent::Notification);
+        old_notification.wait_reason = Some("Approve delivery?".to_owned());
+        let (_, old_notification) = session_reason(&old_notification).unwrap();
+        assert_eq!(old_notification.kind, AttentionReasonKind::Inferred);
+
         let mut synthetic_delivery = session(SessionState::WaitingForInput, 30);
         synthetic_delivery.last_hook_event = Some(ProviderHookEvent::Notification);
         synthetic_delivery.wait_reason = Some("delivery unacknowledged".to_owned());
@@ -940,5 +1144,77 @@ mod tests {
             AttentionReasonKind::DeliveryRecovery
         );
         assert_eq!(synthetic_delivery.action, AttentionAction::InspectRecovery);
+    }
+
+    #[test]
+    fn completed_prior_run_is_never_bound_to_the_next_queued_task_attention() {
+        let project = ProjectId::try_from("p").unwrap();
+        let mut waiting = session(SessionState::WaitingForInput, 30);
+        waiting.wait_reason = Some("delivery unacknowledged".to_owned());
+        let running = task("current-task", TaskStatus::Running, 35);
+        let next = task("next-task", TaskStatus::Queued, 40);
+        let mut delivery_status = status(agent("a", false), Some(waiting), vec![running, next]);
+        delivery_status.latest_run = Some(run(RunStatus::Succeeded, None));
+
+        let item = attention_items(&project, &[delivery_status], &[], false)
+            .into_iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::DeliveryRecovery)
+            .unwrap();
+        assert_eq!(item.task_id.as_ref().map(TaskId::as_str), Some("next-task"));
+        assert!(item.run_id.is_none());
+
+        let mut budget = status(
+            agent("b", false),
+            None,
+            vec![task("later-task", TaskStatus::Queued, 50)],
+        );
+        budget.latest_run = Some(run(RunStatus::Succeeded, None));
+        budget.budget.exhausted = true;
+        let item = attention_items(&project, &[budget], &[], false)
+            .into_iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::BudgetExhausted)
+            .unwrap();
+        assert!(item.task_id.is_none());
+        assert!(item.session_id.is_none());
+        assert!(item.run_id.is_none());
+    }
+
+    #[test]
+    fn active_queue_attention_counts_and_targets_only_queued_work() {
+        let project = ProjectId::try_from("p").unwrap();
+        let running = task("current-task", TaskStatus::Running, 10);
+
+        let running_only = status(agent("a", true), None, vec![running.clone()]);
+        let items = attention_items(&project, &[running_only], &[], true);
+        assert!(items.iter().all(|item| !matches!(
+            item.reason.kind,
+            AttentionReasonKind::PausedWithWork | AttentionReasonKind::WaitingForCapacity
+        )));
+
+        let next = task("next-task", TaskStatus::Queued, 20);
+        let paused = status(agent("a", true), None, vec![running.clone(), next.clone()]);
+        let paused_item = attention_items(&project, &[paused], &[], true)
+            .into_iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::PausedWithWork)
+            .unwrap();
+        assert_eq!(
+            paused_item.task_id.as_ref().map(TaskId::as_str),
+            Some("next-task")
+        );
+        assert_eq!(paused_item.reason.summary, "paused with 1 queued task(s)");
+
+        let waiting = status(agent("a", false), None, vec![running, next]);
+        let waiting_item = attention_items(&project, &[waiting], &[], true)
+            .into_iter()
+            .find(|item| item.reason.kind == AttentionReasonKind::WaitingForCapacity)
+            .unwrap();
+        assert_eq!(
+            waiting_item.task_id.as_ref().map(TaskId::as_str),
+            Some("next-task")
+        );
+        assert_eq!(
+            waiting_item.reason.summary,
+            "1 queued task(s) but the daemon is at its live-session cap"
+        );
     }
 }

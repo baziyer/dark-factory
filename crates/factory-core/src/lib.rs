@@ -482,6 +482,9 @@ pub struct SessionSnapshot {
     /// bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
+    /// Independent bounded explanation for degraded terminal observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_reason: Option<String>,
     #[serde(default)]
     pub observer_health: ObserverHealth,
     #[serde(default)]

@@ -610,12 +610,11 @@ Two different test doubles exist at two different layers, easy to conflate:
 - They do not own a PTY, call `send_input`/`resize`/`stop`, or read process
   output — that is generic, implemented once.
 - They do not guess precise session state when the underlying CLI does not
-  expose it. Claude's `Notification` hook and Codex's `PermissionRequest`
-  hook (added in Codex 0.147.0; no Claude equivalent name, since Claude's
-  permission prompts already surface through `Notification`) are both
-  treated uniformly as "waiting for input," whether that's a permission
-  prompt or genuine idle-wait — providers report what actually happened;
-  the state machine, not the provider, decides what it means. A provider
+  expose it. Codex's `PermissionRequest` hook (added in Codex 0.147.0) is an
+  authoritative approval prompt. Claude reports permissions, elicitation,
+  and idle waits through `Notification`; the daemon retains its exact
+  `notification_type`, and an absent or unknown subtype remains an ambiguous
+  wait rather than being presented as a question. A provider
   does not answer `PermissionRequest` approval prompts; auto mode prevents
   those prompts. The separate `PreToolUse` hook always receives the
   factory's allow/deny policy answer and is durably audited.

@@ -403,10 +403,18 @@ fn render_attention_card(
             &format!("safe action: {}", item.action_text()),
             inner_width,
         )));
-        lines.push(Line::from(ui::truncate(
-            "typing off; Ctrl-] to enter",
-            inner_width,
-        )));
+        if matches!(
+            item.reason.action,
+            factory_core::status::AttentionAction::AnswerInTerminal
+                | factory_core::status::AttentionAction::ReviewProviderPermission
+        ) {
+            lines.push(Line::from(ui::truncate(
+                "typing off; Ctrl-] to enter",
+                inner_width,
+            )));
+        } else {
+            lines.push(Line::from("terminal typing is not an action"));
+        }
     } else {
         lines.push(Line::from(ui::truncate(
             "safe action: refresh NEEDS YOU",

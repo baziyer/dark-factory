@@ -373,6 +373,7 @@ pub struct SessionRow {
     /// be marked, not silently presented as exact.
     pub activity_inferred: bool,
     pub wait_reason: Option<String>,
+    pub observer_reason: Option<String>,
     pub observer_health: ObserverHealth,
     pub observer_health_since_ms: i64,
     pub runner_instance_id: RunnerInstanceId,
@@ -415,6 +416,7 @@ impl SessionRow {
             last_hook_event: self.last_hook_event,
             last_hook_at_ms: self.last_hook_at_ms,
             wait_reason: self.wait_reason.clone(),
+            observer_reason: self.observer_reason.clone(),
             observer_health: self.observer_health,
             observer_health_since_ms: self.observer_health_since_ms,
             started_at_ms: self.started_at_ms,
@@ -2212,6 +2214,79 @@ impl Store {
         ))
     }
 
+    /// Records whether the daemon can attach to a live session's runner PTY.
+    /// Attach failures are shared durable observer state, not a TUI-only note;
+    /// the next successful attach clears the exact daemon-owned failure reason.
+    pub fn record_terminal_attach_health(
+        &mut self,
+        session_id: &SessionId,
+        failure: Option<String>,
+        now_ms: i64,
+    ) -> Result<Option<(SessionSnapshot, EventEnvelope)>> {
+        if failure
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_WAIT_REASON_BYTES)
+        {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        let attach_was_degraded = session
+            .observer_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("terminal attach failed: "));
+        let (health, next_reason) = match failure {
+            Some(reason) => (ObserverHealth::Degraded, Some(reason)),
+            None if attach_was_degraded => (ObserverHealth::Healthy, None),
+            None if session.observer_health == ObserverHealth::Unknown => {
+                (ObserverHealth::Healthy, session.observer_reason.clone())
+            }
+            None => (session.observer_health, session.observer_reason.clone()),
+        };
+        if session.observer_health == health && session.observer_reason == next_reason {
+            return Ok(None);
+        }
+        let health_since_ms = if session.observer_health == health {
+            session.observer_health_since_ms
+        } else {
+            now_ms
+        };
+        transaction.execute(
+            "UPDATE sessions
+             SET observer_health = ?1, observer_health_since_ms = ?2,
+                 observer_reason = ?3, updated_at_ms = ?4
+             WHERE id = ?5",
+            params![
+                observer_health_value(health),
+                health_since_ms,
+                next_reason,
+                now_ms,
+                session_id.as_str(),
+            ],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        transaction.commit()?;
+        Ok(Some((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: changed,
+            },
+        )))
+    }
+
     /// Every session the daemon must reconnect to after a restart.
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
@@ -3776,7 +3851,7 @@ impl Store {
             .ok_or(StoreError::TaskNotFound)?;
         if !matches!(
             task.snapshot.status,
-            TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Blocked | TaskStatus::Failed | TaskStatus::Cancelled
         ) {
             return Err(StoreError::TaskNotRetryable);
         }
@@ -3786,7 +3861,7 @@ impl Store {
              SET status = 'queued', result = NULL, started_at_ms = NULL,
                  completed_at_ms = NULL, blocked_reason = NULL, updated_at_ms = ?1
              WHERE id = ?2 AND project_id = ?3
-               AND status IN ('failed', 'cancelled')",
+               AND status IN ('blocked', 'failed', 'cancelled')",
             params![now_ms, task_id.as_str(), project_id.as_str()],
         )?;
         if changed != 1 {
@@ -5407,8 +5482,8 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.runtime_permission_mode, s.runtime_control_mode,
                     s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
                     s.state, s.state_since_ms,
-                    s.activity, s.activity_inferred, s.wait_reason, s.observer_health,
-                    s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
+                    s.activity, s.activity_inferred, s.wait_reason, s.observer_reason,
+                    s.observer_health, s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
                     s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
                     s.started_at_ms, s.updated_at_ms, s.ended_at_ms, s.exit_code,
                     s.exit_signal, s.stop_requested_at_ms,
@@ -5426,10 +5501,10 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
     let state: String = row.get(12)?;
-    let observer_health: String = row.get(17)?;
-    let protocol: i64 = row.get(21)?;
-    let last_hook_event: Option<String> = row.get(22)?;
-    let current_run_id: Option<String> = row.get(31)?;
+    let observer_health: String = row.get(18)?;
+    let protocol: i64 = row.get(22)?;
+    let last_hook_event: Option<String> = row.get(23)?;
+    let current_run_id: Option<String> = row.get(32)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -5448,25 +5523,26 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         activity: row.get(14)?,
         activity_inferred: row.get(15)?,
         wait_reason: row.get(16)?,
-        observer_health: parse_observer_health(&observer_health, 17)?,
-        observer_health_since_ms: row.get(18)?,
-        runner_instance_id: parse_id(row.get(19)?, 19)?,
-        runner_runtime: row.get(20)?,
+        observer_reason: row.get(17)?,
+        observer_health: parse_observer_health(&observer_health, 18)?,
+        observer_health_since_ms: row.get(19)?,
+        runner_instance_id: parse_id(row.get(20)?, 20)?,
+        runner_runtime: row.get(21)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(21, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(22, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 22))
+            .map(|value| parse_provider_hook_event(&value, 23))
             .transpose()?,
-        last_hook_at_ms: row.get(23)?,
-        started_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
-        ended_at_ms: row.get(26)?,
-        exit_code: row.get(27)?,
-        exit_signal: row.get(28)?,
-        stop_requested_at_ms: row.get(29)?,
-        delivery_recovery_stop_requested_at_ms: row.get(30)?,
-        current_run_id: parse_optional_id(current_run_id, 31)?,
+        last_hook_at_ms: row.get(24)?,
+        started_at_ms: row.get(25)?,
+        updated_at_ms: row.get(26)?,
+        ended_at_ms: row.get(27)?,
+        exit_code: row.get(28)?,
+        exit_signal: row.get(29)?,
+        stop_requested_at_ms: row.get(30)?,
+        delivery_recovery_stop_requested_at_ms: row.get(31)?,
+        current_run_id: parse_optional_id(current_run_id, 32)?,
     })
 }
 

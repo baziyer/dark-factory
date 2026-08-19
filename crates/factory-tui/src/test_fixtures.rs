@@ -124,6 +124,7 @@ pub(crate) fn session(
         last_hook_event: None,
         last_hook_at_ms: None,
         wait_reason: None,
+        observer_reason: None,
         observer_health: ObserverHealth::Unknown,
         observer_health_since_ms: 0,
         started_at_ms: 0,

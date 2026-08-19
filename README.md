@@ -142,7 +142,10 @@ factoryctl agent status --project my-project --agent worker-1
 `factoryctl status` is a concise fleet summary for people, including each
 bounded attention reason, its task/session/age, and a safe next action.
 `factoryctl agent status` exposes the same structured attention projection for
-one agent. Use `--json` when a script needs the complete protocol frame.
+one agent. Terminal attach failures are durable observer problems in that same
+projection and disappear after a successful reattach without erasing an
+independent provider question, permission, or delivery wait. Use `--json` when a
+script needs the complete protocol frame.
 
 You can answer an agent in its terminal or send a durable message:
 
@@ -151,7 +154,8 @@ factoryctl agent message --project my-project --to worker-1 \
   --body "Continue with the smaller fix."
 ```
 
-Pause an agent before recovery work. Use `task retry` for failed or cancelled
+Pause an agent before recovery work. After resolving a reported block, use
+`task retry` to requeue a blocked task; it also requeues failed or cancelled
 tasks. Use each command's `--help` option for its exact arguments.
 
 Repository authority is write-once and must be set while the factory has no

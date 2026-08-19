@@ -615,11 +615,24 @@ fn spawn_terminal_attach(
         let mut subscription = match client.attach_terminal(since_offset).await {
             Ok(subscription) => subscription,
             Err(error) => {
+                // A future/rotated client cursor is a request error, not a
+                // loss of the daemon's ability to observe the runner.
+                if attach_error_degrades_observer(&error) {
+                    record_terminal_attach_health(
+                        &state,
+                        &session_id,
+                        Some(bounded_hook_field(&format!(
+                            "terminal attach failed: {error}"
+                        ))),
+                    )
+                    .await;
+                }
                 let response = runner_control_failure(error, "attach terminal").into_response();
                 let _ = send_terminal_error(&frame_tx, response).await;
                 return;
             }
         };
+        record_terminal_attach_health(&state, &session_id, None).await;
         if frame_tx
             .send(ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
@@ -646,6 +659,14 @@ fn spawn_terminal_attach(
                     }
                 }
                 Err(error) => {
+                    record_terminal_attach_health(
+                        &state,
+                        &session_id,
+                        Some(bounded_hook_field(&format!(
+                            "terminal attach failed: {error}"
+                        ))),
+                    )
+                    .await;
                     let response = runner_control_failure(error, "attach terminal").into_response();
                     let _ = send_terminal_error(&frame_tx, response).await;
                     return;
@@ -653,6 +674,33 @@ fn spawn_terminal_attach(
             }
         }
     });
+}
+
+fn attach_error_degrades_observer(error: &RunnerClientError) -> bool {
+    !matches!(
+        error,
+        RunnerClientError::RunnerRejected {
+            code: RunnerErrorCode::InvalidRequest
+        }
+    )
+}
+
+async fn record_terminal_attach_health(
+    state: &ApiState,
+    session_id: &SessionId,
+    failure: Option<String>,
+) {
+    let session_id = session_id.clone();
+    let _ = state
+        .commit_and_publish(move |store| {
+            let Some((_, event)) =
+                store.record_terminal_attach_health(&session_id, failure, now_ms()?)?
+            else {
+                return Ok(((), Vec::new()));
+            };
+            Ok(((), vec![event]))
+        })
+        .await;
 }
 
 async fn send_terminal_error(
@@ -750,13 +798,14 @@ async fn handle_request(
         }
         LocalRequest::FleetStatus => {
             let live_session_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
-            let (projects, live_sessions, generated_at_ms, auto_mode) = state
+            let (projects, live_sessions, generated_at_ms, auto_mode, event_sequence) = state
                 .with_store(move |store| {
                     Ok((
                         store.fleet_status()?,
                         store.live_session_count()?,
                         now_ms()?,
                         store.auto_mode()?,
+                        store.latest_event_sequence()?,
                     ))
                 })
                 .await?;
@@ -794,6 +843,7 @@ async fn handle_request(
             Ok(LocalResponse::FleetStatus {
                 status: status::FleetStatus {
                     generated_at_ms,
+                    event_sequence,
                     auto_mode,
                     live_session_cap,
                     live_sessions,
@@ -840,7 +890,7 @@ async fn handle_request(
         } => {
             let lookup_project_id = project_id.clone();
             let lookup_agent_id = agent_id.clone();
-            let (mut agent_status, blocked, live_sessions, generated_at_ms) = state
+            let (mut agent_status, blocked, live_sessions, generated_at_ms, event_sequence) = state
                 .with_store(move |store| {
                     let status = store.agent_status(&lookup_project_id, &lookup_agent_id)?;
                     let blocked = store
@@ -850,7 +900,13 @@ async fn handle_request(
                             blocked.task.assigned_agent_id.as_ref() == Some(&lookup_agent_id)
                         })
                         .collect::<Vec<_>>();
-                    Ok((status, blocked, store.live_session_count()?, now_ms()?))
+                    Ok((
+                        status,
+                        blocked,
+                        store.live_session_count()?,
+                        now_ms()?,
+                        store.latest_event_sequence()?,
+                    ))
                 })
                 .await?;
             let at_capacity = live_sessions >= execution.max_active_runs();
@@ -872,6 +928,7 @@ async fn handle_request(
             Ok(LocalResponse::AgentStatus {
                 status: Box::new(status::AgentStatusDetail {
                     generated_at_ms,
+                    event_sequence,
                     status: agent_status,
                     detail,
                     worktree,
@@ -2837,7 +2894,20 @@ fn compute_hook_fields(
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("waiting for input");
-            (None, false, Some(bounded_hook_field(message)))
+            let cause = match payload
+                .get("notification_type")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("permission_prompt") => "provider permission: ",
+                Some("elicitation_dialog") => "provider question: ",
+                Some("idle_prompt") => "provider idle: ",
+                _ => "provider notification: ",
+            };
+            (
+                None,
+                false,
+                Some(bounded_hook_field(&format!("{cause}{message}"))),
+            )
         }
         ProviderHookEvent::PermissionRequest => {
             // Codex's own approval prompt (`docs/providers.md`'s
@@ -3244,6 +3314,66 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
 /// `UserPromptSubmit` hooks deliberately bypass it and reach the durable
 /// attempt fence; otherwise gate contention could fail open while recovery
 /// concurrently retires the provider thread.
+#[cfg(test)]
+mod hook_field_tests {
+    use super::*;
+
+    #[test]
+    fn claude_notification_subtype_is_the_only_answerability_authority() {
+        for (notification_type, prefix) in [
+            ("permission_prompt", "provider permission: "),
+            ("elicitation_dialog", "provider question: "),
+            ("idle_prompt", "provider idle: "),
+            ("unknown", "provider notification: "),
+        ] {
+            let (_, _, reason) = compute_hook_fields(
+                ProviderHookEvent::Notification,
+                &serde_json::json!({
+                    "notification_type": notification_type,
+                    "message": "Approve delivery?"
+                }),
+            );
+            assert!(reason.unwrap().starts_with(prefix));
+        }
+        let (_, _, reason) = compute_hook_fields(
+            ProviderHookEvent::Notification,
+            &serde_json::json!({"message": "Which branch?"}),
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("provider notification: Which branch?")
+        );
+    }
+
+    #[test]
+    fn client_cursor_rejection_does_not_degrade_runner_observation() {
+        assert!(!attach_error_degrades_observer(
+            &RunnerClientError::RunnerRejected {
+                code: RunnerErrorCode::InvalidRequest,
+            }
+        ));
+        assert!(attach_error_degrades_observer(
+            &RunnerClientError::RunnerRejected {
+                code: RunnerErrorCode::Conflict,
+            }
+        ));
+    }
+}
+
+/// Wiring-level tests for the two deletion-gate call sites this file adds
+/// around `execution::stop_hook_reply`/`execution::commit_pending_delivery_on_prompt`
+/// (PR #50 review, round 3's nit): every existing `tests/local_api.rs`/
+/// `tests/sessions_e2e.rs` suite still passes even if `try_begin_agent_write`'s
+/// result is discarded at both call sites (the reviewer verified this by
+/// mutation), because neither hook path's *ordinary* behavior depends on
+/// the gate -- only the race this PR closes does, and that race needs a
+/// second, concurrent request to observe. These tests drive
+/// `handle_request` directly (visible here, not from the external
+/// `tests/` crate, since it is module-private) with the agent already
+/// marked deleting, so no real race or timing is needed: the assertion is
+/// "this exact call, with the mark already set, must not touch the store
+/// the way it normally would" -- exactly what the mutation the reviewer
+/// tried would break.
 #[cfg(test)]
 mod deletion_gate_tests {
     use std::os::unix::fs::PermissionsExt;
