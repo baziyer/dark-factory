@@ -3478,7 +3478,6 @@ mod tests {
                 }
             )
         );
-        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
         assert!(
             request_for(CliCommand::Attach {
                 project_id: "project-1".into(),
@@ -4147,7 +4146,12 @@ mod tests {
             Some("from-env".into())
         );
         assert_eq!(resolve_or_env(None, Some(String::new())), None);
-        assert_eq!(resolve_or_env(None, None), None);
+        let missing = resolve_or_env(None, None)
+            .ok_or_else(|| "--project is required (or set $DARK_FACTORY_PROJECT)".to_owned());
+        assert_eq!(
+            missing.unwrap_err(),
+            "--project is required (or set $DARK_FACTORY_PROJECT)"
+        );
     }
 
     #[test]

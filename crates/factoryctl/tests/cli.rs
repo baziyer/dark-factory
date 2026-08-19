@@ -591,6 +591,71 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
     server.join().unwrap();
 }
 
+#[test]
+fn explicit_project_wins_over_the_dark_factory_project_environment_variable() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::GetProject {
+                project_id: ProjectId::try_from("explicit").unwrap(),
+            })
+        );
+        write_response(
+            &mut stream,
+            LocalResponse::Health {
+                runner_path: "/opt/factory-runner".to_owned(),
+                factoryctl_path: "/opt/factoryctl".to_owned(),
+                version: "0.1.0".to_owned(),
+                process_id: 0,
+            },
+        );
+    });
+
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "project",
+            "get",
+            "--project",
+            "explicit",
+        ])
+        .env("DARK_FACTORY_PROJECT", "from-worker-environment")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    server.join().unwrap();
+}
+
+#[test]
+fn missing_project_is_clear_when_the_worker_environment_is_absent() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            directory.path().join("missing.sock").to_str().unwrap(),
+            "project",
+            "get",
+        ])
+        .env_remove("DARK_FACTORY_PROJECT")
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("--project is required (or set $DARK_FACTORY_PROJECT)"),
+        "{output:?}"
+    );
+}
+
 /// `agent message --from` falls back to `$DARK_FACTORY_AGENT`, matching how
 /// the daemon exports it into a session so an agent's own `factoryctl agent
 /// message` calls are attributed to it without repeating `--from`.
