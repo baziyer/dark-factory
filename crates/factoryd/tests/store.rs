@@ -6,7 +6,34 @@ use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
     NewTask, Store, StoreError, UpdateAgentProfile,
 };
-use std::sync::{Arc, Barrier};
+use std::{
+    path::Path,
+    sync::{Arc, Barrier},
+    time::{Duration, Instant},
+};
+
+fn open_race_stores(first: &Path, second: &Path) -> factoryd::store::Result<[Store; 2]> {
+    Ok([Store::open(first)?, Store::open(second)?])
+}
+
+#[test]
+fn concurrent_store_setup_failure_is_reported_before_barrier_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let valid_database = directory.path().join("valid.db");
+    let invalid_database = directory.path().join("missing").join("factory.db");
+    let started = Instant::now();
+    let result = open_race_stores(&valid_database, &invalid_database);
+    let Err(error) = result else {
+        panic!("invalid sibling setup unexpectedly succeeded");
+    };
+
+    assert!(matches!(error, StoreError::Sqlite(_)));
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "setup failure took too long: {:?}",
+        started.elapsed()
+    );
+}
 
 #[test]
 fn connector_event_idempotency_is_atomic_and_survives_restart() {
@@ -143,30 +170,36 @@ fn concurrent_mismatched_connector_events_keep_the_first_payload_only() {
         .unwrap();
     drop(setup);
 
+    let stores = open_race_stores(&database, &database).unwrap();
     let barrier = Arc::new(Barrier::new(2));
     let results = std::thread::scope(|scope| {
-        let handles = [1_u8, 2_u8].map(|variant| {
-            let database = database.clone();
-            let barrier = Arc::clone(&barrier);
-            scope.spawn(move || {
-                let mut store = Store::open(database).unwrap();
-                barrier.wait();
-                store.apply_connector_event(
-                    "monitor",
-                    "evt-race",
-                    [variant; 32],
-                    ConnectorEventInput::Task {
-                        id: task_id(&format!("connector-{variant}")),
-                        project_id: project_id("factory"),
-                        title: format!("Imported {variant}"),
-                        body: format!("Payload {variant}"),
-                        priority: 0,
-                    },
-                    i64::from(variant) + 1,
-                )
+        let handles = [1_u8, 2_u8]
+            .into_iter()
+            .zip(stores)
+            .map(|(variant, mut store)| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store.apply_connector_event(
+                        "monitor",
+                        "evt-race",
+                        [variant; 32],
+                        ConnectorEventInput::Task {
+                            id: task_id(&format!("connector-{variant}")),
+                            project_id: project_id("factory"),
+                            title: format!("Imported {variant}"),
+                            body: format!("Payload {variant}"),
+                            priority: 0,
+                        },
+                        i64::from(variant) + 1,
+                    )
+                })
             })
-        });
-        handles.map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
     });
     assert_eq!(
         results
@@ -405,25 +438,29 @@ fn concurrent_tool_observations_cannot_cross_the_limit() {
         .unwrap();
     drop(store);
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    let mut joins = Vec::new();
-    for now in [4, 5] {
-        let database = database.clone();
-        let barrier = barrier.clone();
-        joins.push(std::thread::spawn(move || {
-            let mut store = Store::open(database).unwrap();
-            barrier.wait();
-            store
-                .observe_tool_call(&project_id("factory"), &agent_id("worker"), now)
-                .unwrap()
-                .1
-        }));
-    }
-    let denied = joins
-        .into_iter()
-        .map(|join| join.join().unwrap())
-        .filter(|denied| *denied)
-        .count();
+    let stores = open_race_stores(&database, &database).unwrap();
+    let barrier = Arc::new(Barrier::new(2));
+    let denied = std::thread::scope(|scope| {
+        let handles = [4, 5]
+            .into_iter()
+            .zip(stores)
+            .map(|(now, mut store)| {
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    store
+                        .observe_tool_call(&project_id("factory"), &agent_id("worker"), now)
+                        .unwrap()
+                        .1
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|denied| *denied)
+            .count()
+    });
     assert_eq!(denied, 1);
     let store = Store::open(database).unwrap();
     let budget = store
