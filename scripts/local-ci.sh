@@ -1,30 +1,13 @@
 #!/bin/sh
 set -eu
 
-. "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/local-ci-lease.sh"
-
-local_ci_cleanup() {
-    local_ci_status=$?
-    trap - EXIT HUP INT TERM
-    local_ci_lease_release || true
-    exit "$local_ci_status"
-}
-
-local_ci_signal() {
-    local_ci_signal_status=$1
-    trap - EXIT HUP INT TERM
-    local_ci_lease_release || true
-    exit "$local_ci_signal_status"
-}
-
-trap local_ci_cleanup EXIT
-trap 'local_ci_signal 129' HUP
-trap 'local_ci_signal 130' INT
-trap 'local_ci_signal 143' TERM
-
-local_ci_lease_acquire
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+if [ "${DARK_FACTORY_LOCAL_CI_LEASE_HELD-}" != 1 ]; then
+    exec "$script_dir/with-local-ci-lease.sh" "$script_dir/local-ci.sh"
+fi
 
 ./scripts/test-local-ci-lease.sh
+./scripts/test-local-ci-lease-mutations.sh
 ./scripts/check-toolchain-pins.sh
 ./scripts/test-prepare-release-source.sh
 ./scripts/test-publish-release.sh
