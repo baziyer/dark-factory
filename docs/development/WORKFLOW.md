@@ -29,11 +29,13 @@ unregistered worktrees. Publication uses a server-enforced exact lease and
 binds PR mutations to the exact published commit. `factoryctl change abandon`
 records a durable removing state before cleanup, so an authenticated retry can
 resume it; if the provider session terminates, the daemon first retains the
-change as abandoned while closing the run, so a dead provider cannot remain
-recorded live. Daemon startup does not reconcile it automatically. Creation
-retries recover an exact worktree left by a database failure. An abandoned
-ledger row is retained until its task, agent, or project is deleted, then
-purged in the same parent-row transaction after the active-state precheck.
+change as recoverable while closing the run, so a dead provider cannot remain
+recorded live and a later authenticated retry can resume the exact change.
+`abandoned` means the worktree removal already succeeded. Daemon startup does
+not reconcile either state automatically. Creation retries recover an exact
+worktree left by a database failure. An abandoned ledger row is retained until
+its task, agent, or project is deleted, then purged in the same parent-row
+transaction after the managed-path precheck.
 
 ### Testing resident sessions
 

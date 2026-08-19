@@ -204,11 +204,13 @@ catalogue.
    revalidates an exact derived worktree left by a database-gap crash; daemon
    startup does not perform this reconciliation automatically. If the provider
    session terminates, the shared repository lifecycle gate first moves an
-   active/removing change to `abandoned` before closing its run, preserving
+   active/removing change to `recoverable` before closing its run, preserving
    the worktree for authenticated recovery without leaving a dead session
-   recorded live. Review, merge, and release
-   remain outside this API; abandoned ledger rows are purged transactionally
-   immediately before their task, agent, or project parent is deleted. The
+   recorded live. A later authenticated retry/new run can resume it; only
+   successful filesystem cleanup changes the row to `abandoned`. Review, merge,
+   and release remain outside this API; abandoned ledger rows are purged
+   transactionally immediately before their task, agent, or project parent is
+   deleted, while recoverable rows keep those deletions blocked. The
    #159 readiness projection consumes this target
    rather than being duplicated here.
 9. Once deletion of an agent or project begins, every known writer of files

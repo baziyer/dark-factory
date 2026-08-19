@@ -2530,9 +2530,13 @@ async fn abandon_managed_change_request(
                 .map_err(repository_failure)?;
         }
         if worktree_exists {
-            crate::worktrees::remove_managed(Path::new(&project.root), Path::new(&change.worktree))
-                .await
-                .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
+            crate::worktrees::remove_managed(
+                Path::new(&project.root),
+                Path::new(&change.worktree),
+                &change.head_sha,
+            )
+            .await
+            .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
         }
         state
             .commit_and_publish({

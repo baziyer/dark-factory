@@ -26,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 25;
+const SCHEMA_VERSION: i64 = 27;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -1923,7 +1923,7 @@ impl Store {
             let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
             // A provider can terminate after a managed change was registered,
             // but the dead session cannot authenticate a later abandon call.
-            // Retain the exact filesystem/lease record as abandoned before
+            // Retain the exact filesystem/lease record as recoverable before
             // closing the run; the daemon repository slot serializes this
             // transition with create, abandon, and StopRun.
             if let Some(task_id) = run.task_id.as_ref() {
@@ -3675,7 +3675,7 @@ impl Store {
             .query_row(
                 "SELECT task_id FROM managed_changes
                  WHERE project_id = ?1 AND agent_id = ?2
-                   AND state IN ('active', 'removing')",
+                   AND state IN ('active', 'removing', 'recoverable')",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
@@ -3719,7 +3719,7 @@ impl Store {
                         base_sha, head_sha, published_head_sha, state
                  FROM managed_changes
                  WHERE project_id = ?1 AND task_id = ?2
-                   AND state IN ('active', 'removing')",
+                   AND state IN ('active', 'removing', 'recoverable')",
                 params![project_id.as_str(), task_id.as_str()],
                 load_managed_change,
             )
@@ -3748,7 +3748,7 @@ impl Store {
                         git_dir_inode, common_dir_device, common_dir_inode,
                         base_sha, head_sha, published_head_sha, state
                  FROM managed_changes WHERE task_id = ?1
-                   AND state IN ('active', 'removing')",
+                   AND state IN ('active', 'removing', 'recoverable')",
                 params![record.task_id.as_str()],
                 load_managed_change,
             )
@@ -3764,7 +3764,7 @@ impl Store {
             .query_row(
                 "SELECT task_id FROM managed_changes
                  WHERE project_id = ?1 AND agent_id = ?2
-                   AND state IN ('active', 'removing')",
+                   AND state IN ('active', 'removing', 'recoverable')",
                 params![record.project_id.as_str(), record.agent_id.as_str()],
                 |row| row.get(0),
             )
@@ -3820,7 +3820,8 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE managed_changes SET head_sha = ?4, published_head_sha = ?4,
                     updated_at_ms = ?5
-             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3 AND state = 'active'",
+             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3
+               AND state IN ('active', 'recoverable')",
             params![
                 project_id.as_str(),
                 task_id.as_str(),
@@ -3848,7 +3849,7 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE managed_changes SET state = 'removing', updated_at_ms = ?4
              WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3
-               AND state IN ('active', 'removing')",
+               AND state IN ('active', 'removing', 'recoverable')",
             params![
                 project_id.as_str(),
                 task_id.as_str(),
@@ -3872,7 +3873,7 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE managed_changes SET state = 'abandoned', updated_at_ms = ?4
              WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3
-               AND state IN ('active', 'removing')",
+               AND state IN ('active', 'removing', 'recoverable')",
             params![
                 project_id.as_str(),
                 task_id.as_str(),
@@ -4316,7 +4317,7 @@ impl Store {
         let _task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
-        reject_active_managed_change(&transaction, task_id)?;
+        reject_managed_change(&transaction, task_id)?;
         let has_active_run: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM runs
@@ -5324,6 +5325,22 @@ fn reject_active_managed_change(connection: &Connection, task_id: &TaskId) -> Re
     }
 }
 
+fn reject_managed_change(connection: &Connection, task_id: &TaskId) -> Result<()> {
+    let managed: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM managed_changes
+             WHERE task_id = ?1 AND state IN ('active', 'removing', 'recoverable')
+         )",
+        params![task_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if managed {
+        Err(StoreError::TaskHasActiveChange)
+    } else {
+        Ok(())
+    }
+}
+
 fn abandon_managed_change_on_session_end(
     transaction: &Transaction<'_>,
     task_id: &TaskId,
@@ -5331,7 +5348,7 @@ fn abandon_managed_change_on_session_end(
 ) -> Result<()> {
     transaction.execute(
         "UPDATE managed_changes
-         SET state = 'abandoned', updated_at_ms = ?2
+         SET state = 'recoverable', updated_at_ms = ?2
          WHERE task_id = ?1 AND state IN ('active', 'removing')",
         params![task_id.as_str(), now_ms],
     )?;
@@ -5533,7 +5550,7 @@ fn check_agent_deletable(
         "SELECT EXISTS(
             SELECT 1 FROM managed_changes
             WHERE project_id = ?1 AND agent_id = ?2
-              AND state IN ('active', 'removing')
+              AND state IN ('active', 'removing', 'recoverable')
          )",
         params![project_id.as_str(), agent_id.as_str()],
         |row| row.get(0),
@@ -5589,7 +5606,7 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     let has_active_change: bool = connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM managed_changes
-            WHERE project_id = ?1 AND state IN ('active', 'removing')
+            WHERE project_id = ?1 AND state IN ('active', 'removing', 'recoverable')
          )",
         params![project_id.as_str()],
         |row| row.get(0),
@@ -6331,6 +6348,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0026_managed_changes.sql"))?;
         transaction.pragma_update(None, "user_version", 26)?;
         transaction.commit()?;
+        current = 26;
+    }
+    if current == 26 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0027_recoverable_managed_changes.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 27)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6897,7 +6923,7 @@ mod tests {
     }
 
     #[test]
-    fn session_end_abandons_a_managed_change_before_closing_the_run() {
+    fn session_end_keeps_a_managed_change_recoverable_until_explicit_abandon() {
         let (mut store, project_id, _agent_id, task_id) = running_managed_fixture();
         let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
         let (session, _) = store.end_session(&session_id, Some(1), None, 9).unwrap();
@@ -6910,7 +6936,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(change_state, "abandoned");
+        assert_eq!(change_state, "recoverable");
+        assert_eq!(
+            store.managed_change(&project_id, &task_id).unwrap().state,
+            "recoverable"
+        );
         assert_eq!(
             store
                 .get_task(&project_id, &task_id)
@@ -6919,6 +6949,95 @@ mod tests {
                 .status,
             TaskStatus::Failed
         );
+        assert!(matches!(
+            store.delete_task(&project_id, &task_id, 10),
+            Err(StoreError::TaskHasActiveChange)
+        ));
+        assert!(matches!(
+            store.check_agent_deletable(&project_id, &_agent_id),
+            Err(StoreError::AgentHasActiveChange)
+        ));
+        assert!(matches!(
+            store.check_project_deletable(&project_id),
+            Err(StoreError::ProjectHasActiveChange)
+        ));
+    }
+
+    #[test]
+    fn retry_and_new_authenticated_run_can_resume_then_abandon_session_exit_change() {
+        let (mut store, project_id, agent_id, task_id) = running_managed_fixture();
+        let ended_session = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        store.end_session(&ended_session, Some(1), None, 9).unwrap();
+
+        store.retry_task(&project_id, &task_id, 10).unwrap();
+        let resumed_session = SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: resumed_session.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/project/worktree".into(),
+                    codex_home: None,
+                    hook_token: "b".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "44444444-4444-4444-8444-444444444444",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/project/runner-2".into(),
+                    runner_protocol_version: 1,
+                },
+                11,
+            )
+            .unwrap();
+        store
+            .synthesize_session_start(&resumed_session, 12)
+            .unwrap();
+        store
+            .open_run_episode(&resumed_session, &task_id, 13)
+            .unwrap();
+        let resumed_run_id = store
+            .list_runs(&project_id, None, 10)
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        let resumed = store
+            .managed_change_for_identity(&project_id, &agent_id, Some(&resumed_run_id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.state, "recoverable");
+        let published = store
+            .publish_managed_change_head(&project_id, &task_id, &agent_id, &"b".repeat(40), 14)
+            .unwrap();
+        assert_eq!(
+            published.published_head_sha.as_deref(),
+            Some(published.head_sha.as_str())
+        );
+
+        let removing = store
+            .begin_abandon_managed_change(&project_id, &task_id, &agent_id, 14)
+            .unwrap();
+        assert_eq!(removing.state, "removing");
+        let abandoned = store
+            .finish_abandon_managed_change(&project_id, &task_id, &agent_id, 15)
+            .unwrap();
+        assert_eq!(abandoned.state, "abandoned");
+        store
+            .end_session(&resumed_session, Some(0), None, 16)
+            .unwrap();
+        store.delete_task(&project_id, &task_id, 17).unwrap();
+        assert!(matches!(
+            store.managed_change(&project_id, &task_id),
+            Err(StoreError::ManagedChangeNotFound)
+        ));
     }
 
     #[test]

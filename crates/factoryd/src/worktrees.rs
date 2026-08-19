@@ -136,19 +136,44 @@ pub async fn remove(project_root: &Path, worktree_dir: &Path) -> Result<(), Work
 }
 
 /// Removes a daemon-managed change worktree after the repository layer has
-/// proved its sandbox clean and its remote lease safe. The normal agent
-/// worktree removal above intentionally refuses dirty paths; managed commits
-/// use a daemon-owned index, so their real checkout can still contain the
-/// already-published files even though the authoritative sandbox is clean.
-pub async fn remove_managed(project_root: &Path, worktree_dir: &Path) -> Result<(), WorktreeError> {
+/// proved its sandbox clean and its remote lease safe. The daemon commit
+/// sandbox has a separate index, so build a temporary index at the registered
+/// HEAD and let ordinary (non-force) removal perform the final cleanliness
+/// check against the real checkout. A file written after the caller's earlier
+/// validation therefore makes removal fail closed instead of being deleted.
+pub async fn remove_managed(
+    project_root: &Path,
+    worktree_dir: &Path,
+    expected_head: &str,
+) -> Result<(), WorktreeError> {
+    let current = run_git(worktree_dir, &["rev-parse", "--verify", "HEAD"]).await?;
+    if !current.status.success() || String::from_utf8_lossy(&current.stdout).trim() != expected_head
+    {
+        return Err(WorktreeError::Git(
+            "managed worktree HEAD changed during removal".into(),
+        ));
+    }
+    let index_directory = tempfile::tempdir().map_err(WorktreeError::Io)?;
+    let index = index_directory.path().join("index");
+    let prepared = run_git_with_index(project_root, &["read-tree", expected_head], &index).await?;
+    if !prepared.status.success() {
+        return Err(WorktreeError::Git(
+            String::from_utf8_lossy(&prepared.stderr).into_owned(),
+        ));
+    }
     let target = worktree_dir.to_string_lossy().into_owned();
-    let output = run_git(project_root, &["worktree", "remove", "--force", &target]).await?;
+    let output = run_git_with_index(project_root, &["worktree", "remove", &target], &index).await?;
     if output.status.success() {
         return Ok(());
     }
-    Err(WorktreeError::Git(
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("contains modified or untracked files")
+        || stderr.contains("is dirty")
+        || stderr.contains("locked working tree")
+    {
+        return Err(WorktreeError::Dirty);
+    }
+    Err(WorktreeError::Git(stderr.into_owned()))
 }
 
 /// `git status --porcelain=v1 --branch --no-optional-locks` of
@@ -308,6 +333,21 @@ async fn run_git(project_root: &Path, args: &[&str]) -> std::io::Result<std::pro
         .arg("-C")
         .arg(project_root)
         .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .await
+}
+
+async fn run_git_with_index(
+    project_root: &Path,
+    args: &[&str],
+    index: &Path,
+) -> std::io::Result<std::process::Output> {
+    Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(args)
+        .env("GIT_INDEX_FILE", index)
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
@@ -569,5 +609,56 @@ mod tests {
 
         assert!(matches!(error, WorktreeError::Dirty));
         assert!(worktree_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_managed_refuses_a_mutation_after_validation() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_dir = repo.path().join("worktrees").join("curie");
+        add(repo.path(), &worktree_dir, "issue/curie")
+            .await
+            .unwrap();
+        let head = run_git(&worktree_dir, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+
+        // This write stands in for the provider racing the caller's earlier
+        // ensure_abandonable check. The final non-force removal must preserve
+        // it rather than treating the pre-check as authorization to delete.
+        let created_after_validation = worktree_dir.join("created-after-validation.txt");
+        std::fs::write(&created_after_validation, b"must survive\n").unwrap();
+
+        let error = remove_managed(repo.path(), &worktree_dir, &head)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, WorktreeError::Dirty), "{error}");
+        assert_eq!(
+            std::fs::read(&created_after_validation).unwrap(),
+            b"must survive\n"
+        );
+        assert!(worktree_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_managed_uses_the_registered_head_for_a_clean_checkout() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let worktree_dir = repo.path().join("worktrees").join("curie");
+        add(repo.path(), &worktree_dir, "issue/curie")
+            .await
+            .unwrap();
+        let head = run_git(&worktree_dir, &["rev-parse", "HEAD"])
+            .await
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_owned();
+
+        remove_managed(repo.path(), &worktree_dir, &head)
+            .await
+            .unwrap();
+
+        assert!(!worktree_dir.exists());
     }
 }

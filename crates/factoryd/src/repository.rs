@@ -1578,6 +1578,7 @@ mod tests {
             exit_code: None,
             exit_signal: None,
             stop_requested_at_ms: None,
+            delivery_recovery_stop_requested_at_ms: None,
             current_run_id: None,
         }
     }
@@ -1936,6 +1937,7 @@ mod tests {
             exit_code: None,
             exit_signal: None,
             stop_requested_at_ms: None,
+            delivery_recovery_stop_requested_at_ms: None,
             current_run_id: None,
         };
         let registered = Target::validate_with_change(
@@ -2015,6 +2017,7 @@ mod tests {
                 exit_code: None,
                 exit_signal: None,
                 stop_requested_at_ms: None,
+                delivery_recovery_stop_requested_at_ms: None,
                 current_run_id: None,
             },
             project,
