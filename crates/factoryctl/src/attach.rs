@@ -100,9 +100,15 @@ pub fn run(
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
     let stdin_rx = spawn_stdin_reader();
-    let exit_code = forward_stdin(client, &project_id, &session_id, &failed, &stdin_rx);
+    let exit_code = forward_with_guard(
+        raw_mode,
+        client,
+        &project_id,
+        &session_id,
+        &failed,
+        &stdin_rx,
+    );
 
-    drop(raw_mode);
     let _ = output_thread.join();
     if let Some(message) = failure
         .lock()
@@ -114,12 +120,15 @@ pub fn run(
     Ok(exit_code)
 }
 
-fn spawn_output_thread(
+fn spawn_output_thread<I>(
     first_frame: Option<Result<ServerFrame, factoryctl::ClientError>>,
-    frames: factoryctl::TerminalFrames,
+    frames: I,
     done: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
-) -> thread::JoinHandle<()> {
+) -> thread::JoinHandle<()>
+where
+    I: Iterator<Item = Result<ServerFrame, factoryctl::ClientError>> + Send + 'static,
+{
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
         for frame in first_frame.into_iter().chain(frames) {
@@ -160,6 +169,22 @@ fn spawn_output_thread(
         }
         done.store(true, Ordering::SeqCst);
     })
+}
+
+/// Runs the forwarding loop while owning the terminal-mode guard. Keeping this production seam
+/// generic lets the refusal-frame regression prove that the same wake path drops its guard
+/// without requiring a provider prompt or a real TTY in the test process.
+fn forward_with_guard<G>(
+    guard: G,
+    client: &Client,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    failed: &AtomicBool,
+    input: &Receiver<Vec<u8>>,
+) -> i32 {
+    let exit_code = forward_stdin(client, project_id, session_id, failed, input);
+    drop(guard);
+    exit_code
 }
 
 fn format_attach_refusal(refusal: &AttachRefusal) -> String {
@@ -346,22 +371,59 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn late_refusal_wakes_stdin_forwarding_without_input() {
+    fn late_refusal_frame_wakes_forwarding_and_drops_terminal_guard() {
+        struct RestoreProbe(Arc<AtomicBool>);
+
+        impl Drop for RestoreProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let failed = Arc::new(AtomicBool::new(false));
-        let failed_later = Arc::clone(&failed);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            failed_later.store(true, Ordering::SeqCst);
-        });
+        let failure = Arc::new(Mutex::new(None));
+        let refusal = AttachRefusal {
+            project_id: ProjectId::try_from("project-1").unwrap(),
+            session_id: SessionId::try_from("session-1").unwrap(),
+            runner_instance_id: None,
+            session_state: None,
+            reason: AttachRefusalReason::RunnerRejected,
+        };
+        let output_thread = spawn_output_thread(
+            None,
+            std::iter::once(Ok(ServerFrame::Response {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                response: LocalResponse::AttachRefused { refusal },
+            })),
+            Arc::clone(&failed),
+            Arc::clone(&failure),
+        );
         let (_input_tx, input_rx) = mpsc::channel();
         let client = Client::new("/tmp/factoryctl-attach-test.sock");
         let project_id = ProjectId::try_from("project-1").unwrap();
         let session_id = SessionId::try_from("session-1").unwrap();
+        let restored = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
 
-        let exit_code = forward_stdin(&client, &project_id, &session_id, &failed, &input_rx);
+        let exit_code = forward_with_guard(
+            RestoreProbe(Arc::clone(&restored)),
+            &client,
+            &project_id,
+            &session_id,
+            &failed,
+            &input_rx,
+        );
+        output_thread.join().unwrap();
 
         assert_eq!(exit_code, 2);
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(restored.load(Ordering::SeqCst));
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|message| message.contains("runner rejected terminal attach"))
+        );
     }
 }

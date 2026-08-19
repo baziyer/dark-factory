@@ -618,6 +618,27 @@ impl Board {
         self.reconcile_attention_focus();
     }
 
+    /// Removes a local attach failure only when the durable session link or its runner generation
+    /// no longer matches the failure owner. Detaching a pane because AGENT is no longer desired
+    /// must not reopen an identity-matching nonretryable refusal fence.
+    pub fn clear_local_attach_failure_if_identity_changed(
+        &mut self,
+        session_id: &SessionId,
+    ) -> bool {
+        let failure_identity = self.attach_failure_identities.get(session_id).cloned();
+        let durable_identity = self.session_attach_identity(session_id);
+        let still_linked = self
+            .agents
+            .values()
+            .any(|agent| agent.current_session_id.as_ref() == Some(session_id));
+        if failure_identity != durable_identity || !still_linked {
+            self.clear_local_attach_failure(session_id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn clear_undesired_attach_failures(&mut self, desired: &[SessionId]) -> bool {
         let previous = (
             self.local_attention.len(),

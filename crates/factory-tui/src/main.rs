@@ -410,7 +410,7 @@ fn sync_panes(
     for session_id in stale {
         if let Some(mut pane) = panes.remove(&session_id) {
             pane.kill();
-            board.clear_local_attach_failure(&session_id);
+            board.clear_local_attach_failure_if_identity_changed(&session_id);
             changed = true;
         }
     }
@@ -1198,6 +1198,51 @@ mod main_tests {
         assert!(board.attention_items().is_empty());
         release_tx.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn stale_pane_detach_preserves_an_identity_matching_nonretryable_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(session_id.clone());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        assert!(
+            board.note_attach_refusal(&factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: session_id.clone(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Stopped),
+                reason: factory_core::local::AttachRefusalReason::SessionEnded,
+            })
+        );
+
+        board.view = model::View::Building;
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id.clone(),
+            Pane::spawn("stale", &["/bin/cat".to_owned()], 24, 80, None).unwrap(),
+        );
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+
+        assert!(panes.is_empty());
+        assert!(!board.take_attach_retry(&session_id));
+        assert!(board.attention_items().iter().any(|item| {
+            item.session_id.as_ref() == Some(&session_id)
+                && item.reason.kind == factory_core::status::AttentionReasonKind::ObserverProblem
+        }));
     }
 
     #[test]
