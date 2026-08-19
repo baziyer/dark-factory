@@ -439,6 +439,7 @@ fn sync_panes(
                     if let Some(mut stale) = panes.remove(&session_id) {
                         stale.kill();
                     }
+                    net::spawn_fleet_snapshot(client.clone(), tx.clone());
                     changed = true;
                     continue;
                 }
