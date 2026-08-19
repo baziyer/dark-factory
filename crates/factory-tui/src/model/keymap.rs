@@ -1257,7 +1257,10 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
 mod tests {
     use super::*;
     use crate::test_fixtures::{agent, attention, project, session, task};
-    use factory_core::{AgentRole, SessionState, TaskStatus, status::AttentionReasonKind};
+    use factory_core::{
+        AgentRole, ObserverHealth, ProviderHookEvent, ProviderNotificationKind, SessionState,
+        TaskStatus, status::AttentionReasonKind,
+    };
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1735,6 +1738,100 @@ mod tests {
             board.attention_items()[0].reason.kind,
             AttentionReasonKind::ProviderPermission
         );
+    }
+
+    #[test]
+    fn same_sequence_status_and_event_preserve_every_structured_session_reason() {
+        let cases = [
+            AttentionReasonKind::ProviderPermission,
+            AttentionReasonKind::ProviderQuestion,
+            AttentionReasonKind::ObserverProblem,
+            AttentionReasonKind::DeliveryRecovery,
+        ];
+
+        for kind in cases {
+            let item = attention(kind, Some("alice"), None, Some("session"), 1);
+            let snapshot = session_for_attention(kind);
+
+            let mut status_first = board();
+            status_first.apply_fleet_status(factory_core::status::FleetStatus {
+                generated_at_ms: 2,
+                event_sequence: 12,
+                auto_mode: true,
+                live_session_cap: 4,
+                live_sessions: 1,
+                projects: Vec::new(),
+                attention: vec![item.clone()],
+            });
+            status_first.apply_event(factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 12,
+                occurred_at_ms: 3,
+                event: factory_core::FactoryEvent::SessionChanged {
+                    session: snapshot.clone(),
+                },
+            });
+            assert_eq!(
+                status_first
+                    .attention_items()
+                    .iter()
+                    .map(|item| item.reason.kind)
+                    .collect::<Vec<_>>(),
+                vec![kind],
+                "status-first lost {kind:?}"
+            );
+
+            let mut event_first = board();
+            event_first.apply_event(factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 12,
+                occurred_at_ms: 2,
+                event: factory_core::FactoryEvent::SessionChanged { session: snapshot },
+            });
+            event_first.apply_fleet_status(factory_core::status::FleetStatus {
+                generated_at_ms: 3,
+                event_sequence: 12,
+                auto_mode: true,
+                live_session_cap: 4,
+                live_sessions: 1,
+                projects: Vec::new(),
+                attention: vec![item],
+            });
+            assert_eq!(
+                event_first
+                    .attention_items()
+                    .iter()
+                    .map(|item| item.reason.kind)
+                    .collect::<Vec<_>>(),
+                vec![kind],
+                "event-first lost {kind:?}"
+            );
+        }
+    }
+
+    fn session_for_attention(kind: AttentionReasonKind) -> factory_core::SessionSnapshot {
+        let mut snapshot = session("session", "alice", "proj", SessionState::WaitingForInput);
+        match kind {
+            AttentionReasonKind::ProviderPermission => {
+                snapshot.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
+                snapshot.wait_reason = Some("approve command".into());
+            }
+            AttentionReasonKind::ProviderQuestion => {
+                snapshot.last_hook_event = Some(ProviderHookEvent::Notification);
+                snapshot.notification_kind = Some(ProviderNotificationKind::ElicitationDialog);
+                snapshot.wait_reason = Some("Which branch should I use?".into());
+            }
+            AttentionReasonKind::ObserverProblem => {
+                snapshot.state = SessionState::Working;
+                snapshot.observer_health = ObserverHealth::Degraded;
+                snapshot.observer_reason = Some("runner disconnected".into());
+            }
+            AttentionReasonKind::DeliveryRecovery => {
+                snapshot.wait_reason = Some("delivery unacknowledged".into());
+            }
+            _ => unreachable!("only session-owned structured reasons belong here"),
+        }
+        snapshot
     }
 
     #[test]

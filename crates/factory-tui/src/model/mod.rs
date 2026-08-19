@@ -30,8 +30,7 @@ use factory_core::status::{
 };
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
-    Provider, ProviderHookEvent, ProviderNotificationKind, RunId, RunSnapshot, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId,
+    Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
 };
 
 pub use announcements::Announcement;
@@ -859,7 +858,7 @@ impl Board {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
             FactoryEvent::SessionChanged { session } => {
-                let retain_reason = session_actionable_reason(session);
+                let retain_reason = factory_core::status::session_attention_reason_kind(session);
                 self.invalidate_attention(|item| {
                     item.session_id.as_ref() == Some(&session.id)
                         && (retain_reason != Some(item.reason.kind))
@@ -1259,30 +1258,6 @@ pub(crate) fn same_attention_source(a: &AttentionItem, b: &AttentionItem) -> boo
         && a.session_id == b.session_id
         && a.run_id == b.run_id
         && a.since_ms == b.since_ms
-}
-
-fn session_actionable_reason(session: &SessionSnapshot) -> Option<AttentionReasonKind> {
-    if session.state != SessionState::WaitingForInput {
-        return None;
-    }
-    match (session.last_hook_event, session.notification_kind) {
-        (Some(ProviderHookEvent::PermissionRequest), _) => {
-            Some(AttentionReasonKind::ProviderPermission)
-        }
-        (
-            Some(ProviderHookEvent::Notification),
-            Some(ProviderNotificationKind::PermissionPrompt),
-        ) => Some(AttentionReasonKind::ProviderPermission),
-        (
-            Some(ProviderHookEvent::Notification),
-            Some(
-                ProviderNotificationKind::ElicitationDialog
-                | ProviderNotificationKind::ElicitationUrlDialog
-                | ProviderNotificationKind::AgentNeedsInput,
-            ),
-        ) => Some(AttentionReasonKind::ProviderQuestion),
-        _ => None,
-    }
 }
 
 fn truncate_status(text: &str, max: usize) -> String {
