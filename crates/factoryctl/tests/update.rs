@@ -58,12 +58,16 @@ impl Fixture {
     /// Writes an archive of four fake executables and a manifest naming
     /// `version`, returns the manifest's `file://` URL.
     fn publish(&self, version: &str, sha_override: Option<&str>) -> String {
-        let source = self.root.path().join(format!("src-{version}"));
+        self.publish_at(version, version, sha_override)
+    }
+
+    fn publish_at(&self, version: &str, path_version: &str, sha_override: Option<&str>) -> String {
+        let source = self.root.path().join(format!("src-{path_version}"));
         self.write_binaries(&source, version);
         let archive = self
             .root
             .path()
-            .join(format!("dark-factory-v{version}.tar.gz"));
+            .join(format!("dark-factory-v{path_version}.tar.gz"));
         assert!(
             Command::new("tar")
                 .arg("-czf")
@@ -86,7 +90,7 @@ impl Fixture {
                 String::from_utf8(output.stdout).unwrap()[..64].to_owned()
             }
         };
-        let manifest = self.root.path().join(format!("latest-{version}.json"));
+        let manifest = self.root.path().join(format!("latest-{path_version}.json"));
         fs::write(
             &manifest,
             serde_json::json!({
@@ -105,7 +109,8 @@ impl Fixture {
         format!("file://{}", manifest.display())
     }
 
-    fn factoryctl(&self, url: &str, args: &[&str]) -> (i32, Value, String) {
+    fn factoryctl_json(&self, url: &str, args: &[&str]) -> (i32, Value, String) {
+        assert!(args.contains(&"--json"), "JSON helper requires --json");
         let output = self.command(url, args).output().expect("run factoryctl");
         let stdout = String::from_utf8(output.stdout).unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -117,10 +122,22 @@ impl Fixture {
 
     fn command(&self, url: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
+        command.args(args);
+        command
+            .env("DARK_FACTORY_HOME", self.home())
+            .env("HOME", self.root.path().join("user-home"))
+            .env_remove("DARK_FACTORY_SOCKET")
+            .env("DARK_FACTORY_UPDATE_URL", url);
+        command
+    }
+
+    fn human_command(&self, url: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
         command
             .args(args)
             .env("DARK_FACTORY_HOME", self.home())
             .env("HOME", self.root.path().join("user-home"))
+            .env_remove("DARK_FACTORY_SOCKET")
             .env("DARK_FACTORY_UPDATE_URL", url);
         command
     }
@@ -278,7 +295,7 @@ fn prepend_path(command: &mut Command, directory: &Path) {
 fn update_reports_a_newer_release_and_caches_the_check() {
     let fixture = Fixture::new();
     let url = fixture.publish("999.0.0", None);
-    let (code, report, _) = fixture.factoryctl(&url, &["update"]);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
     assert_eq!(code, 0);
     assert_eq!(report["current"], factoryctl::update::CURRENT_VERSION);
     assert!(report["active"].is_null());
@@ -301,20 +318,132 @@ fn update_reports_a_newer_release_and_caches_the_check() {
 }
 
 #[test]
+fn update_is_human_readable_by_default_and_names_both_versions() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    let url = fixture.publish("999.0.0", None);
+    let output = fixture.human_command(&url, &["update"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("invoking factoryctl: "));
+    assert!(stdout.contains("active runtime (bin/current): 0.1.0\n"));
+    assert!(stdout.contains("latest release: 999.0.0\n"));
+    assert!(stdout.contains("update --install: available\n"));
+    assert!(!stdout.trim_start().starts_with('{'));
+
+    let json_output = fixture
+        .human_command(&url, &["update", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(report["current"], factoryctl::update::CURRENT_VERSION);
+    assert_eq!(report["active"], "0.1.0");
+}
+
+#[test]
+fn human_update_output_sanitizes_manifest_text_but_json_keeps_it_exact() {
+    let fixture = Fixture::new();
+    let hostile = "999.0.0-rc\u{1b}[2J\nupdate --install: forged";
+    let url = fixture.publish_at(hostile, "hostile", None);
+    let output = fixture.human_command(&url, &["update"]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!output.stdout.contains(&0x1b_u8));
+    assert_eq!(
+        output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
+        4
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("latest release: 999.0.0-rc?[2J?update --install: forged\n"));
+
+    let (_, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
+    assert_eq!(report["latest"], hostile);
+}
+
+#[test]
+fn matching_active_release_reports_no_install_work_human_and_json() {
+    let fixture = Fixture::new();
+    let version = factoryctl::update::CURRENT_VERSION;
+    fixture.activate(version);
+    let url = fixture.publish(version, None);
+
+    let output = fixture.human_command(&url, &["update"]).output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("update --install: not needed\n")
+    );
+
+    let (_, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
+    assert_eq!(report["update_available"], false);
+
+    let output = fixture
+        .human_command(&url, &["update", "--install"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains(&format!(
+        "update --install: installed {version} (restart the daemon yourself)\n"
+    )));
+}
+
+#[test]
+fn human_install_branches_report_their_actual_work() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    let url = fixture.publish("999.0.0", None);
+    let output = fixture
+        .human_command(&url, &["update", "--install"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("update --install: installed 999.0.0 (restart the daemon yourself)\n")
+    );
+
+    let fixture = Fixture::new();
+    fixture.activate("999.0.0");
+    let url = fixture.publish(factoryctl::update::CURRENT_VERSION, None);
+    let output = fixture
+        .human_command(&url, &["update", "--install"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("update --install: not needed\n"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn homebrew_bootstrap_updates_an_older_active_runtime() {
     let fixture = Fixture::new();
     fixture.activate("0.1.0");
     let latest = factoryctl::update::CURRENT_VERSION;
     let url = fixture.publish(latest, None);
 
-    let (code, report, stderr) = fixture.factoryctl(&url, &["update"]);
+    let (code, report, stderr) = fixture.factoryctl_json(&url, &["update", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(report["current"], latest);
     assert_eq!(report["active"], "0.1.0");
     assert_eq!(report["latest"], latest);
     assert_eq!(report["update_available"], true);
 
-    let (code, report, stderr) = fixture.factoryctl(&url, &["update", "--install"]);
+    let (code, report, stderr) = fixture.factoryctl_json(&url, &["update", "--install", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(report["installed"], latest);
     assert_eq!(report["launchd"], "not_installed");
@@ -337,7 +466,7 @@ fn update_malformed_existing_capacity_restores_runtime_and_reports_unchanged_job
     let socket = fixture.home().join("f.sock");
     let server = serve_managed_health_once(&socket, "0.1.0", &fixture.home(), 4242);
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     prepend_path(&mut command, &tools);
     let output = command
         .env("FAKE_LAUNCHCTL_LOG", &log)
@@ -405,7 +534,7 @@ fn production_update_revalidates_a_candidate_after_a_competing_newer_activation(
         }
     });
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -449,7 +578,7 @@ fn matching_active_runtime_and_daemon_are_a_no_op() {
     let socket = fixture.home().join("f.sock");
     let server = serve_health_once(&socket, latest);
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     let output = command
         .env("DARK_FACTORY_SOCKET", &socket)
         .output()
@@ -478,7 +607,7 @@ fn launchd_reload_failure_rolls_back_the_active_runtime() {
     let url = fixture.publish(latest, None);
     let (tools, log) = fixture.fake_launchctl(false);
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     prepend_path(&mut command, &tools);
     let output = command.env("FAKE_LAUNCHCTL_LOG", &log).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
@@ -512,7 +641,7 @@ fn update_failed_activation_restores_runtime_before_old_job_and_checks_managed_h
     let socket = fixture.home().join("f.sock");
     let server = serve_managed_health_once(&socket, "0.1.0", &fixture.home(), 4242);
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     prepend_path(&mut command, &tools);
     let output = command
         .env("FAKE_LAUNCHCTL_LOG", &log)
@@ -552,7 +681,7 @@ fn launchd_reload_restarts_into_the_new_active_runtime() {
     let socket = fixture.home().join("f.sock");
     let server = serve_health_once(&socket, latest);
 
-    let mut command = fixture.command(&url, &["update", "--install"]);
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     prepend_path(&mut command, &tools);
     let output = command
         .env("FAKE_LAUNCHCTL_LOG", &log)
@@ -579,10 +708,10 @@ fn launchd_reload_restarts_into_the_new_active_runtime() {
 fn update_with_nothing_newer_is_a_no_op_for_install_too() {
     let fixture = Fixture::new();
     let url = fixture.publish("0.0.1", None);
-    let (code, report, _) = fixture.factoryctl(&url, &["update"]);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
     assert_eq!(code, 0);
     assert_eq!(report["update_available"], false);
-    let (code, report, _) = fixture.factoryctl(&url, &["update", "--install"]);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--install", "--json"]);
     assert_eq!(code, 0);
     assert_eq!(report["installed"], false);
     assert!(!fixture.home().join("bin").exists());
@@ -593,7 +722,7 @@ fn update_never_downgrades_a_newer_active_runtime() {
     let fixture = Fixture::new();
     fixture.activate("999.0.0");
     let url = fixture.publish(factoryctl::update::CURRENT_VERSION, None);
-    let (code, report, stderr) = fixture.factoryctl(&url, &["update", "--install"]);
+    let (code, report, stderr) = fixture.factoryctl_json(&url, &["update", "--install", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(report["active"], "999.0.0");
     assert_eq!(report["update_available"], false);
@@ -604,7 +733,8 @@ fn update_never_downgrades_a_newer_active_runtime() {
 #[test]
 fn update_reports_an_unreachable_manifest_as_an_error() {
     let fixture = Fixture::new();
-    let (code, report, _) = fixture.factoryctl("http://127.0.0.1:9/never", &["update"]);
+    let (code, report, _) =
+        fixture.factoryctl_json("http://127.0.0.1:9/never", &["update", "--json"]);
     assert_eq!(code, 1);
     assert!(report["error"].as_str().unwrap().contains("failed"));
     assert_eq!(report["update_available"], false);
@@ -626,7 +756,7 @@ fn install_verifies_unpacks_and_activates_then_reports_no_launchd_job() {
     assert!(!fixture.home().join("bin/999.0.0").exists());
 
     let url = fixture.publish("999.0.0", None);
-    let (code, report, stderr) = fixture.factoryctl(&url, &["update", "--install"]);
+    let (code, report, stderr) = fixture.factoryctl_json(&url, &["update", "--install", "--json"]);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(report["installed"], "999.0.0");
     assert_eq!(report["launchd"], "not_installed");
@@ -653,7 +783,7 @@ fn install_verifies_unpacks_and_activates_then_reports_no_launchd_job() {
     assert!(!fixture.root.path().join("user-home/Library").exists());
 
     // Running it again with the same release already on disk just re-activates.
-    let (code, report, _) = fixture.factoryctl(&url, &["update", "--install"]);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--install", "--json"]);
     assert_eq!(code, 0);
     assert_eq!(report["installed"], "999.0.0");
     assert_eq!(read_link(&bin.join("current")), "999.0.0");

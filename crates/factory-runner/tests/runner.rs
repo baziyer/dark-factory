@@ -988,10 +988,12 @@ fn forced_stop_reaps_nested_child_and_grandchild_before_terminal_event() {
         "stop-nested",
     );
     runner.wait_for_terminal_spool();
-    wait_for_process_exit(child_pid);
-    wait_for_process_exit(grandchild_pid);
-
     let frames = subscribe_through_terminal(&runner, 0);
+    // Observe the durable terminal event before checking either descendant:
+    // waiting for the PIDs first would let a regression publish Exited while
+    // provider tools were still alive without this test noticing.
+    assert_process_is_gone(child_pid);
+    assert_process_is_gone(grandchild_pid);
     assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
         event,
         RunnerEvent::Exited {
@@ -1087,6 +1089,55 @@ fn runner_sigterm_reaps_the_group_and_preserves_unacknowledged_spool() {
             )
         })
     }));
+}
+
+/// An abrupt runner loss cannot publish the cleanup boundary. The daemon must
+/// therefore retain the live ownership row and route cleanup failure instead
+/// of treating the runner's disappearance as a clean `Exited`.
+#[test]
+fn abrupt_runner_loss_does_not_publish_exited_with_descendants_alive() {
+    let directory = tempfile::tempdir().unwrap();
+    let child_marker = directory.path().join("abrupt-child.pid");
+    let grandchild_marker = directory.path().join("abrupt-grandchild.pid");
+    let mut runner = RunningRunner::spawn_program(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "trap '' TERM; /bin/sh -c 'sleep 30 >/dev/null 2>&1 & echo $! > \"$1\"; trap \"\" TERM; while :; do sleep 1; done' sh \"$2\" & echo $! > \"$1\"; while :; do sleep 1; done",
+            "sh",
+            child_marker.to_str().unwrap(),
+            grandchild_marker.to_str().unwrap(),
+        ],
+    );
+    let child_pid = wait_for_pid_file(&child_marker);
+    let grandchild_pid = wait_for_pid_file(&grandchild_marker);
+    let runner_pid = Pid::from_raw(i32::try_from(runner.runner_pid()).unwrap()).unwrap();
+
+    kill_process(runner_pid, Signal::KILL).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if runner.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+            runner.child.take();
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_process_is_alive(child_pid);
+    assert_process_is_alive(grandchild_pid);
+    let spool = fs::read_to_string(runner.spool()).unwrap();
+    assert!(!spool.lines().any(|line| {
+        serde_json::from_str::<RunnerEventEnvelope>(line)
+            .is_ok_and(|event| matches!(event.event, RunnerEvent::Exited { .. }))
+    }));
+
+    // Only the exact fixture group is cleaned up; no name- or host-wide
+    // signal is used by this regression.
+    let child_group = Pid::from_raw(child_pid).unwrap();
+    let _ = kill_process_group(child_group, Signal::KILL);
+    let _ = kill_process(Pid::from_raw(child_pid).unwrap(), Signal::KILL);
+    let _ = kill_process(Pid::from_raw(grandchild_pid).unwrap(), Signal::KILL);
+    wait_for_process_exit_within(child_pid, Duration::from_secs(10));
+    wait_for_process_exit_within(grandchild_pid, Duration::from_secs(10));
 }
 
 /// The second production leak shape is an interrupted agent/tool turn: the
@@ -1382,8 +1433,12 @@ fn wait_for_pid_file(path: &Path) -> i32 {
 }
 
 fn wait_for_process_exit(raw_pid: i32) {
+    wait_for_process_exit_within(raw_pid, Duration::from_secs(5));
+}
+
+fn wait_for_process_exit_within(raw_pid: i32, timeout: Duration) {
     let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if rustix::process::test_kill_process(pid).is_err() {
             return;
@@ -1391,4 +1446,20 @@ fn wait_for_process_exit(raw_pid: i32) {
         thread::sleep(Duration::from_millis(10));
     }
     panic!("descendant process {raw_pid} survived group stop");
+}
+
+fn assert_process_is_gone(raw_pid: i32) {
+    let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
+    assert!(
+        rustix::process::test_kill_process(pid).is_err(),
+        "process {raw_pid} was still alive when RunnerEvent::Exited was observed"
+    );
+}
+
+fn assert_process_is_alive(raw_pid: i32) {
+    let pid = rustix::process::Pid::from_raw(raw_pid).unwrap();
+    assert!(
+        rustix::process::test_kill_process(pid).is_ok(),
+        "process {raw_pid} was unexpectedly gone"
+    );
 }

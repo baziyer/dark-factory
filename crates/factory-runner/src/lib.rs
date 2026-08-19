@@ -1904,6 +1904,7 @@ async fn supervise_terminal(
     let mut kill_deadline: Option<Pin<Box<Sleep>>> = None;
     let mut runner_signalled = false;
     let mut stop_requested = false;
+    let mut group_killed = false;
     let mut reader_open = true;
     let mut raw_mode_pending = true;
     let status = loop {
@@ -1987,6 +1988,7 @@ async fn supervise_terminal(
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
                 signal_process_group(pid, sentinel_pid, Signal::KILL)?;
+                group_killed = true;
                 kill_deadline = None;
             }
             command = terminal_commands.recv() => {
@@ -2019,6 +2021,7 @@ async fn supervise_terminal(
         &mut stops,
         &mut runner_shutdown,
         &mut runner_signalled,
+        &mut group_killed,
     )
     .await?;
 
@@ -2040,6 +2043,14 @@ async fn supervise_terminal(
             }
         }
     }
+    audit_private_runtime_processes(
+        &config.cwd,
+        &[
+            pid,
+            sentinel_pid,
+            Pid::from_raw(std::process::id() as i32).unwrap(),
+        ],
+    )?;
     write_cleanup_proof(&config.runtime_dir)?;
     log.append_lifecycle(
         RunnerEvent::Exited {
@@ -2055,6 +2066,69 @@ async fn supervise_terminal(
     } else {
         Ok(SupervisionOutcome::AwaitAcknowledgement)
     }
+}
+
+/// Performs one bounded ownership audit at the terminal cleanup boundary.
+///
+/// A process group and inherited lease cannot see a provider child that calls
+/// `setsid`, asks Node for `{ detached: true, stdio: "ignore" }`, and closes
+/// inherited descriptors. Such a child still has the private worktree as its
+/// cwd. We do not poll the process table during supervision and never signal
+/// a process discovered here: an exact private-cwd match is enough to fail
+/// closed, while an unavailable/ambiguous audit is also a cleanup failure.
+fn audit_private_runtime_processes(cwd: &Path, excluded: &[Pid]) -> Result<(), Error> {
+    match audit_private_runtime_processes_once(cwd, excluded) {
+        Ok(()) => Ok(()),
+        Err(first_error) => {
+            // A provider hook can still be reaping a short-lived helper when
+            // the PTY closes. Give that helper one bounded settle window;
+            // this is still a terminal-boundary audit, never a supervision
+            // or process-table polling loop. A detached child that remains
+            // alive is observed again and keeps the runner fail-closed.
+            std::thread::sleep(Duration::from_millis(100));
+            audit_private_runtime_processes_once(cwd, excluded).map_err(|_| first_error)
+        }
+    }
+}
+
+fn audit_private_runtime_processes_once(cwd: &Path, excluded: &[Pid]) -> Result<(), Error> {
+    let cwd = std::fs::canonicalize(cwd).map_err(|error| {
+        Error::Task(format!("cannot canonicalize private runtime cwd: {error}"))
+    })?;
+    let lsof = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
+    let output = std::process::Command::new(lsof)
+        .args(["-a", "-d", "cwd", "-Fn"])
+        .output()
+        .map_err(|error| Error::Task(format!("private process audit unavailable: {error}")))?;
+    if !output.status.success() {
+        return Err(Error::Task(
+            "private process audit could not prove runtime ownership".into(),
+        ));
+    }
+    let mut pid = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(raw) = line.strip_prefix('p') {
+            pid = raw.parse::<i32>().ok().and_then(Pid::from_raw);
+            continue;
+        }
+        let Some(path) = line.strip_prefix('n') else {
+            continue;
+        };
+        let path = Path::new(path);
+        if (path == cwd || path.starts_with(&cwd))
+            && let Some(pid) = pid
+            && !excluded.contains(&pid)
+        {
+            return Err(Error::Task(format!(
+                "unowned process {pid} remains in private runtime cwd"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn wait_status_to_exit(status: rustix::process::WaitStatus) -> (Option<i32>, Option<i32>) {
@@ -2310,8 +2384,13 @@ async fn reap_pty_group(
     stops: &mut mpsc::Receiver<StopCommand>,
     runner_shutdown: &mut watch::Receiver<bool>,
     runner_signalled: &mut bool,
+    group_killed: &mut bool,
 ) -> Result<(), Error> {
     if !sentinel_is_present(group_pid, sentinel_pid) {
+        if *group_killed {
+            wait_for_pty_lease_free(lease_path).await?;
+            return wait_for_pty_group_gone(group_pid).await;
+        }
         return Err(Error::Task(format!(
             "PTY cleanup ownership could not be proved (group={}, sentinel={}, sentinel_alive={}, sentinel_group={:?})",
             group_pid.as_raw_pid(),
@@ -2336,6 +2415,7 @@ async fn reap_pty_group(
         tokio::select! {
             () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
                 signal_process_group(group_pid, sentinel_pid, Signal::KILL)?;
+                *group_killed = true;
                 wait_for_pty_lease_free(lease_path).await?;
                 return wait_for_pty_group_gone(group_pid).await;
             }

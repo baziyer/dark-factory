@@ -18,7 +18,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
-/// its agents' statuses, its project backlog, and its blocked tasks (see
+/// its agents' statuses, its unassigned queue, and its blocked tasks (see
 /// [`Store::fleet_status`]).
 pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -52,6 +52,8 @@ const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AGENT_MODEL_BYTES: usize = 256;
 const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
 const MAX_RUNTIME_METADATA_BYTES: usize = 256;
+const MAX_DELIVERY_ATTEMPT_FAILURES: i64 = 2;
+const DELIVERY_RETRY_DELAY_MS: i64 = 5_000;
 /// Mirrors the `sessions.wait_reason`/`activity` CHECK bounds (migration
 /// 0014): the operator-facing explanation the hook state machine records.
 const MAX_WAIT_REASON_BYTES: usize = 512;
@@ -165,6 +167,45 @@ pub struct AgentMessage {
     /// idle session), so delivery is keyed to the session, with the run id
     /// recorded alongside only when one happened to be open.
     pub delivered_session_id: Option<SessionId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryAttempt {
+    pub id: String,
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub task_id: Option<TaskId>,
+    pub task_incarnation_id: Option<String>,
+    pub prior_run_count: Option<usize>,
+    pub message_ids: Vec<MessageId>,
+    pub text: String,
+    pub failure_count: u32,
+    pub next_attempt_at_ms: Option<i64>,
+    pub state: DeliveryAttemptState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryAttemptState {
+    InFlight,
+    Retryable,
+    Terminal,
+    Acknowledged,
+    Cancelled,
+}
+
+#[derive(Clone)]
+pub struct NewDeliveryAttempt {
+    pub id: String,
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub task_id: Option<TaskId>,
+    pub task_incarnation_id: Option<String>,
+    pub prior_run_count: Option<usize>,
+    pub message_ids: Vec<MessageId>,
+    pub text: String,
+    pub created_at_ms: i64,
 }
 
 /// Provider-independent task vocabulary exposed by authenticated integrations.
@@ -401,6 +442,7 @@ pub struct NewSession {
 pub struct SessionControlTarget {
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
+    pub worktree: String,
 }
 
 /// Minimal private identity required to resume observing a durable
@@ -465,18 +507,10 @@ pub enum StoreError {
     RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
-    #[error("task page cursor is stale; restart the listing")]
-    StaleTaskCursor,
-    #[error("task page cursor requires its queue revision")]
-    MissingTaskCursorRevision,
-    #[error("task page revision requires its cursor")]
-    UnexpectedTaskCursorRevision,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
-    #[error("agent model policy rejected the profile: {0}")]
-    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
     UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
@@ -509,10 +543,20 @@ pub enum StoreError {
     SessionAlreadyLive,
     #[error("session is not live")]
     SessionNotLive,
+    #[error("session is stopping")]
+    SessionStopping,
     #[error("provider cleanup is unverified; run the explicit cleanup verification first")]
     SessionCleanupUnverified,
     #[error("session does not need cleanup verification")]
     SessionCleanupNotFailed,
+    #[error("task page cursor is stale; restart the listing")]
+    StaleTaskCursor,
+    #[error("task page cursor requires its queue revision")]
+    MissingTaskCursorRevision,
+    #[error("task page revision requires its cursor")]
+    UnexpectedTaskCursorRevision,
+    #[error("agent model policy rejected the profile: {0}")]
+    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("session hook token is invalid")]
     InvalidHookToken,
     #[error("run is not in the required state")]
@@ -832,6 +876,18 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(agent_id) = assigned_agent_id.as_ref() {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2
+                )",
+                params![agent_id.as_str(), input.project_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::AgentNotFound);
+            }
+        }
         let (record, event) = insert_task(&transaction, input, assigned_agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
@@ -1215,8 +1271,9 @@ impl Store {
         ))
     }
 
-    /// The next queued task assigned to `agent_id`, in the canonical active
-    /// queue order, or `None` when the agent is paused or has no queued work.
+    /// The oldest queued task assigned to `agent_id`, in delivery order
+    /// (`created_at_ms, id`), or `None` when the agent is paused or has no
+    /// queued work.
     pub fn next_deliverable(
         &self,
         project_id: &ProjectId,
@@ -1230,7 +1287,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM tasks
                  WHERE project_id = ?1 AND assigned_agent_id = ?2 AND status = 'queued'
-                 ORDER BY priority DESC, created_at_ms, id
+                 ORDER BY created_at_ms, id
                  LIMIT 1",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get(0),
@@ -1610,6 +1667,13 @@ impl Store {
              WHERE id = ?2",
             params![now_ms, session_id.as_str()],
         )?;
+        transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE session_id = ?2
+               AND state IN ('in_flight', 'retryable', 'terminal')",
+            params![now_ms, session_id.as_str()],
+        )?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
         let event = FactoryEvent::SessionChanged {
@@ -1683,6 +1747,13 @@ impl Store {
         }
         let operator_stopped = session.stop_requested_at_ms.is_some();
         let graceful = operator_stopped || (exit_code == Some(0) && exit_signal.is_none());
+        transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE session_id = ?2
+               AND state IN ('in_flight', 'retryable', 'terminal')",
+            params![now_ms, session_id.as_str()],
+        )?;
         let state = if graceful {
             SessionState::Stopped
         } else {
@@ -1935,17 +2006,6 @@ impl Store {
         )))
     }
 
-    pub fn get_session(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<SessionSnapshot> {
-        let session = load_session(&self.connection, session_id)?
-            .filter(|session| session.project_id == *project_id)
-            .ok_or(StoreError::SessionNotFound)?;
-        Ok(session.snapshot())
-    }
-
     pub fn list_sessions(
         &self,
         project_id: &ProjectId,
@@ -1979,6 +2039,17 @@ impl Store {
                     .ok_or(StoreError::SessionNotFound)
             })
             .collect()
+    }
+
+    pub fn get_session(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionSnapshot> {
+        load_session(&self.connection, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .map(|session| session.snapshot())
+            .ok_or(StoreError::SessionNotFound)
     }
 
     /// The agent's current live session, if any.
@@ -2177,18 +2248,30 @@ impl Store {
     ) -> Result<SessionControlTarget> {
         self.connection
             .query_row(
-                "SELECT runner_instance_id, runner_runtime FROM sessions
+                "SELECT runner_instance_id, runner_runtime, worktree FROM sessions
                  WHERE id = ?1 AND project_id = ?2",
                 params![session_id.as_str(), project_id.as_str()],
                 |row| {
                     Ok(SessionControlTarget {
                         runner_instance_id: parse_id(row.get(0)?, 0)?,
                         runner_runtime: row.get(1)?,
+                        worktree: row.get(2)?,
                     })
                 },
             )
             .optional()
             .map_err(StoreError::from)?
+            .ok_or(StoreError::SessionNotFound)
+    }
+
+    pub fn session_snapshot(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionSnapshot> {
+        load_session(&self.connection, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .map(|session| session.snapshot())
             .ok_or(StoreError::SessionNotFound)
     }
 
@@ -2205,10 +2288,18 @@ impl Store {
         self.session_control_target(project_id, &session_id)
     }
 
-    /// The runner's control protocol is session-addressed even when the
-    /// operator selected a task-episode run. Keep that translation beside
-    /// `run_control_target` so StopRun cannot accidentally send the episode
-    /// id to a resident runner and claim the shared cleanup completed.
+    pub fn run_session_snapshot(
+        &self,
+        project_id: &ProjectId,
+        run_id: &RunId,
+    ) -> Result<SessionSnapshot> {
+        let run = load_run(&self.connection, run_id)?
+            .filter(|run| run.project_id == *project_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let session_id = run.session_id.ok_or(StoreError::SessionNotFound)?;
+        self.session_snapshot(project_id, &session_id)
+    }
+
     pub fn run_control_id(&self, project_id: &ProjectId, run_id: &RunId) -> Result<RunId> {
         let run = load_run(&self.connection, run_id)?
             .filter(|run| run.project_id == *project_id)
@@ -2228,12 +2319,29 @@ impl Store {
         task_id: &TaskId,
         now_ms: i64,
     ) -> Result<OpenedEpisode> {
+        self.open_run_episode_with_message_ids(session_id, task_id, None, now_ms)
+    }
+
+    /// Opens a task episode and delivers only the message ids captured by
+    /// the durable delivery attempt. `None` retains the legacy operation's
+    /// meaning of delivering the whole current inbox; delivery retries pass
+    /// `Some` so messages arriving after composition remain queued.
+    pub fn open_run_episode_with_message_ids(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        message_ids: Option<&[MessageId]>,
+        now_ms: i64,
+    ) -> Result<OpenedEpisode> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
+        }
+        if session.stop_requested_at_ms.is_some() {
+            return Err(StoreError::SessionStopping);
         }
         let has_open: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM runs WHERE session_id = ?1 AND ended_at_ms IS NULL)",
@@ -2290,14 +2398,25 @@ impl Store {
         task.snapshot.status = TaskStatus::Running;
         task.snapshot.updated_at_ms = now_ms;
 
-        let agent_messages = Self::deliver_agent_messages_in_transaction(
-            &transaction,
-            &session.project_id,
-            &session.agent_id,
-            session_id,
-            Some(&run_id),
-            now_ms,
-        )?;
+        let agent_messages = match message_ids {
+            Some(message_ids) => Self::deliver_agent_messages_by_ids_in_transaction(
+                &transaction,
+                &session.project_id,
+                &session.agent_id,
+                session_id,
+                Some(&run_id),
+                message_ids,
+                now_ms,
+            )?,
+            None => Self::deliver_agent_messages_in_transaction(
+                &transaction,
+                &session.project_id,
+                &session.agent_id,
+                session_id,
+                Some(&run_id),
+                now_ms,
+            )?,
+        };
         let agent = load_agent(&transaction, &session.agent_id)?
             .ok_or(StoreError::AgentNotFound)?
             .snapshot;
@@ -2310,6 +2429,259 @@ impl Store {
             agent_messages,
             events,
         })
+    }
+
+    /// Creates or resumes the one durable delivery attempt for this agent.
+    /// The stored text and identities are authoritative on retry/restart;
+    /// callers must not recompose a newer queue head for an existing row.
+    pub fn ensure_delivery_attempt(
+        &mut self,
+        input: NewDeliveryAttempt,
+    ) -> Result<DeliveryAttempt> {
+        if input.id.is_empty()
+            || input.text.is_empty()
+            || input.text.len() > 65_536
+            || input.created_at_ms < 0
+            || input.task_id.is_none() != input.task_incarnation_id.is_none()
+        {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let message_ids_json = serde_json::to_string(
+            &input
+                .message_ids
+                .iter()
+                .map(MessageId::as_str)
+                .collect::<Vec<_>>(),
+        )?;
+        let prior_run_count = input
+            .prior_run_count
+            .map(|value| i64::try_from(value).map_err(|_| StoreError::InvalidExecutionMetadata))
+            .transpose()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            load_active_delivery_attempt(&transaction, &input.project_id, &input.agent_id)?
+        {
+            if existing.session_id == input.session_id {
+                return Ok(existing);
+            }
+            transaction.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                 WHERE id = ?2",
+                params![input.created_at_ms, existing.id],
+            )?;
+        }
+        let session = load_session(&transaction, &input.session_id)?
+            .filter(|session| {
+                session.project_id == input.project_id
+                    && session.agent_id == input.agent_id
+                    && session.state.is_live()
+            })
+            .ok_or(StoreError::SessionNotLive)?;
+        if session.stop_requested_at_ms.is_some() {
+            return Err(StoreError::SessionStopping);
+        }
+        if let (Some(task_id), Some(incarnation_id)) = (&input.task_id, &input.task_incarnation_id)
+        {
+            let task = load_task(&transaction, task_id)?
+                .filter(|task| task.snapshot.project_id == input.project_id)
+                .filter(|task| task.snapshot.status == TaskStatus::Queued)
+                .filter(|task| task.snapshot.assigned_agent_id.as_ref() == Some(&input.agent_id))
+                .ok_or(StoreError::TaskNotQueued)?;
+            let current_incarnation: String = transaction.query_row(
+                "SELECT incarnation_id FROM tasks WHERE id = ?1",
+                params![task_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if current_incarnation != *incarnation_id {
+                return Err(StoreError::TaskNotQueued);
+            }
+            let _ = task;
+        }
+        transaction.execute(
+            "INSERT INTO delivery_attempts (
+                id, project_id, agent_id, session_id, task_id,
+                task_incarnation_id, prior_run_count, message_ids_json, text, failure_count,
+                next_attempt_at_ms, state, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, 'in_flight', ?10, ?10)",
+            params![
+                input.id,
+                input.project_id.as_str(),
+                input.agent_id.as_str(),
+                input.session_id.as_str(),
+                input.task_id.as_ref().map(TaskId::as_str),
+                input.task_incarnation_id,
+                prior_run_count,
+                message_ids_json,
+                input.text,
+                input.created_at_ms,
+            ],
+        )?;
+        let attempt = load_delivery_attempt(&transaction, &input.id)?
+            .ok_or(StoreError::InvalidExecutionMetadata)?;
+        transaction.commit()?;
+        Ok(attempt)
+    }
+
+    pub fn delivery_attempt_for_session(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<Option<DeliveryAttempt>> {
+        self.connection
+            .query_row(
+                "SELECT id, project_id, agent_id, session_id, task_id,
+                        task_incarnation_id, prior_run_count, message_ids_json,
+                        text, failure_count, next_attempt_at_ms, state
+                 FROM delivery_attempts
+                 WHERE project_id = ?1 AND agent_id = ?2 AND session_id = ?3
+                   AND state IN ('in_flight', 'retryable', 'terminal')",
+                params![project_id.as_str(), agent_id.as_str(), session_id.as_str()],
+                delivery_attempt_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn delivery_attempt_due(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .delivery_attempt_for_session(project_id, agent_id, session_id)?
+            .is_some_and(|attempt| {
+                matches!(
+                    attempt.state,
+                    DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+                ) && attempt.next_attempt_at_ms.is_none_or(|at| at <= now_ms)
+            }))
+    }
+
+    /// Atomically claims a retryable attempt before any PTY bytes are
+    /// written. An interrupted claim is recovered as an in-flight attempt,
+    /// so a daemon restart cannot replay the same retry without consuming
+    /// the bounded failure budget. Initial attempts are already in-flight;
+    /// returning them here keeps the admission rule explicit for every
+    /// caller that is about to write.
+    pub fn begin_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<DeliveryAttempt>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'in_flight', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state = 'retryable'",
+            params![now_ms, attempt_id],
+        )?;
+        let attempt = load_delivery_attempt(&transaction, attempt_id)?;
+        transaction.commit()?;
+        if changed == 1 {
+            return Ok(attempt);
+        }
+        Ok(attempt.filter(|attempt| attempt.state == DeliveryAttemptState::InFlight))
+    }
+
+    pub fn record_delivery_failure(&mut self, attempt_id: &str, now_ms: i64) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_attempts
+             SET failure_count = failure_count + 1,
+                 state = CASE WHEN failure_count + 1 >= ?1 THEN 'terminal' ELSE 'retryable' END,
+                 next_attempt_at_ms = CASE WHEN failure_count + 1 >= ?1 THEN NULL ELSE ?2 END,
+                 updated_at_ms = ?2
+             WHERE id = ?3 AND state IN ('in_flight', 'retryable')",
+            params![
+                MAX_DELIVERY_ATTEMPT_FAILURES,
+                now_ms + DELIVERY_RETRY_DELAY_MS,
+                attempt_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        Ok(())
+    }
+
+    pub fn reset_delivery_attempt(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_attempts
+             SET failure_count = 0, state = 'retryable', next_attempt_at_ms = ?1,
+                 updated_at_ms = ?1
+             WHERE project_id = ?2 AND agent_id = ?3
+               AND state IN ('retryable', 'terminal')",
+            params![now_ms, project_id.as_str(), agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// A daemon restart interrupts `in_flight` attempts. Count that
+    /// interruption as a failure so repeated restarts cannot reset the
+    /// bounded recovery allowance.
+    pub fn recover_delivery_attempts(&mut self, now_ms: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_attempts
+             SET failure_count = failure_count + 1,
+                 state = CASE WHEN failure_count + 1 >= ?1 THEN 'terminal' ELSE 'retryable' END,
+                 next_attempt_at_ms = CASE WHEN failure_count + 1 >= ?1 THEN NULL ELSE ?2 END,
+                 updated_at_ms = ?2
+             WHERE state = 'in_flight'",
+            params![
+                MAX_DELIVERY_ATTEMPT_FAILURES,
+                now_ms + DELIVERY_RETRY_DELAY_MS
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn acknowledge_delivery_attempt(&mut self, attempt_id: &str, now_ms: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_attempts
+             SET state = 'acknowledged', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+            params![now_ms, attempt_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delivery_attempt_state(&self, attempt_id: &str) -> Result<Option<DeliveryAttemptState>> {
+        self.connection
+            .query_row(
+                "SELECT state FROM delivery_attempts WHERE id = ?1",
+                params![attempt_id],
+                |row| parse_delivery_attempt_state(&row.get::<_, String>(0)?, 0),
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    fn cancel_delivery_attempts_for_task(
+        transaction: &Transaction<'_>,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        now_ms: i64,
+    ) -> Result<()> {
+        transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE project_id = ?2 AND task_id = ?3
+               AND state IN ('in_flight', 'retryable', 'terminal')",
+            params![now_ms, project_id.as_str(), task_id.as_str()],
+        )?;
+        Ok(())
     }
 
     /// Immutable task incarnation plus the number of attempts already
@@ -2562,23 +2934,50 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
-        for id in &ids {
-            transaction.execute(
+        Self::deliver_agent_messages_by_ids_in_transaction(
+            transaction,
+            project_id,
+            agent_id,
+            session_id,
+            run_id,
+            &ids,
+            delivered_at_ms,
+        )
+    }
+
+    fn deliver_agent_messages_by_ids_in_transaction(
+        transaction: &Transaction<'_>,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        run_id: Option<&RunId>,
+        message_ids: &[MessageId],
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let mut messages = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            let changed = transaction.execute(
                 "UPDATE agent_messages
                  SET delivered_at_ms = ?1, delivered_session_id = ?2, delivered_run_id = ?3
-                 WHERE id = ?4 AND project_id = ?5 AND delivered_at_ms IS NULL",
+                 WHERE id = ?4 AND project_id = ?5 AND recipient_agent_id = ?6
+                   AND delivered_at_ms IS NULL",
                 params![
                     delivered_at_ms,
                     session_id.as_str(),
                     run_id.map(RunId::as_str),
-                    id.as_str(),
-                    project_id.as_str()
+                    message_id.as_str(),
+                    project_id.as_str(),
+                    agent_id.as_str(),
                 ],
             )?;
+            if changed == 1 {
+                messages.push(
+                    load_agent_message(transaction, message_id)?
+                        .ok_or(StoreError::InvalidAgentMessage)?,
+                );
+            }
         }
-        ids.into_iter()
-            .map(|id| load_agent_message(transaction, &id)?.ok_or(StoreError::InvalidAgentMessage))
-            .collect()
+        Ok(messages)
     }
 
     /// Delivers every undelivered inbox message as a standalone nudge (no
@@ -2602,6 +3001,30 @@ impl Store {
             agent_id,
             session_id,
             None,
+            delivered_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(messages)
+    }
+
+    pub fn deliver_agent_messages_by_ids(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        message_ids: &[MessageId],
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let messages = Self::deliver_agent_messages_by_ids_in_transaction(
+            &transaction,
+            project_id,
+            agent_id,
+            session_id,
+            None,
+            message_ids,
             delivered_at_ms,
         )?;
         transaction.commit()?;
@@ -3163,53 +3586,20 @@ impl Store {
             return Err(StoreError::StaleTaskCursor);
         }
         if let Some(agent_id) = agent_id {
-            let exists = load_agent(&self.connection, agent_id)?
-                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
-            if !exists {
+            if load_agent(&self.connection, agent_id)?
+                .is_none_or(|agent| agent.snapshot.project_id != *project_id)
+            {
                 return Err(StoreError::AgentNotFound);
-            }
-        }
-        if let Some(after_id) = after_id {
-            let cursor_exists: bool = self.connection.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM tasks
-                    WHERE project_id = ?1 AND id = ?2
-                      AND (?3 IS NULL OR assigned_agent_id = ?3)
-                      AND (?4 OR status IN ('queued', 'running'))
-                )",
-                params![
-                    project_id.as_str(),
-                    after_id.as_str(),
-                    agent_id.map(AgentId::as_str),
-                    include_history,
-                ],
-                |row| row.get(0),
-            )?;
-            if !cursor_exists {
-                return Err(StoreError::TaskNotFound);
             }
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
-            WHERE project_id = ?1
+             WHERE project_id = ?1
                AND (?2 IS NULL OR assigned_agent_id = ?2)
                AND (?3 OR status IN ('queued', 'running'))
-               AND (?4 IS NULL OR
-                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
-                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                        FROM tasks WHERE project_id = ?1 AND id = ?4
-                    ) OR (
-                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
-                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                            FROM tasks WHERE project_id = ?1 AND id = ?4
-                        )
-                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
-                                                             WHERE project_id = ?1 AND id = ?4)))
-                    ))
+               AND (?4 IS NULL OR id > ?4)
              ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
              LIMIT ?5",
         )?;
@@ -3273,6 +3663,7 @@ impl Store {
         ) {
             return Err(StoreError::TaskNotRetryable);
         }
+        Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
         let changed = transaction.execute(
             "UPDATE tasks
              SET status = 'queued', result = NULL, started_at_ms = NULL,
@@ -3324,6 +3715,7 @@ impl Store {
                 return Err(StoreError::AgentNotFound);
             }
         }
+        Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
         transaction.execute(
             "UPDATE tasks
              SET assigned_agent_id = ?1, updated_at_ms = ?2
@@ -3408,6 +3800,7 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::TaskNotCancellable);
         }
+        Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
         let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
         let event = FactoryEvent::TaskChanged {
             task: task.snapshot.clone(),
@@ -3442,6 +3835,7 @@ impl Store {
         let _task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
+        Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
         let changed = transaction.execute(
             "UPDATE tasks
              SET title = COALESCE(?1, title), body = COALESCE(?2, body),
@@ -3527,6 +3921,7 @@ impl Store {
         }
 
         transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
         transaction.execute(
             "DELETE FROM task_question_documents
              WHERE project_id = ?1
@@ -3670,6 +4065,10 @@ impl Store {
             params![agent_id.as_str()],
         )?;
         transaction.execute(
+            "DELETE FROM delivery_attempts WHERE agent_id = ?1 AND project_id = ?2",
+            params![agent_id.as_str(), project_id.as_str()],
+        )?;
+        transaction.execute(
             "DELETE FROM runs WHERE agent_id = ?1 AND project_id = ?2",
             params![agent_id.as_str(), project_id.as_str()],
         )?;
@@ -3728,6 +4127,10 @@ impl Store {
         transaction.execute(
             "DELETE FROM agent_profiles
              WHERE agent_id IN (SELECT id FROM agents WHERE project_id = ?1)",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM delivery_attempts WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
         transaction.execute(
@@ -3851,7 +4254,7 @@ impl Store {
 
     /// Every project's live picture in one read: agents with their live
     /// (or, failing that, most recent) session, current run, queued tasks,
-    /// and undelivered inbox count; per-project backlog; the
+    /// and undelivered inbox count; per-project unassigned queue; the
     /// project's blocked tasks (for the attention list). One connection,
     /// so every field is from the same instant. See
     /// `factory_core::status`.
@@ -3886,7 +4289,7 @@ impl Store {
                 .iter()
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
-            let backlog = self.active_tasks(&project.id, None)?;
+            let backlog = self.queued_tasks(&project.id, None)?;
             let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
@@ -3911,7 +4314,7 @@ impl Store {
             Some(run_id) => load_run(&self.connection, run_id)?,
             None => None,
         };
-        let queue = self.active_tasks(project_id, Some(agent_id))?;
+        let queue = self.queued_tasks(project_id, Some(agent_id))?;
         let inbox_pending: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM agent_messages
              WHERE project_id = ?1 AND recipient_agent_id = ?2 AND delivered_at_ms IS NULL",
@@ -3987,10 +4390,9 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
-    /// Active tasks assigned to `agent_id` (or unassigned when `None`): the
-    /// canonical queue projection used by status and the TUI. Running work
-    /// is first, followed by queued work in priority/creation order.
-    fn active_tasks(
+    /// Active tasks assigned to `agent_id` (or the unassigned backlog), with
+    /// running work first and queued work in priority/creation order.
+    fn queued_tasks(
         &self,
         project_id: &ProjectId,
         agent_id: Option<&AgentId>,
@@ -4057,6 +4459,16 @@ impl Store {
         let agent = load_agent(&transaction, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
+        let selection = model_policy::normalize_profile(
+            agent.snapshot.provider,
+            agent.snapshot.role,
+            model_policy::ModelSelection {
+                model: input.model.clone(),
+                reasoning_effort: input.reasoning_effort.clone(),
+                reason: input.model_selection_reason.clone(),
+            },
+            false,
+        )?;
         if let Some(mode) = input.permission_mode.as_deref() {
             let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
             if !capabilities.permission_modes.contains(&mode) {
@@ -4066,20 +4478,10 @@ impl Store {
                 });
             }
         }
-        let selection = model_policy::normalize_profile(
-            agent.snapshot.provider,
-            agent.snapshot.role,
-            model_policy::ModelSelection {
-                model: input.model,
-                reasoning_effort: input.reasoning_effort,
-                reason: input.model_selection_reason,
-            },
-            false,
-        )?;
         transaction.execute(
             "INSERT INTO agent_profiles (
-                agent_id, model, reasoning_effort, model_selection_reason,
-                permission_mode, updated_at_ms
+                agent_id, model, reasoning_effort, model_selection_reason, permission_mode,
+                updated_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
@@ -4721,8 +5123,7 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, reasoning_effort, model_selection_reason,
-                    permission_mode, updated_at_ms
+            "SELECT model, reasoning_effort, model_selection_reason, permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
@@ -4749,19 +5150,12 @@ fn insert_task(
     if input.body.len() > MAX_TASK_BODY_BYTES {
         return Err(StoreError::InvalidTaskInput);
     }
-    if let Some(agent_id) = assigned_agent_id.as_ref() {
-        let valid = load_agent(transaction, agent_id)?
-            .is_some_and(|agent| agent.snapshot.project_id == input.project_id);
-        if !valid {
-            return Err(StoreError::AgentNotFound);
-        }
-    }
     let record = TaskDetail {
         snapshot: TaskSnapshot {
             id: input.id,
             project_id: input.project_id,
             parent_task_id: input.parent_task_id,
-            assigned_agent_id,
+            assigned_agent_id: assigned_agent_id.clone(),
             title,
             status: TaskStatus::Queued,
             priority: input.priority,
@@ -4781,11 +5175,7 @@ fn insert_task(
             record.snapshot.id.as_str(),
             record.snapshot.project_id.as_str(),
             record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
-            record
-                .snapshot
-                .assigned_agent_id
-                .as_ref()
-                .map(AgentId::as_str),
+            assigned_agent_id.as_ref().map(AgentId::as_str),
             &record.snapshot.title,
             &record.body,
             record.snapshot.priority,
@@ -5026,6 +5416,76 @@ fn agent_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMess
         delivered_at_ms: row.get(6)?,
         delivered_run_id: parse_optional_id(delivered_run_id, 7)?,
         delivered_session_id: parse_optional_id(delivered_session_id, 8)?,
+    })
+}
+
+fn load_active_delivery_attempt(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> rusqlite::Result<Option<DeliveryAttempt>> {
+    transaction
+        .query_row(
+            "SELECT id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json,
+                    text, failure_count, next_attempt_at_ms, state
+             FROM delivery_attempts
+             WHERE project_id = ?1 AND agent_id = ?2
+               AND state IN ('in_flight', 'retryable', 'terminal')",
+            params![project_id.as_str(), agent_id.as_str()],
+            delivery_attempt_from_row,
+        )
+        .optional()
+}
+
+fn load_delivery_attempt(
+    transaction: &Transaction<'_>,
+    attempt_id: &str,
+) -> rusqlite::Result<Option<DeliveryAttempt>> {
+    transaction
+        .query_row(
+            "SELECT id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json,
+                    text, failure_count, next_attempt_at_ms, state
+             FROM delivery_attempts WHERE id = ?1",
+            params![attempt_id],
+            delivery_attempt_from_row,
+        )
+        .optional()
+}
+
+fn delivery_attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeliveryAttempt> {
+    let task_id: Option<String> = row.get(4)?;
+    let message_ids: Vec<String> =
+        serde_json::from_str(&row.get::<_, String>(7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(7, Type::Text, Box::new(error))
+        })?;
+    let failure_count = row.get::<_, i64>(9)?;
+    Ok(DeliveryAttempt {
+        id: row.get(0)?,
+        project_id: parse_id(row.get(1)?, 1)?,
+        agent_id: parse_id(row.get(2)?, 2)?,
+        session_id: parse_id(row.get(3)?, 3)?,
+        task_id: task_id.map(|value| parse_id(value, 4)).transpose()?,
+        task_incarnation_id: row.get(5)?,
+        prior_run_count: row
+            .get::<_, Option<i64>>(6)?
+            .map(|value| {
+                usize::try_from(value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
+                })
+            })
+            .transpose()?,
+        message_ids: message_ids
+            .into_iter()
+            .map(|value| parse_id(value, 7))
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        text: row.get(8)?,
+        failure_count: u32::try_from(failure_count).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(9, Type::Integer, Box::new(error))
+        })?,
+        next_attempt_at_ms: row.get(10)?,
+        state: parse_delivery_attempt_state(&row.get::<_, String>(11)?, 11)?,
     })
 }
 
@@ -5327,6 +5787,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0024_session_cleanup_state.sql"))?;
         transaction.pragma_update(None, "user_version", 24)?;
+        transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0025_delivery_attempts.sql"))?;
+        transaction.pragma_update(None, "user_version", 25)?;
         transaction.commit()?;
     }
     Ok(())
@@ -5634,6 +6101,24 @@ fn parse_optional_failure_reason(
         .transpose()
 }
 
+fn parse_delivery_attempt_state(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<DeliveryAttemptState> {
+    match value {
+        "in_flight" => Ok(DeliveryAttemptState::InFlight),
+        "retryable" => Ok(DeliveryAttemptState::Retryable),
+        "terminal" => Ok(DeliveryAttemptState::Terminal),
+        "acknowledged" => Ok(DeliveryAttemptState::Acknowledged),
+        "cancelled" => Ok(DeliveryAttemptState::Cancelled),
+        _ => Err(rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            format!("invalid delivery attempt state {value:?}").into(),
+        )),
+    }
+}
+
 const fn agent_role_value(value: AgentRole) -> &'static str {
     match value {
         AgentRole::Orchestrator => "orchestrator",
@@ -5768,5 +6253,177 @@ mod tests {
 
         let error = migrate(&mut connection).unwrap_err();
         assert!(matches!(error, StoreError::InvalidSchemaVersion(-1)));
+    }
+
+    #[test]
+    fn delivery_attempt_survives_restart_and_requires_explicit_resume() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let task_id = TaskId::try_from("task-1").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: "/tmp/factory".to_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".to_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".to_owned(),
+                    runner_protocol_version: 1,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                2,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "First".to_owned(),
+                    body: "Body".to_owned(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 4)
+            .unwrap();
+        let (incarnation_id, prior_run_count) =
+            store.task_delivery_marker(&session_id, &task_id).unwrap();
+        let input = NewDeliveryAttempt {
+            id: "attempt-1".to_owned(),
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.clone()),
+            task_incarnation_id: Some(incarnation_id),
+            prior_run_count: Some(prior_run_count),
+            message_ids: Vec::new(),
+            text: "exact prompt".to_owned(),
+            created_at_ms: 5,
+        };
+        let attempt = store.ensure_delivery_attempt(input.clone()).unwrap();
+        assert_eq!(attempt.state, DeliveryAttemptState::InFlight);
+
+        // The daemon's first restart consumes the in-flight attempt as one
+        // failure. Reopening the same durable row cannot reset that count.
+        store.recover_delivery_attempts(100).unwrap();
+        assert_eq!(
+            store.delivery_attempt_state("attempt-1").unwrap(),
+            Some(DeliveryAttemptState::Retryable)
+        );
+        let recovered = store
+            .delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.failure_count, 1);
+        assert_eq!(recovered.state, DeliveryAttemptState::Retryable);
+        assert_eq!(recovered.next_attempt_at_ms, Some(5_100));
+        assert_eq!(
+            store.ensure_delivery_attempt(input).unwrap().failure_count,
+            1
+        );
+
+        // A retry must be claimed durably before its first PTY write. If the
+        // daemon dies again after that claim, recovery consumes the final
+        // allowance; another restart cannot replay it without an explicit
+        // operator resume/reset.
+        let claimed = store.begin_delivery_attempt("attempt-1", 5_100).unwrap();
+        assert_eq!(
+            claimed.as_ref().map(|a| a.state),
+            Some(DeliveryAttemptState::InFlight)
+        );
+        store.recover_delivery_attempts(5_200).unwrap();
+        let terminal = store
+            .delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.failure_count, 2);
+        assert_eq!(terminal.state, DeliveryAttemptState::Terminal);
+        assert!(
+            store
+                .begin_delivery_attempt("attempt-1", 5_300)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .reset_delivery_attempt(&project_id, &agent_id, 7_000)
+            .unwrap();
+        let resumed = store
+            .delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.failure_count, 0);
+        assert_eq!(resumed.state, DeliveryAttemptState::Retryable);
+        assert_eq!(resumed.next_attempt_at_ms, Some(7_000));
+        assert_eq!(
+            store
+                .begin_delivery_attempt("attempt-1", 7_000)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryAttemptState::InFlight
+        );
+
+        // Stop intent is durable and cancels the same attempt before any
+        // later run admission can win the race.
+        store
+            .request_session_stop(&project_id, &session_id, 8_000)
+            .unwrap();
+        assert_eq!(
+            store.delivery_attempt_state("attempt-1").unwrap(),
+            Some(DeliveryAttemptState::Cancelled)
+        );
+        assert!(matches!(
+            store.open_run_episode(&session_id, &task_id, 8_001),
+            Err(StoreError::SessionStopping)
+        ));
     }
 }

@@ -5,8 +5,13 @@ A "provider" is one supported coding-agent CLI: today, Claude Code
 implementation (`sh -lc <command>`, no resume, no generated config) that
 exercises the exact same `Provider` boundary as the real two, and is what
 `crates/factoryd/tests/sessions_e2e.rs` drives instead of a real provider
-CLI (see `tests/fixtures/shell-agent.sh`, a POSIX-`sh` fixture speaking the
-same hook/`task done`/`task blocked` protocol a real session would). Start
+CLI (see `tests/fixtures/shell-agent.sh`, a small POSIX-`sh` launcher around
+the byte-oriented `shell-agent.py` fixture, speaking the same
+hook/`task done`/`task blocked` protocol a real session would). Its PTY
+fixture buffers bytes through the complete prompt and emits one
+`UserPromptSubmit` at the CR submission boundary, including for multiline
+prompts; this keeps the test provider faithful to the exact durable attempt
+acknowledgement contract. Start
 there if you want a working example to copy before reading the rest of this
 file. Dark Factory runs each provider as one
 resident interactive process per agent, under a PTY, visible and typeable
@@ -139,6 +144,23 @@ them into `factory_core::ProviderHookEvent` values (see
      (Codex's `SessionStart` `session_id` field is the shipped example),
      that is a `local_api.rs`/`store.rs` concern, not this trait's — see
      `Store::set_provider_session_id`.
+   - A clean stop may be acknowledged by the runner before the provider
+     process has exited. The dispatcher holds queued work until that terminal
+     event, then launches the successor with `ctx.resume` when supported. If
+     the resumed provider does not acknowledge the first delivery, the shared
+     path records the exact prompt as a durable delivery attempt, makes one
+     bounded recovery submission using a bare CR, and leaves
+     `delivery unacknowledged` durably visible if its hook still fails. It
+     never retypes a body after that CR because the provider may already have
+     accepted it. A daemon restart consumes an
+     interrupted attempt rather than resetting its retry budget; only an
+     explicit operator resume resets a terminal attempt. A provider must not
+     silently consume a prompt without its exact hook acknowledgement. The
+     submitted prompt also carries an invisible durable-attempt nonce; the
+     hook must echo that exact body, including the nonce, so a delayed
+     same-text hook from a deleted/recreated task cannot acknowledge the new
+     attempt. A provider that normalizes the nonce is rejected as
+     unacknowledged rather than guessed successful.
    - **Provider A1** — a session's own `factoryctl` calls (an agent's own
      `task done`/`task blocked`, or an operator typing one directly) use a
      bare `factoryctl`, not `ctx.factoryctl_path`: that trusted absolute

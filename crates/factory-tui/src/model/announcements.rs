@@ -5,7 +5,9 @@
 
 use factory_core::{EventEnvelope, FactoryEvent, RunStatus, SessionState, TaskStatus};
 
-use factory_core::attention::{Attention, run_attention, session_attention, task_attention};
+use factory_core::attention::{
+    Attention, run_attention, session_snapshot_attention, task_attention,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Announcement {
@@ -104,7 +106,7 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
                 truncate_id(session.agent_id.as_str(), 10),
                 session_state_word(session.state)
             );
-            (text, session_attention(session.state))
+            (text, session_snapshot_attention(session))
         }
         FactoryEvent::AgentChanged { agent } => {
             let text = format!(

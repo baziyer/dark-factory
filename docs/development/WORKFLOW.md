@@ -32,9 +32,10 @@ leaves the runner waiting for an acknowledgement that can never arrive.
 
 Tests that create resident sessions must therefore use both safeguards in
 `crates/factoryd/tests/sessions_e2e.rs`: call `cleanup_session` on the normal
-path, which waits until the session is non-live **and its runner process has
-exited** before stopping the daemon (pausing the agent first so pending fixture
-work cannot spawn a replacement), and retain `Daemon`'s `Drop` cleanup for
+path. Its `StopSession` request does not return until the session is non-live;
+the helper then also waits until its runner process has exited before stopping
+the daemon (pausing the agent first so pending fixture work cannot spawn a
+replacement). Retain `Daemon`'s `Drop` cleanup for
 assertion failures. A test may stop the daemon while a session is live only when
 daemon restart/recovery is the behavior under test; it must reconnect, then
 perform the same cleanup handshake before returning. Never replace this with a
@@ -45,9 +46,9 @@ visible as a cleanup failure across daemon restart. Tests must exercise that
 state through recovery and resolve it only through the explicit operator
 verification API after checking the fixture's private runtime; the API checks
 the durable runner evidence, absent leader/group, and free descendant lease,
-not a caller-supplied assertion. The API requires the daemon-generated
-`$DARK_FACTORY_HOME/operator.token`; a provider hook token and raw local
-protocol frame are deliberately insufficient. PTY providers execute through
+not a caller-supplied assertion. A raw local protocol frame is accepted only
+when that daemon-side proof passes; provider hooks cannot assert cleanup. PTY
+providers execute through
 the runner's lease-locking wrapper, which waits/reaps the actual provider and
 preserves TERM grace; a double-fork/`setsid` descendant retaining the lease
 prevents `Exited` rather than being guessed away. Process-sensitive tests
@@ -206,9 +207,9 @@ remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
 GitHub Releases are the source of truth for binaries; nothing else builds
 them.
 
-1. **Build and publish**: pushing a semver tag (`git tag v0.2.2 && git push
-   origin v0.2.2`, on a commit whose `Cargo.toml` workspace version is
-   `0.2.2` — the workflow refuses a mismatch) runs
+1. **Build and publish**: pushing a semver tag (`git tag v0.2.3 && git push
+   origin v0.2.3`, on a commit whose `Cargo.toml` workspace version is
+   `0.2.3` — the workflow refuses a mismatch) runs
    `.github/workflows/release.yml` on the trusted self-hosted arm Mac. One
    serialized job builds `aarch64-apple-darwin` and then
    `x86_64-apple-darwin`; there is no release-writing matrix to race shared
@@ -223,7 +224,7 @@ them.
    transport failures get four attempts with 2/4/8-second backoff. After any
    failed write, the publisher reads the release once and accepts an
    already-committed exact result; deterministic client errors are not
-   retried. A tag with a pre-release suffix (`v0.2.2-rc.1`) is published as
+   retried. A tag with a pre-release suffix (`v0.2.3-rc.1`) is published as
    a pre-release so `releases/latest` keeps pointing at the newest full
    release. `latest.json` is `{version, tag, assets: {<target>: {url,
    sha256}}}` with both macOS targets; the newest one is always at
@@ -239,9 +240,11 @@ them.
    checked out.
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
-   and prints JSON: `current` (the invoking/bootstrap binary), `active` (the
-   validated `bin/current` runtime, or null), `latest`, `update_available`,
-   and the platform `asset`. Availability compares `latest` with `active`
+   and prints concise human-readable lines naming the invoking/bootstrap
+   version, active `bin/current` runtime, latest release, and whether
+   `update --install` has work. Pass `factoryctl update --json` for the
+   machine-readable object (`current`, `active`, `latest`,
+   `update_available`, and the platform `asset`). Availability compares `latest` with `active`
    when installed, not with a newer Homebrew bootstrap. The manifest result
    is cached in `$DARK_FACTORY_HOME/update-check.json`;
    `factory-tui` reads the same cache and refetches at most hourly, in a

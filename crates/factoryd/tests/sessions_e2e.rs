@@ -72,6 +72,10 @@ impl Daemon {
         Self::spawn(home, runner, false)
     }
 
+    fn start_with_provider_path(home: &Path, provider_path: &Path) -> Self {
+        Self::spawn_with_provider_path(home, &factory_runner_path(), false, Some(provider_path))
+    }
+
     /// Like [`Daemon::start`], but the daemon is the leader of its own
     /// process group, so [`Daemon::stop_process_group`] can do what
     /// launchd's `bootout`/`kickstart -k` (and a terminal's Ctrl-C) do:
@@ -81,6 +85,15 @@ impl Daemon {
     }
 
     fn spawn(home: &Path, runner: &Path, own_process_group: bool) -> Self {
+        Self::spawn_with_provider_path(home, runner, own_process_group, None)
+    }
+
+    fn spawn_with_provider_path(
+        home: &Path,
+        runner: &Path,
+        own_process_group: bool,
+        provider_path: Option<&Path>,
+    ) -> Self {
         let socket = home.join("f.sock");
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryd"));
         command
@@ -97,6 +110,10 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(provider_path) = provider_path {
+            let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", provider_path.display());
+            command.env("PATH", path);
+        }
         if own_process_group {
             command.process_group(0);
         }
@@ -405,6 +422,26 @@ fn shell_agent_path() -> String {
         .into_owned()
 }
 
+fn exact_shell_agent_path() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/exact-shell-agent.py")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn install_fake_codex(home: &Path) -> PathBuf {
+    let bin = home.join("fake-bin");
+    std::fs::create_dir(&bin).unwrap();
+    let codex = bin.join("codex");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex.sh"),
+        &codex,
+    )
+    .unwrap();
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
 /// Starts a daemon on `home`, creates a real git repo project at
 /// `home/repo`, and returns everything a test needs to drive it further.
 struct Project {
@@ -522,6 +559,30 @@ fn create_shell_agent(client: &Client, agent_id: &str) -> factory_core::AgentSna
             role: AgentRole::Worker,
             provider: Provider::Shell,
             model: Some(shell_agent_path()),
+            reasoning_effort: None,
+            model_selection_reason: None,
+            worktree: None,
+        })
+        .unwrap();
+    let ServerFrame::Response {
+        response: LocalResponse::AgentCreated { agent },
+        ..
+    } = response
+    else {
+        panic!("expected AgentCreated, got {response:?}");
+    };
+    agent
+}
+
+fn create_codex_agent(client: &Client, agent_id: &str) -> factory_core::AgentSnapshot {
+    let response = client
+        .request(LocalRequest::CreateAgent {
+            id: AgentId::try_from(agent_id).unwrap(),
+            project_id: project_id(),
+            parent_agent_id: None,
+            role: AgentRole::Worker,
+            provider: Provider::Codex,
+            model: None,
             reasoning_effort: None,
             model_selection_reason: None,
             worktree: None,
@@ -697,25 +758,9 @@ fn wait_for_session_state(client: &Client, agent_id: &str, state: SessionState) 
 
 /// Like [`wait_for_session_state`] for `Idle`, but confirms it *stays*
 /// idle continuously across a full settle window before returning, not
-/// just at one single later instant. A single composed delivery is typed
-/// as one multi-line PTY write; the shell fixture reads it back line by
-/// line (its own doc comment), running a full hook cycle per line -- so
-/// it can pass through `idle` transiently between the task header line
-/// (which finishes the task) and a later line (e.g. the memory-file
-/// footer, always present) before truly settling. This track's item 10:
-/// a single re-check after a fixed sleep (the original approach) is only
-/// as robust as that one sleep being longer than however long the
-/// remaining lines take to process, which is not a safe assumption on a
-/// loaded machine -- found live, `factoryd_restart_does_not_lose_a_live_session`
-/// flaking with the session observed `Working` immediately after a
-/// restart that followed what this function had just certified as stable
-/// `Idle`. Polling continuously through the whole window and restarting
-/// the wait on any non-idle observation closes that gap: a fixture still
-/// mid-delivery is caught well before the window elapses, not raced
-/// against it. A precise fix would need the fixture to tell the daemon it
-/// is done with an entire delivery, not just one line; this is a
-/// test-side settle check, since only this suite's own timing depends on
-/// "idle" meaning "fully done," not the product's own delivery/ack logic.
+/// just at one single later instant. This catches a delivery still in
+/// flight after a fast hook cycle, without making the product rely on a
+/// test-only sleep or a fixture-specific acknowledgement.
 const IDLE_SETTLE_WINDOW: Duration = Duration::from_secs(3);
 const IDLE_SETTLE_POLL: Duration = Duration::from_millis(150);
 
@@ -763,15 +808,10 @@ fn wait_for_task_status(client: &Client, task_id: &str, status: TaskStatus) -> T
 /// group, including a mid-`sleep` grandchild. Waiting here (rather than
 /// firing the request and immediately calling `daemon.stop()`, as a caller
 /// might otherwise do right after) matters for a subtler reason than just
-/// "the process is still exiting": `StopSession`'s RPC returns as soon as
-/// the runner *accepts* the stop command, well before the daemon's own
-/// background `supervise_child` task finishes subscribing to and
-/// acknowledging the runner's terminal event (`execution.rs`'s
-/// `wait_for_runner_exit` -- `factory_runner::run` will not let its own
-/// process exit without that acknowledgement). If the daemon is killed
-/// before that in-flight background task completes, the runner is
-/// orphaned forever, still waiting for an acknowledgement nothing will
-/// ever send again.
+/// "the process is still exiting": `StopSession`'s RPC waits for the daemon
+/// to observe the runner's terminal event and complete its cleanup handshake.
+/// The runner then receives `AcknowledgeExit` and exits; the helper's second
+/// wait proves that final process-level condition before the daemon stops.
 fn cleanup_session(daemon: &Daemon, agent_id: &str) {
     let client = daemon.client();
     let home = daemon.socket.parent().expect("daemon socket has a parent");
@@ -864,10 +904,8 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
         "agent/curie"
     );
 
-    // task-1's title embeds `sleep:2`, landing on the same composed-text
-    // header line as `task:task-1` (see shell-agent.sh): the fixture
-    // stays `working` for 2s mid-turn, giving this test a window to
-    // assign task-2 while curie is busy.
+    // task-1's title embeds `sleep:2`, giving this test a window to assign
+    // task-2 while curie is busy.
     create_task(&client, "task-1", "First (sleep:2)", "do the first thing");
     assign_task(&client, "task-1", "curie");
 
@@ -885,18 +923,16 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
     assign_task(&client, "task-2", "curie");
 
     let task1 = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
-    assert_eq!(
-        task1.result.as_deref(),
-        Some("done: Task task-1: First (sleep:2) (task:task-1)")
+    let task1_result = task1.result.as_deref().unwrap_or_default();
+    assert!(
+        task1_result.starts_with("done: Task task-1: First (sleep:2) (task:task-1)"),
+        "unexpected task-1 result: {task1_result:?}"
     );
 
-    // Unlike task-1 (typed in as one line among possibly several, so the
-    // fixture completes it on the exact header line alone), task-2 arrives
-    // via the Stop-hook block-reply path as one atomic `reason` string --
-    // the *entire* composed delivery (header, guidance, memory footer),
-    // matching how a real provider's Stop hook reply works: `reason` is one
-    // whole instruction, not a sequence of separately-submitted lines. Only
-    // the recognizable header prefix is asserted exactly.
+    // The fixture submits the complete composed delivery at one CR boundary,
+    // matching how a real provider's Stop hook reply carries one whole
+    // instruction. Only the recognizable header prefix is asserted because
+    // the durable prompt also contains guidance and memory context.
     let task2 = wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
     let task2_result = task2.result.as_deref().unwrap_or_default();
     assert!(
@@ -966,7 +1002,7 @@ fn a_standalone_message_delivers_without_opening_a_run() {
             project_id: project_id(),
             sender_agent_id: None,
             recipient_agent_id: AgentId::try_from("curie").unwrap(),
-            body: "Please check the queue.".into(),
+            body: "Please check the queue.\nKeep this prompt intact.".into(),
         })
         .unwrap();
     assert!(matches!(
@@ -1002,6 +1038,21 @@ fn a_standalone_message_delivers_without_opening_a_run() {
     });
 
     wait_for_session_state(&client, "curie", SessionState::Idle);
+    let prompt_submits = events_after(&client, 0)
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.event,
+                factory_core::FactoryEvent::SessionChanged { ref session }
+                    if session.last_hook_event
+                        == Some(factory_core::ProviderHookEvent::UserPromptSubmit)
+            )
+        })
+        .count();
+    assert_eq!(
+        prompt_submits, 1,
+        "a multiline standalone delivery must have one complete prompt acknowledgement"
+    );
     assert!(
         list_runs(&client).is_empty(),
         "a standalone message must never open a run episode"
@@ -1100,6 +1151,14 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
         }
     ));
 
+    // The RPC response is the cleanup boundary: do not hide an ordering
+    // regression by polling until terminal state after it returns.
+    let returned_session = session_by_agent(&client, "curie").expect("session after StopSession");
+    assert!(
+        !returned_session.state.is_live(),
+        "StopSession returned before the session became terminal"
+    );
+
     // The session process actually exits and the daemon records it
     // terminal; the open episode closes stopped/operator_stop, task
     // cancelled -- not failed (this track's step-5 fix).
@@ -1124,7 +1183,7 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
 }
 
 #[test]
-fn stop_run_response_waits_for_the_shared_session_cleanup_boundary() {
+fn stop_run_response_waits_for_the_same_session_cleanup_boundary() {
     let home = private_tempdir();
     let Project { daemon, .. } = setup_project(home.path());
     let client = daemon.client();
@@ -1144,42 +1203,196 @@ fn stop_run_response_waits_for_the_shared_session_cleanup_boundary() {
     let stopped = client
         .request(LocalRequest::StopRun {
             project_id: project_id(),
-            run_id: run.id.clone(),
+            run_id: run.id,
             grace_ms: 2_000,
         })
         .unwrap();
+    assert!(matches!(
+        stopped,
+        ServerFrame::Response {
+            response: LocalResponse::RunStopped { .. },
+            ..
+        }
+    ));
+    let returned_session = session_by_agent(&client, "curie").expect("session after StopRun");
     assert!(
-        matches!(
-            stopped,
-            ServerFrame::Response {
-                response: LocalResponse::RunStopped { .. },
-                ..
-            }
-        ),
-        "unexpected StopRun response: {stopped:?}"
-    );
-    let session = session_by_agent(&client, "curie").expect("session after StopRun");
-    assert!(
-        !session.state.is_live(),
-        "StopRun must not acknowledge before its shared session cleanup boundary"
-    );
-    assert_eq!(
-        wait_for_task_status(&client, "task-1", TaskStatus::Cancelled)
-            .snapshot
-            .status,
-        TaskStatus::Cancelled
+        !returned_session.state.is_live(),
+        "StopRun returned before the shared session cleanup boundary"
     );
     daemon.stop();
 }
 
-// --- (e) restart: a live session survives a daemon restart (D7) --------
+// --- (e) StopSession handoff: queued work must wait for the successor -----
+
+#[test]
+fn task_assigned_during_a_clean_stop_delivers_after_the_session_is_replaced() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    let delayed_agent = format!("SHELL_AGENT_STOP_DELAY=2 {}", shell_agent_path());
+    create_shell_agent_with_command(&client, "curie", delayed_agent);
+
+    create_task(&client, "task-1", "First", "complete before stopping");
+    assign_task(&client, "task-1", "curie");
+    let first_session = wait_for_stable_idle(&client, "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+
+    // The RPC only acknowledges the runner's stop request; the old session
+    // remains live and idle until its terminal event is observed. Assign the
+    // next task in exactly that window. It must never be typed into the
+    // session that is already being torn down.
+    let stopped = client
+        .request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: first_session.id.clone(),
+            grace_ms: 2_000,
+        })
+        .unwrap();
+    assert!(matches!(
+        stopped,
+        ServerFrame::Response {
+            response: LocalResponse::SessionStopped { .. },
+            ..
+        }
+    ));
+
+    create_task(&client, "task-2", "Second", "deliver after the clean stop");
+    assign_task(&client, "task-2", "curie");
+
+    let task = wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
+    assert!(
+        task.result
+            .as_deref()
+            .is_some_and(|result| result.starts_with("done: Task task-2: Second (task:task-2)")),
+        "the successor must receive the exact queued task, got {task:?}"
+    );
+    let successor = poll_until(DELIVERY_TIMEOUT, || {
+        list_sessions(&client).into_iter().find(|session| {
+            session.agent_id.as_str() == "curie"
+                && session.id != first_session.id
+                && session.state == SessionState::Idle
+        })
+    });
+    assert_ne!(
+        successor.id, first_session.id,
+        "a task assigned during clean stop must use a successor session"
+    );
+    let runs = list_runs(&client);
+    let task2_run = runs
+        .iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+        .expect("run for task-2");
+    assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
+
+    cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+#[test]
+fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
+    const FAKE_CODEX_THREAD_ID: &str = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+
+    let home = private_tempdir();
+    let fake_bin = install_fake_codex(home.path());
+    let daemon = Daemon::start_with_provider_path(home.path(), &fake_bin);
+    let project = setup_project_with(daemon, home.path());
+    let client = project.daemon.client();
+    create_codex_agent(&client, "curie");
+
+    create_task(&client, "task-1", "First", "complete before resuming");
+    assign_task(&client, "task-1", "curie");
+    let first_session = wait_for_stable_idle(&client, "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    assert_eq!(
+        first_session.provider_session_id.as_deref(),
+        Some(FAKE_CODEX_THREAD_ID)
+    );
+
+    // Delay only the resumed provider's prompt hook. The recovery CR is
+    // accepted immediately, but its acknowledgement arrives three seconds
+    // later; a retry that retypes the body would submit the same nonce twice.
+    std::fs::write(fake_bin.join("delay-user-prompt-submit"), b"3").unwrap();
+    let stopped = client
+        .request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: first_session.id.clone(),
+            grace_ms: 2_000,
+        })
+        .unwrap();
+    assert!(matches!(
+        stopped,
+        ServerFrame::Response {
+            response: LocalResponse::SessionStopped { .. },
+            ..
+        }
+    ));
+    poll_until(DELIVERY_TIMEOUT, || {
+        session_by_agent(&client, "curie").filter(|session| !session.state.is_live())
+    });
+
+    // The fake resumed thread drops the first two PTY submissions after
+    // `codex resume <thread-id>`, reproducing the observed no-run/no-prompt
+    // delivery loss. The shared dispatcher must make one delayed outer retry
+    // and deliver the still-queued task rather than leave it wedged forever.
+    create_task(&client, "task-2", "Second", "deliver after resuming");
+    assign_task(&client, "task-2", "curie");
+    wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
+
+    let submitted_prompts: Vec<String> = std::fs::read_dir(home.path().join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("fake-codex-prompts.jsonl"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fake Codex prompt log is JSONL"))
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    let task2_prompts = submitted_prompts
+        .iter()
+        .filter(|prompt| prompt.contains("task:task-2"))
+        .count();
+    assert_eq!(
+        task2_prompts, 1,
+        "the resumed provider must submit exactly one task-2 prompt, got {submitted_prompts:?}"
+    );
+
+    let successor = poll_until(DELIVERY_TIMEOUT, || {
+        list_sessions(&client).into_iter().find(|session| {
+            session.agent_id.as_str() == "curie"
+                && session.id != first_session.id
+                && session.state == SessionState::Idle
+        })
+    });
+    assert_eq!(
+        successor.provider_session_id.as_deref(),
+        Some(FAKE_CODEX_THREAD_ID),
+        "the successor must preserve provider-thread continuity"
+    );
+    let task2_run = list_runs(&client)
+        .into_iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+        .expect("run for task-2");
+    assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
+
+    cleanup_session(&project.daemon, "curie");
+    project.daemon.stop();
+}
+
+// --- (f) restart: a live session survives a daemon restart (D7) --------
 
 #[test]
 fn factoryd_restart_does_not_lose_a_live_session() {
     let home = private_tempdir();
     let project = setup_project(home.path());
     let client = project.daemon.client();
-    create_shell_agent(&client, "curie");
+    create_shell_agent_with_command(
+        &client,
+        "curie",
+        format!("python3 {}", exact_shell_agent_path()),
+    );
 
     create_task(&client, "task-1", "First", "before the restart");
     assign_task(&client, "task-1", "curie");
@@ -1258,10 +1471,6 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
     wait_for_task_status(&client, "abrupt-loss-task", TaskStatus::Succeeded);
     let before = wait_for_session_state(&client, "curie", SessionState::Idle);
     let runtime = home.path().join("runs").join(before.id.as_str());
-    let hook_token = std::fs::read_to_string(runtime.join("hook.token"))
-        .unwrap()
-        .trim()
-        .to_owned();
     let runner_pid = runner_pid_for_runtime(&runtime);
     let provider_group = started_group_for_runtime(&runtime);
 
@@ -1303,33 +1512,14 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
         }
     ));
 
-    let late_hook = client
-        .request(LocalRequest::ProviderHook {
-            token: hook_token,
-            event: factory_core::ProviderHookEvent::UserPromptSubmit,
-            payload: serde_json::json!({}),
-        })
-        .unwrap();
-    assert!(matches!(
-        late_hook,
-        ServerFrame::Response {
-            response: LocalResponse::Error {
-                code: factory_core::local::ErrorCode::Conflict,
-                ..
-            },
-            ..
-        }
-    ));
-
-    let unauthorized = client
+    let unresolved = client
         .request(LocalRequest::ResolveSessionCleanup {
             project_id: project_id(),
             session_id: blocked.id.clone(),
-            operator_token: "wrong-operator-token".into(),
         })
         .unwrap();
     assert!(matches!(
-        unauthorized,
+        unresolved,
         ServerFrame::Response {
             response: LocalResponse::Error {
                 code: factory_core::local::ErrorCode::Conflict,
@@ -1349,10 +1539,6 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
         .request(LocalRequest::ResolveSessionCleanup {
             project_id: project_id(),
             session_id: blocked.id.clone(),
-            operator_token: std::fs::read_to_string(home.path().join("operator.token"))
-                .unwrap()
-                .trim()
-                .to_owned(),
         })
         .unwrap();
     assert!(matches!(
@@ -1920,9 +2106,10 @@ fn task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_h
     // done` in `process_turn`) -- proving `outbox::drain` ran before that
     // hook was sent, not after.
     let task = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
-    assert_eq!(
-        task.result.as_deref(),
-        Some("done: Task task-1: Queue via the outbox (task:task-1)")
+    let result = task.result.as_deref().unwrap_or_default();
+    assert!(
+        result.starts_with("done: Task task-1: Queue via the outbox (task:task-1)"),
+        "unexpected task result: {result:?}"
     );
 
     let runs = list_runs(&client);
@@ -2019,6 +2206,18 @@ fn a_refused_delete_project_leaves_every_file_intact() {
     // shell-agent.sh completes the task and settles back to Idle -- still
     // live (`ended_at_ms IS NULL`), which is exactly what
     // `ProjectHasActiveRun` checks for.
+    let task = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let result = task.result.as_deref().unwrap_or_default();
+    assert!(
+        result.starts_with("done: Task task-1: Trigger a spawn (task:task-1)"),
+        "task delivery was not acknowledged with the expected result: {result:?}"
+    );
+    let run = list_runs(&client)
+        .into_iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-1"))
+        .expect("completed task must have a run");
+    assert_eq!(run.status, factory_core::RunStatus::Succeeded);
+    assert_eq!(run.closed_by, Some(factory_core::RunClosedBy::TaskDone));
     wait_for_session_state(&client, "curie", SessionState::Idle);
 
     let deleted = client
@@ -2118,26 +2317,11 @@ fn permission_request_hook_reports_waiting_for_input_and_is_never_answered() {
     let Project { daemon, .. } = setup_project(home.path());
     let client = daemon.client();
 
-    // `printf '{}' |` matters, not just decoration: with no stdin piped in
-    // at all, `factoryctl hook`'s bounded stdin read blocks forever on the
-    // inherited PTY (which never reaches EOF), so the hook request is
-    // never even sent -- the session would sit in `starting` forever
-    // instead of reaching `idle`. Likewise, some pending work is required
-    // to trigger the initial spawn at all, so this reads and acknowledges
-    // (`UserPromptSubmit`) exactly the delivered task's first line, then
-    // `Stop`s -- otherwise the dispatcher's own unacknowledged-delivery
-    // watchdog would land the session on `waiting_for_input` with its own
-    // wait reason (`"delivery unacknowledged"`) before this test ever
-    // gets to drive `PermissionRequest` by hand, racing the assertion
-    // below. What that first delivered line actually says is irrelevant
-    // (never read again after this). `h()` shortens the repeated
-    // `factoryctl hook --token-file ...` invocation: `agent_profiles.model`
-    // (this command runs as, verbatim) is bounded at 256 bytes.
-    let command = "h(){ \"$DARK_FACTORY_FACTORYCTL\" hook --token-file \"$DARK_FACTORY_SESSION_TOKEN_FILE\" \"$1\"; }; \
-printf '{}' | h SessionStart >/dev/null; read l; \
-printf '{}' | h UserPromptSubmit >/dev/null; printf '{}' | h Stop >/dev/null; \
-while :; do sleep 3600; done"
-        .to_owned();
+    // A pending task is required to trigger the initial spawn. The
+    // byte-oriented fixture acknowledges the daemon's complete prompt at
+    // its CR boundary and then stays resident, so this test reaches `idle`
+    // without manufacturing an invalid empty UserPromptSubmit payload.
+    let command = format!("python3 {}", exact_shell_agent_path());
     create_shell_agent_with_command(&client, "curie", command);
     create_task(&client, "task-1", "Trigger a spawn", "irrelevant body");
     assign_task(&client, "task-1", "curie");

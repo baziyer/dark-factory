@@ -50,6 +50,19 @@ pub const fn agent_state_from_session(state: SessionState) -> AgentState {
     }
 }
 
+/// Maps a session snapshot's durable state, including a cleanup failure that
+/// intentionally remains live for ownership safety, to board presentation.
+#[must_use]
+pub fn agent_state_from_session_snapshot(session: &factory_core::SessionSnapshot) -> AgentState {
+    if factory_core::attention::session_snapshot_attention(session)
+        == factory_core::attention::Attention::Failed
+    {
+        AgentState::Failed
+    } else {
+        agent_state_from_session(session.state)
+    }
+}
+
 /// Maps a run's status onto [`AgentState`] — the pre-sessions fallback, used when an agent has no
 /// session yet. Preserved verbatim from the pre-Track-6c board (see its README for the original
 /// judgment calls: no run/succeeded reads as idle; a run that failed or was stopped keeps showing

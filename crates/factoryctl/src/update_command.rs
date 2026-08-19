@@ -28,9 +28,11 @@ use factoryctl::{install, launchd, probes, runtime, update};
 use serde_json::json;
 
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
+const HUMAN_FIELD_MAX: usize = 160;
 
 pub struct Options {
     pub install: bool,
+    pub json: bool,
 }
 
 pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
@@ -40,13 +42,25 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let active_version = install::active_version(&home)?;
 
     if !options.install {
-        println!("{}", check_json(&check, active_version.as_deref()));
+        print_result(
+            options,
+            check_json(&check, active_version.as_deref()),
+            &check,
+            active_version.as_deref(),
+            install_action(&check, active_version.as_deref()),
+        );
         return Ok(check_exit_code(&check));
     }
     let Some(manifest) = install_candidate(&check, active_version.as_deref()).cloned() else {
         let mut report = check_json(&check, active_version.as_deref());
         report["installed"] = json!(false);
-        println!("{report}");
+        print_result(
+            options,
+            report,
+            &check,
+            active_version.as_deref(),
+            install_action(&check, active_version.as_deref()),
+        );
         return Ok(check_exit_code(&check));
     };
 
@@ -67,14 +81,17 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             "{} is already installed and running",
             manifest.version
         ));
-        println!(
-            "{}",
+        print_result(
+            options,
             json!({
                 "installed": manifest.version,
                 "current": install::current_link(&home),
                 "launchd": "unchanged",
                 "health": { "ok": true, "version": manifest.version },
-            })
+            }),
+            &check,
+            Some(manifest.version.as_str()),
+            "already up to date (daemon healthy)",
         );
         return Ok(0);
     }
@@ -94,15 +111,18 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             "active runtime {active} is newer than downloaded {}; not activating a downgrade",
             manifest.version
         ));
-        println!(
-            "{}",
+        print_result(
+            options,
             json!({
                 "installed": false,
                 "current": install::current_link(&home),
                 "active": active,
                 "launchd": "unchanged",
                 "skipped": "active runtime is newer than the selected release",
-            })
+            }),
+            &check,
+            Some(active),
+            "not needed (active runtime is newer)",
         );
         return Ok(0);
     }
@@ -111,14 +131,20 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     let Some(existing) = existing else {
         log("no launchd job installed; restart the daemon yourself to run the new version");
-        println!(
-            "{}",
+        print_result(
+            options,
             json!({
                 "installed": manifest.version,
                 "bin": installed,
                 "current": install::current_link(&home),
                 "launchd": "not_installed",
-            })
+            }),
+            &check,
+            Some(manifest.version.as_str()),
+            &format!(
+                "installed {} (restart the daemon yourself)",
+                manifest.version
+            ),
         );
         return Ok(0);
     };
@@ -144,15 +170,18 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     log(&format!("rewrote and reloaded {}", plist.display()));
     match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
         Ok(version) => {
-            println!(
-                "{}",
+            print_result(
+                options,
                 json!({
                     "installed": manifest.version,
                     "bin": installed,
                     "current": install::current_link(&home),
                     "launchd": "reloaded",
                     "health": { "ok": true, "version": version },
-                })
+                }),
+                &check,
+                Some(manifest.version.as_str()),
+                &format!("installed {} (launchd reloaded)", manifest.version),
             );
             Ok(0)
         }
@@ -167,8 +196,8 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                         .map(|_| ())
                 },
             );
-            println!(
-                "{}",
+            print_result(
+                options,
                 json!({
                     "installed": manifest.version,
                     "bin": installed,
@@ -176,7 +205,17 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                     "launchd": "reloaded",
                     "health": { "ok": false, "error": error },
                     "rollback": rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
-                })
+                }),
+                &check,
+                previous_version.as_deref(),
+                &format!(
+                    "install failed (rollback {})",
+                    if rollback.is_ok() {
+                        "restored"
+                    } else {
+                        "failed"
+                    }
+                ),
             );
             if let Err(rollback_error) = rollback {
                 eprintln!("update: rollback failed: {rollback_error}");
@@ -201,6 +240,70 @@ fn check_exit_code(check: &UpdateCheck) -> i32 {
     } else {
         0
     }
+}
+
+fn install_action(check: &UpdateCheck, active_version: Option<&str>) -> &'static str {
+    if check.latest.is_none() && check.error.is_some() {
+        "unavailable (manifest check failed)"
+    } else if check
+        .available_from(active_version.unwrap_or(&check.current))
+        .is_some()
+    {
+        "available"
+    } else {
+        "not needed"
+    }
+}
+
+fn print_result(
+    options: &Options,
+    report: serde_json::Value,
+    check: &UpdateCheck,
+    active_version: Option<&str>,
+    action: &str,
+) {
+    if options.json {
+        println!("{report}");
+    } else {
+        print_human(check, active_version, action);
+    }
+}
+
+fn print_human(check: &UpdateCheck, active_version: Option<&str>, action: &str) {
+    print!("{}", render_human(check, active_version, action));
+}
+
+fn render_human(check: &UpdateCheck, active_version: Option<&str>, action: &str) -> String {
+    let latest = check.latest.as_ref().map_or_else(
+        || "unavailable".to_owned(),
+        |manifest| human_field(&manifest.version),
+    );
+    let mut output = format!(
+        "invoking factoryctl: {}\nactive runtime (bin/current): {}\nlatest release: {latest}\nupdate --install: {}\n",
+        human_field(&check.current),
+        human_field(active_version.unwrap_or("not installed")),
+        human_field(action),
+    );
+    if let Some(error) = &check.error {
+        output.push_str(&format!("update error: {}\n", human_field(error)));
+    }
+    output
+}
+
+fn human_field(value: &str) -> String {
+    let mut output = String::new();
+    for (index, character) in value.chars().enumerate() {
+        if index == HUMAN_FIELD_MAX {
+            output.push_str("...");
+            break;
+        }
+        output.push(if character == ' ' || character.is_ascii_graphic() {
+            character
+        } else {
+            '?'
+        });
+    }
+    output
 }
 
 /// The release to install or reconcile. An active runtime equal to the
@@ -248,5 +351,33 @@ fn absolute(path: PathBuf) -> PathBuf {
         path
     } else {
         env::current_dir().map_or(path.clone(), |cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn human_rendering_replaces_controls_and_bounds_untrusted_fields() {
+        let check = UpdateCheck {
+            checked_at_ms: 0,
+            current: "0.2.2".to_owned(),
+            latest: Some(update::Manifest {
+                version: "999.0.0-rc\u{1b}[2J\nforged".to_owned(),
+                assets: Default::default(),
+            }),
+            error: Some("failed\nforged\u{202e}".to_owned()),
+        };
+        let output = render_human(&check, Some("0.1.0\tactive"), "available\nforged");
+        assert_eq!(output.matches('\n').count(), 5);
+        assert!(
+            !output
+                .bytes()
+                .any(|byte| (byte < b' ' && byte != b'\n') || byte == 0x7f)
+        );
+        assert!(output.contains("latest release: 999.0.0-rc?[2J?forged\n"));
+        assert!(output.contains("update error: failed?forged?\n"));
+        assert!(human_field(&"x".repeat(HUMAN_FIELD_MAX + 1)).len() <= HUMAN_FIELD_MAX + 3);
     }
 }

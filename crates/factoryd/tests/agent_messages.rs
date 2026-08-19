@@ -163,15 +163,39 @@ fn opening_a_run_episode_delivers_messages_into_the_new_episode() {
             6,
         )
         .unwrap();
+    // Compose the durable attempt's message identity first. A later inbox
+    // message must not be swept into the task episode merely because it is
+    // undelivered when the acknowledgement commits.
+    let captured_message_ids = store
+        .undelivered_messages_for_agent(&project, &agent)
+        .unwrap()
+        .into_iter()
+        .map(|message| message.id)
+        .collect::<Vec<_>>();
+    store
+        .send_agent_message(NewAgentMessage {
+            id: MessageId::try_from("message-3").unwrap(),
+            project_id: project.clone(),
+            sender_agent_id: Some(AgentId::try_from("god").unwrap()),
+            recipient_agent_id: agent.clone(),
+            body: "Arrived after composition.".into(),
+            created_at_ms: 7,
+        })
+        .unwrap();
     let opened = store
-        .open_run_episode(&session_id, &TaskId::try_from("task-1").unwrap(), 6)
+        .open_run_episode_with_message_ids(
+            &session_id,
+            &TaskId::try_from("task-1").unwrap(),
+            Some(&captured_message_ids),
+            8,
+        )
         .unwrap();
     assert_eq!(opened.agent_messages.len(), 1);
     assert_eq!(
         opened.agent_messages[0].sender_agent_id.as_ref(),
         Some(&AgentId::try_from("god").unwrap())
     );
-    assert_eq!(opened.agent_messages[0].delivered_at_ms, Some(6));
+    assert_eq!(opened.agent_messages[0].delivered_at_ms, Some(8));
     assert_eq!(
         opened.agent_messages[0].delivered_run_id,
         Some(opened.run.id.clone())
@@ -184,5 +208,14 @@ fn opening_a_run_episode_delivers_messages_into_the_new_episode() {
     let persisted = store
         .list_agent_messages(&project, &agent, None, 100)
         .unwrap();
-    assert_eq!(persisted, opened.agent_messages);
+    assert_eq!(persisted.len(), 2);
+    assert!(persisted.iter().any(|message| {
+        message.id == MessageId::try_from("message-3").unwrap()
+            && message.delivered_at_ms.is_none()
+            && message.delivered_run_id.is_none()
+    }));
+    assert!(persisted.iter().any(|message| {
+        message.id == MessageId::try_from("message-2").unwrap()
+            && message.delivered_run_id == Some(opened.run.id.clone())
+    }));
 }

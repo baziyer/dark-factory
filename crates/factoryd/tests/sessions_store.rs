@@ -128,14 +128,14 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 24 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 25 after the
 /// connector-event migration, runtime metadata, and legacy permission repair
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
 /// chain including 0015's `sessions` rebuild, 0016's task incarnations, and
 /// 0021's historical runtime metadata columns, 0022's legacy permission
-/// repair, and 0024's cleanup ownership state.
+/// repair, and 0023's cleanup ownership state.
 /// repair.
 #[test]
 fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
@@ -223,14 +223,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0020.
+    // Opening through the real store runs migrations 0014 through 0025.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -283,7 +283,8 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE connector_events;
+                "DROP TABLE delivery_attempts;
+                 DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
@@ -302,7 +303,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -329,6 +330,7 @@ fn migration_0022_runs_both_model_policy_and_cleanup_steps() {
                 "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  ALTER TABLE sessions DROP COLUMN cleanup_state;
+                 DROP TABLE delivery_attempts;
                  PRAGMA user_version = 22;",
             )
             .unwrap();
@@ -339,7 +341,7 @@ fn migration_0022_runs_both_model_policy_and_cleanup_steps() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     connection
         .prepare("SELECT reasoning_effort, model_selection_reason FROM agent_profiles")
         .unwrap();
@@ -426,14 +428,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0019 migrations.
+    // Opening through the real store runs the 0015 through 0025 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

@@ -37,6 +37,19 @@ struct RunningTerminalRunner {
     _directory: tempfile::TempDir,
 }
 
+/// Owns exactly one fixture-created escaped PID. The guard runs on assertion
+/// panic/unwind, so a failed regression cannot leave its detached child for a
+/// later test; it never guesses a process group or uses a process name.
+struct ExactPidGuard(Option<Pid>);
+
+impl Drop for ExactPidGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.take() {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+    }
+}
+
 impl RunningTerminalRunner {
     fn spawn(program: &Path, args: &[&str], cols: u16, rows: u16) -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -742,6 +755,7 @@ fn setsid_escape_during_term_fails_closed_without_a_false_exited_event() {
         .trim()
         .parse::<i32>()
         .unwrap();
+    let _escaped_guard = ExactPidGuard(Pid::from_raw(escaped));
     let lease = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -765,7 +779,40 @@ fn setsid_escape_during_term_fails_closed_without_a_false_exited_event() {
             .any(|event| matches!(event, RunnerEvent::Exited { .. })),
         "a setsid escape must not be reported as clean PTY exit"
     );
-    kill_process(Pid::from_raw(escaped).unwrap(), Signal::KILL).unwrap();
+}
+
+/// Exercise the provider-to-tool boundary with the runtime that caused the
+/// production escape: Node closes inherited stdio/descriptors while spawning
+/// a detached tool. The runner must fail closed before `Exited`; it cannot
+/// claim a lease/group proof after the tool has escaped into the private cwd.
+#[test]
+fn node_detached_stdio_ignore_tool_fails_closed_before_exited() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("node-escaped.pid");
+    let runner = RunningTerminalRunner::spawn(
+        Path::new("node"),
+        &[
+            "-e",
+            "const fs=require('fs'); const {spawn}=require('child_process'); const p=spawn('/bin/sleep',['30'],{detached:true,stdio:'ignore'}); fs.writeFileSync(process.argv[1],String(p.pid)+'\\n'); process.exit(0);",
+            marker.to_str().unwrap(),
+        ],
+        80,
+        24,
+    );
+    wait_for_path(&marker);
+    let escaped = fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let _escaped_guard = ExactPidGuard(Pid::from_raw(escaped));
+    thread::sleep(Duration::from_millis(750));
+    assert!(
+        !spool_events(&runner)
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Exited { .. })),
+        "Node's detached stdio-ignored tool must block the terminal proof"
+    );
 }
 
 fn spool_events(runner: &RunningTerminalRunner) -> Vec<RunnerEvent> {

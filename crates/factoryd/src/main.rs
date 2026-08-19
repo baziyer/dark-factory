@@ -1,12 +1,4 @@
-use std::{
-    env,
-    error::Error,
-    ffi::OsString,
-    fs, io,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
@@ -43,7 +35,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     preflight_sibling_binaries(&config)?;
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
-    let state = ApiState::with_operator_token(store, load_operator_token(&config.guidance_root)?);
+    let state = ApiState::new(store);
     let shutdown = ShutdownSignals::install()?;
     let (listener, socket_cleanup) = instance.bind_socket()?;
     listener.set_nonblocking(true)?;
@@ -335,35 +327,6 @@ fn next_path(
 
 fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
     Ok(factory_core::paths::dark_factory_home()?)
-}
-
-fn load_operator_token(home: &Path) -> Result<String, Box<dyn Error>> {
-    if !home.exists() {
-        fs::create_dir_all(home)?;
-        fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
-    }
-    let path = home.join("operator.token");
-    if let Ok(token) = fs::read_to_string(&path) {
-        let token = token.trim().to_owned();
-        if token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Ok(token);
-        }
-        return Err(format!("invalid daemon operator token at {}", path.display()).into());
-    }
-    let mut bytes = [0_u8; 32];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| format!("cannot generate operator token: {error}"))?;
-    let mut token = String::with_capacity(bytes.len() * 2 + 1);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        write!(token, "{byte:02x}")?;
-    }
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true).mode(0o600);
-    let mut file = options.open(&path)?;
-    use std::io::Write as _;
-    writeln!(file, "{token}")?;
-    Ok(token)
 }
 
 /// Refuses to start with a one-line actionable error if `factory-runner`

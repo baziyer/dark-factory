@@ -888,20 +888,10 @@ impl Board {
             PendingAction::ResolveSessionCleanup {
                 project_id,
                 session_id,
-            } => match self.operator_token.clone() {
-                Some(operator_token) => Intent::Send(LocalRequest::ResolveSessionCleanup {
-                    project_id,
-                    session_id,
-                    operator_token,
-                }),
-                None => {
-                    self.set_status(
-                        "daemon operator token is unavailable; use factoryctl after checking its home",
-                        StatusLevel::Error,
-                    );
-                    Intent::Redraw
-                }
-            },
+            } => Intent::Send(LocalRequest::ResolveSessionCleanup {
+                project_id,
+                session_id,
+            }),
         }
     }
 
@@ -1385,7 +1375,6 @@ mod tests {
     #[test]
     fn cleanup_resolution_is_two_press_operator_action() {
         let mut board = board();
-        board.operator_token = Some("test-operator-token".into());
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
         board
             .sessions

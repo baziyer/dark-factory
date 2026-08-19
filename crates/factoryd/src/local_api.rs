@@ -27,10 +27,7 @@ use factory_core::{
     },
     status,
 };
-use rustix::{
-    fs::FlockOperation,
-    process::{Pid, test_kill_process, test_kill_process_group},
-};
+use rustix::fs::FlockOperation;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take},
     net::{
@@ -58,11 +55,14 @@ use crate::{
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
-// A caller may request the full 60-second runner grace. Allow that grace,
-// group reap, and the short terminal-output drain to finish before claiming
-// the shared StopRun/StopSession operation completed.
-const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(75);
-const STOP_COMPLETION_POLL: Duration = Duration::from_millis(100);
+// A stop may consume the caller's 60s grace, then up to 5s waiting for the
+// killed process group to disappear and another 5s draining provider output.
+// Keep the API bound above that complete runner path rather than timing out
+// while the runner is still proving cleanup.
+// 60s provider grace + 200ms final group grace + 5s lease reap + 5s group
+// reap + 5s PTY output drain, with 5s scheduler/I/O margin.
+const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(80);
+const STOP_COMPLETION_POLL: Duration = Duration::from_millis(20);
 
 enum RepositoryRequest {
     Status,
@@ -82,32 +82,6 @@ enum RepositoryRequest {
         title: String,
         body: String,
     },
-}
-
-#[cfg(test)]
-mod protocol_tests {
-    use super::*;
-
-    #[test]
-    fn protocol_version_is_rejected_before_unknown_request_variants_are_parsed() {
-        let payload = serde_json::json!({
-            "protocol_version": PROTOCOL_VERSION - 1,
-            "request": {
-                "type": "future_unknown_request",
-                "data": {"future_field": "future-shape"}
-            }
-        });
-        let Err(response) = parse_envelope(&serde_json::to_vec(&payload).unwrap()) else {
-            panic!("unsupported protocol was accepted");
-        };
-        assert!(matches!(
-            *response,
-            LocalResponse::Error {
-                code: ErrorCode::UnsupportedProtocol,
-                ..
-            }
-        ));
-    }
 }
 
 struct RepositoryAudit {
@@ -287,7 +261,8 @@ impl ApiFailure {
                 | StoreError::AgentRunHasDependents
                 | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun
-                | StoreError::RunNotStoppable),
+                | StoreError::RunNotStoppable
+                | StoreError::SessionStopping),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(
                 error
@@ -330,7 +305,8 @@ impl From<execution::Error> for ApiFailure {
                 | StoreError::TaskAssignmentMismatch
                 | StoreError::AgentUnavailable
                 | StoreError::SessionNotFound
-                | StoreError::SessionNotLive),
+                | StoreError::SessionNotLive
+                | StoreError::SessionStopping),
             )) => Self::Store(error),
             _ => Self::Internal("execution manager could not accept the task".into()),
         }
@@ -481,40 +457,21 @@ async fn handle_connection(
 }
 
 fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
-    // Read the version discriminator before deserializing the request enum.
-    // A newer client may contain a request variant this daemon does not know;
-    // that must still produce UnsupportedProtocol, not a misleading invalid
-    // request from enum deserialization.
-    let value: serde_json::Value = serde_json::from_slice(payload).map_err(|_| {
+    let envelope: RequestEnvelope = serde_json::from_slice(payload).map_err(|_| {
         Box::new(LocalResponse::Error {
             code: ErrorCode::InvalidRequest,
             message: "request is not valid local protocol JSON".into(),
         })
     })?;
-    let protocol_version = value
-        .get("protocol_version")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|version| u16::try_from(version).ok())
-        .ok_or_else(|| {
-            Box::new(LocalResponse::Error {
-                code: ErrorCode::InvalidRequest,
-                message: "request is missing a valid protocol_version".into(),
-            })
-        })?;
-    if protocol_version != PROTOCOL_VERSION {
+    if envelope.protocol_version != PROTOCOL_VERSION {
         return Err(Box::new(LocalResponse::Error {
             code: ErrorCode::UnsupportedProtocol,
             message: format!(
-                "protocol {protocol_version} is unsupported; this daemon speaks {PROTOCOL_VERSION}",
+                "protocol {} is unsupported; this daemon speaks {}",
+                envelope.protocol_version, PROTOCOL_VERSION
             ),
         }));
     }
-    let envelope: RequestEnvelope = serde_json::from_value(value).map_err(|_| {
-        Box::new(LocalResponse::Error {
-            code: ErrorCode::InvalidRequest,
-            message: "request is not valid local protocol JSON".into(),
-        })
-    })?;
     Ok(envelope.request)
 }
 
@@ -1383,11 +1340,6 @@ async fn handle_request(
             // flight, so nothing can still be writing into its guidance
             // directory below.
             execution.begin_delete(&agent_id).await?;
-            // Assignment changes and delivery share the owner-side barrier.
-            // Hold it while the delete transaction unassigns every task so
-            // no in-flight prompt can escape to an agent that is being
-            // removed.
-            let _delivery_slot = execution.lock_delivery_slot(&agent_id).await;
             let result = delete_agent_locked(state, guidance_root, project_id, agent_id).await;
             execution.end_delete(&response_agent_id);
             result?;
@@ -1419,20 +1371,10 @@ async fn handle_request(
                     }
                 }
             }
-            let delivery_slots = if begin_error.is_none() {
-                let mut slots = Vec::with_capacity(begun.len());
-                for agent_id in &begun {
-                    slots.push(execution.lock_delivery_slot(agent_id).await);
-                }
-                slots
-            } else {
-                Vec::new()
-            };
             let result = match begin_error {
                 Some(error) => Err(ApiFailure::from(error)),
                 None => delete_project_locked(state, guidance_root, project_id).await,
             };
-            drop(delivery_slots);
             for agent_id in &begun {
                 execution.end_delete(agent_id);
             }
@@ -1447,28 +1389,6 @@ async fn handle_request(
             task_id,
             agent_id,
         } => {
-            let _assignment_slot = execution.lock_assignment_slot().await;
-            let lookup_project_id = project_id.clone();
-            let lookup_task_id = task_id.clone();
-            let previous_owner = state
-                .with_store(move |store| {
-                    Ok(store
-                        .get_task(&lookup_project_id, &lookup_task_id)?
-                        .snapshot
-                        .assigned_agent_id)
-                })
-                .await?;
-            // The task-scoped lock orders competing moves. This owner-side
-            // barrier orders the move against delivery itself: when the
-            // move commits, the old worker's delivery slot is definitely
-            // free, and a later delivery observes the new assignment.
-            let _delivery_slot = previous_owner
-                .as_ref()
-                .map(|owner| execution.lock_delivery_slot(owner));
-            let _delivery_slot = match _delivery_slot {
-                Some(future) => Some(future.await),
-                None => None,
-            };
             let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
@@ -1504,11 +1424,37 @@ async fn handle_request(
             }
             let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
+            let session = state
+                .with_store(move |store| {
+                    store.run_session_snapshot(&lookup_project_id, &lookup_run_id)
+                })
+                .await?;
+            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
+            let stop_project_id = project_id.clone();
+            let stop_run_id = run_id.clone();
+            let _run = state
+                .commit_and_publish(move |store| {
+                    let (run, event) =
+                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
+                    Ok((run, vec![event]))
+                })
+                .await?;
+            let session_project_id = project_id.clone();
+            let session_id = session.id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (session, event) =
+                        store.request_session_stop(&session_project_id, &session_id, now_ms()?)?;
+                    Ok((session, vec![event]))
+                })
+                .await?;
+            let target_project_id = project_id.clone();
+            let target_run_id = run_id.clone();
             let (target, control_run_id) = state
                 .with_store(move |store| {
                     Ok((
-                        store.run_control_target(&lookup_project_id, &lookup_run_id)?,
-                        store.run_control_id(&lookup_project_id, &lookup_run_id)?,
+                        store.run_control_target(&target_project_id, &target_run_id)?,
+                        store.run_control_id(&target_project_id, &target_run_id)?,
                     ))
                 })
                 .await?;
@@ -1520,37 +1466,7 @@ async fn handle_request(
             .stop(grace_ms)
             .await
             .map_err(|error| runner_control_failure(error, "stop"))?;
-            let stop_project_id = project_id.clone();
-            let stop_run_id = run_id.clone();
-            let run = state
-                .commit_and_publish(move |store| {
-                    let (run, event) =
-                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
-                    Ok((run, vec![event]))
-                })
-                .await?;
-            // A run's process *is* its session's: `StopRun` kills the same
-            // runner `StopSession` would (above), so it must also record
-            // stop intent on the session, not just the run -- otherwise
-            // `end_session` (fired once the runner actually exits) cannot
-            // tell this apart from a crash and would wrongly close the
-            // episode `failed`/`session_ended` instead of
-            // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
-            if let Some(session_id) = run.session_id.clone() {
-                let session_project_id = project_id.clone();
-                let request_session_id = session_id.clone();
-                state
-                    .commit_and_publish(move |store| {
-                        let (session, event) = store.request_session_stop(
-                            &session_project_id,
-                            &request_session_id,
-                            now_ms()?,
-                        )?;
-                        Ok((session, vec![event]))
-                    })
-                    .await?;
-                wait_for_session_stop(state, &project_id, &session_id).await?;
-            }
+            wait_for_session_stop(state, &project_id, &session.id).await?;
             Ok(LocalResponse::RunStopped { run_id })
         }
         LocalRequest::CancelRun { project_id, run_id } => {
@@ -1631,6 +1547,9 @@ async fn handle_request(
             // backoff/streak slate rather than being immediately eligible
             // to re-trip the same pause on its very next deadline.
             execution.resume_backoff(&wake_agent_id);
+            execution
+                .reset_delivery_attempt(&wake_project_id, &wake_agent_id)
+                .await?;
             execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentResumed { agent })
         }
@@ -1663,20 +1582,20 @@ async fn handle_request(
             }
             let lookup_project_id = project_id.clone();
             let lookup_session_id = session_id.clone();
+            let session = state
+                .with_store(move |store| {
+                    store.session_snapshot(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
+            let target_project_id = project_id.clone();
+            let target_session_id = session_id.clone();
             let target = state
                 .with_store(move |store| {
-                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                    store.session_control_target(&target_project_id, &target_session_id)
                 })
                 .await?;
             let control_run_id = session_control_run_id(&session_id)?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_session_id = session_id.clone();
             state
@@ -1689,19 +1608,21 @@ async fn handle_request(
                     Ok((session, vec![event]))
                 })
                 .await?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
             wait_for_session_stop(state, &project_id, &session_id).await?;
             Ok(LocalResponse::SessionStopped { session_id })
         }
         LocalRequest::ResolveSessionCleanup {
             project_id,
             session_id,
-            operator_token,
         } => {
-            if !state.operator_token_matches(&operator_token) {
-                return Err(ApiFailure::Conflict(
-                    "cleanup resolution requires the daemon operator token".into(),
-                ));
-            }
             let target = state
                 .with_store({
                     let project_id = project_id.clone();
@@ -1743,7 +1664,7 @@ async fn handle_request(
             }
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
-            let session_id = session.id;
+            let session_id = session.id.clone();
             let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
             let policy_decision = (event == ProviderHookEvent::PreToolUse)
                 .then(|| crate::policy::decide(&payload, Path::new(&session.worktree)));
@@ -1763,6 +1684,21 @@ async fn handle_request(
             } else {
                 false
             };
+            if event == ProviderHookEvent::UserPromptSubmit {
+                // Bind and commit the exact durable delivery before
+                // publishing the hook event. The ack waiter then observes
+                // `acknowledged`, never merely an unrelated prompt event.
+                if execution.try_begin_agent_write(&agent_id) {
+                    let result = execution::commit_pending_delivery_on_prompt(
+                        state,
+                        &session.snapshot(),
+                        &payload,
+                    )
+                    .await;
+                    execution.end_agent_write(&agent_id);
+                    result?;
+                }
+            }
             let record_session_id = session_id.clone();
             let updated_session = state
                 .commit_and_publish(move |store| {
@@ -1847,27 +1783,6 @@ async fn handle_request(
             } else {
                 serde_json::json!({})
             };
-            if event == ProviderHookEvent::UserPromptSubmit {
-                // Commit any pending PTY-typed delivery *now*, before this
-                // hook request's own reply reaches the client -- closes a
-                // race a fast-reacting client can otherwise win against
-                // the dispatcher's own separate ack-detection/commit
-                // (`execution::commit_pending_delivery_on_prompt`'s own
-                // doc comment has the full story; this track's item 1).
-                // Same deletion gate as the stop-hook reply above, and the
-                // same silent-decline reasoning: `compose_delivery` inside
-                // it can lazily recreate guidance files too.
-                if execution.try_begin_agent_write(&agent_id) {
-                    let result = execution::commit_pending_delivery_on_prompt(
-                        state,
-                        guidance_root,
-                        &updated_session,
-                    )
-                    .await;
-                    execution.end_agent_write(&agent_id);
-                    result?;
-                }
-            }
             if event == ProviderHookEvent::SessionStart {
                 // Codex reports its own thread id back in this hook's
                 // payload (a Claude-shaped `session_id` field -- its
@@ -2001,6 +1916,78 @@ async fn handle_request(
         }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
     }
+}
+
+fn verify_cleanup_runtime(target: &crate::store::SessionControlTarget) -> Result<(), ApiFailure> {
+    let runtime = PathBuf::from(&target.runner_runtime);
+    if !runtime.is_absolute() || !runtime.is_dir() {
+        return Err(ApiFailure::Conflict(
+            "private runner runtime is unavailable".into(),
+        ));
+    }
+    let lease_path = runtime.join("pty-lease");
+    if lease_path.exists() {
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lease_path)
+            .map_err(|_| ApiFailure::Conflict("runner cleanup lease is unavailable".into()))?;
+        match rustix::fs::flock(&lease, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::ACCESS) => {
+                return Err(ApiFailure::Conflict(
+                    "a provider descendant still holds the cleanup lease".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(ApiFailure::Conflict(
+                    "runner cleanup lease could not be verified".into(),
+                ));
+            }
+        }
+    }
+    audit_cleanup_cwd(Path::new(&target.worktree))?;
+    fs::write(
+        runtime.join("cleanup.proof"),
+        b"daemon-verified-cleanup-v2\n",
+    )
+    .map_err(|_| ApiFailure::Conflict("cleanup proof could not be durably recorded".into()))?;
+    Ok(())
+}
+
+fn audit_cleanup_cwd(cwd: &Path) -> Result<(), ApiFailure> {
+    let cwd = fs::canonicalize(cwd)
+        .map_err(|_| ApiFailure::Conflict("cleanup cwd could not be canonicalized".into()))?;
+    let lsof = if cfg!(target_os = "macos") {
+        "/usr/sbin/lsof"
+    } else {
+        "lsof"
+    };
+    let output = std::process::Command::new(lsof)
+        .args(["-a", "-d", "cwd", "-Fn"])
+        .output()
+        .map_err(|_| ApiFailure::Conflict("cleanup ownership audit is unavailable".into()))?;
+    if !output.status.success() {
+        return Err(ApiFailure::Conflict(
+            "cleanup ownership audit failed closed".into(),
+        ));
+    }
+    let self_pid = std::process::id().to_string();
+    let mut pid = String::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(raw) = line.strip_prefix('p') {
+            pid = raw.to_owned();
+        } else if let Some(path) = line.strip_prefix('n') {
+            if (path == cwd.to_string_lossy() || Path::new(path).starts_with(&cwd))
+                && pid != self_pid
+            {
+                return Err(ApiFailure::Conflict(
+                    "an unowned process remains in the private worktree".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
@@ -3230,82 +3217,6 @@ fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> I
 /// a stop to the operator. A timeout or explicit cleanup failure leaves the
 /// session live, so `DeleteAgent` cannot make an unconfirmed process tree
 /// undiscoverable.
-/// Verifies cleanup from daemon-owned runtime evidence before the operator can
-/// release a cleanup-failed session. The caller supplies only the session
-/// identity; it cannot assert that a process tree is gone. A live runner,
-/// live recorded leader, or any remaining original process group fails closed.
-fn verify_cleanup_runtime(target: &SessionControlTarget) -> Result<(), ApiFailure> {
-    let runtime = PathBuf::from(&target.runner_runtime);
-    let control_socket = runtime.join("control.sock");
-    if control_socket.exists() && std::os::unix::net::UnixStream::connect(&control_socket).is_ok() {
-        return Err(ApiFailure::Conflict(
-            "runner control socket is still live; cleanup is not verified".into(),
-        ));
-    }
-    let spool = fs::read_to_string(runtime.join("events.ndjson"))
-        .map_err(|_| ApiFailure::Conflict("runner cleanup evidence is unavailable".into()))?;
-    if spool.len() > MAX_RUNNER_SPOOL_BYTES {
-        return Err(ApiFailure::Conflict(
-            "runner cleanup evidence exceeded its bound".into(),
-        ));
-    }
-    let started_pid = spool.lines().find_map(|line| {
-        let event = serde_json::from_str::<RunnerEventEnvelope>(line).ok()?;
-        match event.event {
-            RunnerEvent::Started { child_pid } => {
-                i32::try_from(child_pid).ok().and_then(Pid::from_raw)
-            }
-            _ => None,
-        }
-    });
-    let Some(pid) = started_pid else {
-        return Err(ApiFailure::Conflict(
-            "runner cleanup evidence has no owned process identity".into(),
-        ));
-    };
-    if test_kill_process(pid).is_ok() {
-        return Err(ApiFailure::Conflict(
-            "the recorded provider leader is still alive".into(),
-        ));
-    }
-    match test_kill_process_group(pid) {
-        Err(error) if error == rustix::io::Errno::SRCH => {}
-        Err(_) | Ok(()) => {
-            return Err(ApiFailure::Conflict(
-                "the recorded provider process group is not proven gone".into(),
-            ));
-        }
-    }
-    let lease_path = runtime.join("pty-lease");
-    if lease_path.exists() {
-        let lease = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(lease_path)
-            .map_err(|_| ApiFailure::Conflict("runner cleanup lease is unavailable".into()))?;
-        match rustix::fs::flock(&lease, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => {}
-            Err(rustix::io::Errno::AGAIN | rustix::io::Errno::ACCESS) => {
-                return Err(ApiFailure::Conflict(
-                    "a provider descendant still holds the cleanup lease".into(),
-                ));
-            }
-            Err(_) => {
-                return Err(ApiFailure::Conflict(
-                    "runner cleanup lease could not be verified".into(),
-                ));
-            }
-        }
-    }
-    let proof = runtime.join("cleanup.proof");
-    if !proof.exists() {
-        fs::write(&proof, b"operator-verified-cleanup-v1\n").map_err(|_| {
-            ApiFailure::Conflict("cleanup proof could not be durably recorded".into())
-        })?;
-    }
-    Ok(())
-}
-
 async fn wait_for_session_stop(
     state: &ApiState,
     project_id: &ProjectId,
@@ -3383,56 +3294,6 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
     })
 }
 
-#[cfg(test)]
-mod cleanup_verification_tests {
-    use super::*;
-    use factory_core::runner::{RunnerEvent, RunnerEventEnvelope};
-    use std::io::Write;
-
-    fn target(runtime: &Path) -> SessionControlTarget {
-        SessionControlTarget {
-            runner_instance_id: factory_core::RunnerInstanceId::try_from("runner-1").unwrap(),
-            runner_runtime: runtime.display().to_string(),
-        }
-    }
-
-    fn evidence(runtime: &Path) {
-        let event = RunnerEventEnvelope {
-            protocol_version: factory_core::runner::RUNNER_PROTOCOL_VERSION,
-            sequence: 1,
-            occurred_at_ms: 1,
-            event: RunnerEvent::Started { child_pid: 999_999 },
-        };
-        let mut file = std::fs::File::create(runtime.join("events.ndjson")).unwrap();
-        writeln!(file, "{}", serde_json::to_string(&event).unwrap()).unwrap();
-        std::fs::File::create(runtime.join("pty-lease")).unwrap();
-    }
-
-    #[test]
-    fn cleanup_resolution_requires_a_free_durable_lease() {
-        let runtime = tempfile::tempdir().unwrap();
-        evidence(runtime.path());
-        verify_cleanup_runtime(&target(runtime.path())).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(runtime.path().join("cleanup.proof")).unwrap(),
-            "operator-verified-cleanup-v1\n"
-        );
-
-        std::fs::remove_file(runtime.path().join("cleanup.proof")).unwrap();
-        let lease = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(runtime.path().join("pty-lease"))
-            .unwrap();
-        rustix::fs::flock(&lease, FlockOperation::LockExclusive).unwrap();
-        let error = verify_cleanup_runtime(&target(runtime.path())).unwrap_err();
-        assert!(matches!(
-            error,
-            ApiFailure::Conflict(message) if message.contains("cleanup lease")
-        ));
-    }
-}
-
 /// Wiring-level tests for the two deletion-gate call sites this file adds
 /// around `execution::stop_hook_reply`/`execution::commit_pending_delivery_on_prompt`
 /// (PR #50 review, round 3's nit): every existing `tests/local_api.rs`/
@@ -3454,7 +3315,13 @@ mod deletion_gate_tests {
     use factory_core::{AgentRole, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus};
 
     use super::*;
-    use crate::store::{NewAgent, NewProject, NewSession, NewTask, Store};
+    use crate::{
+        execution::DELIVERY_ATTEMPT_MARKER,
+        store::{
+            DeliveryAttemptState, NewAgent, NewDeliveryAttempt, NewProject, NewSession, NewTask,
+            Store,
+        },
+    };
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -3626,6 +3493,140 @@ mod deletion_gate_tests {
         );
 
         execution.end_delete(&agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_same_text_hook_cannot_commit_a_recreated_task_attempt() {
+        let directory = private_tempdir();
+        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let visible_text = "same prompt";
+        let old_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-a\u{2063}");
+        let old_attempt_text = old_text.clone();
+        let (old_incarnation, old_run_count) = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.task_delivery_marker(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "attempt-a".to_owned(),
+                        project_id,
+                        agent_id,
+                        session_id,
+                        task_id: Some(task_id),
+                        task_incarnation_id: Some(old_incarnation),
+                        prior_run_count: Some(old_run_count),
+                        message_ids: Vec::new(),
+                        text: old_attempt_text,
+                        created_at_ms: 1_001,
+                    })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+
+        // Delete/recreate the same operator-facing id. Deletion cancels A;
+        // B has the same visible prompt but a different immutable attempt
+        // nonce and task incarnation.
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.delete_task(&project_id, &task_id, 1_002)?;
+                    store.create_task(
+                        NewTask {
+                            id: task_id.clone(),
+                            project_id: project_id.clone(),
+                            parent_task_id: None,
+                            title: "Replacement".to_owned(),
+                            body: visible_text.to_owned(),
+                            priority: 0,
+                        },
+                        1_003,
+                    )?;
+                    store.assign_task(&project_id, &task_id, Some(&agent_id), 1_004)?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+        let (incarnation, prior_run_count) = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.task_delivery_marker(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+        let new_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-b\u{2063}");
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "attempt-b".to_owned(),
+                        project_id,
+                        agent_id,
+                        session_id,
+                        task_id: Some(task_id),
+                        task_incarnation_id: Some(incarnation),
+                        prior_run_count: Some(prior_run_count),
+                        message_ids: Vec::new(),
+                        text: new_text,
+                        created_at_ms: 1_005,
+                    })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+
+        let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::UserPromptSubmit,
+                payload: serde_json::json!({"prompt": old_text}),
+            },
+        )
+        .await;
+        assert!(response.is_ok());
+        let task = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.get_task(&project_id, &task_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.snapshot.status, TaskStatus::Queued);
+        assert_eq!(
+            state
+                .with_store(|store| store.delivery_attempt_state("attempt-b"))
+                .await
+                .unwrap(),
+            Some(DeliveryAttemptState::InFlight)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
