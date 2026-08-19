@@ -62,13 +62,23 @@ async fn raw_request(socket: &Path, payload: &[u8]) -> ServerFrame {
     read_frame(&mut BufReader::new(stream)).await
 }
 
+fn private_tempdir() -> tempfile::TempDir {
+    let base = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let directory = tempfile::tempdir_in(base).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
 async fn with_server<F, Fut>(test: F)
 where
     F: FnOnce(std::path::PathBuf) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
@@ -95,8 +105,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_events() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let database = directory.path().join("factory.db");
     let project_id = project_id("factory");
     {
@@ -553,8 +562,7 @@ async fn the_frame_limit_counts_json_but_not_the_newline_delimiter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_closes_idle_connections_before_returning() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
@@ -584,8 +592,7 @@ async fn shutdown_closes_idle_connections_before_returning() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_a_blocked_historical_replay() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut store = Store::open_in_memory().unwrap();

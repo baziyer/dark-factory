@@ -3566,7 +3566,12 @@ mod tests {
     }
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let base = if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        };
+        let directory = tempfile::tempdir_in(base).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
@@ -5326,7 +5331,7 @@ mod tests {
 
     #[test]
     fn compose_text_embeds_the_task_colon_id_marker_the_shell_fixture_looks_for() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5347,7 +5352,7 @@ mod tests {
 
     #[test]
     fn compose_text_appends_the_orchestrator_footer_only_for_orchestrators() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5367,7 +5372,7 @@ mod tests {
 
     #[test]
     fn compose_text_never_exceeds_the_delivery_bound() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5382,7 +5387,7 @@ mod tests {
 
     #[test]
     fn composing_guidance_does_not_rewrite_project_or_standing_instructions() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
         let project_path =
