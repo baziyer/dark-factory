@@ -1,6 +1,11 @@
 //! Small, explicit `PreToolUse` deny policy. This is a tripwire, not an OS
 //! sandbox: providers run as the operator and can encode commands in ways a
 //! JSON hook cannot safely interpret. The exact boundary lives in SECURITY.md.
+//!
+//! GitHub publication is deliberately not one of this policy's decisions.
+//! `scripts/github-comment.sh` is a safe transport convention, not a source
+//! of authority; credentials and daemon capabilities belong to the shared
+//! authenticated API boundary.
 
 use std::path::Path;
 
@@ -30,8 +35,6 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
-    } else if direct_github_comment(commands.as_deref().unwrap_or_default()) {
-        Some("github_comment_helper_required")
     } else if changes_capacity(commands.as_deref().unwrap_or_default()) {
         Some("capacity_operator_only")
     } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
@@ -51,18 +54,6 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
         tool_name: tool_name.to_owned(),
         denied_by,
     }
-}
-
-fn direct_github_comment(commands: &[Vec<ShellWord>]) -> bool {
-    commands.iter().any(|words| {
-        let Some((program, args)) = resolve_command(words) else {
-            return false;
-        };
-        program == "gh"
-            && args.len() >= 3
-            && matches!(args[0].as_str(), "issue" | "pr")
-            && args[1] == "comment"
-    })
 }
 
 fn changes_capacity(commands: &[Vec<ShellWord>]) -> bool {
@@ -569,18 +560,6 @@ mod tests {
             decide(&bash("echo replacement > ~/.aws/credentials"), root).denied_by,
             Some("secret_path")
         );
-        for command in [
-            "gh issue comment 80 --body literal",
-            "gh pr comment 95 --body-file -",
-            "env gh issue comment 80 --body literal",
-            "command gh pr comment 95",
-        ] {
-            assert_eq!(
-                decide(&bash(command), root).denied_by,
-                Some("github_comment_helper_required"),
-                "{command}"
-            );
-        }
     }
 
     #[test]
@@ -690,14 +669,6 @@ mod tests {
             ("scripts/github-comment.sh issue 80", None),
             ("printf '%s' 'foo>bar'", None),
             ("scripts/github-comment.sh pr 95", None),
-            (
-                "gh issue comment 80 --body 'literal > ~/.aws/credentials'",
-                Some("github_comment_helper_required"),
-            ),
-            (
-                "gh pr comment 95 --body-file - <<EOF\nplain git push --force prose\nEOF",
-                Some("github_comment_helper_required"),
-            ),
         ];
         for (command, expected) in cases {
             assert_eq!(
@@ -705,6 +676,27 @@ mod tests {
                 expected,
                 "{command}"
             );
+        }
+    }
+
+    #[test]
+    fn github_publication_is_not_a_hook_policy_boundary() {
+        let root = Path::new("/tmp/worktree");
+        for command in [
+            // The helper is a transport convention; the hook cannot safely
+            // distinguish this form from aliases, interpreters, or raw APIs.
+            "scripts/github-comment.sh issue 80",
+            "gh issue comment 80 --body literal",
+            "sh -c 'gh issue comment 80 --body literal'",
+            "xargs gh issue comment 80",
+            "gh alias set publish 'issue comment 80'",
+            "gh api repos/example/project/issues/80/comments -f body=literal",
+            // Read-only GitHub commands must remain ordinary allowed work.
+            "gh issue view 80",
+            "gh pr view 95",
+            "gh api repos/example/project/pulls/95",
+        ] {
+            assert_eq!(decide(&bash(command), root).denied_by, None, "{command}");
         }
     }
 

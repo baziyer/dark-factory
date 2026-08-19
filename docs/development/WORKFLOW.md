@@ -29,9 +29,11 @@ printf '%s\n' 'Reviewed: `literal` and $(not shell syntax)' |
 Do not pass Markdown through a GitHub CLI shell argument or embed it in a
 shell command. The helper validates the target, supplies stdin to
 `--body-file -` exactly once, never opens a caller-supplied path, and never
-echoes the body. Direct `gh issue/pr comment` commands are denied by the
-runtime policy. Run `scripts/test-github-comment.sh` when changing this
-workflow.
+echoes the body. It is a transport helper, not a publication capability
+boundary; the runtime policy deliberately does not attempt to recognize
+direct, nested, aliased, or raw-API GitHub publication. Authentication and
+request capabilities belong to the shared daemon boundary in #203/#209. Run
+`scripts/test-github-comment.sh` when changing this workflow.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
 ### Testing resident sessions

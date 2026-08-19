@@ -1,10 +1,12 @@
 #!/bin/sh
-# Post literal Markdown from stdin to one GitHub issue or PR.
+# Safely transport literal Markdown from stdin to one GitHub issue or PR.
 #
 #   scripts/github-comment.sh issue|pr NUMBER
 #
 # The target is deliberately narrow and the body is always read by gh from
-# stdin. Never put Markdown in a shell argument or open a caller-supplied path.
+# stdin. This helper constrains transport only; daemon authentication and
+# capabilities decide whether publication is authorized. Never put Markdown
+# in a shell argument or open a caller-supplied path.
 set -eu
 
 maximum_output_bytes=4096

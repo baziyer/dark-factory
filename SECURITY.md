@@ -79,9 +79,12 @@ operator from their own agents. Concretely:
   and command substitution, backticks, process substitution, globs,
   malformed quoting/redirection, and wrapper options whose operands are
   ambiguous deny the whole tool call as `unsupported_shell_syntax`. Auto
-  mode remains on by default because ordinary GitHub review/comment commands
-  fit this grammar (including quoted bodies and quoted heredocs); a denied
-  command must be rewritten into the accepted form or run with auto mode off.
+  mode remains on by default for the accepted shell grammar. GitHub comment
+  publication is not a hook-policy capability: `scripts/github-comment.sh`
+  is a bounded stdin/target transport only, and the parser deliberately does
+  not try to recognize direct, nested, aliased, or raw-API GitHub publication.
+  Authentication and request capabilities remain the shared daemon boundary
+  being composed in #203/#209; this tripwire does not duplicate that authority.
   The hook fails closed if the daemon cannot answer and records each decision
   as an append-only event. This narrow parser is still not a sandbox:
   interpreters, generated scripts, MCP tools, provider bugs, or direct
