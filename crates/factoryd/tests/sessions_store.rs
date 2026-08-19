@@ -282,7 +282,8 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE connector_events;
+                "DROP TABLE delivery_attempts;
+                 DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;

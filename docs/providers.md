@@ -148,7 +148,12 @@ them into `factory_core::ProviderHookEvent` values (see
      durably visible if it still fails. A daemon restart consumes an
      interrupted attempt rather than resetting its retry budget; only an
      explicit operator resume resets a terminal attempt. A provider must not
-     silently consume a prompt without its exact hook acknowledgement.
+     silently consume a prompt without its exact hook acknowledgement. The
+     submitted prompt also carries an invisible durable-attempt nonce; the
+     hook must echo that exact body, including the nonce, so a delayed
+     same-text hook from a deleted/recreated task cannot acknowledge the new
+     attempt. A provider that normalizes the nonce is rejected as
+     unacknowledged rather than guessed successful.
    - **Provider A1** — a session's own `factoryctl` calls (an agent's own
      `task done`/`task blocked`, or an operator typing one directly) use a
      bare `factoryctl`, not `ctx.factoryctl_path`: that trusted absolute

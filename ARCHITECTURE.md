@@ -64,7 +64,9 @@ catalogue.
    request; a session already `working`/`waiting_for_input` is instead
    delivered via its `Stop`/`SubagentStop` hook's block-reply contract. A
    delivery attempt row stores the exact prompt, task incarnation, prior
-   run count, and message identities. Retry state is durable: a daemon
+   run count, and message identities. Each typed prompt carries an invisible
+   attempt nonce that the acknowledgement must echo, binding the hook to the
+   immutable attempt even when task ids are deleted and recreated. Retry state is durable: a daemon
    restart consumes an interrupted in-flight attempt, and only an explicit
    operator resume resets a terminal attempt. The hook must match that
    stored prompt exactly before acknowledging it, so a stale hook cannot

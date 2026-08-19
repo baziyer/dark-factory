@@ -60,22 +60,21 @@ hook("SessionStart", {"session_id": thread_id})
 # composer is ready. The first bounded delivery intentionally models the
 # observed no-prompt/no-run loss; the daemon's one outer retry must recover.
 ignored_resumed_deliveries = 1 if resumed else 0
-buffer = ""
+buffer = bytearray()
 prompt_log = os.path.join(os.path.dirname(token), "fake-codex-prompts.jsonl")
 while True:
     data = os.read(sys.stdin.fileno(), 1)
     if not data:
         break
-    character = data.decode("utf-8", errors="replace")
-    if character == "\r":
-        text = buffer
+    if data == b"\r":
+        text = buffer.decode("utf-8")
         if resumed and ignored_resumed_deliveries:
             ignored_resumed_deliveries -= 1
             # The live failure leaves the exact pasted prompt in the
             # provider's input buffer. A recovery bare CR submits that same
             # prompt; it must not cause a second prompt body to be typed.
             continue
-        buffer = ""
+        buffer.clear()
         if prompt_log:
             with open(prompt_log, "a", encoding="utf-8") as log:
                 log.write(json.dumps(text) + "\n")
@@ -87,4 +86,4 @@ while True:
             task_done(match.group(1), text)
         hook("Stop", {})
     else:
-        buffer += character
+        buffer.extend(data)
