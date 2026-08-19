@@ -1900,7 +1900,7 @@ async fn supervise_terminal(
                 stop_requested = true;
                 if let Err(error) = begin_group_termination_legacy(
                     pid,
-                    &ownership,
+                    &mut ownership,
                     command.grace,
                     &mut kill_deadline,
                 ) {
@@ -1917,7 +1917,7 @@ async fn supervise_terminal(
                 runner_signalled = true;
                 begin_group_termination_legacy(
                     pid,
-                    &ownership,
+                    &mut ownership,
                     DEFAULT_GROUP_GRACE,
                     &mut kill_deadline,
                 )?;
@@ -2317,7 +2317,12 @@ async fn reap_group_stragglers_legacy(
     if !legacy_process_group_exists(pid)? {
         return Ok(());
     }
-    begin_group_termination_legacy(pid, ownership, grace, kill_deadline)?;
+    if kill_deadline.is_none() {
+        signal_process_group_legacy(pid, Signal::TERM)?;
+        *kill_deadline = Some(Box::pin(tokio::time::sleep(grace)));
+    } else {
+        shorten_deadline(grace, kill_deadline);
+    }
     loop {
         tokio::select! {
             () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
@@ -2364,11 +2369,16 @@ async fn wait_for_group_empty_legacy(pid: Pid) -> Result<(), Error> {
 
 fn begin_group_termination_legacy(
     pid: Pid,
-    ownership: &ProcessGroupSnapshot,
+    ownership: &mut ProcessGroupSnapshot,
     grace: Duration,
     deadline: &mut Option<Pin<Box<Sleep>>>,
 ) -> Result<(), Error> {
     if deadline.is_none() {
+        // The leader is still alive at the first stop/shutdown request, so
+        // synchronously admit children created since the last poll while the
+        // group identity is still anchored. Once the leader is gone, refresh
+        // is forbidden and unknown members fail closed.
+        ownership.refresh(pid)?;
         ownership.verify(pid)?;
         signal_process_group_legacy(pid, Signal::TERM)?;
         *deadline = Some(Box::pin(tokio::time::sleep(grace)));
