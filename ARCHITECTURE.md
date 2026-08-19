@@ -200,9 +200,12 @@ catalogue.
    Collisions, stale leases, detached/dirty/swapped worktrees,
    wrong-task/cross-agent requests, and protected refs fail closed and are
    audited. Abandonment durably enters `removing` before filesystem cleanup;
-   restart retries that state, while a create retry revalidates an exact
-   derived worktree left by a database-gap crash. Review, merge, and release
-   remain outside this API; the #159 readiness projection consumes this target
+   an authenticated retry resumes that state, while a create retry
+   revalidates an exact derived worktree left by a database-gap crash; daemon
+   startup does not perform this reconciliation automatically. Review, merge, and release
+   remain outside this API; abandoned ledger rows are purged transactionally
+   immediately before their task, agent, or project parent is deleted. The
+   #159 readiness projection consumes this target
    rather than being duplicated here.
 9. Once deletion of an agent or project begins, every known writer of files
    under its identity is blocked from starting a new write and drained if

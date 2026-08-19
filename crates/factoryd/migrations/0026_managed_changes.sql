@@ -15,11 +15,11 @@ CREATE TABLE managed_changes (
     base_sha TEXT NOT NULL CHECK (length(base_sha) BETWEEN 1 AND 128),
     head_sha TEXT NOT NULL CHECK (length(head_sha) BETWEEN 1 AND 128),
     published_head_sha TEXT CHECK (published_head_sha IS NULL OR length(published_head_sha) BETWEEN 1 AND 128),
-    state TEXT NOT NULL CHECK (state IN ('preparing', 'active', 'removing', 'abandoned')),
+    state TEXT NOT NULL CHECK (state IN ('active', 'removing', 'abandoned')),
     created_at_ms INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL,
     UNIQUE(project_id, branch)
 ) STRICT;
 
 CREATE UNIQUE INDEX managed_changes_one_active_agent
-    ON managed_changes(project_id, agent_id) WHERE state IN ('preparing', 'active', 'removing');
+    ON managed_changes(project_id, agent_id) WHERE state IN ('active', 'removing');

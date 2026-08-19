@@ -11,7 +11,7 @@ use factoryctl::Client;
 use factoryd::{
     execution,
     local_api::{ApiState, serve},
-    store::{NewProject, NewTask, Store},
+    store::{ManagedChangeRecord, NewProject, NewTask, Store},
 };
 use rusqlite::Connection;
 use tokio::{
@@ -91,6 +91,174 @@ where
     server.await.unwrap().unwrap();
     execution.shutdown().await.unwrap();
     execution_join.await.unwrap().unwrap();
+}
+
+async fn with_seeded_server<F, Fut>(seed: impl FnOnce(&mut Store), test: F)
+where
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("f.sock");
+    let mut store = Store::open_in_memory().unwrap();
+    seed(&mut store);
+    let listener = UnixListener::bind(&socket).unwrap();
+    let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    test(socket).await;
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+fn seed_abandoned_change(store: &mut Store, project: &str, agent: &str, task: &str, now: i64) {
+    let project_id = project_id(project);
+    let agent_id = agent_id(agent);
+    let task_id = task_id(task);
+    store
+        .create_project(
+            NewProject {
+                id: project_id.clone(),
+                name: project.into(),
+                root: format!("/tmp/{project}"),
+            },
+            now,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            factoryd::store::NewAgent {
+                id: agent_id.clone(),
+                project_id: project_id.clone(),
+                parent_agent_id: None,
+                role: factory_core::AgentRole::Worker,
+                provider: factory_core::Provider::Shell,
+            },
+            now + 1,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                parent_task_id: None,
+                title: task.into(),
+                body: task.into(),
+                priority: 0,
+            },
+            now + 2,
+        )
+        .unwrap();
+    store
+        .assign_task(&project_id, &task_id, Some(&agent_id), now + 3)
+        .unwrap();
+    store
+        .create_managed_change(
+            ManagedChangeRecord {
+                project_id: project_id.clone(),
+                task_id: task_id.clone(),
+                agent_id: agent_id.clone(),
+                worktree: format!("/tmp/{project}/change"),
+                branch: format!("issue/{task}"),
+                git_dir: format!("/tmp/{project}/git"),
+                common_dir: format!("/tmp/{project}/common"),
+                worktree_device: 1,
+                worktree_inode: 2,
+                git_dir_device: 3,
+                git_dir_inode: 4,
+                common_dir_device: 5,
+                common_dir_inode: 6,
+                base_sha: "a".repeat(40),
+                head_sha: "a".repeat(40),
+                published_head_sha: None,
+                state: "active".into(),
+            },
+            now + 4,
+        )
+        .unwrap();
+    store
+        .begin_abandon_managed_change(&project_id, &task_id, &agent_id, now + 5)
+        .unwrap();
+    store
+        .finish_abandon_managed_change(&project_id, &task_id, &agent_id, now + 6)
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_deletes_purge_abandoned_changes_before_parent_rows() {
+    with_seeded_server(
+        |store| {
+            seed_abandoned_change(store, "task-project", "task-agent", "task-change", 1);
+            seed_abandoned_change(store, "agent-project", "agent-agent", "agent-change", 10);
+            seed_abandoned_change(
+                store,
+                "project-project",
+                "project-agent",
+                "project-change",
+                20,
+            );
+        },
+        |socket| async move {
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::DeleteTask {
+                        project_id: project_id("task-project"),
+                        task_id: task_id("task-change"),
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::TaskDeleted { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::DeleteAgent {
+                        project_id: project_id("agent-project"),
+                        agent_id: agent_id("agent-agent"),
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::AgentDeleted { .. },
+                    ..
+                }
+            ));
+            assert!(matches!(
+                request(
+                    &socket,
+                    LocalRequest::DeleteProject {
+                        project_id: project_id("project-project"),
+                    },
+                )
+                .await,
+                ServerFrame::Response {
+                    response: LocalResponse::ProjectDeleted { .. },
+                    ..
+                }
+            ));
+        },
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

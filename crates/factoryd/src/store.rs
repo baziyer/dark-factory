@@ -26,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 25;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -3667,7 +3667,7 @@ impl Store {
             .query_row(
                 "SELECT task_id FROM managed_changes
                  WHERE project_id = ?1 AND agent_id = ?2
-                   AND state IN ('preparing', 'active', 'removing')",
+                   AND state IN ('active', 'removing')",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
@@ -3711,7 +3711,7 @@ impl Store {
                         base_sha, head_sha, published_head_sha, state
                  FROM managed_changes
                  WHERE project_id = ?1 AND task_id = ?2
-                   AND state IN ('preparing', 'active', 'removing')",
+                   AND state IN ('active', 'removing')",
                 params![project_id.as_str(), task_id.as_str()],
                 load_managed_change,
             )
@@ -3740,7 +3740,7 @@ impl Store {
                         git_dir_inode, common_dir_device, common_dir_inode,
                         base_sha, head_sha, published_head_sha, state
                  FROM managed_changes WHERE task_id = ?1
-                   AND state IN ('preparing', 'active', 'removing')",
+                   AND state IN ('active', 'removing')",
                 params![record.task_id.as_str()],
                 load_managed_change,
             )
@@ -3756,7 +3756,7 @@ impl Store {
             .query_row(
                 "SELECT task_id FROM managed_changes
                  WHERE project_id = ?1 AND agent_id = ?2
-                   AND state IN ('preparing', 'active', 'removing')",
+                   AND state IN ('active', 'removing')",
                 params![record.project_id.as_str(), record.agent_id.as_str()],
                 |row| row.get(0),
             )
@@ -4308,7 +4308,7 @@ impl Store {
         let _task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
-        reject_any_managed_change(&transaction, task_id)?;
+        reject_active_managed_change(&transaction, task_id)?;
         let has_active_run: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM runs
@@ -4345,6 +4345,11 @@ impl Store {
 
         transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
         Self::cancel_delivery_attempts_for_task(&transaction, project_id, task_id, now_ms)?;
+        transaction.execute(
+            "DELETE FROM managed_changes
+             WHERE task_id = ?1 AND project_id = ?2 AND state = 'abandoned'",
+            params![task_id.as_str(), project_id.as_str()],
+        )?;
         transaction.execute(
             "DELETE FROM task_question_documents
              WHERE project_id = ?1
@@ -4488,6 +4493,11 @@ impl Store {
             params![agent_id.as_str()],
         )?;
         transaction.execute(
+            "DELETE FROM managed_changes
+             WHERE project_id = ?1 AND agent_id = ?2 AND state = 'abandoned'",
+            params![project_id.as_str(), agent_id.as_str()],
+        )?;
+        transaction.execute(
             "DELETE FROM runs WHERE agent_id = ?1 AND project_id = ?2",
             params![agent_id.as_str(), project_id.as_str()],
         )?;
@@ -4541,6 +4551,11 @@ impl Store {
         )?;
         transaction.execute(
             "DELETE FROM agent_messages WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM managed_changes
+             WHERE project_id = ?1 AND state = 'abandoned'",
             params![project_id.as_str()],
         )?;
         transaction.execute(
@@ -5289,25 +5304,12 @@ fn reject_active_managed_change(connection: &Connection, task_id: &TaskId) -> Re
     let active: bool = connection.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM managed_changes
-             WHERE task_id = ?1 AND state IN ('preparing', 'active', 'removing')
+             WHERE task_id = ?1 AND state IN ('active', 'removing')
          )",
         params![task_id.as_str()],
         |row| row.get(0),
     )?;
     if active {
-        Err(StoreError::TaskHasActiveChange)
-    } else {
-        Ok(())
-    }
-}
-
-fn reject_any_managed_change(connection: &Connection, task_id: &TaskId) -> Result<()> {
-    let exists: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM managed_changes WHERE task_id = ?1)",
-        params![task_id.as_str()],
-        |row| row.get(0),
-    )?;
-    if exists {
         Err(StoreError::TaskHasActiveChange)
     } else {
         Ok(())
@@ -5509,7 +5511,7 @@ fn check_agent_deletable(
         "SELECT EXISTS(
             SELECT 1 FROM managed_changes
             WHERE project_id = ?1 AND agent_id = ?2
-              AND state IN ('preparing', 'active', 'removing')
+              AND state IN ('active', 'removing')
          )",
         params![project_id.as_str(), agent_id.as_str()],
         |row| row.get(0),
@@ -5565,7 +5567,7 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     let has_active_change: bool = connection.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM managed_changes
-            WHERE project_id = ?1 AND state IN ('preparing', 'active', 'removing')
+            WHERE project_id = ?1 AND state IN ('active', 'removing')
          )",
         params![project_id.as_str()],
         |row| row.get(0),
@@ -6816,7 +6818,7 @@ mod tests {
     }
 
     #[test]
-    fn active_change_blocks_task_delete_but_can_be_closed_before_it() {
+    fn abandoned_change_is_purged_before_task_delete() {
         let (mut store, project_id, agent_id, task_id) = managed_fixture();
         let record = ManagedChangeRecord {
             project_id: project_id.clone(),
@@ -6851,9 +6853,94 @@ mod tests {
             .finish_abandon_managed_change(&project_id, &task_id, &agent_id, 8)
             .unwrap();
         assert_eq!(abandoned.state, "abandoned");
+        store.delete_task(&project_id, &task_id, 9).unwrap();
         assert!(matches!(
-            store.delete_task(&project_id, &task_id, 9),
-            Err(StoreError::TaskHasActiveChange)
+            store.managed_change(&project_id, &task_id),
+            Err(StoreError::ManagedChangeNotFound)
+        ));
+    }
+
+    #[test]
+    fn abandoned_change_is_purged_before_agent_and_project_delete() {
+        let (mut store, project_id, agent_id, task_id) = managed_fixture();
+        let record = |agent_id: &AgentId, task_id: &TaskId, suffix: &str| ManagedChangeRecord {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            worktree: format!("/state/{suffix}"),
+            branch: format!("issue/{suffix}"),
+            git_dir: format!("/repo/.git/worktrees/{suffix}"),
+            common_dir: "/repo/.git".into(),
+            worktree_device: 1,
+            worktree_inode: 2,
+            git_dir_device: 3,
+            git_dir_inode: 4,
+            common_dir_device: 5,
+            common_dir_inode: 6,
+            base_sha: "a".repeat(40),
+            head_sha: "a".repeat(40),
+            published_head_sha: None,
+            state: "active".into(),
+        };
+
+        store
+            .create_managed_change(record(&agent_id, &task_id, "task-agent"), 5)
+            .unwrap();
+        store
+            .begin_abandon_managed_change(&project_id, &task_id, &agent_id, 6)
+            .unwrap();
+        store
+            .finish_abandon_managed_change(&project_id, &task_id, &agent_id, 7)
+            .unwrap();
+        store.delete_agent(&project_id, &agent_id, 8).unwrap();
+        assert!(matches!(
+            store.get_agent_detail(&project_id, &agent_id),
+            Err(StoreError::AgentNotFound)
+        ));
+
+        let second_agent = AgentId::try_from("reviewer").unwrap();
+        let second_task = TaskId::try_from("issue-175-project").unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: second_agent.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                9,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: second_task.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Project change".into(),
+                    body: "Project change".into(),
+                    priority: 0,
+                },
+                10,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &second_task, Some(&second_agent), 11)
+            .unwrap();
+        store
+            .create_managed_change(record(&second_agent, &second_task, "task-project"), 12)
+            .unwrap();
+        store
+            .begin_abandon_managed_change(&project_id, &second_task, &second_agent, 13)
+            .unwrap();
+        store
+            .finish_abandon_managed_change(&project_id, &second_task, &second_agent, 14)
+            .unwrap();
+        store.delete_project(&project_id, 15).unwrap();
+        assert!(matches!(
+            store.get_project(&project_id),
+            Err(StoreError::ProjectNotFound)
         ));
     }
 

@@ -27,9 +27,11 @@ through `factoryctl pr`. The client cannot select a repository, remote,
 branch, or path, and the daemon refuses dirty, detached, stale, swapped, or
 unregistered worktrees. Publication uses a server-enforced exact lease and
 binds PR mutations to the exact published commit. `factoryctl change abandon`
-records a durable removing state before cleanup, so a daemon restart can
-resume it; creation retries also recover an exact worktree left by a database
-failure.
+records a durable removing state before cleanup, so an authenticated retry can
+resume it; daemon startup does not reconcile it automatically. Creation
+retries recover an exact worktree left by a database failure. An abandoned
+ledger row is retained until its task, agent, or project is deleted, then
+purged in the same parent-row transaction after the active-state precheck.
 
 ### Testing resident sessions
 
