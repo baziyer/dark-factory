@@ -141,7 +141,6 @@ impl Client {
     pub fn attach_terminal(&self, request: LocalRequest) -> Result<TerminalFrames, ClientError> {
         let stream = self.connect(request)?;
         let cancellation = TerminalFramesCancellation {
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream: Arc::new(Mutex::new(stream.try_clone()?)),
         };
         Ok(TerminalFrames {
@@ -219,7 +218,6 @@ pub struct TerminalFrames {
 /// therefore never required to wait for another output frame.
 #[derive(Clone)]
 pub struct TerminalFramesCancellation {
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
     stream: Arc<Mutex<UnixStream>>,
 }
 
@@ -232,8 +230,6 @@ impl TerminalFrames {
 
 impl TerminalFramesCancellation {
     pub fn cancel(&self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(stream) = self.stream.lock() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
@@ -341,7 +337,7 @@ mod protocol_tests {
     use factory_core::{FactoryEvent, ProjectId, ProjectSnapshot};
     use std::os::unix::net::UnixStream;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn v1_durable_event_is_accepted_inside_a_v2_replay_frame() {
@@ -369,7 +365,6 @@ mod protocol_tests {
     fn terminal_attach_cancellation_wakes_a_blocked_reader() {
         let (_server, client) = UnixStream::pair().unwrap();
         let cancellation = TerminalFramesCancellation {
-            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             stream: Arc::new(Mutex::new(client.try_clone().unwrap())),
         };
         let frames = TerminalFrames {
@@ -382,8 +377,10 @@ mod protocol_tests {
             frames.next()
         });
         thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
         cancellation.cancel();
         assert!(handle.join().unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }
 

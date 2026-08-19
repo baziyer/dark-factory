@@ -124,16 +124,20 @@ catalogue.
    or outside retained generations is a structured gap containing the current
    generation and valid offset range, so recovery is actionable rather than a
    blank pane. Ready and gap frames include the generation owning the retained
-   base, the exact replay start/end offsets, and continuity metadata. Frames
-   remain opaque base64 bytes, bounded to the runner frame limit, preserving
-   UTF-8 and ANSI bytes without interpreting provider output. A new daemon
-   explicitly probes runner attach capabilities: an old runner may serve
-   `Legacy` or explicit full history, but a bounded tail/cursor is refused
-   rather than silently becoming an unbounded replay. The bounded tail starts
-   at a safe UTF-8/ANSI boundary after a terminal reset prefix. Replay snapshots
-   pin open file handles, so rotations cannot relabel or short-read retained
-   bytes. Ctrl-] closes only the client stream; Ctrl-C remains ordinary PTY
-   input, and output failure wakes blocked CLI input.
+   base, the generation and exact byte offset at which replay starts, and
+   continuity metadata; every output chunk carries its owning generation.
+   Frames remain opaque base64 bytes, bounded to the runner frame limit,
+   preserving UTF-8 and ANSI bytes without interpreting provider output. A new
+   daemon explicitly probes runner attach capabilities: an old runner may
+   serve `Legacy` or explicit full history, but a bounded tail/cursor is
+   refused rather than silently becoming an unbounded replay. The bounded tail
+   is deliberately a reset-baseline view, not a reconstruction of an
+   application's mouse, paste, cursor, or alternate-screen state; use full
+   history when that state matters. Its suffix starts at safe UTF-8/ANSI
+   boundaries. Replay snapshots pin independent file descriptions and use
+   positional reads, so rotations and appends cannot move a replay cursor.
+   Ctrl-] closes only the client stream; Ctrl-C remains ordinary PTY input, and
+   output failure wakes blocked CLI input.
    Carve-out: Codex 0.147 does not dispatch its own `SessionStart` hook at
    TUI startup — only once its first turn begins, which the daemon cannot
    wait for without deadlocking every fresh Codex session (`docs/

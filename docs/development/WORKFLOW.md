@@ -359,13 +359,17 @@ request into an unbounded legacy replay. Use `--full-history` (or
 `--since-offset 0`) when a complete currently retained replay is intentional;
 that explicit mode can use the old runner's equivalent during a rolling
 upgrade. A resume cursor may include `--generation N`; Ready and gap frames
-carry the owning base generation plus exact byte start/end bounds so a client
-can distinguish a retained cursor from compaction lag. Clients never inspect
-`terminal.log` directly: the runner snapshots immutable file handles and
-replays a reset-prefixed suffix beginning at a safe UTF-8/ANSI boundary. PTY
-bytes stay opaque and bounded on every wire frame. Ctrl-] closes only the
-attach stream, Ctrl-C is forwarded as ordinary PTY input, and output/socket
-failure wakes blocked CLI input; detaching does not stop the session.
+carry the owning base generation, replay generation, and exact byte start/end
+bounds so a client can distinguish a retained cursor from compaction lag;
+every output chunk carries its generation when replay crosses a rotation.
+Clients never inspect `terminal.log` directly: the runner snapshots immutable
+file descriptions and uses positional reads. The bounded tail is a reset-
+baseline view, not a promise to reconstruct application mouse, bracketed
+paste, cursor, or alternate-screen state; use full history for that. Its
+suffix begins at a safe UTF-8/ANSI boundary. PTY bytes stay opaque and bounded
+on every wire frame. Ctrl-] closes only the attach stream, Ctrl-C is forwarded
+as ordinary PTY input, and output/socket failure wakes blocked CLI input;
+detaching does not stop the session.
 
 ## Task list for whoever picks this up
 

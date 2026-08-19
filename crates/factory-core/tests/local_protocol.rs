@@ -760,6 +760,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
     let frame = ServerFrame::TerminalOutput {
         protocol_version: PROTOCOL_VERSION,
         session_id: session_id("session-1"),
+        generation: 0,
         offset: 4,
         bytes: "aGk=".into(),
     };
@@ -771,6 +772,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
     let ready = ServerFrame::TerminalOutput {
         protocol_version: PROTOCOL_VERSION,
         session_id: session_id("session-1"),
+        generation: 0,
         offset: 4,
         bytes: String::new(),
     };
@@ -781,6 +783,7 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
             "data": {
                 "protocol_version": PROTOCOL_VERSION,
                 "session_id": "session-1",
+                "generation": 0,
                 "offset": 4,
                 "bytes": ""
             }

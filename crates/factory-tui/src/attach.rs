@@ -131,6 +131,7 @@ mod tests {
         let frame = ServerFrame::TerminalOutput {
             protocol_version: factory_core::PROTOCOL_VERSION,
             session_id: SessionId::try_from(session_id).unwrap(),
+            generation: 0,
             offset,
             bytes: encode_terminal_bytes(bytes),
         };
