@@ -1005,6 +1005,60 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
 }
 
 #[test]
+fn public_start_task_opens_its_claimed_delivery_attempt() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    create_shell_agent(&client, "curie");
+
+    create_task(
+        &client,
+        "task-1",
+        "First (sleep:2)",
+        "complete before explicit start",
+    );
+    assign_task(&client, "task-1", "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    wait_for_session_state(&client, "curie", SessionState::Idle);
+
+    // Hold the queue so assignment cannot let the dispatcher win the race;
+    // the public StartTask operation must still claim and open its own
+    // delivery attempt through the attempt-aware store operation.
+    client
+        .request(LocalRequest::PauseAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+        })
+        .unwrap();
+    create_task(&client, "task-2", "Second", "complete through StartTask");
+    assign_task(&client, "task-2", "curie");
+    let started = client.request(LocalRequest::StartTask {
+        project_id: project_id(),
+        task_id: TaskId::try_from("task-2").unwrap(),
+        agent_id: AgentId::try_from("curie").unwrap(),
+        parent_run_id: None,
+        worktree: None,
+    });
+    let run_id = match started {
+        Ok(ServerFrame::Response {
+            response: LocalResponse::RunAccepted { run_id },
+            ..
+        }) => run_id,
+        other => panic!("public StartTask must accept its own attempt: {other:?}"),
+    };
+    let run = poll_until(DELIVERY_TIMEOUT, || {
+        list_runs(&client)
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .filter(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+    });
+    assert_eq!(run.status, factory_core::RunStatus::Running);
+
+    cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+#[test]
 fn successor_admission_proves_no_provider_boundary_crossing_across_restart() {
     let home = private_tempdir();
     let Project { daemon, .. } = setup_project(home.path());

@@ -435,13 +435,15 @@ impl Handle {
         let session_id = session.id.clone();
         let open_task_id = task_id.clone();
         let message_ids = attempt.message_ids.clone();
+        let delivery_attempt_id = attempt.id.clone();
         let opened = self
             .state
             .commit_and_publish(move |store| {
-                let opened = store.open_run_episode_with_message_ids(
+                let opened = store.open_run_episode_with_delivery_attempt(
                     &session_id,
                     &open_task_id,
                     Some(&message_ids),
+                    Some(&delivery_attempt_id),
                     opened_at_ms,
                 )?;
                 let events = opened.events.clone();
@@ -1813,7 +1815,7 @@ async fn spawn_session_for_agent(
                 .transpose()
         })
         .await?;
-    let target_binding = pending.as_ref().and_then(|(_, binding)| binding.clone());
+    let session_target_binding = pending.as_ref().and_then(|(_, binding)| binding.clone());
     let pending_task_id = pending.as_ref().map(|(task, _)| task.snapshot.id.clone());
     let worktree = match pending.and_then(|(task, binding)| binding.map(|binding| (task, binding)))
     {
@@ -1847,7 +1849,11 @@ async fn spawn_session_for_agent(
         None => agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?,
     };
     let worktree_path = PathBuf::from(&worktree);
-    let target_binding = if let Some(binding) = target_binding {
+    // Unbound tasks inherit the agent worktree for this session, but the
+    // session itself remains unbound so the normal task delivery guard does
+    // not turn that inheritance into a bound-to-unbound rejection. The
+    // observed binding is still retained as the launch capability.
+    let launch_binding = if let Some(binding) = session_target_binding.clone() {
         Some(binding)
     } else {
         let authority_project_id = project_id.clone();
@@ -1961,7 +1967,7 @@ async fn spawn_session_for_agent(
         Provider::Shell => None,
     };
 
-    let launch_spec = LaunchSpec {
+    let mut launch_spec = LaunchSpec {
         runner_program: config.runner_program.clone(),
         factoryctl_path: config.factoryctl_path.clone(),
         provider_program: launch.program,
@@ -1976,6 +1982,7 @@ async fn spawn_session_for_agent(
         runner_instance_id: runner_instance_id.clone(),
         runtime_dir: runtime_dir.clone(),
         cwd: worktree_path,
+        cwd_handle: None,
         startup_input: Vec::new(),
         terminal: Some(TerminalSize {
             cols: 200,
@@ -1994,7 +2001,8 @@ async fn spawn_session_for_agent(
                 Ok((current_id, current_binding))
             })
             .await?;
-        if current.0.as_ref() != Some(&task_id) || current.1 != target_binding {
+        let target_changed = current.1 != session_target_binding;
+        if current.0.as_ref() != Some(&task_id) || target_changed {
             let _ = fs::remove_dir_all(&runtime_dir);
             return Err(Error::WorktreeBinding(
                 "queued task target changed during session spawn; retry to rotate safely".into(),
@@ -2010,7 +2018,6 @@ async fn spawn_session_for_agent(
     // with no visible trace and no runtime-directory cleanup (18 leaked
     // `runs/<uuid>/` directories in the repro that motivated this).
     let created_at_ms = now_ms()?;
-    let launch_binding = target_binding.clone();
     let new_session = crate::store::NewSession {
         id: session_id.clone(),
         project_id: project_id.clone(),
@@ -2027,7 +2034,7 @@ async fn spawn_session_for_agent(
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         runner_protocol_version: 1,
-        target_binding,
+        target_binding: session_target_binding,
     };
     let snapshot = state
         .commit_and_publish(move |store| {
@@ -2041,7 +2048,7 @@ async fn spawn_session_for_agent(
     // a deterministic worktree leaf replacement fail before the child can
     // inherit the pathname. Git operations apply the same boundary in
     // `repository::Target`.
-    if let Some(binding) = launch_binding {
+    if let Some(ref binding) = launch_binding {
         let authority_project_id = project_id.clone();
         let (project, authority) = state
             .with_store(move |store| {
@@ -2051,7 +2058,7 @@ async fn spawn_session_for_agent(
                 ))
             })
             .await?;
-        let guard = crate::repository::revalidate_worktree_binding(&project, authority, &binding)
+        let guard = crate::repository::revalidate_worktree_binding(&project, authority, binding)
             .await
             .map_err(|error| Error::WorktreeBinding(error.to_string()));
         if let Err(error) = guard {
@@ -2073,6 +2080,32 @@ async fn spawn_session_for_agent(
             return Err(error);
         }
     }
+
+    let binding = launch_binding.as_ref().ok_or_else(|| {
+        Error::WorktreeBinding("session launch target has no managed binding".into())
+    })?;
+    let cwd_handle = match crate::repository::open_worktree_handle(binding) {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&runtime_dir);
+            let failed_session_id = session_id.clone();
+            let failed_at_ms = now_ms().unwrap_or(created_at_ms);
+            let _ = state
+                .commit_and_publish(move |store| {
+                    let (snapshot, events) = store.end_session_with_reason(
+                        &failed_session_id,
+                        None,
+                        None,
+                        Some("session target changed while opening launch handle".to_owned()),
+                        failed_at_ms,
+                    )?;
+                    Ok((snapshot, events))
+                })
+                .await;
+            return Err(Error::WorktreeBinding(error.to_string()));
+        }
+    };
+    launch_spec.cwd_handle = Some(cwd_handle);
 
     let child = match runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await {
         Ok(child) => child,
@@ -3911,6 +3944,7 @@ mod tests {
             runner_instance_id: instance_id,
             runtime_dir,
             cwd: directory.path().to_path_buf(),
+            cwd_fd: None,
             startup_input: None,
             program: PathBuf::from("/bin/sh"),
             arguments: vec!["-c".into(), "while :; do sleep 1; done".into()],

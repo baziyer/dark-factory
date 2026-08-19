@@ -5,6 +5,7 @@ use std::{
     future::pending,
     io,
     io::{Read as _, Write as _},
+    os::fd::RawFd,
     os::unix::{
         fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
@@ -30,7 +31,7 @@ use factory_core::{
 use nix::sys::termios::LocalFlags;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{
-    Pid, Signal, WaitOptions, kill_process_group, test_kill_process_group, waitpid,
+    Pid, Signal, WaitOptions, fchdir, kill_process_group, test_kill_process_group, waitpid,
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -125,6 +126,10 @@ pub struct Config {
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    /// Inherited directory capability opened by factoryd after final target
+    /// validation. When present, the provider inherits this anchored cwd;
+    /// the pathname is never reopened for the child launch.
+    pub cwd_fd: Option<RawFd>,
     pub startup_input: Option<Vec<u8>>,
     pub program: PathBuf,
     pub arguments: Vec<String>,
@@ -625,6 +630,7 @@ pub async fn run_with_shutdown(
     mut runner_signal_rx: watch::Receiver<bool>,
 ) -> Result<(), Error> {
     validate_config(&config)?;
+    anchor_cwd(&config)?;
     let terminal_mode = config.terminal.is_some();
     let prepared = prepare_runtime(&config.runtime_dir, terminal_mode).await?;
     let (stop_tx, stop_rx) = mpsc::channel(16);
@@ -777,12 +783,24 @@ fn validate_config(config: &Config) -> Result<(), Error> {
                 .into(),
         ));
     }
-    let metadata = std::fs::metadata(&config.cwd)
-        .map_err(|error| Error::InvalidArguments(format!("invalid cwd: {error}")))?;
-    if !metadata.is_dir() {
-        return Err(Error::InvalidArguments("cwd is not a directory".into()));
+    if config.cwd_fd.is_none() {
+        let metadata = std::fs::metadata(&config.cwd)
+            .map_err(|error| Error::InvalidArguments(format!("invalid cwd: {error}")))?;
+        if !metadata.is_dir() {
+            return Err(Error::InvalidArguments("cwd is not a directory".into()));
+        }
     }
     Ok(())
+}
+
+fn anchor_cwd(config: &Config) -> Result<(), Error> {
+    let Some(fd) = config.cwd_fd else {
+        return Ok(());
+    };
+    let handle = std::fs::File::open(format!("/dev/fd/{fd}"))
+        .map_err(|error| Error::InvalidArguments(format!("invalid cwd handle: {error}")))?;
+    fchdir(&handle)
+        .map_err(|error| Error::InvalidArguments(format!("cannot enter cwd handle: {error}")))
 }
 
 /// Creates `runtime_dir` fresh (mode `0700`), or -- new for resident
@@ -1549,9 +1567,11 @@ async fn supervise_piped(
         }
     };
     let mut command = Command::new(&config.program);
+    command.args(&config.arguments);
+    if config.cwd_fd.is_none() {
+        command.current_dir(&config.cwd);
+    }
     command
-        .args(&config.arguments)
-        .current_dir(&config.cwd)
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1748,7 +1768,9 @@ async fn supervise_terminal(
 
     let mut builder = CommandBuilder::new(&config.program);
     builder.args(&config.arguments);
-    builder.cwd(&config.cwd);
+    if config.cwd_fd.is_none() {
+        builder.cwd(&config.cwd);
+    }
     let spawned = pair.slave.spawn_command(builder);
     drop(pair.slave);
     let child = match spawned {
@@ -2290,6 +2312,7 @@ mod tests {
             runner_instance_id: RunnerInstanceId::try_from("instance-1").unwrap(),
             runtime_dir: directory.path().join("run"),
             cwd: directory.path().to_owned(),
+            cwd_fd: None,
             startup_input: Some(vec![0; MAX_STARTUP_STDIN_BYTES + 1]),
             program: "/bin/true".into(),
             arguments: Vec::new(),
@@ -2307,6 +2330,7 @@ mod tests {
             runner_instance_id: RunnerInstanceId::try_from("instance-1").unwrap(),
             runtime_dir: directory.path().join("run"),
             cwd: directory.path().to_owned(),
+            cwd_fd: None,
             startup_input: Some(b"hello".to_vec()),
             program: "/bin/true".into(),
             arguments: Vec::new(),

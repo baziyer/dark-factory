@@ -1,4 +1,4 @@
-use std::{env, io::Read, path::PathBuf, process};
+use std::{env, io::Read, os::fd::RawFd, path::PathBuf, process};
 
 use factory_core::{
     RunId, RunnerInstanceId,
@@ -49,6 +49,7 @@ fn parse_arguments() -> Result<Config, Error> {
     let mut runner_instance_id = None;
     let mut runtime_dir = None;
     let mut cwd = None;
+    let mut cwd_fd = None;
     let mut stdin_bytes = None;
     let mut terminal_cols = None;
     let mut terminal_rows = None;
@@ -65,6 +66,12 @@ fn parse_arguments() -> Result<Config, Error> {
                 runtime_dir = Some(PathBuf::from(required(&mut arguments, "--runtime-dir")?));
             }
             "--cwd" => cwd = Some(PathBuf::from(required(&mut arguments, "--cwd")?)),
+            "--cwd-fd" => {
+                let value = required(&mut arguments, "--cwd-fd")?;
+                cwd_fd = Some(value.parse::<RawFd>().map_err(|_| {
+                    Error::InvalidArguments("--cwd-fd must be a valid file descriptor".into())
+                })?);
+            }
             "--stdin-bytes" => {
                 let value = required(&mut arguments, "--stdin-bytes")?;
                 stdin_bytes = Some(value.parse::<usize>().map_err(|_| {
@@ -119,6 +126,7 @@ fn parse_arguments() -> Result<Config, Error> {
         runner_instance_id,
         runtime_dir,
         cwd,
+        cwd_fd,
         startup_input,
         program,
         arguments: agent_arguments,

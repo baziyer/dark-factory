@@ -7,6 +7,7 @@
 
 use std::{
     env,
+    os::fd::OwnedFd,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Stdio,
@@ -14,7 +15,10 @@ use std::{
 };
 
 use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId};
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::{
+    fs::{Mode, OFlags, fstat, open},
+    process::{Pid, Signal, kill_process_group},
+};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::Command,
@@ -109,6 +113,30 @@ pub(crate) async fn revalidate_worktree_binding(
         None,
     )
     .await
+}
+
+/// Opens the already-revalidated worktree as an identity capability. The
+/// caller must pass this handle across the runner boundary; reusing the path
+/// after this point would reopen the leaf and reintroduce the validation/use
+/// race.
+pub(crate) fn open_worktree_handle(binding: &TaskWorktreeBinding) -> Result<OwnedFd, Error> {
+    let handle = open(
+        Path::new(&binding.path),
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| Error::Rejected(format!("task worktree could not be anchored: {error}")))?;
+    let metadata = fstat(&handle).map_err(|error| {
+        Error::Rejected(format!("task worktree handle could not be read: {error}"))
+    })?;
+    let device = u64::try_from(metadata.st_dev)
+        .map_err(|_| Error::Rejected("task worktree handle has an invalid device".into()))?;
+    if device != binding.worktree_device || metadata.st_ino != binding.worktree_inode {
+        return Err(Error::Rejected(
+            "task worktree changed while its launch handle was opening".into(),
+        ));
+    }
+    Ok(handle)
 }
 
 async fn validate_worktree_binding_at(
@@ -1258,6 +1286,43 @@ mod tests {
 
         let error = target.status().await.unwrap_err();
         assert!(error.to_string().contains("leaf was replaced"));
+    }
+
+    #[tokio::test]
+    async fn launch_handle_rejects_a_leaf_swap_after_validation() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: "project".try_into().unwrap(),
+            name: "Test".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let binding = validate_worktree_binding(
+            &project,
+            authority,
+            &target.worktree,
+            &target.branch,
+            &target.head,
+        )
+        .await
+        .unwrap();
+
+        let original = target.worktree.clone();
+        let replacement = temp.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        let moved = temp.path().join("worktree-moved");
+        fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink(&replacement, &original).unwrap();
+
+        let error = open_worktree_handle(&binding).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("changed while its launch handle")
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,10 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt, fs::PermissionsExt},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt, fs::PermissionsExt},
+    },
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -83,6 +86,10 @@ pub struct LaunchSpec {
     pub runner_instance_id: RunnerInstanceId,
     pub runtime_dir: PathBuf,
     pub cwd: PathBuf,
+    /// Directory identity opened by the daemon after its final target
+    /// validation. The runner passes this capability to the provider rather
+    /// than reopening `cwd` by pathname.
+    pub cwd_handle: Option<OwnedFd>,
     pub startup_input: Vec<u8>,
     /// When `Some`, the runner spawns the provider under a PTY of this size
     /// instead of piped stdout/stderr, and `startup_input` is not sent (it
@@ -283,6 +290,11 @@ async fn spawn_runner_with_environment_and_timeout(
         .arg(spec.runtime_dir)
         .arg("--cwd")
         .arg(spec.cwd);
+    if let Some(cwd_handle) = spec.cwd_handle.as_ref() {
+        command
+            .arg("--cwd-fd")
+            .arg(cwd_handle.as_raw_fd().to_string());
+    }
     match terminal {
         Some(size) => {
             command
@@ -623,7 +635,7 @@ for item in "$@"; do
 done
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --run-id|--runner-instance-id|--runtime-dir|--cwd|--stdin-bytes) shift 2 ;;
+        --run-id|--runner-instance-id|--runtime-dir|--cwd|--cwd-fd|--stdin-bytes) shift 2 ;;
         --) shift; break ;;
         *) exit 64 ;;
     esac
@@ -654,6 +666,14 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             runner_instance_id: id::<RunnerInstanceId>("runner-safe-launch"),
             runtime_dir: directory.join("runtime"),
             cwd: directory.to_owned(),
+            cwd_handle: Some(
+                rustix::fs::open(
+                    directory,
+                    rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                    rustix::fs::Mode::empty(),
+                )
+                .unwrap(),
+            ),
             startup_input: task,
             terminal: None,
         }
