@@ -89,6 +89,7 @@ impl From<serde_json::Error> for ClientError {
 #[derive(Clone, Debug)]
 pub struct Client {
     socket: PathBuf,
+    session_token: Option<String>,
 }
 
 impl Client {
@@ -96,7 +97,17 @@ impl Client {
     pub fn new(socket: impl AsRef<Path>) -> Self {
         Self {
             socket: socket.as_ref().to_owned(),
+            session_token: None,
         }
+    }
+
+    /// Binds this client to one daemon-issued live-session credential. The
+    /// daemon derives the principal and all scopes from the credential; this
+    /// client never sends a caller-selected agent or session identity.
+    #[must_use]
+    pub fn with_session_token(mut self, session_token: String) -> Self {
+        self.session_token = Some(session_token);
+        self
     }
 
     pub fn request(&self, request: LocalRequest) -> Result<ServerFrame, ClientError> {
@@ -156,7 +167,12 @@ impl Client {
     ) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
         stream.set_write_timeout(Some(timeout))?;
-        write_request(&mut stream, &RequestEnvelope::new(request))?;
+        let envelope = RequestEnvelope::new(request);
+        let envelope = match &self.session_token {
+            Some(token) => envelope.with_session_token(token.clone()),
+            None => envelope,
+        };
+        write_request(&mut stream, &envelope)?;
         Ok(stream)
     }
 }

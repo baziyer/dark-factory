@@ -4694,6 +4694,57 @@ impl Store {
         })
     }
 
+    /// Returns whether `candidate` is a strict descendant of `ancestor` in
+    /// one project. This is intentionally resolved from durable parent links
+    /// rather than from a caller-supplied role or prompt profile.
+    pub fn agent_is_descendant(
+        &self,
+        project_id: &ProjectId,
+        ancestor: &AgentId,
+        candidate: &AgentId,
+    ) -> Result<bool> {
+        if ancestor == candidate {
+            return Ok(false);
+        }
+        let mut current = candidate.clone();
+        for _ in 0..MAX_STATE_PAGE {
+            let Some(agent) = load_agent(&self.connection, &current)? else {
+                return Ok(false);
+            };
+            if agent.snapshot.project_id != *project_id {
+                return Ok(false);
+            }
+            let Some(parent) = agent.snapshot.parent_agent_id else {
+                return Ok(false);
+            };
+            if parent == *ancestor {
+                return Ok(true);
+            }
+            current = parent;
+        }
+        Ok(false)
+    }
+
+    /// Auth-only ownership probe used before a session may complete or block
+    /// a task. The request still passes through the normal task state machine
+    /// afterward; this probe only prevents cross-agent task selection.
+    pub fn task_assigned_to_agent(
+        &self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+    ) -> Result<bool> {
+        let assigned: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT assigned_agent_id FROM tasks WHERE project_id = ?1 AND id = ?2",
+                params![project_id.as_str(), task_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(assigned.as_deref() == Some(agent_id.as_str()))
+    }
+
     pub fn update_agent_profile(
         &mut self,
         project_id: &ProjectId,

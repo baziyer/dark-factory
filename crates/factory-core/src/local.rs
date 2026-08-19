@@ -108,6 +108,11 @@ pub struct RunTerminal {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
     pub protocol_version: u16,
+    /// Absent means the preserved operator socket contract. Present values
+    /// are opaque bearer credentials resolved by the daemon; callers never
+    /// select a principal, project, agent, or session here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_token: Option<String>,
     pub request: LocalRequest,
 }
 
@@ -116,8 +121,15 @@ impl RequestEnvelope {
     pub const fn new(request: LocalRequest) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            session_token: None,
             request,
         }
+    }
+
+    #[must_use]
+    pub fn with_session_token(mut self, session_token: String) -> Self {
+        self.session_token = Some(session_token);
+        self
     }
 }
 

@@ -35,6 +35,7 @@ fn agent_id(value: &str) -> AgentId {
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
     let envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        session_token: None,
         request,
     };
     let mut json = serde_json::to_vec(&envelope).unwrap();
@@ -242,7 +243,7 @@ async fn repository_requests_require_a_live_session_token_and_accept_no_target_i
                     ref message,
                 },
                 ..
-            } if message == "session authentication failed"
+            } if message == "repository operations require an authenticated live session"
         ));
     })
     .await;
@@ -783,6 +784,7 @@ async fn an_unsupported_protocol_cannot_mutate_state() {
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let envelope = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION + 1,
+            session_token: None,
             request: LocalRequest::CreateProject {
                 id: project_id("never-created"),
                 name: "No".into(),

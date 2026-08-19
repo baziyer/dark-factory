@@ -421,6 +421,7 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
                 event: ProviderHookEvent::Stop,
                 payload: serde_json::json!({"stop_hook_active": false}),
             })
+            .with_session_token("session-token-value".into())
         );
         write_response(
             &mut stream,

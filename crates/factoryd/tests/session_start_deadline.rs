@@ -114,6 +114,7 @@ fn runner_control_ready(runtime_dir: &Path) -> bool {
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
     let envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        session_token: None,
         request,
     };
     let mut json = serde_json::to_vec(&envelope).unwrap();

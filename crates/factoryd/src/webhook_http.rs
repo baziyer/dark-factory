@@ -32,6 +32,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 
 use crate::{
+    auth::{self, Capability, IntegrationPrincipal, RequestDescriptor, Scope},
     daemon_state::{DaemonState, DaemonStateError},
     store::{
         ConnectorEventInput, ConnectorEventResult, NewWebhookTask, OperationalTaskStatus,
@@ -366,6 +367,16 @@ impl From<&WebhookEndpoint> for RequestEndpoint {
             secret: Arc::clone(&endpoint.secret),
             project_id: endpoint.project_id.clone(),
             orchestrator_agent_id: endpoint.orchestrator_agent_id.clone(),
+        }
+    }
+}
+
+impl RequestEndpoint {
+    fn principal(&self) -> IntegrationPrincipal {
+        IntegrationPrincipal {
+            endpoint_id: self.id.clone(),
+            project_id: self.project_id.clone(),
+            orchestrator_agent_id: self.orchestrator_agent_id.clone(),
         }
     }
 }
@@ -774,6 +785,33 @@ async fn accept_event(
             json!({"status":"rejected","error":"timestamp_out_of_range"}),
         );
     }
+    let integration = IntegrationPrincipal {
+        endpoint_id: endpoint_id.clone(),
+        project_id: state
+            .endpoint
+            .project_id
+            .clone()
+            .or_else(|| Some(envelope.project_id.clone())),
+        orchestrator_agent_id: state.endpoint.orchestrator_agent_id.clone(),
+    };
+    if auth::authorize_integration(
+        &integration,
+        &RequestDescriptor {
+            capability: Capability::ConnectorEvent,
+            scope: Scope::Project(envelope.project_id.clone()),
+        },
+    )
+    .is_err()
+    {
+        return authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNAUTHORIZED,
+            "scope_denied",
+            json!({"status":"rejected","error":"unauthorized"}),
+        );
+    }
     let payload_digest: [u8; 32] = Sha256::digest(&bytes).into();
     let result_id = match random_hex::<12>() {
         Ok(id) => format!("connector-{id}"),
@@ -896,10 +934,11 @@ async fn accept_event(
     }
 }
 
-fn authenticate(endpoint: &RequestEndpoint, headers: &HeaderMap) -> bool {
+fn authenticate(endpoint: &RequestEndpoint, headers: &HeaderMap) -> Option<IntegrationPrincipal> {
     headers
         .get(LEGACY_SECRET_HEADER)
         .is_some_and(|provided| endpoint.secret.matches(provided.as_bytes()))
+        .then(|| endpoint.principal())
 }
 
 fn unauthorized() -> Response {
@@ -1265,9 +1304,9 @@ async fn create_task(
     let Some(endpoint) = endpoint(&state, &endpoint_id) else {
         return unauthorized();
     };
-    if !authenticate(&endpoint, request.headers()) {
+    let Some(principal) = authenticate(&endpoint, request.headers()) else {
         return unauthorized();
-    }
+    };
     let value = match bounded_json(request, &state).await {
         Ok(value) => value,
         Err(response) => return record_body_rejection(&state, route, started, response),
@@ -1310,7 +1349,7 @@ async fn create_task(
     };
     let task = NewWebhookTask {
         id: task_id,
-        project_id: endpoint.project_id.expect("legacy endpoint project"),
+        project_id: principal.project_id.expect("legacy endpoint project"),
         orchestrator_agent_id: endpoint
             .orchestrator_agent_id
             .expect("legacy endpoint orchestrator"),
@@ -1417,7 +1456,7 @@ async fn read_snapshot(
     let Some(endpoint) = endpoint(&state, &endpoint_id) else {
         return unauthorized();
     };
-    if !authenticate(&endpoint, &headers) {
+    if authenticate(&endpoint, &headers).is_none() {
         return unauthorized();
     }
     let project_id = endpoint.project_id.expect("legacy endpoint project");
@@ -1475,7 +1514,7 @@ async fn answer_question(
     let Some(endpoint) = endpoint(&state, &endpoint_id) else {
         return unauthorized();
     };
-    if !authenticate(&endpoint, request.headers()) {
+    if authenticate(&endpoint, request.headers()).is_none() {
         return unauthorized();
     }
     let value = match bounded_json(request, &state).await {
@@ -1577,7 +1616,7 @@ async fn read_document(
     let Some(endpoint) = endpoint(&state, &endpoint_id) else {
         return unauthorized();
     };
-    if !authenticate(&endpoint, request.headers()) {
+    if authenticate(&endpoint, request.headers()).is_none() {
         return unauthorized();
     }
     let value = match bounded_json(request, &state).await {

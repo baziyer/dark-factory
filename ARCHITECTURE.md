@@ -150,8 +150,15 @@ catalogue.
    hook this way.
 6. The local control and event API uses a private Unix socket by default. A
    subscription captures a durable replay head and marks when it has caught up.
-   Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
-   message is a durable write before it wakes the orchestrator.
+   Every local request is resolved by `factoryd` to one daemon-owned principal:
+   an envelope without a credential is the preserved operator socket, while a
+   session envelope must carry the exact live session token from
+   `DARK_FACTORY_SESSION_TOKEN_FILE`. The daemon derives project, agent,
+   session, parent, and role from durable state; request fields are targets,
+   never caller identity. Inbound HTTP webhooks are an explicit,
+   HMAC-authenticated integration principal with its configured endpoint and
+   project scope; receiving a message is a durable write before it wakes the
+   orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals
    repaint when their PTY emits bytes. A 1Hz tick may request a coarse repaint
    for elapsed-time labels and to age the bounded five-second activity
@@ -171,11 +178,18 @@ catalogue.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
-   directly or via its own session's shell access to it). It may coordinate
-   and delegate work, but this local socket currently does not establish a
-   human caller or enforce operator-only agent creation/profile changes; that
-   principal boundary remains #133/#127. Prompt guidance must not be described
-   as authorization, and the orchestrator cannot reach SQLite directly.
+   directly or via its own session's shell access to it). The daemon applies
+   one exhaustive capability/scope map to every request. A worker can read
+   project state, complete or block its assigned task, message its parent,
+   create unassigned proposals, and use its own authenticated repository and
+   terminal paths. An orchestrator may additionally inspect and delegate to
+   descendants. Agent profile/budget/pause/resume, global policy, other-agent
+   mutation, and operator controls remain fixed operator capabilities. Token
+   expiry or session end revokes the principal. Prompt guidance must not be
+   described as authorization, and the orchestrator cannot reach SQLite
+   directly. This boundary protects against cooperative or buggy agent code
+   sharing the operator's OS account; it is not isolation from a hostile
+   same-user process that can already access the private socket or token file.
 9. Remote repository mutation is a daemon boundary. A session may edit and
    inspect its worktree, but its environment disables Git credential helpers,
    SSH transport, interactive credential prompts, and the operator's `gh`

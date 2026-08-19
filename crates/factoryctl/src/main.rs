@@ -1048,7 +1048,7 @@ fn run() -> Result<i32, String> {
     if let CliCommand::Doctor { json } = command {
         return doctor::run(&doctor::Options { json }, &socket);
     }
-    let client = Client::new(socket);
+    let client = client_from_environment(socket)?;
     if let CliCommand::Attach {
         project_id,
         target,
@@ -1137,6 +1137,24 @@ fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
         "launchd": "reloaded",
         "live_sessions_preserved": true,
     })
+}
+
+/// A provider session's environment carries the only credential a routine
+/// agent client may use. Operator invocations without this variable retain
+/// the existing unauthenticated local-socket contract; the daemon resolves
+/// that absence to the operator principal.
+fn client_from_environment(socket: PathBuf) -> Result<Client, String> {
+    let client = Client::new(socket);
+    let Ok(path) = env::var(SESSION_TOKEN_FILE_ENV) else {
+        return Ok(client);
+    };
+    let token = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {SESSION_TOKEN_FILE_ENV}: {error}"))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err(format!("{SESSION_TOKEN_FILE_ENV} is empty"));
+    }
+    Ok(client.with_session_token(token))
 }
 
 /// The agent-facing mutations a session's own `factoryctl` calls make on
@@ -1253,6 +1271,7 @@ fn hook_reply(
         return None;
     }
     let payload = read_bounded_stdin_json(HOOK_PAYLOAD_LIMIT_BYTES)?;
+    let client = client.clone().with_session_token(token.clone());
     let frame = client
         .request_with_timeout(
             LocalRequest::ProviderHook {

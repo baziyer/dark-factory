@@ -41,6 +41,7 @@ use tokio::{
 pub use crate::daemon_state::DaemonState as ApiState;
 
 use crate::{
+    auth::{self, Principal},
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
     guidance::{self, GuidanceError},
@@ -418,13 +419,39 @@ async fn handle_connection(
     }
     payload.pop();
 
-    let request = match parse_envelope(&payload) {
-        Ok(request) => request,
+    let envelope = match parse_envelope(&payload) {
+        Ok(envelope) => envelope,
         Err(response) => return write_response(&mut write, *response).await,
     };
+    let principal = match auth::resolve(&state, envelope.session_token).await {
+        Ok(principal) => principal,
+        Err(error) => {
+            return write_response(
+                &mut write,
+                LocalResponse::Error {
+                    code: ErrorCode::Unauthorized,
+                    message: error.to_string(),
+                },
+            )
+            .await;
+        }
+    };
+    let request = match auth::authorize(&state, &principal, envelope.request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return write_response(
+                &mut write,
+                LocalResponse::Error {
+                    code: ErrorCode::Unauthorized,
+                    message: error.to_string(),
+                },
+            )
+            .await;
+        }
+    };
 
-    if let LocalRequest::Subscribe { after_sequence } = request {
-        if after_sequence < 0 {
+    if let LocalRequest::Subscribe { after_sequence } = &request {
+        if *after_sequence < 0 {
             return write_response(
                 &mut write,
                 LocalResponse::Error {
@@ -437,7 +464,7 @@ async fn handle_connection(
         return tokio::select! {
             biased;
             _ = shutdown.changed() => Ok(()),
-            result = stream_events(write, &state, after_sequence) => result,
+            result = stream_events(write, &state, *after_sequence) => result,
         };
     }
 
@@ -445,7 +472,7 @@ async fn handle_connection(
         project_id,
         session_id,
         since_offset,
-    } = request
+    } = &request
     {
         let session_shutdown = shutdown.clone();
         return tokio::select! {
@@ -456,20 +483,21 @@ async fn handle_connection(
                 write,
                 state.clone(),
                 session_shutdown,
-                project_id,
-                session_id,
-                since_offset,
+                principal,
+                project_id.clone(),
+                session_id.clone(),
+                *since_offset,
             ) => result,
         };
     }
 
-    let response = handle_request(&state, &execution, &guidance_root, request)
+    let response = handle_request_as(&state, &execution, &guidance_root, &principal, request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
 }
 
-fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
+fn parse_envelope(payload: &[u8]) -> Result<RequestEnvelope, Box<LocalResponse>> {
     // Read the version discriminator before deserializing the request enum.
     // A newer client may contain a request variant this daemon does not know;
     // that must still produce UnsupportedProtocol, not a misleading invalid
@@ -504,7 +532,7 @@ fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
             message: "request is not valid local protocol JSON".into(),
         })
     })?;
-    Ok(envelope.request)
+    Ok(envelope)
 }
 
 /// Persistent multiplexed connection for one or more `AttachTerminal`
@@ -520,6 +548,7 @@ async fn terminal_attach_session(
     mut write: OwnedWriteHalf,
     state: ApiState,
     mut shutdown: watch::Receiver<bool>,
+    principal: Principal,
     project_id: ProjectId,
     session_id: SessionId,
     since_offset: u64,
@@ -547,27 +576,56 @@ async fn terminal_attach_session(
             result = read_next_line(&mut reader, &mut payload) => {
                 let Some(line) = result? else { return Ok(()); };
                 match parse_envelope(&line) {
-                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset }) => {
-                        spawn_terminal_attach(
-                            &mut attaches,
-                            state.clone(),
-                            frame_tx.clone(),
-                            project_id,
-                            session_id,
-                            since_offset,
-                        );
-                    }
-                    Ok(_) => {
-                        write_response(
-                            &mut write,
-                            LocalResponse::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: "only AttachTerminal is accepted on an attached \
-                                          terminal connection"
-                                    .into(),
-                            },
-                        )
-                        .await?;
+                    Ok(envelope) => {
+                        let request = match auth::resolve(&state, envelope.session_token).await {
+                            Ok(request_principal) if request_principal == principal => {
+                                auth::authorize(&state, &principal, envelope.request).await
+                            }
+                            Ok(_) => Err(auth::AuthError::SessionMismatch),
+                            Err(error) => Err(error),
+                        };
+                        let request = match request {
+                            Ok(request) => request,
+                            Err(error) => {
+                                write_response(
+                                    &mut write,
+                                    LocalResponse::Error {
+                                        code: ErrorCode::Unauthorized,
+                                        message: error.to_string(),
+                                    },
+                                )
+                                .await?;
+                                continue;
+                            }
+                        };
+                        match request {
+                            LocalRequest::AttachTerminal {
+                                project_id,
+                                session_id,
+                                since_offset,
+                            } => {
+                                spawn_terminal_attach(
+                                    &mut attaches,
+                                    state.clone(),
+                                    frame_tx.clone(),
+                                    project_id,
+                                    session_id,
+                                    since_offset,
+                                );
+                            }
+                            _ => {
+                                write_response(
+                                    &mut write,
+                                    LocalResponse::Error {
+                                        code: ErrorCode::InvalidRequest,
+                                        message: "only AttachTerminal is accepted on an attached \
+                                                  terminal connection"
+                                            .into(),
+                                    },
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     Err(response) => write_response(&mut write, *response).await?,
                 }
@@ -738,10 +796,28 @@ async fn read_next_line(
     Ok(Some(std::mem::take(payload)))
 }
 
+#[cfg(test)]
 async fn handle_request(
     state: &ApiState,
     execution: &execution::Handle,
     guidance_root: &Path,
+    request: LocalRequest,
+) -> Result<LocalResponse, ApiFailure> {
+    handle_request_as(
+        state,
+        execution,
+        guidance_root,
+        &Principal::Operator,
+        request,
+    )
+    .await
+}
+
+async fn handle_request_as(
+    state: &ApiState,
+    execution: &execution::Handle,
+    guidance_root: &Path,
+    principal: &Principal,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
@@ -852,30 +928,30 @@ async fn handle_request(
                 },
             })
         }
-        LocalRequest::GitStatus { token } => {
-            repository_request(state, token, RepositoryRequest::Status).await
+        LocalRequest::GitStatus { .. } => {
+            repository_request_as(state, principal, RepositoryRequest::Status).await
         }
-        LocalRequest::GitDiff { token, staged } => {
-            repository_request(state, token, RepositoryRequest::Diff { staged }).await
+        LocalRequest::GitDiff { staged, .. } => {
+            repository_request_as(state, principal, RepositoryRequest::Diff { staged }).await
         }
-        LocalRequest::GitCommit { token, message } => {
-            repository_request(state, token, RepositoryRequest::Commit { message }).await
+        LocalRequest::GitCommit { message, .. } => {
+            repository_request_as(state, principal, RepositoryRequest::Commit { message }).await
         }
-        LocalRequest::GitPush { token } => {
-            repository_request(state, token, RepositoryRequest::Push).await
+        LocalRequest::GitPush { .. } => {
+            repository_request_as(state, principal, RepositoryRequest::Push).await
         }
-        LocalRequest::PrOpen { token, title, body } => {
-            repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
+        LocalRequest::PrOpen { title, body, .. } => {
+            repository_request_as(state, principal, RepositoryRequest::PrOpen { title, body }).await
         }
         LocalRequest::PrUpdate {
-            token,
             number,
             title,
             body,
+            ..
         } => {
-            repository_request(
+            repository_request_as(
                 state,
-                token,
+                principal,
                 RepositoryRequest::PrUpdate {
                     number,
                     title,
@@ -2201,14 +2277,34 @@ mod worktree_status_tests {
     }
 }
 
+#[cfg(test)]
 async fn repository_request(
     state: &ApiState,
     token: String,
     request: RepositoryRequest,
 ) -> Result<LocalResponse, ApiFailure> {
+    let principal = auth::resolve(state, Some(token))
+        .await
+        .map_err(|error| ApiFailure::Unauthorized(error.to_string()))?;
+    repository_request_as(state, &principal, request).await
+}
+
+async fn repository_request_as(
+    state: &ApiState,
+    principal: &Principal,
+    request: RepositoryRequest,
+) -> Result<LocalResponse, ApiFailure> {
+    let Principal::Session(principal) = principal else {
+        return Err(ApiFailure::Unauthorized(
+            "repository operations require an authenticated live session".into(),
+        ));
+    };
+    let project_id = principal.project_id.clone();
+    let agent_id = principal.agent_id.clone();
     let session = state
-        .with_store(move |store| store.find_session_by_hook_token(&token))
+        .with_store(move |store| store.live_session_for_agent(&project_id, &agent_id))
         .await?
+        .filter(|session| session.id == principal.session_id)
         .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
     let project_id = session.project_id.clone();
     let project = state

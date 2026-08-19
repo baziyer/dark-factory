@@ -32,6 +32,7 @@ fn session_id(value: &str) -> SessionId {
 fn request_envelope_has_a_stable_tagged_shape() {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        session_token: None,
         request: LocalRequest::EventsAfter {
             sequence: 41,
             limit: 100,

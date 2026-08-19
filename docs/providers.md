@@ -79,6 +79,32 @@ Repository execution itself never consumes provider or repository config: the
 daemon uses an empty-config temporary gitdir/index and an operator-pinned
 remote/base, with compare-and-swap ref publication.
 
+### Session authority
+
+The private Unix socket retains its operator compatibility contract: a
+`RequestEnvelope` with no `session_token` is an operator request. A resident
+provider session receives `DARK_FACTORY_SESSION_TOKEN_FILE`; `factoryctl`
+reads that file and puts the opaque token in every ordinary local request
+envelope. `factoryd` resolves the token against a live session and derives the
+project, agent, session, parent, and fixed role profile from its store. Agent
+supplied `project_id`, `agent_id`, `session_id`, and message sender fields are
+targets or checked claims, not authority. Ended sessions no longer resolve,
+so their bearer token is revoked.
+
+The capability map is deliberately closed. Workers can inspect project state,
+their own agent/inbox, assigned task completion, parent messaging, unassigned
+task proposals, and their own authenticated repository/terminal operations.
+Orchestrators additionally inspect and delegate within their descendant tree.
+Global policy, agent profile and budget changes, cross-agent mutation, session
+control, and operator actions remain operator-only. HTTP webhook requests are
+separately resolved as HMAC-authenticated integration principals with their
+configured endpoint/project scope.
+
+This prevents cooperative or buggy agent code from accidentally acting as a
+different agent while sharing the operator's OS account. It is not a hostile
+same-user process boundary: such a process may already be able to access the
+private socket or the token file.
+
 ## The `Provider` trait
 
 Defined in `crates/factoryd/src/providers/mod.rs`:

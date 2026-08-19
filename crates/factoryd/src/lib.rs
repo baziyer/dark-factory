@@ -1,5 +1,6 @@
 //! Daemon state and supervision.
 
+pub mod auth;
 pub mod daemon_state;
 pub mod execution;
 pub mod guidance;
