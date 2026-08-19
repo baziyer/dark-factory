@@ -5,6 +5,10 @@ external monitor, backlog feeder, or recovery tool can create queued tasks or
 send durable agent messages. These writes use the same store and event ledger
 as `factoryctl`.
 
+The least-privilege GitHub App design for a future issue/release connector is
+documented in [`github-app.md`](github-app.md). No GitHub App is registered,
+installed, or credentialed by this repository preparation.
+
 Configure one `generic_v1` endpoint in the owner-only
 `$DARK_FACTORY_HOME/webhooks.json` file:
 

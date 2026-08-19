@@ -1,0 +1,15 @@
+{
+  "repository_selection": "selected",
+  "repositories": [
+    {
+      "full_name": "baziyer/dark-factory",
+      "purpose": "#153 issue intake and #154 release-readiness observation"
+    }
+  ],
+  "not_requested": [
+    "baziyer/dark-factory-site",
+    "baziyer/homebrew-tap",
+    "all other repositories"
+  ],
+  "operator_confirmation_required": true
+}

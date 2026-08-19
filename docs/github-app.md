@@ -1,0 +1,131 @@
+# Dark Factory GitHub App preparation
+
+This is the security-boundary preparation for [#188](https://github.com/baziyer/dark-factory/issues/188), composed with [#153](https://github.com/baziyer/dark-factory/issues/153) and [#154](https://github.com/baziyer/dark-factory/issues/154). It does not register or install an App, create a credential, change attribution, or contact GitHub as an App.
+
+The machine-readable artifacts are:
+
+- [`github-app-manifest.json`](github-app-manifest.json): the exact private-App permission and event request.
+- [`github-app-repository-selection.json`](github-app-repository-selection.json): the installation boundary.
+
+The operator must still confirm the owner, endpoint, repositories, and recovery contact before any registration. The manifest intentionally has no webhook URL: there is no deployed receiver to authorize yet.
+
+## Requested registration
+
+Create a private App, visible only on its owning account, with the Dark Factory logo. The first installation must use **Only select repositories** and select exactly:
+
+```text
+baziyer/dark-factory
+```
+
+Do not select `baziyer/dark-factory-site`, `baziyer/homebrew-tap`, or all repositories. A future source repository or release surface needs a separate operator decision and installation-scope change. Repository selection is independent of the permission manifest: an installation token must also be narrowed to the exact repository and permission subset needed for each request.
+
+The logo reference is the shipped site icon at [`~/dark-factory-site/app/icon.svg`](https://github.com/baziyer/dark-factory-site/blob/main/app/icon.svg): 64×64, `#070A09` background, `#4AC7A5` outline, and `#1E6F60` center. The inspected source is site commit `566e83620775de01f28224cf4c73e57d89c08cab`, blob `00312914cf70a625a61ac1ccdfa8cf9245fd886f`; re-check that source and record the uploaded asset checksum at registration time. Upload that asset through the GitHub App registration UI only after the operator confirms the owning account and repository scope. Do not copy it into a provider worktree or generate a new logo in this preparation.
+
+### Permission rationale
+
+| Permission | Level | Needed for | Explicitly not granted |
+| --- | --- | --- | --- |
+| Metadata | read | repository identity and boundary checks; `repository` events | no administration or collaborator management |
+| Issues | write | issue intake, issue comments, labels, and the post-merge issue closure in #153 | no project/discussion/secret mutation |
+| Pull requests | read | linked PR state, head/base SHA, merge state, and review evidence | no PR review comments, labels, or merge authority |
+| Checks | write | the App-authored bounded status check in #153/#154; read existing check runs | no workflow execution authority |
+| Actions | read | release-readiness workflow-run observation for #154 | no dispatch, cancellation, artifact deletion, or workflow mutation |
+| Contents | read | commit/release metadata and exact merged-SHA verification | no push, branch, tag, release, or asset write |
+| Commit statuses | read | compatibility with legacy hosted status contexts during gate reconciliation | no status write |
+
+`issues:write` is sufficient for ordinary timeline comments on both issues and PRs because GitHub exposes a PR as an issue for that operation. The App must not request `pull_requests:write`; that broader permission would also grant merge-related authority. Line-level PR review comments are out of scope for this identity.
+
+No organization or account permissions are requested. No `administration`, `repository_hooks`, `secrets`, `workflows`, `packages`, `deployments`, `members`, or `organization_*` permission is requested. Release publication remains the existing trusted Actions path in `.github/workflows/release.yml`; adding `contents:write` later is a separate security-reviewed change, not part of this manifest.
+
+### Event rationale and receiver allowlist
+
+The manifest subscribes only to these event families:
+
+- `issues`: `opened`, `edited`, `labeled`, `unlabeled`, `reopened`, `closed`, `transferred`, and `deleted` for #153 intake and reconciliation.
+- `issue_comment`: `created`, `edited`, and `deleted` for issue/PR conversation changes. Bodies are untrusted input.
+- `pull_request`: `opened`, `edited`, `reopened`, `synchronize`, `ready_for_review`, `converted_to_draft`, `closed`, and label changes for linkage and #154 readiness.
+- `pull_request_review`: `submitted`, `edited`, and `dismissed` for independent-review evidence; the App never approves its own work.
+- `check_run` and `check_suite`: `completed`, plus only the App's own bounded re-request path if that is separately implemented. Existing checks are observed, not trusted merely because the event arrived.
+- `workflow_run`: `requested`, `in_progress`, and `completed` for the existing trusted release workflow and exact commit binding.
+- `release`: `created`, `published`, `prereleased`, `edited`, and `deleted` for release verification only; this App does not publish or edit releases.
+- `repository`: `archived`, `deleted`, `renamed`, `transferred`, `publicized`, and `privatized` to fail closed when the selected-repository boundary changes.
+- `installation`, `installation_target`, and the automatic `installation_repositories` lifecycle delivery to audit install, suspend, rename, permission, and repository-selection changes.
+
+The receiver rejects every unlisted action, validates the webhook signature over the exact bytes, binds every payload to its installation and repository, and records a bounded immutable delivery before any work candidate or projection. GitHub documents `installation_repositories` as an automatic App delivery rather than a manually selected event; it must still be handled for scope changes.
+
+## Credential and token boundary
+
+The future daemon-owned connector, not a provider session, owns this material:
+
+1. Store the App ID, installation ID, key fingerprint, selected repository IDs, permission revision, and last rotation/revocation times as non-secret daemon state.
+2. Store the private key and webhook secret in the operator's OS secret store (macOS Keychain in the supported product), under a Dark Factory service/account namespace. A keychain-unavailable setup fails closed; it never falls back to a worktree, task body, database blob, log, argv, provider environment, or `gh` configuration.
+3. Keep any encrypted export outside all project and agent worktrees, owner-readable only, with its encryption key held separately by the OS secret store. Do not add a secret file to the repository. Provider processes receive neither the private key nor an installation token.
+4. Mint an installation JWT/token only in the connector. Pin every token request to the selected repository ID and the smallest permission subset; do not rely on GitHub's default “all repositories/all granted permissions” token behavior. Keep the token in memory, refresh before its one-hour expiry, and erase it after the request or on shutdown.
+5. Audit every GitHub mutation with installation ID, repository ID, API operation kind, result, request/correlation ID, originating Dark Factory task/change, and exact target SHA where applicable. Never log Authorization headers, JWTs, private keys, webhook secrets, issue bodies, or full request payloads.
+
+### Rotation
+
+Rotation is an operator-authorized, two-key transition: create the replacement GitHub App key, store it under a new fingerprint, validate App-authenticated token minting and a read-only repository call, switch the connector atomically, allow only the bounded lifetime of in-flight tokens, then delete the old GitHub key and secret-store entry. A failed validation leaves the old key active. Permission or repository-scope changes are not hidden inside rotation and require a fresh operator approval plus an installation audit record.
+
+Webhook-secret rotation keeps the previous verifier only for a short, recorded overlap after GitHub is changed, accepts both only during that bounded window, then deletes the old value. Any signature failure, unknown delivery ID, installation mismatch, repository mismatch, replay, or action outside the allowlist is rejected visibly.
+
+### Revocation and degraded behavior
+
+The operator can suspend/uninstall the App, delete all App keys, remove the secret-store entries, and mark the connector revoked. A `401`, `403`, `404`, suspended-installation event, or failed signature causes the connector to stop GitHub mutation immediately, preserve the durable candidate/task state, and expose a `NEEDS YOU` recovery item. It must not silently fall back to an operator token, `gh`, a provider credential, or a different repository. Reconciliation resumes only after the operator verifies the installation ID, repository allowlist, permission revision, key fingerprint, and webhook health.
+
+## Attribution and identity verification seam
+
+Autonomous GitHub API calls use an installation access token, so GitHub attributes them to the App bot rather than to an operator. User-to-server tokens are intentionally out of scope: they would attribute activity to a human and require additional authorization. Every UI/API projection must display the App bot identity and installation/repository audit context.
+
+The future commit path must not guess a bot email from the App slug. Before replacing the current `factory@localhost` trailer, an operator-authorized disposable test must:
+
+1. install the App only on the selected disposable/test repository;
+2. use the installation token to create one test branch/PR or equivalent harmless commit path;
+3. read the resulting commit's author/co-author identity and the App bot login/avatar from GitHub;
+4. add a `Co-authored-by` trailer with the exact GitHub-linked noreply email only in a second disposable test commit;
+5. verify in the GitHub UI/API that the trailer maps to the App bot and shows the App logo; and
+6. record the verified bot login, numeric ID, exact email, test commit SHA, App ID, and date as non-secret metadata.
+
+The attribution policy is narrow: credit Dark Factory only when it materially authored the committed change. Monitoring, issue ingestion, reconciliation, rebasing, independent review, merge, release publication, and merely executing an operator-approved action do not earn a co-author trailer. Preserve human author and reviewer attribution. Replacing `factory@localhost` is a separate implementation and migration decision; this preparation intentionally does not change it.
+
+## Compact future CLI surface
+
+These are proposed daemon-owned operations, not commands implemented or safe to run by this preparation:
+
+```text
+factoryctl github app setup --manifest PATH --repository OWNER/REPO
+factoryctl github app status [--json]
+factoryctl github app rotate --confirm
+factoryctl github app revoke --confirm
+```
+
+`setup` should validate the manifest, require the explicit selected repository and operator confirmation, then pause at the GitHub registration/install boundary. It must not silently register, install, widen permissions, or accept a provider-supplied path. `status` should show App/install IDs, selected repository IDs, granted-vs-requested permissions, event/webhook health, key fingerprint and age, last successful token mint, last delivery, last mutation, and degraded/revoked reason—never secrets. `rotate` and `revoke` require the operator principal and durable confirmation; provider sessions cannot call them.
+
+## Operator checklist: the human boundary
+
+No action below should be automated by this preparation.
+
+- [ ] Choose the App owner and a recovery contact with authority to suspend, rotate, and delete it.
+- [ ] Confirm the first repository list is exactly `baziyer/dark-factory`; leave `dark-factory-site`, `homebrew-tap`, and all other repositories unselected.
+- [ ] Provide the deployed webhook endpoint and secret-store host; do not use a provider worktree, task body, or provider environment.
+- [ ] Review `github-app-manifest.json` against the GitHub permission/event UI. Reject any extra permission, event, OAuth request, or public visibility.
+- [ ] Upload the referenced Dark Factory logo and record the asset checksum/source.
+- [ ] Register the private App only after the preceding choices are approved.
+- [ ] Install it with selected-repository scope only; record installation ID and the GitHub audit event.
+- [ ] Store the private key/webhook secret in the daemon-owned OS secret store and verify file/worktree/process scans contain no secret.
+- [ ] Run the disposable bot identity/co-author verification before changing generated attribution.
+- [ ] Exercise invalid signature, replay, cross-repository, revoked-installation, edited-payload, and App-unavailable paths in a fixture before any real mutation.
+- [ ] Obtain a separate Sol/xhigh security review for credential/auth implementation and a separate independent security review of its PR.
+- [ ] Request the serialized clean full local-ci slot, then require hosted green at the exact head before merge. This preparation has not requested or used that slot.
+
+## References
+
+- [Choosing permissions for a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app)
+- [Registering from a GitHub App manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
+- [Webhook events and payloads](https://docs.github.com/en/webhooks/webhook-events-and-payloads)
+- [Installing a GitHub App with selected repositories](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
+- [Authenticating as a GitHub App installation](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation)
+- [Creating and updating check runs](https://docs.github.com/en/rest/checks/runs)
+- [Issue comments on issues and pull requests](https://docs.github.com/en/rest/issues/comments)
+- [GitHub commit email attribution](https://docs.github.com/en/account-and-profile/concepts/email-addresses)
+- [GitHub App logo/custom badge](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/creating-a-custom-badge-for-your-github-app)
