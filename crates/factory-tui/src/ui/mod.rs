@@ -352,7 +352,7 @@ mod tests {
             0,
         );
         board.mode = Mode::Confirm(PendingAction::ResetBudget {
-            source,
+            source: Box::new(source),
             request: factory_core::local::LocalRequest::ResetAgentBudget {
                 project_id: ProjectId::try_from("proj").unwrap(),
                 agent_id: AgentId::try_from("alice").unwrap(),

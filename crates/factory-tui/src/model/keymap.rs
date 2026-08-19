@@ -312,7 +312,7 @@ fn task_menu_items(task: &factory_core::TaskDetail) -> Vec<&'static str> {
 pub enum PendingAction {
     DeleteTask(TaskId),
     ResetBudget {
-        source: AttentionItem,
+        source: Box<AttentionItem>,
         request: LocalRequest,
     },
     StopSession {
@@ -932,7 +932,10 @@ impl Board {
                     project_id: source.project_id.clone(),
                     agent_id,
                 };
-                self.mode = Mode::Confirm(PendingAction::ResetBudget { source, request });
+                self.mode = Mode::Confirm(PendingAction::ResetBudget {
+                    source: Box::new(source),
+                    request,
+                });
                 Intent::Redraw
             }
             factory_core::status::AttentionAction::AnswerInTerminal => {
@@ -1008,7 +1011,7 @@ impl Board {
                 let still_current = self
                     .decision_items()
                     .into_iter()
-                    .any(|item| super::same_attention_source(&item, &source) && item == source);
+                    .any(|item| super::same_attention_source(&item, &source) && item == *source);
                 if !still_current {
                     self.set_status(
                         "budget decision changed before confirmation",
