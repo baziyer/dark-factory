@@ -142,8 +142,15 @@ authoritative on both platforms.
 `.github/workflows/ci.yml` runs the macOS source gate as one job, `checks`, on
 every pull request and every push to `main`; its Ubuntu preview job invokes
 the shared Rust gate with `--linux-source`, the source smoke, and its bounded
-interrupted-teardown regression. Linux does not invoke the macOS
-release-source, publisher, or package fixtures.
+interrupted-teardown regression. The final `required` job is the single
+required merge context and fails unless both hosted jobs pass. Linux does not
+invoke the macOS release-source, publisher, or package fixtures.
+
+The declarative required-context proposal lives in
+`.github/repository-settings.yml`. `scripts/test-repository-settings.sh`
+checks that the manifest, workflow aggregate, and settings publisher keep the
+same `required` context. It is static and does not contact GitHub or mutate
+repository rules.
 
 **Going public is one step**: flip the repository, then immediately run
 `scripts/github-repo-settings.sh` — the rulesets, the security features,
@@ -153,14 +160,14 @@ It applies, idempotently:
 
 - labels (`known-issue`, `area:*`, `size:*`, `decision`, `security`) and
   merge settings (squash or rebase only, merged branches deleted);
-- ruleset `main-protect`, with no bypass for anyone: a green `checks` run
-  from GitHub Actions against a head that is up to date with `main`,
-  linear history, no force-push, no deletion;
+- ruleset `main-protect`, with no bypass for anyone: a green `required`
+  aggregate from GitHub Actions (both hosted macOS and Ubuntu) against a head
+  that is up to date with `main`, linear history, no force-push, no deletion;
 - ruleset `main-review`: a pull request with one CODEOWNERS approval and
   every thread resolved. The repository admin may bypass *this* ruleset,
   and only through a pull request — GitHub never lets an author approve
   their own PR and this repository has one maintainer — so the maintainer
-  can merge their own reviewed PR, but never without green `checks`, and
+  can merge their own reviewed PR, but never without green `required`, and
   nobody pushes to `main`;
 - private vulnerability reporting, Dependabot alerts, secret scanning with
   push protection, and "every workflow run from an outside contributor's

@@ -97,6 +97,23 @@ jobs:
             } >>"$GITHUB_STEP_SUMMARY"
           fi
 
+  # The repository's single required context is deliberately an aggregate:
+  # GitHub must require both hosted source gates, not just whichever job name
+  # happened to be selected when the ruleset was first configured.
+  required:
+    if: always()
+    needs: [checks, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both hosted source gates
+        if: needs.checks.result != 'success' || needs.linux.result != 'success'
+        run: |
+          echo "required source gates failed: macOS=${{ needs.checks.result }}, Linux=${{ needs.linux.result }}" >&2
+          exit 1
+      - name: Confirm both hosted source gates passed
+        run: echo "macOS and Linux source gates passed"
+
   # Ubuntu is the source-contributor preview gate. It keeps the macOS
   # compatibility gate above intact while making the Linux claim explicit:
   # x86-64 source builds, the shared deterministic Rust suite, and the public
@@ -132,6 +149,9 @@ jobs:
 
       - name: Verify source-gate mode boundary
         run: ./scripts/test-local-ci-mode.sh
+
+      - name: Verify repository settings proposal
+        run: ./scripts/test-repository-settings.sh
 
       - name: Run the source contributor smoke
         run: ./scripts/linux-contributor-smoke.sh

@@ -16,8 +16,8 @@ cargo build --workspace
 `local-ci.sh` is the authoritative gate (`cargo +1.88.0 fmt --check`,
 `clippy --all-targets --all-features -D warnings` across the whole
 workspace, every test with `--test-threads=1`, and `git diff --check`).
-CI runs the same script on every pull request (the `checks` status
-`main` requires), so a local pass is what makes a PR mergeable.
+CI runs the same script on every pull request (the aggregate `required`
+context `main` requires), so a local pass is what makes a PR mergeable.
 
 A few workspace-wide rules the gate enforces, worth knowing up front:
 

@@ -43,12 +43,13 @@ try gh repo edit "$repository" --enable-squash-merge --enable-rebase-merge \
 
 # Two rulesets on main, because a bypass applies to every rule in ITS
 # ruleset: "main-protect" (no bypass for anyone, not even the admin) makes
-# the green `checks` run, linear history, and no force-push/deletion
+# the aggregate `required` run (hosted macOS + Ubuntu), linear history, and no
+# force-push/deletion
 # unconditional; "main-review" carries the pull-request rule with a
 # Repository-admin (id 5) bypass in pull-request mode, since GitHub never
 # lets an author approve their own PR and this repository has one
 # maintainer. Everyone else needs the PR, the CODEOWNERS approval, resolved
-# threads, and a green `checks` from GitHub Actions (integration 15368)
+# threads, and a green `required` aggregate from GitHub Actions (integration 15368)
 # against a head that is up to date with main. Nobody pushes to main.
 apply_ruleset() {
     printf '%s' "$2" > "$tmp"
@@ -61,7 +62,7 @@ apply_ruleset() {
     fi
 }
 
-step "ruleset: main-protect (checks + linear history + no force-push/delete; no bypass)"
+step "ruleset: main-protect (required aggregate + linear history + no force-push/delete; no bypass)"
 apply_ruleset main-protect '{
   "name": "main-protect",
   "target": "branch",
@@ -74,7 +75,7 @@ apply_ruleset main-protect '{
     { "type": "required_linear_history" },
     { "type": "required_status_checks", "parameters": {
         "strict_required_status_checks_policy": true,
-        "required_status_checks": [ { "context": "checks", "integration_id": 15368 } ] } }
+        "required_status_checks": [ { "context": "required", "integration_id": 15368 } ] } }
   ]
 }'
 
