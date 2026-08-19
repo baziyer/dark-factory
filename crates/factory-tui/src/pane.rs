@@ -632,9 +632,10 @@ pub type PaneMap = std::collections::HashMap<SessionId, Pane>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
@@ -645,29 +646,82 @@ mod tests {
     use ratatui::widgets::{Block, Borders};
     use tui_term::widget::PseudoTerminal;
 
+    struct PeerConsumption {
+        observed: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl PeerConsumption {
+        fn new() -> Self {
+            Self {
+                observed: Mutex::new(false),
+                wake: Condvar::new(),
+            }
+        }
+
+        fn wait(&self) {
+            let mut observed = self.observed.lock().unwrap();
+            while !*observed {
+                observed = self.wake.wait(observed).unwrap();
+            }
+        }
+
+        fn mark(&self) {
+            *self.observed.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        fn was_marked(&self) -> bool {
+            *self.observed.lock().unwrap()
+        }
+    }
+
     struct AttachFixture {
         socket: PathBuf,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        send_complete: mpsc::Receiver<Result<(), String>>,
+        peer_consumption: Arc<PeerConsumption>,
+        send_errors: Arc<Mutex<Vec<String>>>,
         _directory: tempfile::TempDir,
     }
 
     impl AttachFixture {
         fn start(output: Vec<u8>) -> Self {
+            Self::start_with_send_failure(output, None)
+        }
+
+        fn start_with_send_failure(output: Vec<u8>, fail_after_frames: Option<usize>) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("factory.sock");
             let listener = UnixListener::bind(&socket).unwrap();
             listener.set_nonblocking(true).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
+            let (send_complete, send_complete_rx) = mpsc::channel();
+            let peer_consumption = Arc::new(PeerConsumption::new());
+            let send_errors = Arc::new(Mutex::new(Vec::new()));
             let thread_stop = Arc::clone(&stop);
+            let thread_peer_consumption = Arc::clone(&peer_consumption);
+            let thread_send_errors = Arc::clone(&send_errors);
             let thread = std::thread::spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let stop = Arc::clone(&thread_stop);
                             let output = output.clone();
+                            let peer_consumption = Arc::clone(&thread_peer_consumption);
+                            let send_errors = Arc::clone(&thread_send_errors);
+                            let send_complete = send_complete.clone();
                             std::thread::spawn(move || {
-                                serve_attach_connection(stream, output, stop);
+                                serve_attach_connection(
+                                    stream,
+                                    output,
+                                    stop,
+                                    send_complete,
+                                    peer_consumption,
+                                    send_errors,
+                                    fail_after_frames,
+                                );
                             });
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -681,13 +735,37 @@ mod tests {
                 socket,
                 stop,
                 thread: Some(thread),
+                send_complete: send_complete_rx,
+                peer_consumption,
+                send_errors,
                 _directory: directory,
             }
+        }
+
+        fn wait_for_send_complete(&self) -> Result<(), String> {
+            self.send_complete
+                .recv_timeout(Duration::from_secs(15))
+                .map_err(|error| {
+                    format!("attach fixture did not report send completion: {error}")
+                })?
+        }
+
+        fn mark_peer_consumed(&self) {
+            self.peer_consumption.mark();
+        }
+
+        fn peer_consumed(&self) -> bool {
+            self.peer_consumption.was_marked()
+        }
+
+        fn send_errors(&self) -> Vec<String> {
+            self.send_errors.lock().unwrap().clone()
         }
     }
 
     impl Drop for AttachFixture {
         fn drop(&mut self) {
+            self.peer_consumption.mark();
             self.stop.store(true, Ordering::Release);
             let _ = UnixStream::connect(&self.socket);
             if let Some(thread) = self.thread.take() {
@@ -696,7 +774,15 @@ mod tests {
         }
     }
 
-    fn serve_attach_connection(mut stream: UnixStream, output: Vec<u8>, stop: Arc<AtomicBool>) {
+    fn serve_attach_connection(
+        mut stream: UnixStream,
+        output: Vec<u8>,
+        stop: Arc<AtomicBool>,
+        send_complete: mpsc::Sender<Result<(), String>>,
+        peer_consumption: Arc<PeerConsumption>,
+        send_errors: Arc<Mutex<Vec<String>>>,
+        fail_after_frames: Option<usize>,
+    ) {
         let mut request = String::new();
         if BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut request)
@@ -708,38 +794,18 @@ mod tests {
         let envelope: RequestEnvelope = serde_json::from_str(&request).unwrap();
         match envelope.request {
             LocalRequest::AttachTerminal { session_id, .. } => {
-                send_frame(
-                    &mut stream,
-                    ServerFrame::TerminalAttachReady {
-                        protocol_version: PROTOCOL_VERSION,
-                        session_id: session_id.clone(),
-                        generation: 0,
-                        base_generation: 0,
-                        base_offset: 0,
-                        start_generation: 0,
-                        start_offset: 0,
-                        end_offset: output.len() as u64,
-                        reset_prefix: encode_terminal_bytes(
-                            b"\x1bc\x1b[?1049l\x1b[?2004l\x1b[0m\x1b[2J\x1b[H",
-                        ),
-                    },
-                );
-                // Deliberately split every frame at a different boundary. This sends UTF-8
-                // scalar values and CSI sequences across frame boundaries, just as a real
-                // runner's bounded chunking can, while keeping every wire frame small.
-                let mut offset = 0_u64;
-                for chunk in output.chunks(7) {
-                    send_frame(
-                        &mut stream,
-                        ServerFrame::TerminalOutput {
-                            protocol_version: PROTOCOL_VERSION,
-                            session_id: session_id.clone(),
-                            generation: 0,
-                            offset,
-                            bytes: encode_terminal_bytes(chunk),
-                        },
-                    );
-                    offset += chunk.len() as u64;
+                let mut fail_after_frames = fail_after_frames;
+                let result =
+                    send_attach_frames(&mut stream, &session_id, &output, &mut fail_after_frames);
+                if let Err(error) = &result {
+                    send_errors.lock().unwrap().push(error.to_string());
+                }
+                let succeeded = result.is_ok();
+                let _ = send_complete.send(result.map_err(|error| error.to_string()));
+                if succeeded {
+                    // The fixture must not let the attach socket close before the test has
+                    // consumed the complete UTF-8/ANSI history and observed the live prompt.
+                    peer_consumption.wait();
                 }
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
                 let mut discard = [0_u8; 1];
@@ -756,22 +822,81 @@ mod tests {
                     }
                 }
             }
-            LocalRequest::ResizeTerminal { session_id, .. } => send_frame(
-                &mut stream,
-                ServerFrame::Response {
-                    protocol_version: PROTOCOL_VERSION,
-                    response: LocalResponse::TerminalResized { session_id },
-                },
-            ),
+            LocalRequest::ResizeTerminal { session_id, .. } => {
+                let mut no_injected_failure = None;
+                if let Err(error) = send_frame(
+                    &mut stream,
+                    ServerFrame::Response {
+                        protocol_version: PROTOCOL_VERSION,
+                        response: LocalResponse::TerminalResized { session_id },
+                    },
+                    &mut no_injected_failure,
+                ) {
+                    send_errors.lock().unwrap().push(error.to_string());
+                }
+            }
             _ => {}
         }
     }
 
-    fn send_frame(stream: &mut UnixStream, frame: ServerFrame) {
-        if serde_json::to_writer(&mut *stream, &frame).is_ok() {
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
+    fn send_attach_frames(
+        stream: &mut UnixStream,
+        session_id: &SessionId,
+        output: &[u8],
+        fail_after_frames: &mut Option<usize>,
+    ) -> io::Result<()> {
+        send_frame(
+            stream,
+            ServerFrame::TerminalAttachReady {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: session_id.clone(),
+                generation: 0,
+                base_generation: 0,
+                base_offset: 0,
+                start_generation: 0,
+                start_offset: 0,
+                end_offset: output.len() as u64,
+                reset_prefix: encode_terminal_bytes(
+                    b"\x1bc\x1b[?1049l\x1b[?2004l\x1b[0m\x1b[2J\x1b[H",
+                ),
+            },
+            fail_after_frames,
+        )?;
+        // Deliberately split every frame at a different boundary. This sends UTF-8 scalar
+        // values and CSI sequences across frame boundaries, just as a real runner's bounded
+        // chunking can, while keeping every wire frame small.
+        let mut offset = 0_u64;
+        for chunk in output.chunks(7) {
+            send_frame(
+                stream,
+                ServerFrame::TerminalOutput {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: session_id.clone(),
+                    generation: 0,
+                    offset,
+                    bytes: encode_terminal_bytes(chunk),
+                },
+                fail_after_frames,
+            )?;
+            offset += chunk.len() as u64;
         }
+        Ok(())
+    }
+
+    fn send_frame(
+        stream: &mut UnixStream,
+        frame: ServerFrame,
+        fail_after_frames: &mut Option<usize>,
+    ) -> io::Result<()> {
+        if let Some(remaining) = fail_after_frames {
+            if *remaining == 0 {
+                return Err(io::Error::other("injected attach fixture send failure"));
+            }
+            *remaining -= 1;
+        }
+        serde_json::to_writer(&mut *stream, &frame).map_err(io::Error::other)?;
+        stream.write_all(b"\n")?;
+        stream.flush()
     }
 
     fn rendered_text(terminal: &Terminal<TestBackend>) -> String {
@@ -838,6 +963,13 @@ mod tests {
         )
         .unwrap();
 
+        let send_result = fixture.wait_for_send_complete();
+        assert!(
+            send_result.is_ok(),
+            "real attach fixture failed before sending the complete stream: {send_result:?}; errors={:?}",
+            fixture.send_errors()
+        );
+
         let deadline = Instant::now() + Duration::from_secs(15);
         while (!pane.is_ready()
             || !pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")))
@@ -885,6 +1017,50 @@ mod tests {
             pane.attach_error().is_none(),
             "attach failed: {:?}",
             pane.attach_error()
+        );
+        assert!(
+            fixture.send_errors().is_empty(),
+            "real attach fixture recorded send errors: {:?}",
+            fixture.send_errors()
+        );
+        fixture.mark_peer_consumed();
+        pane.kill();
+    }
+
+    #[test]
+    fn failed_attach_fixture_cannot_satisfy_complete_readiness_barrier() {
+        let fixture = AttachFixture::start_with_send_failure(
+            b"history-0000 caf\xC3\xA9 \x1b[32mansi-0000\x1b[0m\r\n\x1b[1;34mLIVE-PROMPT\x1b[0m $ "
+                .to_vec(),
+            Some(1),
+        );
+        let mut pane = Pane::attach(
+            fixture.socket.clone(),
+            ProjectId::try_from("project-1").unwrap(),
+            SessionId::try_from("session-1").unwrap(),
+            "attached",
+            8,
+            48,
+        )
+        .unwrap();
+
+        let send_result = fixture.wait_for_send_complete();
+        assert!(
+            send_result
+                .as_ref()
+                .is_err_and(|error| error.contains("injected attach fixture send failure")),
+            "failed fixture was reported as ready: {send_result:?}"
+        );
+        assert_eq!(
+            fixture.send_errors(),
+            vec!["injected attach fixture send failure"]
+        );
+        assert!(!fixture.peer_consumed());
+        assert!(
+            !(pane.is_ready()
+                && pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT"))),
+            "truncated fixture appeared complete: screen={:?}",
+            pane.with_screen(|screen| screen.contents())
         );
         pane.kill();
     }
