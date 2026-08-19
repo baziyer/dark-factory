@@ -186,7 +186,13 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     assert!(human.stderr.is_empty());
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "Dark Factory: factoryctl v0.2.4 | active runtime v0.2.4 | auto on | sessions 0/4 | projects 0 | attention 0\n"
+        concat!(
+            "Dark Factory: factoryctl v",
+            env!("CARGO_PKG_VERSION"),
+            " | active runtime v",
+            env!("CARGO_PKG_VERSION"),
+            " | auto on | sessions 0/4 | projects 0 | attention 0\n"
+        )
     );
 
     let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))

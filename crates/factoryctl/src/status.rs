@@ -333,7 +333,9 @@ mod tests {
         assert_eq!(
             output,
             concat!(
-                "Dark Factory: factoryctl v0.2.4 | active runtime version unknown | auto on | sessions 2/4 | projects 2 | attention 2\n",
+                "Dark Factory: factoryctl v",
+                env!("CARGO_PKG_VERSION"),
+                " | active runtime version unknown | auto on | sessions 2/4 | projects 2 | attention 2\n",
                 "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | backlog 5\n",
                 "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
@@ -380,7 +382,11 @@ mod tests {
         write_with_daemon_version(&mut output, &status, None).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Dark Factory: factoryctl v0.2.4 | active runtime version unknown | auto off | sessions 0/3 | projects 0 | attention 0\n"
+            concat!(
+                "Dark Factory: factoryctl v",
+                env!("CARGO_PKG_VERSION"),
+                " | active runtime version unknown | auto off | sessions 0/3 | projects 0 | attention 0\n"
+            )
         );
     }
 
@@ -398,6 +404,10 @@ mod tests {
         let mut output = Vec::new();
         write_with_daemon_version(&mut output, &status, Some("0.3.0")).unwrap();
         let output = String::from_utf8(output).unwrap();
-        assert!(output.starts_with("Dark Factory: factoryctl v0.2.4 | active runtime v0.3.0 |"));
+        assert!(output.starts_with(concat!(
+            "Dark Factory: factoryctl v",
+            env!("CARGO_PKG_VERSION"),
+            " | active runtime v0.3.0 |"
+        )));
     }
 }
