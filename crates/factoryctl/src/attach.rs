@@ -84,7 +84,7 @@ pub fn run(
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
     let (input_tx, input_rx) = mpsc::channel();
-    spawn_stdin_reader(input_tx);
+    let input_thread = spawn_stdin_reader(input_tx, Arc::clone(&done));
     let exit_code = loop {
         if done.load(Ordering::SeqCst) {
             break if failure
@@ -106,8 +106,10 @@ pub fn run(
     };
 
     cancellation.cancel();
+    done.store(true, Ordering::SeqCst);
     drop(raw_mode);
     let _ = output_thread.join();
+    let _ = input_thread.join();
     if let Some(message) = failure
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -228,13 +230,17 @@ enum StdinEvent {
     Eof,
 }
 
-fn spawn_stdin_reader(sender: Sender<StdinEvent>) {
+fn spawn_stdin_reader(sender: Sender<StdinEvent>, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
         loop {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
             match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => {
+                Ok(0) => continue,
+                Err(_) => {
                     let _ = sender.send(StdinEvent::Eof);
                     return;
                 }
@@ -253,7 +259,7 @@ fn spawn_stdin_reader(sender: Sender<StdinEvent>) {
                 }
             }
         }
-    });
+    })
 }
 
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {
@@ -394,6 +400,11 @@ impl RawMode {
         let original = termios::tcgetattr(&stdin).map_err(std::io::Error::from)?;
         let mut raw = original.clone();
         raw.make_raw();
+        // Keep the reader interruptible so output failure can join both
+        // directions before the terminal is restored. In raw mode, a
+        // tenth-second VTIME is a read timeout, not an input byte.
+        raw.special_codes[termios::SpecialCodeIndex::VMIN] = 0;
+        raw.special_codes[termios::SpecialCodeIndex::VTIME] = 1;
         termios::tcsetattr(&stdin, OptionalActions::Flush, &raw).map_err(std::io::Error::from)?;
         Ok(Self { original })
     }
