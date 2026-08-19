@@ -161,9 +161,15 @@ fn rejects_an_oversized_server_frame_before_parsing_json() {
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
+            let bytes_read = BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
+            assert!(bytes_read > 0);
+            assert!(line.ends_with('\n'));
+            assert_eq!(
+                serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+                RequestEnvelope::new(LocalRequest::Health)
+            );
             write_oversized_frame(&mut stream);
         });
 
