@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "selected_repository": "baziyer/dark-factory",
+    "contents": "read",
+    "pull_requests": "read",
+    "delivery_identity": [
+      "delivery_guid",
+      "raw_payload_digest",
+      "identity_tuple_digest"
+    ]
+  },
+  "cases": [
+    {
+      "name": "first_valid_delivery",
+      "input": {
+        "delivery_guid": "guid-1",
+        "raw_payload_digest": "sha256:aaa",
+        "identity_tuple_digest": "sha256:identity-1",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened"
+      },
+      "expected": {
+        "decision": "accept",
+        "durable_result": "candidate-created",
+        "mutation_count": 1
+      }
+    },
+    {
+      "name": "exact_github_redelivery",
+      "input": {
+        "delivery_guid": "guid-1",
+        "raw_payload_digest": "sha256:aaa",
+        "identity_tuple_digest": "sha256:identity-1",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened"
+      },
+      "expected": {
+        "decision": "return-existing-result",
+        "durable_result": "candidate-created",
+        "mutation_count": 1
+      }
+    },
+    {
+      "name": "response_loss_reconciliation",
+      "input": {
+        "delivery_guid": "guid-1",
+        "raw_payload_digest": "sha256:aaa",
+        "identity_tuple_digest": "sha256:identity-1",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened",
+        "prior_response": "lost"
+      },
+      "expected": {
+        "decision": "reconcile-existing-result",
+        "durable_result": "candidate-created",
+        "mutation_count": 1
+      }
+    },
+    {
+      "name": "conflicting_guid_digest",
+      "input": {
+        "delivery_guid": "guid-1",
+        "raw_payload_digest": "sha256:bbb",
+        "identity_tuple_digest": "sha256:identity-1",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened"
+      },
+      "expected": {
+        "decision": "reject",
+        "reason": "idempotency_conflict",
+        "mutation_count": 0
+      }
+    },
+    {
+      "name": "conflicting_guid_identity",
+      "input": {
+        "delivery_guid": "guid-1",
+        "raw_payload_digest": "sha256:aaa",
+        "identity_tuple_digest": "sha256:identity-2",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened"
+      },
+      "expected": {
+        "decision": "reject",
+        "reason": "idempotency_conflict",
+        "mutation_count": 0
+      }
+    },
+    {
+      "name": "missing_delivery_guid",
+      "input": {
+        "delivery_guid": null,
+        "raw_payload_digest": "sha256:aaa",
+        "identity_tuple_digest": "sha256:identity-1",
+        "signature": "valid",
+        "repository": "baziyer/dark-factory",
+        "event": "issues",
+        "action": "opened"
+      },
+      "expected": {
+        "decision": "reject",
+        "reason": "malformed_delivery_identity",
+        "mutation_count": 0
+      }
+    },
+    {
+      "name": "read_only_identity_verification",
+      "input": {
+        "contents": "read",
+        "pull_requests": "read",
+        "selected_repository": "baziyer/dark-factory",
+        "requires_test_commit": true,
+        "requires_test_pull_request": true
+      },
+      "expected": {
+        "decision": "temporary_authority_proposal",
+        "proposal_kind": "github_app_identity_verification",
+        "additional_permissions": ["contents:write", "pull_requests:write"],
+        "additional_repository": "operator-selected-disposable-repository",
+        "provider_receives_credentials": false,
+        "expires": true,
+        "teardown_required": true
+      }
+    },
+    {
+      "name": "target_404_after_valid_scope_check",
+      "input": {
+        "response_status": 404,
+        "installation_check": "valid",
+        "repository_scope_check": "valid",
+        "target_exists": false
+      },
+      "expected": {
+        "decision": "reconcile_target",
+        "durable_state": "target_not_found",
+        "mutation_allowed": false,
+        "installation_revoked": false,
+        "operator_attention": false
+      }
+    },
+    {
+      "name": "confirmed_repository_scope_revocation",
+      "input": {
+        "response_status": 404,
+        "installation_check": "valid",
+        "repository_scope_check": "removed",
+        "target_exists": "unknown"
+      },
+      "expected": {
+        "decision": "fail_closed",
+        "durable_state": "scope_revoked",
+        "mutation_allowed": false,
+        "installation_revoked": true,
+        "operator_attention": true
+      }
+    },
+    {
+      "name": "confirmed_installation_revocation",
+      "input": {
+        "response_status": 401,
+        "installation_check": "uninstalled"
+      },
+      "expected": {
+        "decision": "fail_closed",
+        "durable_state": "installation_revoked",
+        "mutation_allowed": false,
+        "installation_revoked": true,
+        "operator_attention": true
+      }
+    },
+    {
+      "name": "registration_gate_incomplete",
+      "input": {
+        "endpoint": null,
+        "hook_active": false,
+        "secret_store_ready": false,
+        "repository_id": null,
+        "permission_digest": null,
+        "event_digest": null,
+        "operator_confirmed": false
+      },
+      "expected": {
+        "registration_allowed": false,
+        "reason": "registration_contract_incomplete"
+      }
+    },
+    {
+      "name": "registration_gate_exact_hypothetical",
+      "input": {
+        "endpoint": "https://hooks.example.invalid/dark-factory",
+        "hook_active": true,
+        "secret_store_ready": true,
+        "repository_id": 1335380107,
+        "permission_digest": "sha256:exact-policy",
+        "event_digest": "sha256:exact-events",
+        "operator_confirmed": true
+      },
+      "expected": {
+        "registration_allowed": true,
+        "reason": "all_inputs_present_for_trusted_setup_validation"
+      }
+    }
+  ]
+}

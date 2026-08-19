@@ -1,0 +1,14 @@
+{
+  "check_run": ["completed"],
+  "check_suite": ["completed"],
+  "installation": ["created", "deleted", "suspend", "unsuspend", "new_permissions_accepted"],
+  "installation_target": ["renamed"],
+  "installation_repositories": ["added", "removed"],
+  "issue_comment": ["created", "edited", "deleted"],
+  "issues": ["opened", "edited", "labeled", "unlabeled", "reopened", "closed", "transferred", "deleted"],
+  "pull_request": ["opened", "edited", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "closed", "labeled", "unlabeled"],
+  "pull_request_review": ["submitted", "edited", "dismissed"],
+  "release": ["created", "published", "prereleased", "edited", "deleted"],
+  "repository": ["archived", "deleted", "renamed", "transferred", "publicized", "privatized"],
+  "workflow_run": ["requested", "in_progress", "completed"]
+}

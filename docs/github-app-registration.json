@@ -1,0 +1,28 @@
+{
+  "artifact_kind": "endpoint_bound_registration_manifest",
+  "registration_allowed": false,
+  "registration_blockers": [
+    "operator_must_supply_exact_endpoint",
+    "active_webhook_must_be_true",
+    "daemon_secret_store_must_be_ready",
+    "selected_repository_id_must_match",
+    "permission_digest_must_match_policy",
+    "event_digest_must_match_policy_and_receiver_allowlist",
+    "operator_confirmation_must_be_recorded"
+  ],
+  "endpoint": null,
+  "hook_attributes": {
+    "url": null,
+    "active": false
+  },
+  "hook_active": false,
+  "secret_store_ref": null,
+  "repository_selection": "selected",
+  "repository": {
+    "full_name": "baziyer/dark-factory",
+    "id": null
+  },
+  "permission_digest": null,
+  "event_digest": null,
+  "operator_confirmed": false
+}
