@@ -932,3 +932,78 @@ fn activity_label_names_recent_stale_and_missing_activity() {
         "a fresh current session must not inherit ended-session activity"
     );
 }
+
+#[test]
+fn session_lifecycle_events_project_the_daemon_current_session_into_activity() {
+    let mut board = Board::new(false, 120_000, crate::theme::FORTRESS);
+    let alice = agent("alice", "a", AgentRole::Worker, None);
+    let mut live = session("sess-1", "alice", "a", SessionState::Working);
+    live.activity = Some("tool: Read".to_owned());
+    live.last_hook_at_ms = Some(110_000);
+    let mut live_agent = alice.clone();
+    live_agent.current_session_id = Some(live.id.clone());
+
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    // This is the event order emitted by Store::create_session: the derived
+    // AgentSnapshot relation is published before the session row, so a board
+    // can never briefly treat an ended row as current during teardown.
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 100_000,
+        event: FactoryEvent::AgentChanged {
+            agent: live_agent,
+        },
+    });
+    assert_eq!(
+        board.activity_label(board.agents.get(&AgentId::try_from("alice").unwrap()).unwrap()),
+        "no recent activity"
+    );
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 100_000,
+        event: FactoryEvent::SessionChanged {
+            session: live.clone(),
+        },
+    });
+    let alice_id = AgentId::try_from("alice").unwrap();
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "tool: Read 10s ago"
+    );
+
+    let mut ended = live;
+    ended.state = SessionState::Stopped;
+    ended.ended_at_ms = Some(120_001);
+    let mut ended_agent = board.agents[&alice_id].clone();
+    ended_agent.current_session_id = None;
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 3,
+        occurred_at_ms: 120_001,
+        event: FactoryEvent::AgentChanged {
+            agent: ended_agent,
+        },
+    });
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity"
+    );
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 4,
+        occurred_at_ms: 120_001,
+        event: FactoryEvent::SessionChanged { session: ended },
+    });
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity"
+    );
+}
