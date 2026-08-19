@@ -981,9 +981,27 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         ));
     }
 
-    #[tokio::test]
-    async fn prompt_is_exact_stdin_and_never_runner_argv_or_environment() {
-        let directory = tempfile::tempdir().unwrap();
+    fn macos_var_alias_tempdir() -> Option<tempfile::TempDir> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        tempfile::Builder::new()
+            .prefix("dark-factory-runner-alias-")
+            .tempdir_in("/var/tmp")
+            .ok()
+    }
+
+    fn linux_tmp_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dark-factory-runner-tmp-")
+            .tempdir_in("/tmp")
+            .expect("the Linux-style /tmp runner fixture must be writable")
+    }
+
+    async fn assert_prompt_is_exact_stdin_and_never_runner_argv_or_environment(
+        directory: tempfile::TempDir,
+        require_macos_alias: bool,
+    ) {
         scripts(directory.path());
         let captured = probe_environment(directory.path(), directory.path());
         let task = b"private task \xf0\x9f\x8f\xad\nwith spaces\0and bytes".to_vec();
@@ -1005,12 +1023,48 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             assert!(!observed.windows(12).any(|bytes| bytes == b"private task"));
         }
         assert!(!provider_env.windows(10).any(|bytes| bytes == b"CODEX_HOME"));
+        assert!(
+            !provider_env
+                .windows("DARK_FACTORY_TASK".len())
+                .any(|bytes| bytes == b"DARK_FACTORY_TASK")
+        );
         let runner_argv = String::from_utf8(runner_argv).unwrap();
         assert!(runner_argv.contains("--stdin-bytes\n39\n"));
         assert!(runner_argv.contains("--run-id\nrun-safe-launch\n"));
         assert!(runner_argv.contains("--runner-instance-id\nrunner-safe-launch\n"));
         assert!(runner_argv.contains("--safe-provider-flag"));
-        assert!(runner_argv.contains(directory.path().join("provider-probe").to_str().unwrap()));
+        let lexical_provider = directory.path().join("provider-probe");
+        let expected_provider = fs::canonicalize(&lexical_provider).unwrap();
+        let runner_tokens: Vec<_> = runner_argv.lines().collect();
+        assert!(runner_tokens.contains(&expected_provider.to_str().unwrap()));
+        assert_eq!(provider_argv, b"--safe-provider-flag\n");
+        if require_macos_alias {
+            assert!(lexical_provider.starts_with("/var/"));
+            assert!(expected_provider.starts_with("/private/var/"));
+            assert_ne!(lexical_provider, expected_provider);
+            assert!(!runner_tokens.contains(&lexical_provider.to_str().unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_is_exact_stdin_and_never_runner_argv_or_environment_under_linux_tmp() {
+        assert_prompt_is_exact_stdin_and_never_runner_argv_or_environment(
+            linux_tmp_tempdir(),
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prompt_is_exact_stdin_and_never_runner_argv_or_environment_under_macos_var_alias() {
+        let Some(directory) = macos_var_alias_tempdir() else {
+            assert!(
+                !cfg!(target_os = "macos"),
+                "macOS /var alias fixture must be writable when running on macOS"
+            );
+            return;
+        };
+        assert_prompt_is_exact_stdin_and_never_runner_argv_or_environment(directory, true).await;
     }
 
     #[tokio::test]
