@@ -370,6 +370,10 @@ suffix begins at a safe UTF-8/ANSI boundary. PTY bytes stay opaque and bounded
 on every wire frame. Ctrl-] closes only the attach stream, Ctrl-C is forwarded
 as ordinary PTY input, and output/socket failure wakes blocked CLI input;
 detaching does not stop the session.
+The TUI parses retained bytes as a real terminal stream, keeps a bounded
+scrollback page, and snapshots the visible state across narrow/wide resize so
+wrapped UTF-8/ANSI output and a live prompt do not disappear at the viewport
+edge.
 
 ## Task list for whoever picks this up
 

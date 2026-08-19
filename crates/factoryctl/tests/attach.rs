@@ -160,9 +160,12 @@ fn handle_connection(
 }
 
 fn write_frame(stream: &mut UnixStream, frame: ServerFrame) {
-    serde_json::to_writer(&mut *stream, &frame).unwrap();
-    stream.write_all(b"\n").unwrap();
-    stream.flush().unwrap();
+    let Ok(mut payload) = serde_json::to_vec(&frame) else {
+        return;
+    };
+    payload.push(b'\n');
+    let _ = stream.write_all(&payload);
+    let _ = stream.flush();
 }
 
 fn spawn_cli(
