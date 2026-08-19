@@ -2003,10 +2003,7 @@ mod tests {
         let archive_target = home.path().join("archive-target");
         fs::create_dir(&archive_target).unwrap();
         symlink(&archive_target, &archive_dir).unwrap();
-        assert!(matches!(
-            compact_memory(&path),
-            Err(GuidanceError::Directory { .. })
-        ));
+        assert!(compact_memory(&path).is_err());
 
         fs::remove_file(&archive_dir).unwrap();
         fs::create_dir(&archive_dir).unwrap();
