@@ -2006,7 +2006,19 @@ fn a_refused_delete_project_leaves_every_file_intact() {
     // shell-agent.sh completes the task and settles back to Idle -- still
     // live (`ended_at_ms IS NULL`), which is exactly what
     // `ProjectHasActiveRun` checks for.
-    wait_for_stable_idle(&client, "curie");
+    let task = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let result = task.result.as_deref().unwrap_or_default();
+    assert!(
+        result.starts_with("done: Task task-1: Trigger a spawn (task:task-1)"),
+        "task delivery was not acknowledged with the expected result: {result:?}"
+    );
+    let run = list_runs(&client)
+        .into_iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-1"))
+        .expect("completed task must have a run");
+    assert_eq!(run.status, factory_core::RunStatus::Succeeded);
+    assert_eq!(run.closed_by, Some(factory_core::RunClosedBy::TaskDone));
+    wait_for_session_state(&client, "curie", SessionState::Idle);
 
     let deleted = client
         .request(LocalRequest::DeleteProject {
