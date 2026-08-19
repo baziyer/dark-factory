@@ -634,7 +634,7 @@ mod tests {
     use super::*;
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread::JoinHandle;
     use std::time::Duration;
@@ -680,6 +680,8 @@ mod tests {
         socket: PathBuf,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        handler_threads: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        active_handlers: Arc<AtomicUsize>,
         send_complete: mpsc::Receiver<Result<(), String>>,
         peer_consumption: Arc<PeerConsumption>,
         send_errors: Arc<Mutex<Vec<String>>>,
@@ -701,18 +703,27 @@ mod tests {
             let peer_consumption = Arc::new(PeerConsumption::new());
             let send_errors = Arc::new(Mutex::new(Vec::new()));
             let thread_stop = Arc::clone(&stop);
+            let handler_threads = Arc::new(Mutex::new(Vec::new()));
+            let thread_handler_threads = Arc::clone(&handler_threads);
+            let active_handlers = Arc::new(AtomicUsize::new(0));
+            let thread_active_handlers = Arc::clone(&active_handlers);
             let thread_peer_consumption = Arc::clone(&peer_consumption);
             let thread_send_errors = Arc::clone(&send_errors);
             let thread = std::thread::spawn(move || {
                 while !thread_stop.load(Ordering::Acquire) {
                     match listener.accept() {
                         Ok((stream, _)) => {
+                            // Only accept polling is nonblocking; fixture writes must block so
+                            // send completion cannot spuriously fail with EWOULDBLOCK.
+                            stream.set_nonblocking(false).unwrap();
                             let stop = Arc::clone(&thread_stop);
                             let output = output.clone();
                             let peer_consumption = Arc::clone(&thread_peer_consumption);
                             let send_errors = Arc::clone(&thread_send_errors);
                             let send_complete = send_complete.clone();
-                            std::thread::spawn(move || {
+                            let active_handlers = Arc::clone(&thread_active_handlers);
+                            active_handlers.fetch_add(1, Ordering::AcqRel);
+                            let handler = std::thread::spawn(move || {
                                 serve_attach_connection(
                                     stream,
                                     output,
@@ -722,7 +733,9 @@ mod tests {
                                     send_errors,
                                     fail_after_frames,
                                 );
+                                active_handlers.fetch_sub(1, Ordering::AcqRel);
                             });
+                            thread_handler_threads.lock().unwrap().push(handler);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(1));
@@ -735,6 +748,8 @@ mod tests {
                 socket,
                 stop,
                 thread: Some(thread),
+                handler_threads,
+                active_handlers,
                 send_complete: send_complete_rx,
                 peer_consumption,
                 send_errors,
@@ -771,6 +786,20 @@ mod tests {
             if let Some(thread) = self.thread.take() {
                 thread.join().unwrap();
             }
+            let handlers = self
+                .handler_threads
+                .lock()
+                .unwrap()
+                .drain(..)
+                .collect::<Vec<_>>();
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+            assert_eq!(
+                self.active_handlers.load(Ordering::Acquire),
+                0,
+                "attach fixture leaked a connection handler"
+            );
         }
     }
 
@@ -802,11 +831,12 @@ mod tests {
                 }
                 let succeeded = result.is_ok();
                 let _ = send_complete.send(result.map_err(|error| error.to_string()));
-                if succeeded {
-                    // The fixture must not let the attach socket close before the test has
-                    // consumed the complete UTF-8/ANSI history and observed the live prompt.
-                    peer_consumption.wait();
+                if !succeeded {
+                    return;
                 }
+                // The fixture must not let the attach socket close before the test has
+                // consumed the complete UTF-8/ANSI history and observed the live prompt.
+                peer_consumption.wait();
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
                 let mut discard = [0_u8; 1];
                 while !stop.load(Ordering::Acquire) {
@@ -1056,6 +1086,20 @@ mod tests {
             vec!["injected attach fixture send failure"]
         );
         assert!(!fixture.peer_consumed());
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while pane.attach_error().is_none() && !pane.has_exited() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let attach_error = pane.attach_error();
+        let disconnected = pane.has_exited();
+        assert!(
+            attach_error.is_some() || disconnected,
+            "truncated fixture produced no client-side attach failure or disconnect projection"
+        );
+        assert!(
+            disconnected,
+            "truncated fixture did not disconnect the client: error={attach_error:?}"
+        );
         assert!(
             !(pane.is_ready()
                 && pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT"))),
