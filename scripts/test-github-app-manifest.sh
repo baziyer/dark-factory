@@ -99,22 +99,82 @@ assert cases["conflicting_guid_digest"]["expected"]["reason"] == "idempotency_co
 assert cases["conflicting_guid_identity"]["expected"]["reason"] == "idempotency_conflict"
 assert cases["missing_delivery_guid"]["expected"]["reason"] == "malformed_delivery_identity"
 
-assert cases["read_only_identity_verification"]["expected"] == {
-    "decision": "temporary_authority_proposal",
-    "proposal_kind": "github_app_identity_verification",
-    "additional_permissions": ["contents:write", "pull_requests:write"],
-    "additional_repository": "operator-must-supply-exact-disposable-repository",
-    "repository_must_not_be_current_selection": True,
-    "teardown_plan": [
+proposal = cases["read_only_identity_verification"]["expected"]
+assert proposal["decision"] == "temporary_authority_proposal_template"
+assert proposal["proposal_kind"] == "github_app_identity_verification"
+assert proposal["authority_ready"] is False
+assert proposal["execution_allowed"] is False
+template = proposal["template"]
+assert template["proposal_id"] is None
+assert template["idempotency_key"] is None
+assert template["target"] == {
+    "repository_full_name": None,
+    "repository_id": None,
+    "branch_ref": None,
+    "pull_request_number": None,
+    "test_commit_sha": None,
+}
+assert template["approver_principal"] is None
+assert template["expires_at"] is None
+assert template["expected_revisions"] == {
+    "permission_revision": None,
+    "event_revision": None,
+    "identity_tuple_revision": None,
+}
+assert template["requested_permissions"] == ["contents:write", "pull_requests:write"]
+assert template["allowed_operations"] == [
+    "create_one_disposable_branch",
+    "create_one_test_commit",
+    "create_one_test_pull_request",
+    "read_bot_identity_and_logo",
+    "read_commit_attribution",
+    "delete_test_branch_and_pull_request",
+]
+assert template["forbidden_operations"] == [
+    "merge_pull_request",
+    "publish_or_edit_release",
+    "write_any_other_branch",
+    "write_selected_production_repository",
+    "dispatch_or_modify_workflow",
+    "grant_permissions",
+    "send_credentials_to_provider",
+]
+assert template["teardown"] == {
+    "repository_full_name": None,
+    "repository_id": None,
+    "branch_ref": None,
+    "pull_request_number": None,
+    "installation_id": None,
+    "temporary_authority_id": None,
+    "token_reference": None,
+    "steps": [
         "delete_test_branch_and_pull_request",
         "remove_disposable_repository_from_installation",
         "revoke_temporary_authority",
         "erase_short_lived_token",
     ],
-    "provider_receives_credentials": False,
-    "expires": True,
-    "teardown_required": True,
 }
+assert template["provider_receives_credentials"] is False
+assert proposal["blockers"] == [
+    "exact_proposal_id_required",
+    "exact_idempotency_key_required",
+    "exact_disposable_repository_id_and_name_required",
+    "exact_branch_and_pull_request_targets_required",
+    "operator_approver_principal_required",
+    "expiry_timestamp_required",
+    "permission_event_and_identity_revisions_required",
+    "teardown_identities_required",
+]
+# A placeholder-complete object must not become executable merely by flipping a boolean.
+assert any(value is None for value in (
+    template["proposal_id"],
+    template["idempotency_key"],
+    template["target"]["repository_id"],
+    template["approver_principal"],
+    template["expires_at"],
+    template["expected_revisions"]["permission_revision"],
+    template["teardown"]["temporary_authority_id"],
+))
 target = cases["target_404_after_valid_scope_check"]["expected"]
 assert target["durable_state"] == "target_not_found"
 assert target["installation_revoked"] is False

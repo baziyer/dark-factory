@@ -124,20 +124,72 @@
         "requires_test_pull_request": true
       },
       "expected": {
-        "decision": "temporary_authority_proposal",
+        "decision": "temporary_authority_proposal_template",
         "proposal_kind": "github_app_identity_verification",
-        "additional_permissions": ["contents:write", "pull_requests:write"],
-        "additional_repository": "operator-must-supply-exact-disposable-repository",
-        "repository_must_not_be_current_selection": true,
-        "teardown_plan": [
-          "delete_test_branch_and_pull_request",
-          "remove_disposable_repository_from_installation",
-          "revoke_temporary_authority",
-          "erase_short_lived_token"
-        ],
-        "provider_receives_credentials": false,
-        "expires": true,
-        "teardown_required": true
+        "authority_ready": false,
+        "execution_allowed": false,
+        "template": {
+          "proposal_id": null,
+          "idempotency_key": null,
+          "target": {
+            "repository_full_name": null,
+            "repository_id": null,
+            "branch_ref": null,
+            "pull_request_number": null,
+            "test_commit_sha": null
+          },
+          "approver_principal": null,
+          "expires_at": null,
+          "expected_revisions": {
+            "permission_revision": null,
+            "event_revision": null,
+            "identity_tuple_revision": null
+          },
+          "requested_permissions": ["contents:write", "pull_requests:write"],
+          "allowed_operations": [
+            "create_one_disposable_branch",
+            "create_one_test_commit",
+            "create_one_test_pull_request",
+            "read_bot_identity_and_logo",
+            "read_commit_attribution",
+            "delete_test_branch_and_pull_request"
+          ],
+          "forbidden_operations": [
+            "merge_pull_request",
+            "publish_or_edit_release",
+            "write_any_other_branch",
+            "write_selected_production_repository",
+            "dispatch_or_modify_workflow",
+            "grant_permissions",
+            "send_credentials_to_provider"
+          ],
+          "teardown": {
+            "repository_full_name": null,
+            "repository_id": null,
+            "branch_ref": null,
+            "pull_request_number": null,
+            "installation_id": null,
+            "temporary_authority_id": null,
+            "token_reference": null,
+            "steps": [
+              "delete_test_branch_and_pull_request",
+              "remove_disposable_repository_from_installation",
+              "revoke_temporary_authority",
+              "erase_short_lived_token"
+            ]
+          },
+          "provider_receives_credentials": false
+        },
+        "blockers": [
+          "exact_proposal_id_required",
+          "exact_idempotency_key_required",
+          "exact_disposable_repository_id_and_name_required",
+          "exact_branch_and_pull_request_targets_required",
+          "operator_approver_principal_required",
+          "expiry_timestamp_required",
+          "permission_event_and_identity_revisions_required",
+          "teardown_identities_required"
+        ]
       }
     },
     {
