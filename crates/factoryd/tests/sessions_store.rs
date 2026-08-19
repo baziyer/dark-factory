@@ -222,14 +222,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0020.
+    // Opening through the real store runs migrations 0014 through 0023.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -284,6 +284,8 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
             .execute_batch(
                 "DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
+                 ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  PRAGMA user_version = 18;",
             )
             .unwrap();
@@ -294,7 +296,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -387,14 +389,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0019 migrations.
+    // Opening through the real store runs the 0015 through 0023 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 22);
+    assert_eq!(version, 23);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

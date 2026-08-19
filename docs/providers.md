@@ -31,12 +31,15 @@ provider's own terminal output, and never owns process lifecycle.
 ## Runtime-resolved session settings
 
 The agent profile is the configured override and remains separate from the
-session's historical runtime metadata. At spawn, a provider may report the
-model, reasoning effort, permission mode, and control mode only when the
-launch argv or a configuration file it actually uses establishes them. Those
-values are stored on the session row and remain on ended sessions, so changing
-an agent profile cannot rewrite history. `None` is rendered as `unreported`;
-the daemon never fills a missing provider default from a plausible model name.
+session's historical runtime metadata. For new Codex agents, the shared
+project policy records the selected model, reasoning effort, and selection
+reason; it defaults routine workers/reviewers to Luna and keeps Sol/xhigh for
+God or an explicit escalation. At spawn, a provider may report the model,
+reasoning effort, permission mode, and control mode only when the launch argv
+or a configuration file it actually uses establishes them. Those values are
+stored on the session row and remain on ended sessions, so changing an agent
+profile cannot rewrite history. `None` is rendered as `unreported`; the daemon
+never fills a missing provider default from a plausible model name.
 
 Codex reports an explicit `--model`, root-level `model` and
 `model_reasoning_effort` from its isolated seeded `config.toml`, and the exact
@@ -45,13 +48,19 @@ launch values and its `bypassPermissions` auto-mode value; an omitted Claude
 default remains unreported. The same session snapshot is returned by
 `factoryctl agent status`/`session list` and consumed by `factory-tui`.
 
-Profile permission modes are validated against this same provider capability
-declaration before the profile row is written. For example, Codex accepts only
+Profile model, reasoning-effort, selection-reason, and permission values are
+validated against one provider capability declaration before the profile row is
+written. Codex accepts the supported GPT-5.6 model IDs and reasoning efforts
+`none`, `low`, `medium`, `high`, `xhigh`, and `max`; Claude and shell reject
+reasoning efforts because those providers do not consume that field, while a
+shell model remains its explicit command. For example, Codex accepts only
 `on-request` and `never`; `bypass` is the factory-wide auto-mode launch posture,
 not a valid Codex profile value, and is rejected instead of being deferred to
 the next session launch. Upgrade migration 0022 also clears invalid
 provider-scoped values already present in older profile rows, restoring the
-provider default so they cannot reach a post-upgrade launch argv.
+provider default so they cannot reach a post-upgrade launch argv. Migration
+0023 adds the nullable model-policy fields without backfilling existing
+profiles; an existing profile remains unchanged until an operator edits it.
 
 Repository authority is provider-independent too. Provider processes do not
 inherit ambient Git/GitHub token variables or the SSH agent; the runner resets
@@ -403,8 +412,7 @@ gates were involved, and both had to change:
   (previously `false`). Confirmed live that `false` denies even a *local*
   Unix-socket connect — seatbelt has no "just localhost" exception — which
   blocked not only a worker's `git push`/`gh pr create` but the
-  orchestrator's own everyday `factoryctl agent add`/`task add`/`task
-  assign`/`session list` calls (only `task done`/`task blocked`/`agent
+  orchestrator's own everyday daemon calls (only `task done`/`task blocked`/`agent
   message` have the outbox fallback below; nothing else does). This is a
   real widening — reads are already unrestricted under `workspace-write`,
   so `network_access = true` means a Codex session can read anything the

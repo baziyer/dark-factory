@@ -7,11 +7,13 @@ use factory_core::{
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
     },
 };
+use factoryctl::Client;
 use factoryd::{
     execution,
     local_api::{ApiState, serve},
-    store::Store,
+    store::{NewProject, NewTask, Store},
 };
+use rusqlite::Connection;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
@@ -85,6 +87,119 @@ where
 
     test(socket).await;
 
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_events() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.path().join("factory.db");
+    let project_id = project_id("factory");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: directory.path().to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+    }
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 UPDATE events SET schema_version = 1;
+                 PRAGMA user_version = 22;",
+            )
+            .unwrap();
+    }
+    let state = ApiState::new(Store::open(&database).unwrap());
+    let socket = directory.path().join("f.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let mut subscription = Client::new(&socket).subscribe(0).unwrap();
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::Subscribed {
+                replay_through: 1,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event: factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 1,
+                ..
+            },
+        }
+    ));
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::CaughtUp { sequence: 1 },
+            ..
+        }
+    ));
+
+    let live_project_id = project_id.clone();
+    state
+        .commit_and_publish(move |store| {
+            let (_, event) = store.create_task(
+                NewTask {
+                    id: task_id("live-task"),
+                    project_id: live_project_id,
+                    parent_task_id: None,
+                    title: "Live".into(),
+                    body: "Live event".into(),
+                    priority: 0,
+                },
+                2,
+            )?;
+            Ok(((), vec![event]))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Event {
+            protocol_version: PROTOCOL_VERSION,
+            event: factory_core::EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence: 2,
+                ..
+            },
+        }
+    ));
+
+    drop(subscription);
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
     execution.shutdown().await.unwrap();
@@ -795,6 +910,8 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -891,6 +1008,8 @@ async fn local_agent_messages_round_trip_without_public_events() {
                     role: factory_core::AgentRole::Orchestrator,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -982,6 +1101,8 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1316,6 +1437,8 @@ async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Codex,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 )
@@ -1454,6 +1577,8 @@ async fn a_failed_guidance_removal_leaves_the_agent_retryable_not_half_deleted()
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1589,6 +1714,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1608,6 +1735,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
@@ -1626,6 +1755,8 @@ async fn a_refused_delete_agent_leaves_every_file_intact() {
                     project_id: project_id("factory"),
                     agent_id: agent_id("boss"),
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     permission_mode: None,
                     instructions: MARKER.into(),
                     memory: String::new(),
@@ -1734,6 +1865,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Shell,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 )
@@ -1750,6 +1883,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         project_id: project_id("factory"),
                         agent_id: boss.clone(),
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         permission_mode: None,
                         instructions: MARKER.into(),
                         memory: String::new(),
@@ -1781,6 +1916,8 @@ async fn concurrent_create_agent_naming_a_deleting_parent_never_destroys_its_fil
                         role: factory_core::AgentRole::Worker,
                         provider: factory_core::Provider::Shell,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 ),
@@ -1868,6 +2005,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                     role: factory_core::AgentRole::Worker,
                     provider: factory_core::Provider::Codex,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: Some("/nonexistent/curie-worktree".into()),
                 },
             )
@@ -1892,6 +2031,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: Some(worktree.clone()),
             },
         )
@@ -1938,6 +2079,8 @@ async fn session_shaped_requests_now_have_real_behavior() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: None,
             },
         )
@@ -2147,6 +2290,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 role: factory_core::AgentRole::Worker,
                 provider: factory_core::Provider::Codex,
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 worktree: None,
             },
             // Paused first, so assigning work never spawns a session: the

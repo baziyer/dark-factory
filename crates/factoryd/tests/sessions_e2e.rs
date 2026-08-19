@@ -474,6 +474,8 @@ fn create_shell_agent(client: &Client, agent_id: &str) -> factory_core::AgentSna
             role: AgentRole::Worker,
             provider: Provider::Shell,
             model: Some(shell_agent_path()),
+            reasoning_effort: None,
+            model_selection_reason: None,
             worktree: None,
         })
         .unwrap();
@@ -504,6 +506,8 @@ fn create_shell_agent_with_command(
             role: AgentRole::Worker,
             provider: Provider::Shell,
             model: Some(command),
+            reasoning_effort: None,
+            model_selection_reason: None,
             worktree: None,
         })
         .unwrap();
@@ -1754,6 +1758,8 @@ fn a_refused_delete_project_leaves_every_file_intact() {
             // posts a single hook, hanging every wait below. Preserve the
             // fixture command `create_shell_agent` set.
             model: Some(shell_agent_path()),
+            reasoning_effort: None,
+            model_selection_reason: None,
             permission_mode: None,
             instructions: MARKER.into(),
             memory: String::new(),

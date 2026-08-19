@@ -277,6 +277,8 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             role,
             provider,
             model,
+            reasoning_effort,
+            model_selection_reason,
             worktree,
         } = request.request
         else {
@@ -288,6 +290,8 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         assert_eq!(role, AgentRole::Worker);
         assert_eq!(provider, Provider::Codex);
         assert_eq!(model, None);
+        assert_eq!(reasoning_effort, None);
+        assert_eq!(model_selection_reason, None);
         assert_eq!(worktree, None);
         write_response(
             &mut agent_stream,

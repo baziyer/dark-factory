@@ -10,12 +10,15 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub mod attention;
 pub mod local;
+pub mod model_policy;
 pub mod paths;
 pub mod runner;
 pub mod status;
 
 /// Local API wire version. Bump for new request/response variants so an older
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
+/// Durable event envelopes retain their own stored schema version and may be
+/// older than this outer frame version during an upgrade.
 pub const PROTOCOL_VERSION: u16 = 2;
 const MAX_ID_LEN: usize = 128;
 

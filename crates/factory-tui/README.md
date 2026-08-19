@@ -27,10 +27,11 @@ events add counts; idle time only advances empty buckets, so a silent agent
 ages out without decorative animation.
 
 AGENT shows the selected agent. It includes the live terminal, assigned and
-active work, durable messages, and settings. Its queue shows active assigned
-tasks in stable `(created_at_ms, id)` order. The
-orchestrator also shows the project backlog and worker queues; messages remain
-the inbox and review attention remains separate.
+active work, durable messages, and settings. Settings distinguish the
+configured model/reasoning tier and durable selection reason from the
+historical runtime-resolved session values. The orchestrator also shows the
+project backlog and worker queues; messages remain the inbox and review
+attention remains separate.
 
 ## Mouse
 

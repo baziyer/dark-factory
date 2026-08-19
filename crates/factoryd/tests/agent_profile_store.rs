@@ -48,7 +48,9 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
             &project,
             &agent,
             UpdateAgentProfile {
-                model: Some("gpt-5-codex".into()),
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                model_selection_reason: Some("operator verification".into()),
                 permission_mode: Some("on-request".into()),
             },
             3,
@@ -56,7 +58,7 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
         .unwrap();
 
     let reloaded = store.get_agent_detail(&project, &agent).unwrap();
-    assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(
         reloaded.profile.permission_mode.as_deref(),
         Some("on-request")
@@ -75,6 +77,8 @@ fn agent_profile_rejects_permission_modes_not_declared_by_the_provider() {
         &agent,
         UpdateAgentProfile {
             model: None,
+            reasoning_effort: None,
+            model_selection_reason: None,
             permission_mode: Some("bypass".into()),
         },
         3,
@@ -126,8 +130,16 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     }
 
     // Simulate the exact pre-#146 durable state, then let the next Store open
-    // perform the 0022 repair as an upgrade would.
+    // perform the 0022 repair as an upgrade would. The fixture was opened by
+    // the current binary, so remove only the later #155 columns before
+    // rewinding its schema version.
     let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+             ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
+        )
+        .unwrap();
     connection
         .execute(
             "UPDATE agent_profiles SET permission_mode = 'bypass' WHERE agent_id = 'god'",
@@ -165,11 +177,152 @@ fn creating_an_agent_can_persist_its_selected_model_in_the_private_profile() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
             },
-            Some("gpt-5-codex".into()),
+            Some("gpt-5.6-luna".into()),
             4,
         )
         .unwrap();
 
     let detail = store.get_agent_detail(&project, &agent).unwrap();
-    assert_eq!(detail.profile.model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(detail.profile.model.as_deref(), Some("gpt-5.6-luna"));
+}
+
+#[test]
+fn new_codex_workers_get_auditable_routine_defaults_without_rewriting_old_profiles() {
+    let mut store = fixture();
+    let project = ProjectId::try_from("factory").unwrap();
+    let agent = AgentId::try_from("worker").unwrap();
+    store
+        .create_agent_with_profile(
+            NewAgent {
+                id: agent.clone(),
+                project_id: project.clone(),
+                parent_agent_id: Some(AgentId::try_from("god").unwrap()),
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            None,
+            None,
+            None,
+            4,
+        )
+        .unwrap();
+
+    let detail = store.get_agent_detail(&project, &agent).unwrap();
+    assert_eq!(
+        detail.profile.model.as_deref(),
+        Some(factory_core::model_policy::ROUTINE_MODEL)
+    );
+    assert_eq!(
+        detail.profile.reasoning_effort.as_deref(),
+        Some(factory_core::model_policy::ROUTINE_REASONING_EFFORT)
+    );
+    assert_eq!(
+        detail.profile.model_selection_reason.as_deref(),
+        Some("routine bounded worker default")
+    );
+    let old = store
+        .get_agent_detail(&project, &AgentId::try_from("god").unwrap())
+        .unwrap();
+    assert_eq!(old.profile.model, None);
+    assert_eq!(old.profile.reasoning_effort, None);
+    assert_eq!(old.profile.model_selection_reason, None);
+}
+
+#[test]
+fn explicit_worker_escalation_persists_sol_xhigh_and_its_reason() {
+    let mut store = fixture();
+    let project = ProjectId::try_from("factory").unwrap();
+    let agent = AgentId::try_from("worker").unwrap();
+    store
+        .create_agent_with_profile(
+            NewAgent {
+                id: agent.clone(),
+                project_id: project.clone(),
+                parent_agent_id: Some(AgentId::try_from("god").unwrap()),
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            None,
+            None,
+            Some("security integration after a failed routine attempt".into()),
+            4,
+        )
+        .unwrap();
+
+    let detail = store.get_agent_detail(&project, &agent).unwrap();
+    assert_eq!(
+        detail.profile.model.as_deref(),
+        Some(factory_core::model_policy::ESCALATED_MODEL)
+    );
+    assert_eq!(
+        detail.profile.reasoning_effort.as_deref(),
+        Some(factory_core::model_policy::ESCALATED_REASONING_EFFORT)
+    );
+    assert_eq!(
+        detail.profile.model_selection_reason.as_deref(),
+        Some("security integration after a failed routine attempt")
+    );
+}
+
+#[test]
+fn profile_escalation_requires_a_reason_and_normalizes_to_xhigh() {
+    let mut store = fixture();
+    let project = ProjectId::try_from("factory").unwrap();
+    let agent = AgentId::try_from("worker").unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent.clone(),
+                project_id: project.clone(),
+                parent_agent_id: Some(AgentId::try_from("god").unwrap()),
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            3,
+        )
+        .unwrap();
+
+    let error = match store.update_agent_profile(
+        &project,
+        &agent,
+        UpdateAgentProfile {
+            model: Some(factory_core::model_policy::ESCALATED_MODEL.into()),
+            reasoning_effort: None,
+            model_selection_reason: None,
+            permission_mode: None,
+        },
+        4,
+    ) {
+        Ok(_) => panic!("an escalation without a reason was persisted"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        factoryd::store::StoreError::InvalidAgentModelPolicy(
+            factory_core::model_policy::ModelPolicyError::EscalationReasonRequired
+        )
+    ));
+
+    store
+        .update_agent_profile(
+            &project,
+            &agent,
+            UpdateAgentProfile {
+                model: Some(factory_core::model_policy::ESCALATED_MODEL.into()),
+                reasoning_effort: None,
+                model_selection_reason: Some("release integration after failed attempt".into()),
+                permission_mode: None,
+            },
+            5,
+        )
+        .unwrap();
+    let detail = store.get_agent_detail(&project, &agent).unwrap();
+    assert_eq!(
+        detail.profile.reasoning_effort.as_deref(),
+        Some(factory_core::model_policy::ESCALATED_REASONING_EFFORT)
+    );
+    assert_eq!(
+        detail.profile.model_selection_reason.as_deref(),
+        Some("release integration after failed attempt")
+    );
 }

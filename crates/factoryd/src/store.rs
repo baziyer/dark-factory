@@ -7,6 +7,7 @@ use factory_core::{
     SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
+    model_policy,
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -25,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -97,6 +98,8 @@ pub struct NewAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
     pub updated_at_ms: i64,
 }
@@ -108,6 +111,8 @@ pub struct AgentDetail {
 
 pub struct UpdateAgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
 }
 
@@ -466,6 +471,8 @@ pub enum StoreError {
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
+    #[error("agent model policy rejected the profile: {0}")]
+    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
     UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
@@ -837,7 +844,7 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.insert_agent(input, None, now_ms)
+        self.insert_agent(input, None, None, None, now_ms)
     }
 
     pub fn create_agent_with_model(
@@ -846,14 +853,43 @@ impl Store {
         model: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        self.create_agent_with_profile(input, model, None, None, now_ms)
+    }
+
+    pub fn create_agent_with_profile(
+        &mut self,
+        input: NewAgent,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
         validate_agent_model(model.as_deref())?;
-        self.insert_agent(input, model, now_ms)
+        let selection = model_policy::normalize_profile(
+            input.provider,
+            input.role,
+            model_policy::ModelSelection {
+                model,
+                reasoning_effort,
+                reason: model_selection_reason,
+            },
+            true,
+        )?;
+        self.insert_agent(
+            input,
+            selection.model,
+            selection.reasoning_effort,
+            selection.reason,
+            now_ms,
+        )
     }
 
     fn insert_agent(
         &mut self,
         input: NewAgent,
         model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         let agent = AgentSnapshot {
@@ -890,9 +926,16 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, updated_at_ms)
-             VALUES (?1, ?2, ?3)",
-            params![agent.id.as_str(), model, agent.updated_at_ms],
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                agent.id.as_str(),
+                model,
+                reasoning_effort,
+                model_selection_reason,
+                agent.updated_at_ms
+            ],
         )?;
         transaction.execute(
             "INSERT INTO agent_budgets (agent_id, max_tool_calls, reset_at_ms, updated_at_ms)
@@ -3837,6 +3880,8 @@ impl Store {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 permission_mode: None,
                 updated_at_ms: 0,
             }),
@@ -3866,16 +3911,32 @@ impl Store {
                 });
             }
         }
+        let selection = model_policy::normalize_profile(
+            agent.snapshot.provider,
+            agent.snapshot.role,
+            model_policy::ModelSelection {
+                model: input.model,
+                reasoning_effort: input.reasoning_effort,
+                reason: input.model_selection_reason,
+            },
+            false,
+        )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason,
+                permission_mode, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
+                reasoning_effort = excluded.reasoning_effort,
+                model_selection_reason = excluded.model_selection_reason,
                 permission_mode = excluded.permission_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
-                input.model,
+                selection.model,
+                selection.reasoning_effort,
+                selection.reason,
                 input.permission_mode,
                 now_ms
             ],
@@ -4505,14 +4566,17 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, permission_mode, updated_at_ms
+            "SELECT model, reasoning_effort, model_selection_reason,
+                    permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
                 Ok(AgentProfile {
                     model: row.get(0)?,
-                    permission_mode: row.get(1)?,
-                    updated_at_ms: row.get(2)?,
+                    reasoning_effort: row.get(1)?,
+                    model_selection_reason: row.get(2)?,
+                    permission_mode: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
                 })
             },
         )
@@ -5092,6 +5156,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             "../migrations/0022_repair_legacy_permission_modes.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 22)?;
+        transaction.commit()?;
+        current = 22;
+    }
+    if current == 22 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0023_agent_model_policy.sql"))?;
+        transaction.pragma_update(None, "user_version", 23)?;
         transaction.commit()?;
     }
     Ok(())

@@ -178,7 +178,10 @@ mod tests {
     use super::*;
     use crate::mouse::{Route, Target, route};
     use crate::test_fixtures::{agent, project, task};
-    use factory_core::{AgentId, AgentRole, TaskId, TaskStatus};
+    use factory_core::{
+        AgentId, AgentRole, TaskId, TaskStatus,
+        local::{AgentDetail, AgentProfile},
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -410,5 +413,54 @@ mod tests {
             .collect::<String>();
         assert!(typing_footer.contains("Ctrl-] board"));
         assert!(typing_footer.contains("[? help] [q detach]"));
+    }
+
+    #[test]
+    fn agent_settings_keep_auditable_policy_fields_legible_at_24_rows() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        let project = project("proj", 0);
+        let worker = agent("worker", "proj", AgentRole::Worker, None);
+        board.apply_fleet_snapshot(
+            vec![project.clone()],
+            vec![worker.clone()],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = View::Agent;
+        board.focused_project = Some(project.id.clone());
+        board.selected_agent = Some(worker.id.clone());
+        board.agent_details.insert(
+            worker.id.clone(),
+            AgentDetail {
+                snapshot: worker,
+                profile: AgentProfile {
+                    model: Some("gpt-5.6-sol".into()),
+                    reasoning_effort: Some("xhigh".into()),
+                    model_selection_reason: Some("release\u{202e} integration".into()),
+                    permission_mode: Some("on-request".into()),
+                    instructions: String::new(),
+                    memory: String::new(),
+                    updated_at_ms: 1,
+                },
+                instructions_path: "/tmp/instructions.md".into(),
+                memory_path: "/tmp/memory.md".into(),
+                project_guidance_path: "/tmp/PROJECT.md".into(),
+            },
+        );
+
+        let (_, terminal) = render_frame(&board, 120, 24);
+        let screen = (0..24)
+            .map(|row| {
+                (0..120)
+                    .map(|column| terminal.backend().buffer()[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("model:"));
+        assert!(screen.contains("effort:"));
+        assert!(screen.contains("audit: release� integration"));
+        assert!(!screen.contains('\u{202e}'));
     }
 }

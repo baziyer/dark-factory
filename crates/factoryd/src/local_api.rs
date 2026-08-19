@@ -175,6 +175,9 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "agent profile is invalid or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidAgentModelPolicy(error)) => {
+                (ErrorCode::InvalidRequest, error.to_string())
+            }
             Self::Store(StoreError::UnsupportedAgentPermissionMode { provider, mode }) => (
                 ErrorCode::InvalidRequest,
                 format!("permission mode {mode:?} is not supported by provider {provider:?}"),
@@ -929,6 +932,8 @@ async fn handle_request(
             role,
             provider,
             model,
+            reasoning_effort,
+            model_selection_reason,
             worktree,
         } => {
             let worktree = match worktree {
@@ -996,6 +1001,8 @@ async fn handle_request(
                     provider,
                 },
                 model,
+                reasoning_effort,
+                model_selection_reason,
                 worktree,
             )
             .await;
@@ -1041,6 +1048,8 @@ async fn handle_request(
             project_id,
             agent_id,
             model,
+            reasoning_effort,
+            model_selection_reason,
             permission_mode,
             instructions,
             memory,
@@ -1054,6 +1063,8 @@ async fn handle_request(
                         &store_agent_id,
                         UpdateAgentProfile {
                             model,
+                            reasoning_effort,
+                            model_selection_reason,
                             permission_mode,
                         },
                         now_ms()?,
@@ -2322,6 +2333,8 @@ fn local_agent_detail(
         snapshot: agent.snapshot,
         profile: LocalAgentProfile {
             model: agent.profile.model,
+            reasoning_effort: agent.profile.reasoning_effort,
+            model_selection_reason: agent.profile.model_selection_reason,
             permission_mode: agent.profile.permission_mode,
             instructions,
             memory,
@@ -2400,13 +2413,21 @@ async fn create_agent_locked(
     guidance_root: &Path,
     new_agent: NewAgent,
     model: Option<String>,
+    reasoning_effort: Option<String>,
+    model_selection_reason: Option<String>,
     worktree: Option<String>,
 ) -> Result<factory_core::AgentSnapshot, ApiFailure> {
     let created_project_id = new_agent.project_id.clone();
     let created_agent_id = new_agent.id.clone();
     let agent = state
         .commit_and_publish(move |store| {
-            let (agent, event) = store.create_agent_with_model(new_agent, model, now_ms()?)?;
+            let (agent, event) = store.create_agent_with_profile(
+                new_agent,
+                model,
+                reasoning_effort,
+                model_selection_reason,
+                now_ms()?,
+            )?;
             Ok((agent, vec![event]))
         })
         .await?;

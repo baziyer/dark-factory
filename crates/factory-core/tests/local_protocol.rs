@@ -175,6 +175,8 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         role: AgentRole::Worker,
         provider: Provider::Codex,
         model: None,
+        reasoning_effort: None,
+        model_selection_reason: None,
         worktree: None,
     };
     let start = LocalRequest::StartTask {
@@ -234,6 +236,8 @@ fn agent_creation_can_carry_an_optional_model_without_exposing_an_id_field_contr
         role: AgentRole::Worker,
         provider: Provider::Codex,
         model: Some("gpt-5-codex".into()),
+        reasoning_effort: None,
+        model_selection_reason: None,
         worktree: None,
     };
     let value = serde_json::to_value(request).unwrap();
@@ -290,6 +294,8 @@ fn agent_profile_is_available_only_through_private_local_detail() {
             snapshot: agent.clone(),
             profile: AgentProfile {
                 model: Some("gpt-5-codex".into()),
+                reasoning_effort: None,
+                model_selection_reason: None,
                 permission_mode: Some("on-request".into()),
                 instructions: "Orchestrate the factory.".into(),
                 memory: "Prefer narrow slices.".into(),

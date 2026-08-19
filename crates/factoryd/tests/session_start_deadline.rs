@@ -229,6 +229,8 @@ async fn create_shell_agent(socket: &Path, agent_id: &str, worktree: &Path, comm
             role: AgentRole::Worker,
             provider: Provider::Shell,
             model: Some(command),
+            reasoning_effort: None,
+            model_selection_reason: None,
             worktree: Some(worktree.to_string_lossy().into_owned()),
         },
     )

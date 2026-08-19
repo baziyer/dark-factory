@@ -17,6 +17,12 @@ use crate::{
 pub struct AgentProfile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Codex's configured reasoning tier, when explicitly known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Durable policy/operator explanation for the configured model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection_reason: Option<String>,
     /// Provider-scoped permission mode (Claude: `default`/`acceptEdits`/
     /// `plan`; Codex: `on-request`/`never`); `None` is the provider default.
     /// Applied to future provider launches; the resulting runtime value is
@@ -177,6 +183,10 @@ pub enum LocalRequest {
         provider: Provider,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_selection_reason: Option<String>,
         /// Overrides the daemon-managed per-agent worktree with an existing
         /// absolute path. Not yet implemented; see local_api.rs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -191,6 +201,10 @@ pub enum LocalRequest {
         agent_id: AgentId,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_selection_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<String>,
         instructions: String,

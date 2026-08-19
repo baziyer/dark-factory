@@ -139,6 +139,17 @@ fn request_response_with_timeout(
     }
 }
 
+fn subscription_message(frame: ServerFrame) -> Option<NetMsg> {
+    match frame {
+        ServerFrame::Event { event, .. } => Some(NetMsg::Event(event)),
+        ServerFrame::Response {
+            response: LocalResponse::CaughtUp { .. },
+            ..
+        } => Some(NetMsg::CaughtUp),
+        ServerFrame::Response { .. } | ServerFrame::TerminalOutput { .. } => None,
+    }
+}
+
 fn next_backoff(delay: Duration) -> Duration {
     delay.checked_mul(2).unwrap_or(MAX_BACKOFF).min(MAX_BACKOFF)
 }
@@ -374,24 +385,17 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
                     let mut failure = "event stream ended".to_owned();
                     for frame in subscription {
                         match frame {
-                            Ok(ServerFrame::Event { event, .. }) => {
-                                after_sequence = event.sequence;
-                                delay = MIN_BACKOFF;
-                                if tx.send(NetMsg::Event(event)).is_err() {
-                                    return;
+                            Ok(frame) => {
+                                if let ServerFrame::Event { event, .. } = &frame {
+                                    after_sequence = event.sequence;
+                                    delay = MIN_BACKOFF;
+                                }
+                                if let Some(message) = subscription_message(frame) {
+                                    if tx.send(message).is_err() {
+                                        return;
+                                    }
                                 }
                             }
-                            Ok(ServerFrame::Response {
-                                response: LocalResponse::CaughtUp { .. },
-                                ..
-                            }) => {
-                                if tx.send(NetMsg::CaughtUp).is_err() {
-                                    return;
-                                }
-                            }
-                            Ok(
-                                ServerFrame::Response { .. } | ServerFrame::TerminalOutput { .. },
-                            ) => {}
                             Err(error) => {
                                 failure = error.to_string();
                                 break;
@@ -624,5 +628,61 @@ mod tests {
         let started = Instant::now();
         drop(worker);
         assert!(started.elapsed() < Duration::from_millis(200));
+    }
+
+    #[test]
+    fn tui_subscription_accepts_stored_v1_replay_and_caught_up_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let frames = [
+                ServerFrame::Response {
+                    protocol_version: factory_core::PROTOCOL_VERSION,
+                    response: LocalResponse::Subscribed {
+                        after_sequence: 0,
+                        replay_through: 1,
+                    },
+                },
+                ServerFrame::Event {
+                    protocol_version: factory_core::PROTOCOL_VERSION,
+                    event: factory_core::EventEnvelope {
+                        protocol_version: 1,
+                        sequence: 1,
+                        occurred_at_ms: 10,
+                        event: factory_core::FactoryEvent::AutoModeChanged { enabled: true },
+                    },
+                },
+                ServerFrame::Response {
+                    protocol_version: factory_core::PROTOCOL_VERSION,
+                    response: LocalResponse::CaughtUp { sequence: 1 },
+                },
+            ];
+            for frame in frames {
+                serde_json::to_writer(&mut stream, &frame).unwrap();
+                stream.write_all(b"\n").unwrap();
+            }
+        });
+
+        let mut subscription = Client::new(&socket).subscribe(0).unwrap();
+        assert!(subscription_message(subscription.next().unwrap().unwrap()).is_none());
+        assert!(matches!(
+            subscription_message(subscription.next().unwrap().unwrap()),
+            Some(NetMsg::Event(factory_core::EventEnvelope {
+                protocol_version: 1,
+                sequence: 1,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            subscription_message(subscription.next().unwrap().unwrap()),
+            Some(NetMsg::CaughtUp)
+        ));
+        server.join().unwrap();
     }
 }
