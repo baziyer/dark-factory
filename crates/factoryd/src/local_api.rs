@@ -2407,7 +2407,7 @@ mod worktree_status_tests {
 #[cfg(test)]
 mod fleet_status_scope_tests {
     use super::*;
-    use factory_core::{AgentRole, ProjectSnapshot, TaskSnapshot, TaskStatus};
+    use factory_core::{AgentRole, ProjectSnapshot, TaskId, TaskSnapshot, TaskStatus};
 
     fn rows(project: &str, task: &str, reason: &str) -> crate::store::ProjectStatusRows {
         let project_id = ProjectId::try_from(project).unwrap();
