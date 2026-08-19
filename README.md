@@ -192,6 +192,7 @@ guide](docs/development/WORKFLOW.md#release-and-update) for rollback details.
 - [Provider setup and behavior](docs/providers.md)
 - [Architecture and safety rules](ARCHITECTURE.md)
 - [External integrations](docs/webhooks.md)
+- [GitHub App identity preparation](docs/github-app.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
 

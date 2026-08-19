@@ -1,0 +1,29 @@
+{
+  "name": "Dark Factory",
+  "url": "https://github.com/baziyer/dark-factory",
+  "description": "Least-privilege issue intake and release-readiness identity for Dark Factory.",
+  "public": false,
+  "request_oauth_on_install": false,
+  "default_permissions": {
+    "actions": "read",
+    "checks": "write",
+    "contents": "read",
+    "issues": "write",
+    "metadata": "read",
+    "pull_requests": "read",
+    "statuses": "read"
+  },
+  "default_events": [
+    "check_run",
+    "check_suite",
+    "installation",
+    "installation_target",
+    "issue_comment",
+    "issues",
+    "pull_request",
+    "pull_request_review",
+    "release",
+    "repository",
+    "workflow_run"
+  ]
+}
