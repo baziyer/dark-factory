@@ -502,7 +502,7 @@ impl Board {
             && self
                 .pending_attention
                 .as_ref()
-                .is_some_and(|item| source_matches(item));
+                .is_some_and(source_matches);
         if matches {
             self.complete_attention_request();
         }
