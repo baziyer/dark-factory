@@ -383,7 +383,7 @@ impl Board {
     /// `None`, so `main.rs` can call this unconditionally on every loop tick — e.g. whenever
     /// WORKSHOP's selected task changes, or a `TaskChanged` event bumps the selected task's
     /// Folds a background `GetTask` fetch's result back into board state (see
-    /// `net::spawn_task_detail_request`). Kept separate from `apply_response`'s generic
+    /// `net::spawn_task_detail_request`). Kept separate from `apply_operation_response`'s generic
     /// `NetMsg::OperationResult` path because a failed fetch needs `pending_detail` cleared for
     /// the *specific* task it was for, which a generic `LocalResponse::Error` (no request-echo)
     #[must_use]
@@ -1102,10 +1102,6 @@ impl Board {
             }
         }
         self.clamp_selection();
-    }
-
-    pub fn apply_response(&mut self, result: Result<LocalResponse, String>) {
-        self.apply_operation_response(0, LocalRequest::Health, result);
     }
 
     pub fn apply_operation_response(

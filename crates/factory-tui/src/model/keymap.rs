@@ -1705,9 +1705,13 @@ mod tests {
                 ..
             }
         ));
-        board.apply_response(Ok(LocalResponse::TerminalInputAccepted {
-            session_id: SessionId::try_from("session").unwrap(),
-        }));
+        board.apply_operation_response(
+            0,
+            LocalRequest::Health,
+            Ok(LocalResponse::TerminalInputAccepted {
+                session_id: SessionId::try_from("session").unwrap(),
+            }),
+        );
         assert_eq!(board.decision_items().len(), 1);
         assert!(matches!(
             board.handle_key(key(KeyCode::Char('2'))),
