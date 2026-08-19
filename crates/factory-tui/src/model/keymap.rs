@@ -884,10 +884,9 @@ impl Board {
         };
         match choice.action {
             factory_core::status::AttentionAction::RetryTask => {
-                let (Some(task_id), Some(project_id)) = (
-                    source.task_id.clone(),
-                    Some(source.project_id.clone()),
-                ) else {
+                let (Some(task_id), Some(project_id)) =
+                    (source.task_id.clone(), Some(source.project_id.clone()))
+                else {
                     self.set_status("retry choice has no exact task", StatusLevel::Error);
                     return Intent::Redraw;
                 };
@@ -1159,7 +1158,8 @@ impl Board {
                     .as_ref()
                     .map(|focus| focus.item.clone())
                     .filter(|source| {
-                        source.project_id == project_id && source.session_id.as_ref() == Some(&session_id)
+                        source.project_id == project_id
+                            && source.session_id.as_ref() == Some(&session_id)
                     })
                 {
                     self.begin_attention_request(&source);
