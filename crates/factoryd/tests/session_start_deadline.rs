@@ -426,6 +426,54 @@ async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
     }
 }
 
+/// A `Starting` event is durable session state, not proof that the runner's
+/// control socket has finished binding. Wait for that causal readiness signal
+/// while failing immediately if the runner exits before binding and bounding
+/// a wedged live process.
+async fn wait_for_runner_control(runtime_dir: &Path) {
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_runner = false;
+        loop {
+            if runner_control_ready(runtime_dir) {
+                return;
+            }
+            if runner_alive(runtime_dir) {
+                saw_runner = true;
+            } else if saw_runner {
+                panic!(
+                    "runner exited before binding its control socket: {}",
+                    runtime_dir.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "runner stayed alive but did not bind its control socket within 5s: {}",
+        runtime_dir.display()
+    );
+}
+
+/// A failed deadline is durable daemon state, but the runner's supervisor may
+/// still be reaping its child. Do not admit the next cycle until that process
+/// has actually exited; bound the barrier so a wedged teardown fails rather
+/// than allowing the test to hang.
+async fn wait_for_runner_exit(runtime_dir: &Path) {
+    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+        while runner_alive(runtime_dir) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        exited.is_ok(),
+        "runner did not exit within 5s after its session failed: {}",
+        runtime_dir.display()
+    );
+}
+
 // --- Harness: a real daemon (execution + local_api), in-process ---------
 
 struct Harness {
@@ -435,7 +483,6 @@ struct Harness {
     shutdown_tx: oneshot::Sender<()>,
     socket: PathBuf,
     home: tempfile::TempDir,
-    session_start_deadline: Duration,
 }
 
 impl Harness {
@@ -471,7 +518,6 @@ impl Harness {
             shutdown_tx,
             socket,
             home,
-            session_start_deadline,
         }
     }
 
@@ -482,23 +528,6 @@ impl Harness {
     fn wake(&self, agent_id: &str) {
         self.execution
             .wake(project_id(), AgentId::try_from(agent_id).unwrap());
-    }
-
-    async fn wake_when_start_deadline_is_due(&self, session: &SessionSnapshot) {
-        let deadline_ms = session.started_at_ms.saturating_add(
-            i64::try_from(self.session_start_deadline.as_millis()).unwrap_or(i64::MAX),
-        );
-        let now_ms = i64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis(),
-        )
-        .unwrap();
-        if deadline_ms > now_ms {
-            tokio::time::sleep(Duration::from_millis((deadline_ms - now_ms) as u64)).await;
-        }
-        self.wake(session.agent_id.as_str());
     }
 
     async fn stop(self) {
@@ -683,7 +712,10 @@ async fn a_session_that_already_sent_session_start_is_left_alone() {
 /// the way back in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() {
-    let harness = Harness::start(Duration::from_millis(120)).await;
+    // A zero test deadline is the causal test-clock boundary: each explicit
+    // wake after a `Starting` event is immediately due, so no wall-clock
+    // startup or five-second readiness window can race the assertion.
+    let harness = Harness::start(Duration::ZERO).await;
     let socket = harness.socket.clone();
     create_project(&socket, &harness.home.path().join("repo")).await;
     create_shell_agent(
@@ -719,11 +751,8 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
         seen.push(spawned.id.clone());
 
         let runtime_dir = harness.runtime_dir(spawned.id.as_str());
-        wait_until(Duration::from_secs(5), || {
-            runner_control_ready(&runtime_dir)
-        })
-        .await;
-        harness.wake_when_start_deadline_is_due(&spawned).await;
+        wait_for_runner_control(&runtime_dir).await;
+        harness.wake(spawned.agent_id.as_str());
         let failed = next_event(&mut events, "that session's deadline failure", |event| {
             let FactoryEvent::SessionChanged { session } = event else {
                 return None;
@@ -738,7 +767,7 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
                 .is_some_and(|reason| reason.contains("SessionStart hook not received")),
             "unexpected deadline failure: {failed:?}"
         );
-        wait_until(Duration::from_secs(5), || !runner_alive(&runtime_dir)).await;
+        wait_for_runner_exit(&runtime_dir).await;
     }
 
     let paused = next_event(
@@ -789,10 +818,7 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
     for session in sessions_for_agent(&socket, "stuck").await {
         if session.state.is_live() {
             let runtime_dir = harness.runtime_dir(session.id.as_str());
-            wait_until(Duration::from_secs(5), || {
-                runner_control_ready(&runtime_dir)
-            })
-            .await;
+            wait_for_runner_control(&runtime_dir).await;
             stop_session(&socket, session.id.clone()).await;
             wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
         }
