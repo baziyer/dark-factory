@@ -5,11 +5,13 @@
 
 use std::{
     io::{Read, Write},
+    sync::mpsc::{self, RecvTimeoutError, Sender},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
+    time::Duration,
 };
 
 use factory_core::{
@@ -67,18 +69,40 @@ pub fn run(
             mode,
         })
         .map_err(|error| error.to_string())?;
+    let cancellation = frames.cancellation();
 
     let raw_mode = RawMode::enable().map_err(|error| error.to_string())?;
 
-    let failed = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let output_thread = spawn_output_thread(frames, Arc::clone(&failed), Arc::clone(&failure));
+    let output_thread = spawn_output_thread(frames, Arc::clone(&done), Arc::clone(&failure));
 
     send_resize(client, &project_id, &session_id);
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
-    let exit_code = forward_stdin(client, &project_id, &session_id, &failed);
+    let (input_tx, input_rx) = mpsc::channel();
+    spawn_stdin_reader(input_tx);
+    let exit_code = loop {
+        if done.load(Ordering::SeqCst) {
+            break if failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+            {
+                2
+            } else {
+                0
+            };
+        }
+        match input_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(StdinEvent::Bytes(bytes)) => send_input(client, &project_id, &session_id, &bytes),
+            Ok(StdinEvent::Detach) => break 0,
+            Ok(StdinEvent::Eof) | Err(RecvTimeoutError::Disconnected) => break 0,
+            Err(RecvTimeoutError::Timeout) => continue,
+        }
+    };
 
+    cancellation.cancel();
     drop(raw_mode);
     let _ = output_thread.join();
     if let Some(message) = failure
@@ -98,12 +122,25 @@ fn spawn_output_thread(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
+        let mut next_offset = None;
         for frame in frames {
             match frame {
-                Ok(ServerFrame::TerminalOutput { bytes, .. }) => {
+                Ok(ServerFrame::TerminalOutput { offset, bytes, .. }) => {
                     match decode_terminal_bytes(&bytes) {
                         Ok(raw) => {
+                            if next_offset.is_some_and(|expected| expected != offset) {
+                                set_failure(
+                                    &failure,
+                                    format!("terminal output continuity broke at offset {offset}"),
+                                );
+                                break;
+                            }
+                            next_offset = Some(offset.saturating_add(raw.len() as u64));
                             if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
+                                set_failure(
+                                    &failure,
+                                    "terminal output stream could not be written".into(),
+                                );
                                 break;
                             }
                         }
@@ -120,9 +157,30 @@ fn spawn_output_thread(
                     set_failure(&failure, message);
                     break;
                 }
+                Ok(ServerFrame::TerminalAttachReady {
+                    initial_state,
+                    start_offset,
+                    ..
+                }) => {
+                    next_offset = Some(start_offset);
+                    match decode_terminal_bytes(&initial_state) {
+                        Ok(raw) => {
+                            if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
+                                set_failure(&failure, "terminal state could not be written".into());
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            set_failure(&failure, "daemon sent unreadable terminal state".into());
+                            break;
+                        }
+                    }
+                }
                 Ok(ServerFrame::TerminalAttachGap {
                     generation,
+                    base_generation,
                     base_offset,
+                    start_offset,
                     end_offset,
                     requested_offset,
                     reason,
@@ -131,12 +189,11 @@ fn spawn_output_thread(
                     set_failure(
                         &failure,
                         format!(
-                            "attach cursor unavailable: {reason}; retry from retained offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation})"
+                            "attach cursor unavailable: {reason}; retry from generation {base_generation} offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation}, replay start {start_offset})"
                         ),
                     );
                     break;
                 }
-                Ok(ServerFrame::TerminalAttachReady { .. }) => {}
                 Ok(_) => {}
                 Err(error) => {
                     set_failure(&failure, error.to_string());
@@ -148,24 +205,45 @@ fn spawn_output_thread(
     })
 }
 
+enum StdinEvent {
+    Bytes(Vec<u8>),
+    Detach,
+    Eof,
+}
+
+fn spawn_stdin_reader(sender: Sender<StdinEvent>) {
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
+        loop {
+            match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => {
+                    let _ = sender.send(StdinEvent::Eof);
+                    return;
+                }
+                Ok(read) => {
+                    let chunk = &buffer[..read];
+                    if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
+                        if detach_at > 0 {
+                            let _ = sender.send(StdinEvent::Bytes(chunk[..detach_at].to_vec()));
+                        }
+                        let _ = sender.send(StdinEvent::Detach);
+                        return;
+                    }
+                    if sender.send(StdinEvent::Bytes(chunk.to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {
     *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
 }
 
-/// Reads stdin and forwards it as `TerminalInput` until EOF, `Ctrl-]`, or the
-/// output side reports failure. Returns the process exit code.
-fn forward_stdin(
-    client: &Client,
-    project_id: &ProjectId,
-    session_id: &SessionId,
-    failed: &AtomicBool,
-) -> i32 {
-    let mut stdin = std::io::stdin();
-    forward_stdin_from(&mut stdin, failed, |bytes| {
-        send_input(client, project_id, session_id, bytes);
-    })
-}
-
+#[cfg(test)]
 fn forward_stdin_from(
     reader: &mut impl Read,
     failed: &AtomicBool,

@@ -353,14 +353,19 @@ daemon cannot satisfy managed health.
 
 `factoryctl attach` and the TUI use the daemon's shared attach operation. A
 normal attach requests a bounded 256 KiB tail, keeping a long-running session
-useful without replaying its entire retained log. Use `--full-history` (or
-`--since-offset 0`) when a complete currently retained replay is intentional.
-A resume cursor may include `--generation N`; the runner owns generation and
-offset negotiation and returns the valid current range when compaction,
-rollover, or an oversized cursor makes the request unavailable. Clients never
-inspect `terminal.log` directly. PTY bytes stay opaque and bounded on every
-wire frame, and closing the CLI/TUI attach socket (including its detach escape)
-does not stop the session.
+useful without replaying its entire retained log. The daemon first negotiates
+the runner capability; an old preserved runner is never allowed to turn this
+request into an unbounded legacy replay. Use `--full-history` (or
+`--since-offset 0`) when a complete currently retained replay is intentional;
+that explicit mode can use the old runner's equivalent during a rolling
+upgrade. A resume cursor may include `--generation N`; Ready and gap frames
+carry the owning base generation plus exact byte start/end bounds so a client
+can distinguish a retained cursor from compaction lag. Clients never inspect
+`terminal.log` directly: the runner snapshots immutable file handles and
+replays a reset-prefixed suffix beginning at a safe UTF-8/ANSI boundary. PTY
+bytes stay opaque and bounded on every wire frame. Ctrl-] closes only the
+attach stream, Ctrl-C is forwarded as ordinary PTY input, and output/socket
+failure wakes blocked CLI input; detaching does not stop the session.
 
 ## Task list for whoever picks this up
 
