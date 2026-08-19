@@ -14,8 +14,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # One job, one required status check ("checks"). It runs the exact same
-  # gate as `./scripts/local-ci.sh` — nothing is re-implemented here.
+  # The macOS job is the release-compatible source gate. Linux uses the same
+  # shared Rust source-gate seam with an explicit source-only mode; macOS
+  # release/publisher/package fixtures stay macOS-only until #142/#143.
   #
   # `runs-on` below is a policy, not a mechanism: a pull request runs the
   # workflow file it carries, so this expression only governs a PR that
@@ -67,7 +68,7 @@ jobs:
       - name: Install the pinned toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
 
-      - name: Run the gate
+      - name: Run the macOS source gate
         run: ./scripts/local-ci.sh
 
       - name: Publish bounded workflow summary
@@ -98,7 +99,7 @@ jobs:
 
   # Ubuntu is the source-contributor preview gate. It keeps the macOS
   # compatibility gate above intact while making the Linux claim explicit:
-  # x86-64 source builds, the full deterministic suite, and the public
+  # x86-64 source builds, the shared deterministic Rust suite, and the public
   # factoryd/factoryctl/factory-tui shell smoke all run on Ubuntu.
   linux:
     runs-on: ubuntu-24.04
@@ -127,7 +128,13 @@ jobs:
         run: cargo +1.88.0 build --locked --workspace
 
       - name: Run the Linux authoritative gate
-        run: ./scripts/local-ci.sh
+        run: ./scripts/local-ci.sh --linux-source
+
+      - name: Verify source-gate mode boundary
+        run: ./scripts/test-local-ci-mode.sh
 
       - name: Run the source contributor smoke
         run: ./scripts/linux-contributor-smoke.sh
+
+      - name: Verify interrupted smoke teardown
+        run: ./scripts/test-linux-contributor-smoke.sh
