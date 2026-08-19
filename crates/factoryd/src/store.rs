@@ -1513,6 +1513,8 @@ impl Store {
                     Some(
                         ProviderNotificationKind::PermissionPrompt
                             | ProviderNotificationKind::ElicitationDialog
+                            | ProviderNotificationKind::ElicitationUrlDialog
+                            | ProviderNotificationKind::AgentNeedsInput
                     )
                 ) {
                     state = SessionState::WaitingForInput;
@@ -6080,6 +6082,21 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         ))?;
         transaction.pragma_update(None, "user_version", 27)?;
         transaction.commit()?;
+        current = 27;
+    }
+    if current == 27 {
+        // The rebuild drops the sessions parent of populated child tables;
+        // disable foreign-key enforcement for the transaction and verify the
+        // restored graph before returning to normal operation.
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0028_widen_session_notification_kind.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 28)?;
+        transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
 }
@@ -6447,10 +6464,13 @@ const fn provider_notification_kind_value(value: ProviderNotificationKind) -> &'
     match value {
         ProviderNotificationKind::PermissionPrompt => "permission_prompt",
         ProviderNotificationKind::ElicitationDialog => "elicitation_dialog",
+        ProviderNotificationKind::ElicitationUrlDialog => "elicitation_url_dialog",
+        ProviderNotificationKind::AgentNeedsInput => "agent_needs_input",
         ProviderNotificationKind::IdlePrompt => "idle_prompt",
         ProviderNotificationKind::AuthSuccess => "auth_success",
         ProviderNotificationKind::ElicitationComplete => "elicitation_complete",
         ProviderNotificationKind::ElicitationResponse => "elicitation_response",
+        ProviderNotificationKind::AgentCompleted => "agent_completed",
     }
 }
 

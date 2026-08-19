@@ -183,18 +183,11 @@ impl SessionState {
 
 /// The provider hook event a `factoryctl hook` invocation was called for.
 ///
-/// `PermissionRequest` is Codex-only (added in Codex 0.147.0, alongside the
-/// existing events every provider wires): Codex fires it when its own
-/// approval prompt is about to block the session on the operator (a shell
-/// command, a file edit, ...), before that tool call's own `PreToolUse`.
-/// Claude Code has no equivalent event name — its permission prompts
-/// already surface through `Notification` — so `PermissionRequest` is
-/// wired only into the Codex provider's generated hooks
-/// (`providers::codex::hooks_block_toml`), not the shared
-/// `providers::hooks::HOOK_EVENTS` both providers iterate. Either way the
-/// daemon only observes `PermissionRequest`; auto mode avoids the native
-/// prompt, while the separate `PreToolUse` hook is where the daemon answers
-/// its own allow/deny policy.
+/// `PermissionRequest` is the immediate provider approval hook. Current
+/// Claude and Codex configurations both emit it before a native approval
+/// prompt; the daemon observes it and never answers that provider prompt.
+/// The separate `PreToolUse` hook is where the daemon answers its own
+/// allow/deny policy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHookEvent {
@@ -217,10 +210,13 @@ pub enum ProviderHookEvent {
 pub enum ProviderNotificationKind {
     PermissionPrompt,
     ElicitationDialog,
+    ElicitationUrlDialog,
+    AgentNeedsInput,
     IdlePrompt,
     AuthSuccess,
     ElicitationComplete,
     ElicitationResponse,
+    AgentCompleted,
 }
 
 impl ProviderHookEvent {

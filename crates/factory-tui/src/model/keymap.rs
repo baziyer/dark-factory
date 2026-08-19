@@ -1673,7 +1673,14 @@ mod tests {
             sequence: 12,
             occurred_at_ms: 3,
             event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::Working),
+                session: {
+                    let mut session =
+                        session("session", "alice", "proj", SessionState::WaitingForInput);
+                    session.last_hook_event =
+                        Some(factory_core::ProviderHookEvent::PermissionRequest);
+                    session.wait_reason = Some("approve command".into());
+                    session
+                },
             },
         });
         assert_eq!(
@@ -1681,9 +1688,53 @@ mod tests {
                 .sessions
                 .get(&SessionId::try_from("session").unwrap())
                 .map(|session| session.state),
-            Some(SessionState::Working)
+            Some(SessionState::WaitingForInput)
         );
-        assert!(board.attention.is_empty());
+        assert_eq!(board.attention_items().len(), 1);
+    }
+
+    #[test]
+    fn same_sequence_event_then_fleet_status_restores_one_actionable_row() {
+        let mut board = board();
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 12,
+            occurred_at_ms: 2,
+            event: factory_core::FactoryEvent::SessionChanged {
+                session: {
+                    let mut session =
+                        session("session", "alice", "proj", SessionState::WaitingForInput);
+                    session.last_hook_event =
+                        Some(factory_core::ProviderHookEvent::PermissionRequest);
+                    session.wait_reason = Some("approve command".into());
+                    session
+                },
+            },
+        });
+        assert_eq!(
+            board.sessions[&SessionId::try_from("session").unwrap()].state,
+            SessionState::WaitingForInput
+        );
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 3,
+            event_sequence: 12,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![attention(
+                AttentionReasonKind::ProviderPermission,
+                Some("alice"),
+                None,
+                Some("session"),
+                1,
+            )],
+        });
+        assert_eq!(board.attention_items().len(), 1);
+        assert_eq!(
+            board.attention_items()[0].reason.kind,
+            AttentionReasonKind::ProviderPermission
+        );
     }
 
     #[test]
