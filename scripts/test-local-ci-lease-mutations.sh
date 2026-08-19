@@ -98,7 +98,10 @@ kill "$holder_pid" 2>/dev/null || true
 wait "$holder_pid" 2>/dev/null || true
 
 # Mutation 2: remove the inherited owner marker. The nested contract must
-# still produce its explicit refusal rather than a generic lock wait.
+# still produce its explicit refusal rather than a generic lock wait. The
+# holder invokes the nested command while it still owns the lease, then waits
+# for an explicit release handshake. This makes the marker observation causal
+# instead of relying on a fixed holder sleep.
 nested_repository="$temporary/nested-repository"
 nested_worktree="$temporary/nested-worktree"
 git init -q "$nested_repository"
@@ -112,32 +115,48 @@ mkdir -p "$nested_worktree/scripts"
 cp "$repository_root/scripts/with-local-ci-lease.sh" "$nested_worktree/scripts/with-local-ci-lease.sh"
 cp "$repository_root/scripts/local-ci-lease.sh" "$nested_worktree/scripts/local-ci-lease.sh"
 chmod +x "$nested_worktree/scripts/with-local-ci-lease.sh" "$nested_worktree/scripts/local-ci-lease.sh"
-sed -i '' 's/local-ci: nested lease invocation refused/local-ci: nested lease mutation/' \
-    "$nested_worktree/scripts/local-ci-lease.sh"
+owner_marker_message='local-ci: nested lease invocation refused; use the existing owner'
+owner_marker_matches=$(grep -F -c "$owner_marker_message" "$nested_worktree/scripts/local-ci-lease.sh" || true)
+[ "$owner_marker_matches" -eq 1 ] || fail "expected exactly one inherited owner-marker branch"
+awk '
+    /local-ci: nested lease invocation refused; use the existing owner/ {
+        print "            if [ -n \"${DARK_FACTORY_LOCAL_CI_TEST_OWNER_MARKER-}\" ]; then"
+        print "                : >\"$DARK_FACTORY_LOCAL_CI_TEST_OWNER_MARKER\""
+        print "            fi"
+        sub(/local-ci: nested lease invocation refused/, "local-ci: nested lease mutation")
+    }
+    { print }
+' "$nested_worktree/scripts/local-ci-lease.sh" >"$nested_worktree/scripts/local-ci-lease.sh.mutated"
+mv "$nested_worktree/scripts/local-ci-lease.sh.mutated" "$nested_worktree/scripts/local-ci-lease.sh"
 held="$temporary/nested-held"
+nested_marker_reached="$temporary/nested-marker-reached"
+nested_release="$temporary/nested-release"
 nested_stderr="$temporary/nested.stderr"
+nested_holder_command="$temporary/nested-holder.sh"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    ': >"$1"' \
+    'if DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true 2>"$2"; then exit 1; fi' \
+    'while [ ! -f "$3" ]; do sleep 0.05; done' \
+    >"$nested_holder_command"
+chmod +x "$nested_holder_command"
 (
+    export DARK_FACTORY_LOCAL_CI_TEST_OWNER_MARKER="$nested_marker_reached"
     cd "$nested_worktree"
-    ./scripts/with-local-ci-lease.sh "$holder_command" "$held"
+    ./scripts/with-local-ci-lease.sh "$nested_holder_command" "$held" "$nested_stderr" "$nested_release"
 ) &
 holder_pid=$!
 background_pids="$background_pids $holder_pid"
 wait_for_file "$held"
-nested_command="$temporary/nested.sh"
-printf '%s\n' '#!/bin/sh' 'if DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true 2>"$1"; then exit 1; fi' >"$nested_command"
-chmod +x "$nested_command"
-if (
-    cd "$nested_worktree"
-    ./scripts/with-local-ci-lease.sh "$nested_command" "$nested_stderr"
-); then
-    :
-else
-    fail "owner-marker mutation made the outer command fail"
-fi
-if grep -Fq 'nested lease invocation refused' "$nested_stderr"; then
+wait_for_file "$nested_marker_reached"
+kill -0 "$holder_pid" 2>/dev/null || fail "nested marker was reached only after holder release"
+if grep -Fq "$owner_marker_message" "$nested_stderr"; then
     fail "owner-marker mutation was not exposed by the nested regression"
 fi
-kill "$holder_pid" 2>/dev/null || true
-wait "$holder_pid" 2>/dev/null || true
+grep -Fq 'local-ci: nested lease mutation' "$nested_stderr" \
+    || fail "nested mutation did not report the mutated owner-marker branch"
+: >"$nested_release"
+wait "$holder_pid" || fail "owner-marker mutation holder failed"
 
 echo "local-ci lease mutation tests passed"
