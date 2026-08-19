@@ -948,8 +948,7 @@ async fn handle_request_as(
                 .await?;
             let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
             let at_capacity = live_sessions >= live_session_cap;
-            let (mut projects, attention) =
-                scoped_fleet_status(principal, projects, at_capacity);
+            let (mut projects, attention) = scoped_fleet_status(principal, projects, at_capacity);
             populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
@@ -2457,9 +2456,15 @@ mod fleet_status_scope_tests {
         );
 
         assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].project.id, ProjectId::try_from("project-a").unwrap());
+        assert_eq!(
+            projects[0].project.id,
+            ProjectId::try_from("project-a").unwrap()
+        );
         assert_eq!(attention.len(), 1);
-        assert_eq!(attention[0].project_id, ProjectId::try_from("project-a").unwrap());
+        assert_eq!(
+            attention[0].project_id,
+            ProjectId::try_from("project-a").unwrap()
+        );
         assert_eq!(attention[0].reason.summary, "visible reason");
     }
 }
