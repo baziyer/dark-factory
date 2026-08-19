@@ -6,6 +6,14 @@ set -eu
 unset DARK_FACTORY_LOCAL_CI_LEASE_HELD
 
 repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+
+# PR #210's additional summary-contract phase remains inside the one
+# local-ci.sh lease entry point; the workflow's always-summary is reporting
+# only and cannot acquire, split, or release this lease.
+grep -F 'exec "$script_dir/with-local-ci-lease.sh" "$script_dir/local-ci.sh"' \
+    "$repository_root/scripts/local-ci.sh" >/dev/null
+grep -F './scripts/test-github-step-summary.sh' "$repository_root/scripts/local-ci.sh" >/dev/null
+
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-local-ci-lease-mutation.XXXXXX")
 background_pids=
 
@@ -54,7 +62,7 @@ chmod +x "$holder_command"
 # Mutation 1: remove the kernel lock from the holder. The regression must
 # observe the fail-fast waiter acquiring concurrently, proving the test would
 # catch the exclusion disappearing.
-sed 's/    lockf -k "$LOCAL_CI_LEASE_LOCK" sh -c/    sh -c/' \
+sed 's/        lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c/        sh -c/' \
     "$repository_root/scripts/local-ci-lease.sh" >"$worktree/scripts/local-ci-lease.sh"
 chmod +x "$worktree/scripts/local-ci-lease.sh"
 held="$temporary/held"

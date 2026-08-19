@@ -75,6 +75,17 @@ common_dir=$(git -C "$first" rev-parse --git-common-dir)
 lease_path="$common_dir/.dark-factory-local-ci"
 lock_path="$common_dir/.dark-factory-local-ci.lock"
 
+# The authority pathname is an atomic directory object, never a followable
+# regular-file or symlink pathname.
+outside_lock="$temporary/outside-lock"
+: >"$outside_lock"
+ln -s "$outside_lock" "$lock_path"
+if (cd "$first" && ./scripts/with-local-ci-lease.sh true) 2>"$temporary/initial-symlink.stderr"; then
+    fail "initial lock-object symlink was followed"
+fi
+grep -Fq 'unsafe lock object path' "$temporary/initial-symlink.stderr" || fail "initial symlink refusal was unexplained"
+rm -f "$lock_path"
+
 start_holder() {
     worktree=$1
     marker=$2
@@ -86,7 +97,8 @@ start_holder() {
         DARK_FACTORY_AGENT="$agent" DARK_FACTORY_TASK="$task" \
             ./scripts/with-local-ci-lease.sh "$holder_command" "$marker" "$seconds"
     ) &
-    background_pids="$background_pids $!"
+    last_holder_pid=$!
+    background_pids="$background_pids $last_holder_pid"
 }
 
 acquire_and_release() {
@@ -119,6 +131,36 @@ wait "$waiter_pid" || fail "waiter did not continue after the holder released"
 [ "$(wc -c <"$waiter_stderr" | tr -d ' ')" -le 2300 ] || fail "owner diagnostic was not bounded"
 grep -Fq "head=$head" "$waiter_stderr" || fail "owner head was not reported"
 ! grep -Fq SECRET "$waiter_stderr" || fail "hostile owner labels leaked"
+
+# Identifier punctuation is not an owner-record escape hatch.
+start_holder "$first" "$temporary/invalid-id-held" 2 'agent:token' 'task:token'
+wait_for_file "$temporary/invalid-id-held"
+invalid_id_stderr="$temporary/invalid-id.stderr"
+if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) \
+    2>"$invalid_id_stderr"; then
+    fail "invalid owner identifiers unexpectedly acquired"
+fi
+! grep -Fq 'agent:token' "$invalid_id_stderr" || fail "invalid agent identifier leaked"
+! grep -Fq 'task:token' "$invalid_id_stderr" || fail "invalid task identifier leaked"
+wait "$last_holder_pid"
+
+# A diagnostic record must be a regular file, never a symlink to arbitrary
+# readable content.
+forged_record="$temporary/forged-record"
+forged_owner_ref=.dark-factory-local-ci-owner.forged
+printf 'pid=7\nworktree=SECRET\nstarted_at=SECRET\nlock_identity=7:7\nhead=0123456789abcdef0123456789abcdef01234567\nsecret=DO_NOT_DISCLOSE\n' >"$forged_record"
+mkdir "$lock_path"
+: >"$lock_path/descriptor"
+ln -s "$forged_record" "$common_dir/$forged_owner_ref"
+ln -s "$forged_owner_ref" "$lease_path"
+forged_stderr="$temporary/forged-record.stderr"
+if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) 2>"$forged_stderr"; then
+    fail "symlinked owner record unexpectedly acquired"
+fi
+! grep -Fq 'DO_NOT_DISCLOSE' "$forged_stderr" || fail "symlinked owner record leaked content"
+! grep -Fq 'SECRET' "$forged_stderr" || fail "symlinked owner record leaked fields"
+rm -f "$lease_path" "$common_dir/$forged_owner_ref"
+rm -rf "$lock_path"
 
 # Fail-fast remains owner-aware.
 fail_fast_stderr="$temporary/fail-fast.stderr"
@@ -164,12 +206,16 @@ fi
 : >"$descendant_release"
 acquire_and_release "$second" "$temporary/descendant-recovered"
 
-# Two stale-recovery contenders cannot remove a new owner: both acquire the
-# kernel lock before cleaning the old diagnostic link.
+# Two stale-recovery contenders cannot remove a new owner: recovery is guarded
+# inside the lock object before cleaning the old diagnostic link.
 stale_record="$common_dir/.dark-factory-local-ci-owner.stale"
 stale_pid=999999
 while kill -0 "$stale_pid" 2>/dev/null; do stale_pid=$((stale_pid - 1)); done
-printf 'pid=%s\nworktree=%s\nstarted_at=stale\nhead=stale\n' "$stale_pid" "$first" >"$stale_record"
+mkdir "$lock_path"
+: >"$lock_path/descriptor"
+printf 'pid=%s\nworktree=%s\nstarted_at=stale\nlock_identity=%s\nhead=%s\n' \
+    "$stale_pid" "$first" "$(stat -f '%d:%i' "$lock_path")" \
+    0123456789abcdef0123456789abcdef01234567 >"$stale_record"
 ln -s "$(basename "$stale_record")" "$lease_path"
 start_holder "$first" "$temporary/stale-first" 1
 start_holder "$second" "$temporary/stale-second" 1
@@ -178,7 +224,38 @@ wait_for_file "$temporary/stale-second"
 assert_absent "$stale_record"
 wait
 assert_absent "$lease_path"
-[ -f "$lock_path" ] || fail "persistent kernel lock file was removed"
+assert_absent "$lock_path"
+
+# Replacing a live object with a symlink or another directory must fail closed
+# rather than locking a different inode.
+replacement_held="$temporary/replacement-held"
+start_holder "$first" "$replacement_held" 2
+wait_for_file "$replacement_held"
+mv "$lock_path" "$temporary/original-lock-object"
+ln -s "$outside_lock" "$lock_path"
+if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) \
+    2>"$temporary/replacement-symlink.stderr"; then
+    fail "live lock-object symlink replacement was followed"
+fi
+grep -Fq 'unsafe lock object path' "$temporary/replacement-symlink.stderr" || fail "live symlink replacement refusal was unexplained"
+rm -f "$lock_path"
+wait
+rm -rf "$temporary/original-lock-object"
+
+replacement_held="$temporary/replacement-directory-held"
+start_holder "$first" "$replacement_held" 2
+wait_for_file "$replacement_held"
+mv "$lock_path" "$temporary/original-lock-object"
+mkdir "$lock_path"
+: >"$lock_path/descriptor"
+if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) \
+    2>"$temporary/replacement-directory.stderr"; then
+    fail "live lock-object directory replacement split the lease"
+fi
+grep -Fq 'lock object replacement' "$temporary/replacement-directory.stderr" || fail "live directory replacement refusal was unexplained"
+rm -rf "$lock_path"
+wait
+rm -rf "$temporary/original-lock-object"
 
 # Malformed metadata is fail-closed rather than silently treated as stale.
 printf 'not an owner\n' >"$stale_record"
