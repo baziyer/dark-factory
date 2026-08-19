@@ -13,7 +13,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -35,6 +35,8 @@ struct FakeDaemon {
     attach_cancelled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
+    handler_threads: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    active_handlers: Arc<AtomicUsize>,
     _directory: tempfile::TempDir,
 }
 
@@ -48,11 +50,15 @@ impl FakeDaemon {
         let output_gate = Arc::new(AtomicBool::new(false));
         let attach_cancelled = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
+        let handler_threads = Arc::new(Mutex::new(Vec::new()));
+        let active_handlers = Arc::new(AtomicUsize::new(0));
         let (attach_ready_tx, attach_ready) = mpsc::channel();
         let thread_inputs = Arc::clone(&inputs);
         let thread_gate = Arc::clone(&output_gate);
         let thread_cancelled = Arc::clone(&attach_cancelled);
         let thread_stop = Arc::clone(&stop);
+        let thread_handler_threads = Arc::clone(&handler_threads);
+        let thread_active_handlers = Arc::clone(&active_handlers);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -61,9 +67,13 @@ impl FakeDaemon {
                         let gate = Arc::clone(&thread_gate);
                         let cancelled = Arc::clone(&thread_cancelled);
                         let ready = attach_ready_tx.clone();
-                        thread::spawn(move || {
+                        let active_handlers = Arc::clone(&thread_active_handlers);
+                        active_handlers.fetch_add(1, Ordering::AcqRel);
+                        let handler = thread::spawn(move || {
                             handle_connection(stream, inputs, gate, cancelled, ready);
+                            active_handlers.fetch_sub(1, Ordering::AcqRel);
                         });
+                        thread_handler_threads.lock().unwrap().push(handler);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -80,6 +90,8 @@ impl FakeDaemon {
             attach_cancelled,
             stop,
             thread: Some(thread),
+            handler_threads,
+            active_handlers,
             _directory: directory,
         }
     }
@@ -88,10 +100,37 @@ impl FakeDaemon {
         self.output_gate.store(true, Ordering::Release);
     }
 
-    fn wait_for_attach(&self) {
-        self.attach_ready
-            .recv_timeout(Duration::from_secs(5))
-            .expect("factoryctl never opened the attach stream");
+    fn wait_for_attach(&self, child: &mut Child) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match self.attach_ready.recv_timeout(Duration::from_millis(50)) {
+                Ok(()) => return,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("fake daemon stopped before factoryctl opened the attach stream")
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(status) = child.try_wait().unwrap() {
+                        let mut stderr = String::new();
+                        if let Some(stderr_pipe) = child.stderr.as_mut() {
+                            stderr_pipe.read_to_string(&mut stderr).unwrap();
+                        }
+                        panic!(
+                            "factoryctl exited before opening the attach stream: status={status:?}, stderr={stderr:?}"
+                        );
+                    }
+                    if Instant::now() >= deadline {
+                        let pid = child.id();
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!(
+                            "factoryctl remained running but never opened the attach stream (pid={pid})"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn inputs(&self) -> Vec<Vec<u8>> {
@@ -105,11 +144,26 @@ impl FakeDaemon {
 
 impl Drop for FakeDaemon {
     fn drop(&mut self) {
+        self.output_gate.store(true, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         let _ = UnixStream::connect(&self.socket);
         if let Some(thread) = self.thread.take() {
             thread.join().unwrap();
         }
+        let handlers = self
+            .handler_threads
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect::<Vec<_>>();
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+        assert_eq!(
+            self.active_handlers.load(Ordering::Acquire),
+            0,
+            "fake daemon leaked a connection handler"
+        );
     }
 }
 
@@ -241,7 +295,7 @@ fn wait_promptly(child: &mut Child) -> std::process::ExitStatus {
 fn executable_attach_ctrl_right_bracket_detaches_and_restores_raw_mode() {
     let daemon = FakeDaemon::start();
     let (mut child, mut input, before, master) = spawn_cli(&daemon, Stdio::null());
-    daemon.wait_for_attach();
+    daemon.wait_for_attach(&mut child);
     daemon.allow_output();
     input.write_all(b"before\x03after\x1dignored").unwrap();
     input.flush().unwrap();
@@ -260,7 +314,7 @@ fn executable_attach_ctrl_right_bracket_detaches_and_restores_raw_mode() {
 fn executable_attach_output_failure_cancels_reader_and_restores_raw_mode() {
     let daemon = FakeDaemon::start();
     let (mut child, _input, before, master) = spawn_cli(&daemon, Stdio::piped());
-    daemon.wait_for_attach();
+    daemon.wait_for_attach(&mut child);
     // Mutation proof: closing the only stdout reader makes the production
     // writer fail. The repaired lifecycle must wake the blocked input wait,
     // cancel the attach socket, join both workers, and let RawMode restore
@@ -287,4 +341,30 @@ fn executable_attach_output_failure_cancels_reader_and_restores_raw_mode() {
         before,
         "raw mode was not restored"
     );
+}
+
+#[test]
+fn executable_attach_repeated_start_attach_detach_has_no_handler_or_child_leak() {
+    for iteration in 0..8 {
+        let daemon = FakeDaemon::start();
+        let (mut child, mut input, before, master) = spawn_cli(&daemon, Stdio::null());
+        daemon.wait_for_attach(&mut child);
+        daemon.allow_output();
+        input
+            .write_all(format!("before-{iteration}\x03after\x1dignored").as_bytes())
+            .unwrap();
+        input.flush().unwrap();
+
+        let status = wait_promptly(&mut child);
+        assert!(status.success(), "detach returned {status:?}");
+        assert_eq!(
+            daemon.inputs(),
+            vec![format!("before-{iteration}\x03after").into_bytes()]
+        );
+        assert_eq!(
+            master.get_termios().map(|termios| format!("{termios:?}")),
+            before,
+            "raw mode was not restored on iteration {iteration}"
+        );
+    }
 }
