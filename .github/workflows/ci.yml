@@ -95,3 +95,39 @@ jobs:
               printf '%s\n' '- Links: workflow run summary'
             } >>"$GITHUB_STEP_SUMMARY"
           fi
+
+  # Ubuntu is the source-contributor preview gate. It keeps the macOS
+  # compatibility gate above intact while making the Linux claim explicit:
+  # x86-64 source builds, the full deterministic suite, and the public
+  # factoryd/factoryctl/factory-tui shell smoke all run on Ubuntu.
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out $GITHUB_SHA
+        run: |
+          set -euxo pipefail
+          rm -rf .git
+          git init
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --force --detach FETCH_HEAD
+          git clean -ffdx
+
+      - name: Verify Ubuntu x86-64 runner
+        run: |
+          set -euxo pipefail
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+
+      - name: Install the pinned toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
+
+      - name: Build the workspace
+        run: cargo +1.88.0 build --locked --workspace
+
+      - name: Run the Linux authoritative gate
+        run: ./scripts/local-ci.sh
+
+      - name: Run the source contributor smoke
+        run: ./scripts/linux-contributor-smoke.sh

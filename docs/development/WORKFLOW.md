@@ -104,6 +104,30 @@ the first `kickstart -k`/`bootout`/`update --install` after upgrading takes
 any live session with it — do that first restart while no session is live.
 Every restart after it (new daemon, new job) keeps sessions.
 
+### Ubuntu x86-64 contributor preview
+
+The Linux preview is source-only and deliberately narrow. On Ubuntu x86-64,
+use Rust 1.88 or later and run:
+
+```sh
+cargo +1.88.0 build --workspace
+./scripts/linux-contributor-smoke.sh
+```
+
+The smoke always creates a throwaway `DARK_FACTORY_HOME` and socket. It starts
+the source-built `factoryd`, checks socket mode and health with `factoryctl`,
+launches `factory-tui --version`, and completes a task through the
+deterministic shell provider. The full workspace suite supplies the deeper
+PTY attach/detach, task completion/blocking, process-group cleanup, and daemon
+restart-recovery evidence.
+
+This preview does not claim a Linux archive, installer, systemd integration,
+or real-provider support. Claude Code and Codex are explicitly **unverified on
+Linux** and no paid provider prompt is needed. macOS-only launchd fixtures are
+marked ignored on Linux with the concrete reason that launchd is unavailable;
+the shared daemon, queue, store, execution, and shell-provider tests remain
+authoritative on both platforms.
+
 ## CI and GitHub
 
 `.github/workflows/ci.yml` runs `./scripts/local-ci.sh` — nothing else —
