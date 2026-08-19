@@ -10,6 +10,7 @@ use factory_core::local::{
     MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
     ServerFrame,
 };
+use factory_core::runner::TerminalAttachMode;
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
 use uuid::Uuid;
@@ -651,10 +652,10 @@ Options:
   -h, --help                  Show this help";
 
 const ATTACH_HELP: &str =
-    "usage: factoryctl attach --project ID (--session ID | --agent ID) [--since-offset N]
+    "usage: factoryctl attach --project ID (--session ID | --agent ID) [--full-history | --since-offset N]
 
 Attach to a session's PTY: puts the local terminal in raw mode, replays
-retained output from --since-offset (default 0, i.e. from the start), then
+the latest bounded retained tail by default, then
 streams live output and forwards stdin as operator input. Resizes the
 remote PTY to match the local terminal on attach and on every SIGWINCH.
 Detach with Ctrl-] without affecting the session.
@@ -667,7 +668,9 @@ Required:
                                one of --session/--run/--agent is required)
 
 Options:
-  --since-offset N            Replay retained output from this byte offset (default 0)
+  --full-history              Replay all currently retained output
+  --since-offset N            Resume from an explicit retained byte offset
+  --generation N              Generation paired with --since-offset
   -h, --help                    Show this help";
 
 const SESSION_HELP: &str = "usage: factoryctl session <list|stop> [options]
@@ -823,7 +826,7 @@ enum CliCommand {
     Attach {
         project_id: String,
         target: AttachTarget,
-        since_offset: u64,
+        mode: TerminalAttachMode,
     },
     TaskRetry {
         project_id: String,
@@ -1051,10 +1054,10 @@ fn run() -> Result<i32, String> {
     if let CliCommand::Attach {
         project_id,
         target,
-        since_offset,
+        mode,
     } = command
     {
-        return attach::run(&client, &project_id, &target, since_offset);
+        return attach::run(&client, &project_id, &target, mode);
     }
     if let CliCommand::Hook { token_file, event } = command {
         return Ok(run_hook(&client, &token_file, event));
@@ -1876,13 +1879,35 @@ fn parse_attach(mut args: Vec<String>) -> Result<CliCommand, String> {
     };
     let since_offset = take_option(&mut args, "--since-offset")?
         .map(|value| parse_number(&value, "--since-offset"))
-        .transpose()?
-        .unwrap_or(0);
+        .transpose()?;
+    let generation = take_option(&mut args, "--generation")?
+        .map(|value| parse_number(&value, "--generation"))
+        .transpose()?;
+    let full_history = take_flag(&mut args, "--full-history")?;
+    if full_history && (since_offset.is_some() || generation.is_some()) {
+        return Err(
+            "--full-history may not be combined with --since-offset or --generation".into(),
+        );
+    }
+    if generation.is_some() && since_offset.is_none() {
+        return Err("--generation requires --since-offset".into());
+    }
+    let mode = if full_history {
+        TerminalAttachMode::FullHistory
+    } else if let Some(offset) = since_offset {
+        if offset == 0 && generation.is_none() {
+            TerminalAttachMode::FullHistory
+        } else {
+            TerminalAttachMode::Offset { generation, offset }
+        }
+    } else {
+        TerminalAttachMode::Tail
+    };
     require_empty(&args)?;
     Ok(CliCommand::Attach {
         project_id,
         target,
-        since_offset,
+        mode,
     })
 }
 
@@ -3406,7 +3431,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_parses_project_session_and_defaults_since_offset_to_zero() {
+    fn attach_defaults_to_a_bounded_tail_and_supports_explicit_history_or_cursor() {
         assert_eq!(
             parse_args(args(&[
                 "attach",
@@ -3421,9 +3446,57 @@ mod tests {
                 CliCommand::Attach {
                     project_id: "project-1".into(),
                     target: AttachTarget::Session("session-1".into()),
-                    since_offset: 0,
+                    mode: TerminalAttachMode::Tail,
                 }
             )
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--session",
+                "session-1",
+                "--full-history",
+            ]))
+            .unwrap()
+            .1,
+            CliCommand::Attach {
+                project_id: "project-1".into(),
+                target: AttachTarget::Session("session-1".into()),
+                mode: TerminalAttachMode::FullHistory,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--session",
+                "session-1",
+                "--since-offset",
+                "0",
+            ]))
+            .unwrap()
+            .1,
+            CliCommand::Attach {
+                project_id: "project-1".into(),
+                target: AttachTarget::Session("session-1".into()),
+                mode: TerminalAttachMode::FullHistory,
+            }
+        );
+        assert!(
+            parse_args(args(&[
+                "attach",
+                "--project",
+                "project-1",
+                "--session",
+                "session-1",
+                "--full-history",
+                "--since-offset",
+                "4",
+            ]))
+            .is_err()
         );
         assert_eq!(
             parse_args(args(&[
@@ -3441,16 +3514,19 @@ mod tests {
                 CliCommand::Attach {
                     project_id: "project-1".into(),
                     target: AttachTarget::Session("session-1".into()),
-                    since_offset: 4096,
+                    mode: TerminalAttachMode::Offset {
+                        generation: None,
+                        offset: 4096
+                    },
                 }
             )
         );
-        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
+        assert!(parse_args(args(&["attach", "--project", "project-1"])).is_err());
         assert!(
             request_for(CliCommand::Attach {
                 project_id: "project-1".into(),
                 target: AttachTarget::Session("session-1".into()),
-                since_offset: 0,
+                mode: TerminalAttachMode::Tail,
             })
             .is_err()
         );
@@ -3472,7 +3548,7 @@ mod tests {
                 CliCommand::Attach {
                     project_id: "project-1".into(),
                     target: AttachTarget::Agent("agent-1".into()),
-                    since_offset: 0,
+                    mode: TerminalAttachMode::Tail,
                 }
             )
         );
@@ -3507,7 +3583,7 @@ mod tests {
                 CliCommand::Attach {
                     project_id: "project-1".into(),
                     target: AttachTarget::Session("run-1".into()),
-                    since_offset: 0,
+                    mode: TerminalAttachMode::Tail,
                 }
             )
         );

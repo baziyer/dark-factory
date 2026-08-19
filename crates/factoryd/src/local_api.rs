@@ -23,7 +23,7 @@ use factory_core::{
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
-        RunnerEventEnvelope,
+        RunnerEventEnvelope, TerminalAttachMode,
     },
     status,
 };
@@ -445,6 +445,7 @@ async fn handle_connection(
         project_id,
         session_id,
         since_offset,
+        mode,
     } = request
     {
         let session_shutdown = shutdown.clone();
@@ -459,6 +460,7 @@ async fn handle_connection(
                 project_id,
                 session_id,
                 since_offset,
+                mode,
             ) => result,
         };
     }
@@ -523,6 +525,7 @@ async fn terminal_attach_session(
     project_id: ProjectId,
     session_id: SessionId,
     since_offset: u64,
+    mode: TerminalAttachMode,
 ) -> io::Result<()> {
     let (frame_tx, mut frame_rx) = mpsc::channel::<ServerFrame>(TERMINAL_FRAME_CHANNEL_CAPACITY);
     let mut attaches = JoinSet::new();
@@ -533,6 +536,7 @@ async fn terminal_attach_session(
         project_id,
         session_id,
         since_offset,
+        mode,
     );
 
     let mut payload = Vec::new();
@@ -547,7 +551,7 @@ async fn terminal_attach_session(
             result = read_next_line(&mut reader, &mut payload) => {
                 let Some(line) = result? else { return Ok(()); };
                 match parse_envelope(&line) {
-                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset }) => {
+                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset, mode }) => {
                         spawn_terminal_attach(
                             &mut attaches,
                             state.clone(),
@@ -555,6 +559,7 @@ async fn terminal_attach_session(
                             project_id,
                             session_id,
                             since_offset,
+                            mode,
                         );
                     }
                     Ok(_) => {
@@ -583,6 +588,7 @@ fn spawn_terminal_attach(
     project_id: ProjectId,
     session_id: SessionId,
     since_offset: u64,
+    mode: TerminalAttachMode,
 ) {
     attaches.spawn(async move {
         let lookup_project_id = project_id.clone();
@@ -612,7 +618,7 @@ fn spawn_terminal_attach(
             control_run_id,
             target.runner_instance_id,
         );
-        let mut subscription = match client.attach_terminal(since_offset).await {
+        let mut subscription = match client.attach_terminal(since_offset, mode).await {
             Ok(subscription) => subscription,
             Err(error) => {
                 let response = runner_control_failure(error, "attach terminal").into_response();
@@ -620,7 +626,21 @@ fn spawn_terminal_attach(
                 return;
             }
         };
-        if frame_tx
+        if let Some(info) = subscription.info() {
+            if frame_tx
+                .send(ServerFrame::TerminalAttachReady {
+                    protocol_version: PROTOCOL_VERSION,
+                    session_id: session_id.clone(),
+                    generation: info.generation,
+                    base_offset: info.base_offset,
+                    end_offset: info.end_offset,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+        } else if frame_tx
             .send(ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: session_id.clone(),
@@ -646,6 +666,29 @@ fn spawn_terminal_attach(
                     }
                 }
                 Err(error) => {
+                    if let RunnerClientError::TerminalAttachGap {
+                        generation,
+                        base_offset,
+                        end_offset,
+                        requested_generation,
+                        requested_offset,
+                        reason,
+                    } = error
+                    {
+                        let _ = frame_tx
+                            .send(ServerFrame::TerminalAttachGap {
+                                protocol_version: PROTOCOL_VERSION,
+                                session_id: session_id.clone(),
+                                generation,
+                                base_offset,
+                                end_offset,
+                                requested_generation,
+                                requested_offset,
+                                reason,
+                            })
+                            .await;
+                        return;
+                    }
                     let response = runner_control_failure(error, "attach terminal").into_response();
                     let _ = send_terminal_error(&frame_tx, response).await;
                     return;

@@ -6,7 +6,7 @@ use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
-        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode,
     },
 };
 use thiserror::Error;
@@ -158,16 +158,51 @@ impl RunnerClient {
     pub async fn attach_terminal(
         &self,
         since_offset: u64,
+        mode: TerminalAttachMode,
     ) -> Result<TerminalSubscription, RunnerClientError> {
         let mut reader = self
-            .request(RunnerRequest::AttachTerminal { since_offset })
+            .request(RunnerRequest::AttachTerminal { since_offset, mode })
             .await?;
-        let pending = match timeout(LEGACY_ATTACH_READY_TIMEOUT, reader.read_frame()).await {
+        let (info, pending) = match timeout(LEGACY_ATTACH_READY_TIMEOUT, reader.read_frame()).await
+        {
             Ok(result) => {
                 let frame = result?;
                 validate_protocol(frame.protocol_version())?;
                 match frame {
-                    RunnerFrame::TerminalOutput { offset, bytes, .. } => Some((offset, bytes)),
+                    RunnerFrame::TerminalOutput { offset, bytes, .. } => {
+                        (None, Some((offset, bytes)))
+                    }
+                    RunnerFrame::TerminalAttachReady {
+                        generation,
+                        base_offset,
+                        end_offset,
+                        ..
+                    } => (
+                        Some(TerminalAttachInfo {
+                            generation,
+                            base_offset,
+                            end_offset,
+                        }),
+                        None,
+                    ),
+                    RunnerFrame::TerminalAttachGap {
+                        generation,
+                        base_offset,
+                        end_offset,
+                        requested_generation,
+                        requested_offset,
+                        reason,
+                        ..
+                    } => {
+                        return Err(RunnerClientError::TerminalAttachGap {
+                            generation,
+                            base_offset,
+                            end_offset,
+                            requested_generation,
+                            requested_offset,
+                            reason,
+                        });
+                    }
                     RunnerFrame::Error { code, .. } => {
                         return Err(RunnerClientError::RunnerRejected { code });
                     }
@@ -176,9 +211,13 @@ impl RunnerClient {
             }
             // v1 runners had no empty-replay acknowledgement. A silent surviving
             // runner is still a valid attachment; retain its reader for later output.
-            Err(_) => None,
+            Err(_) => (None, None),
         };
-        Ok(TerminalSubscription { reader, pending })
+        Ok(TerminalSubscription {
+            reader,
+            info,
+            pending,
+        })
     }
 
     /// Writes operator input to a terminal-mode run's PTY. `bytes` is
@@ -276,10 +315,23 @@ impl fmt::Debug for RunnerStreamItem {
 /// to end: the daemon proxy forwards it opaquely without decoding.
 pub struct TerminalSubscription {
     reader: FrameReader,
+    info: Option<TerminalAttachInfo>,
     pending: Option<(u64, String)>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalAttachInfo {
+    pub generation: u64,
+    pub base_offset: u64,
+    pub end_offset: u64,
+}
+
 impl TerminalSubscription {
+    #[must_use]
+    pub const fn info(&self) -> Option<TerminalAttachInfo> {
+        self.info
+    }
+
     /// Returns the next chunk's byte-stream offset and base64-encoded bytes.
     pub async fn next_chunk(&mut self) -> Result<(u64, String), RunnerClientError> {
         if let Some(chunk) = self.pending.take() {
@@ -289,6 +341,25 @@ impl TerminalSubscription {
         validate_protocol(frame.protocol_version())?;
         match frame {
             RunnerFrame::TerminalOutput { offset, bytes, .. } => Ok((offset, bytes)),
+            RunnerFrame::TerminalAttachReady { .. } => Err(RunnerClientError::UnexpectedFrame {
+                expected: "terminal output",
+            }),
+            RunnerFrame::TerminalAttachGap {
+                generation,
+                base_offset,
+                end_offset,
+                requested_generation,
+                requested_offset,
+                reason,
+                ..
+            } => Err(RunnerClientError::TerminalAttachGap {
+                generation,
+                base_offset,
+                end_offset,
+                requested_generation,
+                requested_offset,
+                reason,
+            }),
             RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
             frame => Err(frame_error(frame)),
         }
@@ -451,6 +522,11 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
         RunnerFrame::TerminalOutput { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner command acknowledgement",
         },
+        RunnerFrame::TerminalAttachReady { .. } | RunnerFrame::TerminalAttachGap { .. } => {
+            RunnerClientError::UnexpectedFrame {
+                expected: "runner command acknowledgement",
+            }
+        }
     }
 }
 
@@ -551,6 +627,17 @@ pub enum RunnerClientError {
     UnexpectedFrame { expected: &'static str },
     #[error("runner rejected the request with {code:?}")]
     RunnerRejected { code: RunnerErrorCode },
+    #[error(
+        "terminal attach cursor is unavailable ({reason}); retained generation {generation}, offsets {base_offset}..{end_offset}"
+    )]
+    TerminalAttachGap {
+        generation: u64,
+        base_offset: u64,
+        end_offset: u64,
+        requested_generation: Option<u64>,
+        requested_offset: u64,
+        reason: String,
+    },
     #[error("runner terminal sequence {found} must be positive")]
     InvalidTerminalSequence { found: i64 },
     #[error("runner acknowledged a different command")]

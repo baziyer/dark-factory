@@ -264,7 +264,10 @@ fn terminal_mode_attaches_replays_and_streams_written_input() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     let mut reader = BufReader::new(stream);
     let mut collected = Vec::new();
@@ -334,7 +337,10 @@ fn silent_terminal_acknowledges_attach_before_first_input_reaches_child() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     let mut reader = BufReader::new(stream);
     let RunnerFrame::TerminalOutput { bytes, .. } = read_frame(&mut reader) else {
@@ -454,7 +460,10 @@ fn attach_terminal_and_terminal_input_are_rejected_on_a_non_terminal_run() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     match read_frame(&mut BufReader::new(stream)) {
         RunnerFrame::Error {
@@ -540,7 +549,10 @@ fn late_attach_replays_only_from_the_requested_offset() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     let mut reader = BufReader::new(stream);
     let mut collected = Vec::new();
@@ -563,7 +575,10 @@ fn late_attach_replays_only_from_the_requested_offset() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 5 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 5,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     let mut reader = BufReader::new(stream);
     let frame = read_frame(&mut reader);
@@ -608,7 +623,10 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     // Deliberately do not read: let output pile up faster than the bounded
     // per-subscriber buffer until the runner drops this connection.
@@ -636,7 +654,10 @@ fn a_slow_attached_subscriber_is_dropped_and_can_reattach_from_its_offset() {
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
-        RunnerRequest::AttachTerminal { since_offset: 0 },
+        RunnerRequest::AttachTerminal {
+            since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Legacy,
+        },
     );
     let frame = read_frame(&mut BufReader::new(stream));
     assert!(
