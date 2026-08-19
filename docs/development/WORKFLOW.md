@@ -220,9 +220,11 @@ them.
    checked out.
 2. **Update signal**: `factoryctl update` fetches that manifest (via
    `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
-   and prints JSON: `current` (the invoking/bootstrap binary), `active` (the
-   validated `bin/current` runtime, or null), `latest`, `update_available`,
-   and the platform `asset`. Availability compares `latest` with `active`
+   and prints concise human-readable lines naming the invoking/bootstrap
+   version, active `bin/current` runtime, latest release, and whether
+   `update --install` has work. Pass `factoryctl update --json` for the
+   machine-readable object (`current`, `active`, `latest`,
+   `update_available`, and the platform `asset`). Availability compares `latest` with `active`
    when installed, not with a newer Homebrew bootstrap. The manifest result
    is cached in `$DARK_FACTORY_HOME/update-check.json`;
    `factory-tui` reads the same cache and refetches at most hourly, in a
