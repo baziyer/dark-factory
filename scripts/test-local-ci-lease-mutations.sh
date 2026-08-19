@@ -56,14 +56,25 @@ cp "$repository_root/scripts/with-local-ci-lease.sh" "$worktree/scripts/with-loc
 chmod +x "$worktree/scripts/with-local-ci-lease.sh"
 
 holder_command="$temporary/holder.sh"
-printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' 'sleep 1' >"$holder_command"
+waiter_command="$temporary/waiter.sh"
+printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' 'sleep 10' >"$holder_command"
+printf '%s\n' '#!/bin/sh' 'set -eu' ': >"$1"' >"$waiter_command"
 chmod +x "$holder_command"
+chmod +x "$waiter_command"
 
 # Mutation 1: remove the kernel lock from the holder. The regression must
-# observe the fail-fast waiter acquiring concurrently, proving the test would
-# catch the exclusion disappearing.
-sed 's/        lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c/        sh -c/' \
-    "$repository_root/scripts/local-ci-lease.sh" >"$worktree/scripts/local-ci-lease.sh"
+# observe the waiter acquiring concurrently while the holder is
+# still alive, proving the test would catch the exclusion disappearing.
+production_lockf='exec lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c'
+lockf_matches=$(grep -F -c "$production_lockf" "$repository_root/scripts/local-ci-lease.sh" || true)
+[ "$lockf_matches" -eq 1 ] || fail "expected exactly one production lockf wrapper, found $lockf_matches"
+awk -v production_lockf="$production_lockf" '
+    (match_start = index($0, production_lockf)) {
+        $0 = substr($0, 1, match_start - 1) "sh -c" \
+            substr($0, match_start + length(production_lockf))
+    }
+    { print }
+' "$repository_root/scripts/local-ci-lease.sh" >"$worktree/scripts/local-ci-lease.sh"
 chmod +x "$worktree/scripts/local-ci-lease.sh"
 held="$temporary/held"
 (
@@ -73,26 +84,40 @@ held="$temporary/held"
 holder_pid=$!
 background_pids="$background_pids $holder_pid"
 wait_for_file "$held"
-if (
+mutation_waiter="$temporary/mutation-waiter"
+(
     cd "$worktree"
-    DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true
-); then
-    :
-else
-    fail "lock-removal mutation was not exposed by the exclusion regression"
-fi
+    ./scripts/with-local-ci-lease.sh "$waiter_command" "$mutation_waiter"
+) &
+waiter_pid=$!
+background_pids="$background_pids $waiter_pid"
+wait_for_file "$mutation_waiter"
+wait "$waiter_pid" || fail "lock-removal mutation waiter failed"
+kill -0 "$holder_pid" 2>/dev/null || fail "lock-removal mutation waiter did not overlap the holder"
 kill "$holder_pid" 2>/dev/null || true
 wait "$holder_pid" 2>/dev/null || true
 
 # Mutation 2: remove the inherited owner marker. The nested contract must
 # still produce its explicit refusal rather than a generic lock wait.
-cp "$repository_root/scripts/local-ci-lease.sh" "$worktree/scripts/local-ci-lease.sh"
+nested_repository="$temporary/nested-repository"
+nested_worktree="$temporary/nested-worktree"
+git init -q "$nested_repository"
+git -C "$nested_repository" config user.email test@example.invalid
+git -C "$nested_repository" config user.name Test
+printf 'nested mutation\n' >"$nested_repository/README"
+git -C "$nested_repository" add README
+git -C "$nested_repository" commit -qm initial
+git -C "$nested_repository" worktree add -q -b nested "$nested_worktree" HEAD
+mkdir -p "$nested_worktree/scripts"
+cp "$repository_root/scripts/with-local-ci-lease.sh" "$nested_worktree/scripts/with-local-ci-lease.sh"
+cp "$repository_root/scripts/local-ci-lease.sh" "$nested_worktree/scripts/local-ci-lease.sh"
+chmod +x "$nested_worktree/scripts/with-local-ci-lease.sh" "$nested_worktree/scripts/local-ci-lease.sh"
 sed -i '' 's/local-ci: nested lease invocation refused/local-ci: nested lease mutation/' \
-    "$worktree/scripts/local-ci-lease.sh"
+    "$nested_worktree/scripts/local-ci-lease.sh"
 held="$temporary/nested-held"
 nested_stderr="$temporary/nested.stderr"
 (
-    cd "$worktree"
+    cd "$nested_worktree"
     ./scripts/with-local-ci-lease.sh "$holder_command" "$held"
 ) &
 holder_pid=$!
@@ -102,7 +127,7 @@ nested_command="$temporary/nested.sh"
 printf '%s\n' '#!/bin/sh' 'if DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true 2>"$1"; then exit 1; fi' >"$nested_command"
 chmod +x "$nested_command"
 if (
-    cd "$worktree"
+    cd "$nested_worktree"
     ./scripts/with-local-ci-lease.sh "$nested_command" "$nested_stderr"
 ); then
     :
