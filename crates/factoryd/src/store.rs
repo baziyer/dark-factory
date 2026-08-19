@@ -2580,6 +2580,25 @@ impl Store {
             .and_then(|session| session.target_binding))
     }
 
+    pub(crate) fn open_run_task_for_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<TaskId>> {
+        self.connection
+            .query_row(
+                "SELECT task_id FROM runs
+                 WHERE session_id = ?1 AND ended_at_ms IS NULL
+                 ORDER BY started_at_ms DESC LIMIT 1",
+                params![session_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .map(|task_id| parse_id(task_id, 0))
+            .transpose()
+            .map_err(StoreError::from)
+    }
+
     // --- Task episodes (runs) ------------------------------------------
 
     /// Opens a task-episode inside a live session: the task moves
@@ -2636,6 +2655,37 @@ impl Store {
         )?;
         if has_open {
             return Err(StoreError::AgentUnavailable);
+        }
+        let competing_delivery: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM delivery_attempts
+                 WHERE session_id = ?1
+                   AND state IN ('in_flight', 'retryable')
+                   AND (?2 IS NULL OR id <> ?2)
+             )",
+            params![session_id.as_str(), delivery_attempt_id],
+            |row| row.get(0),
+        )?;
+        if competing_delivery {
+            return Err(StoreError::AgentUnavailable);
+        }
+        if let Some(attempt_id) = delivery_attempt_id {
+            let attempt_identity: Option<(String, Option<String>)> = transaction
+                .query_row(
+                    "SELECT session_id, task_id FROM delivery_attempts WHERE id = ?1",
+                    params![attempt_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if attempt_identity
+                .as_ref()
+                .is_none_or(|(attempt_session, attempt_task)| {
+                    attempt_session != session_id.as_str()
+                        || attempt_task.as_deref() != Some(task_id.as_str())
+                })
+            {
+                return Err(StoreError::InvalidExecutionMetadata);
+            }
         }
         let mut task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == session.project_id)
@@ -2758,19 +2808,6 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(existing) =
-            load_active_delivery_attempt(&transaction, &input.project_id, &input.agent_id)?
-        {
-            if existing.session_id == input.session_id {
-                return Ok(existing);
-            }
-            transaction.execute(
-                "UPDATE delivery_attempts
-                 SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
-                 WHERE id = ?2",
-                params![input.created_at_ms, existing.id],
-            )?;
-        }
         let session = load_session(&transaction, &input.session_id)?
             .filter(|session| {
                 session.project_id == input.project_id
@@ -2780,6 +2817,63 @@ impl Store {
             .ok_or(StoreError::SessionNotLive)?;
         if session.stop_requested_at_ms.is_some() {
             return Err(StoreError::SessionStopping);
+        }
+        let open_task_id: Option<String> = transaction
+            .query_row(
+                "SELECT task_id FROM runs
+                 WHERE session_id = ?1 AND ended_at_ms IS NULL
+                 ORDER BY started_at_ms DESC LIMIT 1",
+                params![input.session_id.as_str()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        if input
+            .task_id
+            .as_ref()
+            .zip(open_task_id.as_ref())
+            .is_some_and(|(candidate, open)| candidate.as_str() != open)
+        {
+            if let Some(existing) =
+                load_active_delivery_attempt(&transaction, &input.project_id, &input.agent_id)?
+            {
+                if existing.session_id == input.session_id {
+                    transaction.execute(
+                        "UPDATE delivery_attempts
+                         SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                         WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+                        params![input.created_at_ms, existing.id],
+                    )?;
+                    transaction.commit()?;
+                    return Err(StoreError::AgentUnavailable);
+                }
+            }
+            return Err(StoreError::AgentUnavailable);
+        }
+        if let Some(existing) =
+            load_active_delivery_attempt(&transaction, &input.project_id, &input.agent_id)?
+        {
+            if existing.session_id == input.session_id {
+                if existing.task_id != input.task_id
+                    || existing.task_incarnation_id != input.task_incarnation_id
+                {
+                    transaction.execute(
+                        "UPDATE delivery_attempts
+                         SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                         WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+                        params![input.created_at_ms, existing.id],
+                    )?;
+                    transaction.commit()?;
+                    return Err(StoreError::AgentUnavailable);
+                }
+                return Ok(existing);
+            }
+            transaction.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                 WHERE id = ?2",
+                params![input.created_at_ms, existing.id],
+            )?;
         }
         if let (Some(task_id), Some(incarnation_id)) = (&input.task_id, &input.task_incarnation_id)
         {
@@ -2908,13 +3002,39 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut attempt = load_delivery_attempt(&transaction, attempt_id)?;
+        let competing_task = attempt.as_ref().and_then(|attempt| attempt.task_id.clone());
+        let open_task_id: Option<String> = transaction
+            .query_row(
+                "SELECT task_id FROM runs
+                 WHERE session_id = (SELECT session_id FROM delivery_attempts WHERE id = ?1)
+                   AND ended_at_ms IS NULL
+                 ORDER BY started_at_ms DESC LIMIT 1",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if competing_task
+            .as_ref()
+            .zip(open_task_id.as_ref())
+            .is_some_and(|(candidate, open)| candidate.as_str() != open.as_str())
+        {
+            transaction.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                 WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+                params![now_ms, attempt_id],
+            )?;
+            transaction.commit()?;
+            return Ok(None);
+        }
         let changed = transaction.execute(
             "UPDATE delivery_attempts
              SET state = 'in_flight', next_attempt_at_ms = NULL, updated_at_ms = ?1
              WHERE id = ?2 AND state = 'retryable'",
             params![now_ms, attempt_id],
         )?;
-        let attempt = load_delivery_attempt(&transaction, attempt_id)?;
+        attempt = load_delivery_attempt(&transaction, attempt_id)?;
         transaction.commit()?;
         if changed == 1 {
             return Ok(attempt);
@@ -2935,6 +3055,19 @@ impl Store {
                 now_ms + DELIVERY_RETRY_DELAY_MS,
                 attempt_id
             ],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        Ok(())
+    }
+
+    pub fn reject_delivery_attempt(&mut self, attempt_id: &str, now_ms: i64) -> Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+            params![now_ms, attempt_id],
         )?;
         if changed == 0 {
             return Err(StoreError::InvalidExecutionMetadata);
@@ -7116,6 +7249,198 @@ mod tests {
         assert!(matches!(
             store.open_run_episode(&session_id, &task_id, 8_001),
             Err(StoreError::SessionStopping)
+        ));
+    }
+
+    #[test]
+    fn queued_successor_is_fenced_before_retry_or_delayed_ack_can_type_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
+        let task_a = TaskId::try_from("task-a").unwrap();
+        let task_b = TaskId::try_from("task-b").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: "/tmp/factory".to_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".to_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "44444444-4444-4444-8444-444444444444",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".to_owned(),
+                    runner_protocol_version: 1,
+                    target_binding: None,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                2,
+            )
+            .unwrap();
+        for (task_id, title) in [(&task_a, "A"), (&task_b, "B")] {
+            store
+                .create_task(
+                    NewTask {
+                        id: task_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_task_id: None,
+                        title: title.to_owned(),
+                        body: title.to_owned(),
+                        priority: 0,
+                    },
+                    3,
+                )
+                .unwrap();
+            store
+                .assign_task(&project_id, task_id, Some(&agent_id), 4)
+                .unwrap();
+        }
+
+        let (a_incarnation, a_prior_runs) =
+            store.task_delivery_marker(&session_id, &task_a).unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "attempt-a".to_owned(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: Some(task_a.clone()),
+                task_incarnation_id: Some(a_incarnation),
+                prior_run_count: Some(a_prior_runs),
+                message_ids: Vec::new(),
+                text: "task A".to_owned(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        store
+            .open_run_episode_with_delivery_attempt(
+                &session_id,
+                &task_a,
+                Some(&[]),
+                Some("attempt-a"),
+                6,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_task(&project_id, &task_b)
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Queued
+        );
+
+        let (b_incarnation, b_prior_runs) =
+            store.task_delivery_marker(&session_id, &task_b).unwrap();
+        assert!(matches!(
+            store.ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "attempt-b-admission".to_owned(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: Some(task_b.clone()),
+                task_incarnation_id: Some(b_incarnation.clone()),
+                prior_run_count: Some(b_prior_runs),
+                message_ids: Vec::new(),
+                text: "task B".to_owned(),
+                created_at_ms: 7,
+            }),
+            Err(StoreError::AgentUnavailable)
+        ));
+        assert_eq!(
+            store.delivery_attempt_state("attempt-b-admission").unwrap(),
+            None
+        );
+
+        // Simulate a queued attempt that was composed just before A won the
+        // serialized admission boundary. Recovery makes it retryable; a
+        // delayed ack/retry must still be fenced before the first provider
+        // byte, and the successor must remain queued exactly once.
+        store
+            .connection
+            .execute(
+                "INSERT INTO delivery_attempts (
+                    id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json, text,
+                    failure_count, next_attempt_at_ms, state, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '[]', ?8, 0, NULL, 'in_flight', ?9, ?9)",
+                params![
+                    "attempt-b-retry",
+                    project_id.as_str(),
+                    agent_id.as_str(),
+                    session_id.as_str(),
+                    task_b.as_str(),
+                    b_incarnation,
+                    i64::try_from(b_prior_runs).unwrap(),
+                    "task B",
+                    8,
+                ],
+            )
+            .unwrap();
+        store.recover_delivery_attempts(100).unwrap();
+        assert_eq!(
+            store
+                .begin_delivery_attempt("attempt-b-retry", 5_100)
+                .unwrap(),
+            None,
+            "a retry must be denied before PTY typing while A is open"
+        );
+        assert_eq!(
+            store.delivery_attempt_state("attempt-b-retry").unwrap(),
+            Some(DeliveryAttemptState::Cancelled)
+        );
+        assert_eq!(
+            store
+                .get_task(&project_id, &task_b)
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Queued
+        );
+        assert!(matches!(
+            store.open_run_episode(&session_id, &task_b, 5_101),
+            Err(StoreError::AgentUnavailable)
         ));
     }
 }

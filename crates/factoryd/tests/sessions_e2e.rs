@@ -97,6 +97,8 @@ impl Daemon {
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryd"));
         command
             .env("DARK_FACTORY_HOME", home)
+            .arg("--socket")
+            .arg(&socket)
             .arg("--runner")
             .arg(runner)
             .arg("--factoryctl")

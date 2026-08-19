@@ -395,6 +395,7 @@ impl Handle {
             .await?;
         ensure_task_target(&self.state, &task, task_binding.as_ref(), &session.worktree).await?;
         ensure_session_target(&self.state, &session.snapshot(), Some(&task_id)).await?;
+        ensure_no_open_task(&self.state, &session.id).await?;
         let text = compose_text(
             &self.config.guidance_root,
             &project_id,
@@ -1694,7 +1695,22 @@ async fn ensure_next_delivery_target(
     let task_id = state
         .with_store(move |store| store.next_deliverable(&project_id, &agent_id))
         .await?;
+    if task_id.is_some() {
+        ensure_no_open_task(state, &session.id).await?;
+    }
     ensure_session_target(state, session, task_id.as_ref()).await
+}
+
+async fn ensure_no_open_task(state: &DaemonState, session_id: &SessionId) -> Result<(), Error> {
+    let session_id = session_id.clone();
+    if state
+        .with_store(move |store| store.open_run_task_for_session(&session_id))
+        .await?
+        .is_some()
+    {
+        return Err(Error::SessionBusy);
+    }
+    Ok(())
 }
 
 async fn has_pending_work(
@@ -2519,6 +2535,10 @@ async fn commit_delivery(
                             Ok((None, Vec::new()))
                         }
                         Err(StoreError::SessionStopping | StoreError::SessionNotLive) => {
+                            Ok((None, Vec::new()))
+                        }
+                        Err(StoreError::AgentUnavailable) => {
+                            store.reject_delivery_attempt(&attempt_id, now_ms)?;
                             Ok((None, Vec::new()))
                         }
                         Err(error) => Err(error),
