@@ -3559,7 +3559,7 @@ mod deletion_gate_tests {
             .into_owned();
         state
             .commit_and_publish(move |store| {
-                let (_, session_event) = store.create_session(
+                let (_, mut session_events) = store.create_session(
                     NewSession {
                         id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
                         project_id: session_project_id.clone(),
@@ -3592,7 +3592,8 @@ mod deletion_gate_tests {
                     Some(&session_agent_id),
                     1_000,
                 )?;
-                Ok(((), vec![session_event, task_event]))
+                session_events.push(task_event);
+                Ok(((), session_events))
             })
             .await
             .unwrap();

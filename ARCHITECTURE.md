@@ -118,6 +118,12 @@ catalogue.
    dirty work. Fleet attention snapshots carry the durable event high-water
    mark from the same store read, so a delayed snapshot cannot overwrite a
    resolution already observed on the event stream.
+   The agent's `current_session_id` is the exact live-session relation used
+   by BUILDING activity: it is derived from sessions whose `ended_at_ms` is
+   null, and session create/end transactions publish the matching
+   `AgentChanged` snapshot with their `SessionChanged` event. Bootstrap and
+   recovery use the same derivation, so a hook's activity can never fall
+   through to an ended session or disappear from event-driven clients.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
    environment additions, generated configuration) and what they can do

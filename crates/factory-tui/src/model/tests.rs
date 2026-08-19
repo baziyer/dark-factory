@@ -844,3 +844,167 @@ fn normal_footer_status_omits_the_old_action_catalog() {
         assert!(!b.status_line_text().contains(old_action));
     }
 }
+
+#[test]
+fn daemon_version_mismatch_is_actionable_and_same_version_is_quiet() {
+    let mut board = board();
+    board.set_daemon_version(env!("CARGO_PKG_VERSION"));
+    assert_eq!(board.version_mismatch(), None);
+
+    board.set_daemon_version("0.0.1");
+    assert_eq!(
+        board.version_mismatch().as_deref(),
+        Some("STALE TUI v0.2.4 / active runtime v0.0.1 — detach + relaunch")
+    );
+
+    board.set_daemon_version("");
+    assert_eq!(
+        board.version_mismatch().as_deref(),
+        Some("STALE TUI — daemon version unknown; detach + relaunch")
+    );
+}
+
+#[test]
+fn activity_label_names_recent_stale_and_missing_activity() {
+    let mut board = Board::new(false, 120_000, crate::theme::FORTRESS);
+    let mut alice = agent("alice", "a", AgentRole::Worker, None);
+    alice.current_session_id = Some(SessionId::try_from("sess-1").unwrap());
+    let mut recent = session("sess-1", "alice", "a", SessionState::Working);
+    recent.activity = Some("tool: Read".to_owned());
+    recent.last_hook_at_ms = Some(110_000);
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![alice.clone()],
+        Vec::new(),
+        Vec::new(),
+        vec![recent],
+    );
+    let alice_id = alice.id.clone();
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "tool: Read 10s ago"
+    );
+
+    let mut stale = session("sess-1", "alice", "a", SessionState::Working);
+    stale.activity = Some("tool: Read".to_owned());
+    stale.last_hook_at_ms = Some(0);
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![board.agents.get(&alice_id).unwrap().clone()],
+        Vec::new(),
+        Vec::new(),
+        vec![stale],
+    );
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "stale activity 2m ago"
+    );
+
+    let mut no_current = agent("alice", "a", AgentRole::Worker, None);
+    let mut ended = session("sess-ended", "alice", "a", SessionState::Stopped);
+    ended.activity = Some("tool: Read".to_owned());
+    ended.last_hook_at_ms = Some(119_000);
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![no_current.clone()],
+        Vec::new(),
+        Vec::new(),
+        vec![ended.clone()],
+    );
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity",
+        "ended activity is not current when the agent has no current session"
+    );
+
+    no_current.current_session_id = Some(SessionId::try_from("sess-fresh").unwrap());
+    let fresh = session("sess-fresh", "alice", "a", SessionState::Working);
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![no_current],
+        Vec::new(),
+        Vec::new(),
+        vec![ended, fresh],
+    );
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity",
+        "a fresh current session must not inherit ended-session activity"
+    );
+}
+
+#[test]
+fn session_lifecycle_events_project_the_daemon_current_session_into_activity() {
+    let mut board = Board::new(false, 120_000, crate::theme::FORTRESS);
+    let alice = agent("alice", "a", AgentRole::Worker, None);
+    let mut live = session("sess-1", "alice", "a", SessionState::Working);
+    live.activity = Some("tool: Read".to_owned());
+    live.last_hook_at_ms = Some(110_000);
+    let mut live_agent = alice.clone();
+    live_agent.current_session_id = Some(live.id.clone());
+
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    // This is the event order emitted by Store::create_session: the derived
+    // AgentSnapshot relation is published before the session row, so a board
+    // can never briefly treat an ended row as current during teardown.
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 100_000,
+        event: FactoryEvent::AgentChanged { agent: live_agent },
+    });
+    assert_eq!(
+        board.activity_label(
+            board
+                .agents
+                .get(&AgentId::try_from("alice").unwrap())
+                .unwrap()
+        ),
+        "no recent activity"
+    );
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 100_000,
+        event: FactoryEvent::SessionChanged {
+            session: live.clone(),
+        },
+    });
+    let alice_id = AgentId::try_from("alice").unwrap();
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "tool: Read 10s ago"
+    );
+
+    let mut ended = live;
+    ended.state = SessionState::Stopped;
+    ended.ended_at_ms = Some(120_001);
+    let mut ended_agent = board.agents[&alice_id].clone();
+    ended_agent.current_session_id = None;
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 3,
+        occurred_at_ms: 120_001,
+        event: FactoryEvent::AgentChanged { agent: ended_agent },
+    });
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity"
+    );
+    board.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 4,
+        occurred_at_ms: 120_001,
+        event: FactoryEvent::SessionChanged { session: ended },
+    });
+    assert_eq!(
+        board.activity_label(board.agents.get(&alice_id).unwrap()),
+        "no recent activity"
+    );
+}

@@ -542,6 +542,18 @@ mod tests {
     }
 
     #[test]
+    fn footer_makes_a_runtime_mismatch_actionable() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.set_daemon_version("0.0.1");
+        let (_, terminal) = render_frame(&board, 120, 24);
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+            .collect::<String>();
+        assert!(footer.contains("STALE TUI"));
+        assert!(footer.contains("detach + relaunch"));
+    }
+
+    #[test]
     fn agent_settings_keep_auditable_policy_fields_legible_at_24_rows() {
         let mut board = Board::new(false, 0, crate::theme::PLAIN);
         let project = project("proj", 0);

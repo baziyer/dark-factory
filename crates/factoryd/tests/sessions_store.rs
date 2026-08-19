@@ -126,6 +126,43 @@ fn fixture() -> Store {
 }
 
 #[test]
+fn session_lifecycle_updates_and_projects_the_live_agent_relation() {
+    let mut store = fixture();
+    let (created, create_events) = store
+        .create_session(new_session("lifecycle-session", "factory", "curie"), 5)
+        .unwrap();
+    assert!(matches!(
+        create_events.as_slice(),
+        [
+            factory_core::EventEnvelope {
+                event: FactoryEvent::AgentChanged { agent },
+                ..
+            },
+            factory_core::EventEnvelope {
+                event: FactoryEvent::SessionChanged { session },
+                ..
+            }
+        ] if session.id == created.id
+            && agent.current_session_id == Some(created.id.clone())
+    ));
+    assert_eq!(
+        store.list_agents(&project_id("factory"), None, 10).unwrap()[0].current_session_id,
+        Some(created.id.clone())
+    );
+
+    let (_, end_events) = store.end_session(&created.id, Some(0), None, 6).unwrap();
+    assert!(end_events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::AgentChanged { agent }
+            if agent.id == agent_id("curie") && agent.current_session_id.is_none()
+    )));
+    assert_eq!(
+        store.list_agents(&project_id("factory"), None, 10).unwrap()[0].current_session_id,
+        None
+    );
+}
+
+#[test]
 fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
     let mut store = fixture();
     let thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
