@@ -223,8 +223,8 @@ local_ci_lease_remove_lock_object() {
     (
         local_ci_lease_enter_lock_object || exit 0
         local_ci_lease_object_identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 0
-        rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME" \
-            "$LOCAL_CI_LEASE_RECOVERY_NAME"
+        rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME"
+        rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
         CDPATH= cd .. || exit 0
         [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_LOCK" 2>/dev/null)" = "$local_ci_lease_object_identity" ] || exit 0
         rmdir "$(basename "$LOCAL_CI_LEASE_LOCK")" 2>/dev/null || true
@@ -247,8 +247,8 @@ local_ci_lease_recover_lock_object() {
         mkdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || exit 1
         if lockf -s -k -t 0 "$LOCAL_CI_LEASE_LOCK_FILE_NAME" true; then
             local_ci_lease_clear_metadata || exit 2
-            rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME" \
-                "$LOCAL_CI_LEASE_RECOVERY_NAME"
+            rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME" "$LOCAL_CI_LEASE_STARTING_NAME"
+            rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
             CDPATH= cd .. || exit 2
             [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_LOCK" 2>/dev/null)" = "$local_ci_lease_object_identity" ] || exit 2
             rmdir "$(basename "$LOCAL_CI_LEASE_LOCK")" 2>/dev/null

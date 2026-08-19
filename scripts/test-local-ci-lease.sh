@@ -101,6 +101,19 @@ start_holder() {
     background_pids="$background_pids $last_holder_pid"
 }
 
+start_stale_holder() {
+    worktree=$1
+    marker=$2
+    done_marker=$3
+    (
+        cd "$worktree"
+        ./scripts/with-local-ci-lease.sh "$holder_command" "$marker" 1
+        : >"$done_marker"
+    ) &
+    last_holder_pid=$!
+    background_pids="$background_pids $last_holder_pid"
+}
+
 acquire_and_release() {
     worktree=$1
     marker=$2
@@ -217,12 +230,19 @@ printf 'pid=%s\nworktree=%s\nstarted_at=stale\nlock_identity=%s\nhead=%s\n' \
     "$stale_pid" "$first" "$(stat -f '%d:%i' "$lock_path")" \
     0123456789abcdef0123456789abcdef01234567 >"$stale_record"
 ln -s "$(basename "$stale_record")" "$lease_path"
-start_holder "$first" "$temporary/stale-first" 1
-start_holder "$second" "$temporary/stale-second" 1
+stale_first_done="$temporary/stale-first-done"
+stale_second_done="$temporary/stale-second-done"
+start_stale_holder "$first" "$temporary/stale-first" "$stale_first_done"
+stale_first_pid=$last_holder_pid
+start_stale_holder "$second" "$temporary/stale-second" "$stale_second_done"
+stale_second_pid=$last_holder_pid
 wait_for_file "$temporary/stale-first"
 wait_for_file "$temporary/stale-second"
 assert_absent "$stale_record"
-wait
+wait_for_file "$stale_first_done"
+wait_for_file "$stale_second_done"
+wait "$stale_first_pid" "$stale_second_pid"
+assert_absent "$lock_path/.recovery"
 assert_absent "$lease_path"
 assert_absent "$lock_path"
 
