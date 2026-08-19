@@ -989,12 +989,15 @@ impl Board {
                     .first()
                     .cloned()
                     .filter(|value| !value.trim().is_empty());
+                let model_selection_reason = (value == detail.profile.model)
+                    .then(|| detail.profile.model_selection_reason.clone())
+                    .flatten();
                 Intent::Send(LocalRequest::UpdateAgentProfile {
                     project_id: detail.snapshot.project_id.clone(),
                     agent_id,
                     model: value,
                     reasoning_effort: detail.profile.reasoning_effort.clone(),
-                    model_selection_reason: detail.profile.model_selection_reason.clone(),
+                    model_selection_reason,
                     permission_mode: detail.profile.permission_mode.clone(),
                     instructions: detail.profile.instructions.clone(),
                     memory: detail.profile.memory.clone(),

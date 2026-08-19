@@ -215,12 +215,7 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         rows[1],
     );
 
-    let pause = if agent.paused {
-        "paused (resume via factoryctl)"
-    } else {
-        "running (pause via factoryctl)"
-    };
-    let (configured_model, configured_reasoning, model_reason, configured_permission, files) =
+    let (configured_model, configured_reasoning, model_reason, configured_permission) =
         board.agent_details.get(agent_id).map_or_else(
             || {
                 (
@@ -228,7 +223,6 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                     "loading…".to_owned(),
                     "loading…".to_owned(),
                     "loading…".to_owned(),
-                    "instructions.md  memory.md".to_owned(),
                 )
             },
             |detail| {
@@ -243,17 +237,15 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                         .reasoning_effort
                         .clone()
                         .unwrap_or_else(|| "provider default".to_owned()),
-                    detail
-                        .profile
-                        .model_selection_reason
-                        .clone()
-                        .unwrap_or_else(|| "unreported".to_owned()),
+                    detail.profile.model_selection_reason.clone().map_or_else(
+                        || "unreported".to_owned(),
+                        |reason| factory_core::model_policy::sanitize_for_display(&reason),
+                    ),
                     detail
                         .profile
                         .permission_mode
                         .clone()
                         .unwrap_or_else(|| "provider default".to_owned()),
-                    format!("{}\n{}", detail.instructions_path, detail.memory_path),
                 )
             },
         );
@@ -271,10 +263,25 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         .and_then(|session| session.runtime_control_mode.as_deref())
         .unwrap_or("unreported");
     frame.render_widget(
-        Paragraph::new(format!(
-            "provider: {:?}\nconfigured model: {configured_model}\nrunning model: {running_model}\nconfigured reasoning: {configured_reasoning}\nrunning reasoning: {running_reasoning}\nmodel selection: {model_reason}\nconfigured permission: {configured_permission}\nrunning permission: {running_permission}\nrunning control: {running_control}\n{pause}\n{files}",
-            agent.provider,
-        ))
+        Paragraph::new(vec![
+            Line::from(format!(
+                "model: {} → {}",
+                ui::truncate(&configured_model, 13),
+                ui::truncate(running_model, 13)
+            )),
+            Line::from(format!(
+                "effort: {} → {}",
+                ui::truncate(&configured_reasoning, 10),
+                ui::truncate(running_reasoning, 10)
+            )),
+            Line::from(format!("audit: {}", ui::truncate(&model_reason, 27))),
+            Line::from(format!(
+                "access: {}/{} {}",
+                ui::truncate(&configured_permission, 8),
+                ui::truncate(running_permission, 8),
+                ui::truncate(running_control, 11)
+            )),
+        ])
         .block(ui::block(" settings ")),
         rows[2],
     );

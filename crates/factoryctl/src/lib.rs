@@ -329,3 +329,81 @@ mod protocol_tests {
         assert!(validate_frame(&frame).is_ok());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+        thread,
+    };
+
+    use factory_core::{
+        AgentId, ProjectId,
+        local::{ErrorCode, LocalResponse},
+    };
+
+    use super::*;
+
+    #[test]
+    fn policy_mutation_rejects_an_old_daemon_instead_of_dropping_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let envelope: factory_core::local::RequestEnvelope =
+                serde_json::from_str(&line).unwrap();
+            assert_eq!(envelope.protocol_version, PROTOCOL_VERSION);
+            match envelope.request {
+                LocalRequest::UpdateAgentProfile {
+                    model,
+                    reasoning_effort,
+                    model_selection_reason,
+                    ..
+                } => {
+                    assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
+                    assert_eq!(reasoning_effort.as_deref(), Some("xhigh"));
+                    assert_eq!(
+                        model_selection_reason.as_deref(),
+                        Some("release integration")
+                    );
+                }
+                request => panic!("unexpected request: {request:?}"),
+            }
+            let old_frame = ServerFrame::Response {
+                protocol_version: 1,
+                response: LocalResponse::Error {
+                    code: ErrorCode::UnsupportedProtocol,
+                    message: "old daemon".into(),
+                },
+            };
+            let payload = serde_json::to_vec(&old_frame).unwrap();
+            stream.write_all(&payload).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+
+        let error = Client::new(&socket)
+            .request(LocalRequest::UpdateAgentProfile {
+                project_id: ProjectId::try_from("factory").unwrap(),
+                agent_id: AgentId::try_from("worker").unwrap(),
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                model_selection_reason: Some("release integration".into()),
+                permission_mode: None,
+                instructions: String::new(),
+                memory: String::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ClientError::UnsupportedProtocol { found: 1, supported }
+                if supported == PROTOCOL_VERSION
+        ));
+        server.join().unwrap();
+    }
+}

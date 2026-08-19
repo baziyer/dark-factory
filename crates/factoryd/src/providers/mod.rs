@@ -138,6 +138,30 @@ pub struct Capabilities {
     /// [`SpawnContext::permission_mode`], for validating `agent profile set
     /// --permission-mode` up front rather than failing at spawn time.
     pub permission_modes: &'static [&'static str],
+    pub model_ids: &'static [&'static str],
+    pub model_prefix: Option<&'static str>,
+    pub reasoning_efforts: &'static [&'static str],
+    pub model_is_command: bool,
+}
+
+impl Capabilities {
+    pub fn for_provider(
+        provider: factory_core::Provider,
+        hooks: bool,
+        resume: bool,
+        permission_modes: &'static [&'static str],
+    ) -> Self {
+        let policy = factory_core::model_policy::capabilities(provider);
+        Self {
+            hooks,
+            resume,
+            permission_modes,
+            model_ids: policy.model_ids,
+            model_prefix: policy.model_prefix,
+            reasoning_efforts: policy.reasoning_efforts,
+            model_is_command: policy.model_is_command,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

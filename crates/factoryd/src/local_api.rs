@@ -175,6 +175,9 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "agent profile is invalid or exceeds its bound".into(),
             ),
+            Self::Store(StoreError::InvalidAgentModelPolicy(error)) => {
+                (ErrorCode::InvalidRequest, error.to_string())
+            }
             Self::Store(StoreError::UnsupportedAgentPermissionMode { provider, mode }) => (
                 ErrorCode::InvalidRequest,
                 format!("permission mode {mode:?} is not supported by provider {provider:?}"),

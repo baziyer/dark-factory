@@ -48,13 +48,19 @@ launch values and its `bypassPermissions` auto-mode value; an omitted Claude
 default remains unreported. The same session snapshot is returned by
 `factoryctl agent status`/`session list` and consumed by `factory-tui`.
 
-Profile permission modes are validated against this same provider capability
-declaration before the profile row is written. For example, Codex accepts only
+Profile model, reasoning-effort, selection-reason, and permission values are
+validated against one provider capability declaration before the profile row is
+written. Codex accepts the supported GPT-5.6 model IDs and reasoning efforts
+`none`, `low`, `medium`, `high`, `xhigh`, and `max`; Claude and shell reject
+reasoning efforts because those providers do not consume that field, while a
+shell model remains its explicit command. For example, Codex accepts only
 `on-request` and `never`; `bypass` is the factory-wide auto-mode launch posture,
 not a valid Codex profile value, and is rejected instead of being deferred to
 the next session launch. Upgrade migration 0022 also clears invalid
 provider-scoped values already present in older profile rows, restoring the
-provider default so they cannot reach a post-upgrade launch argv.
+provider default so they cannot reach a post-upgrade launch argv. Migration
+0023 adds the nullable model-policy fields without backfilling existing
+profiles; an existing profile remains unchanged until an operator edits it.
 
 Repository authority is provider-independent too. Provider processes do not
 inherit ambient Git/GitHub token variables or the SSH agent; the runner resets

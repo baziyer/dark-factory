@@ -315,11 +315,7 @@ impl Provider for CodexProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            hooks: true,
-            resume: true,
-            permission_modes: &PERMISSION_MODES,
-        }
+        Capabilities::for_provider(factory_core::Provider::Codex, true, true, &PERMISSION_MODES)
     }
 }
 

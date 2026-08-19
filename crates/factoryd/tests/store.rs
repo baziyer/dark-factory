@@ -1623,7 +1623,7 @@ fn delete_agent_deletes_its_profile_and_inbox_but_keeps_sent_messages_with_sende
             &project_id("factory"),
             &agent_id("curie"),
             UpdateAgentProfile {
-                model: Some("claude-test".into()),
+                model: Some("gpt-5.6-luna".into()),
                 reasoning_effort: None,
                 model_selection_reason: None,
                 permission_mode: None,
@@ -1717,7 +1717,7 @@ fn delete_project_cascades_agent_profiles_and_messages() {
             &project_id("factory"),
             &agent_id("curie"),
             UpdateAgentProfile {
-                model: Some("claude-test".into()),
+                model: Some("gpt-5.6-luna".into()),
                 reasoning_effort: None,
                 model_selection_reason: None,
                 permission_mode: None,

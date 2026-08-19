@@ -157,11 +157,12 @@ impl Provider for ClaudeProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            hooks: true,
-            resume: true,
-            permission_modes: &PERMISSION_MODES,
-        }
+        Capabilities::for_provider(
+            factory_core::Provider::ClaudeCode,
+            true,
+            true,
+            &PERMISSION_MODES,
+        )
     }
 }
 

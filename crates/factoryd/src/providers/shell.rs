@@ -51,11 +51,12 @@ impl Provider for ShellProvider {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            hooks: true,
-            resume: false,
-            permission_modes: &PERMISSION_MODES,
-        }
+        Capabilities::for_provider(
+            factory_core::Provider::Shell,
+            true,
+            false,
+            &PERMISSION_MODES,
+        )
     }
 }
 

@@ -48,9 +48,9 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
             &project,
             &agent,
             UpdateAgentProfile {
-                model: Some("gpt-5-codex".into()),
-                reasoning_effort: None,
-                model_selection_reason: None,
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                model_selection_reason: Some("operator verification".into()),
                 permission_mode: Some("on-request".into()),
             },
             3,
@@ -58,7 +58,7 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
         .unwrap();
 
     let reloaded = store.get_agent_detail(&project, &agent).unwrap();
-    assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5.6-sol"));
     assert_eq!(
         reloaded.profile.permission_mode.as_deref(),
         Some("on-request")
@@ -177,13 +177,13 @@ fn creating_an_agent_can_persist_its_selected_model_in_the_private_profile() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
             },
-            Some("gpt-5-codex".into()),
+            Some("gpt-5.6-luna".into()),
             4,
         )
         .unwrap();
 
     let detail = store.get_agent_detail(&project, &agent).unwrap();
-    assert_eq!(detail.profile.model.as_deref(), Some("gpt-5-codex"));
+    assert_eq!(detail.profile.model.as_deref(), Some("gpt-5.6-luna"));
 }
 
 #[test]
@@ -298,7 +298,9 @@ fn profile_escalation_requires_a_reason_and_normalizes_to_xhigh() {
     };
     assert!(matches!(
         error,
-        factoryd::store::StoreError::InvalidAgentProfile
+        factoryd::store::StoreError::InvalidAgentModelPolicy(
+            factory_core::model_policy::ModelPolicyError::EscalationReasonRequired
+        )
     ));
 
     store

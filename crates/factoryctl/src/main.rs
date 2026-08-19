@@ -1337,19 +1337,12 @@ fn agent_profile_set_frame(
         None => agent.profile.memory,
     };
     let selected_model = model.clone().or_else(|| agent.profile.model.clone());
-    if model.as_deref() == Some(factory_core::model_policy::ESCALATED_MODEL)
-        && model_selection_reason.is_none()
-    {
-        return Err(
-            "gpt-5.6-sol requires --model-reason describing the explicit high-risk escalation"
-                .into(),
-        );
-    }
-    let selection_reason = model_selection_reason.or_else(|| {
-        (model.is_some() && selected_model != agent.profile.model)
-            .then(|| "operator-selected model".to_owned())
-            .or(agent.profile.model_selection_reason.clone())
-    });
+    let model_changed = model.is_some() && selected_model != agent.profile.model;
+    let selection_reason = if model_changed {
+        model_selection_reason
+    } else {
+        model_selection_reason.or(agent.profile.model_selection_reason.clone())
+    };
     client
         .request(LocalRequest::UpdateAgentProfile {
             project_id,

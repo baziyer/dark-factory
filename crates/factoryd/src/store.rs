@@ -49,7 +49,6 @@ const MAX_WEBHOOK_TITLE_BYTES: usize = 240;
 const MAX_WEBHOOK_TEXT_BYTES: usize = 4_000;
 const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_AGENT_MODEL_BYTES: usize = 256;
-const MAX_AGENT_MODEL_REASON_BYTES: usize = 512;
 const MAX_AGENT_PERMISSION_MODE_BYTES: usize = 64;
 const MAX_RUNTIME_METADATA_BYTES: usize = 256;
 /// Mirrors the `sessions.wait_reason`/`activity` CHECK bounds (migration
@@ -472,6 +471,8 @@ pub enum StoreError {
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
+    #[error("agent model policy rejected the profile: {0}")]
+    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
     UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
@@ -852,8 +853,7 @@ impl Store {
         model: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        validate_agent_model(model.as_deref())?;
-        self.insert_agent(input, model, None, None, now_ms)
+        self.create_agent_with_profile(input, model, None, None, now_ms)
     }
 
     pub fn create_agent_with_profile(
@@ -865,15 +865,16 @@ impl Store {
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         validate_agent_model(model.as_deref())?;
-        validate_agent_model_reason(model_selection_reason.as_deref())?;
-        let selection = model_policy::select(
+        let selection = model_policy::normalize_profile(
             input.provider,
             input.role,
-            model.as_deref(),
-            reasoning_effort.as_deref(),
-            model_selection_reason.as_deref(),
-        )
-        .map_err(|_| StoreError::InvalidAgentProfile)?;
+            model_policy::ModelSelection {
+                model,
+                reasoning_effort,
+                reason: model_selection_reason,
+            },
+            true,
+        )?;
         self.insert_agent(
             input,
             selection.model,
@@ -3901,13 +3902,6 @@ impl Store {
         let agent = load_agent(&transaction, agent_id)?
             .filter(|agent| agent.snapshot.project_id == *project_id)
             .ok_or(StoreError::AgentNotFound)?;
-        let current_profile = load_agent_profile(&transaction, agent_id)?.unwrap_or(AgentProfile {
-            model: None,
-            reasoning_effort: None,
-            model_selection_reason: None,
-            permission_mode: None,
-            updated_at_ms: 0,
-        });
         if let Some(mode) = input.permission_mode.as_deref() {
             let capabilities = crate::providers::capabilities_for(agent.snapshot.provider);
             if !capabilities.permission_modes.contains(&mode) {
@@ -3917,33 +3911,16 @@ impl Store {
                 });
             }
         }
-        model_policy::validate_reasoning_effort(input.reasoning_effort.as_deref())
-            .map_err(|_| StoreError::InvalidAgentProfile)?;
-        validate_agent_model_reason(input.model_selection_reason.as_deref())?;
-        if input.reasoning_effort.is_some() && agent.snapshot.provider != Provider::Codex {
-            return Err(StoreError::InvalidAgentProfile);
-        }
-        let model_changed = input.model != current_profile.model;
-        let mut reasoning_effort = input.reasoning_effort;
-        let mut model_selection_reason = input.model_selection_reason;
-        if model_changed
-            && input.model.as_deref() == Some(model_policy::ESCALATED_MODEL)
-            && model_selection_reason.is_none()
-        {
-            return Err(StoreError::InvalidAgentProfile);
-        }
-        if model_changed && model_selection_reason.is_none() {
-            model_selection_reason = Some("operator-selected model".to_owned());
-        }
-        if model_changed && input.model.as_deref() == Some(model_policy::ESCALATED_MODEL) {
-            if reasoning_effort
-                .as_deref()
-                .is_some_and(|effort| effort != model_policy::ESCALATED_REASONING_EFFORT)
-            {
-                return Err(StoreError::InvalidAgentProfile);
-            }
-            reasoning_effort = Some(model_policy::ESCALATED_REASONING_EFFORT.to_owned());
-        }
+        let selection = model_policy::normalize_profile(
+            agent.snapshot.provider,
+            agent.snapshot.role,
+            model_policy::ModelSelection {
+                model: input.model,
+                reasoning_effort: input.reasoning_effort,
+                reason: input.model_selection_reason,
+            },
+            false,
+        )?;
         transaction.execute(
             "INSERT INTO agent_profiles (
                 agent_id, model, reasoning_effort, model_selection_reason,
@@ -3957,9 +3934,9 @@ impl Store {
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
-                input.model,
-                reasoning_effort,
-                model_selection_reason,
+                selection.model,
+                selection.reasoning_effort,
+                selection.reason,
                 input.permission_mode,
                 now_ms
             ],
@@ -4443,17 +4420,6 @@ fn validate_agent_model(model: Option<&str>) -> Result<()> {
     if model.is_some_and(|value| {
         value.is_empty()
             || value.len() > MAX_AGENT_MODEL_BYTES
-            || value.chars().any(char::is_control)
-    }) {
-        return Err(StoreError::InvalidAgentProfile);
-    }
-    Ok(())
-}
-
-fn validate_agent_model_reason(reason: Option<&str>) -> Result<()> {
-    if reason.is_some_and(|value| {
-        value.is_empty()
-            || value.len() > MAX_AGENT_MODEL_REASON_BYTES
             || value.chars().any(char::is_control)
     }) {
         return Err(StoreError::InvalidAgentProfile);

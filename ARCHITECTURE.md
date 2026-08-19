@@ -144,9 +144,9 @@ catalogue.
 8. The orchestrator is an agent like any other: it drives its own resident
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
-   directly or via its own session's shell access to it) — it may choose and
-   delegate work, but it cannot bypass daemon-owned limits or reach SQLite
-   directly.
+   directly or via its own session's shell access to it). It may coordinate
+   and delegate work, but agent creation and profile/model changes require the
+   operator; it cannot bypass daemon-owned limits or reach SQLite directly.
 9. Remote repository mutation is a daemon boundary. A session may edit and
    inspect its worktree, but its environment disables Git credential helpers,
    SSH transport, interactive credential prompts, and the operator's `gh`
@@ -259,15 +259,18 @@ API, `factoryctl agent status`, and `factory-tui` all project the same fields.
 
 ### Auditable model tiers
 
-The shared `factory_core::model_policy` applies only when a new Codex agent
-is created without an explicit model: routine workers and focused reviewers
-receive `gpt-5.6-luna` with `medium` reasoning, while the orchestrator/God
-receives `gpt-5.6-sol` with `xhigh`. A worker receives Sol/xhigh only for an
-explicit high-risk escalation reason (integration, security, release, or a
-failed cheaper attempt). The selected model, reasoning effort, and reason
-are durable profile fields and are projected through `factoryctl` and the
-TUI. Existing profiles remain unchanged; this is a bounded tier policy, not
-a live pricing engine.
+The shared `factory_core::model_policy` normalizes the final desired profile
+for creation and update, so the daemon, CLI, and TUI cannot disagree. New
+Codex routine workers and focused reviewers without an explicit escalation
+receive `gpt-5.6-luna` with `medium` reasoning; the orchestrator/God is fixed
+to `gpt-5.6-sol` with `xhigh`; a worker receives Sol/xhigh only with an
+explicit high-risk reason. Provider model/effort capabilities are declared by
+this same policy table, and unsupported values fail before launch. The
+selected model, reasoning effort, and reason are durable profile fields and
+are projected through `factoryctl` and the TUI. Existing profiles remain
+unchanged; this is a bounded tier policy, not a live pricing engine. Local
+protocol version mismatches are rejected rather than silently dropping policy
+fields.
 
 The separate resumed-Codex delivery failure remains tracked by
 [#158](https://github.com/baziyer/dark-factory/issues/158): live evidence shows
