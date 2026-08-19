@@ -1510,6 +1510,7 @@ async fn handle_request(
                     "runner stop grace must be at most 60000 ms".into(),
                 ));
             }
+            let _repository_slot = state.repository_slot().await;
             let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
             let session = state
@@ -2526,7 +2527,7 @@ async fn abandon_managed_change_request(
                 .map_err(repository_failure)?;
         }
         if worktree_exists {
-            crate::worktrees::remove(Path::new(&project.root), Path::new(&change.worktree))
+            crate::worktrees::remove_managed(Path::new(&project.root), Path::new(&change.worktree))
                 .await
                 .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
         }
@@ -3688,6 +3689,84 @@ mod deletion_gate_tests {
             .await
             .unwrap();
         (state, execution, project_id, agent_id, task_id)
+    }
+
+    #[tokio::test]
+    async fn terminal_local_requests_wait_for_the_managed_change_lifecycle_slot() {
+        let directory = private_tempdir();
+        let state = ApiState::new(Store::open_in_memory().unwrap());
+        let (execution, execution_join) =
+            execution::spawn(config(directory.path()), state.clone()).unwrap();
+        for request in [
+            LocalRequest::CompleteTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+                result: "done".into(),
+            },
+            LocalRequest::BlockTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+                reason: "blocked".into(),
+            },
+            LocalRequest::CancelTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+            },
+            LocalRequest::CreateManagedChange {
+                token: "not-a-token".into(),
+            },
+        ] {
+            let held = state.repository_slot().await;
+            let waiting_state = state.clone();
+            let waiting_execution = execution.clone();
+            let waiting_root = directory.path().to_path_buf();
+            let waiter = tokio::spawn(async move {
+                handle_request(&waiting_state, &waiting_execution, &waiting_root, request).await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), waiter)
+                    .await
+                    .is_err(),
+                "terminal/create request bypassed the repository lifecycle slot"
+            );
+            drop(held);
+        }
+        execution.shutdown().await.unwrap();
+        execution_join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_run_waits_for_the_managed_change_lifecycle_slot() {
+        let directory = private_tempdir();
+        let state = ApiState::new(Store::open_in_memory().unwrap());
+        let (execution, execution_join) =
+            execution::spawn(config(directory.path()), state.clone()).unwrap();
+        let held = state.repository_slot().await;
+        let waiting_state = state.clone();
+        let waiting_execution = execution.clone();
+        let waiting_root = directory.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            handle_request(
+                &waiting_state,
+                &waiting_execution,
+                &waiting_root,
+                LocalRequest::StopRun {
+                    project_id: ProjectId::try_from("project").unwrap(),
+                    run_id: RunId::try_from("run").unwrap(),
+                    grace_ms: 0,
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiter)
+                .await
+                .is_err(),
+            "StopRun bypassed the repository lifecycle slot"
+        );
+        drop(held);
+        execution.shutdown().await.unwrap();
+        execution_join.await.unwrap().unwrap();
     }
 
     /// `commit_pending_delivery_on_prompt`'s gated call site

@@ -403,10 +403,11 @@ async fn public_managed_change_create_and_abandon_use_the_authenticated_run() {
         execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     execution.shutdown().await.unwrap();
     execution_join.await.unwrap().unwrap();
+    let state_for_server = state.clone();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
-        state,
+        state_for_server,
         execution,
         directory.path().to_path_buf(),
         async {
@@ -429,6 +430,83 @@ async fn public_managed_change_create_and_abandon_use_the_authenticated_run() {
         other => panic!("unexpected create response: {other:?}"),
     };
     assert!(created_path.is_dir());
+
+    std::fs::write(created_path.join("progress.txt"), "published progress\n").unwrap();
+    assert!(matches!(
+        request(
+            &socket,
+            LocalRequest::GitCommit {
+                token: "a".repeat(64),
+                message: "Publish progress".into(),
+            },
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::GitOutput { ref operation, .. },
+            ..
+        } if operation == "git_commit"
+    ));
+    assert!(matches!(
+        request(
+            &socket,
+            LocalRequest::GitPush {
+                token: "a".repeat(64),
+            },
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::GitOutput { ref operation, .. },
+            ..
+        } if operation == "git_push"
+    ));
+    let published = state
+        .with_store({
+            let project_id = project_id.clone();
+            let task_id = task_id.clone();
+            move |store| store.managed_change(&project_id, &task_id)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        published.published_head_sha.as_deref(),
+        Some(published.head_sha.as_str())
+    );
+    let remote_head = String::from_utf8(
+        Command::new("git")
+            .args([
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "rev-parse",
+                &published.branch,
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(remote_head.trim(), published.head_sha);
+    let audit = state
+        .with_store(|store| store.events_after(0, 100))
+        .await
+        .unwrap();
+    assert!(audit.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::RepositoryOperation {
+            operation,
+            phase,
+            success: Some(true),
+            ..
+        } if operation == "git_commit" && phase == "finished"
+    )));
+    assert!(audit.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::RepositoryOperation {
+            operation,
+            phase,
+            success: Some(true),
+            ..
+        } if operation == "git_push" && phase == "finished"
+    )));
 
     let abandoned = request(
         &socket,

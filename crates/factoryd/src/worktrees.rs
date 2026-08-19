@@ -135,6 +135,22 @@ pub async fn remove(project_root: &Path, worktree_dir: &Path) -> Result<(), Work
     Err(WorktreeError::Git(stderr.into_owned()))
 }
 
+/// Removes a daemon-managed change worktree after the repository layer has
+/// proved its sandbox clean and its remote lease safe. The normal agent
+/// worktree removal above intentionally refuses dirty paths; managed commits
+/// use a daemon-owned index, so their real checkout can still contain the
+/// already-published files even though the authoritative sandbox is clean.
+pub async fn remove_managed(project_root: &Path, worktree_dir: &Path) -> Result<(), WorktreeError> {
+    let target = worktree_dir.to_string_lossy().into_owned();
+    let output = run_git(project_root, &["worktree", "remove", "--force", &target]).await?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(WorktreeError::Git(
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
 /// `git status --porcelain=v1 --branch --no-optional-locks` of
 /// `worktree_dir`, summarized for `factoryctl agent status`: the branch
 /// (`None` on a detached `HEAD`) and how many entries are modified, staged,

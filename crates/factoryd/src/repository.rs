@@ -214,6 +214,26 @@ pub async fn create_managed_change(
                     "managed change recovery worktree is dirty at the new base".into(),
                 ));
             }
+            if safe_git(
+                &project_root,
+                None,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    existing_head.trim(),
+                    &base_sha,
+                ],
+                None,
+                READ_TIMEOUT,
+            )
+            .await
+            .is_err()
+            {
+                return Err(Error::Rejected(
+                    "managed change recovery worktree diverged from the new base; preserving it"
+                        .into(),
+                ));
+            }
             safe_git(
                 &project_root,
                 None,
@@ -874,6 +894,19 @@ impl Target {
         self
     }
 
+    #[cfg(test)]
+    fn with_test_github(
+        mut self,
+        authority: RepositoryAuthority,
+        program: PathBuf,
+        repository: &str,
+    ) -> Self {
+        self.authority = authority;
+        self.gh_program = program;
+        self.github_repo = Some(repository.to_owned());
+        self
+    }
+
     pub async fn revalidate_head_for_audit(&self) -> Result<String, Error> {
         self.revalidate().await
     }
@@ -1513,6 +1546,42 @@ mod tests {
         );
     }
 
+    fn session_for_target(target: &Target) -> SessionRow {
+        SessionRow {
+            id: target.session_id.clone(),
+            project_id: target.project_id.clone(),
+            agent_id: target.agent_id.clone(),
+            provider: Provider::Shell,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            provider_session_id: None,
+            worktree: target.worktree.to_string_lossy().into_owned(),
+            codex_home: None,
+            hook_token: "a".repeat(64),
+            state: SessionState::Idle,
+            state_since_ms: 1,
+            activity: None,
+            activity_inferred: false,
+            wait_reason: None,
+            observer_health: ObserverHealth::Healthy,
+            observer_health_since_ms: 1,
+            runner_instance_id: RunnerInstanceId::try_from("runner").unwrap(),
+            runner_runtime: "/tmp/runner".into(),
+            runner_protocol_version: 1,
+            last_hook_event: None,
+            last_hook_at_ms: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            ended_at_ms: None,
+            exit_code: None,
+            exit_signal: None,
+            stop_requested_at_ms: None,
+            current_run_id: None,
+        }
+    }
+
     async fn fixture() -> (tempfile::TempDir, Target, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path().join("repo");
@@ -1695,6 +1764,67 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(recovered.base_sha, recovered.head_sha);
+    }
+
+    #[tokio::test]
+    async fn managed_change_preserves_a_clean_divergent_recovery_branch() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-divergent".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-divergent");
+        let record = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+        fs::write(path.join("unique"), "must survive\n").unwrap();
+        run(&path, &["add", "unique"]);
+        run(&path, &["commit", "-m", "unique managed work"]);
+        let unique_head = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(&path)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let unique_head = unique_head.trim();
+
+        fs::write(temp.path().join("repo").join("README"), "different base\n").unwrap();
+        run(
+            &temp.path().join("repo"),
+            &["commit", "-am", "different base"],
+        );
+        run(&temp.path().join("repo"), &["push", "origin", "main"]);
+        let error = create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("diverged"));
+        assert!(path.is_dir(), "divergent recovery worktree was removed");
+        let branch_head = String::from_utf8(
+            StdCommand::new("git")
+                .current_dir(temp.path().join("repo"))
+                .args(["rev-parse", "refs/heads/issue/issue-175-divergent"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(branch_head.trim(), unique_head);
+        assert_ne!(record.base_sha, unique_head);
     }
 
     #[tokio::test]
@@ -2075,15 +2205,18 @@ mod tests {
 
     #[tokio::test]
     async fn gh_is_pinned_to_configured_repo_base_and_reverified_after_mutation() {
-        let (temp, mut target, _) = fixture().await;
-        target.authority =
+        let (temp, target, _) = fixture().await;
+        let authority =
             validate_authority("https://github.com/owner/repo.git".into(), "main".into()).unwrap();
-        target.github_repo = Some("owner/repo".into());
         let fake = temp.path().join("gh");
         let log = temp.path().join("gh.log");
         fs::write(&fake, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n 'pr view') printf 'agent/worker\\tmain\\t{}\\thttps://github.com/owner/repo/pull/7\\n' ;;\nesac\n", log.display(), target.head)).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o500)).unwrap();
-        target.gh_program = std::fs::canonicalize(fake).unwrap();
+        let target = target.with_test_github(
+            authority,
+            std::fs::canonicalize(fake).unwrap(),
+            "owner/repo",
+        );
         assert_eq!(
             target.pr_open("Title", "Body").await.unwrap(),
             "https://github.com/owner/repo/pull/7"
@@ -2101,7 +2234,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_change_pr_uses_the_registered_published_head() {
-        let (temp, mut target, remote) = fixture().await;
+        let (temp, target, remote) = fixture().await;
         let project = ProjectSnapshot {
             id: target.project_id.clone(),
             name: "Project".into(),
@@ -2122,27 +2255,20 @@ mod tests {
         )
         .await
         .unwrap();
-        target.worktree = path;
-        target.branch = record.branch.clone();
-        target.git_dir = PathBuf::from(&record.git_dir);
-        target.common_dir = PathBuf::from(&record.common_dir);
-        target.worktree_device = record.worktree_device;
-        target.worktree_inode = record.worktree_inode;
-        target.git_dir_device = record.git_dir_device;
-        target.git_dir_inode = record.git_dir_inode;
-        target.common_dir_device = record.common_dir_device;
-        target.common_dir_inode = record.common_dir_inode;
-        target.head = record.head_sha.clone();
-        target.registered_change = Some(record.clone());
-        let head = target.commit("managed PR commit").await.unwrap();
-        target.push().await.unwrap();
+        let publishing_target = Target::validate_with_change(
+            session_for_target(&target),
+            project.clone(),
+            authority.clone(),
+            Some(record.clone()),
+        )
+        .await
+        .unwrap();
+        let head = publishing_target.commit("managed PR commit").await.unwrap();
+        publishing_target.push().await.unwrap();
 
         let mut published = record;
         published.head_sha = head.clone();
         published.published_head_sha = Some(head.clone());
-        target.head = head.clone();
-        target.registered_change = Some(published);
-        target.github_repo = Some("owner/repo".into());
         let fake = temp.path().join("gh-managed");
         let log = temp.path().join("gh-managed.log");
         fs::write(
@@ -2154,7 +2280,15 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o500)).unwrap();
-        target.gh_program = fs::canonicalize(fake).unwrap();
+        let target = Target::validate_with_change(
+            session_for_target(&target),
+            project,
+            authority.clone(),
+            Some(published),
+        )
+        .await
+        .unwrap()
+        .with_test_github(authority, fs::canonicalize(fake).unwrap(), "owner/repo");
         assert_eq!(
             target
                 .pr_open("Managed title", "Managed body")
