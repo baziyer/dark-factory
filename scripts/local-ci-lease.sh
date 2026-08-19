@@ -433,9 +433,9 @@ local_ci_lease_release_owner() {
 }
 
 local_ci_lease_start_child() {
-    # A forked child creates its own session before publishing its PID.  This
-    # avoids both a parent-side setpgid race and observing the child before the
-    # process-group identity is established.
+    # The background function execs this helper, so the session leader remains
+    # the wrapper's direct waitable child. No detached grandchild can survive
+    # if startup aborts before the release handshake.
     command -v perl >/dev/null 2>&1 || {
         echo "local-ci: Perl is required to establish the command process group" >&2
         return 1
@@ -443,8 +443,8 @@ local_ci_lease_start_child() {
     local_ci_lease_pid_file=$1
     local_ci_lease_release_fifo=$2
     shift 2
-    perl -MPOSIX -e \
-        'my ($pid_file, $release_fifo) = splice @ARGV, 0, 2; my $pid = fork(); die "fork: $!\n" unless defined $pid; if ($pid) { waitpid($pid, 0); my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : ($status >> 8)); } POSIX::setsid() == -1 and die "setsid: $!\n"; open my $fh, ">", $pid_file or die "pid file: $!\n"; print $fh "$$\n"; close $fh; open my $release, "<", $release_fifo or die "release fifo: $!\n"; <$release>; close $release; exec @ARGV or die "exec: $!\n"' \
+    exec perl -MPOSIX -e \
+        'my ($pid_file, $release_fifo) = splice @ARGV, 0, 2; POSIX::setsid() == -1 and die "setsid: $!\n"; open my $fh, ">", $pid_file or die "pid file: $!\n"; print $fh "$$\n"; close $fh; open my $release, "<", $release_fifo or die "release fifo: $!\n"; <$release>; close $release; exec @ARGV or die "exec: $!\n"' \
         -- "$local_ci_lease_pid_file" "$local_ci_lease_release_fifo" "$@"
 }
 
@@ -566,9 +566,36 @@ local_ci_lease_run() {
     # without following mutable parent-PID relationships.
     local_ci_lease_group_pid_file="$LOCAL_CI_LEASE_COMMON_DIR/.dark-factory-local-ci-group-$$"
     local_ci_lease_group_release_fifo="$LOCAL_CI_LEASE_COMMON_DIR/.dark-factory-local-ci-release-$$"
+    local_ci_lease_holder_wait_pid=
     rm -f "$local_ci_lease_group_pid_file"
     rm -f "$local_ci_lease_group_release_fifo"
     mkfifo "$local_ci_lease_group_release_fifo" || return 1
+
+    local_ci_lease_abort_startup() {
+        local_ci_lease_abort_signal=$1
+        if [ -n "$local_ci_lease_holder_wait_pid" ]; then
+            kill -"$local_ci_lease_abort_signal" "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+            wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        fi
+        rm -f "$local_ci_lease_group_pid_file" "$local_ci_lease_group_release_fifo"
+    }
+    local_ci_lease_startup_cleanup() {
+        local_ci_lease_status=$?
+        trap - EXIT HUP INT TERM
+        local_ci_lease_abort_startup 15
+        exit "$local_ci_lease_status"
+    }
+    local_ci_lease_startup_signal() {
+        local_ci_lease_signal=$1
+        trap - EXIT HUP INT TERM
+        local_ci_lease_abort_startup "$local_ci_lease_signal"
+        exit $((128 + local_ci_lease_signal))
+    }
+    trap local_ci_lease_startup_cleanup EXIT
+    trap 'local_ci_lease_startup_signal 1' HUP
+    trap 'local_ci_lease_startup_signal 2' INT
+    trap 'local_ci_lease_startup_signal 15' TERM
+
     local_ci_lease_start_child "$local_ci_lease_group_pid_file" \
         "$local_ci_lease_group_release_fifo" sh -c \
         '. "$1"; shift; local_ci_lease_lock_holder "$@"' \
@@ -579,16 +606,27 @@ local_ci_lease_run() {
     while [ ! -s "$local_ci_lease_group_pid_file" ]; do
         [ "$local_ci_lease_group_attempts" -lt 100 ] || {
             echo "local-ci: lock-holder process-group startup timed out" >&2
-            kill "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
-            wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
-            rm -f "$local_ci_lease_group_pid_file" "$local_ci_lease_group_release_fifo"
+            trap - EXIT HUP INT TERM
+            local_ci_lease_abort_startup 15
             return 1
         }
         sleep 0.01
         local_ci_lease_group_attempts=$((local_ci_lease_group_attempts + 1))
     done
+    if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_GROUP_TRAPS-}" ]; then
+        read -r local_ci_lease_test_pause_token \
+            <"$DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_GROUP_TRAPS" || true
+    fi
     local_ci_lease_holder_pid=$(cat "$local_ci_lease_group_pid_file")
     rm -f "$local_ci_lease_group_pid_file"
+    [ "$local_ci_lease_holder_pid" = "$local_ci_lease_holder_wait_pid" ] || {
+        echo "local-ci: lock-holder PID handshake did not match its direct child" >&2
+        kill "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        rm -f "$local_ci_lease_group_release_fifo"
+        trap - EXIT HUP INT TERM
+        return 1
+    }
     local_ci_lease_identity_attempts=0
     local_ci_lease_holder_start=
     local_ci_lease_holder_pgid=
@@ -621,6 +659,7 @@ local_ci_lease_run() {
         kill "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
         wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
         rm -f "$local_ci_lease_group_release_fifo"
+        trap - EXIT HUP INT TERM
         return 1
     }
 

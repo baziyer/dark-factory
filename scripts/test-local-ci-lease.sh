@@ -168,6 +168,10 @@ wait_terminated() {
     else
         status=$?
     fi
+    if [ "$status" -eq 124 ]; then
+        echo "local-ci lease test failed: $phase: internal teardown wait timed out" >&2
+        return 124
+    fi
     printf 'local-ci lease test: %s child pid=%s exited status=%s after tree teardown\n' \
         "$phase" "$pid" "$status" >&2
 }
@@ -201,6 +205,26 @@ kill -KILL "$timeout_probe_pid" 2>/dev/null || true
 wait "$timeout_probe_pid" 2>/dev/null || true
 grep -Fq 'timeout probe: timed out after' "$timeout_probe_stderr" \
     || fail "bounded wait timeout had no causal phase diagnostic"
+
+# The termination wrapper must propagate its internal timeout as a hard
+# failure rather than treating status 124 as an expected killed child.
+terminated_timeout_stderr="$temporary/terminated-timeout-probe.stderr"
+sleep 30 &
+terminated_timeout_pid=$!
+if wait_terminated "terminated timeout probe" "$terminated_timeout_pid" \
+    2>"$terminated_timeout_stderr"; then
+    fail "terminated wait timeout probe unexpectedly completed"
+else
+    terminated_timeout_status=$?
+fi
+[ "$terminated_timeout_status" -eq 124 ] \
+    || fail "wait_terminated timeout returned status $terminated_timeout_status"
+kill -KILL "$terminated_timeout_pid" 2>/dev/null || true
+wait "$terminated_timeout_pid" 2>/dev/null || true
+grep -Fq 'terminated timeout probe: internal teardown wait timed out' "$terminated_timeout_stderr" \
+    || fail "wait_terminated masked its internal timeout"
+! grep -Fq 'exited status=124 after tree teardown' "$terminated_timeout_stderr" \
+    || fail "wait_terminated reported timeout 124 as expected termination"
 
 git init -q "$temporary/repository"
 git -C "$temporary/repository" config user.email test@example.invalid
@@ -246,6 +270,41 @@ if (cd "$first" && ./scripts/with-local-ci-lease.sh true) 2>"$temporary/initial-
 fi
 grep -Fq 'unsafe lock object path' "$temporary/initial-symlink.stderr" || fail "initial symlink refusal was unexplained"
 rm -f "$lock_path"
+
+# The wrapper owns its detached session leader before the command is released.
+# Interrupt that exact PID-published/pre-trap seam and prove the direct child,
+# handshake paths, and empty lock object cannot strand the next contender.
+group_pause_fifo="$temporary/group-pause"
+group_command_marker="$temporary/group-command-ran"
+mkfifo "$group_pause_fifo"
+sh -c 'cd "$1" && exec env DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_GROUP_TRAPS="$2" ./scripts/with-local-ci-lease.sh "$3" "$4"' \
+    local-ci-group-abort "$first" "$group_pause_fifo" "$short_command" "$group_command_marker" \
+    2>"$temporary/group-abort.stderr" &
+group_wrapper_pid=$!
+background_pids="$background_pids $group_wrapper_pid"
+group_pid_file="$common_dir/.dark-factory-local-ci-group-$group_wrapper_pid"
+group_release_fifo="$common_dir/.dark-factory-local-ci-release-$group_wrapper_pid"
+wait_for_file "$group_pid_file"
+group_child_pid=$(cat "$group_pid_file")
+case "$group_child_pid" in
+    ''|*[!0-9]*) fail "group startup abort: handshake did not contain a numeric child PID" ;;
+esac
+kill -TERM "$group_wrapper_pid"
+wait_terminated "group startup abort" "$group_wrapper_pid"
+kill -0 "$group_child_pid" 2>/dev/null \
+    && fail "group startup abort left its direct session leader alive"
+assert_absent "$group_pid_file"
+assert_absent "$group_release_fifo"
+assert_absent "$group_command_marker"
+acquire_and_release() {
+    worktree=$1
+    marker=$2
+    (
+        cd "$worktree"
+        ./scripts/with-local-ci-lease.sh "$short_command" "$marker"
+    )
+}
+acquire_and_release "$second" "$temporary/group-abort-recovered"
 
 # A holder publishes an identity-bound directory marker only after it owns
 # lockf. Kill that holder at the narrow post-lockf seam; a waiter must not
@@ -312,15 +371,6 @@ start_stale_holder() {
     ) &
     last_holder_pid=$!
     background_pids="$background_pids $last_holder_pid"
-}
-
-acquire_and_release() {
-    worktree=$1
-    marker=$2
-    (
-        cd "$worktree"
-        ./scripts/with-local-ci-lease.sh "$short_command" "$marker"
-    )
 }
 
 # Interruption cleanup must kill descendants before deleting the throwaway
