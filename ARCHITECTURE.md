@@ -63,9 +63,14 @@ catalogue.
    delivery durably, synchronously, as part of handling that exact hook
    request; a session already `working`/`waiting_for_input` is instead
    delivered via its `Stop`/`SubagentStop` hook's block-reply contract. A
-   single pending-delivery slot per agent keeps the dispatcher's PTY-typed
-   path and a hook-reply delivery from ever composing and delivering the
-   same task or messages twice. `factoryd`'s own restart never stops a
+   delivery attempt row stores the exact prompt, task incarnation, prior
+   run count, and message identities. Retry state is durable: a daemon
+   restart consumes an interrupted in-flight attempt, and only an explicit
+   operator resume resets a terminal attempt. The hook must match that
+   stored prompt exactly before acknowledging it, so a stale hook cannot
+   recompose a newer queue head. A single pending-delivery slot per agent
+   keeps the dispatcher's PTY-typed path and a hook-reply delivery from ever
+   composing and delivering the same task or messages twice. `factoryd`'s own restart never stops a
    session: `factory-runner` is a detached process tree — spawned as its
    own process-group leader, and the launchd job abandons its group, so a
    group-wide signal to the daemon (launchd's `bootout`, a terminal's
@@ -277,8 +282,8 @@ protocol version mismatches are rejected rather than silently dropping policy
 fields. This PR does not implement the human authorization boundary for agent
 creation; that remains #133/#127.
 
-The separate resumed-Codex delivery failure remains tracked by
-[#158](https://github.com/baziyer/dark-factory/issues/158): live evidence shows
+The resumed-Codex delivery lifecycle repair is tracked by
+[#170](https://github.com/baziyer/dark-factory/issues/170): live evidence shows
 that after a clean stop and provider-thread resume, a completed task followed
 by a newly assigned task can reach `delivery unacknowledged` without creating
 a run or typing the new task body. Its regression shape is completed task →
@@ -308,6 +313,10 @@ the acceptance condition is the new task body entering a running task.
   is never typed into the still-live session; the dispatcher waits for the
   terminal event and then starts the successor, resuming the provider thread
   when its capabilities support that. A delivery with no provider hook is
-  retried once after a bounded delay; if it still cannot be acknowledged, the
-  session remains durably `waiting_for_input` with `delivery unacknowledged`
-  so recovery is truthful rather than an invisible queue wedge.
+  retried once after a durable bounded delay; if it still cannot be
+  acknowledged, the session remains durably `waiting_for_input` with
+  `delivery unacknowledged` and the terminal attempt remains recoverable by
+  an explicit resume, so recovery is truthful rather than an invisible queue
+  wedge. Stop admission shares the per-agent delivery slot and persists stop
+  intent before signalling the runner, so no admitted delivery can open a
+  later run after stop wins.

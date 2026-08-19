@@ -57,10 +57,11 @@ tty.setraw(sys.stdin.fileno())
 hook("SessionStart", {"session_id": thread_id})
 
 # A resumed provider can expose a raw terminal before its prior thread's
-# composer is ready. The first two bounded deliveries intentionally model the
+# composer is ready. The first bounded delivery intentionally models the
 # observed no-prompt/no-run loss; the daemon's one outer retry must recover.
-ignored_resumed_deliveries = 2 if resumed else 0
+ignored_resumed_deliveries = 1 if resumed else 0
 buffer = ""
+prompt_log = os.path.join(os.path.dirname(token), "fake-codex-prompts.jsonl")
 while True:
     data = os.read(sys.stdin.fileno(), 1)
     if not data:
@@ -68,10 +69,16 @@ while True:
     character = data.decode("utf-8", errors="replace")
     if character == "\r":
         text = buffer
-        buffer = ""
         if resumed and ignored_resumed_deliveries:
             ignored_resumed_deliveries -= 1
+            # The live failure leaves the exact pasted prompt in the
+            # provider's input buffer. A recovery bare CR submits that same
+            # prompt; it must not cause a second prompt body to be typed.
             continue
+        buffer = ""
+        if prompt_log:
+            with open(prompt_log, "a", encoding="utf-8") as log:
+                log.write(json.dumps(text) + "\n")
         hook("UserPromptSubmit", {"prompt": text})
         hook("PreToolUse", {"tool_name": "Bash"})
         hook("PostToolUse", {"tool_name": "Bash"})

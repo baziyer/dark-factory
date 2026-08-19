@@ -7,7 +7,7 @@ use std::{
 
 use factory_core::{AgentId, EventEnvelope};
 use thiserror::Error;
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast};
+use tokio::sync::{broadcast, Mutex as AsyncMutex, OwnedMutexGuard};
 
 use crate::store::{Store, StoreError};
 
@@ -21,40 +21,21 @@ pub struct DaemonState {
     /// path (`execution.rs`'s `deliver_pending`, `Handle::start_task`, and
     /// `stop_hook_reply`): whichever composes a delivery first holds the
     /// agent's slot until it acks/times out/commits, so a second delivery
-    /// attempt racing the same agent (the dispatcher's tick-driven
-    /// `deliver_pending` racing a `Stop` hook's own inline
-    /// `stop_hook_reply` -- both see the session go `idle` at the same
-    /// instant, since `record_hook_event`'s `Stop` arm always flips state
-    /// to `idle` *before* `local_api.rs` calls `stop_hook_reply`) finds the
-    /// slot held and skips instead of independently recomposing and
-    /// redelivering the same task/messages (this track's item 1; see
-    /// `Store::open_run_episode`'s `has_open` check for why a *second*
-    /// task delivery is merely rejected rather than silently duplicated,
-    /// and why that alone was not enough -- an agent inbox message has no
-    /// equivalent guard, so two concurrent `compose_delivery` calls could
-    /// each read the same undelivered messages and each type/reply them
-    /// before either committed).
+    /// attempt racing the same agent finds the slot held and skips instead
+    /// of independently recomposing and redelivering the same work.
     ///
     /// Never pruned: bounded by the number of agents that have ever
-    /// attempted a delivery in this daemon's lifetime, which is small
-    /// relative to daemon uptime memory budgets and never grows within one
-    /// agent's lifetime (one `Arc<AsyncMutex<()>>` reused for every
-    /// delivery attempt).
+    /// attempted a delivery in this daemon's lifetime.
     delivery_slots: Arc<Mutex<HashMap<AgentId, Arc<AsyncMutex<()>>>>>,
     /// Assignment mutations are infrequent and must be serialized with the
-    /// owner delivery barrier. A bounded gate is simpler and safer than a
-    /// registry keyed by an unbounded stream of task IDs.
+    /// owner delivery barrier.
     assignment_gate: Arc<AsyncMutex<()>>,
     /// All repository mutations pass through one daemon-owned committer.
-    /// Read-only status/diff operations share this lock too, so their output
-    /// is never captured halfway through a commit or push.
     repository_slot: Arc<AsyncMutex<()>>,
 }
 
 /// Held for the duration of one delivery attempt (compose through commit,
-/// or compose through a timed-out ack); dropping it (however the holder
-/// returns -- success, ack timeout, or error) frees the agent's slot for
-/// the next attempt. See [`DaemonState::try_delivery_slot`].
+/// or compose through a timed-out ack); dropping it frees the agent's slot.
 pub struct DeliverySlot {
     _guard: OwnedMutexGuard<()>,
 }
@@ -87,13 +68,7 @@ impl DaemonState {
     }
 
     /// Attempts to claim `agent_id`'s single pending-delivery slot,
-    /// returning `None` (skip this delivery attempt) if another one is
-    /// already in flight. Non-blocking by design: a delivery attempt that
-    /// loses the race must not queue up behind the winner (that would
-    /// still redeliver once it got its turn, since the winner's commit
-    /// already satisfied the same pending work) -- it simply defers to
-    /// whatever the current holder is doing, exactly like a wake trigger
-    /// that arrives while the dispatcher is already busy with that agent.
+    /// returning `None` if another attempt is already in flight.
     #[must_use]
     pub fn try_delivery_slot(&self, agent_id: &AgentId) -> Option<DeliverySlot> {
         let lock = self.delivery_lock(agent_id);
@@ -103,16 +78,15 @@ impl DaemonState {
     }
 
     /// Waits for the owner-side delivery barrier. Assignment changes use
-    /// this blocking form so a task cannot be moved while the old worker's
-    /// delivery is composing, typing, awaiting its hook, or committing.
+    /// this blocking form so a task cannot move while delivery is composing,
+    /// typing, awaiting its hook, or committing.
     pub async fn lock_delivery_slot(&self, agent_id: &AgentId) -> DeliverySlot {
         DeliverySlot {
             _guard: self.delivery_lock(agent_id).lock_owned().await,
         }
     }
 
-    /// Serializes all assignment mutations, including moves between workers
-    /// and moves to the project backlog.
+    /// Serializes all assignment mutations, including moves to the backlog.
     pub async fn lock_assignment_slot(&self) -> OwnedMutexGuard<()> {
         Arc::clone(&self.assignment_gate).lock_owned().await
     }
@@ -130,19 +104,7 @@ impl DaemonState {
     }
 
     /// `true` if another delivery attempt currently holds `agent_id`'s
-    /// pending-delivery slot -- a non-claiming peek, immediately releasing
-    /// the slot again if it happens to be free (see [`Self::try_delivery_slot`]).
-    ///
-    /// Used by `execution::commit_pending_delivery_on_prompt` to decide
-    /// whether a `UserPromptSubmit` hook is plausibly the ack for an
-    /// in-flight PTY-typed delivery (slot held by `deliver_pending`/
-    /// `Handle::start_task`, so yes, safe to commit whatever they just
-    /// typed right now) versus an operator's or provider's own unrelated
-    /// prompt with no delivery attempt behind it at all (slot free -- a
-    /// pending task must not be silently auto-attached to whatever the
-    /// operator happened to be typing; that task's own real delivery
-    /// still goes through the ordinary idle-dispatch or Stop-hook
-    /// block-reply path, untouched by this).
+    /// pending-delivery slot.
     #[must_use]
     pub fn delivery_in_flight(&self, agent_id: &AgentId) -> bool {
         self.try_delivery_slot(agent_id).is_none()
@@ -224,8 +186,6 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished(), "move crossed the in-flight delivery");
         drop(assignment);
-        // The move still cannot pass until the old worker's prompt/commit
-        // has released its delivery barrier.
         tokio::task::yield_now().await;
         assert!(!waiter.is_finished());
         drop(delivery);

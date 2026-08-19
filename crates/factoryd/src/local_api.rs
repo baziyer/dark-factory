@@ -278,7 +278,8 @@ impl ApiFailure {
                 | StoreError::AgentRunHasDependents
                 | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun
-                | StoreError::RunNotStoppable),
+                | StoreError::RunNotStoppable
+                | StoreError::SessionStopping),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -317,7 +318,8 @@ impl From<execution::Error> for ApiFailure {
                 | StoreError::TaskAssignmentMismatch
                 | StoreError::AgentUnavailable
                 | StoreError::SessionNotFound
-                | StoreError::SessionNotLive),
+                | StoreError::SessionNotLive
+                | StoreError::SessionStopping),
             )) => Self::Store(error),
             _ => Self::Internal("execution manager could not accept the task".into()),
         }
@@ -1491,9 +1493,35 @@ async fn handle_request(
             }
             let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
+            let session = state
+                .with_store(move |store| {
+                    store.run_session_snapshot(&lookup_project_id, &lookup_run_id)
+                })
+                .await?;
+            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
+            let stop_project_id = project_id.clone();
+            let stop_run_id = run_id.clone();
+            let _run = state
+                .commit_and_publish(move |store| {
+                    let (run, event) =
+                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
+                    Ok((run, vec![event]))
+                })
+                .await?;
+            let session_project_id = project_id.clone();
+            let session_id = session.id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (session, event) =
+                        store.request_session_stop(&session_project_id, &session_id, now_ms()?)?;
+                    Ok((session, vec![event]))
+                })
+                .await?;
+            let target_project_id = project_id.clone();
+            let target_run_id = run_id.clone();
             let target = state
                 .with_store(move |store| {
-                    store.run_control_target(&lookup_project_id, &lookup_run_id)
+                    store.run_control_target(&target_project_id, &target_run_id)
                 })
                 .await?;
             let control_run_id = run_id.clone();
@@ -1505,35 +1533,6 @@ async fn handle_request(
             .stop(grace_ms)
             .await
             .map_err(|error| runner_control_failure(error, "stop"))?;
-            let stop_project_id = project_id.clone();
-            let stop_run_id = run_id.clone();
-            let run = state
-                .commit_and_publish(move |store| {
-                    let (run, event) =
-                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
-                    Ok((run, vec![event]))
-                })
-                .await?;
-            // A run's process *is* its session's: `StopRun` kills the same
-            // runner `StopSession` would (above), so it must also record
-            // stop intent on the session, not just the run -- otherwise
-            // `end_session` (fired once the runner actually exits) cannot
-            // tell this apart from a crash and would wrongly close the
-            // episode `failed`/`session_ended` instead of
-            // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
-            if let Some(session_id) = run.session_id.clone() {
-                let session_project_id = project_id.clone();
-                let _ = state
-                    .commit_and_publish(move |store| {
-                        let (session, event) = store.request_session_stop(
-                            &session_project_id,
-                            &session_id,
-                            now_ms()?,
-                        )?;
-                        Ok((session, vec![event]))
-                    })
-                    .await;
-            }
             Ok(LocalResponse::RunStopped { run_id })
         }
         LocalRequest::CancelRun { project_id, run_id } => {
@@ -1614,6 +1613,9 @@ async fn handle_request(
             // backoff/streak slate rather than being immediately eligible
             // to re-trip the same pause on its very next deadline.
             execution.resume_backoff(&wake_agent_id);
+            execution
+                .reset_delivery_attempt(&wake_project_id, &wake_agent_id)
+                .await?;
             execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentResumed { agent })
         }
@@ -1646,20 +1648,20 @@ async fn handle_request(
             }
             let lookup_project_id = project_id.clone();
             let lookup_session_id = session_id.clone();
+            let session = state
+                .with_store(move |store| {
+                    store.session_snapshot(&lookup_project_id, &lookup_session_id)
+                })
+                .await?;
+            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
+            let target_project_id = project_id.clone();
+            let target_session_id = session_id.clone();
             let target = state
                 .with_store(move |store| {
-                    store.session_control_target(&lookup_project_id, &lookup_session_id)
+                    store.session_control_target(&target_project_id, &target_session_id)
                 })
                 .await?;
             let control_run_id = session_control_run_id(&session_id)?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
             let stop_project_id = project_id.clone();
             let stop_session_id = session_id.clone();
             state
@@ -1672,6 +1674,14 @@ async fn handle_request(
                     Ok((session, vec![event]))
                 })
                 .await?;
+            RunnerClient::new(
+                &target.runner_runtime,
+                control_run_id,
+                target.runner_instance_id,
+            )
+            .stop(grace_ms)
+            .await
+            .map_err(|error| runner_control_failure(error, "stop"))?;
             Ok(LocalResponse::SessionStopped { session_id })
         }
         LocalRequest::ProviderHook {
@@ -1689,7 +1699,7 @@ async fn handle_request(
                 .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
-            let session_id = session.id;
+            let session_id = session.id.clone();
             let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
             let policy_decision = (event == ProviderHookEvent::PreToolUse)
                 .then(|| crate::policy::decide(&payload, Path::new(&session.worktree)));
@@ -1709,6 +1719,21 @@ async fn handle_request(
             } else {
                 false
             };
+            if event == ProviderHookEvent::UserPromptSubmit {
+                // Bind and commit the exact durable delivery before
+                // publishing the hook event. The ack waiter then observes
+                // `acknowledged`, never merely an unrelated prompt event.
+                if execution.try_begin_agent_write(&agent_id) {
+                    let result = execution::commit_pending_delivery_on_prompt(
+                        state,
+                        &session.snapshot(),
+                        &payload,
+                    )
+                    .await;
+                    execution.end_agent_write(&agent_id);
+                    result?;
+                }
+            }
             let record_session_id = session_id.clone();
             let updated_session = state
                 .commit_and_publish(move |store| {
@@ -1793,27 +1818,6 @@ async fn handle_request(
             } else {
                 serde_json::json!({})
             };
-            if event == ProviderHookEvent::UserPromptSubmit {
-                // Commit any pending PTY-typed delivery *now*, before this
-                // hook request's own reply reaches the client -- closes a
-                // race a fast-reacting client can otherwise win against
-                // the dispatcher's own separate ack-detection/commit
-                // (`execution::commit_pending_delivery_on_prompt`'s own
-                // doc comment has the full story; this track's item 1).
-                // Same deletion gate as the stop-hook reply above, and the
-                // same silent-decline reasoning: `compose_delivery` inside
-                // it can lazily recreate guidance files too.
-                if execution.try_begin_agent_write(&agent_id) {
-                    let result = execution::commit_pending_delivery_on_prompt(
-                        state,
-                        guidance_root,
-                        &updated_session,
-                    )
-                    .await;
-                    execution.end_agent_write(&agent_id);
-                    result?;
-                }
-            }
             if event == ProviderHookEvent::SessionStart {
                 // Codex reports its own thread id back in this hook's
                 // payload (a Claude-shaped `session_id` field -- its
