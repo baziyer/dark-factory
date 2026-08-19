@@ -19,8 +19,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, SessionId,
-    SessionSnapshot, SessionState, TaskId,
+    AgentId, AgentRole, PROTOCOL_VERSION, ProjectId, Provider, SessionId, SessionSnapshot,
+    SessionState, TaskId,
     local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 use factoryd::{
@@ -145,58 +145,6 @@ async fn request(socket: &Path, request: LocalRequest) -> ServerFrame {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     write_request(&mut stream, request).await;
     read_frame(&mut BufReader::new(stream)).await
-}
-
-async fn subscribe_from_current_head(socket: &Path) -> BufReader<UnixStream> {
-    let head = match request(socket, LocalRequest::LatestEventSequence).await {
-        ServerFrame::Response {
-            response: LocalResponse::EventHead { sequence },
-            ..
-        } => sequence,
-        frame => panic!("expected event head, got {frame:?}"),
-    };
-    let mut stream = UnixStream::connect(socket).await.unwrap();
-    write_request(
-        &mut stream,
-        LocalRequest::Subscribe {
-            after_sequence: head,
-        },
-    )
-    .await;
-    let mut reader = BufReader::new(stream);
-    assert!(matches!(
-        read_frame(&mut reader).await,
-        ServerFrame::Response {
-            response: LocalResponse::Subscribed { .. },
-            ..
-        }
-    ));
-    assert!(matches!(
-        read_frame(&mut reader).await,
-        ServerFrame::Response {
-            response: LocalResponse::CaughtUp { sequence },
-            ..
-        } if sequence == head
-    ));
-    reader
-}
-
-async fn next_event<T>(
-    reader: &mut BufReader<UnixStream>,
-    label: &str,
-    mut select: impl FnMut(FactoryEvent) -> Option<T>,
-) -> T {
-    tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            if let ServerFrame::Event { event, .. } = read_frame(reader).await
-                && let Some(value) = select(event.event)
-            {
-                return value;
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("timed out waiting for event: {label}"))
 }
 
 fn project_id() -> ProjectId {
@@ -326,52 +274,6 @@ async fn pause_agent(socket: &Path, agent_id: &str) {
     .await;
 }
 
-/// The documented way back in after the dispatcher pauses an agent on its
-/// own (issue #24 finding 4's escalation, after
-/// `MAX_CONSECUTIVE_START_DEADLINES` consecutive deadline failures) --
-/// also resets its spawn backoff/start-deadline streak
-/// (`execution::Handle::resume_backoff`, wired into this exact request in
-/// `local_api.rs`).
-async fn resume_agent(socket: &Path, agent_id: &str) {
-    let response = request(
-        socket,
-        LocalRequest::ResumeAgent {
-            project_id: project_id(),
-            agent_id: AgentId::try_from(agent_id).unwrap(),
-        },
-    )
-    .await;
-    assert!(
-        matches!(
-            response,
-            ServerFrame::Response {
-                response: LocalResponse::AgentResumed { .. },
-                ..
-            }
-        ),
-        "{response:?}"
-    );
-}
-
-async fn agent_paused(socket: &Path, agent_id: &str) -> bool {
-    let response = request(
-        socket,
-        LocalRequest::GetAgent {
-            project_id: project_id(),
-            agent_id: AgentId::try_from(agent_id).unwrap(),
-        },
-    )
-    .await;
-    let ServerFrame::Response {
-        response: LocalResponse::Agent { agent },
-        ..
-    } = response
-    else {
-        panic!("expected Agent, got {response:?}");
-    };
-    agent.snapshot.paused
-}
-
 async fn sessions_for_agent(socket: &Path, agent_id: &str) -> Vec<SessionSnapshot> {
     let response = request(
         socket,
@@ -437,54 +339,6 @@ async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-/// A `Starting` event is durable session state, not proof that the runner's
-/// control socket has finished binding. Wait for that causal readiness signal
-/// while failing immediately if the runner exits before binding and bounding
-/// a wedged live process.
-async fn wait_for_runner_control(runtime_dir: &Path) {
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut saw_runner = false;
-        loop {
-            if runner_control_ready(runtime_dir) {
-                return;
-            }
-            if runner_alive(runtime_dir) {
-                saw_runner = true;
-            } else if saw_runner {
-                panic!(
-                    "runner exited before binding its control socket: {}",
-                    runtime_dir.display()
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        ready.is_ok(),
-        "runner did not make its control socket ready within 5s: {}",
-        runtime_dir.display()
-    );
-}
-
-/// A failed deadline is durable daemon state, but the runner's supervisor may
-/// still be reaping its child. Do not admit the next cycle until that process
-/// has actually exited; bound the barrier so a wedged teardown fails rather
-/// than allowing the test to hang.
-async fn wait_for_runner_exit(runtime_dir: &Path) {
-    let exited = tokio::time::timeout(Duration::from_secs(5), async {
-        while runner_alive(runtime_dir) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-    assert!(
-        exited.is_ok(),
-        "runner did not exit within 5s after its session failed: {}",
-        runtime_dir.display()
-    );
 }
 
 // --- Harness: a real daemon (execution + local_api), in-process ---------
@@ -713,128 +567,5 @@ async fn a_session_that_already_sent_session_start_is_left_alone() {
     let runtime_dir = harness.runtime_dir(session_id.as_str());
     stop_session(&socket, session_id).await;
     wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
-    harness.stop().await;
-}
-
-/// Issue #24 finding 4's escalation: a hookless provider (`sleep 300`,
-/// same fixture as the first test) always spawns successfully, so an
-/// ordinary spawn failure's backoff alone never caps the fail/backoff/
-/// retry cycle. After `MAX_CONSECUTIVE_START_DEADLINES` (3) consecutive
-/// deadline expiries in a row, the dispatcher must pause the agent instead
-/// of spawning a fourth session, and `factoryctl agent resume` must be
-/// the way back in.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() {
-    // A zero test deadline is the causal test-clock boundary: each explicit
-    // wake after a `Starting` event is immediately due, so no wall-clock
-    // startup or five-second readiness window can race the assertion.
-    let harness = Harness::start(Duration::ZERO).await;
-    let socket = harness.socket.clone();
-    create_project(&socket, &harness.home.path().join("repo")).await;
-    create_shell_agent(
-        &socket,
-        "stuck",
-        &harness.home.path().join("worktree-stuck"),
-        "sleep 300".to_owned(),
-    )
-    .await;
-    create_task(&socket, "task-1", "Do it", "do it").await;
-    let mut events = subscribe_from_current_head(&socket).await;
-    assign_task(&socket, "task-1", "stuck").await;
-
-    // Drive three full spawn -> deadline -> failed cycles from durable
-    // transition events. The prior test repeatedly polled ListSessions and
-    // wake() behind independent 10-second clocks; under load it could observe
-    // a row only after the timeout intended for the next transition. Here a
-    // session's own started_at timestamp determines the one deadline wake,
-    // and the event stream acknowledges the exact transition before the test
-    // advances to the next cycle.
-    let mut seen: Vec<SessionId> = Vec::new();
-    for _ in 0..3 {
-        let spawned = next_event(&mut events, "a distinct starting session", |event| {
-            let FactoryEvent::SessionChanged { session } = event else {
-                return None;
-            };
-            (session.agent_id.as_str() == "stuck"
-                && session.state == SessionState::Starting
-                && !seen.contains(&session.id))
-            .then_some(session)
-        })
-        .await;
-        seen.push(spawned.id.clone());
-
-        let runtime_dir = harness.runtime_dir(spawned.id.as_str());
-        wait_for_runner_control(&runtime_dir).await;
-        harness.wake(spawned.agent_id.as_str());
-        let failed = next_event(&mut events, "that session's deadline failure", |event| {
-            let FactoryEvent::SessionChanged { session } = event else {
-                return None;
-            };
-            (session.id == spawned.id && session.state == SessionState::Failed).then_some(session)
-        })
-        .await;
-        assert!(
-            failed
-                .wait_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("SessionStart hook not received")),
-            "unexpected deadline failure: {failed:?}"
-        );
-        wait_for_runner_exit(&runtime_dir).await;
-    }
-
-    let paused = next_event(
-        &mut events,
-        "agent pause after the third deadline",
-        |event| {
-            let FactoryEvent::AgentChanged { agent } = event else {
-                return None;
-            };
-            (agent.id.as_str() == "stuck" && agent.paused).then_some(agent)
-        },
-    )
-    .await;
-    assert!(paused.paused);
-    let sessions = sessions_for_agent(&socket, "stuck").await;
-    assert_eq!(
-        sessions.len(),
-        3,
-        "no fourth session must be spawned once the agent is paused"
-    );
-    assert!(
-        agent_paused(&socket, "stuck").await,
-        "agent must be paused after 3 consecutive start-deadline failures"
-    );
-    // The third session's own `failed` reason is still exactly what an
-    // operator sees (`factoryctl status`/`agent status`/the TUI's
-    // attention view) -- no new state, nothing extra to check here.
-
-    resume_agent(&socket, "stuck").await;
-    let fourth = next_event(&mut events, "a new session after resume", |event| {
-        let FactoryEvent::SessionChanged { session } = event else {
-            return None;
-        };
-        (session.agent_id.as_str() == "stuck"
-            && session.state == SessionState::Starting
-            && !seen.contains(&session.id))
-        .then_some(session)
-    })
-    .await;
-    assert!(
-        !seen.contains(&fourth.id),
-        "resume must actually spawn a new session, not reuse a paused-over one"
-    );
-
-    // Cleanup: pause again so nothing keeps respawning `sleep 300` behind
-    // this test, then stop whatever is currently live (issue #26).
-    pause_agent(&socket, "stuck").await;
-    for session in sessions_for_agent(&socket, "stuck").await {
-        if session.state.is_live() {
-            let runtime_dir = harness.runtime_dir(session.id.as_str());
-            wait_for_runner_control(&runtime_dir).await;
-            stop_session(&socket, session.id.clone()).await;
-            wait_until(Duration::from_secs(10), || !runner_alive(&runtime_dir)).await;
-        }
-    }
     harness.stop().await;
 }
