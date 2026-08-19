@@ -335,6 +335,13 @@ pub enum LocalRequest {
         session_id: SessionId,
         grace_ms: u64,
     },
+    /// Records that the operator has independently verified a previously
+    /// unconfirmed provider tree is gone. This is the only operation that
+    /// can release a cleanup-failed session for deletion.
+    ResolveSessionCleanup {
+        project_id: ProjectId,
+        session_id: SessionId,
+    },
     /// One `factoryctl hook` invocation, forwarded verbatim from a
     /// provider's hook subprocess. `token` is the contents of the session's
     /// `hook.token` file; `payload` is the hook's JSON body, opaque here and
@@ -569,6 +576,9 @@ pub enum LocalResponse {
         next_after_id: Option<SessionId>,
     },
     SessionStopped {
+        session_id: SessionId,
+    },
+    SessionCleanupResolved {
         session_id: SessionId,
     },
     /// The `reply` JSON is printed verbatim to stdout by `factoryctl hook`.

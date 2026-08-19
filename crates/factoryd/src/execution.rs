@@ -3916,8 +3916,8 @@ mod tests {
             .unwrap();
         assert!(session.state.is_live());
         assert_eq!(
-            session.activity.as_deref(),
-            Some(factory_core::CLEANUP_FAILED_ACTIVITY)
+            session.cleanup_state,
+            factory_core::SessionCleanupState::Failed
         );
         assert!(matches!(
             state

@@ -192,7 +192,11 @@ pub fn attention_items(
                     agent_id: Some(agent.id.clone()),
                     task_id: None,
                     session_id: Some(session.id.clone()),
-                    since_ms: session.state_since_ms,
+                    since_ms: if session.cleanup_state == crate::SessionCleanupState::Failed {
+                        session.observer_health_since_ms
+                    } else {
+                        session.state_since_ms
+                    },
                     detail: session
                         .wait_reason
                         .clone()
@@ -282,7 +286,9 @@ pub fn sort_attention(items: &mut [AttentionItem]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentRole, ObserverHealth, Provider, SessionState, TaskStatus};
+    use crate::{
+        AgentRole, ObserverHealth, Provider, SessionCleanupState, SessionState, TaskStatus,
+    };
 
     fn agent(id: &str, paused: bool) -> AgentSnapshot {
         AgentSnapshot {
@@ -311,6 +317,7 @@ mod tests {
             runtime_permission_mode: None,
             runtime_control_mode: None,
             state,
+            cleanup_state: SessionCleanupState::None,
             state_since_ms: since,
             worktree: "/w".to_owned(),
             provider_session_id: None,
@@ -455,7 +462,7 @@ mod tests {
     fn cleanup_failed_live_session_is_shared_failed_attention() {
         let project = ProjectId::try_from("p").unwrap();
         let mut cleanup = session(SessionState::Idle, 1);
-        cleanup.activity = Some(crate::CLEANUP_FAILED_ACTIVITY.to_owned());
+        cleanup.cleanup_state = crate::SessionCleanupState::Failed;
         cleanup.wait_reason = Some("provider cleanup was not confirmed".to_owned());
         let items = attention_items(
             &project,

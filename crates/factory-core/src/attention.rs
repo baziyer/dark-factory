@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CLEANUP_FAILED_ACTIVITY, RunSnapshot, RunStatus, SessionSnapshot, SessionState, TaskStatus,
+    RunSnapshot, RunStatus, SessionCleanupState, SessionSnapshot, SessionState, TaskStatus,
 };
 
 /// How urgently something wants the operator's attention, ranked low to high. `Ord`/`PartialOrd`
@@ -78,7 +78,7 @@ pub const fn session_attention(state: SessionState) -> Attention {
 /// deletion safety but must still route the operator to it as failed.
 #[must_use]
 pub fn session_snapshot_attention(session: &SessionSnapshot) -> Attention {
-    if session.activity.as_deref() == Some(CLEANUP_FAILED_ACTIVITY) {
+    if session.cleanup_state == SessionCleanupState::Failed {
         Attention::Failed
     } else {
         session_attention(session.state)

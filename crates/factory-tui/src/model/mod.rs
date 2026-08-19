@@ -541,6 +541,10 @@ impl Board {
                 PendingAction::StopSession { .. } | PendingAction::StopRun { .. } => {
                     "stop this agent? x/y/Enter confirms, anything else cancels".to_owned()
                 }
+                PendingAction::ResolveSessionCleanup { .. } => {
+                    "verify no provider descendants remain, then resolve? y/Enter confirms"
+                        .to_owned()
+                }
             },
             Mode::Prompt(prompt) => format!(
                 "{}: type to edit, Tab/Enter next field, Esc cancels",

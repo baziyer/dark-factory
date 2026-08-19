@@ -248,6 +248,10 @@ impl ApiFailure {
                 | StoreError::ProjectHasActiveRun
                 | StoreError::RunNotStoppable),
             ) => (ErrorCode::Conflict, error.to_string()),
+            Self::Store(
+                error
+                @ (StoreError::SessionCleanupUnverified | StoreError::SessionCleanupNotFailed),
+            ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
             }
@@ -1559,6 +1563,22 @@ async fn handle_request(
             wait_for_session_stop(state, &project_id, &session_id).await?;
             Ok(LocalResponse::SessionStopped { session_id })
         }
+        LocalRequest::ResolveSessionCleanup {
+            project_id,
+            session_id,
+        } => {
+            let response_session_id = session_id.clone();
+            state
+                .commit_and_publish(move |store| {
+                    let (session, events) =
+                        store.resolve_session_cleanup(&project_id, &session_id, now_ms()?)?;
+                    Ok((session, events))
+                })
+                .await?;
+            Ok(LocalResponse::SessionCleanupResolved {
+                session_id: response_session_id,
+            })
+        }
         LocalRequest::ProviderHook {
             token,
             event,
@@ -1572,6 +1592,12 @@ async fn handle_request(
                 .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
                 .await?
                 .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
+            if session.cleanup_state == factory_core::SessionCleanupState::Failed {
+                return Err(ApiFailure::Conflict(
+                    "provider cleanup is unverified; hook ignored until the operator verifies it"
+                        .into(),
+                ));
+            }
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
             let session_id = session.id;
@@ -3070,7 +3096,7 @@ async fn wait_for_session_stop(
             if !snapshot.state.is_live() {
                 return Ok(());
             }
-            if snapshot.activity.as_deref() == Some(factory_core::CLEANUP_FAILED_ACTIVITY) {
+            if snapshot.cleanup_state == factory_core::SessionCleanupState::Failed {
                 return Err(ApiFailure::Conflict(
                     snapshot
                         .wait_reason

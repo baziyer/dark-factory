@@ -39,6 +39,13 @@ daemon restart/recovery is the behavior under test; it must reconnect, then
 perform the same cleanup handshake before returning. Never replace this with a
 fixed sleep or a bare `daemon.stop()`.
 
+If a runner disappears before cleanup is proven, the session remains owned and
+visible as a cleanup failure across daemon restart. Tests must exercise that
+state through recovery and resolve it only through the explicit operator
+verification API after checking the fixture's private runtime. Process-sensitive
+tests also audit and remove only runners descended from their own temporary
+runtime at teardown; they must not use process-name or host-wide signalling.
+
 ### Developing the daemon without disrupting a running factory
 
 Never point a development build at `~/.dark-factory` or the installed

@@ -155,6 +155,10 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
         PendingAction::StopRun { run_id, .. } => {
             ("stop agent?".to_owned(), format!("stop run {run_id}?"))
         }
+        PendingAction::ResolveSessionCleanup { session_id, .. } => (
+            "resolve provider cleanup?".to_owned(),
+            format!("verify no descendants remain for session {session_id}, then confirm"),
+        ),
     };
     let rect = centered_rect(area, 56, 5);
     frame.render_widget(Clear, rect);

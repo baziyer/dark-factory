@@ -1,11 +1,11 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentBudget, AgentId, AgentRole, AgentSnapshot, CLEANUP_FAILED_ACTIVITY, EventEnvelope,
-    FactoryEvent, MessageId, ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
-    Provider, ProviderHookEvent, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
-    RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
-    TaskStatus,
+    AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
+    ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
+    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId,
+    SessionCleanupState, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    TaskSnapshot, TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
@@ -26,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 22;
+const SCHEMA_VERSION: i64 = 23;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -310,6 +310,7 @@ pub struct SessionRow {
     pub codex_home: Option<String>,
     pub hook_token: String,
     pub state: SessionState,
+    pub cleanup_state: SessionCleanupState,
     pub state_since_ms: i64,
     /// Bounded free-text activity label (e.g. `"tool: Read"`), durable but
     /// not yet part of `SessionSnapshot`.
@@ -349,6 +350,7 @@ impl SessionRow {
             runtime_permission_mode: self.runtime_permission_mode.clone(),
             runtime_control_mode: self.runtime_control_mode.clone(),
             state: self.state,
+            cleanup_state: self.cleanup_state,
             state_since_ms: self.state_since_ms,
             worktree: self.worktree.clone(),
             provider_session_id: self.provider_session_id.clone(),
@@ -494,6 +496,10 @@ pub enum StoreError {
     SessionAlreadyLive,
     #[error("session is not live")]
     SessionNotLive,
+    #[error("provider cleanup is unverified; run the explicit cleanup verification first")]
+    SessionCleanupUnverified,
+    #[error("session does not need cleanup verification")]
+    SessionCleanupNotFailed,
     #[error("session hook token is invalid")]
     InvalidHookToken,
     #[error("run is not in the required state")]
@@ -1313,6 +1319,9 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
+        }
 
         let mut state = session.state;
         let mut next_activity = session.activity.clone();
@@ -1602,6 +1611,9 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
+        }
         let operator_stopped = session.stop_requested_at_ms.is_some();
         let graceful = operator_stopped || (exit_code == Some(0) && exit_signal.is_none());
         let state = if graceful {
@@ -1667,6 +1679,71 @@ impl Store {
             events.extend(closed.events);
         }
 
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        events.push(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event: changed,
+        });
+        transaction.commit()?;
+        Ok((snapshot, events))
+    }
+
+    /// Resolves a live cleanup failure only after an operator has verified
+    /// that the provider tree is gone. This is the sole transition out of
+    /// the durable failed ownership state; it closes the session and its
+    /// open run in one transaction, so deletion cannot race a half-resolved
+    /// row. The terminal session remains marked `verified` for auditability.
+    pub fn resolve_session_cleanup(
+        &mut self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        if session.cleanup_state != SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupNotFailed);
+        }
+        let reason = "operator verified provider cleanup after an unconfirmed runner exit";
+        transaction.execute(
+            "UPDATE sessions
+             SET cleanup_state = 'verified', state = 'failed', state_since_ms = ?1,
+                 updated_at_ms = ?1, ended_at_ms = ?1, activity = NULL,
+                 activity_inferred = 0, wait_reason = ?2, observer_health = 'degraded',
+                 observer_health_since_ms = ?1, exit_code = NULL, exit_signal = NULL
+             WHERE id = ?3 AND cleanup_state = 'failed' AND ended_at_ms IS NULL",
+            params![now_ms, reason, session_id.as_str()],
+        )?;
+        let mut events = Vec::new();
+        if let Some(run_id) = session.current_run_id {
+            let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
+            let closed = close_run_in_transaction(
+                &transaction,
+                &run,
+                RunStatus::Failed,
+                RunClosedBy::SessionEnded,
+                Some(RunFailureReason::Unverifiable),
+                TaskStatus::Failed,
+                None,
+                None,
+                now_ms,
+            )?;
+            events.extend(closed.events);
+        }
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
         let changed = FactoryEvent::SessionChanged {
@@ -1918,6 +1995,9 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
+        }
         transaction.execute(
             "UPDATE sessions
              SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
@@ -1966,11 +2046,11 @@ impl Store {
         }
         transaction.execute(
             "UPDATE sessions
-             SET activity = ?1, activity_inferred = 1,
-                 wait_reason = ?2, observer_health = 'degraded',
-                 observer_health_since_ms = ?3, updated_at_ms = ?3
-             WHERE id = ?4",
-            params![CLEANUP_FAILED_ACTIVITY, reason, now_ms, session_id.as_str()],
+             SET cleanup_state = 'failed', activity_inferred = 1,
+                 wait_reason = ?1, observer_health = 'degraded',
+                 observer_health_since_ms = ?2, updated_at_ms = ?2
+             WHERE id = ?3",
+            params![reason, now_ms, session_id.as_str()],
         )?;
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
@@ -1994,7 +2074,7 @@ impl Store {
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider, provider_session_id, worktree, runner_instance_id,
-                    runner_runtime, runner_protocol_version, observer_health, activity
+                    runner_runtime, runner_protocol_version, observer_health, cleanup_state
              FROM sessions
              WHERE ended_at_ms IS NULL
              ORDER BY project_id, started_at_ms, id",
@@ -2003,7 +2083,7 @@ impl Store {
             let provider: String = row.get(1)?;
             let protocol: i64 = row.get(6)?;
             let observer_health: String = row.get(7)?;
-            let activity: Option<String> = row.get(8)?;
+            let cleanup_state: String = row.get(8)?;
             Ok(RecoverableSession {
                 session_id: parse_id(row.get(0)?, 0)?,
                 provider: parse_provider(&provider, 1)?,
@@ -2015,7 +2095,8 @@ impl Store {
                     rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
                 })?,
                 observer_health: parse_observer_health(&observer_health, 7)?,
-                cleanup_failed: activity.as_deref() == Some(CLEANUP_FAILED_ACTIVITY),
+                cleanup_failed: parse_cleanup_state(&cleanup_state, 8)?
+                    == SessionCleanupState::Failed,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -4593,7 +4674,7 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.runtime_model, s.runtime_reasoning_effort,
                     s.runtime_permission_mode, s.runtime_control_mode,
                     s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
-                    s.state, s.state_since_ms,
+                    s.state, s.cleanup_state, s.state_since_ms,
                     s.activity, s.activity_inferred, s.wait_reason, s.observer_health,
                     s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
                     s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
@@ -4612,10 +4693,11 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
     let state: String = row.get(12)?;
-    let observer_health: String = row.get(17)?;
-    let protocol: i64 = row.get(21)?;
-    let last_hook_event: Option<String> = row.get(22)?;
-    let current_run_id: Option<String> = row.get(30)?;
+    let cleanup_state: String = row.get(13)?;
+    let observer_health: String = row.get(18)?;
+    let protocol: i64 = row.get(22)?;
+    let last_hook_event: Option<String> = row.get(23)?;
+    let current_run_id: Option<String> = row.get(31)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -4630,28 +4712,29 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         codex_home: row.get(10)?,
         hook_token: row.get(11)?,
         state: parse_session_state(&state, 12)?,
-        state_since_ms: row.get(13)?,
-        activity: row.get(14)?,
-        activity_inferred: row.get(15)?,
-        wait_reason: row.get(16)?,
-        observer_health: parse_observer_health(&observer_health, 17)?,
-        observer_health_since_ms: row.get(18)?,
-        runner_instance_id: parse_id(row.get(19)?, 19)?,
-        runner_runtime: row.get(20)?,
+        cleanup_state: parse_cleanup_state(&cleanup_state, 13)?,
+        state_since_ms: row.get(14)?,
+        activity: row.get(15)?,
+        activity_inferred: row.get(16)?,
+        wait_reason: row.get(17)?,
+        observer_health: parse_observer_health(&observer_health, 18)?,
+        observer_health_since_ms: row.get(19)?,
+        runner_instance_id: parse_id(row.get(20)?, 20)?,
+        runner_runtime: row.get(21)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(21, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(22, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 22))
+            .map(|value| parse_provider_hook_event(&value, 23))
             .transpose()?,
-        last_hook_at_ms: row.get(23)?,
-        started_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
-        ended_at_ms: row.get(26)?,
-        exit_code: row.get(27)?,
-        exit_signal: row.get(28)?,
-        stop_requested_at_ms: row.get(29)?,
-        current_run_id: parse_optional_id(current_run_id, 30)?,
+        last_hook_at_ms: row.get(24)?,
+        started_at_ms: row.get(25)?,
+        updated_at_ms: row.get(26)?,
+        ended_at_ms: row.get(27)?,
+        exit_code: row.get(28)?,
+        exit_signal: row.get(29)?,
+        stop_requested_at_ms: row.get(30)?,
+        current_run_id: parse_optional_id(current_run_id, 31)?,
     })
 }
 
@@ -5020,6 +5103,23 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         ))?;
         transaction.pragma_update(None, "user_version", 22)?;
         transaction.commit()?;
+        current = 22;
+    }
+    if current == 22 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'cleanup_state'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_present {
+            transaction
+                .execute_batch(include_str!("../migrations/0023_session_cleanup_state.sql"))?;
+        }
+        transaction.pragma_update(None, "user_version", 23)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -5290,6 +5390,12 @@ fn parse_observer_health(value: &str, column: usize) -> rusqlite::Result<Observe
 }
 
 fn parse_session_state(value: &str, column: usize) -> rusqlite::Result<SessionState> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
+fn parse_cleanup_state(value: &str, column: usize) -> rusqlite::Result<SessionCleanupState> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
     })

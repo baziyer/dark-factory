@@ -78,7 +78,7 @@ fn session_label(session: Option<&SessionSnapshot>) -> String {
     let Some(session) = session else {
         return "no session".to_owned();
     };
-    if session.activity.as_deref() == Some(factory_core::CLEANUP_FAILED_ACTIVITY) {
+    if session.cleanup_state == factory_core::SessionCleanupState::Failed {
         return format!(
             "cleanup failed: {}",
             display_text(
@@ -196,6 +196,7 @@ mod tests {
             runtime_permission_mode: None,
             runtime_control_mode: None,
             state,
+            cleanup_state: factory_core::SessionCleanupState::None,
             state_since_ms: 1,
             worktree: format!("/tmp/{agent_id}"),
             provider_session_id: None,
@@ -406,7 +407,7 @@ mod tests {
         let project_id: ProjectId = id("factory");
         let mut cleanup_agent = agent("author", Some(SessionState::Idle), 0, 0, None);
         let session = cleanup_agent.session.as_mut().unwrap();
-        session.activity = Some(factory_core::CLEANUP_FAILED_ACTIVITY.to_owned());
+        session.cleanup_state = factory_core::SessionCleanupState::Failed;
         session.wait_reason = Some("provider cleanup was not confirmed".to_owned());
         let status = FleetStatus {
             generated_at_ms: 1,

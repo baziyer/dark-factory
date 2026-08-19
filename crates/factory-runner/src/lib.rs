@@ -30,7 +30,8 @@ use factory_core::{
 use nix::sys::termios::LocalFlags;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::process::{
-    Pid, Signal, WaitOptions, kill_process_group, test_kill_process_group, waitpid,
+    Pid, Signal, WaitOptions, getpgid, kill_process_group, setpgid, test_kill_process,
+    test_kill_process_group, waitpid,
 };
 use tokio::{
     fs::{File, OpenOptions},
@@ -201,13 +202,18 @@ enum SupervisionOutcome {
 }
 
 struct ProcessGroupGuard {
-    pid: Pid,
+    group_pid: Pid,
+    sentinel_pid: Pid,
     armed: bool,
 }
 
 impl ProcessGroupGuard {
-    fn new(pid: Pid) -> Self {
-        Self { pid, armed: true }
+    fn new(group_pid: Pid, sentinel_pid: Pid) -> Self {
+        Self {
+            group_pid,
+            sentinel_pid,
+            armed: true,
+        }
     }
 
     fn disarm(&mut self) {
@@ -217,8 +223,8 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if self.armed {
-            let _ = kill_process_group(self.pid, Signal::KILL);
+        if self.armed && owned_group_is_present(self.group_pid, self.sentinel_pid) {
+            let _ = kill_process_group(self.group_pid, Signal::KILL);
         }
     }
 }
@@ -1553,6 +1559,7 @@ async fn supervise_piped(
             return Ok(SupervisionOutcome::AwaitAcknowledgement);
         }
     };
+    let (mut sentinel, sentinel_pid) = spawn_group_sentinel(None)?;
     let mut command = Command::new(&config.program);
     command
         .args(&config.arguments)
@@ -1560,11 +1567,14 @@ async fn supervise_piped(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    command.as_std_mut().process_group(0);
+    command
+        .as_std_mut()
+        .process_group(sentinel_pid.as_raw_pid());
     command.kill_on_drop(true);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
+            let _ = sentinel.start_kill();
             log.append_lifecycle(
                 RunnerEvent::SpawnFailed {
                     message: truncate_utf8(error.to_string(), MAX_RUNNER_ERROR_BYTES),
@@ -1579,11 +1589,7 @@ async fn supervise_piped(
     let child_pid = child
         .id()
         .ok_or_else(|| Error::Task("spawned child has no process ID".into()))?;
-    let pid = Pid::from_raw(
-        i32::try_from(child_pid).map_err(|_| Error::Task("child PID overflow".into()))?,
-    )
-    .ok_or_else(|| Error::Task("child PID was zero".into()))?;
-    let mut process_group = ProcessGroupGuard::new(pid);
+    let mut process_group = ProcessGroupGuard::new(sentinel_pid, sentinel_pid);
     log.append_lifecycle(RunnerEvent::Started { child_pid }, false)
         .await?;
     let stdout = child
@@ -1615,7 +1621,12 @@ async fn supervise_piped(
                     continue;
                 };
                 stop_requested = true;
-                if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
+                if let Err(error) = begin_group_termination(
+                    sentinel_pid,
+                    sentinel_pid,
+                    command.grace,
+                    &mut kill_deadline,
+                ) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
                         format!("failed to stop process group: {error}"),
@@ -1627,15 +1638,20 @@ async fn supervise_piped(
             changed = runner_shutdown.changed(), if !runner_signalled => {
                 changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
                 runner_signalled = true;
-                begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+                begin_group_termination(
+                    sentinel_pid,
+                    sentinel_pid,
+                    DEFAULT_GROUP_GRACE,
+                    &mut kill_deadline,
+                )?;
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
-                signal_process_group(pid, Signal::KILL)?;
+                signal_process_group(sentinel_pid, sentinel_pid, Signal::KILL)?;
                 kill_deadline = None;
             }
             result = &mut stdout_task.handle, if !stdout_task.finished => {
                 if let Err(error) = stdout_task.finish(result) {
-                    signal_process_group(pid, Signal::KILL)?;
+                    signal_process_group(sentinel_pid, sentinel_pid, Signal::KILL)?;
                     stderr_task.abort().await;
                     let _ = child.wait().await;
                     return Err(error);
@@ -1643,7 +1659,7 @@ async fn supervise_piped(
             }
             result = &mut stderr_task.handle, if !stderr_task.finished => {
                 if let Err(error) = stderr_task.finish(result) {
-                    signal_process_group(pid, Signal::KILL)?;
+                    signal_process_group(sentinel_pid, sentinel_pid, Signal::KILL)?;
                     stdout_task.abort().await;
                     let _ = child.wait().await;
                     return Err(error);
@@ -1658,7 +1674,9 @@ async fn supervise_piped(
         DEFAULT_GROUP_GRACE
     };
     reap_group_stragglers(
-        pid,
+        sentinel_pid,
+        sentinel_pid,
+        &mut sentinel,
         cleanup_grace,
         &mut kill_deadline,
         &mut stops,
@@ -1682,6 +1700,7 @@ async fn supervise_piped(
             ));
         }
     }
+    let _ = sentinel.wait().await?;
     log.append_lifecycle(
         RunnerEvent::Exited {
             exit_code: status.code(),
@@ -1772,12 +1791,12 @@ async fn supervise_terminal(
     let child_pid = child
         .process_id()
         .ok_or_else(|| Error::Task("spawned pty child has no process ID".into()))?;
-    drop(child);
     let pid = Pid::from_raw(
         i32::try_from(child_pid).map_err(|_| Error::Task("child PID overflow".into()))?,
     )
     .ok_or_else(|| Error::Task("child PID was zero".into()))?;
-    let mut process_group = ProcessGroupGuard::new(pid);
+    drop(child);
+    let mut process_group = ProcessGroupGuard::new(pid, pid);
     log.append_lifecycle(RunnerEvent::Started { child_pid }, false)
         .await?;
 
@@ -1818,6 +1837,9 @@ async fn supervise_terminal(
     let mut stop_requested = false;
     let mut reader_open = true;
     let mut raw_mode_pending = true;
+    let ownership = ProcessGroupSnapshot::capture(pid)?;
+    let mut ownership = ownership;
+    let mut ownership_poll = tokio::time::interval(GROUP_POLL_INTERVAL);
     let status = loop {
         tokio::select! {
             result = &mut exit_rx => {
@@ -1829,6 +1851,9 @@ async fn supervise_terminal(
                     ));
                 };
                 break status;
+            }
+            _ = ownership_poll.tick(), if test_kill_process(pid).is_ok() => {
+                ownership.refresh(pid)?;
             }
             chunk = output_rx.recv(), if reader_open => match chunk {
                 Some(bytes) => terminal_log.append(bytes).await?,
@@ -1873,7 +1898,12 @@ async fn supervise_terminal(
                     continue;
                 };
                 stop_requested = true;
-                if let Err(error) = begin_group_termination(pid, command.grace, &mut kill_deadline) {
+                if let Err(error) = begin_group_termination_legacy(
+                    pid,
+                    &ownership,
+                    command.grace,
+                    &mut kill_deadline,
+                ) {
                     let _ = command.response.send(Err(ControlError::new(
                         RunnerErrorCode::Internal,
                         format!("failed to stop process group: {error}"),
@@ -1885,10 +1915,16 @@ async fn supervise_terminal(
             changed = runner_shutdown.changed(), if !runner_signalled => {
                 changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
                 runner_signalled = true;
-                begin_group_termination(pid, DEFAULT_GROUP_GRACE, &mut kill_deadline)?;
+                begin_group_termination_legacy(
+                    pid,
+                    &ownership,
+                    DEFAULT_GROUP_GRACE,
+                    &mut kill_deadline,
+                )?;
             }
             () = wait_for_deadline(&mut kill_deadline), if kill_deadline.is_some() => {
-                signal_process_group(pid, Signal::KILL)?;
+                ownership.verify(pid)?;
+                signal_process_group_legacy(pid, Signal::KILL)?;
                 kill_deadline = None;
             }
             command = terminal_commands.recv() => {
@@ -1913,8 +1949,9 @@ async fn supervise_terminal(
     } else {
         DEFAULT_GROUP_GRACE
     };
-    reap_group_stragglers(
+    reap_group_stragglers_legacy(
         pid,
+        &ownership,
         cleanup_grace,
         &mut kill_deadline,
         &mut stops,
@@ -1959,6 +1996,121 @@ async fn supervise_terminal(
 
 fn wait_status_to_exit(status: rustix::process::WaitStatus) -> (Option<i32>, Option<i32>) {
     (status.exit_status(), status.terminating_signal())
+}
+
+/// A PTY child is a session leader, so an external sentinel cannot join its
+/// process group. Capture process start identities while the leader is alive;
+/// later group signalling is allowed only when every current member is one of
+/// those exact processes. PID/PGID reuse or an unobserved escape fails closed.
+struct ProcessGroupSnapshot {
+    starts: HashMap<i32, String>,
+    root: i32,
+    escaped: bool,
+}
+
+impl ProcessGroupSnapshot {
+    fn capture(group: Pid) -> Result<Self, Error> {
+        let processes = process_table()?;
+        let root = group.as_raw_pid();
+        Ok(Self {
+            starts: processes
+                .iter()
+                .filter(|process| process.pgid == root)
+                .map(|process| (process.pid, process.start.clone()))
+                .collect(),
+            root,
+            escaped: false,
+        })
+    }
+
+    fn verify(&self, group: Pid) -> Result<(), Error> {
+        if self.escaped {
+            return Err(Error::Task(
+                "PTY provider descendant escaped its owned process group".into(),
+            ));
+        }
+        let current = process_table()?
+            .into_iter()
+            .filter(|process| process.pgid == group.as_raw_pid())
+            .map(|process| (process.pid, process.start))
+            .collect::<HashMap<_, _>>();
+        if current
+            .iter()
+            .any(|(pid, start)| self.starts.get(pid) != Some(start))
+        {
+            return Err(Error::Task(
+                "PTY process-group ownership could not be proved".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn refresh(&mut self, group: Pid) -> Result<(), Error> {
+        let processes = process_table()?;
+        self.escaped |= descendants(&processes, self.root)
+            .iter()
+            .any(|process| process.pgid != group.as_raw_pid());
+        self.starts.extend(
+            processes
+                .into_iter()
+                .filter(|process| process.pgid == group.as_raw_pid())
+                .map(|process| (process.pid, process.start)),
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ProcessInfo {
+    pid: i32,
+    ppid: i32,
+    pgid: i32,
+    start: String,
+}
+
+fn process_table() -> Result<Vec<ProcessInfo>, Error> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,pgid=,lstart="])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Task("could not inspect the process table".into()));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<i32>().ok()?;
+            let ppid = fields.next()?.parse::<i32>().ok()?;
+            let pgid = fields.next()?.parse::<i32>().ok()?;
+            let start = fields.collect::<Vec<_>>().join(" ");
+            (!start.is_empty()).then_some(ProcessInfo {
+                pid,
+                ppid,
+                pgid,
+                start,
+            })
+        })
+        .collect())
+}
+
+fn descendants(processes: &[ProcessInfo], root: i32) -> Vec<ProcessInfo> {
+    let mut seen = HashMap::from([(root, ())]);
+    loop {
+        let before = seen.len();
+        for process in processes {
+            if seen.contains_key(&process.ppid) {
+                seen.insert(process.pid, ());
+            }
+        }
+        if seen.len() == before {
+            break;
+        }
+    }
+    processes
+        .iter()
+        .filter(|process| seen.contains_key(&process.pid))
+        .cloned()
+        .collect()
 }
 
 fn pty_reader_loop(mut reader: Box<dyn std::io::Read + Send>, output_tx: mpsc::Sender<Vec<u8>>) {
@@ -2042,12 +2194,13 @@ fn prepare_startup_stdin(input: Option<Vec<u8>>) -> Result<Stdio, Error> {
 }
 
 fn begin_group_termination(
-    pid: Pid,
+    group_pid: Pid,
+    sentinel_pid: Pid,
     grace: Duration,
     deadline: &mut Option<Pin<Box<Sleep>>>,
 ) -> Result<(), Error> {
     if deadline.is_none() {
-        signal_process_group(pid, Signal::TERM)?;
+        signal_process_group(group_pid, sentinel_pid, Signal::TERM)?;
         *deadline = Some(Box::pin(tokio::time::sleep(grace)));
     } else {
         shorten_deadline(grace, deadline);
@@ -2064,6 +2217,31 @@ fn shorten_deadline(grace: Duration, deadline: &mut Option<Pin<Box<Sleep>>>) {
     }
 }
 
+fn spawn_group_sentinel(join_group: Option<Pid>) -> Result<(tokio::process::Child, Pid), Error> {
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "trap '' TERM INT; while :; do sleep 2147483647; done"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn()?;
+    let child_pid = child
+        .id()
+        .ok_or_else(|| Error::Task("sentinel has no process ID".into()))?;
+    let sentinel_pid = Pid::from_raw(
+        i32::try_from(child_pid).map_err(|_| Error::Task("sentinel PID overflow".into()))?,
+    )
+    .ok_or_else(|| Error::Task("sentinel PID was zero".into()))?;
+    if let Some(group_pid) = join_group {
+        if let Err(error) = setpgid(Some(sentinel_pid), Some(group_pid)) {
+            let _ = child.start_kill();
+            return Err(Error::Io(error.into()));
+        }
+    }
+    Ok((child, sentinel_pid))
+}
+
 /// `EPERM` is not evidence that an owned group is gone: it means a process
 /// group with this numeric ID is still present but outside our authority (or
 /// that its ownership cannot be proved). A PGID is reusable after its leader
@@ -2075,19 +2253,151 @@ fn is_group_gone(error: rustix::io::Errno) -> bool {
     matches!(error, rustix::io::Errno::SRCH)
 }
 
-fn signal_process_group(pid: Pid, signal: Signal) -> Result<(), Error> {
-    match kill_process_group(pid, signal) {
+/// A numeric PGID is not an ownership identity once its leader exits. The
+/// runner therefore keeps one private sentinel in the group for its entire
+/// supervision window. We may signal/publish against the group only while
+/// that exact child is still present and still reports the recorded PGID.
+/// If the sentinel disappeared while another member remains, ownership is
+/// unknowable and the caller fails closed instead of risking a reused group.
+fn owned_group_is_present(group_pid: Pid, sentinel_pid: Pid) -> bool {
+    test_kill_process(sentinel_pid).is_ok()
+        && getpgid(Some(sentinel_pid)).is_ok_and(|actual| actual == group_pid)
+        && test_kill_process_group(group_pid).is_ok()
+}
+
+fn signal_process_group(group_pid: Pid, sentinel_pid: Pid, signal: Signal) -> Result<(), Error> {
+    if !owned_group_is_present(group_pid, sentinel_pid) {
+        match test_kill_process_group(group_pid) {
+            Err(error) if is_group_gone(error) => return Ok(()),
+            Err(error) => return Err(Error::Io(error.into())),
+            Ok(()) => {
+                return Err(Error::Task(
+                    "provider process-group ownership could not be proved".into(),
+                ));
+            }
+        }
+    }
+    match kill_process_group(group_pid, signal) {
         Ok(()) => Ok(()),
         Err(error) if is_group_gone(error) => Ok(()),
-        Err(error) => Err(Error::Io(error.into())),
+        Err(error) => Err(Error::Task(format!("signal owned process group: {error}"))),
     }
 }
 
-fn process_group_exists(pid: Pid) -> Result<bool, Error> {
+/// The PTY wrapper is the stable group witness. `portable-pty` itself forces
+/// every direct child into a new session, so the runner never uses a provider
+/// PID as a post-exit owner and never treats an EPERM result as proof that a
+/// numeric group is gone.
+fn signal_process_group_legacy(pid: Pid, signal: Signal) -> Result<(), Error> {
+    match kill_process_group(pid, signal) {
+        Ok(()) => Ok(()),
+        Err(error) if is_group_gone(error) => Ok(()),
+        Err(error) => Err(Error::Task(format!("PTY process-group signal: {error}"))),
+    }
+}
+
+fn legacy_process_group_exists(pid: Pid) -> Result<bool, Error> {
     match test_kill_process_group(pid) {
         Ok(()) => Ok(true),
         Err(error) if is_group_gone(error) => Ok(false),
-        Err(error) => Err(Error::Io(error.into())),
+        Err(error) => Err(Error::Task(format!("PTY process-group probe: {error}"))),
+    }
+}
+
+async fn reap_group_stragglers_legacy(
+    pid: Pid,
+    ownership: &ProcessGroupSnapshot,
+    grace: Duration,
+    kill_deadline: &mut Option<Pin<Box<Sleep>>>,
+    stops: &mut mpsc::Receiver<StopCommand>,
+    runner_shutdown: &mut watch::Receiver<bool>,
+    runner_signalled: &mut bool,
+) -> Result<(), Error> {
+    ownership.verify(pid)?;
+    if !legacy_process_group_exists(pid)? {
+        return Ok(());
+    }
+    begin_group_termination_legacy(pid, ownership, grace, kill_deadline)?;
+    loop {
+        tokio::select! {
+            () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
+                ownership.verify(pid)?;
+                signal_process_group_legacy(pid, Signal::KILL)?;
+                return wait_for_group_empty_legacy(pid).await;
+            }
+            () = sleep(GROUP_POLL_INTERVAL) => {
+                if !legacy_process_group_exists(pid)? {
+                    return Ok(());
+                }
+                ownership.verify(pid)?;
+            }
+            command = stops.recv() => {
+                let Some(command) = command else { continue };
+                shorten_deadline(command.grace, kill_deadline);
+                let _ = command.response.send(Ok(()));
+            }
+            changed = runner_shutdown.changed(), if !*runner_signalled => {
+                changed.map_err(|_| Error::Task("runner signal watcher stopped".into()))?;
+                *runner_signalled = true;
+            }
+        }
+    }
+}
+
+async fn wait_for_group_empty_legacy(pid: Pid) -> Result<(), Error> {
+    match timeout(GROUP_KILL_REAP_TIMEOUT, async {
+        loop {
+            if !legacy_process_group_exists(pid)? {
+                return Ok(());
+            }
+            sleep(GROUP_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::Task(
+            "PTY process group remained after SIGKILL".into(),
+        )),
+    }
+}
+
+fn begin_group_termination_legacy(
+    pid: Pid,
+    ownership: &ProcessGroupSnapshot,
+    grace: Duration,
+    deadline: &mut Option<Pin<Box<Sleep>>>,
+) -> Result<(), Error> {
+    if deadline.is_none() {
+        ownership.verify(pid)?;
+        signal_process_group_legacy(pid, Signal::TERM)?;
+        *deadline = Some(Box::pin(tokio::time::sleep(grace)));
+    } else {
+        shorten_deadline(grace, deadline);
+    }
+    Ok(())
+}
+
+fn process_group_exists(group_pid: Pid, sentinel_pid: Pid) -> Result<bool, Error> {
+    if test_kill_process(sentinel_pid).is_ok() {
+        match getpgid(Some(sentinel_pid)) {
+            Ok(actual) if actual != group_pid => {
+                return Err(Error::Task(
+                    "provider process-group sentinel changed groups".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if is_group_gone(error) => {}
+            Err(error) => return Err(Error::Task(format!("inspect sentinel group: {error}"))),
+        }
+    }
+    match test_kill_process_group(group_pid) {
+        Ok(()) if test_kill_process(sentinel_pid).is_ok() => Ok(true),
+        Ok(()) => Err(Error::Task(
+            "provider process-group ownership could not be proved".into(),
+        )),
+        Err(error) if is_group_gone(error) => Ok(false),
+        Err(error) => Err(Error::Task(format!("probe owned process group: {error}"))),
     }
 }
 
@@ -2108,26 +2418,50 @@ async fn wait_for_deadline(deadline: &mut Option<Pin<Box<Sleep>>>) {
 /// whether a `Stop`/shutdown was ever requested. Shared by both
 /// `supervise_piped` and `supervise_terminal`, whose stop/shutdown handling
 /// (and therefore this cleanup pass) is otherwise identical.
+#[allow(clippy::too_many_arguments)]
 async fn reap_group_stragglers(
-    pid: Pid,
+    group_pid: Pid,
+    sentinel_pid: Pid,
+    sentinel: &mut tokio::process::Child,
     grace: Duration,
     kill_deadline: &mut Option<Pin<Box<Sleep>>>,
     stops: &mut mpsc::Receiver<StopCommand>,
     runner_shutdown: &mut watch::Receiver<bool>,
     runner_signalled: &mut bool,
 ) -> Result<(), Error> {
-    if !process_group_exists(pid)? {
-        return Ok(());
+    match process_group_exists(group_pid, sentinel_pid) {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(_error) if !sentinel_is_present(group_pid, sentinel_pid) => {
+            // The runner already proved this group while its private
+            // sentinel was alive, then a prior TERM/KILL may have removed
+            // that sentinel before this post-leader cleanup pass. Do not
+            // signal the numeric group again; only wait for the already
+            // owned group to disappear. If it was reused, the non-empty
+            // probe fails closed rather than targeting the new group.
+            if raw_process_group_exists(group_pid)? {
+                return wait_for_unowned_group_empty(group_pid, sentinel).await;
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error),
     }
-    begin_group_termination(pid, grace, kill_deadline)?;
+    if !group_has_other_members(group_pid, sentinel_pid)? {
+        return terminate_sentinel(group_pid, sentinel_pid, sentinel).await;
+    }
+    begin_group_termination(group_pid, sentinel_pid, grace, kill_deadline)?;
     loop {
         tokio::select! {
             () = wait_for_deadline(kill_deadline), if kill_deadline.is_some() => {
-                signal_process_group(pid, Signal::KILL)?;
-                return wait_for_group_empty(pid).await;
+                signal_process_group(group_pid, sentinel_pid, Signal::KILL)?;
+                return wait_for_group_empty(group_pid, sentinel_pid, sentinel).await;
             }
             () = sleep(GROUP_POLL_INTERVAL) => {
-                if !process_group_exists(pid)? {
+                let _ = sentinel.try_wait()?;
+                if !group_has_other_members(group_pid, sentinel_pid)? {
+                    return terminate_sentinel(group_pid, sentinel_pid, sentinel).await;
+                }
+                if !process_group_exists(group_pid, sentinel_pid)? {
                     return Ok(());
                 }
             }
@@ -2146,15 +2480,117 @@ async fn reap_group_stragglers(
     }
 }
 
+fn group_has_other_members(group_pid: Pid, sentinel_pid: Pid) -> Result<bool, Error> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Task(
+            "could not inspect provider process-group members".into(),
+        ));
+    }
+    let group = group_pid.as_raw_pid();
+    let sentinel = sentinel_pid.as_raw_pid();
+    let mut processes = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(pgid) = fields.next().and_then(|value| value.parse::<i32>().ok()) else {
+            continue;
+        };
+        processes.push((pid, ppid, pgid));
+    }
+    let mut sentinel_tree = std::collections::HashSet::from([sentinel]);
+    loop {
+        let before = sentinel_tree.len();
+        for (pid, ppid, _) in &processes {
+            if sentinel_tree.contains(ppid) {
+                sentinel_tree.insert(*pid);
+            }
+        }
+        if sentinel_tree.len() == before {
+            break;
+        }
+    }
+    Ok(processes
+        .into_iter()
+        .any(|(pid, _, pgid)| pgid == group && !sentinel_tree.contains(&pid)))
+}
+
+async fn terminate_sentinel(
+    group_pid: Pid,
+    sentinel_pid: Pid,
+    sentinel: &mut tokio::process::Child,
+) -> Result<(), Error> {
+    signal_process_group(group_pid, sentinel_pid, Signal::KILL)?;
+    let _ = sentinel.wait().await?;
+    if raw_process_group_exists(group_pid)? {
+        return Err(Error::Task(
+            "provider process-group changed after its members exited".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn sentinel_is_present(group_pid: Pid, sentinel_pid: Pid) -> bool {
+    test_kill_process(sentinel_pid).is_ok()
+        && getpgid(Some(sentinel_pid)).is_ok_and(|actual| actual == group_pid)
+}
+
+fn raw_process_group_exists(group_pid: Pid) -> Result<bool, Error> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pgid="])
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Task("could not inspect the process table".into()));
+    }
+    let group = group_pid.as_raw_pid().to_string();
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.trim() == group))
+}
+
+async fn wait_for_unowned_group_empty(
+    group_pid: Pid,
+    sentinel: &mut tokio::process::Child,
+) -> Result<(), Error> {
+    match timeout(GROUP_KILL_REAP_TIMEOUT, async {
+        loop {
+            let _ = sentinel.try_wait()?;
+            if !raw_process_group_exists(group_pid)? {
+                return Ok(());
+            }
+            sleep(GROUP_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(Error::Task(
+            "owned process group remained after termination".into(),
+        )),
+    }
+}
+
 /// Waits until a group that was hard-killed is no longer visible to the
 /// kernel. Sending `SIGKILL` is asynchronous: returning immediately would let
 /// the runner append `Exited` while a provider tool is still present, allowing
 /// the daemon to clear the session's ownership and an operator to delete its
 /// worktree underneath that tool.
-async fn wait_for_group_empty(pid: Pid) -> Result<(), Error> {
+async fn wait_for_group_empty(
+    group_pid: Pid,
+    sentinel_pid: Pid,
+    sentinel: &mut tokio::process::Child,
+) -> Result<(), Error> {
     match timeout(GROUP_KILL_REAP_TIMEOUT, async {
         loop {
-            if !process_group_exists(pid)? {
+            let _ = sentinel.try_wait()?;
+            if !process_group_exists(group_pid, sentinel_pid)? {
                 return Ok(());
             }
             sleep(GROUP_POLL_INTERVAL).await;

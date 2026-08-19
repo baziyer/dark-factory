@@ -1,7 +1,7 @@
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, SessionId, SessionSnapshot, SessionState,
-    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, SessionCleanupState, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
@@ -573,6 +573,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         runtime_permission_mode: None,
         runtime_control_mode: None,
         state: SessionState::Idle,
+        cleanup_state: SessionCleanupState::None,
         state_since_ms: 10,
         worktree: "/work/agent-1".into(),
         provider_session_id: None,
@@ -660,6 +661,7 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
         runtime_permission_mode: None,
         runtime_control_mode: None,
         state: SessionState::WaitingForInput,
+        cleanup_state: SessionCleanupState::None,
         state_since_ms: 20,
         worktree: "/work/agent-1".into(),
         provider_session_id: Some("thread-1".into()),

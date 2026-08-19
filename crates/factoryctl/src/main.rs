@@ -61,7 +61,7 @@ Commands:
   git status|diff|commit|push                  Session-authenticated daemon-owned Git operations
   pr open|update                               Session-authenticated daemon-owned pull requests
   run list|stop                               List and stop process attempts
-  session list|stop                           List and stop resident provider sessions
+  session list|stop|resolve-cleanup           List, stop, or safely resolve provider cleanup
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
   attach --project P (--session S | --agent A) Attach to a session's PTY, by ID or by its agent
   events [--follow]                           Read durable events
@@ -651,7 +651,7 @@ Options:
   --since-offset N            Replay retained output from this byte offset (default 0)
   -h, --help                    Show this help";
 
-const SESSION_HELP: &str = "usage: factoryctl session <list|stop> [options]
+const SESSION_HELP: &str = "usage: factoryctl session <list|stop|resolve-cleanup> [options]
 
 Inspect and control resident provider sessions (one per agent, PTY-backed,
 spanning many task episodes).
@@ -659,6 +659,7 @@ spanning many task episodes).
 Actions:
   list      List sessions in a project
   stop      Gracefully stop a session's provider process
+  resolve-cleanup  Confirm the provider tree is gone and release a failed session
 
 Run `factoryctl session <action> --help` for action-specific options.";
 const SESSION_LIST_HELP: &str = "usage: factoryctl session list --project ID [options]
@@ -686,6 +687,17 @@ Required:
 
 Options:
   --grace-ms N              Grace period before a harder stop (default 0, max 60000)
+  -h, --help                  Show this help";
+const SESSION_RESOLVE_CLEANUP_HELP: &str =
+    "usage: factoryctl session resolve-cleanup --project ID --session ID
+
+Confirm, after independently checking the private provider runtime, that a
+cleanup-failed session has no remaining descendants. This terminalizes the
+session and releases the agent deletion guard.
+
+Required:
+  --project ID
+  --session ID
   -h, --help                  Show this help";
 
 const HOOK_HELP: &str = "usage: factoryctl hook --token-file PATH <Event>
@@ -936,6 +948,10 @@ enum CliCommand {
         project_id: String,
         session_id: String,
         grace_ms: u64,
+    },
+    SessionResolveCleanup {
+        project_id: String,
+        session_id: String,
     },
     Hook {
         token_file: String,
@@ -1747,6 +1763,7 @@ fn parse_session(mut args: Vec<String>) -> Result<CliCommand, String> {
         return Ok(CliCommand::Help(match action.as_str() {
             "list" => SESSION_LIST_HELP,
             "stop" => SESSION_STOP_HELP,
+            "resolve-cleanup" => SESSION_RESOLVE_CLEANUP_HELP,
             _ => SESSION_HELP,
         }));
     }
@@ -1774,6 +1791,15 @@ fn parse_session(mut args: Vec<String>) -> Result<CliCommand, String> {
                 project_id,
                 session_id,
                 grace_ms,
+            })
+        }
+        "resolve-cleanup" => {
+            let project_id = required_project(&mut args)?;
+            let session_id = required_option(&mut args, "--session")?;
+            require_empty(&args)?;
+            Ok(CliCommand::SessionResolveCleanup {
+                project_id,
+                session_id,
             })
         }
         _ => Err(format!("unknown session action {action:?}")),
@@ -2399,6 +2425,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             session_id: parse_id(session_id, "session")?,
             grace_ms,
+        }),
+        CliCommand::SessionResolveCleanup {
+            project_id,
+            session_id,
+        } => Ok(LocalRequest::ResolveSessionCleanup {
+            project_id: parse_id(project_id, "project")?,
+            session_id: parse_id(session_id, "session")?,
         }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
         CliCommand::Events {

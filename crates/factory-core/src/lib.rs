@@ -18,7 +18,6 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// Durable activity marker for a live session whose provider process tree was
 /// not observed to finish cleanup. It deliberately remains live so ownership
 /// and deletion stay blocked until an operator verifies the tree.
-pub const CLEANUP_FAILED_ACTIVITY: &str = "cleanup_failed";
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -206,6 +205,27 @@ pub enum ProviderHookEvent {
     Stop,
     SubagentStop,
     SessionEnd,
+}
+
+/// Durable ownership state for a provider process tree. `Failed` is
+/// deliberately separate from the mutable provider activity stream: once
+/// cleanup is unproven, hooks may continue to be authenticated but cannot
+/// make the session look safe again. Only an explicit operator verification
+/// can move it to `Verified`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCleanupState {
+    #[default]
+    None,
+    Failed,
+    Verified,
+}
+
+impl SessionCleanupState {
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
 impl ProviderHookEvent {
@@ -446,6 +466,8 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_control_mode: Option<String>,
     pub state: SessionState,
+    #[serde(default, skip_serializing_if = "SessionCleanupState::is_none")]
+    pub cleanup_state: SessionCleanupState,
     pub state_since_ms: i64,
     pub worktree: String,
     #[serde(skip_serializing_if = "Option::is_none")]
