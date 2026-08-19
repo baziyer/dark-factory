@@ -708,25 +708,9 @@ fn wait_for_session_state(client: &Client, agent_id: &str, state: SessionState) 
 
 /// Like [`wait_for_session_state`] for `Idle`, but confirms it *stays*
 /// idle continuously across a full settle window before returning, not
-/// just at one single later instant. A single composed delivery is typed
-/// as one multi-line PTY write; the shell fixture reads it back line by
-/// line (its own doc comment), running a full hook cycle per line -- so
-/// it can pass through `idle` transiently between the task header line
-/// (which finishes the task) and a later line (e.g. the memory-file
-/// footer, always present) before truly settling. This track's item 10:
-/// a single re-check after a fixed sleep (the original approach) is only
-/// as robust as that one sleep being longer than however long the
-/// remaining lines take to process, which is not a safe assumption on a
-/// loaded machine -- found live, `factoryd_restart_does_not_lose_a_live_session`
-/// flaking with the session observed `Working` immediately after a
-/// restart that followed what this function had just certified as stable
-/// `Idle`. Polling continuously through the whole window and restarting
-/// the wait on any non-idle observation closes that gap: a fixture still
-/// mid-delivery is caught well before the window elapses, not raced
-/// against it. A precise fix would need the fixture to tell the daemon it
-/// is done with an entire delivery, not just one line; this is a
-/// test-side settle check, since only this suite's own timing depends on
-/// "idle" meaning "fully done," not the product's own delivery/ack logic.
+/// just at one single later instant. This catches a delivery still in
+/// flight after a fast hook cycle, without making the product rely on a
+/// test-only sleep or a fixture-specific acknowledgement.
 const IDLE_SETTLE_WINDOW: Duration = Duration::from_secs(3);
 const IDLE_SETTLE_POLL: Duration = Duration::from_millis(150);
 
@@ -875,10 +859,8 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
         "agent/curie"
     );
 
-    // task-1's title embeds `sleep:2`, landing on the same composed-text
-    // header line as `task:task-1` (see shell-agent.sh): the fixture
-    // stays `working` for 2s mid-turn, giving this test a window to
-    // assign task-2 while curie is busy.
+    // task-1's title embeds `sleep:2`, giving this test a window to assign
+    // task-2 while curie is busy.
     create_task(&client, "task-1", "First (sleep:2)", "do the first thing");
     assign_task(&client, "task-1", "curie");
 
@@ -896,18 +878,16 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
     assign_task(&client, "task-2", "curie");
 
     let task1 = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
-    assert_eq!(
-        task1.result.as_deref(),
-        Some("done: Task task-1: First (sleep:2) (task:task-1)")
+    let task1_result = task1.result.as_deref().unwrap_or_default();
+    assert!(
+        task1_result.starts_with("done: Task task-1: First (sleep:2) (task:task-1)"),
+        "unexpected task-1 result: {task1_result:?}"
     );
 
-    // Unlike task-1 (typed in as one line among possibly several, so the
-    // fixture completes it on the exact header line alone), task-2 arrives
-    // via the Stop-hook block-reply path as one atomic `reason` string --
-    // the *entire* composed delivery (header, guidance, memory footer),
-    // matching how a real provider's Stop hook reply works: `reason` is one
-    // whole instruction, not a sequence of separately-submitted lines. Only
-    // the recognizable header prefix is asserted exactly.
+    // The fixture submits the complete composed delivery at one CR boundary,
+    // matching how a real provider's Stop hook reply carries one whole
+    // instruction. Only the recognizable header prefix is asserted because
+    // the durable prompt also contains guidance and memory context.
     let task2 = wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
     let task2_result = task2.result.as_deref().unwrap_or_default();
     assert!(
@@ -977,7 +957,7 @@ fn a_standalone_message_delivers_without_opening_a_run() {
             project_id: project_id(),
             sender_agent_id: None,
             recipient_agent_id: AgentId::try_from("curie").unwrap(),
-            body: "Please check the queue.".into(),
+            body: "Please check the queue.\nKeep this prompt intact.".into(),
         })
         .unwrap();
     assert!(matches!(
@@ -1013,6 +993,21 @@ fn a_standalone_message_delivers_without_opening_a_run() {
     });
 
     wait_for_session_state(&client, "curie", SessionState::Idle);
+    let prompt_submits = events_after(&client, 0)
+        .into_iter()
+        .filter(|envelope| {
+            matches!(
+                envelope.event,
+                factory_core::FactoryEvent::SessionChanged { ref session }
+                    if session.last_hook_event
+                        == Some(factory_core::ProviderHookEvent::UserPromptSubmit)
+            )
+        })
+        .count();
+    assert_eq!(
+        prompt_submits, 1,
+        "a multiline standalone delivery must have one complete prompt acknowledgement"
+    );
     assert!(
         list_runs(&client).is_empty(),
         "a standalone message must never open a run episode"
@@ -1909,9 +1904,10 @@ fn task_done_falls_back_to_the_file_outbox_when_forced_and_drains_via_the_next_h
     // done` in `process_turn`) -- proving `outbox::drain` ran before that
     // hook was sent, not after.
     let task = wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
-    assert_eq!(
-        task.result.as_deref(),
-        Some("done: Task task-1: Queue via the outbox (task:task-1)")
+    let result = task.result.as_deref().unwrap_or_default();
+    assert!(
+        result.starts_with("done: Task task-1: Queue via the outbox (task:task-1)"),
+        "unexpected task result: {result:?}"
     );
 
     let runs = list_runs(&client);
@@ -2107,26 +2103,11 @@ fn permission_request_hook_reports_waiting_for_input_and_is_never_answered() {
     let Project { daemon, .. } = setup_project(home.path());
     let client = daemon.client();
 
-    // `printf '{}' |` matters, not just decoration: with no stdin piped in
-    // at all, `factoryctl hook`'s bounded stdin read blocks forever on the
-    // inherited PTY (which never reaches EOF), so the hook request is
-    // never even sent -- the session would sit in `starting` forever
-    // instead of reaching `idle`. Likewise, some pending work is required
-    // to trigger the initial spawn at all, so this reads and acknowledges
-    // (`UserPromptSubmit`) exactly the delivered task's first line, then
-    // `Stop`s -- otherwise the dispatcher's own unacknowledged-delivery
-    // watchdog would land the session on `waiting_for_input` with its own
-    // wait reason (`"delivery unacknowledged"`) before this test ever
-    // gets to drive `PermissionRequest` by hand, racing the assertion
-    // below. What that first delivered line actually says is irrelevant
-    // (never read again after this). `h()` shortens the repeated
-    // `factoryctl hook --token-file ...` invocation: `agent_profiles.model`
-    // (this command runs as, verbatim) is bounded at 256 bytes.
-    let command = "h(){ \"$DARK_FACTORY_FACTORYCTL\" hook --token-file \"$DARK_FACTORY_SESSION_TOKEN_FILE\" \"$1\"; }; \
-printf '{}' | h SessionStart >/dev/null; read l; \
-printf '{}' | h UserPromptSubmit >/dev/null; printf '{}' | h Stop >/dev/null; \
-while :; do sleep 3600; done"
-        .to_owned();
+    // A pending task is required to trigger the initial spawn. The
+    // byte-oriented fixture acknowledges the daemon's complete prompt at
+    // its CR boundary and then stays resident, so this test reaches `idle`
+    // without manufacturing an invalid empty UserPromptSubmit payload.
+    let command = format!("python3 {}", exact_shell_agent_path());
     create_shell_agent_with_command(&client, "curie", command);
     create_task(&client, "task-1", "Trigger a spawn", "irrelevant body");
     assign_task(&client, "task-1", "curie");
