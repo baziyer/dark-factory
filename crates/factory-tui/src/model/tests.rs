@@ -900,32 +900,35 @@ fn activity_label_names_recent_stale_and_missing_activity() {
         "stale activity 2m ago"
     );
 
+    let mut no_current = agent("alice", "a", AgentRole::Worker, None);
+    let mut ended = session("sess-ended", "alice", "a", SessionState::Stopped);
+    ended.activity = Some("tool: Read".to_owned());
+    ended.last_hook_at_ms = Some(119_000);
     board.apply_fleet_snapshot(
         vec![project("a", 0)],
-        vec![board.agents.get(&alice_id).unwrap().clone()],
+        vec![no_current.clone()],
         Vec::new(),
         Vec::new(),
-        vec![session("sess-1", "alice", "a", SessionState::Idle)],
+        vec![ended.clone()],
     );
     assert_eq!(
         board.activity_label(board.agents.get(&alice_id).unwrap()),
-        "no recent activity"
+        "no recent activity",
+        "ended activity is not current when the agent has no current session"
     );
 
-    let mut event_session = session("sess-2", "alice", "a", SessionState::Working);
-    event_session.activity = Some("tool: Write".to_owned());
-    event_session.last_hook_at_ms = Some(119_000);
-    board.apply_event(EventEnvelope {
-        protocol_version: 1,
-        sequence: 1,
-        occurred_at_ms: 119_000,
-        event: FactoryEvent::SessionChanged {
-            session: event_session,
-        },
-    });
+    no_current.current_session_id = Some(SessionId::try_from("sess-fresh").unwrap());
+    let fresh = session("sess-fresh", "alice", "a", SessionState::Working);
+    board.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![no_current],
+        Vec::new(),
+        Vec::new(),
+        vec![ended, fresh],
+    );
     assert_eq!(
         board.activity_label(board.agents.get(&alice_id).unwrap()),
-        "tool: Write 1s ago",
-        "live session events remain visible even before an agent snapshot links the session"
+        "no recent activity",
+        "a fresh current session must not inherit ended-session activity"
     );
 }

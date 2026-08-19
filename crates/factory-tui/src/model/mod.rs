@@ -133,7 +133,6 @@ pub struct Board {
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
-    activity_last_at_ms: BTreeMap<AgentId, i64>,
     activity_identities: BTreeMap<AgentId, ActivityIdentity>,
     seen_event_sequences: state::RingBuffer<i64>,
     /// Causal revision of the currently displayed attention projection.
@@ -191,7 +190,6 @@ impl Board {
             local_attention: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
-            activity_last_at_ms: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             attention_revision: 0,
@@ -739,18 +737,13 @@ impl Board {
     /// sample is explicitly reported rather than rendered as evidence of inactivity.
     #[must_use]
     pub fn activity_label(&self, agent: &AgentSnapshot) -> String {
-        let session = self
-            .sessions
-            .values()
-            .filter(|session| session.agent_id == agent.id)
-            .max_by_key(|session| (session.updated_at_ms, session.id.clone()));
-        let Some(session) = session else {
+        let Some(session_id) = agent.current_session_id.as_ref() else {
             return "no recent activity".to_owned();
         };
-        let Some(at_ms) = session
-            .last_hook_at_ms
-            .or_else(|| self.activity_last_at_ms.get(&agent.id).copied())
-        else {
+        let Some(session) = self.sessions.get(session_id) else {
+            return "no recent activity".to_owned();
+        };
+        let Some(at_ms) = session.last_hook_at_ms else {
             return "no recent activity".to_owned();
         };
         let age = age_text(self.now_ms, at_ms);
@@ -1178,8 +1171,6 @@ impl Board {
         self.activity_identities
             .insert(agent_id.clone(), identity.clone());
         let occurred_at_ms = occurred_at_ms.min(self.now_ms);
-        self.activity_last_at_ms
-            .insert(agent_id.clone(), occurred_at_ms);
         let series = self.activity.entry(agent_id.clone()).or_default();
         series.record(occurred_at_ms);
         series.roll_to(self.now_ms);
@@ -1237,7 +1228,6 @@ impl Board {
 
     fn remove_activity(&mut self, agent_id: &AgentId) {
         self.activity.remove(agent_id);
-        self.activity_last_at_ms.remove(agent_id);
         self.activity_identities.remove(agent_id);
     }
 
