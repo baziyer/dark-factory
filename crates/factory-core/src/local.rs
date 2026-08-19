@@ -34,6 +34,43 @@ pub struct AgentProfile {
     pub updated_at_ms: i64,
 }
 
+/// The single guidance-file size limit shared by the daemon and local wire
+/// projection. Guidance is operator/agent-editable text, not ledger state.
+pub const MAX_GUIDANCE_FILE_BYTES: usize = 16 * 1024;
+
+/// The bounded health projection for an agent's file-backed memory. The
+/// mechanical agent/status responses carry this even when the active file is
+/// too large or not readable, so guidance failure cannot hide durable state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidanceHealthState {
+    Ok,
+    NearLimit,
+    Oversized,
+    InvalidUtf8,
+    PathError,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GuidanceHealth {
+    pub state: GuidanceHealthState,
+    pub bytes: u64,
+    pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl Default for GuidanceHealth {
+    fn default() -> Self {
+        Self {
+            state: GuidanceHealthState::Ok,
+            bytes: 0,
+            max_bytes: MAX_GUIDANCE_FILE_BYTES as u64,
+            detail: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AgentDetail {
     pub snapshot: AgentSnapshot,
@@ -41,9 +78,20 @@ pub struct AgentDetail {
     /// Absolute path to this agent's standing-guidance file, editable
     /// directly with `$EDITOR`.
     pub instructions_path: String,
+    /// Bounded health of `instructions.md`; unhealthy content is omitted
+    /// from the profile rather than making a mechanical lookup fail.
+    #[serde(default)]
+    pub instructions_health: GuidanceHealth,
     /// Absolute path to this agent's memory file. The agent itself is
     /// expected to append durable lessons here.
     pub memory_path: String,
+    /// Absolute path to the private lossless pre-compaction archive directory.
+    #[serde(default)]
+    pub memory_archive_path: String,
+    /// Bounded health of the active `memory.md`; unhealthy content is not
+    /// copied into this response.
+    #[serde(default)]
+    pub memory_health: GuidanceHealth,
     /// Absolute path to this agent's project's `PROJECT.md`.
     pub project_guidance_path: String,
 }

@@ -2344,6 +2344,26 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
             );
         }
 
+        // Mechanical status remains available when an old install has a
+        // memory file beyond the provider guidance bound; the response carries
+        // health instead of echoing unbounded content or failing the lookup.
+        let memory_path = factory_core::paths::agent_memory_path(
+            socket.parent().unwrap(),
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        std::fs::write(
+            &memory_path,
+            vec![b'x'; factoryd::guidance::MAX_GUIDANCE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let instructions_path = factory_core::paths::agent_instructions_path(
+            socket.parent().unwrap(),
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        std::fs::write(&instructions_path, [0xff]).unwrap();
+
         let ServerFrame::Response {
             response: LocalResponse::FleetStatus { status },
             ..
@@ -2406,6 +2426,16 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         };
         assert_eq!(detail.status, *curie, "the same picture the fleet view had");
         assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert_eq!(
+            detail.detail.memory_health.state,
+            factory_core::local::GuidanceHealthState::Oversized
+        );
+        assert_eq!(
+            detail.detail.instructions_health.state,
+            factory_core::local::GuidanceHealthState::InvalidUtf8
+        );
+        assert!(detail.detail.profile.instructions.is_empty());
+        assert!(detail.detail.profile.memory.is_empty());
         assert_eq!(detail.attention, vec![item.clone()]);
         assert!(detail.generated_at_ms > 0);
         assert!(detail.detail.instructions_path.ends_with("instructions.md"));

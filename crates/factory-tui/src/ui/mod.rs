@@ -570,7 +570,10 @@ mod tests {
                     updated_at_ms: 1,
                 },
                 instructions_path: "/tmp/instructions.md".into(),
+                instructions_health: Default::default(),
                 memory_path: "/tmp/memory.md".into(),
+                memory_archive_path: "/tmp/memory-archive".into(),
+                memory_health: Default::default(),
                 project_guidance_path: "/tmp/PROJECT.md".into(),
             },
         );

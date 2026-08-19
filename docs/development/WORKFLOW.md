@@ -45,6 +45,19 @@ bypass, or release the lease. The summary contract is checked by
    `AGENTS.md`'s "Critical rules" for the exact steps.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
+### Agent memory maintenance
+
+`memory.md` is bounded guidance, not the agent's append-only authority log.
+The daemon accepts and exposes mechanical agent status even when memory is
+near the 16 KiB limit, oversized, invalid UTF-8, or unavailable; `agent get`
+and `agent status` return the typed health state and omit unsafe content.
+Before dispatching an agent with no live session, `factoryd` preserves the
+exact old bytes in a private `memory-archive/` rotation and atomically
+projects recent complete UTF-8-safe lines back into `memory.md`. Generated
+provider guidance tells agents to curate durable lessons and keep the active
+file below the 12 KiB compaction high-water mark. `PROJECT.md`, Rules, and
+standing instructions are not rewritten by this maintenance.
+
 ### Testing resident sessions
 
 An E2E harness must not stop `factoryd` immediately after a `StopSession`

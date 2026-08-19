@@ -229,40 +229,52 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         rows[1],
     );
 
-    let (configured_model, configured_reasoning, model_reason, configured_permission) =
-        board.agent_details.get(agent_id).map_or_else(
-            || {
-                (
-                    "loading…".to_owned(),
-                    "loading…".to_owned(),
-                    "loading…".to_owned(),
-                    "loading…".to_owned(),
-                )
-            },
-            |detail| {
-                (
-                    detail
-                        .profile
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| "provider default".to_owned()),
-                    detail
-                        .profile
-                        .reasoning_effort
-                        .clone()
-                        .unwrap_or_else(|| "provider default".to_owned()),
-                    detail.profile.model_selection_reason.clone().map_or_else(
-                        || "unreported".to_owned(),
-                        |reason| factory_core::model_policy::sanitize_for_display(&reason),
-                    ),
-                    detail
-                        .profile
-                        .permission_mode
-                        .clone()
-                        .unwrap_or_else(|| "provider default".to_owned()),
-                )
-            },
-        );
+    let (
+        configured_model,
+        configured_reasoning,
+        model_reason,
+        configured_permission,
+        memory_health,
+    ) = board.agent_details.get(agent_id).map_or_else(
+        || {
+            (
+                "loading…".to_owned(),
+                "loading…".to_owned(),
+                "loading…".to_owned(),
+                "loading…".to_owned(),
+                "loading…".to_owned(),
+            )
+        },
+        |detail| {
+            (
+                detail
+                    .profile
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "provider default".to_owned()),
+                detail
+                    .profile
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "provider default".to_owned()),
+                detail.profile.model_selection_reason.clone().map_or_else(
+                    || "unreported".to_owned(),
+                    |reason| factory_core::model_policy::sanitize_for_display(&reason),
+                ),
+                detail
+                    .profile
+                    .permission_mode
+                    .clone()
+                    .unwrap_or_else(|| "provider default".to_owned()),
+                format!(
+                    "{} {}/{}",
+                    memory_health_state(detail.memory_health.state),
+                    detail.memory_health.bytes,
+                    detail.memory_health.max_bytes
+                ),
+            )
+        },
+    );
     let session = board.session_for(agent);
     let running_model = session
         .and_then(|session| session.runtime_model.as_deref())
@@ -295,6 +307,7 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                 ui::truncate(running_permission, 8),
                 ui::truncate(running_control, 11)
             )),
+            Line::from(format!("memory: {}", ui::truncate(&memory_health, 24))),
         ])
         .block(ui::block(" settings ")),
         rows[2],
@@ -327,6 +340,16 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
                 .block(ui::block(" backlog + worker queues ")),
             rows[3],
         );
+    }
+}
+
+fn memory_health_state(state: factory_core::local::GuidanceHealthState) -> &'static str {
+    match state {
+        factory_core::local::GuidanceHealthState::Ok => "ok",
+        factory_core::local::GuidanceHealthState::NearLimit => "near_limit",
+        factory_core::local::GuidanceHealthState::Oversized => "oversized",
+        factory_core::local::GuidanceHealthState::InvalidUtf8 => "invalid_utf8",
+        factory_core::local::GuidanceHealthState::PathError => "path_error",
     }
 }
 

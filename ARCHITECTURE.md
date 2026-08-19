@@ -19,7 +19,13 @@ catalogue.
    are operator- and agent-editable files under `$DARK_FACTORY_HOME/projects`
    (`factory_core::paths`, `factoryd::guidance`), not SQLite columns or
    events; SQLite still owns the identities those files are keyed by, and
-   the daemon bounds the files but never treats their content as ledger.
+   the daemon bounds the files but never treats their content as ledger. The
+   active `memory.md` is capped at 16 KiB; `agent get`/`agent status` report a
+   bounded health state and omit unhealthy content rather than failing the
+   mechanical lookup. At the no-live-session dispatch boundary, an oversized
+   memory is archived losslessly in a private bounded rotation and replaced
+   atomically with a valid UTF-8 recent-line projection. `PROJECT.md`, Rules,
+   and standing instructions are never rewritten by memory compaction.
 3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent.
 4. A **session**, not a run, is the unit `factory-runner` supervises: one
