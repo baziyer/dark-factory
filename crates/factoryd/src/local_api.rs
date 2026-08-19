@@ -948,7 +948,8 @@ async fn handle_request_as(
                 .await?;
             let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
             let at_capacity = live_sessions >= live_session_cap;
-            let (mut projects, attention) = scoped_fleet_status(principal, projects, at_capacity);
+            let (mut projects, mut attention) =
+                scoped_fleet_status(principal, projects, at_capacity);
             populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
