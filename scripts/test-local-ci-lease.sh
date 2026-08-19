@@ -88,6 +88,44 @@ fi
 grep -Fq 'unsafe lock object path' "$temporary/initial-symlink.stderr" || fail "initial symlink refusal was unexplained"
 rm -f "$lock_path"
 
+# A starter publishes an identity-bound directory marker before it can invoke
+# lockf.  Kill that starter at the narrow pre-lockf seam; a waiter must not
+# inherit the dead marker forever or split authority with a late starter.
+starting_pause_fifo="$temporary/starting-pause"
+starting_marker="$lock_path/.starting"
+starting_held="$temporary/starting-held"
+starting_waiter="$temporary/starting-waiter"
+starting_waiter_stderr="$temporary/starting-waiter.stderr"
+mkfifo "$starting_pause_fifo"
+(
+    cd "$first"
+    DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_LOCKF="$starting_pause_fifo" \
+        ./scripts/with-local-ci-lease.sh "$short_command" "$starting_held"
+) &
+starting_pid=$!
+background_pids="$background_pids $starting_pid"
+wait_for_file "$starting_marker/owner"
+starting_owner_pid=$(sed -n 's/^pid=//p' "$starting_marker/owner")
+case "$starting_owner_pid" in
+    ''|*[!0-9]*) fail "startup marker did not contain a numeric owner PID" ;;
+esac
+kill -KILL "$starting_owner_pid"
+wait "$starting_pid" 2>/dev/null || true
+(
+    cd "$second"
+    ./scripts/with-local-ci-lease.sh "$short_command" "$starting_waiter"
+) 2>"$starting_waiter_stderr" &
+starting_waiter_pid=$!
+background_pids="$background_pids $starting_waiter_pid"
+wait "$starting_waiter_pid" || fail "waiter did not recover a killed pre-lockf starter"
+[ -f "$starting_waiter" ] || fail "recovered waiter did not run its command"
+assert_absent "$starting_marker"
+assert_absent "$lease_path"
+assert_absent "$lock_path/.recovery"
+assert_absent "$lock_path"
+[ -z "$(find "$common_dir" -maxdepth 1 -type f -name '.dark-factory-local-ci-owner.*' -print)" ] \
+    || fail "dead starter left owner records behind"
+
 start_holder() {
     worktree=$1
     marker=$2
