@@ -1,7 +1,8 @@
-use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
+use std::{future::Future, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, RunnerInstanceId,
+    SessionId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
@@ -11,7 +12,9 @@ use factoryctl::Client;
 use factoryd::{
     execution,
     local_api::{ApiState, serve},
-    store::{ManagedChangeRecord, NewProject, NewTask, Store},
+    store::{
+        ManagedChangeRecord, NewAgent, NewProject, NewSession, NewTask, RepositoryAuthority, Store,
+    },
 };
 use rusqlite::Connection;
 use tokio::{
@@ -259,6 +262,192 @@ async fn public_deletes_purge_abandoned_changes_before_parent_rows() {
         },
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_managed_change_create_and_abandon_use_the_authenticated_run() {
+    fn git(cwd: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let repo = directory.path().join("repo");
+    let remote = directory.path().join("remote.git");
+    let worktree = directory.path().join("agent");
+    git(
+        directory.path(),
+        &["init", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        directory.path(),
+        &["init", "-b", "main", repo.to_str().unwrap()],
+    );
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    std::fs::write(repo.join("README"), "initial\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-m", "initial"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "origin", "main"]);
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "agent/worker",
+            worktree.to_str().unwrap(),
+        ],
+    );
+
+    let project_id = project_id("managed-project");
+    let agent_id = agent_id("worker");
+    let task_id = task_id("issue-175-public");
+    let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id.clone(),
+                name: "Managed project".into(),
+                root: repo.to_string_lossy().into_owned(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id.clone(),
+                project_id: project_id.clone(),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .set_repository_authority(
+            &project_id,
+            &RepositoryAuthority {
+                remote_url: remote.to_string_lossy().into_owned(),
+                base_branch: "main".into(),
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id.clone(),
+                project_id: project_id.clone(),
+                parent_task_id: None,
+                title: "Publish a managed change".into(),
+                body: "Publish a managed change".into(),
+                priority: 0,
+            },
+            4,
+        )
+        .unwrap();
+    store
+        .create_session(
+            NewSession {
+                id: session_id.clone(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                provider: Provider::Shell,
+                runtime_model: None,
+                runtime_reasoning_effort: None,
+                runtime_permission_mode: None,
+                runtime_control_mode: None,
+                provider_session_id: None,
+                worktree: worktree.to_string_lossy().into_owned(),
+                codex_home: None,
+                hook_token: "a".repeat(64),
+                runner_instance_id: RunnerInstanceId::try_from(
+                    "22222222-2222-4222-8222-222222222222",
+                )
+                .unwrap(),
+                runner_runtime: directory
+                    .path()
+                    .join("runner")
+                    .to_string_lossy()
+                    .into_owned(),
+                runner_protocol_version: 1,
+            },
+            5,
+        )
+        .unwrap();
+    store
+        .assign_task(&project_id, &task_id, Some(&agent_id), 6)
+        .unwrap();
+    store.synthesize_session_start(&session_id, 7).unwrap();
+    store.open_run_episode(&session_id, &task_id, 8).unwrap();
+
+    let socket = directory.path().join("f.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        state,
+        execution,
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let created = request(
+        &socket,
+        LocalRequest::CreateManagedChange {
+            token: "a".repeat(64),
+        },
+    )
+    .await;
+    let created_path = match created {
+        ServerFrame::Response {
+            response: LocalResponse::ManagedChange { change },
+            ..
+        } => Path::new(&change.worktree).to_path_buf(),
+        other => panic!("unexpected create response: {other:?}"),
+    };
+    assert!(created_path.is_dir());
+
+    let abandoned = request(
+        &socket,
+        LocalRequest::AbandonManagedChange {
+            token: "a".repeat(64),
+        },
+    )
+    .await;
+    assert!(matches!(
+        abandoned,
+        ServerFrame::Response {
+            response: LocalResponse::ManagedChange { .. },
+            ..
+        }
+    ));
+    assert!(!created_path.exists());
+
+    shutdown_tx.send(()).unwrap();
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

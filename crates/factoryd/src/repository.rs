@@ -100,7 +100,22 @@ pub async fn create_managed_change(
     // A daemon crash can leave the exact derived worktree after the SQLite
     // insert failed. Reuse it only after proving its path and branch are the
     // expected managed identity; unrelated occupants remain a hard collision.
-    let reuse_existing = worktree_path.exists();
+    let mut reuse_existing = match std::fs::symlink_metadata(worktree_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(Error::Rejected(
+                    "managed change worktree leaf must not be a symlink".into(),
+                ));
+            }
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(Error::Rejected(
+                "managed change worktree is unavailable".into(),
+            ));
+        }
+    };
     let parent = worktree_path
         .parent()
         .ok_or_else(|| Error::Rejected("managed change path has no parent".into()))?;
@@ -113,11 +128,16 @@ pub async fn create_managed_change(
         .nth(2)
         .ok_or_else(|| Error::Rejected("managed change path is invalid".into()))?;
     let daemon_root = canonical_directory(daemon_root, "managed change root")?;
-    if !canonical_directory(parent, "managed change parent")?.starts_with(daemon_root) {
+    let managed_parent = canonical_directory(parent, "managed change parent")?;
+    if !managed_parent.starts_with(&daemon_root) {
         return Err(Error::Rejected(
             "managed change path escaped its daemon root".into(),
         ));
     }
+    let leaf = worktree_path
+        .file_name()
+        .ok_or_else(|| Error::Rejected("managed change path has no leaf".into()))?;
+    let expected_worktree = managed_parent.join(leaf);
     let base_ref = format!("refs/heads/{}", authority.base_branch);
     let base_output =
         trusted_remote_ls_remote(&project_root, &authority.remote_url, &base_ref).await?;
@@ -148,6 +168,11 @@ pub async fn create_managed_change(
     let branch_ref = format!("refs/heads/{branch}");
     if reuse_existing {
         let existing_root = canonical_directory(worktree_path, "managed change worktree")?;
+        if existing_root != expected_worktree {
+            return Err(Error::Rejected(
+                "managed change worktree leaf escaped its managed path".into(),
+            ));
+        }
         let existing_branch = safe_git(
             &existing_root,
             None,
@@ -184,9 +209,32 @@ pub async fn create_managed_change(
         )
         .await?;
         if existing_head.trim() != base_sha {
-            return Err(Error::Rejected(
-                "managed change recovery worktree is not at the configured base".into(),
-            ));
+            if !managed_worktree_is_clean(worktree_path).await? {
+                return Err(Error::Rejected(
+                    "managed change recovery worktree is dirty at the new base".into(),
+                ));
+            }
+            safe_git(
+                &project_root,
+                None,
+                &[
+                    "worktree",
+                    "remove",
+                    worktree_path.to_string_lossy().as_ref(),
+                ],
+                None,
+                MUTATION_TIMEOUT,
+            )
+            .await?;
+            safe_git(
+                &project_root,
+                None,
+                &["branch", "-D", &branch],
+                None,
+                MUTATION_TIMEOUT,
+            )
+            .await?;
+            reuse_existing = false;
         }
     } else if safe_git(
         &project_root,
@@ -271,6 +319,61 @@ pub async fn create_managed_change(
         published_head_sha: None,
         state: "active".into(),
     })
+}
+
+/// Removes a worktree that was provisioned before its managed row could be
+/// committed. The caller invokes this only for that failed registration, so
+/// the exact derived branch and path cannot become an unauthenticated live
+/// change after a transaction rollback.
+pub async fn discard_unregistered_change(
+    project_root: &Path,
+    record: &ManagedChangeRecord,
+) -> Result<(), Error> {
+    let project_root = canonical_directory(project_root, "project root")?;
+    let worktree = canonical_directory(Path::new(&record.worktree), "managed worktree")?;
+    let path = worktree.to_string_lossy().into_owned();
+    safe_git(
+        &project_root,
+        None,
+        &["worktree", "remove", &path],
+        None,
+        MUTATION_TIMEOUT,
+    )
+    .await?;
+    safe_git(
+        &project_root,
+        None,
+        &["branch", "-D", &record.branch],
+        None,
+        MUTATION_TIMEOUT,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn managed_worktree_is_clean(worktree: &Path) -> Result<bool, Error> {
+    if safe_git(
+        worktree,
+        None,
+        &["diff", "--quiet", "--no-ext-diff", "--"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await
+    .is_err()
+    {
+        return Ok(false);
+    }
+    Ok(safe_git(
+        worktree,
+        None,
+        &["ls-files", "--others", "--exclude-standard"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?
+    .trim()
+    .is_empty())
 }
 
 fn parse_remote_head(output: &str, reference: &str) -> Result<Option<String>, Error> {
@@ -1516,6 +1619,22 @@ mod tests {
             retry, record,
             "a DB-gap retry must recover the exact worktree"
         );
+
+        run(&temp.path().join("repo"), &["checkout", "main"]);
+        fs::write(temp.path().join("repo").join("README"), "advanced\n").unwrap();
+        run(&temp.path().join("repo"), &["commit", "-am", "advance"]);
+        run(&temp.path().join("repo"), &["push", "origin", "main"]);
+        let advanced = create_managed_change(
+            &project,
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_ne!(advanced.base_sha, record.base_sha);
+        assert_eq!(advanced.base_sha, advanced.head_sha);
     }
 
     #[tokio::test]
@@ -1570,6 +1689,60 @@ mod tests {
         run(
             &foreign,
             &["worktree", "remove", "--force", path.to_str().unwrap()],
+        );
+        let recovered =
+            create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+                .await
+                .unwrap();
+        assert_eq!(recovered.base_sha, recovered.head_sha);
+    }
+
+    #[tokio::test]
+    async fn managed_change_rejects_a_same_repository_leaf_symlink() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-symlink".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-symlink");
+        let outside = temp.path().join("outside");
+        run(
+            &temp.path().join("repo"),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "issue/issue-175-symlink",
+                outside.to_str().unwrap(),
+            ],
+        );
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        let error = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("leaf"));
+
+        fs::remove_file(&path).unwrap();
+        run(
+            &temp.path().join("repo"),
+            &["worktree", "remove", "--force", outside.to_str().unwrap()],
+        );
+        run(
+            &temp.path().join("repo"),
+            &["branch", "-D", "issue/issue-175-symlink"],
         );
         let recovered =
             create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
@@ -1924,5 +2097,73 @@ mod tests {
             "open and both sides of update must verify"
         );
         assert!(calls.contains("pr edit 7 --repo owner/repo"));
+    }
+
+    #[tokio::test]
+    async fn managed_change_pr_uses_the_registered_published_head() {
+        let (temp, mut target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-pr".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-pr");
+        let record = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+        target.worktree = path;
+        target.branch = record.branch.clone();
+        target.git_dir = PathBuf::from(&record.git_dir);
+        target.common_dir = PathBuf::from(&record.common_dir);
+        target.worktree_device = record.worktree_device;
+        target.worktree_inode = record.worktree_inode;
+        target.git_dir_device = record.git_dir_device;
+        target.git_dir_inode = record.git_dir_inode;
+        target.common_dir_device = record.common_dir_device;
+        target.common_dir_inode = record.common_dir_inode;
+        target.head = record.head_sha.clone();
+        target.registered_change = Some(record.clone());
+        let head = target.commit("managed PR commit").await.unwrap();
+        target.push().await.unwrap();
+
+        let mut published = record;
+        published.head_sha = head.clone();
+        published.published_head_sha = Some(head.clone());
+        target.head = head.clone();
+        target.registered_change = Some(published);
+        target.github_repo = Some("owner/repo".into());
+        let fake = temp.path().join("gh-managed");
+        let log = temp.path().join("gh-managed.log");
+        fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n 'pr view') printf 'issue/issue-175-pr\\tmain\\t{}\\thttps://github.com/owner/repo/pull/8\\n' ;;\nesac\n",
+                log.display(), head
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o500)).unwrap();
+        target.gh_program = fs::canonicalize(fake).unwrap();
+        assert_eq!(
+            target
+                .pr_open("Managed title", "Managed body")
+                .await
+                .unwrap(),
+            "https://github.com/owner/repo/pull/8"
+        );
+        let calls = fs::read_to_string(log).unwrap();
+        assert!(calls.contains("pr create --repo owner/repo --head issue/issue-175-pr"));
+        assert!(calls.contains("pr view issue/issue-175-pr --repo owner/repo"));
     }
 }
