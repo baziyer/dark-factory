@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 factory-core = { path = "../factory-core" }
+nix = { version = "0.28", default-features = false, features = ["poll"] }
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

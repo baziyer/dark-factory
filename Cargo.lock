@@ -449,6 +449,7 @@ name = "factoryctl"
 version = "0.2.4"
 dependencies = [
  "factory-core",
+ "nix 0.28.0",
  "portable-pty",
  "rustix",
  "serde",

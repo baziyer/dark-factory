@@ -32,6 +32,7 @@ struct FakeDaemon {
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
     attach_ready: Receiver<()>,
     output_gate: Arc<AtomicBool>,
+    attach_cancelled: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
     _directory: tempfile::TempDir,
@@ -45,10 +46,12 @@ impl FakeDaemon {
         listener.set_nonblocking(true).unwrap();
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let output_gate = Arc::new(AtomicBool::new(false));
+        let attach_cancelled = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (attach_ready_tx, attach_ready) = mpsc::channel();
         let thread_inputs = Arc::clone(&inputs);
         let thread_gate = Arc::clone(&output_gate);
+        let thread_cancelled = Arc::clone(&attach_cancelled);
         let thread_stop = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
@@ -56,8 +59,11 @@ impl FakeDaemon {
                     Ok((stream, _)) => {
                         let inputs = Arc::clone(&thread_inputs);
                         let gate = Arc::clone(&thread_gate);
+                        let cancelled = Arc::clone(&thread_cancelled);
                         let ready = attach_ready_tx.clone();
-                        thread::spawn(move || handle_connection(stream, inputs, gate, ready));
+                        thread::spawn(move || {
+                            handle_connection(stream, inputs, gate, cancelled, ready);
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -71,6 +77,7 @@ impl FakeDaemon {
             inputs,
             attach_ready,
             output_gate,
+            attach_cancelled,
             stop,
             thread: Some(thread),
             _directory: directory,
@@ -90,6 +97,10 @@ impl FakeDaemon {
     fn inputs(&self) -> Vec<Vec<u8>> {
         self.inputs.lock().unwrap().clone()
     }
+
+    fn attach_cancelled(&self) -> bool {
+        self.attach_cancelled.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for FakeDaemon {
@@ -106,6 +117,7 @@ fn handle_connection(
     mut stream: UnixStream,
     inputs: Arc<Mutex<Vec<Vec<u8>>>>,
     output_gate: Arc<AtomicBool>,
+    attach_cancelled: Arc<AtomicBool>,
     attach_ready: mpsc::Sender<()>,
 ) {
     let mut line = String::new();
@@ -132,6 +144,7 @@ fn handle_connection(
             );
             let mut discard = [0_u8; 1];
             let _ = stream.read(&mut discard);
+            attach_cancelled.store(true, Ordering::Release);
         }
         LocalRequest::TerminalInput { bytes, .. } => {
             inputs
@@ -248,9 +261,10 @@ fn executable_attach_output_failure_cancels_reader_and_restores_raw_mode() {
     let daemon = FakeDaemon::start();
     let (mut child, _input, before, master) = spawn_cli(&daemon, Stdio::piped());
     daemon.wait_for_attach();
-    // Closing the only stdout reader makes the production writer fail. The
-    // output thread must set the lifecycle error, cancel the blocked attach
-    // reader, join it, and let RawMode restore before returning.
+    // Mutation proof: closing the only stdout reader makes the production
+    // writer fail. The repaired lifecycle must wake the blocked input wait,
+    // cancel the attach socket, join both workers, and let RawMode restore
+    // before returning. The old timing-only reader lifecycle hangs here.
     drop(child.stdout.take());
     daemon.allow_output();
 
@@ -264,6 +278,10 @@ fn executable_attach_output_failure_cancels_reader_and_restores_raw_mode() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert!(stderr.contains("terminal output stream"), "{stderr}");
+    assert!(
+        daemon.attach_cancelled(),
+        "output failure did not cancel the attach socket"
+    );
     assert_eq!(
         master.get_termios().map(|termios| format!("{termios:?}")),
         before,

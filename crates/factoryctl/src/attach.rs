@@ -5,6 +5,7 @@
 
 use std::{
     io::{Read, Write},
+    os::{fd::AsFd, unix::net::UnixStream},
     sync::mpsc::{self, RecvTimeoutError, Sender},
     sync::{
         Arc, Mutex,
@@ -23,6 +24,7 @@ use factory_core::{
     },
 };
 use factoryctl::Client;
+use nix::sys::select::{FdSet, select};
 use rustix::termios::{self, OptionalActions, Termios};
 
 /// Byte the operator types to detach: Ctrl-] (ASCII GS, 0x1D), the classic
@@ -84,7 +86,9 @@ pub fn run(
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
     let (input_tx, input_rx) = mpsc::channel();
-    let input_thread = spawn_stdin_reader(input_tx, Arc::clone(&done));
+    let (input_cancel_read, mut input_cancel_write) = UnixStream::pair()
+        .map_err(|error| format!("could not create attach cancellation: {error}"))?;
+    let input_thread = spawn_stdin_reader(input_tx, Arc::clone(&done), input_cancel_read);
     let exit_code = loop {
         if done.load(Ordering::SeqCst) {
             break if failure
@@ -107,9 +111,10 @@ pub fn run(
 
     cancellation.cancel();
     done.store(true, Ordering::SeqCst);
-    drop(raw_mode);
+    let _ = input_cancel_write.write_all(&[1]);
     let _ = output_thread.join();
     let _ = input_thread.join();
+    drop(raw_mode);
     if let Some(message) = failure
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -230,13 +235,25 @@ enum StdinEvent {
     Eof,
 }
 
-fn spawn_stdin_reader(sender: Sender<StdinEvent>, done: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+fn spawn_stdin_reader(
+    sender: Sender<StdinEvent>,
+    done: Arc<AtomicBool>,
+    cancel: UnixStream,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
         loop {
             if done.load(Ordering::SeqCst) {
                 return;
+            }
+            match wait_for_input_or_cancel(&stdin, &cancel) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(_) => {
+                    let _ = sender.send(StdinEvent::Eof);
+                    return;
+                }
             }
             match stdin.read(&mut buffer) {
                 Ok(0) => continue,
@@ -260,6 +277,20 @@ fn spawn_stdin_reader(sender: Sender<StdinEvent>, done: Arc<AtomicBool>) -> thre
             }
         }
     })
+}
+
+/// Waits for either operator input or the lifecycle cancellation signal.
+/// `select` is used instead of a tty read timeout: macOS does not reliably
+/// poll terminal devices, while an explicit cancellation fd makes the input
+/// join deterministic on every Unix target supported by factoryctl.
+fn wait_for_input_or_cancel(input: &impl AsFd, cancel: &impl AsFd) -> std::io::Result<bool> {
+    let input_fd = input.as_fd();
+    let cancel_fd = cancel.as_fd();
+    let mut readfds = FdSet::new();
+    readfds.insert(input_fd);
+    readfds.insert(cancel_fd);
+    select(None, Some(&mut readfds), None, None, None)?;
+    Ok(readfds.contains(cancel_fd))
 }
 
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {
@@ -400,11 +431,6 @@ impl RawMode {
         let original = termios::tcgetattr(&stdin).map_err(std::io::Error::from)?;
         let mut raw = original.clone();
         raw.make_raw();
-        // Keep the reader interruptible so output failure can join both
-        // directions before the terminal is restored. In raw mode, a
-        // tenth-second VTIME is a read timeout, not an input byte.
-        raw.special_codes[termios::SpecialCodeIndex::VMIN] = 0;
-        raw.special_codes[termios::SpecialCodeIndex::VTIME] = 1;
         termios::tcsetattr(&stdin, OptionalActions::Flush, &raw).map_err(std::io::Error::from)?;
         Ok(Self { original })
     }
@@ -420,8 +446,13 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     use super::{forward_stdin_from, write_terminal_bytes};
-    use std::io::{Cursor, Write};
     use std::sync::atomic::AtomicBool;
+    use std::{
+        io::{Cursor, Write},
+        os::unix::net::UnixStream,
+        thread,
+        time::Duration,
+    };
 
     struct FailingWriter;
 
@@ -469,5 +500,15 @@ mod tests {
         let mut writer = FailingWriter;
         let error = write_terminal_bytes(&mut writer, b"output").unwrap_err();
         assert!(error.contains("could not be written"));
+    }
+
+    #[test]
+    fn cancellation_wakes_a_blocked_input_wait() {
+        let (input, _input_writer) = UnixStream::pair().unwrap();
+        let (cancel, mut cancel_writer) = UnixStream::pair().unwrap();
+        let handle = thread::spawn(move || super::wait_for_input_or_cancel(&input, &cancel));
+        thread::sleep(Duration::from_millis(25));
+        cancel_writer.write_all(&[1]).unwrap();
+        assert!(handle.join().unwrap().unwrap());
     }
 }
