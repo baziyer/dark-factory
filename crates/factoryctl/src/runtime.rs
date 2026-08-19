@@ -62,7 +62,7 @@ pub fn rollback_report(
 }
 
 /// The rollback authority captured while [`MutationLock`] is held.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MutationSnapshot {
     pub active_version: Option<String>,
     pub plist: Option<String>,

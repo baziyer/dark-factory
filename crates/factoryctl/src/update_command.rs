@@ -64,7 +64,15 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     let mut log = |line: &str| eprintln!("update: {line}");
     let mut progress = |stage| eprintln!("update: {stage:?}");
-    match managed_update::install(&home, socket, &manifest, false, &mut progress, &mut log) {
+    match managed_update::install(
+        &home,
+        socket,
+        &manifest,
+        false,
+        false,
+        &mut progress,
+        &mut log,
+    ) {
         Ok(outcome) => {
             let launchd = match outcome.daemon {
                 managed_update::ManagedDaemon::NotInstalled => "not_installed",

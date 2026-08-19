@@ -349,27 +349,26 @@ fn update_is_human_readable_by_default_and_names_both_versions() {
 }
 
 #[test]
-fn human_update_output_sanitizes_manifest_text_but_json_keeps_it_exact() {
+fn hostile_manifest_text_is_rejected_and_human_error_stays_safe() {
     let fixture = Fixture::new();
     let hostile = "999.0.0-rc\u{1b}[2J\nupdate --install: forged";
     let url = fixture.publish_at(hostile, "hostile", None);
     let output = fixture.human_command(&url, &["update"]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "stderr={} stdout={}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert!(!output.status.success());
     assert!(!output.stdout.contains(&0x1b_u8));
     assert_eq!(
         output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
-        4
+        5
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("latest release: 999.0.0-rc?[2J?update --install: forged\n"));
+    assert!(stdout.contains("latest release: unavailable\n"));
+    assert!(stdout.contains("update error: manifest is not valid:"));
+    assert!(!stdout.contains("update --install: forged\n"));
 
-    let (_, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
-    assert_eq!(report["latest"], hostile);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
+    assert_eq!(code, 1);
+    assert!(report.get("latest").is_none());
+    assert!(report["error"].as_str().unwrap().contains("not valid"));
 }
 
 #[test]
@@ -394,11 +393,9 @@ fn matching_active_release_reports_no_install_work_human_and_json() {
         .human_command(&url, &["update", "--install"])
         .output()
         .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(&format!(
-        "update --install: installed {version} (restart the daemon yourself)\n"
-    )));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("verified release identity"), "{stderr}");
 }
 
 #[test]
@@ -746,7 +743,8 @@ fn update_reports_an_unreachable_manifest_as_an_error() {
 #[test]
 fn install_verifies_unpacks_and_activates_then_reports_no_launchd_job() {
     let fixture = Fixture::new();
-    let bad = fixture.publish("999.0.0", Some("00"));
+    let bad_sha = "00".repeat(32);
+    let bad = fixture.publish("999.0.0", Some(&bad_sha));
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args(["update", "--install"])
         .env("DARK_FACTORY_HOME", fixture.home())

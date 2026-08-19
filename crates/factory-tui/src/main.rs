@@ -24,7 +24,6 @@ mod ui;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -64,6 +63,28 @@ struct ContextRefresh {
     was_agent_view: bool,
     last_refresh: Instant,
     force: bool,
+}
+
+#[derive(Default)]
+struct UpdateWorker(Option<std::thread::JoinHandle<()>>);
+
+impl UpdateWorker {
+    fn replace(&mut self, worker: std::thread::JoinHandle<()>) {
+        debug_assert!(self.0.is_none());
+        self.0 = Some(worker);
+    }
+
+    fn join(&mut self) {
+        if let Some(worker) = self.0.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+impl Drop for UpdateWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
 }
 
 impl ContextRefresh {
@@ -270,34 +291,13 @@ fn relaunch_arguments(board: &Board, original: &[OsString]) -> Result<Vec<OsStri
     Ok(arguments)
 }
 
-fn active_tui_path(version: &str) -> Result<PathBuf, String> {
-    let home = factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
-    let active = factoryctl::update::active_version(&home)?;
-    if active.as_deref() != Some(version) {
-        return Err(format!(
-            "active runtime changed before relaunch (expected {version}, found {})",
-            active.as_deref().unwrap_or("none")
-        ));
-    }
-    let executable = home.join("bin/current/factory-tui");
-    let metadata = std::fs::metadata(&executable)
-        .map_err(|error| format!("cannot inspect {}: {error}", executable.display()))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
-        return Err(format!(
-            "{} is not an executable file",
-            executable.display()
-        ));
-    }
-    Ok(executable)
-}
-
 fn finish_update(
     outcome: factoryctl::managed_update::InstalledUpdate,
     board: &mut Board,
     panes: &mut PaneMap,
     original_args: &[OsString],
 ) {
-    let preparation = active_tui_path(&outcome.version).and_then(|executable| {
+    let preparation = outcome.verified_tui_executable().and_then(|executable| {
         relaunch_arguments(board, original_args).map(|args| (executable, args))
     });
     let (executable, arguments) = match preparation {
@@ -340,10 +340,15 @@ fn rollback_failed_relaunch(
 
 fn reexec_failure_message(
     seam_error: String,
-    rollback: impl FnOnce() -> Result<(), String>,
+    rollback: impl FnOnce() -> Result<factoryctl::managed_update::ReexecRecovery, String>,
 ) -> String {
     match rollback() {
-        Ok(()) => format!("{seam_error}; previous runtime restored"),
+        Ok(factoryctl::managed_update::ReexecRecovery::Restored) => {
+            format!("{seam_error}; previous runtime restored")
+        }
+        Ok(factoryctl::managed_update::ReexecRecovery::NotNeeded) => {
+            format!("{seam_error}; runtime was already active, so no rollback was needed")
+        }
         Err(error) => format!("{seam_error}; rollback failed: {error}"),
     }
 }
@@ -449,7 +454,8 @@ fn run(
     let mut remembered_project = board.focused_project.clone();
     let mut context_refresh = ContextRefresh::new();
     let mut mouse_capture = mouse::Capture::default();
-    net::spawn_update_check(tx.clone(), now_ms());
+    let mut update_worker = UpdateWorker::default();
+    net::spawn_update_check(socket.to_owned(), tx.clone(), now_ms());
 
     sync_panes(board, panes, socket, client, tx, debug_log);
     let mut hit_map = draw_board(terminal, board, panes)?;
@@ -465,7 +471,8 @@ fn run(
             match event::read()? {
                 Event::Key(key) => {
                     let intent = board.handle_key(key);
-                    needs_redraw |= apply_intent(intent, board, client, socket, tx, panes);
+                    needs_redraw |=
+                        apply_intent(intent, board, client, socket, tx, panes, &mut update_worker);
                 }
                 Event::Paste(text) => {
                     forward_paste_if_applicable(board, panes, &text);
@@ -483,6 +490,7 @@ fn run(
                             socket,
                             tx,
                             panes,
+                            update_worker: &mut update_worker,
                         },
                     );
                 }
@@ -495,6 +503,7 @@ fn run(
                 context_refresh.force = true;
             }
             if let NetMsg::UpdateFinished(result) = msg {
+                update_worker.join();
                 match result {
                     Ok(outcome) => finish_update(outcome, board, panes, relaunch_args),
                     Err(error) => {
@@ -539,7 +548,7 @@ fn run(
             last_second = Instant::now();
             needs_redraw = true;
             if last_update_check.elapsed() >= factoryctl::update::CHECK_INTERVAL {
-                net::spawn_update_check(tx.clone(), now_ms());
+                net::spawn_update_check(socket.to_owned(), tx.clone(), now_ms());
                 last_update_check = Instant::now();
             }
         }
@@ -787,6 +796,7 @@ struct IntentContext<'a> {
     socket: &'a std::path::Path,
     tx: &'a mpsc::Sender<NetMsg>,
     panes: &'a PaneMap,
+    update_worker: &'a mut UpdateWorker,
 }
 
 fn handle_mouse(
@@ -820,6 +830,7 @@ fn handle_mouse(
                 context.socket,
                 context.tx,
                 context.panes,
+                context.update_worker,
             )
         }
         mouse::Route::Scroll { session_id, up } => {
@@ -858,6 +869,7 @@ fn apply_intent(
     socket: &std::path::Path,
     tx: &mpsc::Sender<NetMsg>,
     panes: &PaneMap,
+    update_worker: &mut UpdateWorker,
 ) -> bool {
     match intent {
         Intent::None => false,
@@ -878,7 +890,11 @@ fn apply_intent(
                 board.note_error("update details are unavailable; wait for the next check");
                 return true;
             };
-            net::spawn_update_install(socket.to_owned(), tx.clone(), check);
+            update_worker.replace(net::spawn_update_install(
+                socket.to_owned(),
+                tx.clone(),
+                check,
+            ));
             true
         }
         Intent::ForwardKey(key) => {
@@ -1086,7 +1102,7 @@ mod main_tests {
                     factoryctl::update::platform_key().to_owned(),
                     Asset {
                         url: "https://example.invalid/release.tar.gz".to_owned(),
-                        sha256: "00".to_owned(),
+                        sha256: "00".repeat(32),
                     },
                 )]
                 .into(),
@@ -1169,7 +1185,7 @@ mod main_tests {
         let called = std::cell::Cell::new(false);
         let message = reexec_failure_message("exec failed".to_owned(), || {
             called.set(true);
-            Ok(())
+            Ok(factoryctl::managed_update::ReexecRecovery::Restored)
         });
         assert!(called.get());
         assert_eq!(message, "exec failed; previous runtime restored");
@@ -1179,6 +1195,13 @@ mod main_tests {
         assert_eq!(
             message,
             "exec failed; rollback failed: old daemon unhealthy"
+        );
+        let message = reexec_failure_message("exec failed".to_owned(), || {
+            Ok(factoryctl::managed_update::ReexecRecovery::NotNeeded)
+        });
+        assert_eq!(
+            message,
+            "exec failed; runtime was already active, so no rollback was needed"
         );
     }
 
@@ -1350,7 +1373,15 @@ mod main_tests {
         assert!(matches!(first_key, Intent::ForwardKey(_)));
         let client = Client::new(&socket);
         let (tx, _rx) = mpsc::channel();
-        apply_intent(first_key, &mut board, &client, &socket, &tx, &panes);
+        apply_intent(
+            first_key,
+            &mut board,
+            &client,
+            &socket,
+            &tx,
+            &panes,
+            &mut UpdateWorker::default(),
+        );
         server.join().unwrap();
     }
 
@@ -1462,10 +1493,19 @@ mod main_tests {
 
         let key = board.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(matches!(key, Intent::ForwardKey(_)));
-        assert!(apply_intent(key, &mut board, &client, &socket, &tx, &panes));
+        assert!(apply_intent(
+            key,
+            &mut board,
+            &client,
+            &socket,
+            &tx,
+            &panes,
+            &mut UpdateWorker::default(),
+        ));
         forward_paste_if_applicable(&board, &panes, "paste");
 
         let mut hits = mouse::HitMap::default();
+        let mut update_worker = UpdateWorker::default();
         hits.set_terminal(Rect::new(0, 0, 10, 5), session_id.clone());
         assert!(!handle_mouse(
             ratatui::crossterm::event::MouseEvent {
@@ -1482,6 +1522,7 @@ mod main_tests {
                 socket: &socket,
                 tx: &tx,
                 panes: &panes,
+                update_worker: &mut update_worker,
             },
         ));
         assert!(
@@ -1847,4 +1888,15 @@ mod main_tests {
         assert!(!text.contains("[exited]"));
         server.join().unwrap();
     }
+}
+#[test]
+fn dropping_the_update_guard_joins_the_worker() {
+    let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_completed = completed.clone();
+    let mut worker = UpdateWorker::default();
+    worker.replace(std::thread::spawn(move || {
+        worker_completed.store(true, std::sync::atomic::Ordering::Release);
+    }));
+    drop(worker);
+    assert!(completed.load(std::sync::atomic::Ordering::Acquire));
 }

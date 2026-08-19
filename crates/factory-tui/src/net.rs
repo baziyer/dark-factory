@@ -540,12 +540,17 @@ fn spawn_fleet_status_refresh_with(
 /// of the manifest) and reports it. `main.rs` calls this at startup and then hourly from the 1 Hz
 /// tick — the check itself is what caps the network cost, so a board restarted every minute
 /// still fetches at most once an hour. No `$DARK_FACTORY_HOME` (no `HOME`) means no check.
-pub fn spawn_update_check(tx: Sender<NetMsg>, now_ms: i64) {
+pub fn spawn_update_check(socket: PathBuf, tx: Sender<NetMsg>, now_ms: i64) {
     let Ok(home) = factory_core::paths::dark_factory_home() else {
         return;
     };
     thread::spawn(move || {
-        let check = update::check(&home, &update::manifest_url(), now_ms, false);
+        let recovery = factoryctl::managed_update::recover_pending(&home, &socket);
+        let mut check = update::check(&home, &update::manifest_url(), now_ms, false);
+        if let Err(error) = recovery {
+            check.latest = None;
+            check.error = Some(format!("interrupted update recovery failed: {error}"));
+        }
         let active_version = update::active_version(&home);
         let _ = tx.send(NetMsg::UpdateCheck {
             check,
@@ -564,7 +569,8 @@ pub fn manual_update_candidate<'a>(
     active: Option<&str>,
 ) -> Option<&'a update::Manifest> {
     let latest = check.latest.as_ref()?;
-    if !latest.assets.contains_key(update::platform_key())
+    if update::validate_manifest(latest).is_err()
+        || !latest.assets.contains_key(update::platform_key())
         || active.is_some_and(|active| update::is_newer(active, &latest.version))
     {
         return None;
@@ -577,7 +583,11 @@ pub fn manual_update_candidate<'a>(
 /// Runs the exact installer transaction used by `factoryctl update --install`
 /// without blocking rendering. Unlike the CLI, the TUI requires the managed
 /// launchd job because it cannot safely restart an unknown daemon owner.
-pub fn spawn_update_install(socket: PathBuf, tx: Sender<NetMsg>, check: UpdateCheck) {
+pub fn spawn_update_install(
+    socket: PathBuf,
+    tx: Sender<NetMsg>,
+    check: UpdateCheck,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let _ = tx.send(NetMsg::UpdateProgress(
             factoryctl::managed_update::UpdateProgress::Checking,
@@ -597,13 +607,14 @@ pub fn spawn_update_install(socket: PathBuf, tx: Sender<NetMsg>, check: UpdateCh
                 &socket,
                 &manifest,
                 true,
+                true,
                 &mut progress,
                 &mut |_| {},
             )
             .map_err(|error| error.to_string())
         })();
         let _ = tx.send(NetMsg::UpdateFinished(result));
-    });
+    })
 }
 
 /// Fires one request in the background and reports the result. Used for every operator action
@@ -654,7 +665,7 @@ mod tests {
                 update::platform_key().to_owned(),
                 update::Asset {
                     url: "https://example.invalid/release.tar.gz".to_owned(),
-                    sha256: "00".to_owned(),
+                    sha256: "00".repeat(32),
                 },
             )]
             .into(),

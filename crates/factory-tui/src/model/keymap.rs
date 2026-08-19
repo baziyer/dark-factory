@@ -474,6 +474,10 @@ impl Board {
             Action::MessageOrchestrator => self.begin_message_orchestrator(),
             Action::SwitchProject => self.begin_switch_project(),
             Action::StopSelected => self.begin_stop_selected(),
+            Action::Detach if self.update_progress.is_some() => {
+                self.note_error("update in progress; this viewer will relaunch when it is safe");
+                Intent::Redraw
+            }
             Action::Detach => {
                 self.quit = true;
                 Intent::Quit
@@ -2077,6 +2081,11 @@ mod tests {
             keyboard.handle_key(key(KeyCode::Char('u'))),
             Intent::None
         ));
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('q'))),
+            Intent::Redraw
+        ));
+        assert!(!keyboard.quit, "detach is delayed until the updater joins");
 
         let mut mouse = board();
         mouse.update_available = Some("0.2.6".to_owned());
@@ -2088,6 +2097,11 @@ mod tests {
             mouse.handle_mouse_target(MouseTarget::Update),
             Intent::None
         ));
+        assert!(matches!(
+            mouse.handle_mouse_target(MouseTarget::Detach),
+            Intent::Redraw
+        ));
+        assert!(!mouse.quit);
     }
 
     #[test]
