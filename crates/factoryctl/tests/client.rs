@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, ErrorKind, Write},
     os::unix::net::UnixListener,
     thread,
 };
@@ -9,6 +9,29 @@ use factory_core::{
     local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
 };
 use factoryctl::{Client, ClientError, MAX_FRAME_BYTES};
+
+fn write_oversized_frame(stream: &mut impl Write) {
+    let chunk = [b'x'; 16 * 1024];
+    let mut written = 0;
+    while written < MAX_FRAME_BYTES {
+        let chunk_len = (MAX_FRAME_BYTES - written).min(chunk.len());
+        let count = stream
+            .write(&chunk[..chunk_len])
+            .expect("server write failed before crossing the frame-size boundary");
+        assert!(
+            count > 0,
+            "server write made no progress before the boundary"
+        );
+        written += count;
+    }
+    assert_eq!(written, MAX_FRAME_BYTES);
+
+    match stream.write_all(b"x\n") {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("unexpected server teardown error after the boundary: {error}"),
+    }
+}
 
 #[test]
 fn request_writes_one_json_line_and_reads_one_versioned_frame() {
@@ -131,22 +154,23 @@ fn subscribe_exposes_each_frame_without_polling() {
 
 #[test]
 fn rejects_an_oversized_server_frame_before_parsing_json() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("factory.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        stream.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]).unwrap();
-        stream.write_all(b"\n").unwrap();
-    });
+    for _ in 0..8 {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            write_oversized_frame(&mut stream);
+        });
 
-    let error = Client::new(&socket)
-        .request(LocalRequest::Health)
-        .unwrap_err();
-    assert!(matches!(error, ClientError::FrameTooLarge { .. }));
-    server.join().unwrap();
+        let error = Client::new(&socket)
+            .request(LocalRequest::Health)
+            .unwrap_err();
+        assert!(matches!(error, ClientError::FrameTooLarge { .. }));
+        server.join().unwrap();
+    }
 }
