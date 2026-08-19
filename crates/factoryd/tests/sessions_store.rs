@@ -5,7 +5,8 @@ use factory_core::{
     ProviderNotificationKind, RunId, RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
 use factoryd::store::{
-    NewAgent, NewAgentMessage, NewProject, NewSession, NewTask, Store, StoreError,
+    NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession, NewTask, Store,
+    StoreError,
 };
 
 fn project_id(value: &str) -> ProjectId {
@@ -314,6 +315,122 @@ fn migrations_0019_through_0027_follow_the_budget_schema_in_order() {
         })
         .unwrap();
     assert_eq!(violations, 0);
+}
+
+#[test]
+fn migration_0027_rebuilds_a_populated_session_graph_with_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("populated-v26.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        let (session, _) = store
+            .create_session(new_session("migration-session", "factory", "curie"), 3)
+            .unwrap();
+        store
+            .record_hook_event(
+                &session.id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                4,
+            )
+            .unwrap();
+        let message_id = MessageId::try_from("migration-message").unwrap();
+        store
+            .send_agent_message(NewAgentMessage {
+                id: message_id.clone(),
+                project_id: project_id("factory"),
+                sender_agent_id: None,
+                recipient_agent_id: agent_id("curie"),
+                body: "message retained across the rebuild".into(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "migration-delivery".into(),
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+                session_id: session.id,
+                task_id: None,
+                task_incarnation_id: None,
+                prior_run_count: Some(0),
+                message_ids: vec![message_id],
+                text: "deliver this message".into(),
+                created_at_ms: 6,
+            })
+            .unwrap();
+    }
+
+    // Round-3's schema is v26. Lowering the version on this populated v26
+    // shape forces the real 0027 rebuild; the child rows make an FK-on DROP
+    // fail with SQLite 787, so this fixture specifically guards the
+    // foreign_keys-off/rebuild/foreign_keys-on discipline.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "user_version", 26).unwrap();
+    }
+    let store = Store::open(&database).unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 27);
+    let message_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let delivery_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_attempts WHERE id = 'migration-delivery'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(message_count, 1);
+    assert_eq!(delivery_count, 1);
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .unwrap();
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    assert!(
+        store
+            .list_sessions(&project_id("factory"), None, 10)
+            .unwrap()
+            .iter()
+            .any(|session| session.id == session_id("migration-session"))
+    );
 }
 
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s

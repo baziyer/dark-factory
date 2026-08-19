@@ -5823,12 +5823,19 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         current = 26;
     }
     if current == 26 {
+        // `runs.session_id`, `agent_messages.delivered_session_id`, and
+        // `delivery_attempts.session_id` all reference `sessions`. SQLite
+        // refuses to drop a populated parent while foreign keys are enabled,
+        // so use the same off/rebuild/on/verify discipline as migration 0015.
+        connection.pragma_update(None, "foreign_keys", false)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
             "../migrations/0027_widen_session_notification_kind.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 27)?;
         transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
 }

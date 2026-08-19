@@ -612,6 +612,13 @@ pub fn attention_items(
     items
 }
 
+/// Returns the structured reason currently authoritative for one session,
+/// using the same provider/observer/delivery precedence as fleet status.
+#[must_use]
+pub fn session_attention_reason_kind(session: &SessionSnapshot) -> Option<AttentionReasonKind> {
+    session_reason(session).map(|(_, reason)| reason.kind)
+}
+
 fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReason)> {
     use crate::{ObserverHealth, ProviderHookEvent, SessionState};
 
