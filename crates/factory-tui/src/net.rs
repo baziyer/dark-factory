@@ -102,6 +102,7 @@ pub enum NetMsg {
     EventsReplay(Vec<EventEnvelope>),
     CaughtUp,
     OperationResult(Result<LocalResponse, String>),
+    CapacityResult(Result<factoryctl::capacity::CapacityChange, String>),
     /// The hourly release-manifest check and the validated installed runtime
     /// it must be compared with (`spawn_update_check`).
     UpdateCheck {
@@ -486,6 +487,16 @@ pub fn spawn_request(client: Client, tx: Sender<NetMsg>, request: LocalRequest) 
     thread::spawn(move || {
         let result = request_response(&client, request);
         let _ = tx.send(NetMsg::OperationResult(result));
+    });
+}
+
+/// Runs the same operator-owned launchd capacity operation as
+/// `factoryctl capacity set`; the render loop never blocks on launchd or the
+/// post-reload health wait.
+pub fn spawn_capacity_update(socket: PathBuf, tx: Sender<NetMsg>, capacity: usize) {
+    thread::spawn(move || {
+        let result = factoryctl::capacity::set_from_environment(&socket, capacity);
+        let _ = tx.send(NetMsg::CapacityResult(result));
     });
 }
 

@@ -7,7 +7,10 @@ catalogue.
 ## Invariants
 
 1. `factoryd` is the sole owner of processes, scheduling, dependencies,
-   concurrency, retries, budgets, durable state, and health.
+   concurrency, retries, budgets, durable state, and health. Its live-session
+   capacity is a finite operator-owned launchd setting (`--max-active-runs`),
+   never model-selected or agent-mutable; changing it restarts only the daemon
+   and preserves detached runner processes.
 2. SQLite is the durable source of truth. State changes and their append-only
    events commit in the same transaction. The store uses WAL with `FULL`
    synchronous writes so acknowledged commands survive more than a process

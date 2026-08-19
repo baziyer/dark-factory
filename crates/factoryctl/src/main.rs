@@ -11,16 +11,13 @@ use factory_core::local::{
     ServerFrame,
 };
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
-use factoryctl::Client;
+use factoryctl::{Client, capacity};
 use uuid::Uuid;
 
 mod attach;
 mod doctor;
 mod init;
-mod install;
-mod launchd;
 mod outbox;
-mod probes;
 mod status;
 mod update_command;
 mod usage;
@@ -39,7 +36,7 @@ const SESSION_TOKEN_FILE_ENV: &str = "DARK_FACTORY_SESSION_TOKEN_FILE";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -48,6 +45,7 @@ Commands:
   health                                      Check the daemon
   status [--json]                             The whole fleet at one instant: sessions, queues, attention, live-session cap
   auto on|off|status                         Set or show the factory-wide provider bypass default
+  capacity status|set N                     Show or change the operator-owned live-session capacity (1..=64)
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Diagnose the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
@@ -88,6 +86,14 @@ factory-tui reads the same request. For history, use the list commands.
 Options:
   --json                       Print the complete protocol response frame
   -h, --help                   Show this help";
+
+const CAPACITY_HELP: &str = "usage: factoryctl capacity <status|set N>
+
+The capacity is a finite daemon-wide live-session bound. `set` is operator-only
+(provider-session shell policy denies this mutation),
+requires the managed launchd job, shows that launchd will restart only factoryd
+while preserving runner processes/session state, and rolls the plist back if the
+reload or health check fails. Valid values are 1 through 64.";
 const INIT_HELP: &str = "usage: factoryctl init [--yes] [--no-launchd]
 
 Guided first install on this machine:
@@ -736,6 +742,10 @@ enum CliCommand {
     SetAutoMode {
         enabled: bool,
     },
+    CapacityStatus,
+    CapacitySet {
+        value: usize,
+    },
     Usage,
     Version,
     Update {
@@ -980,6 +990,27 @@ fn run() -> Result<i32, String> {
         factory_home.as_deref(),
         home.as_deref(),
     )?;
+    if matches!(&command, CliCommand::CapacityStatus) {
+        let status = capacity::status_from_environment()?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "capacity": status.configured,
+                "launchd_loaded": status.launchd_loaded,
+            })
+        );
+        return Ok(0);
+    }
+    if let CliCommand::CapacitySet { value } = &command {
+        let previous = capacity::status_from_environment()?.configured;
+        let requested = capacity::validate(*value)?;
+        eprintln!(
+            "capacity: {previous} -> {requested} live sessions; launchd will restart only factoryd, preserving live runner processes and session state; higher values can increase concurrent provider/subscription use, lower values leave work queued"
+        );
+        let change = capacity::set_from_environment(&socket, *value)?;
+        println!("{}", capacity_result(&change));
+        return Ok(0);
+    }
     if let CliCommand::Update { install } = command {
         return update_command::run(&update_command::Options { install }, &socket);
     }
@@ -1063,6 +1094,15 @@ fn run() -> Result<i32, String> {
         write_frame(&mut output, &frame)?;
     }
     Ok(if is_error(&frame) { 2 } else { 0 })
+}
+
+fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
+    serde_json::json!({
+        "previous": change.previous,
+        "capacity": change.current,
+        "launchd": "reloaded",
+        "live_sessions_preserved": true,
+    })
 }
 
 /// The agent-facing mutations a session's own `factoryctl` calls make on
@@ -1338,6 +1378,12 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
                 _ => Err("auto action must be `on`, `off`, or `status`".into()),
             }
         }
+        "capacity" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(CAPACITY_HELP)));
+            }
+            parse_capacity(args).map(|command| (socket, command))
+        }
         "version" | "--version" | "-V" => {
             require_empty(&args)?;
             Ok((socket, CliCommand::Version))
@@ -1469,6 +1515,27 @@ fn parse_pr(mut args: Vec<String>) -> Result<CliCommand, String> {
             })
         }
         _ => Err(format!("unknown pr action {action:?}")),
+    }
+}
+
+fn parse_capacity(mut args: Vec<String>) -> Result<CliCommand, String> {
+    let action = take_action(&mut args, "capacity")?;
+    match action.as_str() {
+        "status" => {
+            require_empty(&args)?;
+            Ok(CliCommand::CapacityStatus)
+        }
+        "set" => {
+            if args.len() != 1 {
+                return Err("capacity set requires one integer value".into());
+            }
+            let value = args
+                .pop()
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or("capacity set requires one positive integer value")?;
+            Ok(CliCommand::CapacitySet { value })
+        }
+        _ => Err("capacity action must be `status` or `set`".into()),
     }
 }
 
@@ -2062,6 +2129,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Status { .. } => Ok(LocalRequest::FleetStatus),
         CliCommand::SetAutoMode { enabled } => Ok(LocalRequest::SetAutoMode { enabled }),
+        CliCommand::CapacityStatus | CliCommand::CapacitySet { .. } => {
+            Err("capacity is handled outside the daemon protocol".into())
+        }
         CliCommand::Usage
         | CliCommand::Version
         | CliCommand::Update { .. }
@@ -2664,6 +2734,27 @@ mod tests {
     }
 
     #[test]
+    fn capacity_commands_are_operator_setting_commands() {
+        let (_, status) = parse_args(args(&["capacity", "status"])).unwrap();
+        assert!(matches!(status, CliCommand::CapacityStatus));
+        let (_, set) = parse_args(args(&["capacity", "set", "8"])).unwrap();
+        assert!(matches!(set, CliCommand::CapacitySet { value: 8 }));
+        assert!(parse_args(args(&["capacity", "set"])).is_err());
+        assert!(parse_args(args(&["capacity", "set", "8", "9"])).is_err());
+    }
+
+    #[test]
+    fn capacity_result_promises_live_session_preservation_in_the_cli_contract() {
+        let value = capacity_result(&capacity::CapacityChange {
+            previous: 4,
+            current: 8,
+        });
+        assert_eq!(value["previous"], 4);
+        assert_eq!(value["capacity"], 8);
+        assert_eq!(value["live_sessions_preserved"], true);
+    }
+
+    #[test]
     fn help_is_available_without_a_daemon_connection() {
         assert_eq!(
             parse_args(args(&["--help"])).unwrap(),
@@ -3153,6 +3244,13 @@ mod tests {
                 if project_id == "factory".try_into().unwrap() && agent_id == "god".try_into().unwrap()
         ));
         assert!(parse_args(args(&["agent", "status", "--project", "factory"])).is_err());
+    }
+
+    #[test]
+    fn status_help_keeps_the_human_default_and_json_escape_hatch() {
+        assert!(STATUS_HELP.contains("A concise human summary"));
+        assert!(STATUS_HELP.contains("--json"));
+        assert!(!STATUS_HELP.contains("One JSON frame"));
     }
 
     #[test]

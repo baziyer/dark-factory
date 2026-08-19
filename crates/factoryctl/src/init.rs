@@ -18,9 +18,7 @@ use std::{
 };
 
 use factory_core::local::{LocalRequest, LocalResponse, ServerFrame};
-use factoryctl::{Client, update};
-
-use crate::{install, launchd, probes};
+use factoryctl::{Client, install, launchd, probes, runtime, update};
 
 pub struct Options {
     /// Skip the consent prompt (`--yes`).
@@ -28,6 +26,8 @@ pub struct Options {
     /// Install binaries only; leave launchd alone (`--no-launchd`).
     pub no_launchd: bool,
 }
+
+const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
 pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let home = factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
@@ -125,6 +125,12 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         install::install_from_dir(&home, &source, version)?;
         println!("install: {} <- {}", destination.display(), source.display());
     }
+    let (_runtime_lock, snapshot) = runtime::MutationLock::begin(&home, &plist)?;
+    let existing = launchd::read_existing(&plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, &home, &user_home)?;
+    }
+    let previous_version = snapshot.active_version.clone();
     install::activate(&home, version)?;
     println!("install: bin/current -> {version}");
 
@@ -177,13 +183,25 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             socket.display()
         ));
     }
-    launchd::apply(
+    let apply = launchd::apply_with_rollback(
         &home,
         &plist,
         existing.as_ref(),
         &probes::provider_directories(),
         &carried,
-    )?;
+        None,
+        || snapshot.restore_runtime(&home),
+    );
+    if let Err(error) = apply {
+        return Err(runtime::rollback_report(
+            &error,
+            previous_version.as_deref(),
+            |previous| {
+                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                    .map(|_| ())
+            },
+        ));
+    }
     println!(
         "launchd: {} loaded{}",
         plist.display(),
@@ -196,10 +214,24 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     match probes::wait_for_daemon(socket, Duration::from_secs(20), Some(version)) {
         Ok(version) => println!("daemon: {version} answering at {}", socket.display()),
         Err(error) => {
+            let rollback = runtime::rollback_after_health_failure(
+                &home,
+                &plist,
+                &snapshot,
+                version,
+                |previous| {
+                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                        .map(|_| ())
+                },
+            );
             println!(
-                "daemon: not answering with {version} yet ({error}); see {}/logs/factoryd.stderr.log",
+                "daemon: not answering with {version} yet ({error}); rollback {}; see {}/logs/factoryd.stderr.log",
+                rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
                 home.display()
             );
+            if let Err(rollback_error) = rollback {
+                println!("rollback: {rollback_error}");
+            }
             print_next_steps(&home, NextSteps::DoctorOnly);
             return Ok(1);
         }
@@ -382,6 +414,7 @@ mod tests {
             runner_path: "/tmp/factory-runner".into(),
             factoryctl_path: "/tmp/factoryctl".into(),
             version: "0.2.0".into(),
+            process_id: 0,
         });
         assert_eq!(
             diagnostic.as_deref(),

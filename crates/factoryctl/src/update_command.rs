@@ -23,10 +23,9 @@ use std::{
     time::Duration,
 };
 
-use factoryctl::update::{self, UpdateCheck};
+use factoryctl::update::UpdateCheck;
+use factoryctl::{install, launchd, probes, runtime, update};
 use serde_json::json;
-
-use crate::{install, launchd, probes};
 
 const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
@@ -61,8 +60,7 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         launchd::check_home(existing, &home, &user_home)?;
     }
     let mut log = |line: &str| eprintln!("update: {line}");
-    let previous_version = active_version;
-    if previous_version.as_deref() == Some(manifest.version.as_str())
+    if active_version.as_deref() == Some(manifest.version.as_str())
         && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version)).is_ok()
     {
         log(&format!(
@@ -82,6 +80,32 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     }
 
     let installed = install::install_release(&home, &manifest, &mut log)?;
+    let (_runtime_lock, snapshot) = runtime::MutationLock::begin(&home, &plist)?;
+    let previous_version = snapshot.active_version.clone();
+    let existing = launchd::read_existing(&plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, &home, &user_home)?;
+    }
+    if let Some(active) = snapshot.active_version.as_deref()
+        && active != manifest.version
+        && !update::is_newer(&manifest.version, active)
+    {
+        log(&format!(
+            "active runtime {active} is newer than downloaded {}; not activating a downgrade",
+            manifest.version
+        ));
+        println!(
+            "{}",
+            json!({
+                "installed": false,
+                "current": install::current_link(&home),
+                "active": active,
+                "launchd": "unchanged",
+                "skipped": "active runtime is newer than the selected release",
+            })
+        );
+        return Ok(0);
+    }
     install::activate(&home, &manifest.version)?;
     log(&format!("bin/current -> {}", manifest.version));
 
@@ -99,24 +123,23 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         return Ok(0);
     };
 
-    if let Err(error) = launchd::apply(
+    if let Err(error) = launchd::apply_with_rollback(
         &home,
         &plist,
         Some(&existing),
         &probes::provider_directories(),
         &std::collections::BTreeMap::new(),
+        None,
+        || snapshot.restore_runtime(&home),
     ) {
-        let outcome = match &previous_version {
-            Some(previous) if install::activate(&home, previous).is_ok() => {
-                format!("bin/current rolled back to {previous}")
-            }
-            Some(previous) => format!("bin/current could NOT be rolled back to {previous}"),
-            None => format!(
-                "bin/current stays at {} (there was no previous version)",
-                manifest.version
-            ),
-        };
-        return Err(format!("{error}; {outcome}"));
+        return Err(runtime::rollback_report(
+            &error,
+            previous_version.as_deref(),
+            |previous| {
+                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                    .map(|_| ())
+            },
+        ));
     }
     log(&format!("rewrote and reloaded {}", plist.display()));
     match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
@@ -134,6 +157,16 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             Ok(0)
         }
         Err(error) => {
+            let rollback = runtime::rollback_after_health_failure(
+                &home,
+                &plist,
+                &snapshot,
+                &manifest.version,
+                |previous| {
+                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
+                        .map(|_| ())
+                },
+            );
             println!(
                 "{}",
                 json!({
@@ -142,8 +175,12 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                     "current": install::current_link(&home),
                     "launchd": "reloaded",
                     "health": { "ok": false, "error": error },
+                    "rollback": rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
                 })
             );
+            if let Err(rollback_error) = rollback {
+                eprintln!("update: rollback failed: {rollback_error}");
+            }
             eprintln!(
                 "update: the new daemon did not answer within {}s ({error}); see {}/logs/factoryd.stderr.log, \
                  or roll back with `ln -sfn {} {}` and `launchctl kickstart -k gui/$(id -u)/{}`",

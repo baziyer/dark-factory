@@ -30,6 +30,8 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
+    } else if changes_capacity(commands.as_deref().unwrap_or_default()) {
+        Some("capacity_operator_only")
     } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
         Some("repository_authority_operator_only")
     } else if destructive_git(commands.as_deref().unwrap_or_default()) {
@@ -47,6 +49,15 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
         tool_name: tool_name.to_owned(),
         denied_by,
     }
+}
+
+fn changes_capacity(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        let Some((program, args)) = resolve_command(words) else {
+            return false;
+        };
+        program == "factoryctl" && args.windows(2).any(|words| words == ["capacity", "set"])
+    })
 }
 
 fn changes_repository_authority(commands: &[Vec<ShellWord>]) -> bool {
@@ -685,5 +696,29 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn capacity_mutation_is_denied_for_every_supported_command_wrapper() {
+        let root = Path::new("/tmp/worktree");
+        for command in [
+            "factoryctl capacity set 8",
+            "FOO=1 factoryctl capacity set 8",
+            "env FOO=1 factoryctl capacity set 8",
+            "command factoryctl capacity set 8",
+            "exec factoryctl capacity set 8",
+            "printf ready; factoryctl capacity set 8",
+            "printf ready | factoryctl capacity set 8",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("capacity_operator_only"),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            decide(&bash("factoryctl capacity status"), root).denied_by,
+            None
+        );
     }
 }

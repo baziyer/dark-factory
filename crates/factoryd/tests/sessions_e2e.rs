@@ -30,6 +30,10 @@ use factory_core::{
     runner::decode_terminal_bytes,
 };
 use factoryctl::Client;
+#[cfg(target_os = "macos")]
+use factoryctl::{capacity, launchd, probes};
+#[cfg(target_os = "macos")]
+use std::collections::BTreeMap;
 
 /// Both ceilings were 10s/20s originally; raised (this track's item 10)
 /// because this machine runs with a third-party process pegging a core
@@ -244,6 +248,72 @@ fn factory_runner_path() -> PathBuf {
 fn factoryctl_path() -> PathBuf {
     ensure_sibling_binaries_built();
     workspace_target_dir().join("factoryctl")
+}
+
+/// Stages two complete runtime directories for the managed-launchd capacity
+/// fixture. The real daemon/runner/factoryctl binaries are used; only the
+/// unused TUI sibling is a tiny executable placeholder so the install
+/// layout remains valid without building an unrelated binary target.
+#[cfg(target_os = "macos")]
+fn stage_managed_capacity_runtimes(home: &Path) {
+    let bin = home.join("bin");
+    for version in ["0.3.0", "0.4.0"] {
+        let directory = bin.join(version);
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, source) in [
+            ("factoryd", PathBuf::from(env!("CARGO_BIN_EXE_factoryd"))),
+            ("factory-runner", factory_runner_path()),
+            ("factoryctl", factoryctl_path()),
+        ] {
+            let destination = directory.join(name);
+            std::fs::copy(source, &destination).unwrap();
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tui = directory.join("factory-tui");
+        std::fs::write(&tui, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tui, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::os::unix::fs::symlink("0.3.0", bin.join("current")).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn runner_pids_under(home: &Path) -> Vec<u32> {
+    let needle = format!("--runtime-dir {}/runs/", home.display());
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            (line.contains("factory-runner") && line.contains(&needle))
+                .then(|| line.trim())
+                .and_then(|line| line.split_whitespace().next())
+                .and_then(|pid| pid.parse().ok())
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn bootout_managed_fixture(target: &launchd::LaunchdTarget) {
+    let _ = Command::new("launchctl")
+        .args([
+            "bootout",
+            &format!("{}/{}", target.domain(), target.label()),
+        ])
+        .status();
+}
+
+#[cfg(target_os = "macos")]
+struct ManagedLaunchdGuard {
+    target: launchd::LaunchdTarget,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ManagedLaunchdGuard {
+    fn drop(&mut self) {
+        bootout_managed_fixture(&self.target);
+    }
 }
 
 /// A fresh `$DARK_FACTORY_HOME` candidate at the private, owner-only mode
@@ -683,6 +753,33 @@ fn cleanup_session(daemon: &Daemon, agent_id: &str) {
     );
 }
 
+#[cfg(target_os = "macos")]
+fn cleanup_session_without_daemon(client: &Client, home: &Path, agent_id: &str) {
+    client
+        .request(LocalRequest::PauseAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from(agent_id).unwrap(),
+        })
+        .unwrap();
+    if let Some(session) = list_sessions(client)
+        .into_iter()
+        .find(|session| session.agent_id.as_str() == agent_id && session.state.is_live())
+    {
+        let _ = client.request(LocalRequest::StopSession {
+            project_id: project_id(),
+            session_id: session.id.clone(),
+            grace_ms: 2_000,
+        });
+        poll_until(DELIVERY_TIMEOUT, || {
+            list_sessions(client)
+                .into_iter()
+                .find(|candidate| candidate.id == session.id)
+                .filter(|candidate| !candidate.state.is_live())
+        });
+    }
+    assert!(wait_for_no_runners_under(home, DELIVERY_TIMEOUT));
+}
+
 // --- (a) auto-delivery, real worktree, hook events, second task via
 //     Stop-hook block-reply --------------------------------------------
 
@@ -1041,6 +1138,116 @@ fn factoryd_restart_does_not_lose_a_live_session() {
 
     cleanup_session(&daemon, "curie");
     daemon.stop();
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn managed_launchd_capacity_change_preserves_session_and_runner() {
+    let home = private_tempdir();
+    let user_home = private_tempdir();
+    let target = launchd::LaunchdTarget::new(
+        format!("gui/{}", rustix::process::getuid().as_raw()),
+        format!("com.dark-factory.test.capacity-{}", std::process::id()),
+    );
+    assert!(!probes::launchd_loaded_for(&target));
+    stage_managed_capacity_runtimes(home.path());
+    std::fs::create_dir_all(home.path().join("logs")).unwrap();
+    let socket = home.path().join("f.sock");
+    let plist = launchd::plist_path_for(user_home.path(), &target);
+    let current = home.path().join("bin/current");
+    let arguments = vec![
+        "--runner".to_owned(),
+        current
+            .join("factory-runner")
+            .to_string_lossy()
+            .into_owned(),
+        "--factoryctl".to_owned(),
+        current.join("factoryctl").to_string_lossy().into_owned(),
+        "--max-active-runs".to_owned(),
+        "4".to_owned(),
+    ];
+    let content = launchd::render_for(
+        &target,
+        home.path(),
+        &current.join("factoryd"),
+        &arguments,
+        &BTreeMap::new(),
+    );
+    launchd::install(&plist, &content, home.path()).unwrap();
+    let _guard = ManagedLaunchdGuard {
+        target: target.clone(),
+    };
+    launchd::reload_for(&target, &plist).expect("isolated launchd must be available");
+    probes::wait_for_managed_daemon_for(&target, &socket, READY_TIMEOUT, None, home.path())
+        .expect("isolated managed launchd daemon must become healthy");
+
+    let client = Client::new(&socket);
+    let project_root = home.path().join("repo");
+    std::fs::create_dir(&project_root).unwrap();
+    init_git_repo(&project_root);
+    let project_response = client
+        .request(LocalRequest::CreateProject {
+            id: project_id(),
+            name: "Factory".into(),
+            root: project_root.to_string_lossy().into_owned(),
+        })
+        .unwrap();
+    assert!(matches!(
+        project_response,
+        ServerFrame::Response {
+            response: LocalResponse::ProjectCreated { .. },
+            ..
+        }
+    ));
+    create_shell_agent(&client, "curie");
+    create_task(&client, "task-1", "First", "before capacity change");
+    assign_task(&client, "task-1", "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let before = wait_for_stable_idle(&client, "curie");
+    let runner_before = runner_pids_under(home.path());
+    assert_eq!(
+        runner_before.len(),
+        1,
+        "one live runner before capacity change"
+    );
+
+    assert_eq!(
+        capacity::status_for(home.path(), user_home.path(), &target)
+            .unwrap()
+            .configured,
+        4
+    );
+    let change = capacity::set_for(home.path(), user_home.path(), &socket, 8, &target).unwrap();
+    assert_eq!(change.previous, 4);
+    assert_eq!(change.current, 8);
+    assert_eq!(
+        capacity::status_for(home.path(), user_home.path(), &target)
+            .unwrap()
+            .configured,
+        8
+    );
+    probes::wait_for_managed_daemon_for(&target, &socket, READY_TIMEOUT, None, home.path())
+        .unwrap();
+
+    let after = session_by_agent(&client, "curie").expect("session after capacity restart");
+    assert_eq!(
+        after.id, before.id,
+        "capacity restart must preserve the session id"
+    );
+    assert_eq!(after.state, SessionState::Idle);
+    assert_eq!(
+        runner_pids_under(home.path()),
+        runner_before,
+        "the same runner survives"
+    );
+
+    cleanup_session_without_daemon(&client, home.path(), "curie");
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn managed_launchd_capacity_change_requires_launchd() {
+    panic!("the managed launchd capacity fixture requires macOS launchd");
 }
 
 // --- (f) direct attach: operator keystrokes reach the real process -----

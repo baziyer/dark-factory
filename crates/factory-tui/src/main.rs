@@ -303,7 +303,7 @@ fn run(
             match event::read()? {
                 Event::Key(key) => {
                     let intent = board.handle_key(key);
-                    needs_redraw |= apply_intent(intent, board, client, tx, panes);
+                    needs_redraw |= apply_intent(intent, board, client, socket, tx, panes);
                 }
                 Event::Paste(text) => {
                     forward_paste_if_applicable(board, panes, &text);
@@ -315,10 +315,13 @@ fn run(
                         event,
                         &hit_map,
                         &mut mouse_capture,
-                        board,
-                        client,
-                        tx,
-                        panes,
+                        &mut IntentContext {
+                            board,
+                            client,
+                            socket,
+                            tx,
+                            panes,
+                        },
                     );
                 }
                 Event::FocusGained | Event::FocusLost => {}
@@ -525,25 +528,30 @@ fn forward_paste_if_applicable(board: &Board, panes: &PaneMap, text: &str) {
     }
 }
 
+struct IntentContext<'a> {
+    board: &'a mut Board,
+    client: &'a Client,
+    socket: &'a std::path::Path,
+    tx: &'a mpsc::Sender<NetMsg>,
+    panes: &'a PaneMap,
+}
+
 fn handle_mouse(
     event: MouseEvent,
     hits: &mouse::HitMap,
     capture: &mut mouse::Capture,
-    board: &mut Board,
-    client: &Client,
-    tx: &mpsc::Sender<NetMsg>,
-    panes: &PaneMap,
+    context: &mut IntentContext<'_>,
 ) -> bool {
-    if !matches!(board.mode, model::Mode::Normal) {
+    if !matches!(context.board.mode, model::Mode::Normal) {
         capture.clear();
         return false;
     }
-    let terminal_context = (board.view == model::View::Agent
-        && board.pane_mode == model::PaneMode::Typing)
+    let terminal_context = (context.board.view == model::View::Agent
+        && context.board.pane_mode == model::PaneMode::Typing)
         .then_some(hits.terminal.as_ref())
         .flatten()
-        .filter(|terminal| board.focus_target().as_ref() == Some(&terminal.session_id))
-        .and_then(|terminal| panes.get(&terminal.session_id))
+        .filter(|terminal| context.board.focus_target().as_ref() == Some(&terminal.session_id))
+        .and_then(|terminal| context.panes.get(&terminal.session_id))
         .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
         .map(Pane::mouse_context)
         .filter(|context| context.enabled());
@@ -551,11 +559,19 @@ fn handle_mouse(
     match mouse::route(event, hits, terminal_context, capture) {
         mouse::Route::None => false,
         mouse::Route::Board(target) => {
-            let intent = board.handle_mouse_target(target);
-            apply_intent(intent, board, client, tx, panes)
+            let intent = context.board.handle_mouse_target(target);
+            apply_intent(
+                intent,
+                context.board,
+                context.client,
+                context.socket,
+                context.tx,
+                context.panes,
+            )
         }
         mouse::Route::Scroll { session_id, up } => {
-            let Some(pane) = panes
+            let Some(pane) = context
+                .panes
                 .get(&session_id)
                 .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
             else {
@@ -570,7 +586,8 @@ fn handle_mouse(
             true
         }
         mouse::Route::ResetScrollback { session_id } => {
-            let Some(pane) = panes
+            let Some(pane) = context
+                .panes
                 .get(&session_id)
                 .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
             else {
@@ -580,7 +597,8 @@ fn handle_mouse(
             true
         }
         mouse::Route::Terminal { session_id, bytes } => {
-            let Some(pane) = panes
+            let Some(pane) = context
+                .panes
                 .get(&session_id)
                 .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
             else {
@@ -596,6 +614,7 @@ fn apply_intent(
     intent: Intent,
     board: &mut Board,
     client: &Client,
+    socket: &std::path::Path,
     tx: &mpsc::Sender<NetMsg>,
     panes: &PaneMap,
 ) -> bool {
@@ -604,6 +623,13 @@ fn apply_intent(
         Intent::Redraw | Intent::Quit => true,
         Intent::Send(request) => {
             net::spawn_request(client.clone(), tx.clone(), request);
+            true
+        }
+        Intent::SetCapacity(capacity) => {
+            board.note_info(format!(
+                "capacity -> {capacity}; only factoryd restarts, runner sessions preserved; provider use may change"
+            ));
+            net::spawn_capacity_update(socket.to_owned(), tx.clone(), capacity);
             true
         }
         Intent::ForwardKey(key) => {
@@ -691,6 +717,13 @@ fn apply_net_msg(
         NetMsg::EventsReplay(events) => board.apply_replay(events),
         NetMsg::CaughtUp => board.caught_up = true,
         NetMsg::OperationResult(result) => board.apply_response(result),
+        NetMsg::CapacityResult(result) => match result {
+            Ok(change) => board.note_info(format!(
+                "capacity {} -> {} (runner sessions preserved)",
+                change.previous, change.current
+            )),
+            Err(error) => board.note_error(error),
+        },
         NetMsg::UpdateCheck {
             check,
             active_version,
@@ -888,7 +921,7 @@ mod main_tests {
         assert!(matches!(first_key, Intent::ForwardKey(_)));
         let client = Client::new(&socket);
         let (tx, _rx) = mpsc::channel();
-        apply_intent(first_key, &mut board, &client, &tx, &panes);
+        apply_intent(first_key, &mut board, &client, &socket, &tx, &panes);
         server.join().unwrap();
     }
 }

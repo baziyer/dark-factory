@@ -7,10 +7,13 @@
 use std::{
     fs,
     io::{BufRead, BufReader, Write},
+    net::TcpListener,
     os::unix::{fs::PermissionsExt, net::UnixListener},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    sync::mpsc,
     thread,
+    time::Duration,
 };
 
 use factory_core::{
@@ -142,6 +145,21 @@ impl Fixture {
         .unwrap();
     }
 
+    fn write_malformed_launchd_job(&self) {
+        let user_home = self.root.path().join("user-home");
+        let plist = user_home.join("Library/LaunchAgents/com.dark-factory.factoryd.plist");
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(
+            plist,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string><string>--max-active-runs</string><string>malformed</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
+                self.home().display(),
+                self.home().display()
+            ),
+        )
+        .unwrap();
+    }
+
     fn fake_launchctl(&self, success: bool) -> (PathBuf, PathBuf) {
         let tools = self.root.path().join(if success {
             "tools-success"
@@ -156,6 +174,26 @@ impl Fixture {
             format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\nexit {}\n",
                 i32::from(!success)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        (tools, log)
+    }
+
+    fn fake_launchctl_first_reload_fails(&self) -> (PathBuf, PathBuf) {
+        let tools = self.root.path().join("tools-first-reload-fails");
+        fs::create_dir_all(&tools).unwrap();
+        let log = tools.join("launchctl.log");
+        let count = tools.join("bootstrap-count");
+        let program = tools.join("launchctl");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\ncase \"$1\" in\n  print) echo 'pid = 4242'; exit 0 ;;\n  bootout) exit 0 ;;\n  bootstrap) n=0; test -f \"{}\" && n=$(cat \"{}\"); n=$((n + 1)); echo \"$n\" > \"{}\"; test \"$n\" -gt 6; exit $? ;;\nesac\nexit 1\n",
+                count.display(),
+                count.display(),
+                count.display(),
             ),
         )
         .unwrap();
@@ -187,6 +225,42 @@ fn serve_health_once(socket: &Path, version: &str) -> thread::JoinHandle<()> {
                 runner_path: "/tmp/factory-runner".to_owned(),
                 factoryctl_path: "/tmp/factoryctl".to_owned(),
                 version,
+                process_id: 0,
+            },
+        };
+        serde_json::to_writer(&mut stream, &frame).unwrap();
+        stream.write_all(b"\n").unwrap();
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn serve_managed_health_once(
+    socket: &Path,
+    version: &str,
+    home: &Path,
+    process_id: u32,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    let version = version.to_owned();
+    let runner = home.join("bin/current/factory-runner");
+    let factoryctl = home.join("bin/current/factoryctl");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::new(LocalRequest::Health)
+        );
+        let frame = ServerFrame::Response {
+            protocol_version: PROTOCOL_VERSION,
+            response: LocalResponse::Health {
+                runner_path: runner.to_string_lossy().into_owned(),
+                factoryctl_path: factoryctl.to_string_lossy().into_owned(),
+                version,
+                process_id,
             },
         };
         serde_json::to_writer(&mut stream, &frame).unwrap();
@@ -247,6 +321,125 @@ fn homebrew_bootstrap_updates_an_older_active_runtime() {
     assert_eq!(read_link(&fixture.home().join("bin/current")), latest);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn update_malformed_existing_capacity_restores_runtime_and_reports_unchanged_job() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    fixture.write_malformed_launchd_job();
+    let plist = fixture
+        .root
+        .path()
+        .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist");
+    let old_plist = fs::read_to_string(&plist).unwrap();
+    let url = fixture.publish(factoryctl::update::CURRENT_VERSION, None);
+    let (tools, log) = fixture.fake_launchctl_first_reload_fails();
+    let socket = fixture.home().join("f.sock");
+    let server = serve_managed_health_once(&socket, "0.1.0", &fixture.home(), 4242);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    prepend_path(&mut command, &tools);
+    let output = command
+        .env("FAKE_LAUNCHCTL_LOG", &log)
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bin/current rolled back to 0.1.0"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("launchd plist and job were unchanged"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("restored runtime is healthy"), "{stderr}");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.1.0");
+    assert_eq!(fs::read_to_string(plist).unwrap(), old_plist);
+    assert!(!fs::read_to_string(log).unwrap().contains("bootstrap"));
+}
+
+#[test]
+fn production_update_revalidates_a_candidate_after_a_competing_newer_activation() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    let file_manifest_url = fixture.publish("0.2.0", None);
+    let manifest_path = PathBuf::from(file_manifest_url.strip_prefix("file://").unwrap());
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    let archive_url = manifest["assets"][factoryctl::update::platform_key()]["url"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let archive_path = PathBuf::from(archive_url.strip_prefix("file://").unwrap());
+    let archive = fs::read(archive_path).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/manifest", listener.local_addr().unwrap());
+    let archive_url = format!("http://{}/archive", listener.local_addr().unwrap());
+    manifest["assets"][factoryctl::update::platform_key()]["url"] = Value::String(archive_url);
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let (requested_tx, requested_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for request_number in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let body = if request_number == 0 {
+                manifest_bytes.clone()
+            } else {
+                requested_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                archive.clone()
+            };
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(&body).unwrap();
+        }
+    });
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    requested_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("production update reached its archive download");
+    fixture.write_binaries(&fixture.home().join("bin/0.3.0"), "0.3.0");
+    let (lock, snapshot) = factoryctl::runtime::MutationLock::begin(
+        &fixture.home(),
+        &fixture
+            .root
+            .path()
+            .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist"),
+    )
+    .unwrap();
+    assert_eq!(snapshot.active_version.as_deref(), Some("0.1.0"));
+    factoryctl::install::activate(&fixture.home(), "0.3.0").unwrap();
+    drop(lock);
+    release_tx.send(()).unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout["installed"], false);
+    assert_eq!(stdout["active"], "0.3.0");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.3.0");
+}
+
 #[test]
 fn matching_active_runtime_and_daemon_are_a_no_op() {
     let fixture = Fixture::new();
@@ -289,12 +482,62 @@ fn launchd_reload_failure_rolls_back_the_active_runtime() {
     prepend_path(&mut command, &tools);
     let output = command.env("FAKE_LAUNCHCTL_LOG", &log).output().unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("bin/current rolled back to 0.1.0"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bin/current rolled back to 0.1.0"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("launchd recovery failed"), "{stderr}");
     assert_eq!(read_link(&fixture.home().join("bin/current")), "0.1.0");
     assert!(fixture.home().join("bin").join(latest).is_dir());
     let calls = fs::read_to_string(log).unwrap();
     assert!(calls.contains("bootout"));
     assert!(calls.contains("bootstrap"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn update_failed_activation_restores_runtime_before_old_job_and_checks_managed_health() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    fixture.write_launchd_job();
+    let plist = fixture
+        .root
+        .path()
+        .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist");
+    let old_plist = fs::read_to_string(&plist).unwrap();
+    let latest = factoryctl::update::CURRENT_VERSION;
+    let url = fixture.publish(latest, None);
+    let (tools, log) = fixture.fake_launchctl_first_reload_fails();
+    let socket = fixture.home().join("f.sock");
+    let server = serve_managed_health_once(&socket, "0.1.0", &fixture.home(), 4242);
+
+    let mut command = fixture.command(&url, &["update", "--install"]);
+    prepend_path(&mut command, &tools);
+    let output = command
+        .env("FAKE_LAUNCHCTL_LOG", &log)
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("restored runtime is healthy"), "{stderr}");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.1.0");
+    assert_eq!(fs::read_to_string(plist).unwrap(), old_plist);
+    let calls = fs::read_to_string(log).unwrap();
+    assert_eq!(calls.matches("bootstrap").count(), 7);
+    assert_eq!(
+        fs::read_to_string(
+            fixture
+                .root
+                .path()
+                .join("tools-first-reload-fails/bootstrap-count")
+        )
+        .unwrap()
+        .trim(),
+        "7"
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -25,8 +25,8 @@ use std::{
     process::Command,
 };
 
-pub use factoryctl::update::RELEASE_BINARIES as BINARIES;
-use factoryctl::update::{self, Manifest};
+pub use crate::update::RELEASE_BINARIES as BINARIES;
+use crate::update::{self, Manifest};
 use sha2::{Digest, Sha256};
 
 /// Downloads larger than this are refused before verification even starts.

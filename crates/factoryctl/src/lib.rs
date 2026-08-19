@@ -14,6 +14,11 @@ use factory_core::{
     local::{LocalRequest, RequestEnvelope, ServerFrame},
 };
 
+pub mod capacity;
+pub mod install;
+pub mod launchd;
+pub mod probes;
+pub mod runtime;
 pub mod update;
 
 pub use factory_core::local::MAX_LOCAL_FRAME_BYTES as MAX_FRAME_BYTES;

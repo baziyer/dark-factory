@@ -63,8 +63,8 @@ operator from their own agents. Concretely:
   command process group.
 - **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
   tool call reaches an authenticated `PreToolUse` hook. The daemon denies
-  recognizable force-push, pushed-ref deletion, branch-delete, and
-  reset-hard commands. It permits
+  recognizable `factoryctl capacity set`, force-push, pushed-ref deletion,
+  branch-delete, and reset-hard commands. It permits
   `rm -rf` only when every literal normalized target is inside the agent
   worktree; changed cwd and compound destructive deletion are denied. It
   also denies direct structured file-tool access, recognized file commands,
