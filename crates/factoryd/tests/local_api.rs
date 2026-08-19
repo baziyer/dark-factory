@@ -1,7 +1,8 @@
 use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, ProviderHookEvent,
+    RunnerInstanceId, SessionId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
@@ -11,7 +12,7 @@ use factoryctl::Client;
 use factoryd::{
     execution,
     local_api::{ApiState, serve},
-    store::{NewProject, NewTask, Store},
+    store::{NewAgent, NewProject, NewSession, NewTask, Store},
 };
 use rusqlite::Connection;
 use tokio::{
@@ -231,6 +232,208 @@ fn execution_config(directory: &Path, socket: &Path) -> execution::Config {
         max_active_runs: 1,
         session_start_deadline: execution::SESSION_START_DEADLINE,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_hook_local_api_projects_the_real_current_session_relation() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("f.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let state = ApiState::new(Store::open_in_memory().unwrap());
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let project = project_id("factory");
+    let agent = agent_id("curie");
+    let root = directory.path().to_string_lossy().into_owned();
+    state
+        .commit_and_publish({
+            let project = project.clone();
+            let agent = agent.clone();
+            let root = root.clone();
+            move |store| {
+                let (_, project_event) = store.create_project(
+                    NewProject {
+                        id: project.clone(),
+                        name: "Factory".into(),
+                        root,
+                    },
+                    1,
+                )?;
+                let (_, agent_event) = store.create_agent(
+                    NewAgent {
+                        id: agent,
+                        project_id: project,
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    2,
+                )?;
+                Ok(((), vec![project_event, agent_event]))
+            }
+        })
+        .await
+        .unwrap();
+
+    // This fixture installs a synthetic session without a real runner process.
+    // Stop startup recovery before that row exists, just as the authoritative
+    // local-API recovery fixtures do; otherwise recovery can legitimately end
+    // the runner-less Starting row between create and the first hook.
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+
+    let session_id = SessionId::try_from("session-1").unwrap();
+    let token = "a".repeat(64);
+    let session_events = state
+        .commit_and_publish({
+            let project = project.clone();
+            let agent = agent.clone();
+            let root = root.clone();
+            let token = token.clone();
+            let session_id = session_id.clone();
+            move |store| {
+                let (_, events) = store.create_session(
+                    NewSession {
+                        id: session_id,
+                        project_id: project,
+                        agent_id: agent,
+                        provider: Provider::Shell,
+                        runtime_model: None,
+                        runtime_reasoning_effort: None,
+                        runtime_permission_mode: None,
+                        runtime_control_mode: None,
+                        provider_session_id: None,
+                        worktree: root.clone(),
+                        codex_home: None,
+                        hook_token: token,
+                        runner_instance_id: RunnerInstanceId::try_from("runner-1").unwrap(),
+                        runner_runtime: format!("{root}/runner"),
+                        runner_protocol_version: 1,
+                    },
+                    3,
+                )?;
+                Ok((events.clone(), events))
+            }
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        session_events.as_slice(),
+        [
+            factory_core::EventEnvelope {
+                event: FactoryEvent::AgentChanged { agent: changed_agent },
+                ..
+            },
+            factory_core::EventEnvelope {
+                event: FactoryEvent::SessionChanged { .. },
+                ..
+            }
+        ] if changed_agent.current_session_id == Some(session_id.clone())
+    ));
+
+    assert!(matches!(
+        request(
+            &socket,
+            LocalRequest::ProviderHook {
+                token,
+                event: ProviderHookEvent::PreToolUse,
+                payload: serde_json::json!({"tool_name": "Read"}),
+            },
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::ProviderHookReply { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            &socket,
+            LocalRequest::ListAgents {
+                project_id: project.clone(),
+                after_id: None,
+                limit: 10,
+            },
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::Agents { ref agents, .. },
+            ..
+        } if agents.len() == 1
+            && agents[0].current_session_id == Some(session_id.clone())
+    ));
+
+    let events = request(
+        &socket,
+        LocalRequest::EventsAfter {
+            sequence: 2,
+            limit: MAX_EVENT_PAGE_ITEMS,
+        },
+    )
+    .await;
+    let ServerFrame::Response {
+        response: LocalResponse::Events { events },
+        ..
+    } = events
+    else {
+        panic!("expected lifecycle events from local API");
+    };
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::AgentChanged { agent: changed_agent }
+            if changed_agent.current_session_id == Some(session_id.clone())
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::SessionChanged { session }
+            if session.id == session_id && session.activity.as_deref() == Some("tool: Read")
+    )));
+
+    let end_events = state
+        .commit_and_publish({
+            let session_id = session_id.clone();
+            move |store| {
+                let (_, events) = store.end_session(&session_id, Some(0), None, 7)?;
+                Ok((events.clone(), events))
+            }
+        })
+        .await
+        .unwrap();
+    assert!(end_events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::AgentChanged { agent: changed_agent }
+            if changed_agent.current_session_id.is_none()
+    )));
+    assert!(matches!(
+        request(
+            &socket,
+            LocalRequest::ListAgents {
+                project_id: project.clone(),
+                after_id: None,
+                limit: 10,
+            },
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::Agents { ref agents, .. },
+            ..
+        } if agents.len() == 1 && agents[0].current_session_id.is_none()
+    ));
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

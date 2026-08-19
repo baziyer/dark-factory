@@ -1300,7 +1300,7 @@ impl Store {
         &mut self,
         input: NewSession,
         now_ms: i64,
-    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
         validate_absolute_path(&input.worktree)?;
         if let Some(codex_home) = input.codex_home.as_deref() {
             validate_absolute_path(codex_home)?;
@@ -1388,16 +1388,20 @@ impl Store {
         let event = FactoryEvent::SessionChanged {
             session: snapshot.clone(),
         };
+        let agent_event = append_agent_changed_event(&transaction, &input.agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
         Ok((
             snapshot,
-            EventEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                sequence,
-                occurred_at_ms: now_ms,
-                event,
-            },
+            vec![
+                agent_event,
+                EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence,
+                    occurred_at_ms: now_ms,
+                    event,
+                },
+            ],
         ))
     }
 
@@ -1988,7 +1992,9 @@ impl Store {
         let changed = FactoryEvent::SessionChanged {
             session: snapshot.clone(),
         };
+        let agent_event = append_agent_changed_event(&transaction, &session.agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &changed)?;
+        events.push(agent_event);
         events.push(EventEnvelope {
             protocol_version: PROTOCOL_VERSION,
             sequence,
@@ -2094,16 +2100,20 @@ impl Store {
         let changed = FactoryEvent::SessionChanged {
             session: snapshot.clone(),
         };
+        let agent_event = append_agent_changed_event(&transaction, &session.agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &changed)?;
         transaction.commit()?;
         Ok(Some((
             snapshot,
-            vec![EventEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                sequence,
-                occurred_at_ms: now_ms,
-                event: changed,
-            }],
+            vec![
+                agent_event,
+                EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence,
+                    occurred_at_ms: now_ms,
+                    event: changed,
+                },
+            ],
         )))
     }
 
@@ -6188,6 +6198,24 @@ fn append_event(
         ],
     )?;
     Ok(transaction.last_insert_rowid())
+}
+
+fn append_agent_changed_event(
+    transaction: &Transaction<'_>,
+    agent_id: &AgentId,
+    occurred_at_ms: i64,
+) -> Result<EventEnvelope> {
+    let agent = load_agent(transaction, agent_id)?
+        .ok_or(StoreError::AgentNotFound)?
+        .snapshot;
+    let event = FactoryEvent::AgentChanged { agent };
+    let sequence = append_event(transaction, occurred_at_ms, &event)?;
+    Ok(EventEnvelope {
+        protocol_version: PROTOCOL_VERSION,
+        sequence,
+        occurred_at_ms,
+        event,
+    })
 }
 
 struct EventMetadata<'a> {

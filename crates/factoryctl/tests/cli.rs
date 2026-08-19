@@ -148,22 +148,33 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     let mut expected_json = serde_json::to_vec(&expected_frame).unwrap();
     expected_json.push(b'\n');
     let server = thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut stream, _) = listener.accept().unwrap();
             let mut line = String::new();
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
                 .unwrap();
-            assert_eq!(
-                serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-                RequestEnvelope::new(LocalRequest::FleetStatus)
-            );
-            write_response(
-                &mut stream,
-                LocalResponse::FleetStatus {
-                    status: status.clone(),
-                },
-            );
+            match serde_json::from_str::<RequestEnvelope>(&line)
+                .unwrap()
+                .request
+            {
+                LocalRequest::FleetStatus => write_response(
+                    &mut stream,
+                    LocalResponse::FleetStatus {
+                        status: status.clone(),
+                    },
+                ),
+                LocalRequest::Health => write_response(
+                    &mut stream,
+                    LocalResponse::Health {
+                        runner_path: "/runner".to_owned(),
+                        factoryctl_path: "/factoryctl".to_owned(),
+                        version: env!("CARGO_PKG_VERSION").to_owned(),
+                        process_id: 1,
+                    },
+                ),
+                request => panic!("unexpected request: {request:?}"),
+            }
         }
     });
 
@@ -175,7 +186,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     assert!(human.stderr.is_empty());
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
-        "Dark Factory: auto on | sessions 0/4 | projects 0 | attention 0\n"
+        "Dark Factory: factoryctl v0.2.4 | active runtime v0.2.4 | auto on | sessions 0/4 | projects 0 | attention 0\n"
     );
 
     let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))

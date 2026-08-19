@@ -1125,7 +1125,26 @@ fn run() -> Result<i32, String> {
             ServerFrame::Response {
                 response: LocalResponse::FleetStatus { status },
                 ..
-            } => status::write(&mut output, status)?,
+            } => {
+                let daemon_version =
+                    client
+                        .request(LocalRequest::Health)
+                        .ok()
+                        .and_then(|frame| match frame {
+                            ServerFrame::Response {
+                                response: LocalResponse::Health { version, .. },
+                                ..
+                            } => Some(version),
+                            _ => None,
+                        });
+                status::write_with_daemon_version(
+                    &mut output,
+                    status,
+                    daemon_version
+                        .as_deref()
+                        .filter(|version| !version.is_empty()),
+                )?
+            }
             _ => write_frame(&mut output, &frame)?,
         }
     } else {
