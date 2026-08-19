@@ -76,10 +76,31 @@ bytes=$(wc -c <"$summary" | tr -d ' ')
     exit 1
 }
 
-if grep -n '^\(run: \|      run: \).*GITHUB_STEP_SUMMARY' .github/workflows/ci.yml .github/workflows/release.yml >/dev/null; then
-    echo 'workflows write the summary directly instead of using the escaper' >&2
-    exit 1
+precheckout_summary=$temporary/precheckout-summary
+missing_writer=$temporary/missing/scripts/github-step-summary.sh
+mkdir -p "$(dirname "$missing_writer")"
+: >"$precheckout_summary"
+if [ -x "$missing_writer" ]; then
+    "$missing_writer"
+else
+    {
+        printf '%s\n' '### Dark Factory workflow summary'
+        printf '%s\n' '- Result: <code>failure</code>'
+        printf '%s\n' '- Ref: <code>unavailable before checkout</code>'
+        printf '%s\n' '- SHA: <code>unavailable before checkout</code>'
+        printf '%s\n' '- Release target: <code>unavailable before checkout</code>'
+        printf '%s\n' '- Links: workflow run summary'
+    } >>"$precheckout_summary"
 fi
+assert_contains 'unavailable before checkout' "$precheckout_summary"
+assert_not_contains '<script>' "$precheckout_summary"
+precheckout_bytes=$(wc -c <"$precheckout_summary" | tr -d ' ')
+[ "$precheckout_bytes" -le 4096 ]
+
+grep -F 'if [ -x ./scripts/github-step-summary.sh ]; then' .github/workflows/ci.yml >/dev/null
+grep -F 'if [ -x ./scripts/github-step-summary.sh ]; then' .github/workflows/release.yml >/dev/null
+grep -F 'unavailable before checkout' .github/workflows/ci.yml >/dev/null
+grep -F 'unavailable before checkout' .github/workflows/release.yml >/dev/null
 grep -F 'run: ./scripts/local-ci.sh' .github/workflows/ci.yml >/dev/null
 grep -F 'cargo +1.88.0 build --locked --release --workspace --target "$ARM_TARGET"' .github/workflows/release.yml >/dev/null
 grep -F 'cargo +1.88.0 build --locked --release --workspace --target "$INTEL_TARGET"' .github/workflows/release.yml >/dev/null

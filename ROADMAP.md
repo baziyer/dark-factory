@@ -28,14 +28,17 @@ GitHub views remain the current source of truth:
 | [v0.4.0 — GitHub-connected factory](https://github.com/baziyer/dark-factory/milestone/2) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.4.0%20%E2%80%94%20GitHub-connected%20factory%22) |
 | [v1.0.0 — production-ready](https://github.com/baziyer/dark-factory/milestone/4) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v1.0.0%20%E2%80%94%20production-ready%22) |
 
-For a participating issue or pull request, exactly one `state:*` label is
-the public workflow state: `state:queued`, `state:in-progress`,
-`state:blocked`, `state:review`, or `state:release-ready`. The milestone is
-the release target; area, size, security, and `known-issue` labels retain
-their existing meanings. The projection is deliberately bounded: public
-state, target, exact ref/SHA, checks, and links are useful to contributors;
-agent/session details, prompts, guidance, transcripts, raw provider output,
-credentials, and private review deliberation remain internal. See the
+For a participating issue or pull request, the operator-maintained workflow
+convention is exactly one `state:*` label: `state:queued`,
+`state:in-progress`, `state:blocked`, `state:review`, or
+`state:release-ready`. The setup script defines this vocabulary but does not
+yet validate or reconcile conflicting labels; App reconciliation is deferred
+to #188 and the contract in #208. The milestone is the release target; area,
+size, security, and `known-issue` labels retain their existing meanings. The
+projection is deliberately bounded: public state, target, exact ref/SHA,
+checks, and links are useful to contributors; agent/session details,
+prompts, guidance, transcripts, raw provider output, credentials, and private
+review deliberation remain internal. See the
 [GitHub projection contract](https://github.com/baziyer/dark-factory/issues/208)
 for idempotency and reconciliation requirements.
 

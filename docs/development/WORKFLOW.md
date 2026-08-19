@@ -145,8 +145,9 @@ Known problems are GitHub issues labelled `known-issue`, see
 
 ### Public work and release visibility
 
-Milestones are the only release-target field. A participating issue or pull
-request carries exactly one of these public state labels:
+Milestones are the only release-target field. The operator-maintained
+convention for a participating issue or pull request is exactly one of these
+public state labels:
 
 | State label | Meaning |
 | --- | --- |
@@ -157,6 +158,10 @@ request carries exactly one of these public state labels:
 | `state:release-ready` | Exact integration or release preconditions are satisfied. |
 
 `area:*`, `size:*`, `security`, and `known-issue` remain orthogonal labels.
+The repository setup script defines the five state labels but does not yet
+validate or reconcile conflicting labels. That enforcement is deferred to
+the GitHub App reconciliation contract in #188 and #208; a human must correct
+conflicting labels in the meantime.
 Use GitHub checks, workflow summaries, and release notes for evidence; do not
 post a comment for every state transition. The first bounded projection is
 specified in [#208](https://github.com/baziyer/dark-factory/issues/208).
