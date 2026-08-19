@@ -1842,7 +1842,7 @@ mod tests {
 
         board.attention_focus = None;
         board.handle_mouse_target(MouseTarget::Attention(item));
-        assert_eq!(board.view, View::Agent);
+        assert_eq!(board.view, View::Building);
         assert_eq!(board.pane_mode, PaneMode::Board);
         assert!(
             board
