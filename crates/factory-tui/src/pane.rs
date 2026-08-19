@@ -458,41 +458,50 @@ fn spawn_attach_reader_thread(
 ) {
     std::thread::spawn(move || {
         let mut next_offset = None;
+        let mut next_generation = None;
         attach::read_frames(reader, |frame| {
             match frame {
-                ServerFrame::TerminalOutput { offset, bytes, .. } => {
-                    match decode_terminal_bytes(&bytes) {
-                        Ok(decoded) => {
-                            if next_offset.is_some_and(|expected| expected != offset) {
-                                if let Ok(mut guard) = attach_error.lock() {
-                                    *guard = Some(format!(
-                                        "terminal output continuity broke at offset {offset}"
-                                    ));
-                                }
-                                return false;
-                            }
-                            next_offset = Some(offset.saturating_add(decoded.len() as u64));
-                            attached.store(true, Ordering::Release);
-                            if let Ok(mut parser) = parser.lock() {
-                                parser.process(&decoded);
-                                dirty.store(true, Ordering::Release);
-                            }
-                        }
-                        Err(error) => {
+                ServerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                } => match decode_terminal_bytes(&bytes) {
+                    Ok(decoded) => {
+                        if next_offset.is_some_and(|expected| expected != offset)
+                            || next_generation.is_some_and(|expected| generation < expected)
+                        {
                             if let Ok(mut guard) = attach_error.lock() {
-                                *guard = Some(format!("invalid terminal bytes: {error}"));
+                                *guard = Some(format!(
+                                    "terminal output continuity broke at offset {offset}"
+                                ));
                             }
                             return false;
                         }
+                        next_offset = Some(offset.saturating_add(decoded.len() as u64));
+                        next_generation = Some(generation);
+                        attached.store(true, Ordering::Release);
+                        if let Ok(mut parser) = parser.lock() {
+                            parser.process(&decoded);
+                            dirty.store(true, Ordering::Release);
+                        }
                     }
-                }
+                    Err(error) => {
+                        if let Ok(mut guard) = attach_error.lock() {
+                            *guard = Some(format!("invalid terminal bytes: {error}"));
+                        }
+                        return false;
+                    }
+                },
                 ServerFrame::TerminalAttachReady {
-                    initial_state,
+                    reset_prefix,
+                    start_generation,
                     start_offset,
                     ..
                 } => {
                     next_offset = Some(start_offset);
-                    match decode_terminal_bytes(&initial_state) {
+                    next_generation = Some(start_generation);
+                    match decode_terminal_bytes(&reset_prefix) {
                         Ok(decoded) => {
                             attached.store(true, Ordering::Release);
                             if let Ok(mut parser) = parser.lock() {
@@ -512,6 +521,7 @@ fn spawn_attach_reader_thread(
                     generation,
                     base_generation,
                     base_offset,
+                    start_generation,
                     start_offset,
                     end_offset,
                     requested_offset,
@@ -520,7 +530,7 @@ fn spawn_attach_reader_thread(
                 } => {
                     if let Ok(mut guard) = attach_error.lock() {
                         *guard = Some(format!(
-                            "attach cursor unavailable: {reason}; retained generation {base_generation} offsets {base_offset}..{end_offset}, requested {requested_offset}, generation {generation}, replay start {start_offset}"
+                            "attach cursor unavailable: {reason}; retained generation {base_generation} offsets {base_offset}..{end_offset}, requested {requested_offset}, generation {generation}, replay generation {start_generation} at {start_offset}"
                         ));
                     }
                     return false;

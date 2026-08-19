@@ -123,33 +123,40 @@ fn spawn_output_thread(
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
         let mut next_offset = None;
+        let mut next_generation = None;
         for frame in frames {
             match frame {
-                Ok(ServerFrame::TerminalOutput { offset, bytes, .. }) => {
-                    match decode_terminal_bytes(&bytes) {
-                        Ok(raw) => {
-                            if next_offset.is_some_and(|expected| expected != offset) {
-                                set_failure(
-                                    &failure,
-                                    format!("terminal output continuity broke at offset {offset}"),
-                                );
-                                break;
-                            }
-                            next_offset = Some(offset.saturating_add(raw.len() as u64));
-                            if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
-                                set_failure(
-                                    &failure,
-                                    "terminal output stream could not be written".into(),
-                                );
-                                break;
-                            }
+                Ok(ServerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                }) => match decode_terminal_bytes(&bytes) {
+                    Ok(raw) => {
+                        if next_offset.is_some_and(|expected| expected != offset)
+                            || next_generation.is_some_and(|expected| generation < expected)
+                        {
+                            set_failure(
+                                &failure,
+                                format!("terminal output continuity broke at offset {offset}"),
+                            );
+                            break;
                         }
-                        Err(_) => {
-                            set_failure(&failure, "daemon sent unreadable terminal output".into());
+                        next_offset = Some(offset.saturating_add(raw.len() as u64));
+                        next_generation = Some(generation);
+                        if write_terminal_bytes(&mut stdout, &raw).is_err() {
+                            set_failure(
+                                &failure,
+                                "terminal output stream could not be written".into(),
+                            );
                             break;
                         }
                     }
-                }
+                    Err(_) => {
+                        set_failure(&failure, "daemon sent unreadable terminal output".into());
+                        break;
+                    }
+                },
                 Ok(ServerFrame::Response {
                     response: LocalResponse::Error { message, .. },
                     ..
@@ -158,14 +165,16 @@ fn spawn_output_thread(
                     break;
                 }
                 Ok(ServerFrame::TerminalAttachReady {
-                    initial_state,
+                    reset_prefix,
+                    start_generation,
                     start_offset,
                     ..
                 }) => {
                     next_offset = Some(start_offset);
-                    match decode_terminal_bytes(&initial_state) {
+                    next_generation = Some(start_generation);
+                    match decode_terminal_bytes(&reset_prefix) {
                         Ok(raw) => {
-                            if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
+                            if write_terminal_bytes(&mut stdout, &raw).is_err() {
                                 set_failure(&failure, "terminal state could not be written".into());
                                 break;
                             }
@@ -180,6 +189,7 @@ fn spawn_output_thread(
                     generation,
                     base_generation,
                     base_offset,
+                    start_generation,
                     start_offset,
                     end_offset,
                     requested_offset,
@@ -189,7 +199,7 @@ fn spawn_output_thread(
                     set_failure(
                         &failure,
                         format!(
-                            "attach cursor unavailable: {reason}; retry from generation {base_generation} offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation}, replay start {start_offset})"
+                            "attach cursor unavailable: {reason}; retry from generation {base_generation} offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation}, replay generation {start_generation} at {start_offset})"
                         ),
                     );
                     break;
@@ -241,6 +251,15 @@ fn spawn_stdin_reader(sender: Sender<StdinEvent>) {
 
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {
     *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
+}
+
+fn write_terminal_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
+    writer
+        .write_all(bytes)
+        .map_err(|error| format!("terminal output stream could not be written: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("terminal output stream could not be flushed: {error}"))
 }
 
 #[cfg(test)]
@@ -382,9 +401,24 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::forward_stdin_from;
-    use std::io::Cursor;
+    use super::{forward_stdin_from, write_terminal_bytes};
+    use std::io::{Cursor, Write};
     use std::sync::atomic::AtomicBool;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn ctrl_right_bracket_detaches_without_forwarding_following_bytes() {
@@ -410,5 +444,12 @@ mod tests {
 
         assert_eq!(exit, 0);
         assert_eq!(forwarded, b"before\x03after");
+    }
+
+    #[test]
+    fn output_write_failure_is_a_lifecycle_error() {
+        let mut writer = FailingWriter;
+        let error = write_terminal_bytes(&mut writer, b"output").unwrap_err();
+        assert!(error.contains("could not be written"));
     }
 }

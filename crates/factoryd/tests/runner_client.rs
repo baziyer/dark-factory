@@ -72,6 +72,7 @@ fn encoded(frame: RunnerFrame) -> Vec<u8> {
 fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
     RunnerFrame::TerminalOutput {
         protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 0,
         offset,
         bytes: bytes.to_owned(),
     }
@@ -690,7 +691,7 @@ async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
         .attach_terminal(7, factory_core::runner::TerminalAttachMode::Legacy)
         .await
         .unwrap();
-    assert_eq!(subscription.next_chunk().await.unwrap(), (7, bytes));
+    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 7, bytes));
     assert_eq!(
         fake.requests.await.unwrap(),
         vec![RequestEnvelope::new(
@@ -739,11 +740,17 @@ async fn bounded_attach_negotiates_exact_generation_and_replay_start() {
                 generation: 4,
                 base_generation: 3,
                 base_offset: 100,
+                start_generation: 3,
                 start_offset: 150,
                 end_offset: 200,
-                initial_state: factory_core::runner::encode_terminal_bytes(b"\x1bc"),
+                reset_prefix: factory_core::runner::encode_terminal_bytes(b"\x1bc"),
             }),
-            encoded(terminal_output(150, "")),
+            encoded(RunnerFrame::TerminalOutput {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                generation: 3,
+                offset: 150,
+                bytes: String::new(),
+            }),
         ],
     ])
     .await;
@@ -753,7 +760,10 @@ async fn bounded_attach_negotiates_exact_generation_and_replay_start() {
         .unwrap();
     assert_eq!(subscription.info().unwrap().base_generation, 3);
     assert_eq!(subscription.info().unwrap().start_offset, 150);
-    assert_eq!(subscription.next_chunk().await.unwrap(), (150, "".into()));
+    assert_eq!(
+        subscription.next_chunk().await.unwrap(),
+        (3, 150, "".into())
+    );
     assert_eq!(
         fake.requests.await.unwrap(),
         vec![
@@ -805,7 +815,8 @@ async fn silent_old_v1_runner_has_a_bounded_fallback_without_losing_later_output
         started.elapsed() < Duration::from_millis(350),
         "legacy silent attach stayed blocked"
     );
-    let (offset, bytes) = subscription.next_chunk().await.unwrap();
+    let (generation, offset, bytes) = subscription.next_chunk().await.unwrap();
+    assert_eq!(generation, 0);
     assert_eq!(offset, 0);
     assert_eq!(
         factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),

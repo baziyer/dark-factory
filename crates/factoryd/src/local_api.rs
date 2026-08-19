@@ -647,9 +647,10 @@ fn spawn_terminal_attach(
                     generation: info.generation,
                     base_generation: info.base_generation,
                     base_offset: info.base_offset,
+                    start_generation: info.start_generation,
                     start_offset: info.start_offset,
                     end_offset: info.end_offset,
-                    initial_state: info.initial_state,
+                    reset_prefix: info.reset_prefix,
                 })
                 .await
                 .is_err()
@@ -660,6 +661,7 @@ fn spawn_terminal_attach(
             .send(ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: session_id.clone(),
+                generation: 0,
                 offset: since_offset,
                 bytes: String::new(),
             })
@@ -670,10 +672,11 @@ fn spawn_terminal_attach(
         }
         loop {
             match subscription.next_chunk().await {
-                Ok((offset, bytes)) => {
+                Ok((generation, offset, bytes)) => {
                     let frame = ServerFrame::TerminalOutput {
                         protocol_version: PROTOCOL_VERSION,
                         session_id: session_id.clone(),
+                        generation,
                         offset,
                         bytes,
                     };
@@ -694,6 +697,7 @@ fn spawn_terminal_attach(
                         generation,
                         base_generation,
                         base_offset,
+                        start_generation,
                         start_offset,
                         end_offset,
                         requested_generation,
@@ -708,6 +712,7 @@ fn spawn_terminal_attach(
                                 generation,
                                 base_generation,
                                 base_offset,
+                                start_generation,
                                 start_offset,
                                 end_offset,
                                 requested_generation,

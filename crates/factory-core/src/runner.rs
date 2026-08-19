@@ -203,6 +203,7 @@ pub enum RunnerFrame {
     /// expected offset is `offset + bytes.len()` after decoding.
     TerminalOutput {
         protocol_version: u16,
+        generation: u64,
         offset: u64,
         bytes: String,
     },
@@ -220,11 +221,13 @@ pub enum RunnerFrame {
         generation: u64,
         base_generation: u64,
         base_offset: u64,
+        start_generation: u64,
         start_offset: u64,
         end_offset: u64,
-        /// Base64 terminal reset/state prefix, not included in byte offsets.
+        /// Base64 reset-baseline prefix, not included in byte offsets. It does
+        /// not claim to reconstruct application-specific terminal state.
         #[serde(default)]
-        initial_state: String,
+        reset_prefix: String,
     },
     /// The requested cursor cannot be replayed from the retained generation.
     TerminalAttachGap {
@@ -232,6 +235,7 @@ pub enum RunnerFrame {
         generation: u64,
         base_generation: u64,
         base_offset: u64,
+        start_generation: u64,
         start_offset: u64,
         end_offset: u64,
         requested_generation: Option<u64>,

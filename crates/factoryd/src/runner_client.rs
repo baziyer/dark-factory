@@ -191,25 +191,30 @@ impl RunnerClient {
                 let frame = result?;
                 validate_protocol(frame.protocol_version())?;
                 match frame {
-                    RunnerFrame::TerminalOutput { offset, bytes, .. } => {
-                        (None, Some((offset, bytes)))
-                    }
+                    RunnerFrame::TerminalOutput {
+                        generation,
+                        offset,
+                        bytes,
+                        ..
+                    } => (None, Some((generation, offset, bytes))),
                     RunnerFrame::TerminalAttachReady {
                         generation,
                         base_generation,
                         base_offset,
+                        start_generation,
                         start_offset,
                         end_offset,
-                        initial_state,
+                        reset_prefix,
                         ..
                     } => (
                         Some(TerminalAttachInfo {
                             generation,
                             base_generation,
                             base_offset,
+                            start_generation,
                             start_offset,
                             end_offset,
-                            initial_state,
+                            reset_prefix,
                         }),
                         None,
                     ),
@@ -217,6 +222,7 @@ impl RunnerClient {
                         generation,
                         base_generation,
                         base_offset,
+                        start_generation,
                         start_offset,
                         end_offset,
                         requested_generation,
@@ -228,6 +234,7 @@ impl RunnerClient {
                             generation,
                             base_generation,
                             base_offset,
+                            start_generation,
                             start_offset,
                             end_offset,
                             requested_generation,
@@ -248,9 +255,18 @@ impl RunnerClient {
             }
             Err(_) => return Err(RunnerClientError::BoundedAttachUnsupported),
         };
+        let next_offset = info
+            .as_ref()
+            .map(|attach| attach.start_offset)
+            .or_else(|| pending.as_ref().map(|(_, offset, _)| *offset));
+        let next_generation = info
+            .as_ref()
+            .map(|attach| attach.start_generation)
+            .or_else(|| pending.as_ref().map(|(generation, ..)| *generation));
         Ok(TerminalSubscription {
             reader,
-            next_offset: info.as_ref().map(|attach| attach.start_offset),
+            next_offset,
+            next_generation,
             info,
             pending,
         })
@@ -376,8 +392,9 @@ impl fmt::Debug for RunnerStreamItem {
 pub struct TerminalSubscription {
     reader: FrameReader,
     info: Option<TerminalAttachInfo>,
-    pending: Option<(u64, String)>,
+    pending: Option<(u64, u64, String)>,
     next_offset: Option<u64>,
+    next_generation: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -385,9 +402,10 @@ pub struct TerminalAttachInfo {
     pub generation: u64,
     pub base_generation: u64,
     pub base_offset: u64,
+    pub start_generation: u64,
     pub start_offset: u64,
     pub end_offset: u64,
-    pub initial_state: String,
+    pub reset_prefix: String,
 }
 
 impl TerminalSubscription {
@@ -396,8 +414,8 @@ impl TerminalSubscription {
         self.info.clone()
     }
 
-    /// Returns the next chunk's byte-stream offset and base64-encoded bytes.
-    pub async fn next_chunk(&mut self) -> Result<(u64, String), RunnerClientError> {
+    /// Returns the next chunk's generation, byte-stream offset, and base64 bytes.
+    pub async fn next_chunk(&mut self) -> Result<(u64, u64, String), RunnerClientError> {
         if let Some(chunk) = self.pending.take() {
             self.validate_chunk(&chunk)?;
             return Ok(chunk);
@@ -405,9 +423,14 @@ impl TerminalSubscription {
         let frame = self.reader.read_frame().await?;
         validate_protocol(frame.protocol_version())?;
         match frame {
-            RunnerFrame::TerminalOutput { offset, bytes, .. } => {
-                self.validate_chunk(&(offset, bytes.clone()))?;
-                Ok((offset, bytes))
+            RunnerFrame::TerminalOutput {
+                generation,
+                offset,
+                bytes,
+                ..
+            } => {
+                self.validate_chunk(&(generation, offset, bytes.clone()))?;
+                Ok((generation, offset, bytes))
             }
             RunnerFrame::TerminalAttachReady { .. } => Err(RunnerClientError::UnexpectedFrame {
                 expected: "terminal output",
@@ -416,6 +439,7 @@ impl TerminalSubscription {
                 generation,
                 base_generation,
                 base_offset,
+                start_generation,
                 start_offset,
                 end_offset,
                 requested_generation,
@@ -426,6 +450,7 @@ impl TerminalSubscription {
                 generation,
                 base_generation,
                 base_offset,
+                start_generation,
                 start_offset,
                 end_offset,
                 requested_generation,
@@ -437,8 +462,8 @@ impl TerminalSubscription {
         }
     }
 
-    fn validate_chunk(&mut self, chunk: &(u64, String)) -> Result<(), RunnerClientError> {
-        let (offset, encoded) = chunk;
+    fn validate_chunk(&mut self, chunk: &(u64, u64, String)) -> Result<(), RunnerClientError> {
+        let (generation, offset, encoded) = chunk;
         let bytes = decode_terminal_bytes(encoded).map_err(|_| RunnerClientError::InvalidJson)?;
         if let Some(expected) = self.next_offset
             && *offset != expected
@@ -448,7 +473,16 @@ impl TerminalSubscription {
                 found: *offset,
             });
         }
+        if let Some(expected) = self.next_generation
+            && *generation < expected
+        {
+            return Err(RunnerClientError::TerminalAttachGeneration {
+                expected,
+                found: *generation,
+            });
+        }
         self.next_offset = Some(offset.saturating_add(bytes.len() as u64));
+        self.next_generation = Some(*generation);
         Ok(())
     }
 }
@@ -721,6 +755,8 @@ pub enum RunnerClientError {
     BoundedAttachUnsupported,
     #[error("terminal output continuity broke: expected offset {expected}, found {found}")]
     TerminalAttachContinuity { expected: u64, found: u64 },
+    #[error("terminal output generation regressed: expected at least {expected}, found {found}")]
+    TerminalAttachGeneration { expected: u64, found: u64 },
     #[error(
         "terminal attach cursor is unavailable ({reason}); retained generation {generation}, offsets {base_offset}..{end_offset}"
     )]
@@ -728,6 +764,7 @@ pub enum RunnerClientError {
         generation: u64,
         base_generation: u64,
         base_offset: u64,
+        start_generation: u64,
         start_offset: u64,
         end_offset: u64,
         requested_generation: Option<u64>,

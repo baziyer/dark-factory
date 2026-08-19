@@ -6,7 +6,7 @@ use std::{
     io,
     io::{Read as _, Write as _},
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, FileExt as _, MetadataExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
@@ -34,9 +34,7 @@ use rustix::process::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{
-        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter,
-    },
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
@@ -419,8 +417,16 @@ impl TerminalLogInner {
 
 #[derive(Clone)]
 struct TerminalChunk {
+    generation: u64,
     offset: u64,
     bytes: Arc<Vec<u8>>,
+}
+
+struct SnapshotSegment {
+    generation: u64,
+    start_offset: u64,
+    len: u64,
+    file: std::fs::File,
 }
 
 struct TerminalSnapshot {
@@ -429,8 +435,8 @@ struct TerminalSnapshot {
     oldest_retained_offset: u64,
     oldest_generation: u64,
     active_start_offset: u64,
-    active_file: File,
-    previous: Option<RetainedSegment>,
+    active_file: std::fs::File,
+    previous: Option<SnapshotSegment>,
 }
 
 impl TerminalLog {
@@ -456,13 +462,13 @@ impl TerminalLog {
 
     async fn snapshot(&self) -> Result<TerminalSnapshot, Error> {
         let inner = self.inner.lock().await;
-        let active_file = inner.active_file.try_clone().await?;
+        let active_file = inner.active_file.try_clone().await?.into_std().await;
         let previous = match inner.previous.as_ref() {
-            Some(segment) => Some(RetainedSegment {
+            Some(segment) => Some(SnapshotSegment {
                 generation: segment.generation,
                 start_offset: segment.start_offset,
                 len: segment.len,
-                file: segment.file.try_clone().await?,
+                file: segment.file.try_clone().await?.into_std().await,
             }),
             None => None,
         };
@@ -481,8 +487,9 @@ impl TerminalLog {
     }
 
     /// Finds a replay boundary that cannot begin inside a UTF-8 code point or
-    /// an ANSI control sequence. The reset prefix sent with Ready restores
-    /// terminal modes before this bounded suffix is applied.
+    /// an ANSI control sequence. The reset prefix sent with Ready establishes
+    /// a documented baseline before this bounded suffix is applied; it is not
+    /// an application-state checkpoint.
     async fn safe_tail_start(
         &self,
         snapshot: &TerminalSnapshot,
@@ -537,6 +544,7 @@ impl TerminalLog {
         let mut inner = self.inner.lock().await;
         let start_offset = inner.total_bytes();
         let mut remaining: &[u8] = &bytes;
+        let mut published = Vec::new();
         while !remaining.is_empty() {
             let space = self.max_bytes.saturating_sub(inner.active_len);
             if space == 0 {
@@ -548,14 +556,18 @@ impl TerminalLog {
                 .min(usize::try_from(space).unwrap_or(usize::MAX));
             inner.active_file.write_all(&remaining[..take]).await?;
             inner.active_len += take as u64;
+            published.push(TerminalChunk {
+                generation: inner.generation,
+                offset: start_offset + (bytes.len() - remaining.len()) as u64,
+                bytes: Arc::new(remaining[..take].to_vec()),
+            });
             remaining = &remaining[take..];
         }
         inner.active_file.flush().await?;
         drop(inner);
-        let _ = self.chunks.send(TerminalChunk {
-            offset: start_offset,
-            bytes: Arc::new(bytes),
-        });
+        for chunk in published {
+            let _ = self.chunks.send(chunk);
+        }
         Ok(())
     }
 
@@ -588,12 +600,9 @@ impl TerminalLog {
     /// frames, reading `terminal.log.1` (if it covers any of the range) then
     /// `terminal.log`, using the file boundaries already fixed in `snapshot`.
     ///
-    /// Files are opened fresh by path and are only ever appended to, never
-    /// rewritten in place, so a concurrent append cannot corrupt a read.
-    /// A pathologically fast *second* rotation while this replay is still in
-    /// flight (the active file filling up again before this function reaches
-    /// it) can shift what `terminal.log` refers to on disk; live streaming is
-    /// unaffected since it carries bytes directly rather than reading files.
+    /// The snapshot owns independent file descriptions and every read is
+    /// positional, so concurrent appends cannot move a shared cursor or alter
+    /// which inode the replay observes.
     async fn replay(
         &self,
         write: &mut OwnedWriteHalf,
@@ -607,6 +616,7 @@ impl TerminalLog {
                 .replay_file(
                     write,
                     &segment.file,
+                    segment.generation,
                     segment.start_offset,
                     segment.len,
                     cursor,
@@ -618,6 +628,7 @@ impl TerminalLog {
         self.replay_file(
             write,
             &snapshot.active_file,
+            snapshot.generation,
             snapshot.active_start_offset,
             active_len,
             cursor,
@@ -631,7 +642,8 @@ impl TerminalLog {
     async fn replay_file(
         &self,
         write: &mut OwnedWriteHalf,
-        file: &File,
+        file: &std::fs::File,
+        generation: u64,
         file_start: u64,
         file_len: u64,
         cursor: u64,
@@ -643,17 +655,20 @@ impl TerminalLog {
         if read_from >= read_through {
             return Ok(cursor);
         }
-        let mut file = file.try_clone().await?;
-        file.seek(io::SeekFrom::Start(read_from - file_start))
-            .await?;
         let mut remaining = read_through - read_from;
         let mut position = read_from;
         let mut buffer = vec![0_u8; TERMINAL_READ_CHUNK];
         while remaining > 0 {
             let want = usize::try_from(remaining.min(TERMINAL_READ_CHUNK as u64))
                 .expect("chunk size fits usize");
-            file.read_exact(&mut buffer[..want]).await?;
-            send_terminal_output(write, position, &buffer[..want]).await?;
+            let read = file.read_at(&mut buffer[..want], position - file_start)?;
+            if read != want {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "terminal snapshot ended during positional replay",
+                )));
+            }
+            send_terminal_output(write, generation, position, &buffer[..want]).await?;
             position += want as u64;
             remaining -= want as u64;
         }
@@ -662,7 +677,7 @@ impl TerminalLog {
 }
 
 async fn read_file_range(
-    source: &File,
+    source: &std::fs::File,
     file_start: u64,
     file_len: u64,
     from: u64,
@@ -674,19 +689,18 @@ async fn read_file_range(
     if start >= end {
         return Ok(());
     }
-    let mut file = source.try_clone().await?;
-    file.seek(std::io::SeekFrom::Start(start - file_start))
-        .await?;
     let mut remaining = usize::try_from(end - start).expect("bounded terminal range fits usize");
     let mut buffer = [0_u8; 4096];
+    let mut position = start;
     while remaining > 0 {
         let take = remaining.min(buffer.len());
-        let read = file.read(&mut buffer[..take]).await?;
+        let read = source.read_at(&mut buffer[..take], position - file_start)?;
         if read == 0 {
             break;
         }
         output.extend_from_slice(&buffer[..read]);
         remaining -= read;
+        position += read as u64;
     }
     Ok(())
 }
@@ -720,6 +734,19 @@ fn safe_terminal_prefix(bytes: &[u8]) -> usize {
         return ansi_sequence_end(bytes, index + 1);
     }
     index
+}
+
+fn generation_at(snapshot: &TerminalSnapshot, offset: u64) -> u64 {
+    snapshot
+        .previous
+        .as_ref()
+        .map_or(snapshot.generation, |segment| {
+            if offset >= segment.start_offset && offset <= segment.start_offset + segment.len {
+                segment.generation
+            } else {
+                snapshot.generation
+            }
+        })
 }
 
 fn ansi_sequence_end(bytes: &[u8], mut index: usize) -> usize {
@@ -1546,6 +1573,7 @@ async fn attach_terminal_connection(
                     generation: snapshot.generation,
                     base_generation: snapshot.oldest_generation,
                     base_offset: snapshot.oldest_retained_offset,
+                    start_generation: snapshot.oldest_generation,
                     start_offset: snapshot.oldest_retained_offset,
                     end_offset: snapshot.total_bytes,
                     requested_generation,
@@ -1583,6 +1611,7 @@ async fn attach_terminal_connection(
     } else {
         requested_from
     };
+    let start_generation = generation_at(&snapshot, from);
     if explicit {
         send_frame(
             write,
@@ -1591,10 +1620,13 @@ async fn attach_terminal_connection(
                 generation: snapshot.generation,
                 base_generation: snapshot.oldest_generation,
                 base_offset: snapshot.oldest_retained_offset,
+                start_generation,
                 start_offset: from,
                 end_offset: snapshot.total_bytes,
-                initial_state: if matches!(mode, TerminalAttachMode::Tail) {
-                    encode_terminal_bytes(b"\x1bc")
+                reset_prefix: if matches!(mode, TerminalAttachMode::Tail) {
+                    encode_terminal_bytes(
+                        b"\x1bc\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[?1l\x1b[0m\x1b[2J\x1b[H",
+                    )
                 } else {
                     String::new()
                 },
@@ -1611,11 +1643,13 @@ async fn attach_terminal_connection(
         write,
         &RunnerFrame::TerminalOutput {
             protocol_version: RUNNER_PROTOCOL_VERSION,
+            generation: snapshot.generation,
             offset: snapshot.total_bytes,
             bytes: String::new(),
         },
     )
     .await?;
+    let mut delivered_generation = snapshot.generation;
     let mut delivered = snapshot.total_bytes;
 
     loop {
@@ -1626,9 +1660,12 @@ async fn attach_terminal_connection(
                 }
             }
             received = chunks.recv() => match received {
-                Ok(chunk) if chunk.offset + chunk.bytes.len() as u64 <= delivered => {}
-                Ok(chunk) if chunk.offset == delivered => {
-                    send_terminal_output(write, chunk.offset, &chunk.bytes).await?;
+                Ok(chunk)
+                    if chunk.generation <= delivered_generation
+                        && chunk.offset + chunk.bytes.len() as u64 <= delivered => {}
+                Ok(chunk) if chunk.offset == delivered && chunk.generation >= delivered_generation => {
+                    send_terminal_output(write, chunk.generation, chunk.offset, &chunk.bytes).await?;
+                    delivered_generation = chunk.generation;
                     delivered += chunk.bytes.len() as u64;
                 }
                 Ok(_) => {
@@ -1673,6 +1710,7 @@ async fn send_attach_gap(
             generation: snapshot.generation,
             base_generation: snapshot.oldest_generation,
             base_offset: snapshot.oldest_retained_offset,
+            start_generation: snapshot.oldest_generation,
             start_offset: snapshot.oldest_retained_offset,
             end_offset: snapshot.total_bytes,
             requested_generation,
@@ -1737,6 +1775,7 @@ async fn send_event(write: &mut OwnedWriteHalf, event: &RunnerEventEnvelope) -> 
 
 async fn send_terminal_output(
     write: &mut OwnedWriteHalf,
+    generation: u64,
     offset: u64,
     bytes: &[u8],
 ) -> Result<(), Error> {
@@ -1744,6 +1783,7 @@ async fn send_terminal_output(
         write,
         &RunnerFrame::TerminalOutput {
             protocol_version: RUNNER_PROTOCOL_VERSION,
+            generation,
             offset,
             bytes: encode_terminal_bytes(bytes),
         },
@@ -2559,6 +2599,7 @@ mod tests {
         },
     };
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::time::Duration;
     use tokio::{
         fs::File,
         io::{AsyncBufReadExt, BufReader},
@@ -2755,24 +2796,28 @@ mod tests {
         let frames = attach_frames(log, TerminalAttachMode::Tail).await;
         let RunnerFrame::TerminalAttachReady {
             generation,
+            start_generation,
             base_generation,
             base_offset,
             start_offset,
             end_offset,
-            ref initial_state,
+            ref reset_prefix,
             ..
         } = frames[0]
         else {
             panic!("bounded attach did not negotiate its retained bounds");
         };
         assert_eq!(generation, 0);
+        assert_eq!(start_generation, 0);
         assert_eq!(base_generation, 0);
         assert_eq!(end_offset - base_offset, 20 * 1024 * 1024);
         assert_eq!(
             start_offset,
             base_offset + 20 * 1024 * 1024 - DEFAULT_TERMINAL_ATTACH_TAIL_BYTES
         );
-        assert_eq!(decode_terminal_bytes(initial_state).unwrap(), b"\x1bc");
+        let reset = decode_terminal_bytes(reset_prefix).unwrap();
+        assert!(reset.starts_with(b"\x1bc"));
+        assert!(reset.windows(6).any(|window| window == b"?2004l"));
         let mut output = Vec::new();
         for frame in &frames[1..] {
             if let RunnerFrame::TerminalOutput { bytes, .. } = frame {
@@ -2877,5 +2922,129 @@ mod tests {
             Some(RunnerFrame::TerminalAttachGap { reason, .. })
                 if reason.contains("beyond")
         ));
+    }
+
+    #[tokio::test]
+    async fn attach_labels_replay_before_and_after_a_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 4);
+        log.append(b"ABCD".to_vec()).await.unwrap();
+        log.append(b"EFGH".to_vec()).await.unwrap();
+
+        let frames = attach_frames(log.clone(), TerminalAttachMode::FullHistory).await;
+        let RunnerFrame::TerminalAttachReady {
+            generation,
+            base_generation,
+            start_generation,
+            start_offset,
+            ..
+        } = frames[0]
+        else {
+            panic!("missing attach ready frame");
+        };
+        assert_eq!(
+            (generation, base_generation, start_generation, start_offset),
+            (1, 0, 0, 0)
+        );
+        let output_generations = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                RunnerFrame::TerminalOutput {
+                    generation, bytes, ..
+                } if !bytes.is_empty() => Some(*generation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_generations, vec![0, 1]);
+
+        let frames = attach_frames(
+            log.clone(),
+            TerminalAttachMode::Offset {
+                generation: Some(0),
+                offset: 2,
+            },
+        )
+        .await;
+        let output_generations = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                RunnerFrame::TerminalOutput {
+                    generation, bytes, ..
+                } if !bytes.is_empty() => Some(*generation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output_generations, vec![0, 1]);
+
+        let frames = attach_frames(
+            log.clone(),
+            TerminalAttachMode::Offset {
+                generation: Some(1),
+                offset: 6,
+            },
+        )
+        .await;
+        let output = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                RunnerFrame::TerminalOutput {
+                    generation, bytes, ..
+                } if !bytes.is_empty() => {
+                    Some((*generation, decode_terminal_bytes(bytes).unwrap()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(output, vec![(1, b"GH".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn positional_replay_stays_intact_while_append_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 8 * 1024 * 1024);
+        let original = vec![b'x'; 2 * 1024 * 1024];
+        log.append(original.clone()).await.unwrap();
+        let snapshot = log.snapshot().await.unwrap();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let (_read, mut write) = server.into_split();
+        let replay_log = log.clone();
+        let replay = tokio::spawn(async move {
+            replay_log
+                .replay(&mut write, &snapshot, 0, snapshot.total_bytes)
+                .await
+                .unwrap();
+        });
+        let append_log = log.clone();
+        let append = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            append_log.append(b"tail".to_vec()).await.unwrap();
+        });
+
+        let reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(&mut client);
+            let mut line = String::new();
+            let mut replayed = Vec::new();
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                if let RunnerFrame::TerminalOutput { bytes, .. } =
+                    serde_json::from_str(line.trim_end()).unwrap()
+                {
+                    replayed.extend(decode_terminal_bytes(&bytes).unwrap());
+                }
+                line.clear();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            replayed
+        });
+        replay.await.unwrap();
+        append.await.unwrap();
+        let replayed = reader.await.unwrap();
+        assert_eq!(replayed, original);
+        let mut expected = original;
+        expected.extend_from_slice(b"tail");
+        assert_eq!(
+            std::fs::read(directory.path().join(TERMINAL_LOG_FILE)).unwrap(),
+            expected
+        );
     }
 }
