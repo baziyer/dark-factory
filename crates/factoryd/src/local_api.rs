@@ -2361,6 +2361,11 @@ async fn create_managed_change_request(
             ));
         };
         if let Some(active) = active {
+            if active.state == "removing" {
+                return Err(ApiFailure::Conflict(
+                    "managed change abandonment is still in progress".into(),
+                ));
+            }
             return Ok(active);
         }
         let project = state
@@ -2466,29 +2471,52 @@ async fn abandon_managed_change_request(
             })
             .await?;
         let _slot = state.repository_slot().await;
-        let target = repository::Target::validate_with_change(
-            session,
-            project.clone(),
-            authority,
-            Some(change.clone()),
-        )
-        .await
-        .map_err(repository_failure)?;
-        target
-            .ensure_abandonable()
-            .await
-            .map_err(repository_failure)?;
-        crate::worktrees::remove(Path::new(&project.root), Path::new(&change.worktree))
-            .await
-            .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
-        state
+        let change = state
             .commit_and_publish({
                 let project_id = project_id.clone();
                 let agent_id = agent_id.clone();
+                let task_id = change.task_id.clone();
                 move |store| {
-                    let change = store.abandon_managed_change(
+                    let change = store.begin_abandon_managed_change(
                         &project_id,
-                        &change.task_id,
+                        &task_id,
+                        &agent_id,
+                        now_ms()?,
+                    )?;
+                    Ok((change, Vec::new()))
+                }
+            })
+            .await
+            .map_err(ApiFailure::from)?;
+        let worktree_exists = Path::new(&change.worktree).exists();
+        if worktree_exists {
+            let target = repository::Target::validate_with_change(
+                session,
+                project.clone(),
+                authority,
+                Some(change.clone()),
+            )
+            .await
+            .map_err(repository_failure)?;
+            target
+                .ensure_abandonable()
+                .await
+                .map_err(repository_failure)?;
+        }
+        if worktree_exists {
+            crate::worktrees::remove(Path::new(&project.root), Path::new(&change.worktree))
+                .await
+                .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
+        }
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let task_id = change.task_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    let change = store.finish_abandon_managed_change(
+                        &project_id,
+                        &task_id,
                         &agent_id,
                         now_ms()?,
                     )?;

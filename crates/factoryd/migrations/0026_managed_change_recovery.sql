@@ -1,4 +1,4 @@
-CREATE TABLE managed_changes (
+CREATE TABLE managed_changes_rebuilt (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
     project_id TEXT NOT NULL REFERENCES projects(id),
     agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -21,5 +21,16 @@ CREATE TABLE managed_changes (
     UNIQUE(project_id, branch)
 ) STRICT;
 
+INSERT INTO managed_changes_rebuilt
+SELECT task_id, project_id, agent_id, worktree, branch, git_dir, common_dir,
+       worktree_device, worktree_inode, git_dir_device, git_dir_inode,
+       common_dir_device, common_dir_inode, base_sha, head_sha,
+       published_head_sha, state, created_at_ms, updated_at_ms
+FROM managed_changes;
+
+DROP TABLE managed_changes;
+ALTER TABLE managed_changes_rebuilt RENAME TO managed_changes;
+
 CREATE UNIQUE INDEX managed_changes_one_active_agent
-    ON managed_changes(project_id, agent_id) WHERE state IN ('preparing', 'active', 'removing');
+    ON managed_changes(project_id, agent_id)
+    WHERE state IN ('preparing', 'active', 'removing');

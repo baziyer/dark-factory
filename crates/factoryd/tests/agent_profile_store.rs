@@ -137,8 +137,11 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     connection
         .execute_batch(
             "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
-             ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
         )
+        .unwrap();
+    connection
+        .execute_batch("DROP TABLE managed_changes;")
         .unwrap();
     connection
         .execute(

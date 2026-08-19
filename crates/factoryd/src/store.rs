@@ -26,7 +26,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 26;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -351,6 +351,7 @@ pub struct ManagedChangeRecord {
     pub base_sha: String,
     pub head_sha: String,
     pub published_head_sha: Option<String>,
+    pub state: String,
 }
 // --- Sessions -------------------------------------------------------------
 //
@@ -3414,7 +3415,8 @@ impl Store {
             .connection
             .query_row(
                 "SELECT task_id FROM managed_changes
-                 WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'",
+                 WHERE project_id = ?1 AND agent_id = ?2
+                   AND state IN ('preparing', 'active', 'removing')",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get::<_, String>(0),
             )
@@ -3455,9 +3457,10 @@ impl Store {
                 "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
                         common_dir, worktree_device, worktree_inode, git_dir_device,
                         git_dir_inode, common_dir_device, common_dir_inode,
-                        base_sha, head_sha, published_head_sha
+                        base_sha, head_sha, published_head_sha, state
                  FROM managed_changes
-                 WHERE project_id = ?1 AND task_id = ?2 AND state = 'active'",
+                 WHERE project_id = ?1 AND task_id = ?2
+                   AND state IN ('preparing', 'active', 'removing')",
                 params![project_id.as_str(), task_id.as_str()],
                 load_managed_change,
             )
@@ -3484,8 +3487,9 @@ impl Store {
                 "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
                         common_dir, worktree_device, worktree_inode, git_dir_device,
                         git_dir_inode, common_dir_device, common_dir_inode,
-                        base_sha, head_sha, published_head_sha
-                 FROM managed_changes WHERE task_id = ?1 AND state = 'active'",
+                        base_sha, head_sha, published_head_sha, state
+                 FROM managed_changes WHERE task_id = ?1
+                   AND state IN ('preparing', 'active', 'removing')",
                 params![record.task_id.as_str()],
                 load_managed_change,
             )
@@ -3500,7 +3504,8 @@ impl Store {
         let active_for_agent: Option<String> = transaction
             .query_row(
                 "SELECT task_id FROM managed_changes
-                 WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'",
+                 WHERE project_id = ?1 AND agent_id = ?2
+                   AND state IN ('preparing', 'active', 'removing')",
                 params![record.project_id.as_str(), record.agent_id.as_str()],
                 |row| row.get(0),
             )
@@ -3571,7 +3576,34 @@ impl Store {
         self.managed_change(project_id, task_id)
     }
 
-    pub fn abandon_managed_change(
+    /// Claims removal durably before touching the filesystem. If the daemon
+    /// dies after this transition, the next authenticated abandon request can
+    /// resume the same removal instead of treating the worktree as lost.
+    pub fn begin_abandon_managed_change(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        now_ms: i64,
+    ) -> Result<ManagedChangeRecord> {
+        let changed = self.connection.execute(
+            "UPDATE managed_changes SET state = 'removing', updated_at_ms = ?4
+             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3
+               AND state IN ('active', 'removing')",
+            params![
+                project_id.as_str(),
+                task_id.as_str(),
+                agent_id.as_str(),
+                now_ms
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ManagedChangeNotFound);
+        }
+        self.managed_change(project_id, task_id)
+    }
+
+    pub fn finish_abandon_managed_change(
         &mut self,
         project_id: &ProjectId,
         task_id: &TaskId,
@@ -3580,7 +3612,8 @@ impl Store {
     ) -> Result<ManagedChangeRecord> {
         let changed = self.connection.execute(
             "UPDATE managed_changes SET state = 'abandoned', updated_at_ms = ?4
-             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3 AND state = 'active'",
+             WHERE project_id = ?1 AND task_id = ?2 AND agent_id = ?3
+               AND state IN ('active', 'removing')",
             params![
                 project_id.as_str(),
                 task_id.as_str(),
@@ -3596,7 +3629,7 @@ impl Store {
                 "SELECT project_id, task_id, agent_id, worktree, branch, git_dir,
                         common_dir, worktree_device, worktree_inode, git_dir_device,
                         git_dir_inode, common_dir_device, common_dir_inode,
-                        base_sha, head_sha, published_head_sha
+                        base_sha, head_sha, published_head_sha, state
                  FROM managed_changes WHERE project_id = ?1 AND task_id = ?2",
                 params![project_id.as_str(), task_id.as_str()],
                 load_managed_change,
@@ -3793,6 +3826,7 @@ impl Store {
         let task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
+        reject_active_managed_change(&transaction, task_id)?;
         if !matches!(
             task.snapshot.status,
             TaskStatus::Failed | TaskStatus::Cancelled
@@ -3896,6 +3930,7 @@ impl Store {
         let task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
+        reject_active_managed_change(&transaction, task_id)?;
         if task.snapshot.status == TaskStatus::Running {
             let run_id: String = transaction
                 .query_row(
@@ -4022,6 +4057,7 @@ impl Store {
         let _task = load_task(&transaction, task_id)?
             .filter(|task| task.snapshot.project_id == *project_id)
             .ok_or(StoreError::TaskNotFound)?;
+        reject_any_managed_change(&transaction, task_id)?;
         let has_active_run: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM runs
@@ -4998,6 +5034,35 @@ fn open_run_for_task(
     load_run(transaction, &run_id)?.ok_or(StoreError::RunNotFound)
 }
 
+fn reject_active_managed_change(connection: &Connection, task_id: &TaskId) -> Result<()> {
+    let active: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM managed_changes
+             WHERE task_id = ?1 AND state IN ('preparing', 'active', 'removing')
+         )",
+        params![task_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if active {
+        Err(StoreError::TaskHasActiveChange)
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_any_managed_change(connection: &Connection, task_id: &TaskId) -> Result<()> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_changes WHERE task_id = ?1)",
+        params![task_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Err(StoreError::TaskHasActiveChange)
+    } else {
+        Ok(())
+    }
+}
+
 /// Closes one open run (task-episode) and moves its task to a terminal or
 /// blocked state in the same transaction, emitting `TaskChanged`,
 /// `AgentChanged`, and `RunChanged` events.
@@ -5013,6 +5078,8 @@ fn close_run_in_transaction(
     task_blocked_reason: Option<&str>,
     now_ms: i64,
 ) -> Result<ClosedEpisode> {
+    let task_id = run.task_id.as_ref().ok_or(StoreError::TaskNotFound)?;
+    reject_active_managed_change(transaction, task_id)?;
     let changed = transaction.execute(
         "UPDATE runs
          SET status = ?1, status_since_ms = ?2, updated_at_ms = ?2, ended_at_ms = ?2,
@@ -5029,7 +5096,6 @@ fn close_run_in_transaction(
     if changed != 1 {
         return Err(StoreError::RunNotStoppable);
     }
-    let task_id = run.task_id.as_ref().ok_or(StoreError::TaskNotFound)?;
     let is_terminal_task_status = task_status.is_terminal();
     let changed = transaction.execute(
         "UPDATE tasks
@@ -5190,7 +5256,9 @@ fn check_agent_deletable(
 ) -> Result<()> {
     let has_active_change: bool = connection.query_row(
         "SELECT EXISTS(
-            SELECT 1 FROM managed_changes WHERE project_id = ?1 AND agent_id = ?2 AND state = 'active'
+            SELECT 1 FROM managed_changes
+            WHERE project_id = ?1 AND agent_id = ?2
+              AND state IN ('preparing', 'active', 'removing')
          )",
         params![project_id.as_str(), agent_id.as_str()],
         |row| row.get(0),
@@ -5245,7 +5313,8 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     }
     let has_active_change: bool = connection.query_row(
         "SELECT EXISTS(
-            SELECT 1 FROM managed_changes WHERE project_id = ?1 AND state = 'active'
+            SELECT 1 FROM managed_changes
+            WHERE project_id = ?1 AND state IN ('preparing', 'active', 'removing')
          )",
         params![project_id.as_str()],
         |row| row.get(0),
@@ -5402,6 +5471,7 @@ fn load_managed_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<ManagedChang
         base_sha: row.get(13)?,
         head_sha: row.get(14)?,
         published_head_sha: row.get(15)?,
+        state: row.get(16)?,
     })
 }
 
@@ -5975,6 +6045,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0025_managed_changes.sql"))?;
         transaction.pragma_update(None, "user_version", 25)?;
         transaction.commit()?;
+        current = 25;
+    }
+    if current == 25 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0026_managed_change_recovery.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 26)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6464,6 +6543,7 @@ mod tests {
             base_sha: "a".repeat(40),
             head_sha: "a".repeat(40),
             published_head_sha: None,
+            state: "active".into(),
         };
         assert_eq!(
             store.create_managed_change(record.clone(), 4).unwrap(),
@@ -6480,6 +6560,48 @@ mod tests {
                 .iter()
                 .all(|event| { !matches!(event.event, FactoryEvent::RepositoryOperation { .. }) })
         );
+    }
+
+    #[test]
+    fn active_change_blocks_task_delete_but_can_be_closed_before_it() {
+        let (mut store, project_id, agent_id, task_id) = managed_fixture();
+        let record = ManagedChangeRecord {
+            project_id: project_id.clone(),
+            task_id: task_id.clone(),
+            agent_id: agent_id.clone(),
+            worktree: "/state/projects/project/changes/issue-175".into(),
+            branch: "issue/issue-175".into(),
+            git_dir: "/repo/.git/worktrees/issue-175".into(),
+            common_dir: "/repo/.git".into(),
+            worktree_device: 1,
+            worktree_inode: 2,
+            git_dir_device: 3,
+            git_dir_inode: 4,
+            common_dir_device: 5,
+            common_dir_inode: 6,
+            base_sha: "a".repeat(40),
+            head_sha: "a".repeat(40),
+            published_head_sha: None,
+            state: "active".into(),
+        };
+        store.create_managed_change(record, 5).unwrap();
+        let delete_error = store.delete_task(&project_id, &task_id, 6).unwrap_err();
+        assert!(
+            matches!(delete_error, StoreError::TaskHasActiveChange),
+            "{delete_error}"
+        );
+        let removing = store
+            .begin_abandon_managed_change(&project_id, &task_id, &agent_id, 7)
+            .unwrap();
+        assert_eq!(removing.state, "removing");
+        let abandoned = store
+            .finish_abandon_managed_change(&project_id, &task_id, &agent_id, 8)
+            .unwrap();
+        assert_eq!(abandoned.state, "abandoned");
+        assert!(matches!(
+            store.delete_task(&project_id, &task_id, 9),
+            Err(StoreError::TaskHasActiveChange)
+        ));
     }
 
     #[test]
