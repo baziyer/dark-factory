@@ -1304,6 +1304,7 @@ async fn handle_request(
             project_id,
             task_id,
         } => {
+            let _repository_slot = state.repository_slot().await;
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) = store.cancel_task(&project_id, &task_id, now_ms()?)?;
@@ -1359,6 +1360,7 @@ async fn handle_request(
             project_id,
             task_id,
         } => {
+            let _repository_slot = state.repository_slot().await;
             let response_project_id = project_id.clone();
             let response_task_id = task_id.clone();
             state
@@ -1376,6 +1378,7 @@ async fn handle_request(
             project_id,
             agent_id,
         } => {
+            let _repository_slot = state.repository_slot().await;
             let response_project_id = project_id.clone();
             let response_agent_id = agent_id.clone();
             // Deletion invariant (ARCHITECTURE.md #9): from this call on,
@@ -1401,6 +1404,7 @@ async fn handle_request(
             })
         }
         LocalRequest::DeleteProject { project_id } => {
+            let _repository_slot = state.repository_slot().await;
             let response_project_id = project_id.clone();
             // Deletion invariant (ARCHITECTURE.md #9): mark the project
             // first, so no `CreateAgent` can start writing a new agent's
@@ -1551,6 +1555,7 @@ async fn handle_request(
             Ok(LocalResponse::RunStopped { run_id })
         }
         LocalRequest::CancelRun { project_id, run_id } => {
+            let _repository_slot = state.repository_slot().await;
             let response_run_id = run_id.clone();
             state
                 .commit_and_publish(move |store| {
@@ -1567,6 +1572,7 @@ async fn handle_request(
             task_id,
             result,
         } => {
+            let _repository_slot = state.repository_slot().await;
             if result.len() > MAX_TASK_RESULT_BYTES {
                 return Err(ApiFailure::Invalid(format!(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
@@ -1585,6 +1591,7 @@ async fn handle_request(
             task_id,
             reason,
         } => {
+            let _repository_slot = state.repository_slot().await;
             if reason.is_empty() || reason.len() > MAX_BLOCKED_REASON_BYTES {
                 return Err(ApiFailure::Invalid(format!(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
@@ -2319,6 +2326,10 @@ async fn create_managed_change_request(
     guidance_root: &Path,
     token: String,
 ) -> Result<LocalResponse, ApiFailure> {
+    // Creation owns the repository slot from authentication through the
+    // durable insert. Terminal task operations take the same slot, so no
+    // task can close between filesystem provisioning and row registration.
+    let _slot = state.repository_slot().await;
     let session = state
         .with_store(move |store| store.find_session_by_hook_token(&token))
         .await?
@@ -2388,7 +2399,6 @@ async fn create_managed_change_request(
             &project_id,
             task.snapshot.id.as_str(),
         );
-        let _slot = state.repository_slot().await;
         let record = repository::create_managed_change(
             &project,
             authority,
@@ -2399,13 +2409,25 @@ async fn create_managed_change_request(
         .await
         .map_err(repository_failure)?;
         let record_for_store = record.clone();
-        state
+        let stored = state
             .commit_and_publish(move |store| {
                 let record = store.create_managed_change(record_for_store, now_ms()?)?;
                 Ok((record, Vec::new()))
             })
-            .await
-            .map_err(ApiFailure::from)
+            .await;
+        match stored {
+            Ok(record) => Ok(record),
+            Err(error) => {
+                if let Err(cleanup) =
+                    repository::discard_unregistered_change(Path::new(&project.root), &record).await
+                {
+                    return Err(ApiFailure::Conflict(format!(
+                        "managed change registration failed: {error}; cleanup failed: {cleanup}"
+                    )));
+                }
+                Err(ApiFailure::from(error))
+            }
+        }
     }
     .await;
     let finished = RepositoryAudit {
