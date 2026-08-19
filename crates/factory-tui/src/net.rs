@@ -113,6 +113,8 @@ pub enum NetMsg {
         check: UpdateCheck,
         active_version: Result<Option<String>, String>,
     },
+    UpdateProgress(factoryctl::managed_update::UpdateProgress),
+    UpdateFinished(Result<factoryctl::managed_update::InstalledUpdate, String>),
     /// The daemon's `FleetStatus` — the same request `factoryctl status` makes — refreshed in a
     /// separate worker because worktree git state changes without durable events.
     FleetStatus(FleetStatus),
@@ -552,6 +554,58 @@ pub fn spawn_update_check(tx: Sender<NetMsg>, now_ms: i64) {
     });
 }
 
+/// The release that can make both the active runtime and this running viewer
+/// current. Comparing only with `bin/current` would hide the action from an
+/// older TUI after `factoryctl update --install` has already activated the
+/// release; comparing only with the compiled viewer could downgrade a newer
+/// active runtime.
+pub fn manual_update_candidate<'a>(
+    check: &'a UpdateCheck,
+    active: Option<&str>,
+) -> Option<&'a update::Manifest> {
+    let latest = check.latest.as_ref()?;
+    if !latest.assets.contains_key(update::platform_key())
+        || active.is_some_and(|active| update::is_newer(active, &latest.version))
+    {
+        return None;
+    }
+    (update::is_newer(&latest.version, &check.current)
+        || active.is_none_or(|active| update::is_newer(&latest.version, active)))
+    .then_some(latest)
+}
+
+/// Runs the exact installer transaction used by `factoryctl update --install`
+/// without blocking rendering. Unlike the CLI, the TUI requires the managed
+/// launchd job because it cannot safely restart an unknown daemon owner.
+pub fn spawn_update_install(socket: PathBuf, tx: Sender<NetMsg>, check: UpdateCheck) {
+    thread::spawn(move || {
+        let _ = tx.send(NetMsg::UpdateProgress(
+            factoryctl::managed_update::UpdateProgress::Checking,
+        ));
+        let result = (|| {
+            let home =
+                factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
+            let active = update::active_version(&home)?;
+            let manifest = manual_update_candidate(&check, active.as_deref())
+                .ok_or("the shown release can no longer update this viewer safely")?
+                .clone();
+            let mut progress = |stage| {
+                let _ = tx.send(NetMsg::UpdateProgress(stage));
+            };
+            factoryctl::managed_update::install(
+                &home,
+                &socket,
+                &manifest,
+                true,
+                &mut progress,
+                &mut |_| {},
+            )
+            .map_err(|error| error.to_string())
+        })();
+        let _ = tx.send(NetMsg::UpdateFinished(result));
+    });
+}
+
 /// Fires one request in the background and reports the result. Used for every operator action
 /// so the render loop is never blocked on the daemon.
 pub fn spawn_request(client: Client, tx: Sender<NetMsg>, request: LocalRequest) {
@@ -590,6 +644,37 @@ mod tests {
             delay = next_backoff(delay);
         }
         assert_eq!(delay, MAX_BACKOFF);
+    }
+
+    #[test]
+    fn manual_update_covers_an_old_viewer_without_downgrading_the_runtime() {
+        let manifest = update::Manifest {
+            version: "0.2.6".to_owned(),
+            assets: [(
+                update::platform_key().to_owned(),
+                update::Asset {
+                    url: "https://example.invalid/release.tar.gz".to_owned(),
+                    sha256: "00".to_owned(),
+                },
+            )]
+            .into(),
+        };
+        let check = UpdateCheck {
+            checked_at_ms: 0,
+            current: "0.2.5".to_owned(),
+            latest: Some(manifest),
+            error: None,
+        };
+
+        assert_eq!(
+            manual_update_candidate(&check, Some("0.2.6")).map(|item| item.version.as_str()),
+            Some("0.2.6"),
+            "an already-updated runtime must still offer the new viewer"
+        );
+        assert!(
+            manual_update_candidate(&check, Some("0.2.7")).is_none(),
+            "a stable manifest must never downgrade a newer active runtime"
+        );
     }
 
     fn empty_fleet(generated_at_ms: i64) -> FleetStatus {

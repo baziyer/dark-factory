@@ -13,6 +13,7 @@ use crate::model::{
 };
 use crate::mouse::{HitMap, Target};
 use crate::ui::{self, centered_rect, render_tabs};
+use factoryctl::managed_update::UpdateProgress;
 
 fn connection_badge(board: &Board) -> Span<'static> {
     match board.connection {
@@ -44,14 +45,35 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         if typing { TYPING_ESCAPE } else { "" }
     );
     let controls_width = u16::try_from(controls.len()).unwrap_or(u16::MAX);
+    let update_label = board.update_progress.map_or_else(
+        || {
+            board
+                .update_available
+                .as_ref()
+                .map(|version| format!("[u update v{version}]"))
+        },
+        |progress| Some(progress_label(progress)),
+    );
     let tabs_width = TABS_WIDTH.min(area.width);
     let remaining = area.width.saturating_sub(tabs_width);
     let controls_width = controls_width.min(remaining);
-    let status_width = remaining.saturating_sub(controls_width);
+    let update_width = update_label
+        .as_ref()
+        .map_or(0, |label| u16::try_from(label.len()).unwrap_or(u16::MAX))
+        .min(remaining.saturating_sub(controls_width));
+    let status_width = remaining
+        .saturating_sub(controls_width)
+        .saturating_sub(update_width);
     let tabs_area = Rect::new(area.x, area.y, tabs_width, 1);
     let status_area = Rect::new(area.x.saturating_add(tabs_width), area.y, status_width, 1);
-    let controls_area = Rect::new(
+    let update_area = Rect::new(
         status_area.x.saturating_add(status_width),
+        area.y,
+        update_width,
+        1,
+    );
+    let controls_area = Rect::new(
+        update_area.x.saturating_add(update_width),
         area.y,
         controls_width,
         1,
@@ -98,13 +120,20 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
             ));
         }
     }
-    if let Some(version) = &board.update_available {
-        spans.push(Span::styled(
-            format!("  update v{version} available: factoryctl update --install"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+    if let Some(label) = update_label {
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(if board.update_progress.is_some() {
+                Color::Cyan
+            } else {
+                Color::Yellow
+            })),
+            update_area,
+        );
+        if board.update_progress.is_none() {
+            hits.add(update_area, Target::Update);
+        }
+    }
     frame.render_widget(
         Paragraph::new(controls.clone()).style(Style::default().fg(Color::Cyan)),
         controls_area,
@@ -136,6 +165,19 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
             ),
             Target::Detach,
         );
+    }
+}
+
+fn progress_label(progress: UpdateProgress) -> String {
+    match progress {
+        UpdateProgress::Checking => "update: checking".to_owned(),
+        UpdateProgress::Downloading => "update: downloading".to_owned(),
+        UpdateProgress::Verifying => "update: verifying".to_owned(),
+        UpdateProgress::Unpacking => "update: unpacking".to_owned(),
+        UpdateProgress::Activating => "update: activating".to_owned(),
+        UpdateProgress::Reloading => "update: reloading".to_owned(),
+        UpdateProgress::CheckingHealth => "update: health check".to_owned(),
+        UpdateProgress::RollingBack => "update: rolling back".to_owned(),
     }
 }
 
@@ -320,6 +362,7 @@ const HELP_TEXT: &[&str] = &[
     "Ctrl-]     return terminal input to BOARD mode",
     "z          maximise/restore terminal     PgUp/PgDn scroll",
     "mouse      click tabs/rows/pane; wheel scrolls terminal history",
+    "u          install the shown update and relaunch this viewer",
     "Space      pause/resume agent            t manage active task",
     "I / M      edit instructions.md / memory.md in $EDITOR",
     "q          detach (quits the client only — never stops the factory)",
@@ -345,4 +388,61 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
     let lines: Vec<Line> = HELP_TEXT.iter().map(|line| Line::from(*line)).collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn update_mouse_target_is_exactly_where_the_label_is_drawn() {
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        board.update_available = Some("0.2.6".to_owned());
+        let mut hits = HitMap::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let start = text
+            .find("[u update v0.2.6]")
+            .expect("visible update label");
+        let start = u16::try_from(start).unwrap();
+        assert_eq!(hits.target_at(start, 0), Some(Target::Update));
+        assert_eq!(hits.target_at(start + 16, 0), Some(Target::Update));
+        assert_ne!(
+            hits.target_at(start.saturating_sub(1), 0),
+            Some(Target::Update)
+        );
+    }
+
+    #[test]
+    fn progress_replaces_the_action_and_cannot_be_clicked() {
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        board.update_available = Some("0.2.6".to_owned());
+        board.update_progress = Some(UpdateProgress::Verifying);
+        let mut hits = HitMap::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("update: verifying"));
+        assert!((0..100).all(|column| hits.target_at(column, 0) != Some(Target::Update)));
+    }
 }

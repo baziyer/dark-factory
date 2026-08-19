@@ -90,6 +90,8 @@ pub enum Action {
     EditModel,
     EditPermission,
     EditCapacity,
+    /// `u`: run the visible verified update once.
+    Update,
     /// `PgUp`/`PgDn`: AGENT terminal scrollback.
     ScrollUp,
     ScrollDown,
@@ -126,6 +128,7 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('v') => Some(Action::EditModel),
         KeyCode::Char('a') => Some(Action::EditPermission),
         KeyCode::Char('C') => Some(Action::EditCapacity),
+        KeyCode::Char('u') => Some(Action::Update),
         KeyCode::PageUp => Some(Action::ScrollUp),
         KeyCode::PageDown => Some(Action::ScrollDown),
         _ => None,
@@ -325,6 +328,7 @@ pub enum Intent {
     Quit,
     Send(LocalRequest),
     SetCapacity(usize),
+    Update,
     /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
     /// `main.rs` encodes and forwards to whichever pane is currently focused.
     ForwardKey(KeyEvent),
@@ -382,6 +386,7 @@ impl Board {
             MouseTarget::View(View::Agent) => self.open_agent(),
             MouseTarget::Help => self.dispatch(Action::ToggleHelp),
             MouseTarget::Detach => self.dispatch(Action::Detach),
+            MouseTarget::Update => self.dispatch(Action::Update),
             MouseTarget::Agent(agent_id) => {
                 if self.select_agent(agent_id) {
                     Intent::Redraw
@@ -489,6 +494,15 @@ impl Board {
             Action::EditModel => self.begin_profile_edit(false),
             Action::EditPermission => self.begin_profile_edit(true),
             Action::EditCapacity => self.begin_capacity_edit(),
+            Action::Update => {
+                if self.update_available.is_some() && self.update_progress.is_none() {
+                    self.update_progress =
+                        Some(factoryctl::managed_update::UpdateProgress::Checking);
+                    Intent::Update
+                } else {
+                    Intent::None
+                }
+            }
             Action::ScrollUp if self.view == View::Agent => Intent::ScrollFocus { up: true },
             Action::ScrollDown if self.view == View::Agent => Intent::ScrollFocus { up: false },
             Action::ScrollUp | Action::ScrollDown => Intent::None,
@@ -2049,6 +2063,31 @@ mod tests {
         ));
         assert!(mouse.quit);
         assert_eq!(mouse.quit, keyboard.quit);
+    }
+
+    #[test]
+    fn update_keyboard_and_mouse_share_one_exact_once_guard() {
+        let mut keyboard = board();
+        keyboard.update_available = Some("0.2.6".to_owned());
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('u'))),
+            Intent::Update
+        ));
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('u'))),
+            Intent::None
+        ));
+
+        let mut mouse = board();
+        mouse.update_available = Some("0.2.6".to_owned());
+        assert!(matches!(
+            mouse.handle_mouse_target(MouseTarget::Update),
+            Intent::Update
+        ));
+        assert!(matches!(
+            mouse.handle_mouse_target(MouseTarget::Update),
+            Intent::None
+        ));
     }
 
     #[test]

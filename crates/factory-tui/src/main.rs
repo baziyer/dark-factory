@@ -22,8 +22,12 @@ mod theme;
 mod ui;
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +56,7 @@ struct Config {
     dev_local_pty: bool,
     debug_log: Option<PathBuf>,
     theme: theme::Theme,
+    resume: Option<client_state::RelaunchState>,
 }
 
 struct ContextRefresh {
@@ -102,6 +107,7 @@ fn parse_args() -> Config {
     let mut dev_local_pty = false;
     let mut debug_log = None;
     let mut theme = theme::FORTRESS;
+    let mut resume = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -110,6 +116,18 @@ fn parse_args() -> Config {
             "--project" => project = args.next(),
             "--dev-local-pty" => dev_local_pty = true,
             "--debug-log" => debug_log = args.next().map(PathBuf::from),
+            "--resume-state" => {
+                let value = args.next().unwrap_or_else(|| {
+                    eprintln!("factory-tui: --resume-state requires a value");
+                    std::process::exit(2);
+                });
+                resume = Some(
+                    client_state::decode_relaunch(&value).unwrap_or_else(|error| {
+                        eprintln!("factory-tui: {error}");
+                        std::process::exit(2);
+                    }),
+                );
+            }
             "--theme" => {
                 let Some(name) = args.next() else {
                     eprintln!("factory-tui: --theme requires a value (fortress|plain)\n");
@@ -145,6 +163,7 @@ fn parse_args() -> Config {
         dev_local_pty,
         debug_log,
         theme,
+        resume,
     }
 }
 
@@ -187,11 +206,150 @@ fn restore_terminal() {
     );
 }
 
+fn enter_terminal() {
+    let _ = enable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture,
+        cursor::Hide
+    );
+}
+
 fn now_ms() -> i64 {
     factoryctl::update::now_ms()
 }
 
+fn base_relaunch_args(args: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    let mut output = Vec::new();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        if argument == OsStr::new("--resume-state") {
+            let _ = args.next();
+        } else {
+            output.push(argument);
+        }
+    }
+    output
+}
+
+fn apply_relaunch_state(board: &mut Board, state: &client_state::RelaunchState) {
+    if let Some(project_id) = &state.focused_project
+        && board
+            .projects
+            .iter()
+            .any(|project| &project.id == project_id)
+    {
+        board.focus_project(project_id.clone());
+    }
+    if let Some(agent_id) = &state.selected_agent
+        && board.agents.contains_key(agent_id)
+    {
+        board.selected_agent = Some(agent_id.clone());
+    }
+    board.view = if state.agent_view && board.selected_agent.is_some() {
+        model::View::Agent
+    } else {
+        model::View::Building
+    };
+    board.pane_mode = model::PaneMode::Board;
+    board.terminal_maximized = state.terminal_maximized && board.view == model::View::Agent;
+}
+
+fn relaunch_arguments(board: &Board, original: &[OsString]) -> Result<Vec<OsString>, String> {
+    let state = client_state::RelaunchState {
+        focused_project: board.focused_project.clone(),
+        selected_agent: board.selected_agent.clone(),
+        agent_view: board.view == model::View::Agent,
+        terminal_maximized: board.terminal_maximized,
+    };
+    let mut arguments = original.to_vec();
+    arguments.push(OsString::from("--resume-state"));
+    arguments.push(OsString::from(client_state::encode_relaunch(&state)?));
+    Ok(arguments)
+}
+
+fn active_tui_path(version: &str) -> Result<PathBuf, String> {
+    let home = factory_core::paths::dark_factory_home().map_err(|error| error.to_string())?;
+    let active = factoryctl::update::active_version(&home)?;
+    if active.as_deref() != Some(version) {
+        return Err(format!(
+            "active runtime changed before relaunch (expected {version}, found {})",
+            active.as_deref().unwrap_or("none")
+        ));
+    }
+    let executable = home.join("bin/current/factory-tui");
+    let metadata = std::fs::metadata(&executable)
+        .map_err(|error| format!("cannot inspect {}: {error}", executable.display()))?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(format!(
+            "{} is not an executable file",
+            executable.display()
+        ));
+    }
+    Ok(executable)
+}
+
+fn finish_update(
+    outcome: factoryctl::managed_update::InstalledUpdate,
+    board: &mut Board,
+    panes: &mut PaneMap,
+    original_args: &[OsString],
+) {
+    let preparation = active_tui_path(&outcome.version).and_then(|executable| {
+        relaunch_arguments(board, original_args).map(|args| (executable, args))
+    });
+    let (executable, arguments) = match preparation {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            rollback_failed_relaunch(
+                outcome,
+                board,
+                format!("relaunch preparation failed: {error}"),
+            );
+            return;
+        }
+    };
+
+    for (_, mut pane) in panes.drain() {
+        pane.kill();
+    }
+    restore_terminal();
+    let exec_error = Command::new(&executable).args(&arguments).exec();
+    enter_terminal();
+    rollback_failed_relaunch(
+        outcome,
+        board,
+        format!("could not exec {}: {exec_error}", executable.display()),
+    );
+}
+
+fn rollback_failed_relaunch(
+    outcome: factoryctl::managed_update::InstalledUpdate,
+    board: &mut Board,
+    seam_error: String,
+) {
+    board.update_progress = Some(factoryctl::managed_update::UpdateProgress::RollingBack);
+    let message = reexec_failure_message(seam_error, || {
+        outcome.rollback_after_reexec_failure(&mut |_| {})
+    });
+    board.update_progress = None;
+    board.note_error(message);
+}
+
+fn reexec_failure_message(
+    seam_error: String,
+    rollback: impl FnOnce() -> Result<(), String>,
+) -> String {
+    match rollback() {
+        Ok(()) => format!("{seam_error}; previous runtime restored"),
+        Err(error) => format!("{seam_error}; rollback failed: {error}"),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    let relaunch_args = base_relaunch_args(std::env::args_os().skip(1));
     let config = parse_args();
 
     let default_panic_hook = std::panic::take_hook();
@@ -255,6 +413,8 @@ fn main() -> anyhow::Result<()> {
         remember_focus,
         &mut panes,
         config.debug_log.as_deref(),
+        config.resume,
+        &relaunch_args,
     )?;
 
     for (_, mut pane) in panes {
@@ -276,6 +436,8 @@ fn run(
     remember_focus: bool,
     panes: &mut PaneMap,
     debug_log: Option<&std::path::Path>,
+    resume: Option<client_state::RelaunchState>,
+    relaunch_args: &[OsString],
 ) -> anyhow::Result<()> {
     // Not a busy-poll: `event::poll` blocks (efficiently, via the OS) for up to `tick` with ~0
     // CPU when idle. This cadence is how the board notices net-thread messages and ticks elapsed
@@ -332,11 +494,25 @@ fn run(
             if matches!(&msg, NetMsg::ConnectionLive) {
                 context_refresh.force = true;
             }
+            if let NetMsg::UpdateFinished(result) = msg {
+                match result {
+                    Ok(outcome) => finish_update(outcome, board, panes, relaunch_args),
+                    Err(error) => {
+                        board.update_progress = None;
+                        board.note_error(format!(
+                            "update failed; current TUI remains usable: {error}"
+                        ));
+                    }
+                }
+                needs_redraw = true;
+                continue;
+            }
             apply_net_msg(
                 msg,
                 board,
                 initial_project.as_ref(),
                 &mut initial_project_applied,
+                resume.as_ref(),
             );
             needs_redraw = true;
         }
@@ -697,6 +873,14 @@ fn apply_intent(
             net::spawn_capacity_update(socket.to_owned(), tx.clone(), capacity);
             true
         }
+        Intent::Update => {
+            let Some(check) = board.update_check.clone() else {
+                board.note_error("update details are unavailable; wait for the next check");
+                return true;
+            };
+            net::spawn_update_install(socket.to_owned(), tx.clone(), check);
+            true
+        }
         Intent::ForwardKey(key) => {
             if let Some(pane) = forwarding_pane(board, panes) {
                 let bytes = keys::encode_key(key, pane.key_context());
@@ -757,6 +941,7 @@ fn apply_net_msg(
     board: &mut Board,
     initial_project: Option<&factory_core::ProjectId>,
     initial_project_applied: &mut bool,
+    resume: Option<&client_state::RelaunchState>,
 ) {
     match msg {
         NetMsg::ConnectionRetrying(detail) => board.set_retrying(detail),
@@ -782,6 +967,9 @@ fn apply_net_msg(
                 if let Some(project_id) = initial_project {
                     board.focus_project(project_id.clone());
                 }
+                if let Some(resume) = resume {
+                    apply_relaunch_state(board, resume);
+                }
                 *initial_project_applied = true;
             }
         }
@@ -799,17 +987,22 @@ fn apply_net_msg(
         NetMsg::UpdateCheck {
             check,
             active_version,
-        } => match active_version {
-            Ok(active_version) => {
-                board.update_available = check
-                    .available_from(active_version.as_deref().unwrap_or(&check.current))
-                    .map(|manifest| manifest.version.clone());
+        } => {
+            board.update_check = Some(check.clone());
+            match active_version {
+                Ok(active_version) => {
+                    board.update_available =
+                        net::manual_update_candidate(&check, active_version.as_deref())
+                            .map(|manifest| manifest.version.clone());
+                }
+                Err(error) => {
+                    board.update_available = None;
+                    board.note_error(format!("update check: {error}"));
+                }
             }
-            Err(error) => {
-                board.update_available = None;
-                board.note_error(format!("update check: {error}"));
-            }
-        },
+        }
+        NetMsg::UpdateProgress(progress) => board.update_progress = Some(progress),
+        NetMsg::UpdateFinished(_) => unreachable!("handled by the event loop"),
         NetMsg::FleetStatus(status) => board.apply_fleet_status(status),
     }
 }
@@ -910,9 +1103,83 @@ mod main_tests {
             &mut board,
             None,
             &mut initial_project_applied,
+            None,
         );
 
         assert_eq!(board.update_available.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn relaunch_arguments_replace_old_state_and_restore_current_navigation() {
+        let base = base_relaunch_args([
+            OsString::from("--socket"),
+            OsString::from("/tmp/f.sock"),
+            OsString::from("--resume-state"),
+            OsString::from("old"),
+            OsString::from("--theme"),
+            OsString::from("plain"),
+        ]);
+        assert_eq!(
+            base,
+            ["--socket", "/tmp/f.sock", "--theme", "plain"].map(OsString::from)
+        );
+
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        board.focused_project = Some(factory_core::ProjectId::try_from("proj").unwrap());
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        board.view = model::View::Agent;
+        board.terminal_maximized = true;
+        let args = relaunch_arguments(&board, &base).unwrap();
+        let encoded = args.last().unwrap().to_str().unwrap();
+        let state = client_state::decode_relaunch(encoded).unwrap();
+        assert!(state.agent_view);
+        assert!(state.terminal_maximized);
+        assert_eq!(state.focused_project.unwrap().as_str(), "proj");
+        assert_eq!(state.selected_agent.unwrap().as_str(), "alice");
+    }
+
+    #[test]
+    fn relaunch_state_is_applied_only_after_ids_exist_in_the_snapshot() {
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        let project = project("proj", 0);
+        let worker = agent("alice", "proj", AgentRole::Worker, None);
+        board.apply_fleet_snapshot_at(
+            vec![project],
+            vec![worker],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            1,
+        );
+        let state = client_state::RelaunchState {
+            focused_project: Some(factory_core::ProjectId::try_from("proj").unwrap()),
+            selected_agent: Some(factory_core::AgentId::try_from("alice").unwrap()),
+            agent_view: true,
+            terminal_maximized: true,
+        };
+        apply_relaunch_state(&mut board, &state);
+        assert_eq!(board.view, model::View::Agent);
+        assert_eq!(board.selected_agent.unwrap().as_str(), "alice");
+        assert!(board.terminal_maximized);
+        assert_eq!(board.pane_mode, model::PaneMode::Board);
+    }
+
+    #[test]
+    fn fake_exec_failure_always_runs_rollback_and_reports_its_result() {
+        let called = std::cell::Cell::new(false);
+        let message = reexec_failure_message("exec failed".to_owned(), || {
+            called.set(true);
+            Ok(())
+        });
+        assert!(called.get());
+        assert_eq!(message, "exec failed; previous runtime restored");
+        let message = reexec_failure_message("exec failed".to_owned(), || {
+            Err("old daemon unhealthy".to_owned())
+        });
+        assert_eq!(
+            message,
+            "exec failed; rollback failed: old daemon unhealthy"
+        );
     }
 
     #[test]
@@ -931,6 +1198,7 @@ mod main_tests {
             &mut board,
             None,
             &mut initial_project_applied,
+            None,
         );
         apply_net_msg(
             NetMsg::FleetStatus(factory_core::status::FleetStatus {
@@ -951,6 +1219,7 @@ mod main_tests {
             &mut board,
             None,
             &mut initial_project_applied,
+            None,
         );
         assert!(board.attention_items().is_empty());
     }
@@ -978,6 +1247,7 @@ mod main_tests {
             &mut board,
             None,
             &mut initial_project_applied,
+            None,
         );
         assert_eq!(board.attention_items().len(), 1);
         apply_net_msg(
@@ -992,6 +1262,7 @@ mod main_tests {
             &mut board,
             None,
             &mut initial_project_applied,
+            None,
         );
         assert!(board.attention_items().is_empty());
     }
