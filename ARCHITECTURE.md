@@ -131,7 +131,20 @@ catalogue.
    normalized into `factory_core::ProviderHookEvent`), never by decoding raw
    terminal bytes; the local control API may still expose or attach live to
    a session's retained `terminal.log` for operator inspection — none of
-   this enters public events, webhook snapshots, or tracing.
+   this enters public events, webhook snapshots, or tracing. Terminal
+   attachment is a negotiated daemon/runner operation, never a client-side
+   read of `terminal.log`. The default `factoryctl attach` and TUI pane
+   request a bounded 256 KiB tail and receive retained generation plus byte
+   bounds before raw PTY frames. `--full-history` (or explicit
+   `--since-offset 0`) replays all bytes still retained; `--since-offset N
+   --generation G` resumes a negotiated cursor. A cursor beyond the live end
+   or outside retained generations is a structured gap containing the current
+   generation and valid offset range, so recovery is actionable rather than a
+   blank pane. Frames remain opaque base64 bytes, bounded to the runner frame
+   limit, preserving UTF-8 and ANSI bytes without interpreting provider
+   output. `Legacy` remains available for rolling upgrades: an older
+   daemon/runner can serve old offset semantics, while an upgraded pair
+   provides the bounded contract.
    Carve-out: Codex 0.147 does not dispatch its own `SessionStart` hook at
    TUI startup — only once its first turn begins, which the daemon cannot
    wait for without deadlocking every fresh Codex session (`docs/

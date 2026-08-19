@@ -15,7 +15,7 @@ use std::{
 use factory_core::{
     AgentId, ProjectId, SessionId,
     local::{LocalRequest, LocalResponse, ServerFrame},
-    runner::{decode_terminal_bytes, encode_terminal_bytes},
+    runner::{TerminalAttachMode, decode_terminal_bytes, encode_terminal_bytes},
 };
 use factoryctl::Client;
 use rustix::termios::{self, OptionalActions, Termios};
@@ -49,7 +49,7 @@ pub fn run(
     client: &Client,
     project_id: &str,
     target: &AttachTarget,
-    since_offset: u64,
+    mode: TerminalAttachMode,
 ) -> Result<i32, String> {
     let project_id = ProjectId::try_from(project_id.to_owned())
         .map_err(|error| format!("invalid project ID: {error}"))?;
@@ -63,7 +63,8 @@ pub fn run(
         .attach_terminal(LocalRequest::AttachTerminal {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
-            since_offset,
+            since_offset: 0,
+            mode,
         })
         .map_err(|error| error.to_string())?;
 
@@ -119,6 +120,23 @@ fn spawn_output_thread(
                     set_failure(&failure, message);
                     break;
                 }
+                Ok(ServerFrame::TerminalAttachGap {
+                    generation,
+                    base_offset,
+                    end_offset,
+                    requested_offset,
+                    reason,
+                    ..
+                }) => {
+                    set_failure(
+                        &failure,
+                        format!(
+                            "attach cursor unavailable: {reason}; retry from retained offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation})"
+                        ),
+                    );
+                    break;
+                }
+                Ok(ServerFrame::TerminalAttachReady { .. }) => {}
                 Ok(_) => {}
                 Err(error) => {
                     set_failure(&failure, error.to_string());
@@ -143,23 +161,33 @@ fn forward_stdin(
     failed: &AtomicBool,
 ) -> i32 {
     let mut stdin = std::io::stdin();
+    forward_stdin_from(&mut stdin, failed, |bytes| {
+        send_input(client, project_id, session_id, bytes);
+    })
+}
+
+fn forward_stdin_from(
+    reader: &mut impl Read,
+    failed: &AtomicBool,
+    mut send: impl FnMut(&[u8]),
+) -> i32 {
     let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
         if failed.load(Ordering::SeqCst) {
             return 2;
         }
-        let read = match stdin.read(&mut buffer) {
+        let read = match reader.read(&mut buffer) {
             Ok(0) | Err(_) => return 0,
             Ok(read) => read,
         };
         let chunk = &buffer[..read];
         if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
             if detach_at > 0 {
-                send_input(client, project_id, session_id, &chunk[..detach_at]);
+                send(&chunk[..detach_at]);
             }
             return 0;
         }
-        send_input(client, project_id, session_id, chunk);
+        send(chunk);
     }
 }
 
@@ -271,5 +299,38 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         let stdin = std::io::stdin();
         let _ = termios::tcsetattr(&stdin, OptionalActions::Flush, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forward_stdin_from;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn ctrl_right_bracket_detaches_without_forwarding_following_bytes() {
+        let mut input = Cursor::new(b"before\x1dafter".to_vec());
+        let failed = AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        let exit = forward_stdin_from(&mut input, &failed, |bytes| {
+            forwarded.extend_from_slice(bytes);
+        });
+
+        assert_eq!(exit, 0);
+        assert_eq!(forwarded, b"before");
+    }
+
+    #[test]
+    fn ctrl_c_is_forwarded_as_ordinary_pty_input() {
+        let mut input = Cursor::new(b"before\x03after".to_vec());
+        let failed = AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        let exit = forward_stdin_from(&mut input, &failed, |bytes| {
+            forwarded.extend_from_slice(bytes);
+        });
+
+        assert_eq!(exit, 0);
+        assert_eq!(forwarded, b"before\x03after");
     }
 }

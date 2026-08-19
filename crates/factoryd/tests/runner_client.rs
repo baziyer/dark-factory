@@ -676,14 +676,20 @@ async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_
 async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
     let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-output");
     let fake = fake_runner(vec![vec![encoded(terminal_output(7, &bytes))]]).await;
-    let mut subscription = client(&fake.runtime_dir).attach_terminal(7).await.unwrap();
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(7, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
     assert_eq!(subscription.next_chunk().await.unwrap(), (7, bytes));
     assert_eq!(
         fake.requests.await.unwrap(),
         vec![RequestEnvelope::new(
             run_id(),
             instance_id(),
-            RunnerRequest::AttachTerminal { since_offset: 7 }
+            RunnerRequest::AttachTerminal {
+                since_offset: 7,
+                mode: factory_core::runner::TerminalAttachMode::Legacy,
+            }
         )]
     );
 }
@@ -711,7 +717,10 @@ async fn silent_old_v1_runner_has_a_bounded_fallback_without_losing_later_output
     });
 
     let started = tokio::time::Instant::now();
-    let mut subscription = client(&runtime_dir).attach_terminal(0).await.unwrap();
+    let mut subscription = client(&runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
     assert!(
         started.elapsed() < Duration::from_millis(350),
         "legacy silent attach stayed blocked"

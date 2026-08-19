@@ -138,12 +138,10 @@ impl Pane {
         })
     }
 
-    /// Attaches to a live daemon-proxied session over the wire contract: opens
-    /// `AttachTerminal { since_offset: 0 }` on a dedicated connection (see `attach.rs` for why not
-    /// the multiplexed one), replays the retained log, then streams live bytes into the same
-    /// `vt100::Parser` a local-PTY pane would use. Reattach is identical — always from offset 0,
-    /// letting the retained log rebuild the correct current screen (per the wire contract: "no
-    /// partial resume in this client").
+    /// Attaches to a live daemon-proxied session over the shared bounded-tail
+    /// contract on a dedicated connection (see `attach.rs` for why not the
+    /// multiplexed one), then streams bytes into the same `vt100::Parser` a
+    /// local-PTY pane would use.
     pub fn attach(
         socket: PathBuf,
         project_id: ProjectId,
@@ -158,6 +156,7 @@ impl Pane {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
                 since_offset: 0,
+                mode: factory_core::runner::TerminalAttachMode::Tail,
             },
         )?;
 
@@ -474,6 +473,22 @@ fn spawn_attach_reader_thread(
                         }
                     }
                 },
+                ServerFrame::TerminalAttachReady { .. } => {}
+                ServerFrame::TerminalAttachGap {
+                    generation,
+                    base_offset,
+                    end_offset,
+                    requested_offset,
+                    reason,
+                    ..
+                } => {
+                    if let Ok(mut guard) = attach_error.lock() {
+                        *guard = Some(format!(
+                            "attach cursor unavailable: {reason}; retained offsets {base_offset}..{end_offset}, requested {requested_offset}, generation {generation}"
+                        ));
+                    }
+                    return false;
+                }
                 ServerFrame::Response { response, .. } => {
                     if let factory_core::local::LocalResponse::Error { message, .. } = response {
                         if let Ok(mut guard) = attach_error.lock() {

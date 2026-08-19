@@ -19,12 +19,12 @@ use std::{
 use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
-        MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES,
-        MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES, MAX_TERMINAL_INPUT_BYTES,
-        MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES, OutputStream,
-        RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
-        RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalSize, decode_terminal_bytes,
-        encode_terminal_bytes,
+        DEFAULT_TERMINAL_ATTACH_TAIL_BYTES, MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES,
+        MAX_RUNNER_OUTPUT_TEXT_BYTES, MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES,
+        MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES,
+        OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
+        RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode, TerminalSize,
+        decode_terminal_bytes, encode_terminal_bytes,
     },
 };
 use nix::sys::termios::LocalFlags;
@@ -389,11 +389,12 @@ struct TerminalLog {
 
 struct TerminalLogInner {
     active_file: File,
+    generation: u64,
     active_start_offset: u64,
     active_len: u64,
     /// Start offset and length of `terminal.log.1`, the previous rotation,
     /// when one exists.
-    previous: Option<(u64, u64)>,
+    previous: Option<(u64, u64, u64)>,
 }
 
 impl TerminalLogInner {
@@ -403,7 +404,7 @@ impl TerminalLogInner {
 
     const fn oldest_retained_offset(&self) -> u64 {
         match self.previous {
-            Some((start, _)) => start,
+            Some((_, start, _)) => start,
             None => self.active_start_offset,
         }
     }
@@ -417,10 +418,11 @@ struct TerminalChunk {
 
 #[derive(Clone, Copy)]
 struct TerminalSnapshot {
+    generation: u64,
     total_bytes: u64,
     oldest_retained_offset: u64,
     active_start_offset: u64,
-    previous: Option<(u64, u64)>,
+    previous: Option<(u64, u64, u64)>,
 }
 
 impl TerminalLog {
@@ -431,6 +433,7 @@ impl TerminalLog {
             max_bytes: max_bytes.max(1),
             inner: Mutex::new(TerminalLogInner {
                 active_file,
+                generation: 0,
                 active_start_offset: 0,
                 active_len: 0,
                 previous: None,
@@ -446,6 +449,7 @@ impl TerminalLog {
     async fn snapshot(&self) -> TerminalSnapshot {
         let inner = self.inner.lock().await;
         TerminalSnapshot {
+            generation: inner.generation,
             total_bytes: inner.total_bytes(),
             oldest_retained_offset: inner.oldest_retained_offset(),
             active_start_offset: inner.active_start_offset,
@@ -497,7 +501,12 @@ impl TerminalLog {
             .mode(0o600)
             .open(&active_path)
             .await?;
-        inner.previous = Some((inner.active_start_offset, inner.active_len));
+        inner.previous = Some((
+            inner.generation,
+            inner.active_start_offset,
+            inner.active_len,
+        ));
+        inner.generation += 1;
         inner.active_start_offset += inner.active_len;
         inner.active_len = 0;
         inner.active_file = fresh;
@@ -522,7 +531,7 @@ impl TerminalLog {
         through: u64,
     ) -> Result<(), Error> {
         let mut cursor = from;
-        if let Some((start, len)) = snapshot.previous {
+        if let Some((_, start, len)) = snapshot.previous {
             cursor = self
                 .replay_file(
                     write,
@@ -1082,7 +1091,7 @@ async fn handle_connection(
             let _ = state.shutdown_tx.send(true);
             result
         }
-        RunnerRequest::AttachTerminal { since_offset } => {
+        RunnerRequest::AttachTerminal { since_offset, mode } => {
             let Some(terminal_log) = state.terminal_log.as_ref() else {
                 return send_control_error(
                     &mut write_half,
@@ -1093,7 +1102,8 @@ async fn handle_connection(
                 )
                 .await;
             };
-            attach_terminal_connection(&mut write_half, terminal_log, shutdown, since_offset).await
+            attach_terminal_connection(&mut write_half, terminal_log, shutdown, since_offset, mode)
+                .await
         }
         RunnerRequest::TerminalInput { bytes } => {
             let Some(terminal_tx) = state.terminal_tx.clone() else {
@@ -1327,31 +1337,84 @@ async fn attach_terminal_connection(
     terminal_log: &TerminalLog,
     mut shutdown: watch::Receiver<bool>,
     since_offset: u64,
+    mode: TerminalAttachMode,
 ) -> Result<(), Error> {
     let mut chunks = terminal_log.subscribe();
     let snapshot = terminal_log.snapshot().await;
-    if since_offset > snapshot.total_bytes {
+    let explicit = !matches!(mode, TerminalAttachMode::Legacy);
+    let (from, requested_generation) = match mode {
+        TerminalAttachMode::Legacy => (since_offset, None),
+        TerminalAttachMode::Tail => (
+            snapshot
+                .total_bytes
+                .saturating_sub(DEFAULT_TERMINAL_ATTACH_TAIL_BYTES)
+                .max(snapshot.oldest_retained_offset),
+            None,
+        ),
+        TerminalAttachMode::FullHistory => (snapshot.oldest_retained_offset, None),
+        TerminalAttachMode::Offset { generation, offset } => (offset, generation),
+    };
+    let generation_valid = requested_generation.is_none_or(|generation| {
+        generation == snapshot.generation
+            && from >= snapshot.active_start_offset
+            && from <= snapshot.total_bytes
+            || snapshot
+                .previous
+                .is_some_and(|(previous_generation, start, len)| {
+                    generation == previous_generation && from >= start && from <= start + len
+                })
+    });
+    if !generation_valid || from > snapshot.total_bytes || from < snapshot.oldest_retained_offset {
+        if explicit {
+            send_frame(
+                write,
+                &RunnerFrame::TerminalAttachGap {
+                    protocol_version: RUNNER_PROTOCOL_VERSION,
+                    generation: snapshot.generation,
+                    base_offset: snapshot.oldest_retained_offset,
+                    end_offset: snapshot.total_bytes,
+                    requested_generation,
+                    requested_offset: from,
+                    reason: if from > snapshot.total_bytes {
+                        "requested offset is beyond the live end"
+                    } else if !generation_valid {
+                        "requested generation is no longer retained"
+                    } else {
+                        "requested offset was compacted from the retained window"
+                    }
+                    .into(),
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         return send_control_error(
             write,
             ControlError::new(
                 RunnerErrorCode::InvalidRequest,
-                "terminal offset is ahead of the live head",
+                if from > snapshot.total_bytes {
+                    "terminal offset is ahead of the live head"
+                } else {
+                    "terminal offset has been rotated out of the retained window"
+                },
             ),
         )
         .await;
     }
-    if since_offset < snapshot.oldest_retained_offset {
-        return send_control_error(
+    if explicit {
+        send_frame(
             write,
-            ControlError::new(
-                RunnerErrorCode::InvalidRequest,
-                "terminal offset has been rotated out of the retained window",
-            ),
+            &RunnerFrame::TerminalAttachReady {
+                protocol_version: RUNNER_PROTOCOL_VERSION,
+                generation: snapshot.generation,
+                base_offset: snapshot.oldest_retained_offset,
+                end_offset: snapshot.total_bytes,
+            },
         )
-        .await;
+        .await?;
     }
     terminal_log
-        .replay(write, snapshot, since_offset, snapshot.total_bytes)
+        .replay(write, snapshot, from, snapshot.total_bytes)
         .await?;
     // A v1-compatible readiness boundary: old clients already understand
     // TerminalOutput, and zero bytes do not alter their parser state.
@@ -2269,17 +2332,23 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         Config, DecodedChunk, Error, MAX_STARTUP_STDIN_BYTES, TERMINAL_LOG_FILE,
-        TERMINAL_LOG_ROTATED_FILE, TerminalLog, decode_available, validate_config,
+        TERMINAL_LOG_ROTATED_FILE, TerminalLog, attach_terminal_connection, decode_available,
+        validate_config,
     };
     use factory_core::{
         RunId, RunnerInstanceId,
-        runner::{MAX_RUNNER_OUTPUT_TEXT_BYTES, RunnerFrame, decode_terminal_bytes},
+        runner::{
+            DEFAULT_TERMINAL_ATTACH_TAIL_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES,
+            MAX_TERMINAL_OUTPUT_CHUNK_BYTES, RunnerFrame, TerminalAttachMode,
+            decode_terminal_bytes,
+        },
     };
     use std::os::unix::fs::OpenOptionsExt as _;
     use tokio::{
         fs::File,
         io::{AsyncBufReadExt, BufReader},
         net::UnixStream,
+        sync::watch,
     };
 
     #[test]
@@ -2380,7 +2449,7 @@ mod tests {
             "the first generation was dropped"
         );
         assert_eq!(snapshot.active_start_offset, 8);
-        assert_eq!(snapshot.previous, Some((4, 4)));
+        assert_eq!(snapshot.previous, Some((1, 4, 4)));
         assert_eq!(
             std::fs::read(directory.path().join(TERMINAL_LOG_ROTATED_FILE)).unwrap(),
             b"EFGH"
@@ -2419,5 +2488,128 @@ mod tests {
             line.clear();
         }
         assert_eq!(collected, b"EFGHIJKL");
+    }
+
+    async fn attach_frames(
+        log: std::sync::Arc<TerminalLog>,
+        mode: TerminalAttachMode,
+    ) -> Vec<RunnerFrame> {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_, mut write) = server.into_split();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            attach_terminal_connection(&mut write, &log, shutdown_rx, 0, mode)
+                .await
+                .unwrap();
+        });
+        let mut reader = BufReader::new(client);
+        let mut frames = Vec::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.is_empty(), "attach ended before its boundary");
+            let frame: RunnerFrame = serde_json::from_str(line.trim_end()).unwrap();
+            let done = matches!(
+                frame,
+                RunnerFrame::TerminalOutput { ref bytes, .. }
+                    if bytes.is_empty()
+            ) || matches!(frame, RunnerFrame::TerminalAttachGap { .. });
+            frames.push(frame);
+            if done {
+                break;
+            }
+        }
+        let _ = shutdown_tx.send(true);
+        task.await.unwrap();
+        frames
+    }
+
+    #[tokio::test]
+    async fn bounded_tail_of_a_20mb_log_is_streamed_with_negotiated_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 64 * 1024 * 1024);
+        let mut data = vec![b'x'; 20 * 1024 * 1024];
+        let marker = "🦀\x1b[31mtail".as_bytes();
+        data[20 * 1024 * 1024 - marker.len()..].copy_from_slice(marker);
+        log.append(data).await.unwrap();
+
+        let frames = attach_frames(log, TerminalAttachMode::Tail).await;
+        let RunnerFrame::TerminalAttachReady {
+            generation,
+            base_offset,
+            end_offset,
+            ..
+        } = frames[0]
+        else {
+            panic!("bounded attach did not negotiate its retained bounds");
+        };
+        assert_eq!(generation, 0);
+        assert_eq!(end_offset - base_offset, 20 * 1024 * 1024);
+        let mut output = Vec::new();
+        for frame in &frames[1..] {
+            if let RunnerFrame::TerminalOutput { bytes, .. } = frame {
+                let bytes = decode_terminal_bytes(bytes).unwrap();
+                assert!(bytes.len() <= MAX_TERMINAL_OUTPUT_CHUNK_BYTES);
+                output.extend(bytes);
+            }
+        }
+        assert_eq!(output.len(), DEFAULT_TERMINAL_ATTACH_TAIL_BYTES as usize);
+        assert_eq!(&output[output.len() - marker.len()..], marker);
+        assert!(std::str::from_utf8(&output[output.len() - marker.len()..]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn full_history_replays_the_retained_20mb_and_stale_generation_is_actionable() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = open_terminal_log(directory.path(), 64 * 1024 * 1024);
+        log.append(vec![b'a'; 20 * 1024 * 1024]).await.unwrap();
+        let frames = attach_frames(log.clone(), TerminalAttachMode::FullHistory).await;
+        let mut output = Vec::new();
+        for frame in &frames[1..] {
+            if let RunnerFrame::TerminalOutput { bytes, .. } = frame {
+                output.extend(decode_terminal_bytes(bytes).unwrap());
+            }
+        }
+        assert_eq!(output.len(), 20 * 1024 * 1024);
+
+        let stale_directory = tempfile::tempdir().unwrap();
+        let stale_log = open_terminal_log(stale_directory.path(), 4 * 1024 * 1024);
+        stale_log
+            .append(vec![b'b'; 20 * 1024 * 1024])
+            .await
+            .unwrap();
+        let frames = attach_frames(
+            stale_log,
+            TerminalAttachMode::Offset {
+                generation: Some(0),
+                offset: 0,
+            },
+        )
+        .await;
+        assert!(matches!(
+            frames.first(),
+            Some(RunnerFrame::TerminalAttachGap {
+                reason,
+                requested_generation: Some(0),
+                ..
+            }) if reason.contains("generation")
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let head_log = open_terminal_log(directory.path(), 64 * 1024 * 1024);
+        head_log.append(b"current".to_vec()).await.unwrap();
+        let frames = attach_frames(
+            head_log,
+            TerminalAttachMode::Offset {
+                generation: Some(0),
+                offset: 999_999_999,
+            },
+        )
+        .await;
+        assert!(matches!(
+            frames.first(),
+            Some(RunnerFrame::TerminalAttachGap { reason, .. })
+                if reason.contains("beyond")
+        ));
     }
 }
