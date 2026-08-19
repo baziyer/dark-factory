@@ -151,10 +151,12 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, board: &Board) {
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
-    let (title, prompt_line) = match action {
-        PendingAction::DeleteTask(task_id) => {
-            ("delete task?".to_owned(), format!("delete task#{task_id}?"))
-        }
+    let (title, prompt_line, confirm_line) = match action {
+        PendingAction::DeleteTask(task_id) => (
+            "delete task?".to_owned(),
+            format!("delete task#{task_id}?"),
+            "y / Enter to confirm — any other key cancels",
+        ),
         PendingAction::ResetBudget { source, .. } => (
             "reset budget?".to_owned(),
             format!(
@@ -164,14 +166,18 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
                     .as_ref()
                     .map_or("this agent", factory_core::AgentId::as_str)
             ),
+            "y / Enter to confirm — any other key cancels",
         ),
         PendingAction::StopSession { session_id, .. } => (
             "stop agent?".to_owned(),
             format!("stop session {session_id}?"),
+            "y / Enter / x again to confirm — any other key cancels",
         ),
-        PendingAction::StopRun { run_id, .. } => {
-            ("stop agent?".to_owned(), format!("stop run {run_id}?"))
-        }
+        PendingAction::StopRun { run_id, .. } => (
+            "stop agent?".to_owned(),
+            format!("stop run {run_id}?"),
+            "y / Enter / x again to confirm — any other key cancels",
+        ),
     };
     let rect = centered_rect(area, 56, 5);
     frame.render_widget(Clear, rect);
@@ -183,7 +189,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
     let text = vec![
         Line::from(prompt_line),
         Line::from(""),
-        Line::from("y / Enter / x again to confirm — any other key cancels"),
+        Line::from(confirm_line),
     ];
     frame.render_widget(Paragraph::new(text), inner);
 }

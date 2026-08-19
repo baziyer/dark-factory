@@ -206,6 +206,7 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PendingAction;
     use crate::mouse::{Route, Target, route};
     use crate::test_fixtures::{agent, attention, project, session, task};
     use factory_core::{
@@ -338,6 +339,36 @@ mod tests {
         assert!(text.contains("age: 1m"));
         assert!(text.contains("safe action:"));
         assert!(text.contains("terminal typing is not an action"));
+    }
+
+    #[test]
+    fn budget_confirmation_only_advertises_the_keys_that_confirm_it() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        let source = attention(
+            AttentionReasonKind::BudgetExhausted,
+            Some("alice"),
+            None,
+            None,
+            0,
+        );
+        board.mode = Mode::Confirm(PendingAction::ResetBudget {
+            source,
+            request: factory_core::local::LocalRequest::ResetAgentBudget {
+                project_id: ProjectId::try_from("proj").unwrap(),
+                agent_id: AgentId::try_from("alice").unwrap(),
+            },
+        });
+
+        let (_, terminal) = render_frame(&board, 80, 12);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("y / Enter to confirm"));
+        assert!(!text.contains("x again"));
     }
 
     #[test]
