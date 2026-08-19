@@ -44,11 +44,12 @@ Read-only context unless a task explicitly asks you to edit them:
    reviewer is satisfied. The author never merges their own unreviewed PR.
 
    GitHub comments are published with
-   `scripts/github-comment.sh issue|pr NUMBER [BODY_FILE]`; provide literal
-   Markdown on stdin when no file is supplied. Do not put comment prose in a
-   shell argument or invoke the GitHub CLI directly from a quoted Markdown
-   command. This keeps backticks, substitutions, controls, and
-   leading options as body data and keeps the target contract narrow.
+   `scripts/github-comment.sh issue|pr NUMBER`; provide literal Markdown on
+   stdin. The helper is stdin-only, so it never opens a caller-supplied body
+   path. Do not put comment prose in a shell argument or invoke the GitHub CLI
+   directly from a quoted Markdown command. This keeps backticks,
+   substitutions, controls, and leading options as body data and keeps the
+   target contract narrow.
 3. **Remove or refactor over patch.** Every change should leave the
    codebase smaller or simpler than it found it, not just working. Delete
    dead code paths instead of leaving them unreachable; collapse

@@ -30,6 +30,8 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
+    } else if direct_github_comment(commands.as_deref().unwrap_or_default()) {
+        Some("github_comment_helper_required")
     } else if changes_capacity(commands.as_deref().unwrap_or_default()) {
         Some("capacity_operator_only")
     } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
@@ -49,6 +51,18 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
         tool_name: tool_name.to_owned(),
         denied_by,
     }
+}
+
+fn direct_github_comment(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        let Some((program, args)) = resolve_command(words) else {
+            return false;
+        };
+        program == "gh"
+            && args.len() >= 3
+            && matches!(args[0].as_str(), "issue" | "pr")
+            && args[1] == "comment"
+    })
 }
 
 fn changes_capacity(commands: &[Vec<ShellWord>]) -> bool {
@@ -527,7 +541,7 @@ mod tests {
             "git push origin :obsolete",
             "/usr/bin/git push --force origin main",
             "cd repo && git push --force origin main",
-            "scripts/github-comment.sh issue 80 comment.md\ngit push --force origin main",
+            "scripts/github-comment.sh issue 80\ngit push --force origin main",
         ] {
             assert_eq!(
                 decide(&bash(command), root).denied_by,
@@ -555,6 +569,18 @@ mod tests {
             decide(&bash("echo replacement > ~/.aws/credentials"), root).denied_by,
             Some("secret_path")
         );
+        for command in [
+            "gh issue comment 80 --body literal",
+            "gh pr comment 95 --body-file -",
+            "env gh issue comment 80 --body literal",
+            "command gh pr comment 95",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("github_comment_helper_required"),
+                "{command}"
+            );
+        }
     }
 
     #[test]
@@ -571,11 +597,11 @@ mod tests {
         );
         assert_eq!(decide(&bash("echo git push --force"), root).denied_by, None);
         assert_eq!(
-            decide(&bash("scripts/github-comment.sh issue 80 comment.md"), root).denied_by,
+            decide(&bash("scripts/github-comment.sh issue 80"), root).denied_by,
             None
         );
         assert_eq!(
-            decide(&bash("scripts/github-comment.sh pr 95 comment.md"), root).denied_by,
+            decide(&bash("scripts/github-comment.sh pr 95"), root).denied_by,
             None
         );
         assert_eq!(
@@ -654,17 +680,24 @@ mod tests {
             ),
             ("echo >", Some("unsupported_shell_syntax")),
             ("env git status --short", None),
-            ("FOO=1 scripts/github-comment.sh issue 80 comment.md", None),
+            ("FOO=1 scripts/github-comment.sh issue 80", None),
             ("command git status --short", None),
             ("sudo echo reviewed", None),
             ("printf safe | cat", None),
             ("echo reviewed>report.txt", None),
             ("printf '%s' '>'", None),
             ("printf '%s' '<'", None),
-            ("scripts/github-comment.sh issue 80 comment.md", None),
+            ("scripts/github-comment.sh issue 80", None),
             ("printf '%s' 'foo>bar'", None),
-            ("scripts/github-comment.sh pr 95 comment.md", None),
-            ("scripts/github-comment.sh pr 95 comment.md", None),
+            ("scripts/github-comment.sh pr 95", None),
+            (
+                "gh issue comment 80 --body 'literal > ~/.aws/credentials'",
+                Some("github_comment_helper_required"),
+            ),
+            (
+                "gh pr comment 95 --body-file - <<EOF\nplain git push --force prose\nEOF",
+                Some("github_comment_helper_required"),
+            ),
         ];
         for (command, expected) in cases {
             assert_eq!(
