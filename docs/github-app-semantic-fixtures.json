@@ -127,7 +127,14 @@
         "decision": "temporary_authority_proposal",
         "proposal_kind": "github_app_identity_verification",
         "additional_permissions": ["contents:write", "pull_requests:write"],
-        "additional_repository": "operator-selected-disposable-repository",
+        "additional_repository": "operator-must-supply-exact-disposable-repository",
+        "repository_must_not_be_current_selection": true,
+        "teardown_plan": [
+          "delete_test_branch_and_pull_request",
+          "remove_disposable_repository_from_installation",
+          "revoke_temporary_authority",
+          "erase_short_lived_token"
+        ],
         "provider_receives_credentials": false,
         "expires": true,
         "teardown_required": true
@@ -202,13 +209,29 @@
         "hook_active": true,
         "secret_store_ready": true,
         "repository_id": 1335380107,
-        "permission_digest": "sha256:exact-policy",
-        "event_digest": "sha256:exact-events",
+        "permission_digest": "sha256:c1c7ecfdab12b5576031094dcba9059a56c8d83e9ce45c2cc13e40d74719f9ff",
+        "event_digest": "sha256:e2ff89b73efac8c1778faea1450017cc9d0df08e17d3d7d1b1bed06b88493458",
         "operator_confirmed": true
       },
       "expected": {
         "registration_allowed": true,
         "reason": "all_inputs_present_for_trusted_setup_validation"
+      }
+    },
+    {
+      "name": "registration_gate_digest_mismatch",
+      "input": {
+        "endpoint": "https://hooks.example.invalid/dark-factory",
+        "hook_active": true,
+        "secret_store_ready": true,
+        "repository_id": 1335380107,
+        "permission_digest": "sha256:not-the-reviewed-policy",
+        "event_digest": "sha256:e2ff89b73efac8c1778faea1450017cc9d0df08e17d3d7d1b1bed06b88493458",
+        "operator_confirmed": true
+      },
+      "expected": {
+        "registration_allowed": false,
+        "reason": "registration_digest_mismatch"
       }
     }
   ]

@@ -5,6 +5,7 @@ repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
 python3 - "$repository_root" <<'PY'
 import json
+import hashlib
 import pathlib
 import sys
 
@@ -102,7 +103,14 @@ assert cases["read_only_identity_verification"]["expected"] == {
     "decision": "temporary_authority_proposal",
     "proposal_kind": "github_app_identity_verification",
     "additional_permissions": ["contents:write", "pull_requests:write"],
-    "additional_repository": "operator-selected-disposable-repository",
+    "additional_repository": "operator-must-supply-exact-disposable-repository",
+    "repository_must_not_be_current_selection": True,
+    "teardown_plan": [
+        "delete_test_branch_and_pull_request",
+        "remove_disposable_repository_from_installation",
+        "revoke_temporary_authority",
+        "erase_short_lived_token",
+    ],
     "provider_receives_credentials": False,
     "expires": True,
     "teardown_required": True,
@@ -126,6 +134,26 @@ assert cases["registration_gate_exact_hypothetical"]["expected"] == {
     "registration_allowed": True,
     "reason": "all_inputs_present_for_trusted_setup_validation",
 }
+assert cases["registration_gate_digest_mismatch"]["expected"] == {
+    "registration_allowed": False,
+    "reason": "registration_digest_mismatch",
+}
+
+def digest(value):
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
+
+expected_permission_digest = digest(manifest["default_permissions"])
+expected_event_digest = digest({
+    "default_events": manifest["default_events"],
+    "receiver_actions": actions,
+})
+ready_input = cases["registration_gate_exact_hypothetical"]["input"]
+assert ready_input["permission_digest"] == expected_permission_digest
+assert ready_input["event_digest"] == expected_event_digest
+mismatch_input = cases["registration_gate_digest_mismatch"]["input"]
+assert mismatch_input["permission_digest"] != expected_permission_digest
+assert mismatch_input["event_digest"] == expected_event_digest
 
 text = (root / "docs/github-app.md").read_text()
 for required in (
