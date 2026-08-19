@@ -79,7 +79,7 @@ chmod +x "$worktree/scripts/local-ci-lease.sh"
 held="$temporary/held"
 (
     cd "$worktree"
-    ./scripts/with-local-ci-lease.sh "$holder_command" "$held"
+    exec ./scripts/with-local-ci-lease.sh "$holder_command" "$held"
 ) &
 holder_pid=$!
 background_pids="$background_pids $holder_pid"
@@ -87,7 +87,7 @@ wait_for_file "$held"
 mutation_waiter="$temporary/mutation-waiter"
 (
     cd "$worktree"
-    ./scripts/with-local-ci-lease.sh "$waiter_command" "$mutation_waiter"
+    exec ./scripts/with-local-ci-lease.sh "$waiter_command" "$mutation_waiter"
 ) &
 waiter_pid=$!
 background_pids="$background_pids $waiter_pid"
@@ -136,6 +136,7 @@ nested_holder_command="$temporary/nested-holder.sh"
 printf '%s\n' \
     '#!/bin/sh' \
     'set -eu' \
+    'if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_HOLDER_PID_FILE-}" ]; then printf "%s\\n" "$$" >"$DARK_FACTORY_LOCAL_CI_TEST_HOLDER_PID_FILE"; fi' \
     ': >"$1"' \
     'if DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true 2>"$2"; then exit 1; fi' \
     'while [ ! -f "$3" ]; do sleep 0.05; done' \
@@ -144,10 +145,13 @@ chmod +x "$nested_holder_command"
 (
     export DARK_FACTORY_LOCAL_CI_TEST_OWNER_MARKER="$nested_marker_reached"
     cd "$nested_worktree"
-    ./scripts/with-local-ci-lease.sh "$nested_holder_command" "$held" "$nested_stderr" "$nested_release"
+    exec ./scripts/with-local-ci-lease.sh "$nested_holder_command" "$held" "$nested_stderr" "$nested_release"
 ) &
 holder_pid=$!
 background_pids="$background_pids $holder_pid"
+if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_WRAPPER_PID_FILE-}" ]; then
+    printf '%s\n' "$holder_pid" >"$DARK_FACTORY_LOCAL_CI_TEST_WRAPPER_PID_FILE"
+fi
 wait_for_file "$held"
 wait_for_file "$nested_marker_reached"
 kill -0 "$holder_pid" 2>/dev/null || fail "nested marker was reached only after holder release"
@@ -156,7 +160,40 @@ if grep -Fq "$owner_marker_message" "$nested_stderr"; then
 fi
 grep -Fq 'local-ci: nested lease mutation' "$nested_stderr" \
     || fail "nested mutation did not report the mutated owner-marker branch"
+if [ "${DARK_FACTORY_LOCAL_CI_TEST_FAIL_AFTER_MARKER-}" = 1 ]; then
+    fail "intentional owner-marker cleanup failure"
+fi
 : >"$nested_release"
 wait "$holder_pid" || fail "owner-marker mutation holder failed"
+
+# A pre-release assertion failure must reap the actual nested wrapper and its
+# polling holder, rather than only the shell that launched the wrapper.
+failure_holder_pid_file="$temporary/failure-holder.pid"
+failure_wrapper_pid_file="$temporary/failure-wrapper.pid"
+failure_output="$temporary/failure-output"
+if DARK_FACTORY_LOCAL_CI_TEST_FAIL_AFTER_MARKER=1 \
+    DARK_FACTORY_LOCAL_CI_TEST_HOLDER_PID_FILE="$failure_holder_pid_file" \
+    DARK_FACTORY_LOCAL_CI_TEST_WRAPPER_PID_FILE="$failure_wrapper_pid_file" \
+    "$0" >"$failure_output" 2>&1; then
+    fail "intentional owner-marker cleanup failure unexpectedly passed"
+fi
+[ -f "$failure_holder_pid_file" ] || fail "failure-path holder did not publish its PID"
+failure_holder_pid=$(sed -n '1p' "$failure_holder_pid_file")
+case "$failure_holder_pid" in
+    ''|*[!0-9]*) fail "failure-path holder PID was not numeric" ;;
+esac
+if kill -0 "$failure_holder_pid" 2>/dev/null; then
+    fail "failure-path cleanup left the nested holder alive"
+fi
+[ -f "$failure_wrapper_pid_file" ] || fail "failure-path wrapper did not publish its PID"
+failure_wrapper_pid=$(sed -n '1p' "$failure_wrapper_pid_file")
+case "$failure_wrapper_pid" in
+    ''|*[!0-9]*) fail "failure-path wrapper PID was not numeric" ;;
+esac
+if kill -0 "$failure_wrapper_pid" 2>/dev/null; then
+    fail "failure-path cleanup left the nested wrapper alive"
+fi
+grep -Fq 'intentional owner-marker cleanup failure' "$failure_output" \
+    || fail "failure-path cleanup did not reach the intentional assertion"
 
 echo "local-ci lease mutation tests passed"
