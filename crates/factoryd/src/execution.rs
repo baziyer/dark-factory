@@ -401,6 +401,23 @@ impl Handle {
         send_wake(&self.wake_tx, project_id, agent_id);
     }
 
+    /// Waits for all delivery work owned by `agent_id` to finish. Local API
+    /// assignment/deletion handlers hold this barrier while changing task
+    /// ownership, so a delivery that loses the race cannot type the task to
+    /// the old worker after the move has committed.
+    pub async fn lock_delivery_slot(
+        &self,
+        agent_id: &AgentId,
+    ) -> crate::daemon_state::DeliverySlot {
+        self.state.lock_delivery_slot(agent_id).await
+    }
+
+    /// Serializes assignment mutations for one task across all local API
+    /// request handlers.
+    pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.state.lock_assignment_slot().await
+    }
+
     /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's
     /// agent-scoped mechanism): marks the agent so no writer --
     /// [`dispatch_agent`]'s spawn preparation, [`deliver_pending`]'s

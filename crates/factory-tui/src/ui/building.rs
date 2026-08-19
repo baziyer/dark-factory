@@ -62,21 +62,9 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
             let spark = board
                 .activity
                 .get(&agent_id)
-                .map(|series| {
-                    state::braille_sparkline(&series.counts(), state::ACTIVITY_VISIBLE_BUCKETS)
-                })
-                .unwrap_or_else(|| " ".repeat(state::ACTIVITY_VISIBLE_BUCKETS));
-            let assigned: Vec<_> = board
-                .tasks
-                .values()
-                .filter(|task| {
-                    task.snapshot.assigned_agent_id.as_ref() == Some(&agent_id)
-                        && matches!(
-                            task.snapshot.status,
-                            factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
-                        )
-                })
-                .collect();
+                .map(|series| state::braille_sparkline(&series.counts(), 8))
+                .unwrap_or_else(|| "        ".to_owned());
+            let assigned = board.active_tasks_for_agent(&agent_id);
             let current = assigned
                 .iter()
                 .find(|task| task.snapshot.status == factory_core::TaskStatus::Running)

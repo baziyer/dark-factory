@@ -41,6 +41,10 @@ pub struct DaemonState {
     /// agent's lifetime (one `Arc<AsyncMutex<()>>` reused for every
     /// delivery attempt).
     delivery_slots: Arc<Mutex<HashMap<AgentId, Arc<AsyncMutex<()>>>>>,
+    /// Assignment mutations are infrequent and must be serialized with the
+    /// owner delivery barrier. A bounded gate is simpler and safer than a
+    /// registry keyed by an unbounded stream of task IDs.
+    assignment_gate: Arc<AsyncMutex<()>>,
     /// All repository mutations pass through one daemon-owned committer.
     /// Read-only status/diff operations share this lock too, so their output
     /// is never captured halfway through a commit or push.
@@ -73,6 +77,7 @@ impl DaemonState {
             store: Arc::new(Mutex::new(store)),
             events,
             delivery_slots: Arc::new(Mutex::new(HashMap::new())),
+            assignment_gate: Arc::new(AsyncMutex::new(())),
             repository_slot: Arc::new(AsyncMutex::new(())),
         }
     }
@@ -91,20 +96,37 @@ impl DaemonState {
     /// that arrives while the dispatcher is already busy with that agent.
     #[must_use]
     pub fn try_delivery_slot(&self, agent_id: &AgentId) -> Option<DeliverySlot> {
-        let lock = {
-            let mut slots = self
-                .delivery_slots
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            Arc::clone(
-                slots
-                    .entry(agent_id.clone())
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
-        };
+        let lock = self.delivery_lock(agent_id);
         lock.try_lock_owned()
             .ok()
             .map(|guard| DeliverySlot { _guard: guard })
+    }
+
+    /// Waits for the owner-side delivery barrier. Assignment changes use
+    /// this blocking form so a task cannot be moved while the old worker's
+    /// delivery is composing, typing, awaiting its hook, or committing.
+    pub async fn lock_delivery_slot(&self, agent_id: &AgentId) -> DeliverySlot {
+        DeliverySlot {
+            _guard: self.delivery_lock(agent_id).lock_owned().await,
+        }
+    }
+
+    /// Serializes all assignment mutations, including moves between workers
+    /// and moves to the project backlog.
+    pub async fn lock_assignment_slot(&self) -> OwnedMutexGuard<()> {
+        Arc::clone(&self.assignment_gate).lock_owned().await
+    }
+
+    fn delivery_lock(&self, agent_id: &AgentId) -> Arc<AsyncMutex<()>> {
+        let mut slots = self
+            .delivery_slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            slots
+                .entry(agent_id.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
+        )
     }
 
     /// `true` if another delivery attempt currently holds `agent_id`'s
@@ -178,5 +200,35 @@ impl DaemonState {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.events.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_core::AgentId;
+
+    #[tokio::test]
+    async fn reassignment_barrier_waits_for_old_owner_delivery() {
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let old_owner = AgentId::try_from("worker-1").unwrap();
+        let delivery = state.try_delivery_slot(&old_owner).unwrap();
+        let assignment = state.lock_assignment_slot().await;
+
+        let state_for_move = state.clone();
+        let old_owner_for_move = old_owner.clone();
+        let waiter = tokio::spawn(async move {
+            let _assignment = state_for_move.lock_assignment_slot().await;
+            state_for_move.lock_delivery_slot(&old_owner_for_move).await
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "move crossed the in-flight delivery");
+        drop(assignment);
+        // The move still cannot pass until the old worker's prompt/commit
+        // has released its delivery barrier.
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        drop(delivery);
+        waiter.await.unwrap();
     }
 }

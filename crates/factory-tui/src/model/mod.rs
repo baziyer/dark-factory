@@ -35,7 +35,7 @@ pub use announcements::Announcement;
 pub use factory_core::attention::{self, Attention, Rated};
 pub use keymap::{
     Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
-    TASK_MENU_ITEMS, TaskMenuState, View,
+    TaskMenuState, View,
 };
 pub use state::AgentState;
 
@@ -262,7 +262,8 @@ impl Board {
             .collect()
     }
 
-    /// Active work assigned to one agent, in the same stable order AGENT renders and targets it.
+    /// The canonical assigned queue for one agent, in the same stable order the AGENT view renders
+    /// and targets it.
     #[must_use]
     pub fn active_tasks_for_agent(&self, agent_id: &AgentId) -> Vec<&TaskDetail> {
         let mut tasks: Vec<_> = self
@@ -276,7 +277,31 @@ impl Board {
                     )
             })
             .collect();
-        tasks.sort_by_key(|task| (task.snapshot.created_at_ms, task.snapshot.id.clone()));
+        tasks.sort_by(|a, b| factory_core::active_task_cmp(&a.snapshot, &b.snapshot));
+        tasks
+    }
+
+    /// Terminal assignment history is deliberately separate from the active
+    /// queue, but remains in the board so retry/cancelled work is operable.
+    #[must_use]
+    pub fn task_history_for_agent(&self, agent_id: &AgentId) -> Vec<&TaskDetail> {
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.snapshot.assigned_agent_id.as_ref() == Some(agent_id)
+                    && !matches!(
+                        task.snapshot.status,
+                        factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
+                    )
+            })
+            .collect();
+        tasks.sort_by(|a, b| {
+            a.snapshot
+                .updated_at_ms
+                .cmp(&b.snapshot.updated_at_ms)
+                .then_with(|| a.snapshot.id.as_str().cmp(b.snapshot.id.as_str()))
+        });
         tasks
     }
 

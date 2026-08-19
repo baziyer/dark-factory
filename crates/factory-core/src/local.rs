@@ -163,6 +163,10 @@ pub enum LocalRequest {
         title: String,
         body: String,
         priority: i32,
+        /// When present, create-and-assign is one durable transaction. The
+        /// daemon wakes only this agent after the commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
     },
     CreateAgent {
         id: AgentId,
@@ -239,6 +243,18 @@ pub enum LocalRequest {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<TaskId>,
+        /// When present, list only this agent's assigned tasks. The active
+        /// queue order is running-first, priority-descending,
+        /// creation time, then ID. Pages carry a durable revision so any
+        /// mutation makes a cursor explicitly stale instead of skipping work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_revision: Option<i64>,
+        /// Include terminal/history rows. The default is the active queue
+        /// only; active work is never hidden by a history view.
+        #[serde(default)]
+        history: bool,
         limit: u32,
     },
     GetTask {
@@ -260,6 +276,9 @@ pub enum LocalRequest {
         title: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         body: Option<String>,
+        /// Queue priority. Updating it is the shared reorder operation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<i32>,
     },
     DeleteTask {
         project_id: ProjectId,
@@ -588,6 +607,8 @@ pub enum LocalResponse {
         tasks: Vec<TaskDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         next_after_id: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_revision: Option<i64>,
     },
     Runs {
         runs: Vec<RunSnapshot>,

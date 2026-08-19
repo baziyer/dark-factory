@@ -526,6 +526,7 @@ fn create_task(client: &Client, id: &str, title: &str, body: &str) {
             title: title.into(),
             body: body.into(),
             priority: 0,
+            agent_id: None,
         })
         .unwrap();
     assert!(

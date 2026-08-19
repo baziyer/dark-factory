@@ -12,7 +12,7 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use factory_core::local::LocalRequest;
-use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId};
+use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId, TaskStatus};
 
 use super::{AttentionTarget, Board, StatusLevel};
 use crate::mouse::Target as MouseTarget;
@@ -137,10 +137,11 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PromptKind {
-    NewTask,
+    NewTask(Option<AgentId>),
     MessageAgent(AgentId),
     MessageOrchestrator(AgentId),
     EditTaskTitle(TaskId),
+    ReorderTask(TaskId),
     EditModel(AgentId),
     EditPermission(AgentId),
     Capacity,
@@ -158,9 +159,9 @@ pub struct PromptState {
 
 impl PromptState {
     #[must_use]
-    fn new_task() -> Self {
+    fn new_task(agent_id: Option<AgentId>) -> Self {
         Self {
-            kind: PromptKind::NewTask,
+            kind: PromptKind::NewTask(agent_id),
             labels: vec!["title", "body"],
             values: vec![String::new(), String::new()],
             field: 0,
@@ -193,6 +194,16 @@ impl PromptState {
             kind: PromptKind::EditTaskTitle(task_id),
             labels: vec!["title"],
             values: vec![current],
+            field: 0,
+        }
+    }
+
+    #[must_use]
+    fn reorder_task(task_id: TaskId, current: i32) -> Self {
+        Self {
+            kind: PromptKind::ReorderTask(task_id),
+            labels: vec!["priority"],
+            values: vec![current.to_string()],
             field: 0,
         }
     }
@@ -246,12 +257,38 @@ pub struct PickerState {
 pub struct TaskMenuState {
     pub task_id: TaskId,
     pub cursor: usize,
+    pub items: Vec<&'static str>,
 }
 
-/// WORKSHOP's task action menu (`Enter` on a task) — "the only place those exist" per the design
-/// brief, which is why `StartTask` isn't reachable from a top-level key any more.
-pub const TASK_MENU_ITEMS: [&str; 6] =
-    ["start", "assign", "cancel", "retry", "delete", "edit title"];
+fn task_menu_items(task: &factory_core::TaskDetail) -> Vec<&'static str> {
+    let status = task.snapshot.status;
+    let mut items = Vec::new();
+    if status == TaskStatus::Queued && task.snapshot.assigned_agent_id.is_some() {
+        items.push("start");
+    }
+    if status == TaskStatus::Queued {
+        items.push("assign");
+    }
+    if status == TaskStatus::Queued && task.snapshot.assigned_agent_id.is_some() {
+        items.push("backlog");
+    }
+    if status == TaskStatus::Queued {
+        items.push("reorder");
+    }
+    if matches!(status, TaskStatus::Queued | TaskStatus::Blocked) {
+        items.push("cancel");
+    }
+    if matches!(status, TaskStatus::Failed | TaskStatus::Cancelled) {
+        items.push("retry");
+    }
+    if status != TaskStatus::Running {
+        items.push("delete");
+    }
+    if status == TaskStatus::Queued {
+        items.push("edit title");
+    }
+    items
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PendingAction {
@@ -352,14 +389,15 @@ impl Board {
                 }
             }
             MouseTarget::Task(task_id) => {
-                let Some(agent_id) = self.selected_agent.as_ref() else {
-                    return Intent::None;
-                };
-                let Some(task) = self
-                    .active_tasks_for_agent(agent_id)
-                    .into_iter()
-                    .find(|task| task.snapshot.id == task_id)
-                else {
+                let Some(task) = self.tasks.get(&task_id).filter(|task| {
+                    matches!(
+                        task.snapshot.status,
+                        TaskStatus::Queued
+                            | TaskStatus::Running
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
+                    )
+                }) else {
                     return Intent::None;
                 };
                 self.focused_project = Some(task.snapshot.project_id.clone());
@@ -545,14 +583,26 @@ impl Board {
         let Some(task_id) = self
             .selected_task
             .as_ref()
-            .filter(|selected| tasks.iter().any(|task| &task.snapshot.id == *selected))
+            .filter(|selected| self.tasks.contains_key(*selected))
             .cloned()
             .or_else(|| tasks.first().map(|task| task.snapshot.id.clone()))
         else {
-            self.set_status("agent queue is empty", StatusLevel::Info);
+            self.set_status("no task selected", StatusLevel::Info);
             return Intent::Redraw;
         };
-        self.mode = Mode::TaskMenu(TaskMenuState { task_id, cursor: 0 });
+        let Some(task) = self.tasks.get(&task_id) else {
+            return Intent::Redraw;
+        };
+        let items = task_menu_items(task);
+        if items.is_empty() {
+            self.set_status("task has no available actions", StatusLevel::Info);
+            return Intent::Redraw;
+        }
+        self.mode = Mode::TaskMenu(TaskMenuState {
+            task_id,
+            cursor: 0,
+            items,
+        });
         Intent::Redraw
     }
 
@@ -616,7 +666,10 @@ impl Board {
             );
             return Intent::Redraw;
         }
-        self.mode = Mode::Prompt(PromptState::new_task());
+        let agent_id = (self.view == View::Agent)
+            .then(|| self.selected_agent.clone())
+            .flatten();
+        self.mode = Mode::Prompt(PromptState::new_task(agent_id));
         Intent::Redraw
     }
 
@@ -842,7 +895,7 @@ impl Board {
             return Intent::None;
         };
         match prompt.kind {
-            PromptKind::NewTask => {
+            PromptKind::NewTask(agent_id) => {
                 let Some(project_id) = self.active_project() else {
                     self.set_status("no project selected yet", StatusLevel::Error);
                     return Intent::Redraw;
@@ -857,14 +910,16 @@ impl Board {
                     self.set_status("failed to generate a task id", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                Intent::Send(LocalRequest::CreateTask {
+                let request = LocalRequest::CreateTask {
                     id,
                     project_id,
                     parent_task_id: None,
                     title,
                     body,
                     priority: 0,
-                })
+                    agent_id,
+                };
+                Intent::Send(request)
             }
             PromptKind::MessageAgent(recipient_agent_id)
             | PromptKind::MessageOrchestrator(recipient_agent_id) => {
@@ -903,6 +958,26 @@ impl Board {
                     task_id,
                     title: Some(title),
                     body: None,
+                    priority: None,
+                })
+            }
+            PromptKind::ReorderTask(task_id) => {
+                let Some(project_id) = self.task_project(&task_id) else {
+                    return Intent::Redraw;
+                };
+                let Some(value) = prompt.values.first() else {
+                    return Intent::Redraw;
+                };
+                let Ok(priority) = value.trim().parse::<i32>() else {
+                    self.set_status("priority must be a signed integer", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                Intent::Send(LocalRequest::UpdateTask {
+                    project_id,
+                    task_id,
+                    title: None,
+                    body: None,
+                    priority: Some(priority),
                 })
             }
             PromptKind::EditModel(agent_id) => {
@@ -1048,11 +1123,11 @@ impl Board {
                 Intent::Redraw
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                state.cursor = (state.cursor + 1) % TASK_MENU_ITEMS.len();
+                state.cursor = (state.cursor + 1) % state.items.len();
                 Intent::Redraw
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                state.cursor = (state.cursor + TASK_MENU_ITEMS.len() - 1) % TASK_MENU_ITEMS.len();
+                state.cursor = (state.cursor + state.items.len() - 1) % state.items.len();
                 Intent::Redraw
             }
             KeyCode::Enter => self.submit_task_menu(),
@@ -1068,7 +1143,7 @@ impl Board {
         let Some(project_id) = self.task_project(&task_id) else {
             return Intent::Redraw;
         };
-        match TASK_MENU_ITEMS[state.cursor] {
+        match state.items[state.cursor] {
             "start" => {
                 let Some(task) = self.tasks.get(&task_id) else {
                     return Intent::Redraw;
@@ -1101,6 +1176,19 @@ impl Board {
                 });
                 Intent::Redraw
             }
+            "reorder" => {
+                let current = self
+                    .tasks
+                    .get(&task_id)
+                    .map_or(0, |task| task.snapshot.priority);
+                self.mode = Mode::Prompt(PromptState::reorder_task(task_id, current));
+                Intent::Redraw
+            }
+            "backlog" => Intent::Send(LocalRequest::AssignTask {
+                project_id,
+                task_id,
+                agent_id: None,
+            }),
             "cancel" => Intent::Send(LocalRequest::CancelTask {
                 project_id,
                 task_id,
@@ -1244,6 +1332,63 @@ mod tests {
             board.handle_key(key(KeyCode::Enter)),
             Intent::SetCapacity(8)
         ));
+    }
+
+    #[test]
+    fn agent_new_task_uses_atomic_assigned_create() {
+        let mut board = board();
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('n'))),
+            Intent::Redraw
+        ));
+        for character in "build".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        board.handle_key(key(KeyCode::Enter));
+        for character in "body".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        let Intent::Send(request) = board.handle_key(key(KeyCode::Enter)) else {
+            panic!("task prompt did not submit");
+        };
+        assert!(matches!(
+            request,
+            LocalRequest::CreateTask { agent_id, .. }
+                if agent_id == Some(AgentId::try_from("alice").unwrap())
+        ));
+    }
+
+    #[test]
+    fn queue_rows_are_stable_and_mouse_targets_the_same_assigned_queue() {
+        let mut board = board();
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.tasks.insert(
+            TaskId::try_from("later").unwrap(),
+            task("later", "proj", TaskStatus::Queued, Some("alice"), 20),
+        );
+        board.tasks.insert(
+            TaskId::try_from("first").unwrap(),
+            task("first", "proj", TaskStatus::Queued, Some("alice"), 10),
+        );
+        assert_eq!(
+            board
+                .active_tasks_for_agent(&AgentId::try_from("alice").unwrap())
+                .iter()
+                .map(|task| task.snapshot.id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("later").unwrap())),
+            Intent::Redraw
+        ));
+        assert_eq!(
+            board.selected_task.as_ref().map(TaskId::as_str),
+            Some("later")
+        );
     }
 
     #[test]
@@ -1392,11 +1537,11 @@ mod tests {
         );
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("second").unwrap()));
+        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("first").unwrap()));
         board.handle_key(key(KeyCode::Char('t')));
         assert!(matches!(
             &board.mode,
-            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "second"
+            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "first"
         ));
     }
 
@@ -1420,6 +1565,24 @@ mod tests {
             Intent::None
         ));
         assert!(board.selected_task.is_none());
+
+        board.tasks.insert(
+            TaskId::try_from("retryable").unwrap(),
+            task("retryable", "proj", TaskStatus::Failed, Some("alice"), 0),
+        );
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("retryable").unwrap())),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('t'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            &board.mode,
+            Mode::TaskMenu(TaskMenuState { items, .. }) if items.contains(&"retry")
+        ));
+        board.mode = Mode::Normal;
 
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());

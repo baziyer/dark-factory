@@ -31,7 +31,7 @@ fn all_run_status_values_have_stable_wire_names() {
 
 #[test]
 fn all_run_failure_reasons_have_stable_wire_names() {
-    assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(PROTOCOL_VERSION, 2);
 
     let cases = [
         (RunFailureReason::Protocol, "protocol"),

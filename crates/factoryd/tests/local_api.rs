@@ -204,6 +204,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
                 title: "Stream a task".into(),
                 body: "The observer should receive this without polling.".into(),
                 priority: 5,
+                agent_id: None,
             },
         )
         .await;
@@ -243,6 +244,7 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
                 title: "Survive observer restart".into(),
                 body: "This event must replay after reconnect.".into(),
                 priority: 1,
+                agent_id: None,
             },
         )
         .await;
@@ -291,6 +293,9 @@ async fn commands_and_live_events_share_the_persisted_cursor() {
             LocalRequest::ListTasks {
                 project_id: project_id("project-1"),
                 after_id: None,
+                agent_id: None,
+                queue_revision: None,
+                history: false,
                 limit: 10,
             },
         )
@@ -342,6 +347,7 @@ async fn live_task_detail_and_event_head_are_bounded_local_reads() {
                     title: "Hydrate me".into(),
                     body: "bounded live body".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await,
@@ -525,6 +531,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                 title: "Too large".into(),
                 body: "x".repeat(MAX_TASK_BODY_BYTES + 1),
                 priority: 0,
+                agent_id: None,
             },
         )
         .await;
@@ -550,6 +557,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                     title: id,
                     body: "bounded".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await;
@@ -560,6 +568,9 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             LocalRequest::ListTasks {
                 project_id: project_id("bounded-project"),
                 after_id: None,
+                agent_id: None,
+                queue_revision: None,
+                history: false,
                 limit: 10,
             },
         )
@@ -570,11 +581,12 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
                     LocalResponse::Tasks {
                         tasks,
                         next_after_id: Some(next),
+                        queue_revision: Some(revision),
                     },
                 ..
             } => {
                 assert_eq!(tasks.len(), 10);
-                next
+                (next, revision)
             }
             other => panic!("unexpected first page: {other:?}"),
         };
@@ -582,17 +594,42 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             &socket,
             LocalRequest::ListTasks {
                 project_id: project_id("bounded-project"),
-                after_id: Some(next),
+                after_id: Some(next.0.clone()),
+                agent_id: None,
+                queue_revision: Some(next.1),
+                history: false,
                 limit: 10,
             },
         )
         .await;
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ListTasks {
+                    project_id: project_id("bounded-project"),
+                    after_id: Some(next.0.clone()),
+                    agent_id: None,
+                    queue_revision: None,
+                    history: false,
+                    limit: 10,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
         assert!(matches!(
             second,
             ServerFrame::Response {
                 response: LocalResponse::Tasks {
                     ref tasks,
                     next_after_id: None,
+                    ..
                 },
                 ..
             } if tasks.len() == 1
@@ -696,6 +733,7 @@ async fn retry_is_a_local_control_operation_and_does_not_change_queued_tasks() {
                     title: "Queued".into(),
                     body: "Still queued".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await,
@@ -776,6 +814,7 @@ async fn queued_task_assignment_is_a_local_control_operation() {
                     title: "Queue me".into(),
                     body: "body".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await,
@@ -962,6 +1001,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                     title: "Cancel me".into(),
                     body: "body".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await,
@@ -1044,6 +1084,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 task_id: task_id("task-1"),
                 title: None,
                 body: None,
+                priority: None,
             },
         )
         .await;
@@ -1065,6 +1106,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 task_id: task_id("task-1"),
                 title: Some("Updated title".into()),
                 body: None,
+                priority: None,
             },
         )
         .await;
@@ -1138,6 +1180,7 @@ async fn cancel_update_and_delete_are_local_control_operations() {
                 title: "Replacement".into(),
                 body: "different body".into(),
                 priority: 0,
+                agent_id: None,
             },
         )
         .await;
@@ -1294,6 +1337,7 @@ async fn delete_agent_never_leaves_guidance_files_racing_a_spawn_attempt() {
                         title: "Race me".into(),
                         body: "body".into(),
                         priority: 0,
+                        agent_id: None,
                     },
                 )
                 .await,
@@ -1871,6 +1915,7 @@ async fn session_shaped_requests_now_have_real_behavior() {
                     title: "Uses the agent's worktree".into(),
                     body: "body".into(),
                     priority: 0,
+                    agent_id: None,
                 },
             )
             .await,
@@ -2118,6 +2163,7 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 title: "assigned".to_owned(),
                 body: "b".to_owned(),
                 priority: 0,
+                agent_id: None,
             },
             LocalRequest::CreateTask {
                 id: task_id("t-loose"),
@@ -2126,6 +2172,7 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
                 title: "unassigned".to_owned(),
                 body: "b".to_owned(),
                 priority: 0,
+                agent_id: None,
             },
             LocalRequest::AssignTask {
                 project_id: project_id("factory"),
@@ -2161,8 +2208,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(status.projects.len(), 1);
         let project = &status.projects[0];
         assert_eq!(project.project.id, project_id("factory"));
-        assert_eq!(project.unassigned_queue_depth, 1);
-        assert_eq!(project.unassigned_queue[0].id, task_id("t-loose"));
+        assert_eq!(project.backlog_depth, 1);
+        assert_eq!(project.backlog[0].id, task_id("t-loose"));
         assert_eq!(project.agents.len(), 1);
         let curie = &project.agents[0];
         assert_eq!(curie.agent.id, agent_id("curie"));

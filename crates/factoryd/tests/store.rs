@@ -547,6 +547,35 @@ fn project_task_and_events_survive_reopen() {
 }
 
 #[test]
+fn v1_durable_events_replay_with_the_current_store_protocol() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("legacy"),
+                    name: "Legacy".into(),
+                    root: "/work/legacy".into(),
+                },
+                1,
+            )
+            .unwrap();
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE events SET schema_version = 1", [])
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&database).unwrap();
+    let events = store.events_after(0, 10).unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].protocol_version, 1);
+}
+
+#[test]
 fn a_rejected_state_change_does_not_append_an_event() {
     let mut store = Store::open_in_memory().unwrap();
     let input = NewProject {
@@ -700,7 +729,9 @@ fn list_pages_use_a_stable_id_cursor() {
         .unwrap();
     assert_eq!(projects[0].id, project_id("project-c"));
 
-    let tasks = store.list_tasks(&project_id("project-a"), None, 2).unwrap();
+    let (tasks, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("project-a"), None, None, true, 2, None)
+        .unwrap();
     assert_eq!(
         tasks
             .iter()
@@ -709,8 +740,16 @@ fn list_pages_use_a_stable_id_cursor() {
         ["task-a", "task-b"]
     );
     let tasks = store
-        .list_tasks(&project_id("project-a"), Some(&task_id("task-b")), 2)
-        .unwrap();
+        .list_tasks_filtered_at_revision(
+            &project_id("project-a"),
+            Some(&task_id("task-b")),
+            None,
+            true,
+            2,
+            Some(revision),
+        )
+        .unwrap()
+        .0;
     assert_eq!(tasks[0].snapshot.id, task_id("task-c"));
 }
 
@@ -888,6 +927,180 @@ fn queued_tasks_can_be_assigned_unassigned_and_reopened() {
 }
 
 #[test]
+fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("factory.db");
+    let alice = agent_id("alice");
+    let bob = agent_id("bob");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for id in [&alice, &bob] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: id.clone(),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        let (task, _) = store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id("alice-first"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "First".into(),
+                    body: String::new(),
+                    priority: 9,
+                },
+                alice.clone(),
+                3,
+            )
+            .unwrap();
+        assert_eq!(task.snapshot.assigned_agent_id, Some(alice.clone()));
+        store
+            .create_task(
+                NewTask {
+                    id: task_id("backlog"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Backlog".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                4,
+            )
+            .unwrap();
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id("alice-second"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Second".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                alice.clone(),
+                5,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.create_assigned_task(
+                NewTask {
+                    id: task_id("bad-agent"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "No delivery".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                AgentId::try_from("deleted").unwrap(),
+                6,
+            ),
+            Err(StoreError::AgentNotFound)
+        ));
+        assert!(matches!(
+            store.get_task(&project_id("factory"), &task_id("bad-agent")),
+            Err(StoreError::TaskNotFound)
+        ));
+    }
+
+    let mut store = Store::open(&database).unwrap();
+    let (first_page, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("factory"), None, Some(&alice), false, 1, None)
+        .unwrap();
+    assert_eq!(first_page[0].snapshot.id, task_id("alice-first"));
+    store
+        .update_task(
+            &project_id("factory"),
+            &task_id("alice-first"),
+            None,
+            None,
+            Some(-1),
+            7,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.list_tasks_filtered_at_revision(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            false,
+            10,
+            Some(revision),
+        ),
+        Err(StoreError::StaleTaskCursor)
+    ));
+    assert!(matches!(
+        store.list_tasks_filtered(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            false,
+            10,
+        ),
+        Err(StoreError::MissingTaskCursorRevision)
+    ));
+    let second_page = store
+        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), false, 10)
+        .unwrap();
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|task| task.snapshot.id.clone())
+            .collect::<Vec<_>>(),
+        vec![task_id("alice-second"), task_id("alice-first")]
+    );
+    store
+        .assign_task(&project_id("factory"), &task_id("alice-first"), None, 8)
+        .unwrap();
+    let (_, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("factory"), None, None, false, 1, None)
+        .unwrap();
+    assert!(matches!(
+        store.list_tasks_filtered_at_revision(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            false,
+            10,
+            Some(revision - 1),
+        ),
+        Err(StoreError::StaleTaskCursor)
+    ));
+    assert_eq!(
+        store
+            .list_tasks_filtered(&project_id("factory"), None, None, false, 10)
+            .unwrap()
+            .iter()
+            .map(|task| task.snapshot.id.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            task_id("backlog"),
+            task_id("alice-second"),
+            task_id("alice-first")
+        ]
+    );
+    assert_eq!(bob, agent_id("bob"));
+}
+
+#[test]
 fn cancel_task_moves_queued_or_blocked_to_cancelled_and_keeps_assignment() {
     let mut store = Store::open_in_memory().unwrap();
     store
@@ -1015,6 +1228,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &task_id("task-1"),
             Some("New title".into()),
             None,
+            None,
             4,
         )
         .unwrap();
@@ -1028,6 +1242,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &task_id("task-1"),
             None,
             Some("New body".into()),
+            None,
             5,
         )
         .unwrap();
@@ -1040,6 +1255,7 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
             &project_id("factory"),
             &task_id("task-1"),
             Some("Too late".into()),
+            None,
             None,
             7,
         ),

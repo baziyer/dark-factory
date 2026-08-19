@@ -25,11 +25,11 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
     for project in &status.projects {
         writeln!(
             output,
-            "\n{} ({}) | agents {} | unassigned {}",
+            "\n{} ({}) | agents {} | backlog {}",
             display_text(&project.project.name),
             project.project.id,
             project.agents.len(),
-            project.unassigned_queue_depth
+            project.backlog_depth
         )
         .map_err(|error| error.to_string())?;
         for agent in &project.agents {
@@ -293,8 +293,8 @@ mod tests {
                             }),
                         ),
                     ],
-                    unassigned_queue_depth: 5,
-                    unassigned_queue: Vec::new(),
+                    backlog_depth: 5,
+                    backlog: Vec::new(),
                 },
                 ProjectStatus {
                     project: ProjectSnapshot {
@@ -305,8 +305,8 @@ mod tests {
                         updated_at_ms: 1,
                     },
                     agents: Vec::new(),
-                    unassigned_queue_depth: 0,
-                    unassigned_queue: Vec::new(),
+                    backlog_depth: 0,
+                    backlog: Vec::new(),
                 },
             ],
             attention: vec![
@@ -340,11 +340,11 @@ mod tests {
             output,
             concat!(
                 "Dark Factory: auto on | sessions 2/4 | projects 2 | attention 2\n",
-                "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | unassigned 5\n",
+                "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | backlog 5\n",
                 "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
-                "\nEmpty (empty) | agents 0 | unassigned 0\n",
+                "\nEmpty (empty) | agents 0 | backlog 0\n",
                 "\nAttention:\n",
                 "  needs input | factory/reviewer | approve command [2JFORGED\n",
                 "  task blocked | factory task task-7 | dependency missing\n",

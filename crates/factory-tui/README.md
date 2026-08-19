@@ -27,8 +27,10 @@ events add counts; idle time only advances empty buckets, so a silent agent
 ages out without decorative animation.
 
 AGENT shows the selected agent. It includes the live terminal, assigned and
-active work, durable messages, and settings. The orchestrator also shows the
-project queue.
+active work, durable messages, and settings. Its queue shows active assigned
+tasks in stable `(created_at_ms, id)` order. The
+orchestrator also shows the project backlog and worker queues; messages remain
+the inbox and review attention remains separate.
 
 ## Mouse
 
@@ -59,7 +61,7 @@ controls below remain available.
 | `j` / `k`, arrows | Select the next or previous agent. |
 | `[` / `]` | Select another agent without leaving AGENT. |
 | `g` | Go to the next item in NEEDS YOU. |
-| `n` | Add a task. |
+| `n` | Add a task (in AGENT, directly into the selected worker's queue). |
 | `m` / `o` | Message the selected agent or an orchestrator. |
 | `p` | Select a project. |
 | `Space` | Pause or resume the selected agent. |
@@ -78,6 +80,13 @@ Board actions use daemon requests. `C` uses the same shared launchd capacity
 operation as `factoryctl capacity set`; it restarts only `factoryd` and keeps
 runner sessions alive. See the [main README](../../README.md) for setup and
 first use.
+
+Mouse clicks select the same agents, tasks, attention rows, and queue rows as
+keyboard navigation. Press `Enter` or `i` to focus typing in an attached
+terminal. Board clicks never become terminal input.
+
+All actions use daemon requests. There is no TUI-only control path. See the
+[main README](../../README.md) for setup and first use.
 
 ## Development
 
