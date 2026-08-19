@@ -19,7 +19,8 @@ project unless `--project` selects one.
 
 BUILDING shows the full factory. Each project is a building. Each agent has a
 floor. The NEEDS YOU list includes agents and tasks. It lists attention items
-globally, oldest first.
+globally, most urgent and then oldest first. Each row names the actionable
+reason instead of collapsing every condition into a generic input request.
 
 BUILDING activity sparklines are event-driven: each bar is a five-second bucket,
 with eight visible bars covering the most recent 40 seconds. Durable hook/tool
@@ -31,7 +32,11 @@ active work, durable messages, and settings. Settings distinguish the
 configured model/reasoning tier and durable selection reason from the
 historical runtime-resolved session values. The orchestrator also shows the
 project backlog and worker queues; messages remain the inbox and review
-attention remains separate.
+attention remains separate. `g` or a NEEDS YOU click opens the
+same reason card here, with task/session/age and a safe action, while terminal
+typing remains off until explicitly entered. If the reason resolves
+concurrently, the stale row disappears and an already-open card says it
+changed before action.
 
 ## Mouse
 

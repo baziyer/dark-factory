@@ -156,6 +156,12 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     connection
         .execute_batch("DROP TABLE delivery_attempts;")
         .unwrap();
+    connection
+        .execute_batch(
+            "ALTER TABLE sessions DROP COLUMN observer_reason;
+             ALTER TABLE sessions DROP COLUMN notification_kind;",
+        )
+        .unwrap();
     connection.pragma_update(None, "user_version", 21).unwrap();
     drop(connection);
 

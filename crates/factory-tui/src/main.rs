@@ -398,7 +398,7 @@ fn sync_panes(
     debug_log: Option<&std::path::Path>,
 ) -> bool {
     let desired: Vec<SessionId> = board.desired_sessions();
-    let mut changed = false;
+    let mut changed = board.clear_undesired_attach_failures(&desired);
 
     let stale: Vec<SessionId> = panes
         .keys()
@@ -408,12 +408,34 @@ fn sync_panes(
     for session_id in stale {
         if let Some(mut pane) = panes.remove(&session_id) {
             pane.kill();
+            board.clear_local_attach_failure(&session_id);
             changed = true;
         }
     }
 
     for session_id in desired {
-        if panes.contains_key(&session_id) {
+        if let Some(pane) = panes.get_mut(&session_id) {
+            let failure = pane.attach_error().or_else(|| {
+                pane.has_exited()
+                    .then(|| "terminal connection closed".to_owned())
+            });
+            if let Some(error) = failure {
+                board.note_local_attach_failure(&session_id, &error);
+                if !board.take_attach_retry(&session_id) {
+                    continue;
+                }
+                if let Some(mut failed) = panes.remove(&session_id) {
+                    failed.kill();
+                }
+                changed = true;
+            } else {
+                if pane.is_ready() {
+                    board.clear_local_attach_failure(&session_id);
+                }
+                continue;
+            }
+        }
+        if !board.take_attach_retry(&session_id) {
             continue;
         }
         let Some(agent) = board.agent_for_pane_session(&session_id) else {
@@ -445,7 +467,10 @@ fn sync_panes(
                 panes.insert(session_id, pane);
                 changed = true;
             }
-            Err(error) => board.note_error(format!("couldn't attach {session_id}: {error}")),
+            Err(error) => {
+                board.note_local_attach_failure(&session_id, &error.to_string());
+                board.note_error(format!("couldn't attach {session_id}: {error}"));
+            }
         }
     }
 
@@ -704,8 +729,10 @@ fn apply_net_msg(
             tasks,
             runs,
             sessions,
+            event_sequence,
         } => {
             board.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
+            board.note_fleet_snapshot_sequence(event_sequence);
             if !*initial_project_applied {
                 if let Some(project_id) = initial_project {
                     board.focus_project(project_id.clone());
@@ -749,7 +776,7 @@ mod main_tests {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
 
-    use factory_core::local::{LocalResponse, ServerFrame};
+    use factory_core::local::{ErrorCode, LocalResponse, ServerFrame};
     use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
     use factoryctl::update::{Asset, Manifest, UpdateCheck};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -841,6 +868,87 @@ mod main_tests {
     }
 
     #[test]
+    fn bootstrap_message_carries_attention_high_water_to_delayed_status_admission() {
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut initial_project_applied = false;
+        apply_net_msg(
+            NetMsg::FleetSnapshot {
+                projects: Vec::new(),
+                agents: Vec::new(),
+                tasks: Vec::new(),
+                runs: Vec::new(),
+                sessions: Vec::new(),
+                event_sequence: 100,
+            },
+            &mut board,
+            None,
+            &mut initial_project_applied,
+        );
+        apply_net_msg(
+            NetMsg::FleetStatus(factory_core::status::FleetStatus {
+                generated_at_ms: 1,
+                event_sequence: 90,
+                auto_mode: true,
+                live_session_cap: 4,
+                live_sessions: 0,
+                projects: Vec::new(),
+                attention: vec![crate::test_fixtures::attention(
+                    factory_core::status::AttentionReasonKind::Inferred,
+                    None,
+                    None,
+                    None,
+                    1,
+                )],
+            }),
+            &mut board,
+            None,
+            &mut initial_project_applied,
+        );
+        assert!(board.attention_items().is_empty());
+    }
+
+    #[test]
+    fn newer_bootstrap_retires_status_that_arrived_first_from_refresh_worker() {
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut initial_project_applied = false;
+        apply_net_msg(
+            NetMsg::FleetStatus(factory_core::status::FleetStatus {
+                generated_at_ms: 1,
+                event_sequence: 90,
+                auto_mode: true,
+                live_session_cap: 4,
+                live_sessions: 0,
+                projects: Vec::new(),
+                attention: vec![crate::test_fixtures::attention(
+                    factory_core::status::AttentionReasonKind::Inferred,
+                    None,
+                    None,
+                    None,
+                    1,
+                )],
+            }),
+            &mut board,
+            None,
+            &mut initial_project_applied,
+        );
+        assert_eq!(board.attention_items().len(), 1);
+        apply_net_msg(
+            NetMsg::FleetSnapshot {
+                projects: Vec::new(),
+                agents: Vec::new(),
+                tasks: Vec::new(),
+                runs: Vec::new(),
+                sessions: Vec::new(),
+                event_sequence: 100,
+            },
+            &mut board,
+            None,
+            &mut initial_project_applied,
+        );
+        assert!(board.attention_items().is_empty());
+    }
+
+    #[test]
     fn silent_attach_ack_enters_typing_and_first_key_reaches_the_child_path() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("factory.sock");
@@ -922,6 +1030,95 @@ mod main_tests {
         let client = Client::new(&socket);
         let (tx, _rx) = mpsc::channel();
         apply_intent(first_key, &mut board, &client, &socket, &tx, &panes);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn asynchronous_attach_failure_is_actionable_and_retries_until_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut attach, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(attach.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
+                    "attach_terminal"
+                );
+                let frame = if attempt == 0 {
+                    ServerFrame::Response {
+                        protocol_version: PROTOCOL_VERSION,
+                        response: LocalResponse::Error {
+                            code: ErrorCode::NotFound,
+                            message: "runner temporarily unavailable".into(),
+                        },
+                    }
+                } else {
+                    ServerFrame::TerminalOutput {
+                        protocol_version: PROTOCOL_VERSION,
+                        session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                        offset: 0,
+                        bytes: String::new(),
+                    }
+                };
+                serde_json::to_writer(&mut attach, &frame).unwrap();
+                attach.write_all(b"\n").unwrap();
+                attach.flush().unwrap();
+                if attempt == 1 {
+                    release_rx.recv().unwrap();
+                }
+            }
+        });
+
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(factory_core::SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let mut panes = PaneMap::new();
+        sync_panes(&mut board, &mut panes, &socket, None);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while board.attention_items().is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            sync_panes(&mut board, &mut panes, &socket, None);
+        }
+        assert_eq!(
+            board.attention_items()[0].reason.kind,
+            factory_core::status::AttentionReasonKind::ObserverProblem
+        );
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 1,
+            event_sequence: 1,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert!(!board.attention_items().is_empty());
+
+        board.tick(1_001);
+        while !board.pane_ready && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            sync_panes(&mut board, &mut panes, &socket, None);
+        }
+        assert!(board.pane_ready);
+        assert!(board.attention_items().is_empty());
+        release_tx.send(()).unwrap();
         server.join().unwrap();
     }
 }
