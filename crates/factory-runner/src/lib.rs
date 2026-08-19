@@ -30,6 +30,7 @@ use factory_core::{
 use nix::sys::termios::LocalFlags;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rustix::fs::FlockOperation;
+use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::{
     Pid, Signal, WaitOptions, getpgid, kill_process, kill_process_group, setpgid,
     test_kill_process, test_kill_process_group, waitpid,
@@ -111,12 +112,27 @@ const TERMINAL_READ_CHUNK: usize = MAX_TERMINAL_OUTPUT_CHUNK_BYTES;
 const PTY_WRAPPER: &str = r#"
 sentinel_file=$1
 lease_file=$2
-shift 2
+lease_helper=$3
+shift 3
 exec 9>"$lease_file"
 (trap '' HUP TERM INT; trap 'exec 9>&-; exit 0' USR1; exec sleep 2147483647) &
 sentinel=$!
 printf '%s\n' "$sentinel" > "$sentinel_file"
-exec "$@"
+provider_pid=
+forward_term() {
+    kill -TERM "$provider_pid" 2>/dev/null || true
+    wait "$provider_pid"
+    status=$?
+    exec 9>&-
+    exit "$status"
+}
+trap forward_term HUP TERM INT
+"$lease_helper" --lease-exec "$lease_file" -- "$@" </dev/tty &
+provider_pid=$!
+wait "$provider_pid"
+status=$?
+exec 9>&-
+exit "$status"
 "#;
 
 #[derive(Debug, thiserror::Error)]
@@ -634,6 +650,26 @@ async fn append_encoded(
 pub async fn run(config: Config) -> Result<(), Error> {
     let (_runner_signal_tx, runner_signal_rx) = watch::channel(false);
     run_with_shutdown(config, runner_signal_rx).await
+}
+
+/// Acquires the PTY-session cleanup lease and then becomes the provider. This
+/// is a tiny runner-owned helper rather than a shell utility: macOS has no
+/// portable `flock` command, and merely inheriting an open descriptor does
+/// not create an advisory lock. Clearing close-on-exec before `exec` makes
+/// the lock part of the provider's actual descendant tree, including a
+/// `setsid` escape.
+pub fn lease_exec(path: PathBuf, program: PathBuf, arguments: Vec<String>) -> Result<(), Error> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    rustix::fs::flock(&file, FlockOperation::LockExclusive)
+        .map_err(|error| Error::Io(error.into()))?;
+    let flags = fcntl_getfd(&file).map_err(|error| Error::Io(error.into()))?;
+    fcntl_setfd(&file, flags.difference(FdFlags::CLOEXEC))
+        .map_err(|error| Error::Io(error.into()))?;
+    let error = std::process::Command::new(program).args(arguments).exec();
+    Err(Error::Io(error))
 }
 
 pub async fn run_with_shutdown(
@@ -1792,14 +1828,16 @@ async fn supervise_terminal(
     // `portable-pty` makes the direct child a session leader. The witness
     // therefore has to be created inside that session, rather than spawned
     // by the runner and moved into the provider's process group (which is
-    // forbidden across sessions). The provider remains foreground via exec;
-    // the sibling witness stays alive after it exits.
+    // forbidden across sessions). The wrapper explicitly waits/reaps the
+    // provider and its TERM trap waits through the caller's grace, so the
+    // inherited cleanup lease cannot be dropped while the provider remains.
     let sentinel_file = config.runtime_dir.join("pty-sentinel.pid");
     let lease_file = config.runtime_dir.join("pty-lease");
     let mut builder = CommandBuilder::new("/bin/sh");
     builder.args(["-c", PTY_WRAPPER, "--"]);
     builder.arg(&sentinel_file);
     builder.arg(&lease_file);
+    builder.arg(std::env::current_exe().map_err(Error::Io)?);
     builder.arg(&config.program);
     builder.args(&config.arguments);
     builder.cwd(&config.cwd);

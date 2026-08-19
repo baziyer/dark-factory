@@ -709,8 +709,10 @@ const SESSION_RESOLVE_CLEANUP_HELP: &str =
     "usage: factoryctl session resolve-cleanup --project ID --session ID
 
 Confirm, after independently checking the private provider runtime, that a
-cleanup-failed session has no remaining descendants. This terminalizes the
-session and releases the agent deletion guard.
+cleanup-failed session has no remaining descendants. The command reads the
+daemon-generated operator.token from DARK_FACTORY_HOME; provider hook tokens
+and raw local protocol requests cannot authorize this operation. This
+terminalizes the session and releases the agent deletion guard.
 
 Required:
   --project ID
@@ -2621,6 +2623,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         } => Ok(LocalRequest::ResolveSessionCleanup {
             project_id: parse_id(project_id, "project")?,
             session_id: parse_id(session_id, "session")?,
+            operator_token: operator_token()?,
         }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
         CliCommand::Events {
@@ -2647,6 +2650,18 @@ fn session_token() -> Result<String, String> {
     let token = token.trim().to_owned();
     if token.is_empty() {
         return Err("session token file is empty".into());
+    }
+    Ok(token)
+}
+
+fn operator_token() -> Result<String, String> {
+    let home = factory_core::paths::dark_factory_home()
+        .map_err(|error| format!("cannot resolve DARK_FACTORY_HOME: {error}"))?;
+    let token = std::fs::read_to_string(home.join("operator.token"))
+        .map_err(|error| format!("cannot read daemon operator token: {error}"))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err("daemon operator token is empty".into());
     }
     Ok(token)
 }

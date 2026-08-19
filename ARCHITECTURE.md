@@ -305,7 +305,11 @@ PTY runs; cleanup is event-driven during supervision and has no global
 `/bin/ps` polling hot path. The daemon's resolution check requires the
 recorded leader/group to be absent and the lease to be exclusively acquirable;
 permission errors, reused identities, held leases, and unprovable ownership
-fail closed.
+fail closed. Resolution also requires the daemon-generated, mode-0600
+`$DARK_FACTORY_HOME/operator.token`; a provider hook token or a raw local
+protocol frame is not operator authority. `StopRun` and `StopSession` share
+the same response boundary: neither acknowledges until the runner has
+published its terminal cleanup proof (or returns a durable cleanup conflict).
 
 ## Deliberately unresolved
 

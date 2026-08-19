@@ -12,6 +12,13 @@ async fn main() {
         println!("factory-runner {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    if let Some((lease, program, arguments)) = lease_exec_arguments() {
+        if let Err(error) = factory_runner::lease_exec(lease, program, arguments) {
+            eprintln!("factory-runner: {error}");
+            process::exit(1);
+        }
+        return;
+    }
     let result = match parse_arguments() {
         Ok(config) => run_config(config).await,
         Err(error) => Err(error),
@@ -20,6 +27,19 @@ async fn main() {
         eprintln!("factory-runner: {error}");
         process::exit(1);
     }
+}
+
+fn lease_exec_arguments() -> Option<(PathBuf, PathBuf, Vec<String>)> {
+    let mut arguments = env::args().skip(1);
+    if arguments.next().as_deref() != Some("--lease-exec") {
+        return None;
+    }
+    let lease = PathBuf::from(arguments.next()?);
+    if arguments.next().as_deref() != Some("--") {
+        return None;
+    }
+    let program = PathBuf::from(arguments.next()?);
+    Some((lease, program, arguments.collect()))
 }
 
 fn version_requested(mut arguments: impl Iterator<Item = String>) -> bool {

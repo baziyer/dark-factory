@@ -45,9 +45,14 @@ visible as a cleanup failure across daemon restart. Tests must exercise that
 state through recovery and resolve it only through the explicit operator
 verification API after checking the fixture's private runtime; the API checks
 the durable runner evidence, absent leader/group, and free descendant lease,
-not a caller-supplied assertion. Process-sensitive tests also audit and remove
-only runners descended from their own temporary runtime at teardown; they
-must not use process-name or host-wide signalling.
+not a caller-supplied assertion. The API requires the daemon-generated
+`$DARK_FACTORY_HOME/operator.token`; a provider hook token and raw local
+protocol frame are deliberately insufficient. PTY providers execute through
+the runner's lease-locking wrapper, which waits/reaps the actual provider and
+preserves TERM grace; a double-fork/`setsid` descendant retaining the lease
+prevents `Exited` rather than being guessed away. Process-sensitive tests
+also audit and remove only runners descended from their own temporary runtime
+at teardown; they must not use process-name or host-wide signalling.
 
 ### Developing the daemon without disrupting a running factory
 

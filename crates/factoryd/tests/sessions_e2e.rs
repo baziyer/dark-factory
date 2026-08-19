@@ -1123,6 +1123,55 @@ fn stop_session_closes_the_open_episode_and_cancels_the_task() {
     daemon.stop();
 }
 
+#[test]
+fn stop_run_response_waits_for_the_shared_session_cleanup_boundary() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    create_shell_agent(&client, "curie");
+    create_task(&client, "task-1", "Slow (sleep:20)", "stop by run");
+    assign_task(&client, "task-1", "curie");
+    wait_for_session_state(&client, "curie", SessionState::Working);
+    let run = list_runs(&client)
+        .into_iter()
+        .find(|run| {
+            run.task_id
+                .as_ref()
+                .is_some_and(|id| id.as_str() == "task-1")
+        })
+        .expect("working run");
+
+    let stopped = client
+        .request(LocalRequest::StopRun {
+            project_id: project_id(),
+            run_id: run.id.clone(),
+            grace_ms: 2_000,
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            stopped,
+            ServerFrame::Response {
+                response: LocalResponse::RunStopped { .. },
+                ..
+            }
+        ),
+        "unexpected StopRun response: {stopped:?}"
+    );
+    let session = session_by_agent(&client, "curie").expect("session after StopRun");
+    assert!(
+        !session.state.is_live(),
+        "StopRun must not acknowledge before its shared session cleanup boundary"
+    );
+    assert_eq!(
+        wait_for_task_status(&client, "task-1", TaskStatus::Cancelled)
+            .snapshot
+            .status,
+        TaskStatus::Cancelled
+    );
+    daemon.stop();
+}
+
 // --- (e) restart: a live session survives a daemon restart (D7) --------
 
 #[test]
@@ -1209,6 +1258,10 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
     wait_for_task_status(&client, "abrupt-loss-task", TaskStatus::Succeeded);
     let before = wait_for_session_state(&client, "curie", SessionState::Idle);
     let runtime = home.path().join("runs").join(before.id.as_str());
+    let hook_token = std::fs::read_to_string(runtime.join("hook.token"))
+        .unwrap()
+        .trim()
+        .to_owned();
     let runner_pid = runner_pid_for_runtime(&runtime);
     let provider_group = started_group_for_runtime(&runtime);
 
@@ -1250,6 +1303,42 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
         }
     ));
 
+    let late_hook = client
+        .request(LocalRequest::ProviderHook {
+            token: hook_token,
+            event: factory_core::ProviderHookEvent::UserPromptSubmit,
+            payload: serde_json::json!({}),
+        })
+        .unwrap();
+    assert!(matches!(
+        late_hook,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: factory_core::local::ErrorCode::Conflict,
+                ..
+            },
+            ..
+        }
+    ));
+
+    let unauthorized = client
+        .request(LocalRequest::ResolveSessionCleanup {
+            project_id: project_id(),
+            session_id: blocked.id.clone(),
+            operator_token: "wrong-operator-token".into(),
+        })
+        .unwrap();
+    assert!(matches!(
+        unauthorized,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: factory_core::local::ErrorCode::Conflict,
+                ..
+            },
+            ..
+        }
+    ));
+
     // Resolve only after the private provider group is actually gone. The
     // daemon's ResolveSessionCleanup path independently checks the recorded
     // identity and inherited lease; this test does not supply either as a
@@ -1260,6 +1349,10 @@ fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
         .request(LocalRequest::ResolveSessionCleanup {
             project_id: project_id(),
             session_id: blocked.id.clone(),
+            operator_token: std::fs::read_to_string(home.path().join("operator.token"))
+                .unwrap()
+                .trim()
+                .to_owned(),
         })
         .unwrap();
     assert!(matches!(

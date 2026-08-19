@@ -2205,6 +2205,18 @@ impl Store {
         self.session_control_target(project_id, &session_id)
     }
 
+    /// The runner's control protocol is session-addressed even when the
+    /// operator selected a task-episode run. Keep that translation beside
+    /// `run_control_target` so StopRun cannot accidentally send the episode
+    /// id to a resident runner and claim the shared cleanup completed.
+    pub fn run_control_id(&self, project_id: &ProjectId, run_id: &RunId) -> Result<RunId> {
+        let run = load_run(&self.connection, run_id)?
+            .filter(|run| run.project_id == *project_id)
+            .ok_or(StoreError::RunNotFound)?;
+        let session_id = run.session_id.ok_or(StoreError::SessionNotFound)?;
+        RunId::try_from(session_id.as_str()).map_err(|_| StoreError::InvalidExecutionMetadata)
+    }
+
     // --- Task episodes (runs) ------------------------------------------
 
     /// Opens a task-episode inside a live session: the task moves

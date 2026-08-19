@@ -373,6 +373,8 @@ pub enum LocalRequest {
     ResolveSessionCleanup {
         project_id: ProjectId,
         session_id: SessionId,
+        /// A daemon-generated operator secret, never a provider hook token.
+        operator_token: String,
     },
     /// One `factoryctl hook` invocation, forwarded verbatim from a
     /// provider's hook subprocess. `token` is the contents of the session's

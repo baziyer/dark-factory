@@ -17,6 +17,7 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct DaemonState {
     store: Arc<Mutex<Store>>,
     events: broadcast::Sender<EventEnvelope>,
+    operator_token: Arc<str>,
     /// One outstanding-delivery slot per agent, shared by every delivery
     /// path (`execution.rs`'s `deliver_pending`, `Handle::start_task`, and
     /// `stop_hook_reply`): whichever composes a delivery first holds the
@@ -72,14 +73,25 @@ pub enum DaemonStateError {
 impl DaemonState {
     #[must_use]
     pub fn new(store: Store) -> Self {
+        Self::with_operator_token(store, "test-operator-token".to_owned())
+    }
+
+    #[must_use]
+    pub fn with_operator_token(store: Store, operator_token: String) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         Self {
             store: Arc::new(Mutex::new(store)),
             events,
+            operator_token: Arc::from(operator_token),
             delivery_slots: Arc::new(Mutex::new(HashMap::new())),
             assignment_gate: Arc::new(AsyncMutex::new(())),
             repository_slot: Arc::new(AsyncMutex::new(())),
         }
+    }
+
+    #[must_use]
+    pub fn operator_token_matches(&self, provided: &str) -> bool {
+        crate::store::constant_time_eq(self.operator_token.as_bytes(), provided.as_bytes())
     }
 
     pub async fn repository_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
@@ -230,5 +242,16 @@ mod tests {
         assert!(!waiter.is_finished());
         drop(delivery);
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn operator_cleanup_secret_is_exact_and_constant_time_compared() {
+        let state = DaemonState::with_operator_token(
+            Store::open_in_memory().unwrap(),
+            "operator-secret".into(),
+        );
+        assert!(state.operator_token_matches("operator-secret"));
+        assert!(!state.operator_token_matches("wrong-secret"));
+        assert!(!state.operator_token_matches("operator-secret-extra"));
     }
 }

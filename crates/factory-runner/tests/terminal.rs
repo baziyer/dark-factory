@@ -22,7 +22,10 @@ use factory_core::{
         encode_terminal_bytes,
     },
 };
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::{
+    fs::FlockOperation,
+    process::{Pid, Signal, kill_process, kill_process_group},
+};
 
 const RUN_ID: &str = "run-terminal-1";
 const INSTANCE_ID: &str = "instance-terminal-1";
@@ -711,6 +714,58 @@ fn natural_leader_exit_reaps_a_well_behaved_descendant_without_the_old_multi_sec
         },
     ));
     runner.wait_for_clean_exit();
+}
+
+/// A provider can escape the PTY process group with a fast double-fork and
+/// `setsid`. The runner must not publish `Exited` from the numeric PGID alone:
+/// the escaped child retains the private lease, so cleanup fails closed until
+/// the exact fixture-owned PID is removed. This is intentionally short and
+/// kills only the PID written inside this test's private runtime.
+#[test]
+fn setsid_escape_during_term_fails_closed_without_a_false_exited_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("escaped.pid");
+    let runner = RunningTerminalRunner::spawn(
+        Path::new("/bin/sh"),
+        &[
+            "-c",
+            "perl -MPOSIX -e 'exit if fork; POSIX::setsid(); open F, \">\", $ARGV[0]; print F \"$$\\n\"; close F; exec \"sleep\", \"30\"' \"$1\"; while :; do sleep 1; done",
+            "sh",
+            marker.to_str().unwrap(),
+        ],
+        80,
+        24,
+    );
+    wait_for_path(&marker);
+    let escaped = fs::read_to_string(&marker)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(runner.runtime.join("pty-lease"))
+        .unwrap();
+    assert!(
+        rustix::fs::flock(&lease, FlockOperation::NonBlockingLockExclusive).is_err(),
+        "the provider must hold the private cleanup lease"
+    );
+    assert_command_ack(request(
+        &runner,
+        RunnerRequest::Stop {
+            command_id: "stop-setsid-escape".into(),
+            grace_ms: 100,
+        },
+    ));
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        !spool_events(&runner)
+            .iter()
+            .any(|event| matches!(event, RunnerEvent::Exited { .. })),
+        "a setsid escape must not be reported as clean PTY exit"
+    );
+    kill_process(Pid::from_raw(escaped).unwrap(), Signal::KILL).unwrap();
 }
 
 fn spool_events(runner: &RunningTerminalRunner) -> Vec<RunnerEvent> {

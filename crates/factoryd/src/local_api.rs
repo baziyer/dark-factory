@@ -58,7 +58,10 @@ use crate::{
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
-const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
+// A caller may request the full 60-second runner grace. Allow that grace,
+// group reap, and the short terminal-output drain to finish before claiming
+// the shared StopRun/StopSession operation completed.
+const STOP_COMPLETION_TIMEOUT: Duration = Duration::from_secs(75);
 const STOP_COMPLETION_POLL: Duration = Duration::from_millis(100);
 
 enum RepositoryRequest {
@@ -1501,12 +1504,14 @@ async fn handle_request(
             }
             let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
-            let target = state
+            let (target, control_run_id) = state
                 .with_store(move |store| {
-                    store.run_control_target(&lookup_project_id, &lookup_run_id)
+                    Ok((
+                        store.run_control_target(&lookup_project_id, &lookup_run_id)?,
+                        store.run_control_id(&lookup_project_id, &lookup_run_id)?,
+                    ))
                 })
                 .await?;
-            let control_run_id = run_id.clone();
             RunnerClient::new(
                 &target.runner_runtime,
                 control_run_id,
@@ -1533,16 +1538,18 @@ async fn handle_request(
             // `stopped`/`operator_stop` (TRACK5-DESIGN.md §6).
             if let Some(session_id) = run.session_id.clone() {
                 let session_project_id = project_id.clone();
-                let _ = state
+                let request_session_id = session_id.clone();
+                state
                     .commit_and_publish(move |store| {
                         let (session, event) = store.request_session_stop(
                             &session_project_id,
-                            &session_id,
+                            &request_session_id,
                             now_ms()?,
                         )?;
                         Ok((session, vec![event]))
                     })
-                    .await;
+                    .await?;
+                wait_for_session_stop(state, &project_id, &session_id).await?;
             }
             Ok(LocalResponse::RunStopped { run_id })
         }
@@ -1688,7 +1695,13 @@ async fn handle_request(
         LocalRequest::ResolveSessionCleanup {
             project_id,
             session_id,
+            operator_token,
         } => {
+            if !state.operator_token_matches(&operator_token) {
+                return Err(ApiFailure::Conflict(
+                    "cleanup resolution requires the daemon operator token".into(),
+                ));
+            }
             let target = state
                 .with_store({
                     let project_id = project_id.clone();

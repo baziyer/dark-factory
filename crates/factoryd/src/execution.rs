@@ -1727,15 +1727,17 @@ async fn supervise_child(
             end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
         }
         None => {
-            let status = wait_status.ok();
-            if status.is_some_and(|status| !status.success()) {
-                mark_recovered_cleanup_failed(
-                    &state,
-                    &session_id,
-                    "runner exited before durable cleanup proof".to_owned(),
-                )
-                .await;
-            }
+            // An Exited event is the runner's durable proof that its own
+            // cleanup boundary completed. A child exit status is not that
+            // proof: the runner can disappear cleanly, be SIGKILLed, or
+            // lose its socket before publishing Exited. Keep the session
+            // live and deletion-blocked for every such loss.
+            let reason = if wait_status.is_ok() {
+                "runner exited before durable cleanup proof"
+            } else {
+                "runner wait failed before durable cleanup proof"
+            };
+            mark_recovered_cleanup_failed(&state, &session_id, reason.to_owned()).await;
         }
     }
 }

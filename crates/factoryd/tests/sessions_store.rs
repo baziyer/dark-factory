@@ -317,6 +317,37 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     assert_eq!(violations, 0);
 }
 
+#[test]
+fn migration_0022_runs_both_model_policy_and_cleanup_steps() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("schema-22.db");
+    drop(Store::open(&database).unwrap());
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN cleanup_state;
+                 PRAGMA user_version = 22;",
+            )
+            .unwrap();
+    }
+
+    drop(Store::open(&database).unwrap());
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 24);
+    connection
+        .prepare("SELECT reasoning_effort, model_selection_reason FROM agent_profiles")
+        .unwrap();
+    connection
+        .prepare("SELECT cleanup_state FROM sessions")
+        .unwrap();
+}
+
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s
 /// original `sessions` shape) with one pre-existing session row whose
 /// `last_hook_event` is a value 0014 already allowed (`'stop'`), then

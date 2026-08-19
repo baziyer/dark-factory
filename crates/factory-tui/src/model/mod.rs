@@ -107,6 +107,10 @@ pub struct Board {
     pub dev_local_pty: bool,
     pub now_ms: i64,
     pub theme: Theme,
+    /// The daemon-created operator secret is loaded once from the same home
+    /// as the socket; cleanup resolution cannot be forged by a raw board
+    /// request or a provider hook token.
+    pub(crate) operator_token: Option<String>,
 
     pub connection: Connection,
     pub connection_detail: Option<String>,
@@ -162,6 +166,7 @@ impl Board {
             dev_local_pty,
             now_ms,
             theme,
+            operator_token: load_operator_token(),
             connection: Connection::Connecting,
             connection_detail: None,
             update_available: None,
@@ -1118,6 +1123,13 @@ impl Board {
                     .is_none_or(|created_at_ms| created_at_ms == agent.created_at_ms)
         })
     }
+}
+
+fn load_operator_token() -> Option<String> {
+    let home = factory_core::paths::dark_factory_home().ok()?;
+    let token = std::fs::read_to_string(home.join("operator.token")).ok()?;
+    let token = token.trim().to_owned();
+    (!token.is_empty()).then_some(token)
 }
 
 fn truncate_status(text: &str, max: usize) -> String {
