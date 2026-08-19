@@ -109,31 +109,44 @@ impl<T> RingBuffer<T> {
 // Activity sparklines
 // ---------------------------------------------------------------------------------------------
 
-/// Width (in minutes) of one activity bucket. "Events per minute" per the design brief.
-const ACTIVITY_BUCKET_MS: i64 = 60_000;
-/// How many one-minute buckets of history each agent's sparkline retains.
-const ACTIVITY_WINDOW: usize = 30;
+/// Width of one short-horizon activity bucket. Durable hook/tool events land in this series;
+/// time-only rolling never adds activity.
+pub const ACTIVITY_BUCKET_MS: i64 = 5_000;
+/// How many five-second buckets of history each agent's sparkline retains.
+const ACTIVITY_WINDOW: usize = 12;
+/// Number of recent buckets shown in BUILDING. At five seconds per bucket this is a 40-second
+/// visible horizon, while the series retains another four buckets for smooth aging at the edge.
+pub const ACTIVITY_VISIBLE_BUCKETS: usize = 8;
 
-/// A rolling per-minute event count for one agent, rendered as a braille sparkline. A stand-in
+/// A rolling five-second event count for one agent, rendered as a braille sparkline. A stand-in
 /// for a real tokens/turns series until session-level per-turn accounting exists.
 #[derive(Debug, Default)]
 pub struct ActivitySeries {
-    /// `(bucket_start_ms, count)`, oldest first, one entry per minute.
-    buckets: VecDeque<(i64, u32)>,
+    /// `(bucket_start_ms, count)`, oldest first, one entry per five seconds.
+    buckets: VecDeque<(i64, u64)>,
 }
 
 impl ActivitySeries {
     /// Advances the window so the newest bucket covers `at_ms`, without incrementing anything.
-    /// Called on every UI tick so idle agents' sparklines still slide forward in real time.
+    /// Called on the UI's ordinary elapsed-time tick so idle agents' sparklines age honestly.
+    /// Large idle gaps are collapsed rather than iterated through one bucket at a time.
     pub fn roll_to(&mut self, at_ms: i64) {
-        let bucket_start = at_ms - at_ms.rem_euclid(ACTIVITY_BUCKET_MS);
+        let bucket_start = at_ms.div_euclid(ACTIVITY_BUCKET_MS) * ACTIVITY_BUCKET_MS;
         match self.buckets.back() {
             None => self.buckets.push_back((bucket_start, 0)),
             Some(&(last_start, _)) if bucket_start > last_start => {
-                let mut next = last_start;
-                while next < bucket_start {
-                    next += ACTIVITY_BUCKET_MS;
-                    self.buckets.push_back((next, 0));
+                let steps = bucket_start
+                    .saturating_sub(last_start)
+                    .checked_div(ACTIVITY_BUCKET_MS)
+                    .unwrap_or(ACTIVITY_WINDOW as i64);
+                if steps >= ACTIVITY_WINDOW as i64 {
+                    self.buckets.clear();
+                    self.buckets.push_back((bucket_start, 0));
+                } else {
+                    for step in 1..=steps {
+                        self.buckets
+                            .push_back((last_start + step * ACTIVITY_BUCKET_MS, 0));
+                    }
                 }
             }
             _ => {}
@@ -143,23 +156,20 @@ impl ActivitySeries {
         }
     }
 
-    /// Records one event at `at_ms`, rolling the window forward first if needed. An event whose
+    /// Records one durable event at `at_ms`, rolling the window forward first if needed. An event whose
     /// timestamp lands before the current bucket (clock skew, replayed history) is folded into
     /// the newest bucket rather than rolling backward.
     pub fn record(&mut self, at_ms: i64) {
         self.roll_to(at_ms);
         if let Some(last) = self.buckets.back_mut() {
-            last.1 += 1;
+            last.1 = last.1.saturating_add(1);
         }
     }
 
     /// Bucket counts, oldest first, suitable for a sparkline.
     #[must_use]
     pub fn counts(&self) -> Vec<u64> {
-        self.buckets
-            .iter()
-            .map(|&(_, count)| u64::from(count))
-            .collect()
+        self.buckets.iter().map(|&(_, count)| count).collect()
     }
 }
 
@@ -186,7 +196,7 @@ pub fn braille_sparkline(counts: &[u64], width: usize) -> String {
         let level = if max == 0 {
             0
         } else {
-            ((count.saturating_mul(7) + max / 2) / max).min(7) as usize
+            ((u128::from(count) * 7 + u128::from(max) / 2) / u128::from(max)).min(7) as usize
         };
         out.push(BRAILLE_LEVELS[level]);
     }
@@ -253,11 +263,11 @@ mod tests {
     }
 
     #[test]
-    fn activity_series_buckets_events_per_minute() {
+    fn activity_series_buckets_events_per_five_seconds() {
         let mut series = ActivitySeries::default();
         series.record(0);
-        series.record(30_000);
-        series.record(65_000);
+        series.record(4_999);
+        series.record(5_000);
         let counts = series.counts();
         assert_eq!(counts, vec![2, 1]);
     }
@@ -272,12 +282,44 @@ mod tests {
     }
 
     #[test]
+    fn activity_series_folds_clock_skew_without_rolling_back() {
+        let mut series = ActivitySeries::default();
+        series.record(10_000);
+        series.record(5_000);
+        assert_eq!(series.counts(), vec![2]);
+    }
+
+    #[test]
+    fn activity_series_collapses_long_idle_gaps() {
+        let mut series = ActivitySeries::default();
+        series.record(0);
+        series.roll_to(1_000_000_000);
+        assert_eq!(series.counts(), vec![0]);
+    }
+
+    #[test]
     fn activity_series_caps_window_length() {
         let mut series = ActivitySeries::default();
-        for minute in 0..(ACTIVITY_WINDOW as i64 + 10) {
-            series.record(minute * ACTIVITY_BUCKET_MS);
+        for bucket in 0..(ACTIVITY_WINDOW as i64 + 10) {
+            series.record(bucket * ACTIVITY_BUCKET_MS);
         }
         assert_eq!(series.counts().len(), ACTIVITY_WINDOW);
+    }
+
+    #[test]
+    fn activity_series_saturates_high_event_rates() {
+        let mut series = ActivitySeries::default();
+        series.buckets.push_back((0, u64::MAX));
+        series.record(0);
+        assert_eq!(series.counts(), vec![u64::MAX]);
+    }
+
+    #[test]
+    fn braille_sparkline_renders_saturated_counts_without_overflow() {
+        assert_eq!(
+            braille_sparkline(&[u64::MAX], 1),
+            BRAILLE_LEVELS[7].to_string()
+        );
     }
 
     #[test]

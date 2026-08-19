@@ -70,6 +70,195 @@ fn project_deleted_event_clears_scoped_state_and_refocuses() {
 }
 
 #[test]
+fn fleet_snapshot_prunes_removed_agents_and_resets_reused_ids() {
+    let mut b = board();
+    let alice = AgentId::try_from("alice").unwrap();
+    let bob = AgentId::try_from("bob").unwrap();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0), project("b", 1)],
+        vec![
+            agent("alice", "a", AgentRole::Worker, None),
+            agent("bob", "b", AgentRole::Worker, None),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    for (sequence, session_id, agent_id, project_id) in
+        [(1, "sess-a", "alice", "a"), (2, "sess-b", "bob", "b")]
+    {
+        b.apply_event(EventEnvelope {
+            protocol_version: 1,
+            sequence,
+            occurred_at_ms: 0,
+            event: FactoryEvent::SessionChanged {
+                session: session(session_id, agent_id, project_id, SessionState::Working),
+            },
+        });
+    }
+    b.apply_fleet_snapshot(
+        vec![project("b", 1)],
+        vec![agent("alice", "b", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(
+        !b.activity.contains_key(&bob),
+        "removed agents must be pruned"
+    );
+    assert!(
+        !b.activity.contains_key(&alice),
+        "an id reused by another project must not inherit old history"
+    );
+
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 3,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-new", "alice", "b", SessionState::Working),
+        },
+    });
+    assert_eq!(b.activity[&alice].counts(), vec![1]);
+}
+
+#[test]
+fn fleet_snapshot_resets_same_project_agent_generation() {
+    let alice = AgentId::try_from("alice").unwrap();
+    let mut old_alice = agent("alice", "a", AgentRole::Worker, None);
+    old_alice.created_at_ms = 100;
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![old_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 100,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-old", "alice", "a", SessionState::Working),
+        },
+    });
+
+    let mut recreated_alice = agent("alice", "a", AgentRole::Worker, None);
+    recreated_alice.created_at_ms = 200;
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![recreated_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    assert!(
+        !b.activity.contains_key(&alice),
+        "a recreated agent must not inherit its predecessor's same-project history"
+    );
+
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 200,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-new", "alice", "a", SessionState::Working),
+        },
+    });
+    assert_eq!(b.activity[&alice].counts(), vec![1]);
+}
+
+#[test]
+fn snapshot_then_replay_rejects_predecessor_generation_activity() {
+    let alice = AgentId::try_from("alice").unwrap();
+    let mut current_alice = agent("alice", "a", AgentRole::Worker, None);
+    current_alice.created_at_ms = 5_000;
+    let mut b = Board::new(false, 10_000, crate::theme::FORTRESS);
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![current_alice],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1_000,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-old", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert!(
+        !b.activity.contains_key(&alice),
+        "predecessor replay activity must not be assigned to the current generation"
+    );
+
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 2,
+        occurred_at_ms: 5_000,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-current", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert_eq!(b.activity[&alice].counts().iter().sum::<u64>(), 1);
+}
+
+#[test]
+fn project_deleted_removes_replayed_project_activity() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0), project("b", 1)],
+        vec![
+            agent("alice", "a", AgentRole::Worker, None),
+            agent("bob", "b", AgentRole::Worker, None),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_replay(vec![
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 0,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-a", "alice", "a", SessionState::Working),
+            },
+        },
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 2,
+            occurred_at_ms: 0,
+            event: FactoryEvent::SessionChanged {
+                session: session("sess-b", "bob", "b", SessionState::Working),
+            },
+        },
+        EventEnvelope {
+            protocol_version: 1,
+            sequence: 3,
+            occurred_at_ms: 1,
+            event: FactoryEvent::ProjectDeleted {
+                project_id: ProjectId::try_from("a").unwrap(),
+            },
+        },
+    ]);
+    assert!(
+        !b.activity
+            .contains_key(&AgentId::try_from("alice").unwrap()),
+        "project deletion must remove every owned activity series"
+    );
+    assert_eq!(
+        b.activity[&AgentId::try_from("bob").unwrap()].counts(),
+        vec![1]
+    );
+}
+
+#[test]
 fn session_changed_event_updates_the_sessions_map() {
     let mut b = board();
     b.apply_fleet_snapshot(
@@ -317,6 +506,14 @@ fn apply_replay_then_a_live_redelivery_of_the_same_event_does_not_duplicate() {
         1,
         "the same event id (sequence) must never announce twice"
     );
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()]
+            .counts()
+            .iter()
+            .sum::<u64>(),
+        1,
+        "the same event id must not inflate the activity signal"
+    );
 }
 
 #[test]
@@ -347,6 +544,98 @@ fn apply_replay_feeds_the_activity_sparkline() {
         counts.iter().sum::<u64>(),
         1,
         "the sparkline's data source must be fed from replayed events too (#70)"
+    );
+}
+
+#[test]
+fn successive_durable_activity_events_are_visible_in_short_horizon_buckets() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    let event = |sequence, occurred_at_ms| EventEnvelope {
+        protocol_version: 1,
+        sequence,
+        occurred_at_ms,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    };
+    b.apply_event(event(1, 0));
+    b.tick(4_999);
+    b.apply_event(event(2, 4_999));
+    b.tick(5_000);
+    b.apply_event(event(3, 5_000));
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![2, 1],
+        "durable events should update adjacent five-second buckets immediately"
+    );
+    b.tick(65_000);
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![0],
+        "a silent agent should age out without invented activity"
+    );
+}
+
+#[test]
+fn replayed_activity_is_aged_against_the_current_board_clock() {
+    let mut b = Board::new(false, 10_000, crate::theme::FORTRESS);
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_replay(vec![EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 0,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    }]);
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![1, 0, 0],
+        "replay should preserve recent history instead of making old activity current"
+    );
+}
+
+#[test]
+fn future_dated_activity_is_clamped_and_expires_from_board_time() {
+    let mut b = board();
+    b.apply_fleet_snapshot(
+        vec![project("a", 0)],
+        vec![agent("alice", "a", AgentRole::Worker, None)],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    );
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 60_000,
+        event: FactoryEvent::SessionChanged {
+            session: session("sess-1", "alice", "a", SessionState::Working),
+        },
+    });
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![1],
+        "future skew should be clamped into the current board bucket"
+    );
+    b.tick(60_000);
+    assert_eq!(
+        b.activity[&AgentId::try_from("alice").unwrap()].counts(),
+        vec![0],
+        "future activity must age out on board time instead of pinning a live bar"
     );
 }
 
