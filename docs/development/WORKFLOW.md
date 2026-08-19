@@ -363,7 +363,9 @@ them.
    `factoryctl health` also returns the daemon's `version`.
 3. **Install**: `factoryctl update --install` and the TUI action call one
    shared transaction. It first does every read-only
-   check (the manifest; the launchd job, if any, and that it runs with
+   check (a canonical stable `MAJOR.MINOR.PATCH` manifest with bounded safe
+   asset fields and exact lowercase SHA-256 digests; the launchd job, if any,
+   and that it runs with
    *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
    moving the operator's job), then downloads the platform asset, verifies
    its SHA-256, unpacks it into `$DARK_FACTORY_HOME/bin/<version>/` (staged,
@@ -384,6 +386,9 @@ them.
    strand itself against an old independently managed daemon. Its bounded
    status reports stages from inside the download, SHA verification, unpack,
    activation, job reload, and exact-version health operations.
+   A complete version directory is reusable only with a private identity file
+   matching the release archive digest and fresh hashes of all four executable
+   bytes; mode-only or same-version substitutions are refused.
 4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
    an update never needs a separate migration step.
 5. **No lost work**: sessions and runners are independent process trees
@@ -406,14 +411,23 @@ them.
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
    so a rollback never re-downloads.
    After a successful TUI install, the viewer validates and execs the exact
-   active `$DARK_FACTORY_HOME/bin/current/factory-tui`, retaining its PID and
-   restoring the focused project, selected agent, BUILDING/AGENT view, and
-   maximized-terminal intent from the next durable snapshot. Before exec it
-   closes only local attach panes and restores the host terminal. If exec
+   digest-proven `$DARK_FACTORY_HOME/bin/<version>/factory-tui` returned by
+   that transaction, never a second mutable `bin/current` lookup, retaining
+   its PID and restoring the focused project, selected agent, BUILDING/AGENT
+   view, and maximized-terminal intent from the next durable snapshot. Before
+   exec it closes only local attach panes and restores the host terminal. If exec
    preparation or exec itself returns an error, the shared rollback plan
    restores the prior runtime and launchd job, verifies the old daemon's exact
    version, and leaves the old board running with one actionable error. Runner
    and provider processes are not children of the viewer and are untouched.
+   The transaction keeps the shared runtime-mutation lock through this exec
+   seam. Normal keyboard/mouse detach is delayed and the update worker is
+   joined. Before activation and at reload/health boundaries it atomically
+   records the prior runtime/job in a private recovery file. On next viewer
+   start, pre-health phases roll back and verify the exact old managed daemon;
+   an awaiting-relaunch phase is committed only if the exact new daemon is
+   healthy. Download-only interruption has not mutated the runtime and its
+   staging directory is replaced on the next attempt.
 7. **Homebrew bootstrap substrate**: this repository renders the exact
    custom-tap formula from the two archive checksums and the update-manifest
    checksum, then publishes it as `dark-factory.rb`. The versioned manifest

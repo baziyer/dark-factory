@@ -29,7 +29,9 @@ catalogue.
 3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
    either one cannot change the lifetime of an agent. A manual TUI update uses
    the same verified active-runtime transaction as `factoryctl`, then execs
-   only the viewer after exact daemon health succeeds; local attach panes are
+   only the digest-verified immutable version-directory viewer after exact
+   daemon health succeeds; the mutation lock spans that seam and a private
+   phase record makes a crashed handoff recoverable. Local attach panes are
    closed, but runner and provider process identities are unchanged.
 4. A **session**, not a run, is the unit `factory-runner` supervises: one
    resident, interactive provider process per agent (Claude Code, Codex, or

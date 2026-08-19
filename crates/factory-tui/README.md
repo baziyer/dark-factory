@@ -98,8 +98,11 @@ operation as `factoryctl capacity set`; it restarts only `factoryd` and keeps
 runner sessions alive. See the [main README](../../README.md) for setup and
 first use. The `u` action is manual and uses the same verified install and
 rollback transaction as `factoryctl update --install`; after daemon health is
-confirmed it execs the exact active `factory-tui`, preserving this viewer PID
-and its current project/screen intent without restarting provider sessions.
+confirmed it execs the exact digest-verified version-directory `factory-tui`,
+preserving this viewer PID and its current project/screen intent without
+restarting provider sessions.
+Detach is delayed until the joined update worker reaches a safe handoff; a
+private phase record makes an abnormal viewer exit recoverable on next start.
 
 Mouse clicks select the same agents, tasks, attention rows, and queue rows as
 keyboard navigation. Press `Enter` or `i` to focus typing in an attached

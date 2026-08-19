@@ -191,16 +191,25 @@ When the board shows `[u update vX.Y.Z]`, press `u` or click that exact action
 to run the same verified install transaction without leaving the TUI. The
 board reports download, verification, unpack, activation, reload, and health
 progress, then replaces only its own process image with the active
-`factory-tui`. Its PID and current project/screen selection are retained;
-daemon-supervised runners and provider sessions are not restarted. This is a
-manual action: Dark Factory does not auto-update. If relaunch preparation or
-exec fails, the active runtime and managed launchd job are rolled back and the
-old TUI remains available with the error. An older viewer still offers the
-action when the matching runtime was already installed from `factoryctl`.
+release's digest-verified version-directory `factory-tui` (never a later
+`bin/current` lookup). Its PID and current project/screen selection are
+retained; daemon-supervised runners and provider sessions are not restarted.
+This is a manual action: Dark Factory does not auto-update. If relaunch
+preparation or exec fails, the active runtime and managed launchd job are
+rolled back and the old TUI remains available with the error. An older viewer
+still offers the action when the matching runtime was already installed from
+`factoryctl`.
+Detach is delayed while this transaction owns the runtime. A private durable
+phase record lets the next viewer roll back a crash-interrupted mutation, or
+commit a handoff only when the exact new managed daemon is already healthy.
 
 `factoryctl update` reports the invoking bootstrap, active runtime, latest
 release, and install availability in human-readable lines. Use
 `factoryctl update --json` for the machine-readable report.
+Fetched and cached manifests accept only canonical stable `MAJOR.MINOR.PATCH`
+versions, bounded safe asset fields, and exact lowercase SHA-256 digests.
+Reusing an installed release requires both its archive identity and every
+binary digest to match; executable-looking modified files are refused.
 
 `brew uninstall dark-factory` removes only the bootstrap. The active runtime,
 launchd job, and state remain. See the [service and uninstall
