@@ -14,6 +14,7 @@ import tty
 factoryctl = os.environ.get("DARK_FACTORY_FACTORYCTL", "factoryctl")
 token = os.environ["DARK_FACTORY_SESSION_TOKEN_FILE"]
 stop_delay = float(os.environ.get("SHELL_AGENT_STOP_DELAY", "0"))
+prompt_log = os.path.join(os.path.dirname(token), "shell-agent-prompts.jsonl")
 
 
 def hook(event, payload):
@@ -52,7 +53,10 @@ def stop_handler(_signum, _frame):
 
 
 def process_turn(text):
+    finish_after_stop = "finish-after-stop" in text
     while True:
+        with open(prompt_log, "a", encoding="utf-8") as log:
+            log.write(json.dumps(text) + "\n")
         hook("UserPromptSubmit", {"prompt": text})
         hook("PreToolUse", {"tool_name": "Bash"})
         sleep_match = re.search(r"sleep:([0-9]+)", text)
@@ -60,16 +64,29 @@ def process_turn(text):
             time.sleep(int(sleep_match.group(1)))
         hook("PostToolUse", {"tool_name": "Bash"})
         task_match = re.search(r"task:([A-Za-z0-9_-]+)", text)
-        if task_match:
+        if task_match and not finish_after_stop:
             task_done(task_match.group(1), text)
         reply = hook("Stop", {})
         try:
             decision = json.loads(reply)
         except json.JSONDecodeError:
             decision = {}
-        if decision.get("decision") != "block":
-            return
-        text = decision.get("reason", "")
+        if decision.get("decision") == "block":
+            text = decision.get("reason", "")
+            finish_after_stop = False
+            continue
+        if task_match and finish_after_stop:
+            task_done(task_match.group(1), text)
+            finish_after_stop = False
+            reply = hook("Stop", {})
+            try:
+                decision = json.loads(reply)
+            except json.JSONDecodeError:
+                decision = {}
+            if decision.get("decision") == "block":
+                text = decision.get("reason", "")
+                continue
+        return
 
 
 signal.signal(signal.SIGTERM, stop_handler)

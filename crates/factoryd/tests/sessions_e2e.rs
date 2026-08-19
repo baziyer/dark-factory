@@ -32,6 +32,8 @@ use factory_core::{
 use factoryctl::Client;
 #[cfg(target_os = "macos")]
 use factoryctl::{capacity, launchd, probes};
+use factoryd::store::Store;
+use rusqlite::params;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
@@ -498,6 +500,24 @@ fn setup_project_with(daemon: Daemon, home: &Path) -> Project {
         ),
         "{response:?}"
     );
+    let authority = daemon
+        .client()
+        .request(LocalRequest::SetProjectRepositoryAuthority {
+            project_id: project_id(),
+            remote_url: "https://github.com/baziyer/dark-factory.git".into(),
+            base_branch: "main".into(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            authority,
+            ServerFrame::Response {
+                response: LocalResponse::ProjectRepositoryAuthoritySet { .. },
+                ..
+            }
+        ),
+        "{authority:?}"
+    );
     Project { daemon, root }
 }
 
@@ -597,6 +617,41 @@ fn create_task(client: &Client, id: &str, title: &str, body: &str) {
             worktree: None,
             branch: None,
             starting_head: None,
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            response,
+            ServerFrame::Response {
+                response: LocalResponse::TaskCreated { .. },
+                ..
+            }
+        ),
+        "{response:?}"
+    );
+}
+
+fn create_bound_task(
+    client: &Client,
+    id: &str,
+    title: &str,
+    body: &str,
+    worktree: &str,
+    branch: &str,
+    starting_head: &str,
+) {
+    let response = client
+        .request(LocalRequest::CreateTask {
+            id: TaskId::try_from(id).unwrap(),
+            project_id: project_id(),
+            parent_task_id: None,
+            title: title.into(),
+            body: body.into(),
+            priority: 0,
+            agent_id: None,
+            worktree: Some(worktree.into()),
+            branch: Some(branch.into()),
+            starting_head: Some(starting_head.into()),
         })
         .unwrap();
     assert!(
@@ -947,6 +1002,209 @@ fn task_auto_delivers_and_a_second_task_delivers_via_stop_hook_reply() {
 
     cleanup_session(&daemon, "curie");
     daemon.stop();
+}
+
+#[test]
+fn successor_admission_proves_no_provider_boundary_crossing_across_restart() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    let agent = create_shell_agent(&client, "curie");
+    let worktree = agent.worktree.clone().expect("managed agent worktree");
+    let branch = Command::new("git")
+        .args(["-C", &worktree, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .unwrap();
+    let branch = String::from_utf8(branch.stdout).unwrap().trim().to_owned();
+    let starting_head = Command::new("git")
+        .args(["-C", &worktree, "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let starting_head = String::from_utf8(starting_head.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    create_bound_task(
+        &client,
+        "task-a",
+        "A (sleep:8 finish-after-stop)",
+        "keep A active while B waits",
+        &worktree,
+        &branch,
+        &starting_head,
+    );
+    assign_task(&client, "task-a", "curie");
+    let session = wait_for_session_state(&client, "curie", SessionState::Working);
+    let a_run = list_runs(&client)
+        .into_iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-a"))
+        .expect("A must open exactly one run before the provider turn continues");
+    assert_eq!(a_run.session_id.as_ref(), Some(&session.id));
+
+    create_bound_task(
+        &client,
+        "task-b",
+        "B",
+        "deliver after A is terminal",
+        &worktree,
+        &branch,
+        &starting_head,
+    );
+    assign_task(&client, "task-b", "curie");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        get_task(&client, "task-b").snapshot.status,
+        TaskStatus::Queued
+    );
+    assert!(
+        provider_prompts(home.path())
+            .iter()
+            .all(|prompt| !prompt.contains("task:task-b")),
+        "B crossed the provider boundary while A was open"
+    );
+
+    // Leave a real in-flight B attempt behind the daemon restart. The
+    // attempt was prepared for the exact queued task, but its prompt must
+    // still lose admission while A owns the open run. The SQL seed only
+    // models the crash window; the authenticated hook below exercises the
+    // actual provider-boundary rejection path.
+    let database = home.path().join("factory.db");
+    let (b_incarnation, b_prior_runs) = {
+        let store = Store::open(&database).unwrap();
+        store
+            .task_delivery_marker(&session.id, &TaskId::try_from("task-b").unwrap())
+            .unwrap()
+    };
+    let attempt_id = "attempt-b-restart";
+    let b_prompt = format!("task:task-b queued successor\u{2063}dark-factory-attempt:{attempt_id}");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "INSERT INTO delivery_attempts (
+                id, project_id, agent_id, session_id, task_id,
+                task_incarnation_id, prior_run_count, message_ids_json, text,
+                failure_count, next_attempt_at_ms, state, created_at_ms, updated_at_ms
+             ) VALUES (?1, 'factory', 'curie', ?2, 'task-b', ?3, ?4, '[]', ?5,
+                       0, NULL, 'in_flight', 10, 10)",
+            params![
+                attempt_id,
+                session.id.as_str(),
+                b_incarnation,
+                i64::try_from(b_prior_runs).unwrap(),
+                b_prompt,
+            ],
+        )
+        .unwrap();
+    drop(connection);
+
+    // The resident shell process survives this daemon restart. Recovery
+    // turns B's in-flight attempt retryable, while A remains the live
+    // authenticated run in the same provider conversation.
+    daemon.stop();
+    let daemon = Daemon::start(home.path());
+    let client = daemon.client();
+    let recovered = Store::open(&database)
+        .unwrap()
+        .delivery_attempt_state(attempt_id)
+        .unwrap();
+    assert_eq!(
+        recovered,
+        Some(factoryd::store::DeliveryAttemptState::Retryable)
+    );
+
+    let token = std::fs::read_to_string(
+        home.path()
+            .join("runs")
+            .join(session.id.as_str())
+            .join("hook.token"),
+    )
+    .unwrap();
+    let late_hook = client
+        .request(LocalRequest::ProviderHook {
+            token: token.trim().to_owned(),
+            event: factory_core::ProviderHookEvent::UserPromptSubmit,
+            payload: serde_json::json!({"prompt": b_prompt}),
+        })
+        .unwrap();
+    let ServerFrame::Response {
+        response: LocalResponse::ProviderHookReply { reply },
+        ..
+    } = late_hook
+    else {
+        panic!("expected a provider hook reply, got {late_hook:?}");
+    };
+    assert_eq!(reply["decision"], "block");
+    assert_eq!(reply["reason"], "Dark Factory rejected this stale delivery");
+    assert_eq!(
+        Store::open(&database)
+            .unwrap()
+            .delivery_attempt_state(attempt_id)
+            .unwrap(),
+        Some(factoryd::store::DeliveryAttemptState::Cancelled)
+    );
+    assert_eq!(
+        get_task(&client, "task-b").snapshot.status,
+        TaskStatus::Queued
+    );
+    assert!(
+        provider_prompts(home.path())
+            .iter()
+            .all(|prompt| !prompt.contains("task:task-b")),
+        "a rejected late hook must not become a provider transcript entry"
+    );
+
+    let a = wait_for_task_status(&client, "task-a", TaskStatus::Succeeded);
+    assert!(a.result.is_some());
+    let b = wait_for_task_status(&client, "task-b", TaskStatus::Succeeded);
+    assert!(b.result.is_some());
+    let prompts = provider_prompts(home.path());
+    assert_eq!(
+        prompts
+            .iter()
+            .filter(|prompt| prompt.contains("task:task-a"))
+            .count(),
+        1,
+        "A must reach the shell provider exactly once: {prompts:?}"
+    );
+    assert_eq!(
+        prompts
+            .iter()
+            .filter(|prompt| prompt.contains("task:task-b"))
+            .count(),
+        1,
+        "B must reach the shell provider exactly once after A: {prompts:?}"
+    );
+    let runs = list_runs(&client);
+    assert_eq!(
+        runs.iter()
+            .filter(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-a"))
+            .count(),
+        1
+    );
+    let b_run = runs
+        .iter()
+        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-b"))
+        .expect("B must open its matching run");
+    assert_eq!(b_run.session_id.as_ref(), Some(&session.id));
+
+    cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+fn provider_prompts(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("shell-agent-prompts.jsonl"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("shell provider transcript JSONL"))
+                .collect::<Vec<String>>()
+        })
+        .collect()
 }
 
 // --- (b) message-only delivery ----------------------------------------
