@@ -31,6 +31,7 @@ const HEALTH_WAIT: Duration = Duration::from_secs(30);
 
 pub struct Options {
     pub install: bool,
+    pub json: bool,
 }
 
 pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
@@ -40,13 +41,29 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     let active_version = install::active_version(&home)?;
 
     if !options.install {
-        println!("{}", check_json(&check, active_version.as_deref()));
+        if options.json {
+            println!("{}", check_json(&check, active_version.as_deref()));
+        } else {
+            print_human(
+                &check,
+                active_version.as_deref(),
+                install_action(&check, active_version.as_deref()),
+            );
+        }
         return Ok(check_exit_code(&check));
     }
     let Some(manifest) = install_candidate(&check, active_version.as_deref()).cloned() else {
-        let mut report = check_json(&check, active_version.as_deref());
-        report["installed"] = json!(false);
-        println!("{report}");
+        if options.json {
+            let mut report = check_json(&check, active_version.as_deref());
+            report["installed"] = json!(false);
+            println!("{report}");
+        } else {
+            print_human(
+                &check,
+                active_version.as_deref(),
+                install_action(&check, active_version.as_deref()),
+            );
+        }
         return Ok(check_exit_code(&check));
     };
 
@@ -67,15 +84,23 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             "{} is already installed and running",
             manifest.version
         ));
-        println!(
-            "{}",
-            json!({
-                "installed": manifest.version,
-                "current": install::current_link(&home),
-                "launchd": "unchanged",
-                "health": { "ok": true, "version": manifest.version },
-            })
-        );
+        if options.json {
+            println!(
+                "{}",
+                json!({
+                    "installed": manifest.version,
+                    "current": install::current_link(&home),
+                    "launchd": "unchanged",
+                    "health": { "ok": true, "version": manifest.version },
+                })
+            );
+        } else {
+            print_human(
+                &check,
+                Some(manifest.version.as_str()),
+                "already up to date (daemon healthy)",
+            );
+        }
         return Ok(0);
     }
 
@@ -94,16 +119,20 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             "active runtime {active} is newer than downloaded {}; not activating a downgrade",
             manifest.version
         ));
-        println!(
-            "{}",
-            json!({
-                "installed": false,
-                "current": install::current_link(&home),
-                "active": active,
-                "launchd": "unchanged",
-                "skipped": "active runtime is newer than the selected release",
-            })
-        );
+        if options.json {
+            println!(
+                "{}",
+                json!({
+                    "installed": false,
+                    "current": install::current_link(&home),
+                    "active": active,
+                    "launchd": "unchanged",
+                    "skipped": "active runtime is newer than the selected release",
+                })
+            );
+        } else {
+            print_human(&check, Some(active), "not needed (active runtime is newer)");
+        }
         return Ok(0);
     }
     install::activate(&home, &manifest.version)?;
@@ -111,15 +140,26 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     let Some(existing) = existing else {
         log("no launchd job installed; restart the daemon yourself to run the new version");
-        println!(
-            "{}",
-            json!({
-                "installed": manifest.version,
-                "bin": installed,
-                "current": install::current_link(&home),
-                "launchd": "not_installed",
-            })
-        );
+        if options.json {
+            println!(
+                "{}",
+                json!({
+                    "installed": manifest.version,
+                    "bin": installed,
+                    "current": install::current_link(&home),
+                    "launchd": "not_installed",
+                })
+            );
+        } else {
+            print_human(
+                &check,
+                Some(manifest.version.as_str()),
+                &format!(
+                    "installed {} (restart the daemon yourself)",
+                    manifest.version
+                ),
+            );
+        }
         return Ok(0);
     };
 
@@ -144,16 +184,24 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     log(&format!("rewrote and reloaded {}", plist.display()));
     match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
         Ok(version) => {
-            println!(
-                "{}",
-                json!({
-                    "installed": manifest.version,
-                    "bin": installed,
-                    "current": install::current_link(&home),
-                    "launchd": "reloaded",
-                    "health": { "ok": true, "version": version },
-                })
-            );
+            if options.json {
+                println!(
+                    "{}",
+                    json!({
+                        "installed": manifest.version,
+                        "bin": installed,
+                        "current": install::current_link(&home),
+                        "launchd": "reloaded",
+                        "health": { "ok": true, "version": version },
+                    })
+                );
+            } else {
+                print_human(
+                    &check,
+                    Some(manifest.version.as_str()),
+                    &format!("installed {} (launchd reloaded)", manifest.version),
+                );
+            }
             Ok(0)
         }
         Err(error) => {
@@ -167,17 +215,32 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                         .map(|_| ())
                 },
             );
-            println!(
-                "{}",
-                json!({
-                    "installed": manifest.version,
-                    "bin": installed,
-                    "current": install::current_link(&home),
-                    "launchd": "reloaded",
-                    "health": { "ok": false, "error": error },
-                    "rollback": rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
-                })
-            );
+            if options.json {
+                println!(
+                    "{}",
+                    json!({
+                        "installed": manifest.version,
+                        "bin": installed,
+                        "current": install::current_link(&home),
+                        "launchd": "reloaded",
+                        "health": { "ok": false, "error": error },
+                        "rollback": rollback.as_ref().map(|()| "restored").unwrap_or("failed"),
+                    })
+                );
+            } else {
+                print_human(
+                    &check,
+                    previous_version.as_deref(),
+                    &format!(
+                        "install failed (rollback {})",
+                        if rollback.is_ok() {
+                            "restored"
+                        } else {
+                            "failed"
+                        }
+                    ),
+                );
+            }
             if let Err(rollback_error) = rollback {
                 eprintln!("update: rollback failed: {rollback_error}");
             }
@@ -200,6 +263,35 @@ fn check_exit_code(check: &UpdateCheck) -> i32 {
         1
     } else {
         0
+    }
+}
+
+fn install_action(check: &UpdateCheck, active_version: Option<&str>) -> &'static str {
+    if check.latest.is_none() && check.error.is_some() {
+        "unavailable (manifest check failed)"
+    } else if install_candidate(check, active_version).is_some() {
+        "available"
+    } else {
+        "not needed"
+    }
+}
+
+fn print_human(check: &UpdateCheck, active_version: Option<&str>, action: &str) {
+    println!("invoking factoryctl: {}", check.current);
+    println!(
+        "active runtime (bin/current): {}",
+        active_version.unwrap_or("not installed")
+    );
+    println!(
+        "latest release: {}",
+        check
+            .latest
+            .as_ref()
+            .map_or("unavailable", |manifest| manifest.version.as_str())
+    );
+    println!("update --install: {action}");
+    if let Some(error) = &check.error {
+        println!("update error: {error}");
     }
 }
 

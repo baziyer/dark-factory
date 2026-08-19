@@ -168,6 +168,10 @@ Homebrew updates the bootstrap. `factoryctl update --install` updates the active
 runtime and restarts the daemon; running agent sessions continue. Do not use
 `brew services` for Dark Factory.
 
+`factoryctl update` reports the invoking bootstrap, active runtime, latest
+release, and install availability in human-readable lines. Use
+`factoryctl update --json` for the machine-readable report.
+
 `brew uninstall dark-factory` removes only the bootstrap. The active runtime,
 launchd job, and state remain. See the [service and uninstall
 guide](launchd/README.md#uninstall) for safe removal and the [release and update

@@ -136,11 +136,12 @@ Exits 1 if any check fails; warnings don't change the exit code.
 Options:
   --json                     One JSON object instead of text lines
   -h, --help                 Show this help";
-const UPDATE_HELP: &str = "usage: factoryctl update [--install]
+const UPDATE_HELP: &str = "usage: factoryctl update [--install] [--json]
 
 Fetch the newest release's manifest and report the invoking factoryctl,
 the active bin/current runtime, and whether the release is newer than the
-active runtime (JSON on stdout; the manifest result is also cached in
+active runtime. Human-readable output is the default; --json preserves the
+machine-readable object. The manifest result is also cached in
 $DARK_FACTORY_HOME/update-check.json, which factory-tui's status line reads at
 most hourly). With no active runtime, compare with the invoking factoryctl.
 
@@ -761,6 +762,7 @@ enum CliCommand {
     Version,
     Update {
         install: bool,
+        json: bool,
     },
     Init {
         yes: bool,
@@ -1035,8 +1037,8 @@ fn run() -> Result<i32, String> {
         println!("{}", capacity_result(&change));
         return Ok(0);
     }
-    if let CliCommand::Update { install } = command {
-        return update_command::run(&update_command::Options { install }, &socket);
+    if let CliCommand::Update { install, json } = command {
+        return update_command::run(&update_command::Options { install, json }, &socket);
     }
     if let CliCommand::Init { yes, no_launchd } = command {
         return init::run(&init::Options { yes, no_launchd }, &socket);
@@ -1463,8 +1465,9 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
                 return Ok((socket, CliCommand::Help(UPDATE_HELP)));
             }
             let install = take_flag(&mut args, "--install")?;
+            let json = take_flag(&mut args, "--json")?;
             require_empty(&args)?;
-            Ok((socket, CliCommand::Update { install }))
+            Ok((socket, CliCommand::Update { install, json }))
         }
         "usage" => {
             if wants_help(&args) {
@@ -2893,13 +2896,27 @@ mod tests {
     fn update_and_version_parse_without_a_daemon_request() {
         assert_eq!(
             parse_args(args(&["update"])).unwrap().1,
-            CliCommand::Update { install: false }
+            CliCommand::Update {
+                install: false,
+                json: false,
+            }
         );
         assert_eq!(
             parse_args(args(&["update", "--install"])).unwrap().1,
-            CliCommand::Update { install: true }
+            CliCommand::Update {
+                install: true,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&["update", "--json"])).unwrap().1,
+            CliCommand::Update {
+                install: false,
+                json: true,
+            }
         );
         assert!(parse_args(args(&["update", "--force"])).is_err());
+        assert!(UPDATE_HELP.contains("update [--install] [--json]"));
         assert_eq!(
             parse_args(args(&["version"])).unwrap().1,
             CliCommand::Version
@@ -2908,7 +2925,13 @@ mod tests {
             parse_args(args(&["--version"])).unwrap().1,
             CliCommand::Version
         );
-        assert!(request_for(CliCommand::Update { install: false }).is_err());
+        assert!(
+            request_for(CliCommand::Update {
+                install: false,
+                json: false,
+            })
+            .is_err()
+        );
         assert_eq!(
             parse_args(args(&["init", "--yes", "--no-launchd"]))
                 .unwrap()

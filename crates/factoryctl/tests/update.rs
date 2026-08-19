@@ -117,6 +117,19 @@ impl Fixture {
 
     fn command(&self, url: &str, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
+        command.args(args);
+        if args.first() == Some(&"update") && !args.contains(&"--json") {
+            command.arg("--json");
+        }
+        command
+            .env("DARK_FACTORY_HOME", self.home())
+            .env("HOME", self.root.path().join("user-home"))
+            .env("DARK_FACTORY_UPDATE_URL", url);
+        command
+    }
+
+    fn human_command(&self, url: &str, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
         command
             .args(args)
             .env("DARK_FACTORY_HOME", self.home())
@@ -298,6 +311,29 @@ fn update_reports_a_newer_release_and_caches_the_check() {
         Some("999.0.0")
     );
     assert!(cached.error.is_none());
+}
+
+#[test]
+fn update_is_human_readable_by_default_and_names_both_versions() {
+    let fixture = Fixture::new();
+    fixture.activate("0.1.0");
+    let url = fixture.publish("999.0.0", None);
+    let output = fixture.human_command(&url, &["update"]).output().unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("invoking factoryctl: "));
+    assert!(stdout.contains("active runtime (bin/current): 0.1.0\n"));
+    assert!(stdout.contains("latest release: 999.0.0\n"));
+    assert!(stdout.contains("update --install: available\n"));
+    assert!(!stdout.trim_start().starts_with('{'));
+
+    let json_output = fixture
+        .human_command(&url, &["update", "--json"])
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(report["current"], factoryctl::update::CURRENT_VERSION);
+    assert_eq!(report["active"], "0.1.0");
 }
 
 #[test]
