@@ -61,6 +61,19 @@ fn render_terminal(
         return;
     };
 
+    // A reader can publish a typed refusal after the last reconciliation but before this draw.
+    // Treat that state as non-renderable too, so the rejected connection can never appear as an
+    // empty or `[exited]` terminal for one frame.
+    if pane.attach_refusal().is_some() {
+        render_placeholder(
+            frame,
+            area,
+            board,
+            "terminal attach refused — see board status",
+        );
+        return;
+    }
+
     let exited = pane.has_exited();
     let marker = if exited { " [exited]" } else { "" };
     let command = match pane.kind {

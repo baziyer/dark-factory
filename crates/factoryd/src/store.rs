@@ -412,6 +412,7 @@ impl SessionRow {
             state_since_ms: self.state_since_ms,
             worktree: self.worktree.clone(),
             provider_session_id: self.provider_session_id.clone(),
+            runner_instance_id: Some(self.runner_instance_id.clone()),
             current_run_id: self.current_run_id.clone(),
             activity: self.activity.clone(),
             activity_inferred: self.activity_inferred,

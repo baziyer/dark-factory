@@ -21,7 +21,7 @@ use tui_term::vt100;
 
 use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
 use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
-use factory_core::{ProjectId, SessionId};
+use factory_core::{ProjectId, RunnerInstanceId, SessionId};
 
 use factoryctl::Client;
 
@@ -40,6 +40,15 @@ const DEBUG_LOG_WINDOW: Duration = Duration::from_secs(6);
 pub enum PaneKind {
     LocalPty,
     Daemon,
+}
+
+/// Durable identity captured by one attach attempt. A session id alone is not sufficient: the
+/// daemon can replace the runner while retaining the session row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneIdentity {
+    pub project_id: ProjectId,
+    pub session_id: SessionId,
+    pub runner_instance_id: Option<RunnerInstanceId>,
 }
 
 enum Backend {
@@ -68,6 +77,7 @@ pub struct Pane {
     dirty: Arc<AtomicBool>,
     rows: u16,
     cols: u16,
+    identity: Option<PaneIdentity>,
     backend: Backend,
 }
 
@@ -131,6 +141,7 @@ impl Pane {
             dirty,
             rows,
             cols,
+            identity: None,
             backend: Backend::LocalPty {
                 writer,
                 master: pair.master,
@@ -149,6 +160,7 @@ impl Pane {
         socket: PathBuf,
         project_id: ProjectId,
         session_id: SessionId,
+        runner_instance_id: Option<RunnerInstanceId>,
         title: impl Into<String>,
         rows: u16,
         cols: u16,
@@ -187,7 +199,7 @@ impl Pane {
             session_id.clone(),
             input_rx,
         );
-        spawn_resize_worker(socket, project_id, session_id, resize_rx);
+        spawn_resize_worker(socket, project_id.clone(), session_id.clone(), resize_rx);
 
         Ok(Self {
             title: title.into(),
@@ -199,6 +211,11 @@ impl Pane {
             // contract's "initial + on resize" — see that method's doc comment.
             rows: 0,
             cols: 0,
+            identity: Some(PaneIdentity {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                runner_instance_id,
+            }),
             backend: Backend::Daemon {
                 attach: attach_conn,
                 input_tx,
@@ -346,6 +363,11 @@ impl Pane {
                 attach_refusal.lock().ok().and_then(|guard| guard.clone())
             }
         }
+    }
+
+    #[must_use]
+    pub fn identity(&self) -> Option<&PaneIdentity> {
+        self.identity.as_ref()
     }
 
     #[must_use]

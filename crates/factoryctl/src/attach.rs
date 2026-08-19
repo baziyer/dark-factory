@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
 };
@@ -98,7 +99,8 @@ pub fn run(
     send_resize(client, &project_id, &session_id);
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
-    let exit_code = forward_stdin(client, &project_id, &session_id, &failed);
+    let stdin_rx = spawn_stdin_reader();
+    let exit_code = forward_stdin(client, &project_id, &session_id, &failed, &stdin_rx);
 
     drop(raw_mode);
     let _ = output_thread.join();
@@ -178,6 +180,27 @@ fn set_failure(failure: &Mutex<Option<String>>, message: String) {
     *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
 }
 
+/// Reads stdin on its own blocking descriptor so the forwarding loop can also observe a late
+/// attach refusal. The reader may remain blocked until the process exits, but the controlling
+/// loop is wakeable and drops [`RawMode`] as soon as the output side reports failure.
+fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
+        loop {
+            let read = match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            if tx.send(buffer[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    rx
+}
+
 /// Reads stdin and forwards it as `TerminalInput` until EOF, `Ctrl-]`, or the
 /// output side reports failure. Returns the process exit code.
 fn forward_stdin(
@@ -185,25 +208,24 @@ fn forward_stdin(
     project_id: &ProjectId,
     session_id: &SessionId,
     failed: &AtomicBool,
+    input: &Receiver<Vec<u8>>,
 ) -> i32 {
-    let mut stdin = std::io::stdin();
-    let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
         if failed.load(Ordering::SeqCst) {
             return 2;
         }
-        let read = match stdin.read(&mut buffer) {
-            Ok(0) | Err(_) => return 0,
-            Ok(read) => read,
+        let chunk = match input.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return 0,
         };
-        let chunk = &buffer[..read];
         if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
             if detach_at > 0 {
                 send_input(client, project_id, session_id, &chunk[..detach_at]);
             }
             return 0;
         }
-        send_input(client, project_id, session_id, chunk);
+        send_input(client, project_id, session_id, &chunk);
     }
 }
 
@@ -315,5 +337,31 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         let stdin = std::io::stdin();
         let _ = termios::tcsetattr(&stdin, OptionalActions::Flush, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn late_refusal_wakes_stdin_forwarding_without_input() {
+        let failed = Arc::new(AtomicBool::new(false));
+        let failed_later = Arc::clone(&failed);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            failed_later.store(true, Ordering::SeqCst);
+        });
+        let (_input_tx, input_rx) = mpsc::channel();
+        let client = Client::new("/tmp/factoryctl-attach-test.sock");
+        let project_id = ProjectId::try_from("project-1").unwrap();
+        let session_id = SessionId::try_from("session-1").unwrap();
+        let started = Instant::now();
+
+        let exit_code = forward_stdin(&client, &project_id, &session_id, &failed, &input_rx);
+
+        assert_eq!(exit_code, 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

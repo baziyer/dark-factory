@@ -29,6 +29,10 @@ fn session_id(value: &str) -> SessionId {
     SessionId::try_from(value).unwrap()
 }
 
+fn runner_instance_id(value: &str) -> RunnerInstanceId {
+    RunnerInstanceId::try_from(value).unwrap()
+}
+
 #[test]
 fn request_envelope_has_a_stable_tagged_shape() {
     let request = RequestEnvelope {
@@ -592,6 +596,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         state_since_ms: 10,
         worktree: "/work/agent-1".into(),
         provider_session_id: None,
+        runner_instance_id: Some(runner_instance_id("runner-1")),
         current_run_id: None,
         activity: None,
         activity_inferred: false,
@@ -681,6 +686,7 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
         state_since_ms: 20,
         worktree: "/work/agent-1".into(),
         provider_session_id: Some("thread-1".into()),
+        runner_instance_id: Some(runner_instance_id("runner-1")),
         current_run_id: Some(run_id("run-1")),
         activity: Some("tool: Read".into()),
         activity_inferred: true,

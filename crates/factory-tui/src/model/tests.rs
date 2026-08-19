@@ -870,7 +870,7 @@ fn ended_attach_refusal_keeps_task_state_and_disables_retry() {
     b.note_attach_refusal(&AttachRefusal {
         project_id: ProjectId::try_from("proj").unwrap(),
         session_id: session_id.clone(),
-        runner_instance_id: None,
+        runner_instance_id: Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
         session_state: Some(SessionState::Stopped),
         reason: AttachRefusalReason::SessionEnded,
     });
@@ -881,10 +881,131 @@ fn ended_attach_refusal_keeps_task_state_and_disables_retry() {
             .status,
         factory_core::TaskStatus::Running
     );
-    assert!(b.attach_retry_after.get(&session_id).is_none());
+    assert!(!b.attach_retry_after.contains_key(&session_id));
     assert!(b.attention_items().iter().any(|item| {
         item.session_id.as_ref() == Some(&session_id)
             && item.reason.kind == factory_core::status::AttentionReasonKind::ObserverProblem
     }));
     assert!(b.status_line_text().contains("session ended"));
+}
+
+#[test]
+fn delayed_refusal_from_old_runner_generation_is_ignored() {
+    let mut b = board();
+    let session_id = SessionId::try_from("sess-1").unwrap();
+    let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+    alice.current_session_id = Some(session_id.clone());
+    b.apply_fleet_snapshot(
+        vec![project("proj", 0)],
+        vec![alice],
+        Vec::new(),
+        Vec::new(),
+        vec![session("sess-1", "alice", "proj", SessionState::Working)],
+    );
+
+    let old_refusal = AttachRefusal {
+        project_id: ProjectId::try_from("proj").unwrap(),
+        session_id: session_id.clone(),
+        runner_instance_id: Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
+        session_state: Some(SessionState::Working),
+        reason: AttachRefusalReason::RunnerRejected,
+    };
+    assert!(b.note_attach_refusal(&old_refusal));
+
+    let mut replacement = session("sess-1", "alice", "proj", SessionState::Working);
+    replacement.runner_instance_id =
+        Some(factory_core::RunnerInstanceId::try_from("runner-2").unwrap());
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1,
+        event: FactoryEvent::SessionChanged {
+            session: replacement,
+        },
+    });
+    assert!(b.attention_items().is_empty());
+    assert!(b.note_attach_refusal(&old_refusal) == false);
+    assert!(b.take_attach_retry(&session_id));
+}
+
+#[test]
+fn nonretryable_refusal_remains_fenced_across_leave_and_reentry() {
+    let mut b = board();
+    let session_id = SessionId::try_from("sess-1").unwrap();
+    let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+    alice.current_session_id = Some(session_id.clone());
+    b.apply_fleet_snapshot(
+        vec![project("proj", 0)],
+        vec![alice],
+        Vec::new(),
+        Vec::new(),
+        vec![session("sess-1", "alice", "proj", SessionState::Working)],
+    );
+    assert!(b.note_attach_refusal(&AttachRefusal {
+        project_id: ProjectId::try_from("proj").unwrap(),
+        session_id: session_id.clone(),
+        runner_instance_id: Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
+        session_state: Some(SessionState::Stopped),
+        reason: AttachRefusalReason::SessionEnded,
+    }));
+
+    b.view = View::Building;
+    assert!(!b.clear_undesired_attach_failures(&[]));
+    b.view = View::Agent;
+    assert!(!b.take_attach_retry(&session_id));
+
+    let mut replacement = session("sess-1", "alice", "proj", SessionState::Working);
+    replacement.runner_instance_id =
+        Some(factory_core::RunnerInstanceId::try_from("runner-2").unwrap());
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 1,
+        occurred_at_ms: 1,
+        event: FactoryEvent::SessionChanged {
+            session: replacement,
+        },
+    });
+    assert!(b.attention_items().is_empty());
+    assert!(b.take_attach_retry(&session_id));
+}
+
+#[test]
+fn older_attach_refresh_cannot_replace_a_newer_session_event() {
+    let mut b = board();
+    let session_id = SessionId::try_from("sess-1").unwrap();
+    let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+    alice.current_session_id = Some(session_id);
+    let old_session = session("sess-1", "alice", "proj", SessionState::Working);
+    b.apply_fleet_snapshot_at(
+        vec![project("proj", 0)],
+        vec![alice.clone()],
+        Vec::new(),
+        Vec::new(),
+        vec![old_session.clone()],
+        10,
+    );
+    let mut new_session = old_session.clone();
+    new_session.runner_instance_id =
+        Some(factory_core::RunnerInstanceId::try_from("runner-2").unwrap());
+    b.apply_event(EventEnvelope {
+        protocol_version: 1,
+        sequence: 11,
+        occurred_at_ms: 11,
+        event: FactoryEvent::SessionChanged {
+            session: new_session.clone(),
+        },
+    });
+
+    assert!(!b.apply_fleet_snapshot_at(
+        vec![project("proj", 0)],
+        vec![alice],
+        Vec::new(),
+        Vec::new(),
+        vec![old_session],
+        10,
+    ));
+    assert_eq!(
+        b.sessions[&SessionId::try_from("sess-1").unwrap()].runner_instance_id,
+        new_session.runner_instance_id
+    );
 }

@@ -118,6 +118,7 @@ pub(crate) fn session(
         state_since_ms: 0,
         worktree: "/work".into(),
         provider_session_id: None,
+        runner_instance_id: Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
         current_run_id: None,
         activity: None,
         activity_inferred: false,

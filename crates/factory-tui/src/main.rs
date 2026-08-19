@@ -417,8 +417,31 @@ fn sync_panes(
 
     for session_id in desired {
         if let Some(pane) = panes.get_mut(&session_id) {
+            let current_identity =
+                board
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| crate::pane::PaneIdentity {
+                        project_id: session.project_id.clone(),
+                        session_id: session.id.clone(),
+                        runner_instance_id: session.runner_instance_id.clone(),
+                    });
+            if pane.identity() != current_identity.as_ref() {
+                if let Some(mut replaced) = panes.remove(&session_id) {
+                    replaced.kill();
+                }
+                board.clear_local_attach_failure(&session_id);
+                changed = true;
+                continue;
+            }
             if let Some(refusal) = pane.attach_refusal() {
-                board.note_attach_refusal(&refusal);
+                if !board.note_attach_refusal(&refusal) {
+                    if let Some(mut stale) = panes.remove(&session_id) {
+                        stale.kill();
+                    }
+                    changed = true;
+                    continue;
+                }
                 if let Some(mut failed) = panes.remove(&session_id) {
                     failed.kill();
                 }
@@ -456,6 +479,7 @@ fn sync_panes(
                 socket.to_path_buf(),
                 session.project_id.clone(),
                 session_id.clone(),
+                session.runner_instance_id.clone(),
                 title,
                 24,
                 80,
@@ -740,9 +764,15 @@ fn apply_net_msg(
             sessions,
             event_sequence,
         } => {
-            board.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
-            board.note_fleet_snapshot_sequence(event_sequence);
-            if !*initial_project_applied {
+            let applied = board.apply_fleet_snapshot_at(
+                projects,
+                agents,
+                tasks,
+                runs,
+                sessions,
+                event_sequence,
+            );
+            if applied && !*initial_project_applied {
                 if let Some(project_id) = initial_project {
                     board.focus_project(project_id.clone());
                 }
@@ -788,6 +818,8 @@ mod main_tests {
     use factory_core::local::{LocalResponse, ServerFrame};
     use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
     use factoryctl::update::{Asset, Manifest, UpdateCheck};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::test_fixtures::{agent, project, session};
@@ -1164,6 +1196,90 @@ mod main_tests {
         assert!(board.pane_ready);
         assert!(board.attention_items().is_empty());
         release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn refusal_after_reconcile_is_not_rendered_as_an_exited_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut attach, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(attach.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let refusal = factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Idle),
+                reason: factory_core::local::AttachRefusalReason::RunnerRejected,
+            };
+            serde_json::to_writer(
+                &mut attach,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::AttachRefused { refusal },
+                },
+            )
+            .unwrap();
+            attach.write_all(b"\n").unwrap();
+            attach.flush().unwrap();
+        });
+
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(factory_core::SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id,
+            Pane::attach(
+                socket,
+                factory_core::ProjectId::try_from("proj").unwrap(),
+                factory_core::SessionId::try_from("session-1").unwrap(),
+                Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
+                "alice",
+                24,
+                80,
+            )
+            .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while panes.values().next().unwrap().attach_refusal().is_none() && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(panes.values().next().unwrap().attach_refusal().is_some());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &board, &mut panes);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("terminal attach refused"));
+        assert!(!text.contains("[exited]"));
         server.join().unwrap();
     }
 }

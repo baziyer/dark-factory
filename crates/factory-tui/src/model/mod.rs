@@ -32,7 +32,8 @@ use factory_core::status::{
 };
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
-    Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    Provider, RunId, RunSnapshot, RunnerInstanceId, SessionId, SessionSnapshot, SessionState,
+    TaskDetail, TaskId,
 };
 
 pub use announcements::Announcement;
@@ -94,6 +95,12 @@ struct ActivityIdentity {
     created_at_ms: Option<i64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttachIdentity {
+    project_id: ProjectId,
+    runner_instance_id: Option<RunnerInstanceId>,
+}
+
 // ---------------------------------------------------------------------------------------------
 // Board
 // ---------------------------------------------------------------------------------------------
@@ -142,6 +149,10 @@ pub struct Board {
     event_revision: i64,
     /// Bounded retry deadlines for client-side terminal attach failures.
     attach_retry_after: BTreeMap<SessionId, i64>,
+    /// Identity of the durable session generation that owns each local failure.
+    attach_failure_identities: BTreeMap<SessionId, AttachIdentity>,
+    /// Non-retryable refusals remain fenced while the same durable identity is selected.
+    attach_retry_blocked: BTreeMap<SessionId, AttachIdentity>,
 
     pub view: View,
     /// The one agent selection shared by BUILDING and AGENT.
@@ -193,6 +204,8 @@ impl Board {
             attention_revision: 0,
             event_revision: -1,
             attach_retry_after: BTreeMap::new(),
+            attach_failure_identities: BTreeMap::new(),
+            attach_retry_blocked: BTreeMap::new(),
             view: View::Building,
             selected_agent: None,
             selected_task: None,
@@ -466,13 +479,22 @@ impl Board {
     /// `factoryd`; this covers the only case it cannot record because the TUI
     /// could not reach it at all.
     pub fn note_local_attach_failure(&mut self, session_id: &SessionId, error: &str) {
-        self.note_attach_failure(session_id, error, true);
+        let identity = self.session_attach_identity(session_id);
+        self.note_attach_failure(session_id, error, true, identity);
     }
 
     /// Folds the daemon's typed refusal into the board without changing task or session state.
     /// Ended/missing sessions are not retried: refreshing the durable fleet is their recovery.
     /// Runner replacement/unavailability may recover in place, so those retain the bounded retry.
-    pub fn note_attach_refusal(&mut self, refusal: &AttachRefusal) {
+    pub fn note_attach_refusal(&mut self, refusal: &AttachRefusal) -> bool {
+        let Some(identity) = self.session_attach_identity(&refusal.session_id) else {
+            return false;
+        };
+        if identity.project_id != refusal.project_id
+            || identity.runner_instance_id != refusal.runner_instance_id
+        {
+            return false;
+        }
         let message = match refusal.reason {
             AttachRefusalReason::SessionNotFound => {
                 "terminal unavailable: session no longer exists; state refreshed"
@@ -490,14 +512,36 @@ impl Board {
                 "terminal unavailable: runner unavailable; retrying after refresh"
             }
         };
-        self.note_attach_failure(&refusal.session_id, message, refusal.reason.retryable());
+        self.note_attach_failure(
+            &refusal.session_id,
+            message,
+            refusal.reason.retryable(),
+            Some(identity),
+        );
         self.note_error(message);
+        true
     }
 
-    fn note_attach_failure(&mut self, session_id: &SessionId, error: &str, retry: bool) {
+    fn note_attach_failure(
+        &mut self,
+        session_id: &SessionId,
+        error: &str,
+        retry: bool,
+        identity: Option<AttachIdentity>,
+    ) {
         let Some(session) = self.sessions.get(session_id) else {
             return;
         };
+        if let Some(identity) = identity {
+            self.attach_failure_identities
+                .insert(session_id.clone(), identity.clone());
+            if retry {
+                self.attach_retry_blocked.remove(session_id);
+            } else {
+                self.attach_retry_blocked
+                    .insert(session_id.clone(), identity);
+            }
+        }
         if retry {
             self.attach_retry_after
                 .entry(session_id.clone())
@@ -528,19 +572,77 @@ impl Board {
         self.reconcile_attention_focus();
     }
 
+    fn session_attach_identity(&self, session_id: &SessionId) -> Option<AttachIdentity> {
+        self.sessions.get(session_id).map(|session| AttachIdentity {
+            project_id: session.project_id.clone(),
+            runner_instance_id: session.runner_instance_id.clone(),
+        })
+    }
+
+    fn clear_changed_attach_failures(&mut self) {
+        let stale: Vec<SessionId> = self
+            .attach_failure_identities
+            .iter()
+            .filter(|(session_id, identity)| {
+                self.session_attach_identity(session_id).as_ref() != Some(*identity)
+            })
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in stale {
+            self.clear_local_attach_failure(&session_id);
+        }
+    }
+
+    fn clear_unlinked_attach_failures(&mut self) {
+        let stale: Vec<SessionId> = self
+            .attach_failure_identities
+            .keys()
+            .filter(|session_id| {
+                !self
+                    .agents
+                    .values()
+                    .any(|agent| agent.current_session_id.as_ref() == Some(*session_id))
+            })
+            .cloned()
+            .collect();
+        for session_id in stale {
+            self.clear_local_attach_failure(&session_id);
+        }
+    }
+
     pub fn clear_local_attach_failure(&mut self, session_id: &SessionId) {
         self.attach_retry_after.remove(session_id);
+        self.attach_retry_blocked.remove(session_id);
+        self.attach_failure_identities.remove(session_id);
         self.local_attention.remove(session_id);
         self.reconcile_attention_focus();
     }
 
     pub fn clear_undesired_attach_failures(&mut self, desired: &[SessionId]) -> bool {
-        let previous = self.local_attention.len();
+        let previous = (
+            self.local_attention.len(),
+            self.attach_retry_after.len(),
+            self.attach_retry_blocked.len(),
+        );
+        let linked: Vec<SessionId> = self
+            .agents
+            .values()
+            .filter_map(|agent| agent.current_session_id.clone())
+            .collect();
+        let keep =
+            |session_id: &SessionId| desired.contains(session_id) || linked.contains(session_id);
         self.local_attention
-            .retain(|session_id, _| desired.contains(session_id));
+            .retain(|session_id, _| keep(session_id));
         self.attach_retry_after
-            .retain(|session_id, _| desired.contains(session_id));
-        let changed = self.local_attention.len() != previous;
+            .retain(|session_id, _| keep(session_id));
+        self.attach_retry_blocked
+            .retain(|session_id, _| keep(session_id));
+        let changed = previous
+            != (
+                self.local_attention.len(),
+                self.attach_retry_after.len(),
+                self.attach_retry_blocked.len(),
+            );
         if changed {
             self.reconcile_attention_focus();
         }
@@ -551,6 +653,9 @@ impl Board {
     /// retry deadline has elapsed. Taking an elapsed deadline lets the next
     /// failure establish a fresh delay instead of spinning every frame.
     pub fn take_attach_retry(&mut self, session_id: &SessionId) -> bool {
+        if self.attach_retry_blocked.contains_key(session_id) {
+            return false;
+        }
         match self.attach_retry_after.get(session_id).copied() {
             Some(deadline) if self.now_ms < deadline => false,
             Some(_) => {
@@ -770,8 +875,32 @@ impl Board {
             .collect();
         self.runs = runs.into_iter().map(|r| (r.id.clone(), r)).collect();
         self.sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
+        self.clear_changed_attach_failures();
+        self.clear_unlinked_attach_failures();
         self.prune_activity_to_current_agents();
         self.ensure_default_focus();
+    }
+
+    /// Applies a complete snapshot only when its consistency point is not older than a live
+    /// event already folded into the board. The sequence check must happen before replacing any
+    /// maps; otherwise a delayed refusal refresh can regress a newer current-session link.
+    pub fn apply_fleet_snapshot_at(
+        &mut self,
+        projects: Vec<ProjectSnapshot>,
+        agents: Vec<AgentSnapshot>,
+        tasks: Vec<TaskDetail>,
+        runs: Vec<RunSnapshot>,
+        sessions: Vec<SessionSnapshot>,
+        event_sequence: i64,
+    ) -> bool {
+        if (event_sequence >= 0 && event_sequence < self.attention_revision)
+            || (self.event_revision >= 0 && event_sequence <= self.event_revision)
+        {
+            return false;
+        }
+        self.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
+        self.note_fleet_snapshot_sequence(event_sequence);
+        true
     }
 
     /// Focuses `project_id` for WORKSHOP/TERMINALS/FOCUS, if it exists among `self.projects`.
@@ -954,12 +1083,14 @@ impl Board {
             }
             FactoryEvent::AgentChanged { agent } => {
                 self.replace_agent(agent);
+                self.clear_unlinked_attach_failures();
             }
             FactoryEvent::RunChanged { run } => {
                 self.runs.insert(run.id.clone(), run);
             }
             FactoryEvent::SessionChanged { session } => {
                 self.sessions.insert(session.id.clone(), session);
+                self.clear_changed_attach_failures();
             }
             FactoryEvent::TaskDeleted { task_id, .. } => {
                 self.tasks.remove(&task_id);
