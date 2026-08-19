@@ -437,6 +437,7 @@ local_ci_lease_run() {
         local_ci_lease_holder "$common_dir" "$@"
         status=$?
         set -e
+        local_ci_lease_release_owner
         local_ci_lease_remove_lock_object
         exit "$status"
     ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
