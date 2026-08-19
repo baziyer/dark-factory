@@ -138,6 +138,9 @@ jobs:
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
 
+      - name: Check build headroom
+        run: ./scripts/check-build-headroom.sh
+
       - name: Install the pinned toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
 

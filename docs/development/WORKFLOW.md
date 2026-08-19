@@ -40,6 +40,21 @@ bypass, or release the lease. The summary contract is checked by
 `local-ci.sh` while the lease is held. The Ubuntu `--linux-source` preview skips
 this macOS-specific lease harness and its release fixtures; GitHub runs that
 mode in an isolated hosted job.
+
+Before either source gate starts a broad Rust compile,
+`scripts/check-build-headroom.sh` reports the exact filesystem bytes available
+to the active Cargo target and that target's exact allocated bytes (the
+platform `df -Pk`/`du -sk` 1024-byte counts converted to bytes). It refuses
+before Cargo when free space is below 12 GiB. That threshold is twice the
+largest clean debug target measured during the #223 incident audit, leaving a
+full second build's margin instead of waiting for rustc to fail opaquely. The
+same read-only preflight runs before Linux's initial workspace build and both
+macOS release builds, and records its bounded result and byte counts in the
+GitHub workflow summary. It never deletes or reclaims anything. Free space on
+the Cargo target filesystem by inspecting only inactive, regenerable Cargo
+targets, then rerun; automatic identity-safe reclamation remains separate work
+in #223.
+
 4. Push the branch, open a PR (the template carries the review checklist).
 5. **Adversarial review before merge**: a second agent or person reads the
    diff cold and tries to break it — correctness, missed simplification,
