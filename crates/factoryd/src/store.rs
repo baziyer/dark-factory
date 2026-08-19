@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 25;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -6056,6 +6056,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if current == 23 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0024_changes.sql"))?;
+        transaction.pragma_update(None, "user_version", 24)?;
+        transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let has_project_id: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('changes') WHERE name = 'project_id')",
             [],
@@ -6072,8 +6079,8 @@ fn migrate(connection: &mut Connection) -> Result<()> {
              WHERE project_id = ''",
             [],
         )?;
-        transaction.execute_batch(include_str!("../migrations/0024_change_scope.sql"))?;
-        transaction.pragma_update(None, "user_version", 24)?;
+        transaction.execute_batch(include_str!("../migrations/0025_change_scope.sql"))?;
+        transaction.pragma_update(None, "user_version", 25)?;
         transaction.commit()?;
     }
     Ok(())

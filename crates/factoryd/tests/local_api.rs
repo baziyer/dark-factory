@@ -273,6 +273,8 @@ async fn durable_change_review_lifecycle_rejects_stale_and_self_claims() {
                         role: AgentRole::Worker,
                         provider: Provider::Shell,
                         model: None,
+                        reasoning_effort: None,
+                        model_selection_reason: None,
                         worktree: None,
                     },
                 )
@@ -310,6 +312,8 @@ async fn durable_change_review_lifecycle_rejects_stale_and_self_claims() {
                     role: AgentRole::Worker,
                     provider: Provider::Shell,
                     model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
                     worktree: None,
                 },
             )
