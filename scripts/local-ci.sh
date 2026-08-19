@@ -9,6 +9,7 @@ fi
 ./scripts/test-local-ci-lease.sh
 ./scripts/test-local-ci-lease-mutations.sh
 ./scripts/check-toolchain-pins.sh
+./scripts/test-github-step-summary.sh
 ./scripts/test-prepare-release-source.sh
 ./scripts/test-publish-release.sh
 ./scripts/test-package-release.sh
