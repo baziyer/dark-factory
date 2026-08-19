@@ -2910,6 +2910,11 @@ async fn end_session_now(
     exit_signal: Option<i32>,
 ) {
     let Ok(now) = now_ms() else { return };
+    // Session termination is a repository lifecycle boundary too. It must
+    // not race managed-change filesystem provisioning or publication: the
+    // same slot lets create finish and lets the transaction retain an
+    // abandoned change, or lets termination win before create authenticates.
+    let _repository_slot = state.repository_slot().await;
     let session_id = session_id.clone();
     let result = state
         .commit_and_publish(move |store| {
@@ -3641,6 +3646,26 @@ mod tests {
         // A second, fresh admission proves the mutex is usable after the
         // barrier rather than relying on the timed-out handle.
         let _released = state.lock_delivery_slot(&agent_id).await;
+    }
+
+    #[tokio::test]
+    async fn natural_runner_exit_waits_for_the_managed_change_lifecycle_slot() {
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let session_id = SessionId::try_from("session").unwrap();
+        let held = state.repository_slot().await;
+        let waiting_state = state.clone();
+        let waiting_wake = wake_tx.clone();
+        let waiter = tokio::spawn(async move {
+            end_session_now(&waiting_state, &waiting_wake, &session_id, Some(1), None).await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiter)
+                .await
+                .is_err(),
+            "natural runner exit bypassed the repository lifecycle slot"
+        );
+        drop(held);
     }
 
     /// This track's item 2: `max_active_runs` must actually bound live

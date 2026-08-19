@@ -1921,6 +1921,14 @@ impl Store {
         let mut events = Vec::new();
         if let Some(run_id) = session.current_run_id.clone() {
             let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
+            // A provider can terminate after a managed change was registered,
+            // but the dead session cannot authenticate a later abandon call.
+            // Retain the exact filesystem/lease record as abandoned before
+            // closing the run; the daemon repository slot serializes this
+            // transition with create, abandon, and StopRun.
+            if let Some(task_id) = run.task_id.as_ref() {
+                abandon_managed_change_on_session_end(&transaction, task_id, now_ms)?;
+            }
             let closed = if operator_stopped {
                 close_run_in_transaction(
                     &transaction,
@@ -5316,6 +5324,20 @@ fn reject_active_managed_change(connection: &Connection, task_id: &TaskId) -> Re
     }
 }
 
+fn abandon_managed_change_on_session_end(
+    transaction: &Transaction<'_>,
+    task_id: &TaskId,
+    now_ms: i64,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE managed_changes
+         SET state = 'abandoned', updated_at_ms = ?2
+         WHERE task_id = ?1 AND state IN ('active', 'removing')",
+        params![task_id.as_str(), now_ms],
+    )?;
+    Ok(())
+}
+
 /// Closes one open run (task-episode) and moves its task to a terminal or
 /// blocked state in the same transaction, emitting `TaskChanged`,
 /// `AgentChanged`, and `RunChanged` events.
@@ -6778,6 +6800,63 @@ mod tests {
         (store, project_id, agent_id, task_id)
     }
 
+    fn running_managed_fixture() -> (Store, ProjectId, AgentId, TaskId) {
+        let (mut store, project_id, agent_id, task_id) = managed_fixture();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/project/worktree".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/project/runner".into(),
+                    runner_protocol_version: 1,
+                },
+                5,
+            )
+            .unwrap();
+        store.synthesize_session_start(&session_id, 6).unwrap();
+        store.open_run_episode(&session_id, &task_id, 7).unwrap();
+        store
+            .create_managed_change(
+                ManagedChangeRecord {
+                    project_id: project_id.clone(),
+                    task_id: task_id.clone(),
+                    agent_id: agent_id.clone(),
+                    worktree: "/state/projects/project/changes/issue-175".into(),
+                    branch: "issue/issue-175".into(),
+                    git_dir: "/repo/.git/worktrees/issue-175".into(),
+                    common_dir: "/repo/.git".into(),
+                    worktree_device: 1,
+                    worktree_inode: 2,
+                    git_dir_device: 3,
+                    git_dir_inode: 4,
+                    common_dir_device: 5,
+                    common_dir_inode: 6,
+                    base_sha: "a".repeat(40),
+                    head_sha: "a".repeat(40),
+                    published_head_sha: None,
+                    state: "active".into(),
+                },
+                8,
+            )
+            .unwrap();
+        (store, project_id, agent_id, task_id)
+    }
+
     #[test]
     fn managed_change_registration_is_durable_and_idempotent() {
         let (mut store, project_id, agent_id, task_id) = managed_fixture();
@@ -6815,6 +6894,59 @@ mod tests {
                 .iter()
                 .all(|event| { !matches!(event.event, FactoryEvent::RepositoryOperation { .. }) })
         );
+    }
+
+    #[test]
+    fn session_end_abandons_a_managed_change_before_closing_the_run() {
+        let (mut store, project_id, _agent_id, task_id) = running_managed_fixture();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let (session, _) = store.end_session(&session_id, Some(1), None, 9).unwrap();
+        assert_eq!(session.state, SessionState::Failed);
+        let change_state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM managed_changes WHERE project_id = ?1 AND task_id = ?2",
+                params![project_id.as_str(), task_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(change_state, "abandoned");
+        assert_eq!(
+            store
+                .get_task(&project_id, &task_id)
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Failed
+        );
+    }
+
+    #[test]
+    fn done_blocked_and_cancel_cannot_close_an_active_managed_change() {
+        let (mut done, project, _agent, task) = running_managed_fixture();
+        assert!(matches!(
+            done.complete_task(&project, &task, "done".into(), 9),
+            Err(StoreError::TaskHasActiveChange)
+        ));
+
+        let (mut blocked, project, _agent, task) = running_managed_fixture();
+        assert!(matches!(
+            blocked.block_task(&project, &task, "blocked".into(), 9),
+            Err(StoreError::TaskHasActiveChange)
+        ));
+
+        let (mut cancelled, project, _agent, _task) = running_managed_fixture();
+        let run_id = cancelled
+            .list_runs(&project, None, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .id;
+        assert!(matches!(
+            cancelled.cancel_run(&project, &run_id, 9),
+            Err(StoreError::TaskHasActiveChange)
+        ));
     }
 
     #[test]

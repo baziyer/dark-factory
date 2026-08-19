@@ -1510,6 +1510,7 @@ async fn handle_request(
                     "runner stop grace must be at most 60000 ms".into(),
                 ));
             }
+            let _repository_slot = state.repository_slot().await;
             let lookup_project_id = project_id.clone();
             let lookup_run_id = run_id.clone();
             let session = state
@@ -2529,7 +2530,7 @@ async fn abandon_managed_change_request(
                 .map_err(repository_failure)?;
         }
         if worktree_exists {
-            crate::worktrees::remove(Path::new(&project.root), Path::new(&change.worktree))
+            crate::worktrees::remove_managed(Path::new(&project.root), Path::new(&change.worktree))
                 .await
                 .map_err(|error| ApiFailure::Conflict(error.to_string()))?;
         }
@@ -3746,6 +3747,94 @@ mod deletion_gate_tests {
     /// reach the store fence instead of replying `{}` while leaving recovery
     /// free to win afterward. This deterministic ordering makes the hook win;
     /// the sibling execution test covers recovery winning and blocking it.
+    #[tokio::test]
+    async fn terminal_local_requests_wait_for_the_managed_change_lifecycle_slot() {
+        let directory = private_tempdir();
+        let state = ApiState::new(Store::open_in_memory().unwrap());
+        let (execution, execution_join) =
+            execution::spawn(config(directory.path()), state.clone()).unwrap();
+        for request in [
+            LocalRequest::CompleteTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+                result: "done".into(),
+            },
+            LocalRequest::BlockTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+                reason: "blocked".into(),
+            },
+            LocalRequest::CancelTask {
+                project_id: ProjectId::try_from("project").unwrap(),
+                task_id: TaskId::try_from("task").unwrap(),
+            },
+            LocalRequest::CreateManagedChange {
+                token: "not-a-token".into(),
+            },
+        ] {
+            let held = state.repository_slot().await;
+            let waiting_state = state.clone();
+            let waiting_execution = execution.clone();
+            let waiting_root = directory.path().to_path_buf();
+            let waiter = tokio::spawn(async move {
+                handle_request(&waiting_state, &waiting_execution, &waiting_root, request).await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), waiter)
+                    .await
+                    .is_err(),
+                "terminal/create request bypassed the repository lifecycle slot"
+            );
+            drop(held);
+        }
+        execution.shutdown().await.unwrap();
+        execution_join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_run_waits_for_the_managed_change_lifecycle_slot() {
+        let directory = private_tempdir();
+        let state = ApiState::new(Store::open_in_memory().unwrap());
+        let (execution, execution_join) =
+            execution::spawn(config(directory.path()), state.clone()).unwrap();
+        let held = state.repository_slot().await;
+        let waiting_state = state.clone();
+        let waiting_execution = execution.clone();
+        let waiting_root = directory.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            handle_request(
+                &waiting_state,
+                &waiting_execution,
+                &waiting_root,
+                LocalRequest::StopRun {
+                    project_id: ProjectId::try_from("project").unwrap(),
+                    run_id: RunId::try_from("run").unwrap(),
+                    grace_ms: 0,
+                },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiter)
+                .await
+                .is_err(),
+            "StopRun bypassed the repository lifecycle slot"
+        );
+        drop(held);
+        execution.shutdown().await.unwrap();
+        execution_join.await.unwrap().unwrap();
+    }
+
+    /// `commit_pending_delivery_on_prompt`'s gated call site
+    /// (`UserPromptSubmit`): with `curie` marked deleting, a
+    /// `UserPromptSubmit` hook -- even with a delivery genuinely in
+    /// flight (`try_delivery_slot` held, satisfying
+    /// `commit_pending_delivery_on_prompt`'s own precondition) and a task
+    /// assigned and waiting -- must not open the run episode. Verified by
+    /// mutation: discarding `try_begin_agent_write`'s result at that call
+    /// site (matching the reviewer's own repro) makes this test's final
+    /// assertion fail (`task-1` moves to `Running`); restoring the gate
+    /// makes it pass again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exact_prompt_admission_bypasses_the_unrelated_agent_write_gate() {
         let directory = private_tempdir();
