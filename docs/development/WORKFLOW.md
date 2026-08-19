@@ -358,9 +358,11 @@ them.
    is cached in `$DARK_FACTORY_HOME/update-check.json`;
    `factory-tui` reads the same cache and refetches at most hourly, in a
    background thread of the running board — no background service — and
-   shows `update vX available: factoryctl update --install` in its status
-   line. `factoryctl health` also returns the daemon's `version`.
-3. **Install**: `factoryctl update --install` first does every read-only
+   shows one `[u update vX]` keyboard/mouse action in its status line.
+   Triggering that action is explicit; there is no automatic update setting.
+   `factoryctl health` also returns the daemon's `version`.
+3. **Install**: `factoryctl update --install` and the TUI action call one
+   shared transaction. It first does every read-only
    check (the manifest; the launchd job, if any, and that it runs with
    *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
    moving the operator's job), then downloads the platform asset, verifies
@@ -377,7 +379,11 @@ them.
    if the new daemon never answers, exit 1 says where the log is and how to
    roll back by hand. If the new version is already installed and running,
    nothing restarts. Without a launchd job it stops after activation and
-   says so; restart the daemon however you run it.
+   says so; restart the daemon however you run it. The TUI requires the
+   matching managed launchd job so it cannot activate an update and then
+   strand itself against an old independently managed daemon. Its bounded
+   status reports stages from inside the download, SHA verification, unpack,
+   activation, job reload, and exact-version health operations.
 4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
    an update never needs a separate migration step.
 5. **No lost work**: sessions and runners are independent process trees
@@ -399,6 +405,15 @@ them.
    (or repoint it the same atomic way) and `launchctl kickstart -k
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
    so a rollback never re-downloads.
+   After a successful TUI install, the viewer validates and execs the exact
+   active `$DARK_FACTORY_HOME/bin/current/factory-tui`, retaining its PID and
+   restoring the focused project, selected agent, BUILDING/AGENT view, and
+   maximized-terminal intent from the next durable snapshot. Before exec it
+   closes only local attach panes and restores the host terminal. If exec
+   preparation or exec itself returns an error, the shared rollback plan
+   restores the prior runtime and launchd job, verifies the old daemon's exact
+   version, and leaves the old board running with one actionable error. Runner
+   and provider processes are not children of the viewer and are untouched.
 7. **Homebrew bootstrap substrate**: this repository renders the exact
    custom-tap formula from the two archive checksums and the update-manifest
    checksum, then publishes it as `dark-factory.rb`. The versioned manifest

@@ -187,6 +187,17 @@ Homebrew updates the bootstrap. `factoryctl update --install` updates the active
 runtime and restarts the daemon; running agent sessions continue. Do not use
 `brew services` for Dark Factory.
 
+When the board shows `[u update vX.Y.Z]`, press `u` or click that exact action
+to run the same verified install transaction without leaving the TUI. The
+board reports download, verification, unpack, activation, reload, and health
+progress, then replaces only its own process image with the active
+`factory-tui`. Its PID and current project/screen selection are retained;
+daemon-supervised runners and provider sessions are not restarted. This is a
+manual action: Dark Factory does not auto-update. If relaunch preparation or
+exec fails, the active runtime and managed launchd job are rolled back and the
+old TUI remains available with the error. An older viewer still offers the
+action when the matching runtime was already installed from `factoryctl`.
+
 `factoryctl update` reports the invoking bootstrap, active runtime, latest
 release, and install availability in human-readable lines. Use
 `factoryctl update --json` for the machine-readable report.

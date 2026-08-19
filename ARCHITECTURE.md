@@ -27,7 +27,10 @@ catalogue.
    atomically with a valid UTF-8 recent-line projection. `PROJECT.md`, Rules,
    and standing instructions are never rewritten by memory compaction.
 3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
-   either one cannot change the lifetime of an agent.
+   either one cannot change the lifetime of an agent. A manual TUI update uses
+   the same verified active-runtime transaction as `factoryctl`, then execs
+   only the viewer after exact daemon health succeeds; local attach panes are
+   closed, but runner and provider process identities are unchanged.
 4. A **session**, not a run, is the unit `factory-runner` supervises: one
    resident, interactive provider process per agent (Claude Code, Codex, or
    the minimal `shell` provider), spawned under a PTY and living across many
