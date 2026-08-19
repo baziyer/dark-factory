@@ -7,7 +7,7 @@ use factory_core::{
     runner::{
         MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
         RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode,
-        decode_terminal_bytes,
+        decode_terminal_bytes, terminal_generation_is_contiguous,
     },
 };
 use thiserror::Error;
@@ -473,13 +473,19 @@ impl TerminalSubscription {
                 found: *offset,
             });
         }
-        if let Some(expected) = self.next_generation
-            && *generation < expected
-        {
-            return Err(RunnerClientError::TerminalAttachGeneration {
-                expected,
-                found: *generation,
-            });
+        if let Some(expected) = self.next_generation {
+            if *generation < expected {
+                return Err(RunnerClientError::TerminalAttachGeneration {
+                    expected,
+                    found: *generation,
+                });
+            }
+            if !terminal_generation_is_contiguous(expected, *generation) {
+                return Err(RunnerClientError::TerminalAttachGenerationJump {
+                    expected: expected.saturating_add(1),
+                    found: *generation,
+                });
+            }
         }
         self.next_offset = Some(offset.saturating_add(bytes.len() as u64));
         self.next_generation = Some(*generation);
@@ -757,6 +763,8 @@ pub enum RunnerClientError {
     TerminalAttachContinuity { expected: u64, found: u64 },
     #[error("terminal output generation regressed: expected at least {expected}, found {found}")]
     TerminalAttachGeneration { expected: u64, found: u64 },
+    #[error("terminal output skipped a generation: expected at most {expected}, found {found}")]
+    TerminalAttachGenerationJump { expected: u64, found: u64 },
     #[error(
         "terminal attach cursor is unavailable ({reason}); retained generation {generation}, offsets {base_offset}..{end_offset}"
     )]

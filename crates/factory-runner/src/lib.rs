@@ -1673,7 +1673,7 @@ async fn attach_terminal_connection(
                     return send_attach_gap(
                         write,
                         &current,
-                        Some(current.generation),
+                        Some(delivered_generation),
                         delivered,
                         "terminal stream desynchronized; reattach from the last offset",
                     )
@@ -1684,7 +1684,7 @@ async fn attach_terminal_connection(
                     return send_attach_gap(
                         write,
                         &current,
-                        Some(current.generation),
+                        Some(delivered_generation),
                         delivered,
                         "terminal subscriber fell behind; reattach from the last offset",
                     )
@@ -2996,6 +2996,110 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(output, vec![(1, b"GH".to_vec())]);
+    }
+
+    #[tokio::test]
+    async fn lag_gap_keeps_the_delivered_previous_generation_and_resumes_across_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let max_bytes = 4 * 1024 * 1024;
+        let log = open_terminal_log(directory.path(), max_bytes);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let (_, mut write) = server.into_split();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let attach_log = log.clone();
+        let task = tokio::spawn(async move {
+            attach_terminal_connection(
+                &mut write,
+                &attach_log,
+                shutdown_rx,
+                0,
+                TerminalAttachMode::Offset {
+                    generation: Some(0),
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut reader = BufReader::new(client);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(!line.is_empty(), "attach ended before its live boundary");
+            let frame: RunnerFrame = serde_json::from_str(line.trim_end()).unwrap();
+            let boundary = matches!(
+                frame,
+                RunnerFrame::TerminalOutput { ref bytes, .. } if bytes.is_empty()
+            );
+            if boundary {
+                break;
+            }
+        }
+
+        // Fill generation 0 while the socket is unread, then cross exactly
+        // one rotation. More than the subscriber's 64-entry broadcast
+        // window is retained, so the live sender is forced to report Lagged
+        // before it can deliver generation 1 to this client.
+        let append_log = log.clone();
+        tokio::spawn(async move {
+            for _ in 0..=(max_bytes / 4096) {
+                append_log.append(vec![b'b'; 4096]).await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+
+        let gap = loop {
+            line.clear();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+                .await
+                .expect("lag gap was not delivered")
+                .unwrap();
+            assert!(!line.is_empty(), "attach ended without a lag gap");
+            let frame: RunnerFrame = serde_json::from_str(line.trim_end()).unwrap();
+            if let RunnerFrame::TerminalAttachGap { .. } = frame {
+                break frame;
+            }
+        };
+        let RunnerFrame::TerminalAttachGap {
+            generation,
+            requested_generation,
+            requested_offset,
+            ..
+        } = gap
+        else {
+            unreachable!();
+        };
+        assert_eq!(generation, 1);
+        assert_eq!(requested_generation, Some(0));
+        assert!(requested_offset <= max_bytes);
+
+        let _ = shutdown_tx.send(true);
+        task.await.unwrap();
+
+        let resumed = attach_frames(
+            log,
+            TerminalAttachMode::Offset {
+                generation: requested_generation,
+                offset: requested_offset,
+            },
+        )
+        .await;
+        assert!(resumed.iter().any(|frame| {
+            matches!(
+                frame,
+                RunnerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                } if *generation == if requested_offset == max_bytes { 1 } else { 0 }
+                    && *offset == requested_offset
+                    && !bytes.is_empty()
+            )
+        }));
     }
 
     #[tokio::test]

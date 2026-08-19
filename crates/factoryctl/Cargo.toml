@@ -17,6 +17,7 @@ tokio = { version = "1.53.1", default-features = false, features = ["io-util", "
 uuid.workspace = true
 
 [dev-dependencies]
+portable-pty = "0.9.0"
 tempfile = "3.27.0"
 
 [lints]

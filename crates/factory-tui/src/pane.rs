@@ -20,7 +20,9 @@ use portable_pty::{
 use tui_term::vt100;
 
 use factory_core::local::{LocalRequest, ServerFrame};
-use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
+use factory_core::runner::{
+    decode_terminal_bytes, encode_terminal_bytes, terminal_generation_is_contiguous,
+};
 use factory_core::{ProjectId, SessionId};
 
 use factoryctl::Client;
@@ -468,8 +470,12 @@ fn spawn_attach_reader_thread(
                     ..
                 } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
+                        let generation_jump = next_generation.is_some_and(|expected| {
+                            !terminal_generation_is_contiguous(expected, generation)
+                        });
                         if next_offset.is_some_and(|expected| expected != offset)
                             || next_generation.is_some_and(|expected| generation < expected)
+                            || generation_jump
                         {
                             if let Ok(mut guard) = attach_error.lock() {
                                 *guard = Some(format!(

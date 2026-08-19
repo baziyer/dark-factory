@@ -88,6 +88,14 @@ pub fn decode_terminal_bytes(encoded: &str) -> Result<Vec<u8>, InvalidTerminalBy
     STANDARD.decode(encoded).map_err(|_| InvalidTerminalBytes)
 }
 
+/// Returns whether a chunk can follow a validated terminal chunk. A live
+/// stream may remain in the same retained generation or cross exactly one
+/// rotation; a larger jump means bytes were silently skipped.
+#[must_use]
+pub const fn terminal_generation_is_contiguous(expected: u64, found: u64) -> bool {
+    found >= expected && found <= expected.saturating_add(1)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("terminal bytes are not valid base64")]
 pub struct InvalidTerminalBytes;
@@ -203,6 +211,11 @@ pub enum RunnerFrame {
     /// expected offset is `offset + bytes.len()` after decoding.
     TerminalOutput {
         protocol_version: u16,
+        /// Additive in the v1 wire: runners predating generation-aware
+        /// attach omit this field. A new daemon only treats the value as
+        /// authoritative after capability negotiation; legacy output keeps
+        /// the historical single-generation cursor contract.
+        #[serde(default)]
         generation: u64,
         offset: u64,
         bytes: String,

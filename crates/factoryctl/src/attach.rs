@@ -17,7 +17,10 @@ use std::{
 use factory_core::{
     AgentId, ProjectId, SessionId,
     local::{LocalRequest, LocalResponse, ServerFrame},
-    runner::{TerminalAttachMode, decode_terminal_bytes, encode_terminal_bytes},
+    runner::{
+        TerminalAttachMode, decode_terminal_bytes, encode_terminal_bytes,
+        terminal_generation_is_contiguous,
+    },
 };
 use factoryctl::Client;
 use rustix::termios::{self, OptionalActions, Termios};
@@ -133,8 +136,12 @@ fn spawn_output_thread(
                     ..
                 }) => match decode_terminal_bytes(&bytes) {
                     Ok(raw) => {
+                        let generation_jump = next_generation.is_some_and(|expected| {
+                            !terminal_generation_is_contiguous(expected, generation)
+                        });
                         if next_offset.is_some_and(|expected| expected != offset)
                             || next_generation.is_some_and(|expected| generation < expected)
+                            || generation_jump
                         {
                             set_failure(
                                 &failure,

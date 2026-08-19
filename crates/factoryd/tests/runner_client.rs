@@ -78,6 +78,20 @@ fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
     }
 }
 
+fn old_v1_terminal_output(offset: u64, bytes: &str) -> Vec<u8> {
+    let frame = serde_json::json!({
+        "type": "terminal_output",
+        "data": {
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
+            "offset": offset,
+            "bytes": bytes,
+        },
+    });
+    let mut encoded = serde_json::to_vec(&frame).unwrap();
+    encoded.push(b'\n');
+    encoded
+}
+
 fn attach_capabilities() -> RunnerFrame {
     RunnerFrame::TerminalAttachCapabilities {
         protocol_version: RUNNER_PROTOCOL_VERSION,
@@ -467,6 +481,31 @@ async fn live_stream_rejects_duplicates_gaps_and_all_non_event_frames() {
     ));
 }
 
+#[tokio::test]
+async fn terminal_stream_rejects_an_arbitrary_forward_generation_jump() {
+    let first = terminal_output(0, &factory_core::runner::encode_terminal_bytes(b"a"));
+    let second = RunnerFrame::TerminalOutput {
+        protocol_version: RUNNER_PROTOCOL_VERSION,
+        generation: 2,
+        offset: 1,
+        bytes: factory_core::runner::encode_terminal_bytes(b"b"),
+    };
+    let fake = fake_runner(vec![vec![encoded(first), encoded(second)]]).await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
+        .await
+        .unwrap();
+    subscription.next_chunk().await.unwrap();
+    assert!(matches!(
+        subscription.next_chunk().await,
+        Err(RunnerClientError::TerminalAttachGenerationJump {
+            expected: 1,
+            found: 2
+        })
+    ));
+    fake.requests.await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acknowledge_exit_uses_a_fresh_connection_and_an_exact_derived_command_id() {
     let fake = fake_runner(vec![vec![encoded(RunnerFrame::CommandAck {
@@ -686,7 +725,7 @@ async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_
 #[tokio::test]
 async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
     let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-output");
-    let fake = fake_runner(vec![vec![encoded(terminal_output(7, &bytes))]]).await;
+    let fake = fake_runner(vec![vec![old_v1_terminal_output(7, &bytes)]]).await;
     let mut subscription = client(&fake.runtime_dir)
         .attach_terminal(7, factory_core::runner::TerminalAttachMode::Legacy)
         .await
@@ -702,6 +741,43 @@ async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
                 mode: factory_core::runner::TerminalAttachMode::Legacy,
             }
         )]
+    );
+}
+
+#[tokio::test]
+async fn full_history_falls_back_and_decodes_a_literal_old_v1_output_frame() {
+    let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-full-history");
+    let fake = fake_runner(vec![
+        vec![encoded(RunnerFrame::Error {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            code: RunnerErrorCode::InvalidRequest,
+            message: "unknown terminal capability request".into(),
+        })],
+        vec![old_v1_terminal_output(0, &bytes)],
+    ])
+    .await;
+    let mut subscription = client(&fake.runtime_dir)
+        .attach_terminal(0, factory_core::runner::TerminalAttachMode::FullHistory)
+        .await
+        .unwrap();
+    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 0, bytes));
+    assert_eq!(
+        fake.requests.await.unwrap(),
+        vec![
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::TerminalAttachCapabilities,
+            ),
+            RequestEnvelope::new(
+                run_id(),
+                instance_id(),
+                RunnerRequest::AttachTerminal {
+                    since_offset: 0,
+                    mode: factory_core::runner::TerminalAttachMode::Legacy,
+                },
+            ),
+        ]
     );
 }
 
