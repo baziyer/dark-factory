@@ -164,6 +164,7 @@ offline) or the restarted daemon doesn't answer in time.
 
 Options:
   --install                  Download, verify, and activate the latest needed release
+  --json                     One JSON object instead of text lines
   -h, --help                 Show this help";
 const USAGE_HELP: &str = "usage: factoryctl usage
 
@@ -2917,6 +2918,10 @@ mod tests {
         );
         assert!(parse_args(args(&["update", "--force"])).is_err());
         assert!(UPDATE_HELP.contains("update [--install] [--json]"));
+        assert!(
+            UPDATE_HELP
+                .contains("--json                     One JSON object instead of text lines")
+        );
         assert_eq!(
             parse_args(args(&["version"])).unwrap().1,
             CliCommand::Version
