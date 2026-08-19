@@ -44,7 +44,7 @@ use factoryctl::Client;
 
 use model::{Board, Intent};
 use net::NetMsg;
-use pane::{Pane, PaneMap};
+use pane::{Pane, PaneMap, PaneObservation};
 
 struct Config {
     socket: Option<String>,
@@ -289,7 +289,7 @@ fn run(
     let mut mouse_capture = mouse::Capture::default();
     net::spawn_update_check(tx.clone(), now_ms());
 
-    sync_panes(board, panes, socket, debug_log);
+    sync_panes(board, panes, socket, client, tx, debug_log);
     let mut hit_map = draw_board(terminal, board, panes)?;
 
     loop {
@@ -341,7 +341,7 @@ fn run(
             needs_redraw = true;
         }
 
-        if sync_panes(board, panes, socket, debug_log) {
+        if sync_panes(board, panes, socket, client, tx, debug_log) {
             needs_redraw = true;
         }
         sync_agent_context(board, client, tx, &mut context_refresh);
@@ -395,6 +395,8 @@ fn sync_panes(
     board: &mut Board,
     panes: &mut PaneMap,
     socket: &std::path::Path,
+    client: &Client,
+    tx: &mpsc::Sender<NetMsg>,
     debug_log: Option<&std::path::Path>,
 ) -> bool {
     let desired: Vec<SessionId> = board.desired_sessions();
@@ -408,31 +410,65 @@ fn sync_panes(
     for session_id in stale {
         if let Some(mut pane) = panes.remove(&session_id) {
             pane.kill();
-            board.clear_local_attach_failure(&session_id);
+            board.clear_local_attach_failure_if_identity_changed(&session_id);
             changed = true;
         }
     }
 
     for session_id in desired {
         if let Some(pane) = panes.get_mut(&session_id) {
-            let failure = pane.attach_error().or_else(|| {
-                pane.has_exited()
-                    .then(|| "terminal connection closed".to_owned())
-            });
-            if let Some(error) = failure {
-                board.note_local_attach_failure(&session_id, &error);
-                if !board.take_attach_retry(&session_id) {
+            let current_identity =
+                board
+                    .sessions
+                    .get(&session_id)
+                    .map(|session| crate::pane::PaneIdentity {
+                        project_id: session.project_id.clone(),
+                        session_id: session.id.clone(),
+                        runner_instance_id: session.runner_instance_id.clone(),
+                    });
+            if pane.identity() != current_identity.as_ref() {
+                if let Some(mut replaced) = panes.remove(&session_id) {
+                    replaced.kill();
+                }
+                board.clear_local_attach_failure(&session_id);
+                changed = true;
+                continue;
+            }
+            match pane.observation() {
+                PaneObservation::AttachRefused(refusal) => {
+                    if !board.note_attach_refusal(&refusal) {
+                        if let Some(mut stale) = panes.remove(&session_id) {
+                            stale.kill();
+                        }
+                        net::spawn_fleet_snapshot(client.clone(), tx.clone());
+                        changed = true;
+                        continue;
+                    }
+                    if let Some(mut failed) = panes.remove(&session_id) {
+                        failed.kill();
+                    }
+                    net::spawn_fleet_snapshot(client.clone(), tx.clone());
+                    changed = true;
                     continue;
                 }
-                if let Some(mut failed) = panes.remove(&session_id) {
-                    failed.kill();
+                PaneObservation::Error(error) => {
+                    board.note_local_attach_failure(&session_id, &error);
+                    if let Some(mut failed) = panes.remove(&session_id) {
+                        failed.kill();
+                    }
+                    changed = true;
+                    continue;
                 }
-                changed = true;
-            } else {
-                if pane.is_ready() {
-                    board.clear_local_attach_failure(&session_id);
+                PaneObservation::Disconnected => {
+                    board.note_local_attach_failure(&session_id, "terminal connection closed");
+                    if let Some(mut failed) = panes.remove(&session_id) {
+                        failed.kill();
+                    }
+                    changed = true;
+                    continue;
                 }
-                continue;
+                PaneObservation::LocalPtyExited => continue,
+                PaneObservation::Connecting | PaneObservation::Attached => continue,
             }
         }
         if !board.take_attach_retry(&session_id) {
@@ -447,6 +483,7 @@ fn sync_panes(
                 socket.to_path_buf(),
                 session.project_id.clone(),
                 session_id.clone(),
+                session.runner_instance_id.clone(),
                 title,
                 24,
                 80,
@@ -474,12 +511,24 @@ fn sync_panes(
         }
     }
 
-    let ready = board.focus_target().is_some_and(|session_id| {
+    let ready_session = board.focus_target().and_then(|session_id| {
         panes
             .get(&session_id)
-            .is_some_and(|pane| pane.is_ready() && pane.attach_error().is_none())
+            .and_then(|pane| pane.observation().is_attached().then_some(session_id))
     });
-    changed |= board.pane_ready != ready;
+    changed |= reconcile_pane_readiness(board, ready_session);
+    changed
+}
+
+/// Applies the final readiness observation for the focused pane and its coupled local refusal
+/// state. Keeping this transition together makes a late-ready pane unable to leave `pane_ready`
+/// true while stale refusal attention remains visible.
+fn reconcile_pane_readiness(board: &mut Board, ready_session: Option<SessionId>) -> bool {
+    let ready = ready_session.is_some();
+    if let Some(session_id) = ready_session {
+        board.clear_local_attach_failure(&session_id);
+    }
+    let mut changed = board.pane_ready != ready;
     board.pane_ready = ready;
     if !ready && board.pane_mode == model::PaneMode::Typing {
         board.pane_mode = model::PaneMode::Board;
@@ -534,23 +583,26 @@ fn context_requests(
 /// AGENT.s selected pane owns the keyboard only in TYPING mode. The
 /// same `Board::terminals_focused_pane` the highlight in `ui::terminals` reads, so the two can
 /// never point at different panes.
-fn forwarding_target(board: &Board) -> Option<SessionId> {
-    (board.view == model::View::Agent)
-        .then(|| board.focus_target())
-        .flatten()
+fn attached_pane<'a>(panes: &'a PaneMap, session_id: &SessionId) -> Option<&'a Pane> {
+    panes
+        .get(session_id)
+        .filter(|pane| pane.observation().is_attached())
+}
+
+fn forwarding_pane<'a>(board: &Board, panes: &'a PaneMap) -> Option<&'a Pane> {
+    if board.view != model::View::Agent || board.pane_mode != model::PaneMode::Typing {
+        return None;
+    }
+    let session_id = board.focus_target()?;
+    attached_pane(panes, &session_id)
 }
 
 fn forward_paste_if_applicable(board: &Board, panes: &PaneMap, text: &str) {
-    if board.pane_mode != model::PaneMode::Typing {
-        return;
-    }
-    let Some(session_id) = forwarding_target(board) else {
+    let Some(pane) = forwarding_pane(board, panes) else {
         return;
     };
-    if let Some(pane) = panes.get(&session_id) {
-        let bytes = keys::encode_paste(text, pane.bracketed_paste());
-        pane.write_input(&bytes);
-    }
+    let bytes = keys::encode_paste(text, pane.bracketed_paste());
+    let _ = pane.write_input(&bytes);
 }
 
 struct IntentContext<'a> {
@@ -577,7 +629,7 @@ fn handle_mouse(
         .flatten()
         .filter(|terminal| context.board.focus_target().as_ref() == Some(&terminal.session_id))
         .and_then(|terminal| context.panes.get(&terminal.session_id))
-        .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
+        .filter(|pane| pane.observation().is_attached())
         .map(Pane::mouse_context)
         .filter(|context| context.enabled());
 
@@ -595,11 +647,7 @@ fn handle_mouse(
             )
         }
         mouse::Route::Scroll { session_id, up } => {
-            let Some(pane) = context
-                .panes
-                .get(&session_id)
-                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
-            else {
+            let Some(pane) = attached_pane(context.panes, &session_id) else {
                 return false;
             };
             const SCROLL_STEP_LINES: usize = 3;
@@ -611,22 +659,14 @@ fn handle_mouse(
             true
         }
         mouse::Route::ResetScrollback { session_id } => {
-            let Some(pane) = context
-                .panes
-                .get(&session_id)
-                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
-            else {
+            let Some(pane) = attached_pane(context.panes, &session_id) else {
                 return false;
             };
             pane.scroll_reset();
             true
         }
         mouse::Route::Terminal { session_id, bytes } => {
-            let Some(pane) = context
-                .panes
-                .get(&session_id)
-                .filter(|pane| pane.is_ready() && pane.attach_error().is_none())
-            else {
+            let Some(pane) = attached_pane(context.panes, &session_id) else {
                 return false;
             };
             pane.write_input(&bytes);
@@ -658,11 +698,9 @@ fn apply_intent(
             true
         }
         Intent::ForwardKey(key) => {
-            if let Some(session_id) = forwarding_target(board) {
-                if let Some(pane) = panes.get(&session_id) {
-                    let bytes = keys::encode_key(key, pane.key_context());
-                    pane.write_input(&bytes);
-                }
+            if let Some(pane) = forwarding_pane(board, panes) {
+                let bytes = keys::encode_key(key, pane.key_context());
+                let _ = pane.write_input(&bytes);
             }
             true
         }
@@ -732,9 +770,15 @@ fn apply_net_msg(
             sessions,
             event_sequence,
         } => {
-            board.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
-            board.note_fleet_snapshot_sequence(event_sequence);
-            if !*initial_project_applied {
+            let applied = board.apply_fleet_snapshot_at(
+                projects,
+                agents,
+                tasks,
+                runs,
+                sessions,
+                event_sequence,
+            );
+            if applied && !*initial_project_applied {
                 if let Some(project_id) = initial_project {
                     board.focus_project(project_id.clone());
                 }
@@ -777,10 +821,13 @@ mod main_tests {
     use std::io::{BufRead as _, BufReader, Write as _};
     use std::os::unix::net::UnixListener;
 
-    use factory_core::local::{ErrorCode, LocalResponse, ServerFrame};
+    use factory_core::local::{LocalResponse, ServerFrame};
     use factory_core::{AgentRole, PROTOCOL_VERSION, SessionState};
     use factoryctl::update::{Asset, Manifest, UpdateCheck};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+    use ratatui::layout::Rect;
 
     use crate::test_fixtures::{agent, project, session};
 
@@ -1012,11 +1059,13 @@ mod main_tests {
         board.view = model::View::Agent;
         board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
         let mut panes = PaneMap::new();
-        sync_panes(&mut board, &mut panes, &socket, None);
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !board.pane_ready && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         }
         assert!(
             board.pane_ready,
@@ -1035,43 +1084,67 @@ mod main_tests {
     }
 
     #[test]
-    fn asynchronous_attach_failure_is_actionable_and_retries_until_ready() {
+    fn delayed_refusal_after_ready_revokes_readiness_and_blocks_all_forwarding() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("factory.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (input_seen_tx, input_seen_rx) = mpsc::channel();
         let server = std::thread::spawn(move || {
-            for attempt in 0..2 {
-                let (mut attach, _) = listener.accept().unwrap();
-                let mut request = String::new();
-                BufReader::new(attach.try_clone().unwrap())
-                    .read_line(&mut request)
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
-                    "attach_terminal"
-                );
-                let frame = if attempt == 0 {
-                    ServerFrame::Response {
-                        protocol_version: PROTOCOL_VERSION,
-                        response: LocalResponse::Error {
-                            code: ErrorCode::NotFound,
-                            message: "runner temporarily unavailable".into(),
-                        },
+            let (mut attach, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(attach.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&request).unwrap()["request"]["type"],
+                "attach_terminal"
+            );
+            let ready = ServerFrame::TerminalOutput {
+                protocol_version: PROTOCOL_VERSION,
+                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                offset: 0,
+                bytes: factory_core::runner::encode_terminal_bytes(b"\x1b[?1000h"),
+            };
+            serde_json::to_writer(&mut attach, &ready).unwrap();
+            attach.write_all(b"\n").unwrap();
+            attach.flush().unwrap();
+            release_rx.recv().unwrap();
+
+            let refusal = factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Idle),
+                reason: factory_core::local::AttachRefusalReason::RunnerRejected,
+            };
+            serde_json::to_writer(
+                &mut attach,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::AttachRefused { refusal },
+                },
+            )
+            .unwrap();
+            attach.write_all(b"\n").unwrap();
+            attach.flush().unwrap();
+
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((input, _)) => {
+                        let _ = input_seen_tx.send(());
+                        let mut ignored = String::new();
+                        let _ = BufReader::new(input.try_clone().unwrap()).read_line(&mut ignored);
+                        break;
                     }
-                } else {
-                    ServerFrame::TerminalOutput {
-                        protocol_version: PROTOCOL_VERSION,
-                        session_id: factory_core::SessionId::try_from("session-1").unwrap(),
-                        offset: 0,
-                        bytes: String::new(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
                     }
-                };
-                serde_json::to_writer(&mut attach, &frame).unwrap();
-                attach.write_all(b"\n").unwrap();
-                attach.flush().unwrap();
-                if attempt == 1 {
-                    release_rx.recv().unwrap();
+                    Err(error) => panic!("unexpected input accept error: {error}"),
                 }
             }
         });
@@ -1088,18 +1161,172 @@ mod main_tests {
         );
         board.view = model::View::Agent;
         board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
         let mut panes = PaneMap::new();
-        sync_panes(&mut board, &mut panes, &socket, None);
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+        assert!(
+            panes
+                .get(&session_id)
+                .expect("attach pane")
+                .wait_until_ready(Duration::from_secs(2))
+        );
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+        assert!(board.pane_ready);
+        assert!(matches!(
+            board.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Intent::Redraw
+        ));
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while board.attention_items().is_empty() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
-        }
+        release_tx.send(()).unwrap();
+        let pane = panes.get(&session_id).expect("ready attach pane");
+        assert!(pane.wait_for_attach_refusal(Duration::from_secs(2)));
+        assert!(matches!(
+            pane.observation(),
+            PaneObservation::AttachRefused(_)
+        ));
+        assert!(board.pane_ready, "readiness changes on reconciliation");
+        assert!(!pane.write_input(b"direct"));
+
+        let key = board.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(key, Intent::ForwardKey(_)));
+        assert!(apply_intent(key, &mut board, &client, &socket, &tx, &panes));
+        forward_paste_if_applicable(&board, &panes, "paste");
+
+        let mut hits = mouse::HitMap::default();
+        hits.set_terminal(Rect::new(0, 0, 10, 5), session_id.clone());
+        assert!(!handle_mouse(
+            ratatui::crossterm::event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &hits,
+            &mut mouse::Capture::default(),
+            &mut IntentContext {
+                board: &mut board,
+                client: &client,
+                socket: &socket,
+                tx: &tx,
+                panes: &panes,
+            },
+        ));
+        assert!(
+            input_seen_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err()
+        );
+
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+        assert!(!board.pane_ready);
+        assert_eq!(board.pane_mode, model::PaneMode::Board);
+        assert!(panes.is_empty());
+        assert!(board.status_line_text().contains("runner rejected attach"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn asynchronous_attach_failure_is_actionable_and_retries_until_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let mut attempt = 0;
+            while attempt < 2 {
+                let (mut attach, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(attach.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                let request = serde_json::from_str::<serde_json::Value>(&request).unwrap();
+                if request["request"]["type"] != "attach_terminal" {
+                    let response = match request["request"]["type"].as_str().unwrap() {
+                        "latest_event_sequence" => LocalResponse::EventHead { sequence: 0 },
+                        "list_projects" => LocalResponse::Projects {
+                            projects: Vec::new(),
+                            next_after_id: None,
+                        },
+                        other => panic!("unexpected refresh request: {other}"),
+                    };
+                    serde_json::to_writer(
+                        &mut attach,
+                        &ServerFrame::Response {
+                            protocol_version: PROTOCOL_VERSION,
+                            response,
+                        },
+                    )
+                    .unwrap();
+                    attach.write_all(b"\n").unwrap();
+                    attach.flush().unwrap();
+                    continue;
+                }
+                let frame = if attempt == 0 {
+                    ServerFrame::Response {
+                        protocol_version: PROTOCOL_VERSION,
+                        response: LocalResponse::AttachRefused {
+                            refusal: factory_core::local::AttachRefusal {
+                                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                                runner_instance_id: Some(
+                                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                                ),
+                                session_state: Some(SessionState::Idle),
+                                reason: factory_core::local::AttachRefusalReason::RunnerUnavailable,
+                            },
+                        },
+                    }
+                } else {
+                    ServerFrame::TerminalOutput {
+                        protocol_version: PROTOCOL_VERSION,
+                        session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                        offset: 0,
+                        bytes: String::new(),
+                    }
+                };
+                serde_json::to_writer(&mut attach, &frame).unwrap();
+                attach.write_all(b"\n").unwrap();
+                attach.flush().unwrap();
+                if attempt == 1 {
+                    release_rx.recv().unwrap();
+                }
+                attempt += 1;
+            }
+        });
+
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(factory_core::SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let mut panes = PaneMap::new();
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+
+        let pane = panes
+            .get(&factory_core::SessionId::try_from("session-1").unwrap())
+            .expect("first attach pane");
+        assert!(pane.wait_for_attach_outcome(Duration::from_secs(2)));
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         assert_eq!(
             board.attention_items()[0].reason.kind,
             factory_core::status::AttentionReasonKind::ObserverProblem
         );
+        assert!(
+            panes.is_empty(),
+            "refused pane must never remain renderable"
+        );
+        assert!(board.status_line_text().contains("runner unavailable"));
 
         board.apply_fleet_status(factory_core::status::FleetStatus {
             generated_at_ms: 1,
@@ -1113,13 +1340,240 @@ mod main_tests {
         assert!(!board.attention_items().is_empty());
 
         board.tick(1_001);
-        while !board.pane_ready && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-            sync_panes(&mut board, &mut panes, &socket, None);
-        }
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+        let pane = panes
+            .get(&factory_core::SessionId::try_from("session-1").unwrap())
+            .expect("retry attach pane");
+        assert!(pane.wait_until_ready(Duration::from_secs(2)));
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
         assert!(board.pane_ready);
         assert!(board.attention_items().is_empty());
         release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn late_ready_reconciliation_clears_refusal_with_readiness_transition() {
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(session_id.clone());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        assert!(
+            board.note_attach_refusal(&factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: session_id.clone(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Stopped),
+                reason: factory_core::local::AttachRefusalReason::SessionEnded,
+            })
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+
+        assert!(!reconcile_pane_readiness(&mut board, None));
+        assert!(!board.pane_ready);
+        assert!(!board.attention_items().is_empty());
+
+        assert!(reconcile_pane_readiness(&mut board, Some(session_id)));
+        assert!(board.pane_ready);
+        assert!(board.attention_items().is_empty());
+    }
+
+    #[test]
+    fn stale_pane_detach_preserves_an_identity_matching_nonretryable_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(session_id.clone());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        assert!(
+            board.note_attach_refusal(&factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: session_id.clone(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Stopped),
+                reason: factory_core::local::AttachRefusalReason::SessionEnded,
+            })
+        );
+
+        board.view = model::View::Building;
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id.clone(),
+            Pane::spawn("stale", &["/bin/cat".to_owned()], 24, 80, None).unwrap(),
+        );
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+
+        assert!(panes.is_empty());
+        assert!(!board.take_attach_retry(&session_id));
+        assert!(board.attention_items().iter().any(|item| {
+            item.session_id.as_ref() == Some(&session_id)
+                && item.reason.kind == factory_core::status::AttentionReasonKind::ObserverProblem
+        }));
+    }
+
+    #[test]
+    fn exited_local_pty_stays_renderable_across_repeated_syncs_without_respawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let mut board = Board::new(true, 0, theme::FORTRESS);
+        let alice = agent("alice", "proj", AgentRole::Worker, None);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let session_id = factory_core::SessionId::try_from("dev-alice").unwrap();
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id.clone(),
+            Pane::spawn(
+                "exiting",
+                &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                24,
+                80,
+                None,
+            )
+            .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            panes.get(&session_id).unwrap().observation(),
+            PaneObservation::LocalPtyExited
+        ) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            panes.get(&session_id).unwrap().observation(),
+            PaneObservation::LocalPtyExited
+        ));
+
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        for _ in 0..5 {
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+            let pane = panes.get(&session_id).expect("exited pane remains present");
+            assert!(matches!(
+                pane.observation(),
+                PaneObservation::LocalPtyExited
+            ));
+            assert_eq!(
+                pane.command,
+                vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned(),],
+                "sync must not replace an exited local shell with a new one"
+            );
+        }
+        assert!(!board.pane_ready);
+    }
+
+    #[test]
+    fn refusal_after_reconcile_is_not_rendered_as_an_exited_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut attach, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(attach.try_clone().unwrap())
+                .read_line(&mut request)
+                .unwrap();
+            let refusal = factory_core::local::AttachRefusal {
+                project_id: factory_core::ProjectId::try_from("proj").unwrap(),
+                session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                runner_instance_id: Some(
+                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
+                ),
+                session_state: Some(SessionState::Idle),
+                reason: factory_core::local::AttachRefusalReason::RunnerRejected,
+            };
+            serde_json::to_writer(
+                &mut attach,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::AttachRefused { refusal },
+                },
+            )
+            .unwrap();
+            attach.write_all(b"\n").unwrap();
+            attach.flush().unwrap();
+        });
+
+        let mut board = Board::new(false, 0, theme::FORTRESS);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(factory_core::SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session("session-1", "alice", "proj", SessionState::Idle)],
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let session_id = factory_core::SessionId::try_from("session-1").unwrap();
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id,
+            Pane::attach(
+                socket,
+                factory_core::ProjectId::try_from("proj").unwrap(),
+                factory_core::SessionId::try_from("session-1").unwrap(),
+                Some(factory_core::RunnerInstanceId::try_from("runner").unwrap()),
+                "alice",
+                24,
+                80,
+            )
+            .unwrap(),
+        );
+        assert!(
+            panes
+                .values()
+                .next()
+                .unwrap()
+                .wait_for_attach_refusal(Duration::from_secs(2))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &board, &mut panes);
+            })
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("terminal attach refused"));
+        assert!(!text.contains("[exited]"));
         server.join().unwrap();
     }
 }

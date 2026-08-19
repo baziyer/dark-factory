@@ -473,6 +473,10 @@ pub struct SessionSnapshot {
     pub worktree: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
+    /// The daemon-owned runner generation for this session. Older daemons may omit it;
+    /// clients must not treat an omitted generation as interchangeable with a known one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_instance_id: Option<RunnerInstanceId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<RunId>,
     /// Bounded free-text activity label (e.g. `"tool: Read"`), or `None`

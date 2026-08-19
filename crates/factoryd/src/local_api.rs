@@ -14,12 +14,12 @@ use factory_core::{
     SessionId,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
-        AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
-        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
-        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES,
-        MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES, MAX_TERMINAL_OUTPUT_BYTES,
-        ProjectDetail as LocalProjectDetail, RequestEnvelope, RunTerminal, ServerFrame,
-        normalize_task_title,
+        AgentProfile as LocalAgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
+        LocalRequest, LocalResponse, MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS,
+        MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS,
+        MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
+        MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail, RequestEnvelope,
+        RunTerminal, ServerFrame, normalize_task_title,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
@@ -595,11 +595,40 @@ fn spawn_terminal_attach(
         {
             Ok(target) => target,
             Err(error) => {
-                let _ =
-                    send_terminal_error(&frame_tx, ApiFailure::from(error).into_response()).await;
+                let response = match error {
+                    DaemonStateError::Store(StoreError::SessionNotFound) => {
+                        LocalResponse::AttachRefused {
+                            refusal: AttachRefusal {
+                                project_id,
+                                session_id,
+                                runner_instance_id: None,
+                                session_state: None,
+                                reason: AttachRefusalReason::SessionNotFound,
+                            },
+                        }
+                    }
+                    error => ApiFailure::from(error).into_response(),
+                };
+                let _ = send_terminal_error(&frame_tx, response).await;
                 return;
             }
         };
+        if target.ended_at_ms.is_some() || !target.state.is_live() {
+            let _ = send_terminal_error(
+                &frame_tx,
+                LocalResponse::AttachRefused {
+                    refusal: AttachRefusal {
+                        project_id,
+                        session_id,
+                        runner_instance_id: Some(target.runner_instance_id),
+                        session_state: Some(target.state),
+                        reason: AttachRefusalReason::SessionEnded,
+                    },
+                },
+            )
+            .await;
+            return;
+        }
         let control_run_id = match session_control_run_id(&session_id) {
             Ok(run_id) => run_id,
             Err(failure) => {
@@ -610,7 +639,7 @@ fn spawn_terminal_attach(
         let client = RunnerClient::new(
             &target.runner_runtime,
             control_run_id,
-            target.runner_instance_id,
+            target.runner_instance_id.clone(),
         );
         let mut subscription = match client.attach_terminal(since_offset).await {
             Ok(subscription) => subscription,
@@ -627,7 +656,16 @@ fn spawn_terminal_attach(
                     )
                     .await;
                 }
-                let response = runner_control_failure(error, "attach terminal").into_response();
+                let reason = attach_refusal_reason(&error);
+                let response = LocalResponse::AttachRefused {
+                    refusal: AttachRefusal {
+                        project_id,
+                        session_id,
+                        runner_instance_id: Some(target.runner_instance_id),
+                        session_state: Some(target.state),
+                        reason,
+                    },
+                };
                 let _ = send_terminal_error(&frame_tx, response).await;
                 return;
             }
@@ -667,7 +705,16 @@ fn spawn_terminal_attach(
                         ))),
                     )
                     .await;
-                    let response = runner_control_failure(error, "attach terminal").into_response();
+                    let reason = attach_refusal_reason(&error);
+                    let response = LocalResponse::AttachRefused {
+                        refusal: AttachRefusal {
+                            project_id: project_id.clone(),
+                            session_id: session_id.clone(),
+                            runner_instance_id: Some(target.runner_instance_id.clone()),
+                            session_state: Some(target.state),
+                            reason,
+                        },
+                    };
                     let _ = send_terminal_error(&frame_tx, response).await;
                     return;
                 }
@@ -3026,6 +3073,14 @@ fn runner_control_failure(error: RunnerClientError, action: &'static str) -> Api
     }
 }
 
+fn attach_refusal_reason(error: &RunnerClientError) -> AttachRefusalReason {
+    match error {
+        RunnerClientError::WrongIdentity => AttachRefusalReason::RunnerReplaced,
+        RunnerClientError::RunnerRejected { .. } => AttachRefusalReason::RunnerRejected,
+        _ => AttachRefusalReason::RunnerUnavailable,
+    }
+}
+
 fn read_run_terminal(
     target: &SessionControlTarget,
     run_id: RunId,
@@ -3428,6 +3483,24 @@ mod hook_field_tests {
                 code: RunnerErrorCode::Conflict,
             }
         ));
+    }
+
+    #[test]
+    fn attach_refusal_classifies_runner_races_without_exposing_error_text() {
+        assert_eq!(
+            attach_refusal_reason(&RunnerClientError::WrongIdentity),
+            AttachRefusalReason::RunnerReplaced
+        );
+        assert_eq!(
+            attach_refusal_reason(&RunnerClientError::RunnerRejected {
+                code: RunnerErrorCode::Conflict,
+            }),
+            AttachRefusalReason::RunnerRejected
+        );
+        assert_eq!(
+            attach_refusal_reason(&RunnerClientError::UnexpectedEof),
+            AttachRefusalReason::RunnerUnavailable
+        );
     }
 }
 

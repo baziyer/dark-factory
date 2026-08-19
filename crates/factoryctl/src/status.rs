@@ -167,6 +167,7 @@ mod tests {
             state_since_ms: 1,
             worktree: format!("/tmp/{agent_id}"),
             provider_session_id: None,
+            runner_instance_id: Some(id(&format!("runner-{agent_id}"))),
             current_run_id: None,
             activity: None,
             activity_inferred: false,
