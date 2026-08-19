@@ -118,6 +118,7 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
+                 ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  DROP TABLE delivery_attempts;

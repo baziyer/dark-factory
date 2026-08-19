@@ -5,7 +5,8 @@ use factory_core::{
     RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
 use factoryd::store::{
-    NewAgent, NewAgentMessage, NewProject, NewSession, NewTask, Store, StoreError,
+    DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession,
+    NewTask, ProviderDeliveryRecovery, Store, StoreError,
 };
 
 fn project_id(value: &str) -> ProjectId {
@@ -122,6 +123,87 @@ fn fixture() -> Store {
         )
         .unwrap();
     store
+}
+
+#[test]
+fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
+    let mut store = fixture();
+    let thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+    let mut initial = new_session("ack-initial", "factory", "curie");
+    initial.provider_session_id = Some(thread.into());
+    let (initial, _) = store.create_session(initial, 5).unwrap();
+    store.end_session(&initial.id, Some(0), None, 6).unwrap();
+    let mut resumed = new_session("ack-resumed", "factory", "curie");
+    resumed.provider_session_id = Some(thread.into());
+    let (resumed, _) = store.create_session(resumed, 7).unwrap();
+    let task = task_id("ack-task");
+    store
+        .create_task(
+            NewTask {
+                id: task.clone(),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Ack first".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            8,
+        )
+        .unwrap();
+    store
+        .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 8)
+        .unwrap();
+    let (incarnation, count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    store
+        .ensure_delivery_attempt(NewDeliveryAttempt {
+            id: "ack-attempt".into(),
+            project_id: project_id("factory"),
+            agent_id: agent_id("curie"),
+            session_id: resumed.id.clone(),
+            task_id: Some(task.clone()),
+            task_incarnation_id: Some(incarnation),
+            prior_run_count: Some(count),
+            message_ids: Vec::new(),
+            text: "accepted prompt".into(),
+            created_at_ms: 8,
+        })
+        .unwrap();
+    store
+        .open_run_episode_with_delivery_attempt(
+            &resumed.id,
+            &task,
+            Some(&[]),
+            Some("ack-attempt"),
+            9,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .request_fresh_provider_recovery(
+                &project_id("factory"),
+                &resumed.id,
+                "ack-attempt",
+                10,
+            )
+            .unwrap(),
+        (ProviderDeliveryRecovery::Acknowledged, None)
+    ));
+    let live = store
+        .live_session_for_agent(&project_id("factory"), &agent_id("curie"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.stop_requested_at_ms, None);
+    assert_eq!(live.delivery_recovery_stop_requested_at_ms, None);
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task)
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Running,
+        "recovery must not cancel an admitted prompt or its run"
+    );
 }
 
 // --- Migration -------------------------------------------------------
@@ -285,6 +367,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
             .execute_batch(
                 "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
+                 ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
                  DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
@@ -573,9 +656,55 @@ fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() 
             .unwrap()
     );
 
+    let task = task_id("recovery-task");
     store
-        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, 8)
+        .create_task(
+            NewTask {
+                id: task.clone(),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Recover delivery".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            7,
+        )
         .unwrap();
+    store
+        .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 7)
+        .unwrap();
+    let (incarnation, prior_run_count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    store
+        .ensure_delivery_attempt(NewDeliveryAttempt {
+            id: "recovery-attempt".into(),
+            project_id: project_id("factory"),
+            agent_id: agent_id("curie"),
+            session_id: resumed.id.clone(),
+            task_id: Some(task),
+            task_incarnation_id: Some(incarnation),
+            prior_run_count: Some(prior_run_count),
+            message_ids: Vec::new(),
+            text: "recover me".into(),
+            created_at_ms: 7,
+        })
+        .unwrap();
+
+    store
+        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, "recovery-attempt", 8)
+        .unwrap();
+    assert_eq!(
+        store.delivery_attempt_state("recovery-attempt").unwrap(),
+        Some(DeliveryAttemptState::Cancelled),
+        "recovery must durably fence a late exact prompt hook"
+    );
+    let recoverable = store.recoverable_sessions().unwrap();
+    assert!(
+        recoverable
+            .iter()
+            .any(|session| session.session_id == resumed.id
+                && session.delivery_recovery_stop_requested),
+        "a crash before runner control must leave replayable stop work"
+    );
     assert_eq!(
         store
             .last_provider_session_id(&project_id("factory"), &agent_id("curie"))

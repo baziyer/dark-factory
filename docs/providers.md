@@ -220,7 +220,12 @@ resume target; learning a new thread id from a fresh session's `SessionStart`
 does not change that provenance. A transient miss in the fresh conversation
 therefore takes the ordinary bounded same-composer retry instead of spawning a
 loop of replacements. The task/run is committed only by the exact nonce-bearing
-hook, preserving one durable run.
+hook, preserving one durable run. That acknowledgement and timeout recovery are
+serialized as a durable fence: if the hook wins, recovery cannot cancel its run;
+if recovery wins, a late exact `UserPromptSubmit` receives a blocking response
+before Codex begins the turn. Recovery-stop intent survives daemon and control
+socket failures and is replayed after reconnect until the poisoned runner's
+actual exit is observed.
 
 ## Codex: `CODEX_HOME` seeding is filtered, not a raw copy
 

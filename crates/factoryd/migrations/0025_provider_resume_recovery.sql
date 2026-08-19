@@ -6,6 +6,13 @@ ALTER TABLE sessions
     ADD COLUMN resumed_provider_session INTEGER NOT NULL DEFAULT 0
         CHECK (resumed_provider_session IN (0, 1));
 
+ALTER TABLE sessions
+    ADD COLUMN delivery_recovery_stop_requested_at_ms INTEGER
+        CHECK (
+            delivery_recovery_stop_requested_at_ms IS NULL
+            OR delivery_recovery_stop_requested_at_ms >= 0
+        );
+
 UPDATE sessions
 SET resumed_provider_session = 1
 WHERE provider_session_id IS NOT NULL

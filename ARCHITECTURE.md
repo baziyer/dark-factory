@@ -73,10 +73,16 @@ catalogue.
    that does not acknowledge its first delivery is retired: the daemon blocks
    that exact provider thread from future resume, stops its runner, and sends
    the still-queued task once in a fresh conversation after the runner's exit
-   is durable. Resumed-vs-fresh launch provenance is recorded at session
-   creation; a fresh Codex `SessionStart` assigning a thread id cannot turn it
-   into a resumed launch or cause fresh-conversation churn. Other recoveries may
-   submit a bare CR to an existing provider buffer and wait the normal bound.
+   is durable. Hook acknowledgement and recovery are one durable fence: an
+   acknowledgement atomically opens the run and wins over any delayed event
+   waiter, while recovery cancellation makes a later exact prompt hook block
+   before provider model/tool execution. The recovery stop is itself durable
+   work; reconciliation and restart supervision reissue it idempotently until
+   the old runner's actual exit is observed. Resumed-vs-fresh launch provenance
+   is recorded at session creation; a fresh Codex `SessionStart` assigning a
+   thread id cannot turn it into a resumed launch or cause fresh-conversation
+   churn. Other recoveries may submit a bare CR to an existing provider buffer
+   and wait the normal bound.
    The hook must match that
    stored prompt exactly before acknowledging it, so a stale hook cannot
    recompose a newer queue head. A single pending-delivery slot per agent

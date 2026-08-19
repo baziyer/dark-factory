@@ -193,6 +193,15 @@ pub enum DeliveryAttemptState {
     Cancelled,
 }
 
+/// Winner of the durable acknowledgement-vs-recovery fence for one exact
+/// delivery attempt. Both decisions are made under one immediate SQLite
+/// transaction, so a timeout can never retire a prompt whose hook already
+/// admitted it.
+pub enum ProviderDeliveryRecovery {
+    Acknowledged,
+    StopRequested,
+}
+
 #[derive(Clone)]
 pub struct NewDeliveryAttempt {
     pub id: String,
@@ -377,6 +386,9 @@ pub struct SessionRow {
     pub exit_code: Option<i32>,
     pub exit_signal: Option<i32>,
     pub stop_requested_at_ms: Option<i64>,
+    /// Recovery stop intent is distinct from an operator stop so startup
+    /// supervision knows it must actively replay the idempotent runner stop.
+    pub delivery_recovery_stop_requested_at_ms: Option<i64>,
     /// The open run (task episode), if any, currently inside this session.
     pub current_run_id: Option<RunId>,
 }
@@ -452,6 +464,7 @@ pub struct RecoverableSession {
     pub runner_runtime: String,
     pub runner_protocol_version: u16,
     pub observer_health: ObserverHealth,
+    pub delivery_recovery_stop_requested: bool,
 }
 
 /// Result of opening a task-episode inside a live session.
@@ -1644,7 +1657,7 @@ impl Store {
         session_id: &SessionId,
         now_ms: i64,
     ) -> Result<(SessionSnapshot, EventEnvelope)> {
-        self.request_session_stop_inner(project_id, session_id, now_ms, false)
+        self.request_session_stop_inner(project_id, session_id, now_ms)
     }
 
     /// Stops a Codex session whose resumed composer could not acknowledge a
@@ -1655,18 +1668,9 @@ impl Store {
         &mut self,
         project_id: &ProjectId,
         session_id: &SessionId,
+        attempt_id: &str,
         now_ms: i64,
-    ) -> Result<(SessionSnapshot, EventEnvelope)> {
-        self.request_session_stop_inner(project_id, session_id, now_ms, true)
-    }
-
-    fn request_session_stop_inner(
-        &mut self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-        now_ms: i64,
-        block_provider_resume: bool,
-    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+    ) -> Result<(ProviderDeliveryRecovery, Option<EventEnvelope>)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1676,31 +1680,98 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
-        if block_provider_resume {
-            let resumed_provider_session: bool = transaction.query_row(
-                "SELECT resumed_provider_session FROM sessions WHERE id = ?1",
-                params![session_id.as_str()],
-                |row| row.get(0),
-            )?;
-            if !resumed_provider_session {
-                return Err(StoreError::InvalidExecutionMetadata);
-            }
-            let provider_session_id = session
-                .provider_session_id
-                .as_deref()
-                .filter(|_| session.provider == Provider::Codex)
-                .ok_or(StoreError::InvalidExecutionMetadata)?;
-            transaction.execute(
-                "UPDATE sessions
-                 SET provider_resume_blocked_at_ms = ?1
-                 WHERE project_id = ?2 AND agent_id = ?3 AND provider_session_id = ?4",
-                params![
-                    now_ms,
-                    project_id.as_str(),
-                    session.agent_id.as_str(),
-                    provider_session_id
-                ],
-            )?;
+        let attempt = load_delivery_attempt(&transaction, attempt_id)?
+            .filter(|attempt| {
+                attempt.project_id == *project_id && attempt.session_id == *session_id
+            })
+            .ok_or(StoreError::InvalidExecutionMetadata)?;
+        if attempt.state == DeliveryAttemptState::Acknowledged {
+            transaction.commit()?;
+            return Ok((ProviderDeliveryRecovery::Acknowledged, None));
+        }
+        if attempt.state == DeliveryAttemptState::Cancelled
+            && session.delivery_recovery_stop_requested_at_ms.is_some()
+        {
+            transaction.commit()?;
+            return Ok((ProviderDeliveryRecovery::StopRequested, None));
+        }
+        if !matches!(
+            attempt.state,
+            DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+        ) {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let resumed_provider_session: bool = transaction.query_row(
+            "SELECT resumed_provider_session FROM sessions WHERE id = ?1",
+            params![session_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if !resumed_provider_session {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let provider_session_id = session
+            .provider_session_id
+            .as_deref()
+            .filter(|_| session.provider == Provider::Codex)
+            .ok_or(StoreError::InvalidExecutionMetadata)?;
+        transaction.execute(
+            "UPDATE sessions
+             SET provider_resume_blocked_at_ms = ?1
+             WHERE project_id = ?2 AND agent_id = ?3 AND provider_session_id = ?4",
+            params![
+                now_ms,
+                project_id.as_str(),
+                session.agent_id.as_str(),
+                provider_session_id
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE sessions
+             SET stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?1),
+                 delivery_recovery_stop_requested_at_ms =
+                    COALESCE(delivery_recovery_stop_requested_at_ms, ?1),
+                 updated_at_ms = ?1
+             WHERE id = ?2",
+            params![now_ms, session_id.as_str()],
+        )?;
+        transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state IN ('in_flight', 'retryable')",
+            params![now_ms, attempt_id],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let event = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            ProviderDeliveryRecovery::StopRequested,
+            Some(EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            }),
+        ))
+    }
+
+    fn request_session_stop_inner(
+        &mut self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
         }
         transaction.execute(
             "UPDATE sessions
@@ -2145,7 +2216,8 @@ impl Store {
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider, provider_session_id, worktree, runner_instance_id,
-                    runner_runtime, runner_protocol_version, observer_health
+                    runner_runtime, runner_protocol_version, observer_health,
+                    delivery_recovery_stop_requested_at_ms IS NOT NULL
              FROM sessions
              WHERE ended_at_ms IS NULL
              ORDER BY project_id, started_at_ms, id",
@@ -2165,6 +2237,7 @@ impl Store {
                     rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
                 })?,
                 observer_health: parse_observer_health(&observer_health, 7)?,
+                delivery_recovery_stop_requested: row.get(8)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -2252,6 +2325,20 @@ impl Store {
         session_id: &SessionId,
         task_id: &TaskId,
         message_ids: Option<&[MessageId]>,
+        now_ms: i64,
+    ) -> Result<OpenedEpisode> {
+        self.open_run_episode_with_delivery_attempt(session_id, task_id, message_ids, None, now_ms)
+    }
+
+    /// Hook acknowledgement and task/run admission are one durable commit.
+    /// This prevents a daemon crash between opening the run and fencing a
+    /// timeout-driven provider recovery.
+    pub fn open_run_episode_with_delivery_attempt(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        message_ids: Option<&[MessageId]>,
+        delivery_attempt_id: Option<&str>,
         now_ms: i64,
     ) -> Result<OpenedEpisode> {
         let transaction = self
@@ -2343,6 +2430,18 @@ impl Store {
             .snapshot;
         let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
         let events = append_execution_events(&transaction, now_ms, &task.snapshot, &agent, &run)?;
+        if let Some(attempt_id) = delivery_attempt_id {
+            let changed = transaction.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'acknowledged', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                 WHERE id = ?2 AND session_id = ?3
+                   AND state IN ('in_flight', 'retryable')",
+                params![now_ms, attempt_id, session_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidExecutionMetadata);
+            }
+        }
         transaction.commit()?;
         Ok(OpenedEpisode {
             run,
@@ -2461,6 +2560,39 @@ impl Store {
                  WHERE project_id = ?1 AND agent_id = ?2 AND session_id = ?3
                    AND state IN ('in_flight', 'retryable', 'terminal')",
                 params![project_id.as_str(), agent_id.as_str(), session_id.as_str()],
+                delivery_attempt_from_row,
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Resolves the exact nonce-bearing prompt even after recovery cancelled
+    /// its attempt. This is the late-hook side of the acknowledgement fence:
+    /// a cancelled match with durable recovery-stop intent must be denied by
+    /// the provider hook instead of allowed to begin model/tool work.
+    pub fn delivery_attempt_for_prompt(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        prompt: &str,
+    ) -> Result<Option<DeliveryAttempt>> {
+        self.connection
+            .query_row(
+                "SELECT id, project_id, agent_id, session_id, task_id,
+                        task_incarnation_id, prior_run_count, message_ids_json,
+                        text, failure_count, next_attempt_at_ms, state
+                 FROM delivery_attempts
+                 WHERE project_id = ?1 AND agent_id = ?2 AND session_id = ?3
+                   AND text = ?4
+                 ORDER BY created_at_ms DESC, id DESC
+                 LIMIT 1",
+                params![
+                    project_id.as_str(),
+                    agent_id.as_str(),
+                    session_id.as_str(),
+                    prompt
+                ],
                 delivery_attempt_from_row,
             )
             .optional()
@@ -2936,6 +3068,25 @@ impl Store {
         message_ids: &[MessageId],
         delivered_at_ms: i64,
     ) -> Result<Vec<AgentMessage>> {
+        self.deliver_agent_messages_by_ids_with_delivery_attempt(
+            project_id,
+            agent_id,
+            session_id,
+            message_ids,
+            None,
+            delivered_at_ms,
+        )
+    }
+
+    pub fn deliver_agent_messages_by_ids_with_delivery_attempt(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        message_ids: &[MessageId],
+        delivery_attempt_id: Option<&str>,
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2948,6 +3099,18 @@ impl Store {
             message_ids,
             delivered_at_ms,
         )?;
+        if let Some(attempt_id) = delivery_attempt_id {
+            let changed = transaction.execute(
+                "UPDATE delivery_attempts
+                 SET state = 'acknowledged', next_attempt_at_ms = NULL, updated_at_ms = ?1
+                 WHERE id = ?2 AND session_id = ?3
+                   AND state IN ('in_flight', 'retryable')",
+                params![delivered_at_ms, attempt_id, session_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::InvalidExecutionMetadata);
+            }
+        }
         transaction.commit()?;
         Ok(messages)
     }
@@ -5240,6 +5403,7 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
                     s.started_at_ms, s.updated_at_ms, s.ended_at_ms, s.exit_code,
                     s.exit_signal, s.stop_requested_at_ms,
+                    s.delivery_recovery_stop_requested_at_ms,
                     (SELECT r.id FROM runs r
                      WHERE r.session_id = s.id AND r.ended_at_ms IS NULL LIMIT 1)
              FROM sessions s WHERE s.id = ?1",
@@ -5256,7 +5420,7 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
     let observer_health: String = row.get(17)?;
     let protocol: i64 = row.get(21)?;
     let last_hook_event: Option<String> = row.get(22)?;
-    let current_run_id: Option<String> = row.get(30)?;
+    let current_run_id: Option<String> = row.get(31)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -5292,7 +5456,8 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         exit_code: row.get(27)?,
         exit_signal: row.get(28)?,
         stop_requested_at_ms: row.get(29)?,
-        current_run_id: parse_optional_id(current_run_id, 30)?,
+        delivery_recovery_stop_requested_at_ms: row.get(30)?,
+        current_run_id: parse_optional_id(current_run_id, 31)?,
     })
 }
 
