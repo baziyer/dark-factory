@@ -1,7 +1,8 @@
 use std::{future::Future, os::unix::fs::PermissionsExt, path::Path};
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, TaskId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, Provider, ProviderHookEvent,
+    RunnerInstanceId, SessionId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
         MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
@@ -10,8 +11,8 @@ use factory_core::{
 use factoryctl::Client;
 use factoryd::{
     execution,
-    local_api::{ApiState, serve},
-    store::{NewProject, NewTask, Store},
+    local_api::{ApiState, serve, serve_session},
+    store::{NewAgent, NewProject, NewSession, NewTask, Store},
 };
 use rusqlite::Connection;
 use tokio::{
@@ -30,6 +31,24 @@ fn task_id(value: &str) -> TaskId {
 
 fn agent_id(value: &str) -> AgentId {
     AgentId::try_from(value).unwrap()
+}
+
+fn event_project_id(event: &FactoryEvent) -> Option<&ProjectId> {
+    match event {
+        FactoryEvent::AutoModeChanged { .. } => None,
+        FactoryEvent::PolicyDecision { project_id, .. }
+        | FactoryEvent::AgentBudgetChanged { project_id, .. }
+        | FactoryEvent::RepositoryOperation { project_id, .. }
+        | FactoryEvent::RepositoryAuthorityChanged { project_id }
+        | FactoryEvent::TaskDeleted { project_id, .. }
+        | FactoryEvent::AgentDeleted { project_id, .. }
+        | FactoryEvent::ProjectDeleted { project_id } => Some(project_id),
+        FactoryEvent::ProjectChanged { project } => Some(&project.id),
+        FactoryEvent::TaskChanged { task } => Some(&task.project_id),
+        FactoryEvent::AgentChanged { agent } => Some(&agent.project_id),
+        FactoryEvent::RunChanged { run } => Some(&run.project_id),
+        FactoryEvent::SessionChanged { session } => Some(&session.project_id),
+    }
 }
 
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
@@ -207,6 +226,180 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
     ));
 
     drop(subscription);
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn credentialless_agent_request_cannot_use_operator_capabilities() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("f.sock.session");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let state = ApiState::new(Store::open_in_memory().unwrap());
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_session(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let frame = Client::new(&socket)
+        .request(LocalRequest::SetAutoMode { enabled: true })
+        .unwrap();
+    assert!(matches!(
+        frame,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: ErrorCode::Unauthorized,
+                ref message,
+            },
+            ..
+        } if message.contains("authenticated live session")
+    ));
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_orchestrator_status_and_events_are_project_scoped() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = directory.path().join("f.sock.session");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let project_a = project_id("project-a");
+    let project_b = project_id("project-b");
+    let agent = agent_id("orchestrator");
+    let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+    let token = "a".repeat(64);
+    let mut store = Store::open_in_memory().unwrap();
+    for (id, root) in [
+        (&project_a, "/tmp/project-a"),
+        (&project_b, "/tmp/project-b"),
+    ] {
+        store
+            .create_project(
+                NewProject {
+                    id: id.clone(),
+                    name: id.as_str().to_owned(),
+                    root: (*root).to_owned(),
+                },
+                1,
+            )
+            .unwrap();
+    }
+    store
+        .create_agent(
+            NewAgent {
+                id: agent.clone(),
+                project_id: project_a.clone(),
+                parent_agent_id: None,
+                role: AgentRole::Orchestrator,
+                provider: Provider::Shell,
+            },
+            3,
+        )
+        .unwrap();
+    store
+        .create_session(
+            NewSession {
+                id: session_id.clone(),
+                project_id: project_a.clone(),
+                agent_id: agent,
+                provider: Provider::Shell,
+                runtime_model: None,
+                runtime_reasoning_effort: None,
+                runtime_permission_mode: None,
+                runtime_control_mode: None,
+                provider_session_id: None,
+                worktree: "/tmp/project-a".into(),
+                codex_home: None,
+                hook_token: token.clone(),
+                runner_instance_id: RunnerInstanceId::try_from(
+                    "22222222-2222-4222-8222-222222222222",
+                )
+                .unwrap(),
+                runner_runtime: "/tmp/project-a-runner".into(),
+                runner_protocol_version: 1,
+            },
+            4,
+        )
+        .unwrap();
+    store
+        .record_hook_event(
+            &session_id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            5,
+        )
+        .unwrap();
+    let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve_session(
+        listener,
+        state,
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let client = Client::new(&socket).with_session_token(token);
+    let status = client.request(LocalRequest::FleetStatus).unwrap();
+    let ServerFrame::Response {
+        response: LocalResponse::FleetStatus { status },
+        ..
+    } = status
+    else {
+        panic!("orchestrator status did not return FleetStatus");
+    };
+    assert_eq!(status.projects.len(), 1);
+    assert_eq!(status.projects[0].project.id, project_a);
+
+    let mut events = client.subscribe(0).unwrap();
+    let first = events.next().unwrap().unwrap();
+    assert!(
+        matches!(
+            &first,
+            ServerFrame::Response {
+                response: LocalResponse::Subscribed { .. },
+                ..
+            }
+        ),
+        "unexpected subscription frame: {first:?}"
+    );
+    let mut visible_events = 0;
+    loop {
+        match events.next().unwrap().unwrap() {
+            ServerFrame::Event { event, .. } => {
+                visible_events += 1;
+                assert!(event_project_id(&event.event).is_some_and(|id| id == &project_a));
+            }
+            ServerFrame::Response {
+                response: LocalResponse::CaughtUp { sequence: 5 },
+                ..
+            } => break,
+            frame => panic!("unexpected subscription frame: {frame:?}"),
+        }
+    }
+    assert!(visible_events > 0);
+
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
     execution.shutdown().await.unwrap();

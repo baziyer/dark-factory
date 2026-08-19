@@ -24,6 +24,15 @@ pub enum Principal {
     Integration(IntegrationPrincipal),
 }
 
+/// The socket endpoint is part of the authentication boundary. The operator
+/// endpoint preserves the credentialless operator contract; the session
+/// endpoint rejects credentialless requests before request authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Endpoint {
+    Operator,
+    Session,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPrincipal {
     pub project_id: ProjectId,
@@ -154,10 +163,14 @@ pub enum AuthError {
 /// is read from durable agent state, never from the request.
 pub async fn resolve(
     state: &DaemonState,
+    endpoint: Endpoint,
     session_token: Option<String>,
 ) -> Result<Principal, AuthError> {
     let Some(token) = session_token else {
-        return Ok(Principal::Operator);
+        return match endpoint {
+            Endpoint::Operator => Ok(Principal::Operator),
+            Endpoint::Session => Err(AuthError::MissingCredential),
+        };
     };
     if token.is_empty() {
         return Err(AuthError::InvalidCredential);
@@ -529,7 +542,15 @@ async fn authorize_session(
     if matches!(descriptor.capability, Health) {
         return Ok(());
     }
-    if matches!(descriptor.scope, Scope::Global) {
+    if matches!(descriptor.scope, Scope::Global)
+        && !matches!(
+            descriptor.capability,
+            Capability::FleetStatus
+                | Capability::EventsAfter
+                | Capability::LatestEventSequence
+                | Capability::Subscribe
+        )
+    {
         return Err(AuthError::ScopeDenied);
     }
     if let Some(project_id) = scope_project(&descriptor.scope)
@@ -621,7 +642,10 @@ async fn authorize_session(
                     let project_id = project_id.clone();
                     let task_id = task_id.clone();
                     let agent_id = principal.agent_id.clone();
-                    move |store| store.task_assigned_to_agent(&project_id, &task_id, &agent_id)
+                    let session_id = principal.session_id.clone();
+                    move |store| {
+                        store.task_open_for_session(&project_id, &task_id, &agent_id, &session_id)
+                    }
                 })
                 .await?
         }
@@ -649,17 +673,16 @@ async fn authorize_session(
         | DeleteAgent | DeleteTask | RetryTask | CancelTask | UpdateTask | AssignTask | StopRun
         | CancelRun | StopSession | GetRunTerminal => false,
         SetAutoMode
-        | FleetStatus
         | CreateProject
         | ListProjects
         | UpdateProjectGuidance
         | SetRepositoryAuthority
         | CreateAgent
         | DeleteProject
-        | EventsAfter
-        | LatestEventSequence
-        | Subscribe
         | ConnectorEvent => false,
+        FleetStatus | EventsAfter | LatestEventSequence | Subscribe => {
+            principal.role == AgentRole::Orchestrator
+        }
     };
     if allowed {
         Ok(())
@@ -815,6 +838,19 @@ mod tests {
         assert!(envelope.get("session_token").is_none());
     }
 
+    #[tokio::test]
+    async fn session_endpoint_never_treats_missing_credential_as_operator() {
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        assert!(matches!(
+            resolve(&state, Endpoint::Session, None).await,
+            Err(AuthError::MissingCredential)
+        ));
+        assert!(matches!(
+            resolve(&state, Endpoint::Operator, None).await,
+            Ok(Principal::Operator)
+        ));
+    }
+
     #[test]
     fn integration_profile_is_fixed_to_its_configured_project() {
         let project_id = ProjectId::try_from("project-a").unwrap();
@@ -911,7 +947,7 @@ mod tests {
             .unwrap();
         let state = DaemonState::new(store);
         assert!(matches!(
-            resolve(&state, Some(token.clone())).await,
+            resolve(&state, Endpoint::Session, Some(token.clone())).await,
             Ok(Principal::Session(_))
         ));
         state
@@ -922,7 +958,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            resolve(&state, Some(token)).await,
+            resolve(&state, Endpoint::Session, Some(token)).await,
             Err(AuthError::InvalidCredential)
         ));
     }

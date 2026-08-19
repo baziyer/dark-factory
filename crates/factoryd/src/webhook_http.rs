@@ -508,7 +508,7 @@ pub fn load_webhook_config(path: &Path) -> Result<WebhookHttpConfig, WebhookHttp
     let [endpoint] = <[RawEndpointConfig; 1]>::try_from(raw.endpoints)
         .map_err(|_| WebhookHttpError::InvalidConfig)?;
     let wire_profile = match endpoint.wire_profile.as_str() {
-        "generic_v1" => WireProfile::GenericV1,
+        "generic_v1" if endpoint.project_id.is_some() => WireProfile::GenericV1,
         "legacy_v1"
             if endpoint.project_id.is_some() && endpoint.orchestrator_agent_id.is_some() =>
         {
@@ -785,13 +785,19 @@ async fn accept_event(
             json!({"status":"rejected","error":"timestamp_out_of_range"}),
         );
     }
+    let Some(project_id) = state.endpoint.project_id.clone() else {
+        return authenticated_response(
+            &state,
+            route,
+            started,
+            StatusCode::UNAUTHORIZED,
+            "scope_denied",
+            json!({"status":"rejected","error":"unauthorized"}),
+        );
+    };
     let integration = IntegrationPrincipal {
         endpoint_id: endpoint_id.clone(),
-        project_id: state
-            .endpoint
-            .project_id
-            .clone()
-            .or_else(|| Some(envelope.project_id.clone())),
+        project_id: Some(project_id),
         orchestrator_agent_id: state.endpoint.orchestrator_agent_id.clone(),
     };
     if auth::authorize_integration(

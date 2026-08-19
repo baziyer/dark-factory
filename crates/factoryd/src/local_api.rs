@@ -248,6 +248,10 @@ impl ApiFailure {
                 ErrorCode::Conflict,
                 "task is not assigned to the requesting agent".into(),
             ),
+            Self::Store(StoreError::SessionTaskMismatch) => (
+                ErrorCode::Conflict,
+                "task has no open run for the requesting session".into(),
+            ),
             Self::Store(StoreError::TaskNotRetryable) => (
                 ErrorCode::Conflict,
                 "task is not retryable in the project".into(),
@@ -317,6 +321,7 @@ impl From<execution::Error> for ApiFailure {
                 error @ (StoreError::AgentNotFound
                 | StoreError::TaskNotQueued
                 | StoreError::TaskAssignmentMismatch
+                | StoreError::SessionTaskMismatch
                 | StoreError::AgentUnavailable
                 | StoreError::SessionNotFound
                 | StoreError::SessionNotLive
@@ -332,6 +337,51 @@ pub async fn serve<F>(
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    serve_with_endpoint(
+        listener,
+        state,
+        execution,
+        guidance_root,
+        auth::Endpoint::Operator,
+        shutdown,
+    )
+    .await
+}
+
+/// Serves the daemon's session endpoint. Unlike the preserved operator
+/// socket, this endpoint requires a live-session credential on every request.
+pub async fn serve_session<F>(
+    listener: UnixListener,
+    state: ApiState,
+    execution: execution::Handle,
+    guidance_root: PathBuf,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()>,
+{
+    serve_with_endpoint(
+        listener,
+        state,
+        execution,
+        guidance_root,
+        auth::Endpoint::Session,
+        shutdown,
+    )
+    .await
+}
+
+async fn serve_with_endpoint<F>(
+    listener: UnixListener,
+    state: ApiState,
+    execution: execution::Handle,
+    guidance_root: PathBuf,
+    endpoint: auth::Endpoint,
     shutdown: F,
 ) -> io::Result<()>
 where
@@ -364,7 +414,15 @@ where
                 handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, state, execution, guidance_root, shutdown).await
+                        handle_connection(
+                            stream,
+                            state,
+                            execution,
+                            guidance_root,
+                            endpoint,
+                            shutdown,
+                        )
+                        .await
                     {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
@@ -392,6 +450,7 @@ async fn handle_connection(
     state: ApiState,
     execution: execution::Handle,
     guidance_root: Arc<PathBuf>,
+    endpoint: auth::Endpoint,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -423,7 +482,7 @@ async fn handle_connection(
         Ok(envelope) => envelope,
         Err(response) => return write_response(&mut write, *response).await,
     };
-    let principal = match auth::resolve(&state, envelope.session_token).await {
+    let principal = match auth::resolve(&state, endpoint, envelope.session_token).await {
         Ok(principal) => principal,
         Err(error) => {
             return write_response(
@@ -464,7 +523,7 @@ async fn handle_connection(
         return tokio::select! {
             biased;
             _ = shutdown.changed() => Ok(()),
-            result = stream_events(write, &state, *after_sequence) => result,
+            result = stream_events(write, &state, &principal, *after_sequence) => result,
         };
     }
 
@@ -483,6 +542,7 @@ async fn handle_connection(
                 write,
                 state.clone(),
                 session_shutdown,
+                endpoint,
                 principal,
                 project_id.clone(),
                 session_id.clone(),
@@ -548,6 +608,7 @@ async fn terminal_attach_session(
     mut write: OwnedWriteHalf,
     state: ApiState,
     mut shutdown: watch::Receiver<bool>,
+    endpoint: auth::Endpoint,
     principal: Principal,
     project_id: ProjectId,
     session_id: SessionId,
@@ -577,7 +638,7 @@ async fn terminal_attach_session(
                 let Some(line) = result? else { return Ok(()); };
                 match parse_envelope(&line) {
                     Ok(envelope) => {
-                        let request = match auth::resolve(&state, envelope.session_token).await {
+                        let request = match auth::resolve(&state, endpoint, envelope.session_token).await {
                             Ok(request_principal) if request_principal == principal => {
                                 auth::authorize(&state, &principal, envelope.request).await
                             }
@@ -914,6 +975,9 @@ async fn handle_request_as(
                     }
                 })
                 .collect();
+            if let Principal::Session(session) = principal {
+                projects.retain(|project| project.project.id == session.project_id);
+            }
             populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
@@ -1710,12 +1774,34 @@ async fn handle_request_as(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
                 )));
             }
-            let task = state
-                .commit_and_publish(move |store| {
-                    let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
-                    Ok((closed.task, closed.events))
-                })
-                .await?;
+            let task = match principal {
+                Principal::Session(session) => {
+                    let agent_id = session.agent_id.clone();
+                    let session_id = session.session_id.clone();
+                    state
+                        .commit_and_publish(move |store| {
+                            let closed = store.complete_task_for_session(
+                                &project_id,
+                                &task_id,
+                                &agent_id,
+                                &session_id,
+                                result,
+                                now_ms()?,
+                            )?;
+                            Ok((closed.task, closed.events))
+                        })
+                        .await?
+                }
+                Principal::Operator | Principal::Integration(_) => {
+                    state
+                        .commit_and_publish(move |store| {
+                            let closed =
+                                store.complete_task(&project_id, &task_id, result, now_ms()?)?;
+                            Ok((closed.task, closed.events))
+                        })
+                        .await?
+                }
+            };
             Ok(LocalResponse::TaskCompleted { task })
         }
         LocalRequest::BlockTask {
@@ -1728,12 +1814,34 @@ async fn handle_request_as(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
                 )));
             }
-            let task = state
-                .commit_and_publish(move |store| {
-                    let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
-                    Ok((closed.task, closed.events))
-                })
-                .await?;
+            let task = match principal {
+                Principal::Session(session) => {
+                    let agent_id = session.agent_id.clone();
+                    let session_id = session.session_id.clone();
+                    state
+                        .commit_and_publish(move |store| {
+                            let closed = store.block_task_for_session(
+                                &project_id,
+                                &task_id,
+                                &agent_id,
+                                &session_id,
+                                reason,
+                                now_ms()?,
+                            )?;
+                            Ok((closed.task, closed.events))
+                        })
+                        .await?
+                }
+                Principal::Operator | Principal::Integration(_) => {
+                    state
+                        .commit_and_publish(move |store| {
+                            let closed =
+                                store.block_task(&project_id, &task_id, reason, now_ms()?)?;
+                            Ok((closed.task, closed.events))
+                        })
+                        .await?
+                }
+            };
             Ok(LocalResponse::TaskBlocked { task })
         }
         LocalRequest::PauseAgent {
@@ -2099,6 +2207,10 @@ async fn handle_request_as(
             let events = state
                 .with_store(move |store| store.events_after(sequence, limit))
                 .await?;
+            let events = events
+                .into_iter()
+                .filter(|event| event_visible(principal, event))
+                .collect();
             Ok(LocalResponse::Events { events })
         }
         LocalRequest::LatestEventSequence => {
@@ -2283,7 +2395,7 @@ async fn repository_request(
     token: String,
     request: RepositoryRequest,
 ) -> Result<LocalResponse, ApiFailure> {
-    let principal = auth::resolve(state, Some(token))
+    let principal = auth::resolve(state, auth::Endpoint::Session, Some(token))
         .await
         .map_err(|error| ApiFailure::Unauthorized(error.to_string()))?;
     repository_request_as(state, &principal, request).await
@@ -3190,7 +3302,12 @@ fn append_terminal_text(output: &mut String, text: &str, truncated: &mut bool) {
     output.drain(..first);
 }
 
-async fn stream_events<W>(mut write: W, state: &ApiState, after_sequence: i64) -> io::Result<()>
+async fn stream_events<W>(
+    mut write: W,
+    state: &ApiState,
+    principal: &Principal,
+    after_sequence: i64,
+) -> io::Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -3218,7 +3335,8 @@ where
         },
     )
     .await?;
-    let mut cursor = replay_events(&mut write, state, after_sequence, replay_through).await?;
+    let mut cursor =
+        replay_events(&mut write, state, principal, after_sequence, replay_through).await?;
     write_response(&mut write, LocalResponse::CaughtUp { sequence: cursor }).await?;
 
     loop {
@@ -3226,20 +3344,23 @@ where
             Ok(event) if event.sequence <= cursor => {}
             Ok(event) if event.sequence == cursor + 1 => {
                 cursor = event.sequence;
-                write_frame(
-                    &mut write,
-                    &ServerFrame::Event {
-                        protocol_version: PROTOCOL_VERSION,
-                        event,
-                    },
-                )
-                .await?;
+                if event_visible(principal, &event) {
+                    write_frame(
+                        &mut write,
+                        &ServerFrame::Event {
+                            protocol_version: PROTOCOL_VERSION,
+                            event,
+                        },
+                    )
+                    .await?;
+                }
             }
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                 let replay_through = latest_event_sequence(state)
                     .await
                     .map_err(api_failure_to_io)?;
-                cursor = replay_events(&mut write, state, cursor, replay_through).await?;
+                cursor =
+                    replay_events(&mut write, state, principal, cursor, replay_through).await?;
                 write_response(&mut write, LocalResponse::CaughtUp { sequence: cursor }).await?;
             }
             Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -3250,6 +3371,7 @@ where
 async fn replay_events<W>(
     write: &mut W,
     state: &ApiState,
+    principal: &Principal,
     mut cursor: i64,
     replay_through: i64,
 ) -> io::Result<i64>
@@ -3288,17 +3410,52 @@ where
                 ));
             }
             cursor = event.sequence;
-            write_frame(
-                write,
-                &ServerFrame::Event {
-                    protocol_version: PROTOCOL_VERSION,
-                    event,
-                },
-            )
-            .await?;
+            if event_visible(principal, &event) {
+                write_frame(
+                    write,
+                    &ServerFrame::Event {
+                        protocol_version: PROTOCOL_VERSION,
+                        event,
+                    },
+                )
+                .await?;
+            }
         }
     }
     Ok(cursor)
+}
+
+fn event_visible(principal: &Principal, event: &factory_core::EventEnvelope) -> bool {
+    match principal {
+        Principal::Operator | Principal::Integration(_) => true,
+        Principal::Session(session) if session.role == factory_core::AgentRole::Orchestrator => {
+            match &event.event {
+                FactoryEvent::AutoModeChanged { .. } => false,
+                FactoryEvent::PolicyDecision { project_id, .. }
+                | FactoryEvent::AgentBudgetChanged { project_id, .. }
+                | FactoryEvent::RepositoryOperation { project_id, .. }
+                | FactoryEvent::RepositoryAuthorityChanged { project_id }
+                | FactoryEvent::TaskDeleted { project_id, .. }
+                | FactoryEvent::AgentDeleted { project_id, .. }
+                | FactoryEvent::ProjectDeleted { project_id } => project_id == &session.project_id,
+                FactoryEvent::ProjectChanged { project } if project.id == session.project_id => {
+                    true
+                }
+                FactoryEvent::TaskChanged { task } if task.project_id == session.project_id => true,
+                FactoryEvent::AgentChanged { agent } if agent.project_id == session.project_id => {
+                    true
+                }
+                FactoryEvent::RunChanged { run } if run.project_id == session.project_id => true,
+                FactoryEvent::SessionChanged { session: changed }
+                    if changed.project_id == session.project_id =>
+                {
+                    true
+                }
+                _ => false,
+            }
+        }
+        Principal::Session(_) => false,
+    }
 }
 
 async fn latest_event_sequence(state: &ApiState) -> Result<i64, ApiFailure> {

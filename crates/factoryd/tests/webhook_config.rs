@@ -36,7 +36,8 @@ fn private_write(path: &std::path::Path, contents: impl AsRef<[u8]>) {
 
 fn generic_config(secret_file: &std::path::Path) -> Value {
     json!({"version":1,"bind":"127.0.0.1:0","endpoints":[{
-        "id":"monitor","wireProfile":"generic_v1","secretFile":secret_file
+        "id":"monitor","wireProfile":"generic_v1","secretFile":secret_file,
+        "projectId":"factory"
     }]})
 }
 
@@ -70,6 +71,22 @@ fn now_ms() -> i64 {
             .as_millis(),
     )
     .unwrap()
+}
+
+#[test]
+fn generic_endpoint_requires_a_daemon_configured_project() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let secret_file = directory.path().join("secret");
+    private_write(&secret_file, b"generic-secret");
+    let config_path = directory.path().join("webhooks.json");
+    let mut config = generic_config(&secret_file);
+    config["endpoints"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("projectId");
+    private_write(&config_path, serde_json::to_vec(&config).unwrap());
+
+    assert!(load_webhook_config(&config_path).is_err());
 }
 
 #[tokio::test]
@@ -250,7 +267,7 @@ async fn generic_events_authenticate_are_idempotent_and_reject_unknown_targets()
         .unwrap();
     assert_eq!(
         router.oneshot(request).await.unwrap().status(),
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
     assert_eq!(
         metrics.snapshot().authenticated_requests,

@@ -79,45 +79,49 @@ impl DaemonInstance {
 
     /// Bind the configured socket, replacing only a confirmed stale socket inode.
     pub fn bind_socket(&self) -> io::Result<(UnixListener, SocketCleanup)> {
-        recover_stale_socket(&self.socket)?;
-        let listener = UnixListener::bind(&self.socket).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot bind local socket {}: {error}",
-                    self.socket.display()
-                ),
-            )
-        })?;
-        let metadata = fs::symlink_metadata(&self.socket)?;
-        if !metadata.file_type().is_socket() {
-            return Err(invalid(format!(
-                "bound socket {} is not a Unix socket",
-                self.socket.display()
-            )));
-        }
-        let identity = FileIdentity::from(&metadata);
-        let cleanup = SocketCleanup {
-            path: self.socket.clone(),
-            identity,
-            armed: true,
-        };
-        fs::set_permissions(&self.socket, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-        let protected = fs::symlink_metadata(&self.socket)?;
-        if !protected.file_type().is_socket()
-            || FileIdentity::from(&protected) != identity
-            || protected.mode() & 0o777 != PRIVATE_FILE_MODE
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "local socket {} is not private mode 0600",
-                    self.socket.display()
-                ),
-            ));
-        }
-        Ok((listener, cleanup))
+        bind_socket_path(&self.socket)
     }
+}
+
+/// Bind a second private socket without claiming another daemon/database
+/// lifetime. The production daemon uses this for the session-authenticated
+/// endpoint while retaining the configured operator socket unchanged.
+pub fn bind_socket_path(path: &Path) -> io::Result<(UnixListener, SocketCleanup)> {
+    ensure_private_parent(path)?;
+    let socket = canonical_child_path(path, "socket")?;
+    check_socket_path_length(&socket)?;
+    recover_stale_socket(&socket)?;
+    let listener = UnixListener::bind(&socket).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot bind local socket {}: {error}", socket.display()),
+        )
+    })?;
+    let metadata = fs::symlink_metadata(&socket)?;
+    if !metadata.file_type().is_socket() {
+        return Err(invalid(format!(
+            "bound socket {} is not a Unix socket",
+            socket.display()
+        )));
+    }
+    let identity = FileIdentity::from(&metadata);
+    let cleanup = SocketCleanup {
+        path: socket.clone(),
+        identity,
+        armed: true,
+    };
+    fs::set_permissions(&socket, fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    let protected = fs::symlink_metadata(&socket)?;
+    if !protected.file_type().is_socket()
+        || FileIdentity::from(&protected) != identity
+        || protected.mode() & 0o777 != PRIVATE_FILE_MODE
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("local socket {} is not private mode 0600", socket.display()),
+        ));
+    }
+    Ok((listener, cleanup))
 }
 
 /// Removes only the socket inode created by this daemon instance.

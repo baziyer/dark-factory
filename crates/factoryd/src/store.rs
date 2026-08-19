@@ -546,6 +546,8 @@ pub enum StoreError {
     TaskNotRunning,
     #[error("task is not assigned to the requesting agent")]
     TaskAssignmentMismatch,
+    #[error("task has no open run for the requesting session")]
+    SessionTaskMismatch,
     #[error("task is not retryable in the requested project")]
     TaskNotRetryable,
     #[error("task result exceeds its bound")]
@@ -2942,6 +2944,42 @@ impl Store {
         Ok(closed)
     }
 
+    /// The session-authenticated completion path is bound atomically to the
+    /// exact open run that carried the bearer credential. Authorization is
+    /// repeated inside this transaction so a concurrent recovery or
+    /// reassignment cannot make the earlier probe authorize a different run.
+    pub fn complete_task_for_session(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        result: String,
+        now_ms: i64,
+    ) -> Result<ClosedEpisode> {
+        if result.len() > MAX_TASK_RESULT_BYTES {
+            return Err(StoreError::InvalidTaskResult);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run =
+            open_run_for_task_session(&transaction, project_id, task_id, agent_id, session_id)?;
+        let closed = close_run_in_transaction(
+            &transaction,
+            &run,
+            RunStatus::Succeeded,
+            RunClosedBy::TaskDone,
+            None,
+            TaskStatus::Succeeded,
+            Some(result.as_str()),
+            None,
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(closed)
+    }
+
     /// `factoryctl task blocked`: closes the open episode `stopped`,
     /// `closed_by = task_blocked`, the task `blocked` with `blocked_reason`.
     pub fn block_task(
@@ -2958,6 +2996,39 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = open_run_for_task(&transaction, project_id, task_id)?;
+        let closed = close_run_in_transaction(
+            &transaction,
+            &run,
+            RunStatus::Stopped,
+            RunClosedBy::TaskBlocked,
+            None,
+            TaskStatus::Blocked,
+            None,
+            Some(reason.as_str()),
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(closed)
+    }
+
+    /// Session-bound counterpart to [`Self::block_task`].
+    pub fn block_task_for_session(
+        &mut self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        reason: String,
+        now_ms: i64,
+    ) -> Result<ClosedEpisode> {
+        if reason.is_empty() || reason.len() > MAX_BLOCKED_REASON_BYTES {
+            return Err(StoreError::InvalidBlockedReason);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let run =
+            open_run_for_task_session(&transaction, project_id, task_id, agent_id, session_id)?;
         let closed = close_run_in_transaction(
             &transaction,
             &run,
@@ -4745,6 +4816,39 @@ impl Store {
         Ok(assigned.as_deref() == Some(agent_id.as_str()))
     }
 
+    /// Returns true only when the task's currently open episode belongs to
+    /// this exact live session of the assigned agent.
+    pub fn task_open_for_session(
+        &self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<bool> {
+        let open: i64 = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM tasks
+                 JOIN runs ON runs.project_id = tasks.project_id
+                          AND runs.task_id = tasks.id
+                 WHERE tasks.project_id = ?1
+                   AND tasks.id = ?2
+                   AND tasks.assigned_agent_id = ?3
+                   AND tasks.status = 'running'
+                   AND runs.session_id = ?4
+                   AND runs.ended_at_ms IS NULL
+             )",
+            params![
+                project_id.as_str(),
+                task_id.as_str(),
+                agent_id.as_str(),
+                session_id.as_str()
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(open != 0)
+    }
+
     pub fn update_agent_profile(
         &mut self,
         project_id: &ProjectId,
@@ -5165,6 +5269,37 @@ fn open_run_for_task(
         )
         .optional()?
         .ok_or(StoreError::RunNotFound)?;
+    let run_id: RunId = parse_id(run_id, 0)?;
+    load_run(transaction, &run_id)?.ok_or(StoreError::RunNotFound)
+}
+
+fn open_run_for_task_session(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+) -> Result<RunSnapshot> {
+    let task = load_task(transaction, task_id)?
+        .filter(|task| task.snapshot.project_id == *project_id)
+        .ok_or(StoreError::TaskNotFound)?;
+    if task.snapshot.status != TaskStatus::Running {
+        return Err(StoreError::TaskNotRunning);
+    }
+    if task.snapshot.assigned_agent_id.as_ref() != Some(agent_id) {
+        return Err(StoreError::TaskAssignmentMismatch);
+    }
+    let run_id: String = transaction
+        .query_row(
+            "SELECT id FROM runs
+             WHERE task_id = ?1 AND project_id = ?2 AND session_id = ?3
+               AND ended_at_ms IS NULL
+             LIMIT 1",
+            params![task_id.as_str(), project_id.as_str(), session_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(StoreError::SessionTaskMismatch)?;
     let run_id: RunId = parse_id(run_id, 0)?;
     load_run(transaction, &run_id)?.ok_or(StoreError::RunNotFound)
 }
@@ -6795,5 +6930,118 @@ mod tests {
             store.open_run_episode(&session_id, &task_id, 8_001),
             Err(StoreError::SessionStopping)
         ));
+    }
+
+    #[test]
+    fn task_completion_is_bound_to_the_exact_open_session_run() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("worker").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let other_session = SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
+        let task_id = TaskId::try_from("task-1").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".into(),
+                    runner_protocol_version: 1,
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                2,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Task".into(),
+                    body: "Body".into(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 4)
+            .unwrap();
+        store.open_run_episode(&session_id, &task_id, 5).unwrap();
+
+        assert!(
+            !store
+                .task_open_for_session(&project_id, &task_id, &agent_id, &other_session)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.complete_task_for_session(
+                &project_id,
+                &task_id,
+                &agent_id,
+                &other_session,
+                "spoof".into(),
+                6,
+            ),
+            Err(StoreError::SessionTaskMismatch)
+        ));
+        assert!(
+            store
+                .complete_task_for_session(
+                    &project_id,
+                    &task_id,
+                    &agent_id,
+                    &session_id,
+                    "done".into(),
+                    7,
+                )
+                .is_ok()
+        );
     }
 }

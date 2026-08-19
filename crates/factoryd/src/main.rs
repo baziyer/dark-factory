@@ -2,8 +2,8 @@ use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
-    lifecycle::{DaemonInstance, ShutdownSignals},
-    local_api::{ApiState, serve},
+    lifecycle::{DaemonInstance, ShutdownSignals, bind_socket_path},
+    local_api::{ApiState, serve, serve_session},
     store::Store,
     webhook_http::{WebhookHttpMetrics, WebhookServer, bind_webhooks, load_webhook_config},
 };
@@ -40,6 +40,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let (listener, socket_cleanup) = instance.bind_socket()?;
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
+    let session_socket = session_socket_path(instance.socket_path());
+    let (session_listener, session_socket_cleanup) = bind_socket_path(&session_socket)?;
+    session_listener.set_nonblocking(true)?;
+    let session_listener = UnixListener::from_std(session_listener)?;
 
     let webhook_metrics = config
         .webhook_config
@@ -66,7 +70,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             factoryctl_path: config.factoryctl,
             runtime_root: config.runtime_root,
             guidance_root: config.guidance_root,
-            socket_path: instance.socket_path().to_path_buf(),
+            socket_path: session_socket.clone(),
             max_active_runs: config.max_active_runs,
             session_start_deadline: execution::SESSION_START_DEADLINE,
         },
@@ -74,7 +78,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     tracing::info!(
         database = %instance.database_path().display(),
-        socket = %instance.socket_path().display(),
+        operator_socket = %instance.socket_path().display(),
+        session_socket = %session_socket.display(),
         webhooks_enabled,
         webhooks_bind = webhooks_bind.map(|bind| bind.to_string()),
         "factory daemon ready"
@@ -90,6 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let control_planes = serve_control_planes(
         listener,
+        session_listener,
         state,
         execution.clone(),
         guidance_root,
@@ -113,6 +119,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(error) = socket_cleanup.remove() {
         tracing::warn!(%error, socket = %instance.socket_path().display(), "could not remove socket");
     }
+    if let Err(error) = session_socket_cleanup.remove() {
+        tracing::warn!(%error, socket = %session_socket.display(), "could not remove session socket");
+    }
     if let Some(metrics) = webhook_metrics {
         let metrics = metrics.snapshot();
         tracing::info!(
@@ -129,6 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn serve_control_planes(
     listener: UnixListener,
+    session_listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
@@ -138,6 +148,13 @@ async fn serve_control_planes(
     let (stop_tx, stop_rx) = watch::channel(false);
     let local = serve(
         listener,
+        state.clone(),
+        execution.clone(),
+        guidance_root.clone(),
+        wait_for_stop(stop_rx.clone()),
+    );
+    let sessions = serve_session(
+        session_listener,
         state,
         execution,
         guidance_root,
@@ -145,39 +162,60 @@ async fn serve_control_planes(
     );
     let web = serve_optional_webhooks(webhooks, stop_rx);
     tokio::pin!(local);
+    tokio::pin!(sessions);
     tokio::pin!(web);
 
     enum Completed {
         Shutdown,
         Local(io::Result<()>),
+        Sessions(io::Result<()>),
         Webhooks(io::Result<()>),
     }
 
     let completed = tokio::select! {
         () = shutdown.recv() => Completed::Shutdown,
         result = &mut local => Completed::Local(result),
+        result = &mut sessions => Completed::Sessions(result),
         result = &mut web => Completed::Webhooks(result),
     };
     let _ = stop_tx.send(true);
     match completed {
         Completed::Shutdown => {
-            let (local, web) = tokio::join!(local, web);
+            let (local, sessions, web) = tokio::join!(local, sessions, web);
             local?;
+            sessions?;
             web?;
             tracing::info!("shutdown requested");
             Ok(())
         }
         Completed::Local(result) => {
-            let web = web.await;
+            let (sessions, web) = tokio::join!(sessions, web);
             result?;
+            sessions?;
+            web
+        }
+        Completed::Sessions(result) => {
+            let (local, web) = tokio::join!(local, web);
+            result?;
+            local?;
             web
         }
         Completed::Webhooks(result) => {
-            let local = local.await;
+            let (local, sessions) = tokio::join!(local, sessions);
             result?;
-            local
+            local?;
+            sessions
         }
     }
+}
+
+fn session_socket_path(operator_socket: &std::path::Path) -> PathBuf {
+    let file_name = operator_socket
+        .file_name()
+        .map_or_else(|| OsString::from("f.sock"), OsString::from);
+    let mut session_name = file_name;
+    session_name.push(".session");
+    operator_socket.with_file_name(session_name)
 }
 
 async fn serve_optional_webhooks(
