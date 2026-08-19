@@ -854,7 +854,11 @@ fn daemon_version_mismatch_is_actionable_and_same_version_is_quiet() {
     board.set_daemon_version("0.0.1");
     assert_eq!(
         board.version_mismatch().as_deref(),
-        Some("STALE TUI v0.2.4 / active runtime v0.0.1 — detach + relaunch")
+        Some(concat!(
+            "STALE TUI v",
+            env!("CARGO_PKG_VERSION"),
+            " / active runtime v0.0.1 — detach + relaunch"
+        ))
     );
 
     board.set_daemon_version("");
