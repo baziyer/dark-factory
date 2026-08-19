@@ -25,6 +25,11 @@ area:tui|1D76DB|factory-tui
 area:providers|1D76DB|claude/codex/shell adapters and their generated config
 area:docs|0075CA|README, ARCHITECTURE, docs/
 area:ci|5319E7|CI, release, toolchain, scripts
+state:queued|D4C5F9|Accepted work has not started
+state:in-progress|1D76DB|Work is actively being executed
+state:blocked|B60205|Work needs a bounded resolution before it can continue
+state:review|FBCA04|A change is awaiting independent review or recheck
+state:release-ready|0E8A16|Exact integration or release preconditions are satisfied
 size:S|C2E0C6|A focused change; hours
 size:M|FBCA04|A day or two; touches more than one crate or a load-bearing path
 size:L|E99695|Needs design or an upstream change first
