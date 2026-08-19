@@ -70,6 +70,9 @@ enum Backend {
 pub enum PaneObservation {
     Connecting,
     Attached,
+    /// The local child reached EOF. This is a terminal pane state, not an attach
+    /// failure: the pane remains renderable and must not be respawned.
+    LocalPtyExited,
     Disconnected,
     AttachRefused(AttachRefusal),
     Error(String),
@@ -373,21 +376,6 @@ impl Pane {
         Ok(())
     }
 
-    /// Whether the pane is no longer usable: the local child exited, or the daemon observation is
-    /// disconnected or has a terminal attach failure.
-    #[must_use]
-    pub fn has_exited(&mut self) -> bool {
-        match &mut self.backend {
-            Backend::LocalPty { child, .. } => matches!(child.try_wait(), Ok(Some(_))),
-            Backend::Daemon { observation, .. } => matches!(
-                self_observation(observation),
-                PaneObservation::Disconnected
-                    | PaneObservation::AttachRefused(_)
-                    | PaneObservation::Error(_)
-            ),
-        }
-    }
-
     /// The one authoritative observation of daemon attach state. In particular, a typed refusal
     /// replaces `Attached` even when it arrives after the first terminal frame.
     #[must_use]
@@ -395,7 +383,7 @@ impl Pane {
         match &self.backend {
             Backend::LocalPty { exited, .. } => {
                 if exited.load(Ordering::Acquire) {
-                    PaneObservation::Disconnected
+                    PaneObservation::LocalPtyExited
                 } else {
                     PaneObservation::Attached
                 }

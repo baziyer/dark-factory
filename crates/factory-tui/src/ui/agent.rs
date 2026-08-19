@@ -89,11 +89,15 @@ fn render_terminal(
             );
             return;
         }
-        PaneObservation::Attached | PaneObservation::Disconnected => {}
+        PaneObservation::Attached
+        | PaneObservation::LocalPtyExited
+        | PaneObservation::Disconnected => {}
     }
 
     let exited = match pane.kind {
-        crate::pane::PaneKind::LocalPty => pane.has_exited(),
+        crate::pane::PaneKind::LocalPty => {
+            matches!(observation, PaneObservation::LocalPtyExited)
+        }
         crate::pane::PaneKind::Daemon => matches!(observation, PaneObservation::Disconnected),
     };
     let marker = if exited { " [exited]" } else { "" };

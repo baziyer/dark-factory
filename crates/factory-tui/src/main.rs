@@ -467,6 +467,7 @@ fn sync_panes(
                     changed = true;
                     continue;
                 }
+                PaneObservation::LocalPtyExited => continue,
                 PaneObservation::Connecting | PaneObservation::Attached => continue,
             }
         }
@@ -1429,6 +1430,65 @@ mod main_tests {
             item.session_id.as_ref() == Some(&session_id)
                 && item.reason.kind == factory_core::status::AttentionReasonKind::ObserverProblem
         }));
+    }
+
+    #[test]
+    fn exited_local_pty_stays_renderable_across_repeated_syncs_without_respawn() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let mut board = Board::new(true, 0, theme::FORTRESS);
+        let alice = agent("alice", "proj", AgentRole::Worker, None);
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        board.view = model::View::Agent;
+        board.selected_agent = Some(factory_core::AgentId::try_from("alice").unwrap());
+        let session_id = factory_core::SessionId::try_from("dev-alice").unwrap();
+        let mut panes = PaneMap::new();
+        panes.insert(
+            session_id.clone(),
+            Pane::spawn(
+                "exiting",
+                &["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                24,
+                80,
+                None,
+            )
+            .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            panes.get(&session_id).unwrap().observation(),
+            PaneObservation::LocalPtyExited
+        ) && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            panes.get(&session_id).unwrap().observation(),
+            PaneObservation::LocalPtyExited
+        ));
+
+        let client = Client::new(&socket);
+        let (tx, _rx) = mpsc::channel();
+        for _ in 0..5 {
+            sync_panes(&mut board, &mut panes, &socket, &client, &tx, None);
+            let pane = panes.get(&session_id).expect("exited pane remains present");
+            assert!(matches!(
+                pane.observation(),
+                PaneObservation::LocalPtyExited
+            ));
+            assert_eq!(
+                pane.command,
+                vec!["/bin/sh".to_owned(), "-c".to_owned(), "exit 0".to_owned(),],
+                "sync must not replace an exited local shell with a new one"
+            );
+        }
+        assert!(!board.pane_ready);
     }
 
     #[test]
