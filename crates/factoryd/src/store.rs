@@ -2947,11 +2947,11 @@ impl Store {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
         }
-        let revision: i64 = self.connection.query_row(
-            "SELECT COALESCE(MAX(sequence), 0) FROM events",
-            [],
-            |row| row.get(0),
-        )?;
+        let revision: i64 =
+            self.connection
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                    row.get(0)
+                })?;
         if expected_revision.is_some_and(|expected| expected != revision) {
             return Err(StoreError::StaleTaskCursor);
         }
@@ -2989,10 +2989,20 @@ impl Store {
             WHERE project_id = ?1
                AND (?2 IS NULL OR assigned_agent_id = ?2)
                AND (?3 OR status IN ('queued', 'running'))
-               AND (?4 IS NULL OR (created_at_ms, id) > (
-                    SELECT created_at_ms, id FROM tasks
-                    WHERE project_id = ?1 AND id = ?4
-               ))
+               AND (?4 IS NULL OR
+                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
+                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                        FROM tasks WHERE project_id = ?1 AND id = ?4
+                    ) OR (
+                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
+                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                            FROM tasks WHERE project_id = ?1 AND id = ?4
+                        )
+                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
+                                                             WHERE project_id = ?1 AND id = ?4)))
+                    ))
              ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
              LIMIT ?5",
         )?;

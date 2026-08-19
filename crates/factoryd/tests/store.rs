@@ -1072,9 +1072,9 @@ fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
             .map(|task| task.snapshot.id.clone())
             .collect::<Vec<_>>(),
         vec![
-            task_id("alice-first"),
             task_id("backlog"),
-            task_id("alice-second")
+            task_id("alice-second"),
+            task_id("alice-first")
         ]
     );
     assert_eq!(bob, agent_id("bob"));

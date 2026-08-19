@@ -325,6 +325,7 @@ Required:
 
 Options:
   --after ID               Resume after this task ID
+  --revision N             Revision returned with the previous page
   --agent ID               Show only tasks assigned to this agent
   --history                Include terminal task history
   --limit N                  Page size (default and max: 10)
@@ -800,6 +801,7 @@ enum CliCommand {
     TaskList {
         project_id: String,
         after_id: Option<String>,
+        queue_revision: Option<i64>,
         agent_id: Option<String>,
         history: bool,
         limit: u32,
@@ -1671,6 +1673,9 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
         "list" => {
             let project_id = required_project(&mut args)?;
             let after_id = take_option(&mut args, "--after")?;
+            let queue_revision = take_option(&mut args, "--revision")?
+                .map(|value| parse_number(&value, "--revision"))
+                .transpose()?;
             let agent_id = take_option(&mut args, "--agent")?;
             let history = take_flag(&mut args, "--history")?;
             let (limit, _) = take_limit(&mut args, TASK_LIST_LIMIT, TASK_LIST_LIMIT)?;
@@ -1678,6 +1683,7 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             Ok(CliCommand::TaskList {
                 project_id,
                 after_id,
+                queue_revision,
                 agent_id,
                 history,
                 limit,
@@ -2233,6 +2239,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::TaskList {
             project_id,
             after_id,
+            queue_revision,
             agent_id,
             history,
             limit,
@@ -2240,7 +2247,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
             agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
-            queue_revision: None,
+            queue_revision,
             history,
             limit,
         }),
@@ -3731,6 +3738,7 @@ mod tests {
                 CliCommand::TaskList {
                     project_id: "project-1".into(),
                     after_id: Some("task-9".into()),
+                    queue_revision: None,
                     agent_id: None,
                     history: false,
                     limit: 10,
