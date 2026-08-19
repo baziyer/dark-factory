@@ -113,11 +113,18 @@ catalogue.
    reasons separate provider questions/permissions from worker blocks,
    delivery or observation failures, exhausted budgets, and lifecycle
    inference; every client receives the same bounded control-safe summary,
-   source IDs, age, and safe action. Attention is not permission to stop or
-   replace a worker; recovery begins by preserving or explicitly resolving
-   dirty work. Fleet attention snapshots carry the durable event high-water
-   mark from the same store read, so a delayed snapshot cannot overwrite a
-   resolution already observed on the event stream.
+   source IDs, age, and safe action. NEEDS YOU is a decision inbox: only
+   authority/ambiguity reasons (provider decisions, explicit worker blocks,
+   budget intervention, manual pause, or unproven lifecycle inference) enter
+   it. Delivery, observer, capacity, and other deterministic recovery remains
+   a control-plane concern. Selecting a row keeps BUILDING visible and shows
+   the same bounded cause, exact evidence, typed choices, recommendation, and
+   consequences in both `factoryctl status` and the TUI. Attention is not
+   permission to stop or replace a worker; recovery begins by preserving or
+   explicitly resolving dirty work. Fleet attention snapshots carry the
+   durable event high-water mark from the same store read, so a delayed
+   snapshot cannot overwrite a resolution already observed on the event
+   stream.
 5. Provider adapters answer exactly two questions for the daemon's generic
    session runner: how to launch (`spawn_spec` — executable, argv,
    environment additions, generated configuration) and what they can do

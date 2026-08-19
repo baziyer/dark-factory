@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, h
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(card_height), Constraint::Min(0)])
             .split(area);
-        render_attention_card(frame, panels[0], board, focus);
+        render_attention_card(frame, panels[0], board, focus, hits);
         panels[1]
     } else {
         area
@@ -330,11 +330,12 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
     }
 }
 
-fn render_attention_card(
+pub(crate) fn render_attention_card(
     frame: &mut Frame,
     area: Rect,
     board: &Board,
     focus: &crate::model::AttentionFocus,
+    hits: &mut HitMap,
 ) {
     let item = &focus.item;
     let title = if focus.resolved {
@@ -399,22 +400,44 @@ fn render_attention_card(
         Line::from(compact_pair("run:", run, "age:", &age, inner_width)),
     ];
     if !focus.resolved {
-        lines.push(Line::from(ui::truncate(
-            &format!("safe action: {}", item.action_text()),
-            inner_width,
-        )));
-        if matches!(
+        let decision = item.decision();
+        for (index, choice) in decision.choices.iter().enumerate() {
+            hits.add_row(
+                ui::block("").inner(area),
+                5 + index,
+                Target::AttentionChoice(item.clone(), index),
+            );
+            lines.push(Line::from(ui::truncate(
+                &format!(
+                    "{}. {}{} — {}",
+                    index + 1,
+                    choice.label,
+                    if index == decision.recommended {
+                        " *"
+                    } else {
+                        ""
+                    },
+                    choice.consequence
+                ),
+                inner_width,
+            )));
+        }
+        let typing = if matches!(
             item.reason.action,
             factory_core::status::AttentionAction::AnswerInTerminal
                 | factory_core::status::AttentionAction::ReviewProviderPermission
         ) {
-            lines.push(Line::from(ui::truncate(
-                "typing off; Ctrl-] to enter",
-                inner_width,
-            )));
+            "typing off; Ctrl-] to enter answer"
         } else {
-            lines.push(Line::from("terminal typing is not an action"));
-        }
+            "terminal typing is not an action"
+        };
+        let suffix_width = typing.chars().count() + 2;
+        let action_width = inner_width.saturating_sub(suffix_width);
+        let action = ui::truncate(
+            &format!("safe action: {}", item.action_text()),
+            action_width,
+        );
+        lines.push(Line::from(format!("{action}; {typing}")));
     } else {
         lines.push(Line::from(ui::truncate(
             "safe action: refresh NEEDS YOU",

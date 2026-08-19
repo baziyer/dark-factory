@@ -26,6 +26,8 @@ use crate::{
 pub const MAX_QUEUE_PREVIEW: usize = 10;
 /// Maximum displayed characters in any operator-controlled attention summary.
 pub const MAX_ATTENTION_SUMMARY_CHARS: usize = 160;
+/// Maximum displayed characters in the compact decision evidence line.
+pub const MAX_ATTENTION_EVIDENCE_CHARS: usize = 240;
 
 const fn legacy_event_sequence() -> i64 {
     -1
@@ -234,6 +236,25 @@ pub struct AttentionItem {
     pub reason: AttentionReason,
 }
 
+/// One safe, typed choice in the BUILDING decision inbox. The daemon remains
+/// the authority for validating and applying the corresponding request; this
+/// is only the shared projection used by `factoryctl` and the TUI.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionChoice {
+    pub label: String,
+    pub action: AttentionAction,
+    pub consequence: String,
+}
+
+/// The bounded operator decision shown for one NEEDS YOU item.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AttentionDecision {
+    pub cause: String,
+    pub evidence: String,
+    pub choices: Vec<AttentionChoice>,
+    pub recommended: usize,
+}
+
 #[derive(Serialize)]
 struct AttentionItemRef<'a> {
     kind: AttentionKind,
@@ -315,6 +336,82 @@ impl<'de> Deserialize<'de> for AttentionItem {
 }
 
 impl AttentionItem {
+    /// Machine recovery belongs to the daemon/control plane, not the
+    /// operator's decision inbox. An inferred state is deliberately retained:
+    /// it means automation lacks enough typed evidence and a human must
+    /// choose what to do.
+    #[must_use]
+    pub const fn needs_operator_decision(&self) -> bool {
+        matches!(
+            self.reason.kind,
+            AttentionReasonKind::ProviderQuestion
+                | AttentionReasonKind::ProviderPermission
+                | AttentionReasonKind::WorkerBlocked
+                | AttentionReasonKind::BudgetExhausted
+                | AttentionReasonKind::PausedWithWork
+                | AttentionReasonKind::Inferred
+        )
+    }
+
+    /// Builds the same bounded card data for CLI and TUI. Choices are typed
+    /// `AttentionAction`s, so neither client invents a terminal-side action.
+    #[must_use]
+    pub fn decision(&self) -> AttentionDecision {
+        let evidence = display_text(&format!(
+            "project={} agent={} task={} session={} run={}",
+            self.project_id,
+            self.agent_id.as_ref().map_or("—", AgentId::as_str),
+            self.task_id.as_ref().map_or("—", TaskId::as_str),
+            self.session_id.as_ref().map_or("—", SessionId::as_str),
+            self.run_id.as_ref().map_or("—", crate::RunId::as_str),
+        ));
+        let choices = match self.reason.kind {
+            AttentionReasonKind::WorkerBlocked => vec![AttentionChoice {
+                label: "Retry task".to_owned(),
+                action: AttentionAction::RetryTask,
+                consequence: "requeues the task and lets the daemon deliver it again".to_owned(),
+            }],
+            AttentionReasonKind::PausedWithWork => vec![AttentionChoice {
+                label: "Resume agent".to_owned(),
+                action: AttentionAction::ResumeAgent,
+                consequence: "allows queued work to be delivered to this agent".to_owned(),
+            }],
+            AttentionReasonKind::BudgetExhausted => vec![AttentionChoice {
+                label: "Reset budget".to_owned(),
+                action: AttentionAction::ResetBudget,
+                consequence: "resets the durable tool-call budget before more work runs".to_owned(),
+            }],
+            AttentionReasonKind::ProviderQuestion => vec![AttentionChoice {
+                label: "Answer question".to_owned(),
+                action: AttentionAction::AnswerInTerminal,
+                consequence: "sends the answer to the waiting provider session".to_owned(),
+            }],
+            AttentionReasonKind::ProviderPermission => vec![AttentionChoice {
+                label: "Review permission".to_owned(),
+                action: AttentionAction::ReviewProviderPermission,
+                consequence: "leaves the provider approval under explicit operator control"
+                    .to_owned(),
+            }],
+            AttentionReasonKind::Inferred => vec![AttentionChoice {
+                label: "Inspect state".to_owned(),
+                action: AttentionAction::InspectInferredState,
+                consequence: "opens the recorded run evidence before a recovery choice".to_owned(),
+            }],
+            AttentionReasonKind::DeliveryRecovery
+            | AttentionReasonKind::ObserverProblem
+            | AttentionReasonKind::WaitingForCapacity => Vec::new(),
+        };
+        AttentionDecision {
+            cause: self.reason.summary.clone(),
+            evidence: evidence
+                .chars()
+                .take(MAX_ATTENTION_EVIDENCE_CHARS)
+                .collect(),
+            choices,
+            recommended: 0,
+        }
+    }
+
     fn legacy_kind(&self) -> AttentionKind {
         match self.reason.kind {
             AttentionReasonKind::ProviderQuestion | AttentionReasonKind::ProviderPermission => {
@@ -1131,6 +1228,62 @@ mod tests {
         );
         assert_eq!(age_text(65_000, 5_000), "1m");
         assert_eq!(age_text(1_000, 2_000), "0s");
+    }
+
+    #[test]
+    fn decision_inbox_keeps_authority_and_ambiguity_but_routes_machine_recovery_away() {
+        let project = ProjectId::try_from("p").unwrap();
+        let agents = vec![status(
+            agent("a", true),
+            None,
+            vec![task("t1", TaskStatus::Queued, 1)],
+        )];
+        let mut items = attention_items(&project, &agents, &[], false);
+        let worker = AttentionItem {
+            level: Attention::NeedsInput,
+            project_id: project.clone(),
+            agent_id: Some(AgentId::try_from("a").unwrap()),
+            task_id: Some(TaskId::try_from("t1").unwrap()),
+            session_id: None,
+            run_id: None,
+            since_ms: 1,
+            reason: reason(
+                AttentionReasonKind::WorkerBlocked,
+                "needs a human choice\u{1b}[2J".to_owned(),
+                "worker blocked",
+                AttentionAction::RetryTask,
+            ),
+        };
+        let delivery = AttentionItem {
+            level: Attention::Failed,
+            project_id: project,
+            agent_id: None,
+            task_id: None,
+            session_id: None,
+            run_id: None,
+            since_ms: 2,
+            reason: reason(
+                AttentionReasonKind::DeliveryRecovery,
+                "delivery unacknowledged".to_owned(),
+                "delivery recovery",
+                AttentionAction::InspectRecovery,
+            ),
+        };
+        assert!(worker.needs_operator_decision());
+        assert!(!delivery.needs_operator_decision());
+        let decision = worker.decision();
+        assert_eq!(decision.choices[0].action, AttentionAction::RetryTask);
+        assert_eq!(decision.recommended, 0);
+        assert!(decision.evidence.contains("project=p"));
+        assert!(!decision.cause.contains('\u{1b}'));
+        items.push(worker);
+        items.push(delivery);
+        let inbox: Vec<_> = items
+            .into_iter()
+            .filter(AttentionItem::needs_operator_decision)
+            .collect();
+        assert_eq!(inbox.len(), 2); // paused work plus the explicit worker block
+        assert!(inbox.iter().all(AttentionItem::needs_operator_decision));
     }
 
     #[test]

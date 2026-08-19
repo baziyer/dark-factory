@@ -117,10 +117,14 @@ The TUI has two screens:
 
 Select an agent and press `Enter` to open AGENT. Press `i` or `Enter` to type
 in its terminal. Press `Ctrl-]` to return control to the board. Press `g` to
-jump to the next item in NEEDS YOU and open its explicit action card before
-typing. The card distinguishes provider questions and permissions from worker
-blocks, delivery/recovery failures, observer problems, exhausted budgets, and
-inferred lifecycle state. Press `?` for all keys. Press `q` to detach.
+jump to the next item in NEEDS YOU and open its decision card in the BUILDING
+right pane; selection never detours into an agent terminal. The card contains
+the bounded cause, exact project/agent/task/session/run evidence, safe typed
+choices, the recommended choice, and its consequence. Press `Enter` for the
+recommended choice or `1`–`9` for a displayed choice. Provider questions and
+permissions remain explicit operator decisions; delivery, observer, capacity,
+and other deterministic recovery stays with the control plane. Press `?` for
+all keys. Press `q` to detach.
 Detaching does not stop any agent.
 
 Mouse navigation uses the same selections as the keyboard: click the footer's
@@ -140,7 +144,9 @@ factoryctl agent status --project my-project --agent worker-1
 ```
 
 `factoryctl status` is a concise fleet summary for people, including each
-bounded attention reason, its task/session/age, and a safe next action.
+bounded decision reason, its task/session/age, typed choices, and a safe next
+action. It uses the same decision projection as the TUI; deterministic
+recovery diagnostics are not presented as NEEDS YOU.
 `factoryctl agent status` exposes the same structured attention projection for
 one agent. Terminal attach failures are durable observer problems in that same
 projection and disappear after a successful reattach without erasing an

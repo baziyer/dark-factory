@@ -178,6 +178,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
         PromptKind::ReorderTask(task_id) => format!("reorder — task#{task_id}"),
+        PromptKind::AttentionAnswer { session_id, .. } => {
+            format!("decision answer — session#{session_id}")
+        }
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
         PromptKind::Capacity => "live-session capacity".to_owned(),

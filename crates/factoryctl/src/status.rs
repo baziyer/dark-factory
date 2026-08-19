@@ -6,6 +6,11 @@ use factory_core::{
 };
 
 pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String> {
+    let decisions: Vec<_> = status
+        .attention
+        .iter()
+        .filter(|item| item.level.needs_operator() && item.needs_operator_decision())
+        .collect();
     writeln!(
         output,
         "Dark Factory: auto {} | sessions {}/{} | projects {} | attention {}",
@@ -13,7 +18,7 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
         status.live_sessions,
         status.live_session_cap,
         status.projects.len(),
-        status.attention.len()
+        decisions.len()
     )
     .map_err(|error| error.to_string())?;
 
@@ -43,9 +48,9 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
         }
     }
 
-    if !status.attention.is_empty() {
+    if !decisions.is_empty() {
         writeln!(output, "\nAttention:").map_err(|error| error.to_string())?;
-        for item in &status.attention {
+        for item in decisions {
             let mut subject = item.project_id.to_string();
             if let Some(agent_id) = &item.agent_id {
                 subject.push('/');
@@ -70,6 +75,22 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                 item.action_text(),
             )
             .map_err(|error| error.to_string())?;
+            let decision = item.decision();
+            for (index, choice) in decision.choices.iter().enumerate() {
+                writeln!(
+                    output,
+                    "    {}. {}{} — {}",
+                    index + 1,
+                    choice.label,
+                    if index == decision.recommended {
+                        " (recommended)"
+                    } else {
+                        ""
+                    },
+                    choice.consequence,
+                )
+                .map_err(|error| error.to_string())?;
+            }
         }
     }
 
@@ -316,7 +337,9 @@ mod tests {
                 "\nEmpty (empty) | agents 0 | backlog 0\n",
                 "\nAttention:\n",
                 "  provider permission | factory/reviewer | task — | session session-reviewer | run — | age 0s | approve command [2JFORGED | action: review the provider prompt before entering terminal typing\n",
+                "    1. Review permission (recommended) — leaves the provider approval under explicit operator control\n",
                 "  worker blocked | factory | task task-7 | session — | run — | age 0s | dependency missing | action: factoryctl task retry --project factory --task task-7\n",
+                "    1. Retry task (recommended) — requeues the task and lets the daemon deliver it again\n",
             )
         );
         assert!(

@@ -429,6 +429,18 @@ impl Board {
         items
     }
 
+    /// The BUILDING NEEDS YOU inbox: only reasons requiring a human authority
+    /// or resolving an ambiguity. Deterministic recovery remains visible to
+    /// diagnostics through [`Board::attention_items`] but never occupies this
+    /// decision list.
+    #[must_use]
+    pub fn decision_items(&self) -> Vec<AttentionItem> {
+        self.attention_items()
+            .into_iter()
+            .filter(AttentionItem::needs_operator_decision)
+            .collect()
+    }
+
     fn reconcile_attention_focus(&mut self) {
         let Some(source) = self
             .attention_focus
@@ -438,7 +450,7 @@ impl Board {
             return;
         };
         let current = self
-            .attention_items()
+            .decision_items()
             .into_iter()
             .find(|item| same_attention_source(item, &source));
         let focus = self.attention_focus.as_mut().expect("focus checked above");

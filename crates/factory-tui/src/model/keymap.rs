@@ -143,6 +143,10 @@ pub enum PromptKind {
     MessageOrchestrator(AgentId),
     EditTaskTitle(TaskId),
     ReorderTask(TaskId),
+    AttentionAnswer {
+        project_id: ProjectId,
+        session_id: SessionId,
+    },
     EditModel(AgentId),
     EditPermission(AgentId),
     Capacity,
@@ -205,6 +209,23 @@ impl PromptState {
             kind: PromptKind::ReorderTask(task_id),
             labels: vec!["priority"],
             values: vec![current.to_string()],
+            field: 0,
+        }
+    }
+
+    #[must_use]
+    fn attention_answer(project_id: ProjectId, session_id: SessionId, permission: bool) -> Self {
+        Self {
+            kind: PromptKind::AttentionAnswer {
+                project_id,
+                session_id,
+            },
+            labels: vec![if permission {
+                "approval (yes/no)"
+            } else {
+                "answer"
+            }],
+            values: vec![String::new()],
             field: 0,
         }
     }
@@ -414,6 +435,18 @@ impl Board {
                     Intent::None
                 }
             }
+            MouseTarget::AttentionChoice(item, index) => {
+                let current = self
+                    .decision_items()
+                    .into_iter()
+                    .find(|current| super::same_attention_source(current, &item));
+                let Some(current) = current else {
+                    self.set_status("that decision changed before the click", StatusLevel::Info);
+                    return Intent::Redraw;
+                };
+                self.select_attention_item(&current);
+                self.choose_attention(index)
+            }
             MouseTarget::Pane(session_id) => {
                 let Some(agent_id) = self
                     .agent_for_pane_session(&session_id)
@@ -430,6 +463,19 @@ impl Board {
     }
 
     fn handle_normal_key(&mut self, key: KeyEvent) -> Intent {
+        if self.view == View::Building
+            && self
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| !focus.resolved)
+        {
+            if key.code == KeyCode::Enter {
+                return self.choose_attention(0);
+            }
+            if let KeyCode::Char(choice @ '1'..='9') = key.code {
+                return self.choose_attention(usize::from(choice as u8 - b'1'));
+            }
+        }
         if self.view == View::Agent {
             if key == crate::keys::PREFIX_KEY {
                 if self.pane_mode == PaneMode::Typing {
@@ -769,7 +815,7 @@ impl Board {
     }
 
     fn jump_to_attention(&mut self) -> Intent {
-        let items = self.attention_items();
+        let items = self.decision_items();
         if items.is_empty() {
             self.set_status("nothing needs attention", StatusLevel::Info);
             return Intent::Redraw;
@@ -788,7 +834,7 @@ impl Board {
 
     fn select_attention_item(&mut self, selected: &AttentionItem) -> bool {
         let current = self
-            .attention_items()
+            .decision_items()
             .into_iter()
             .find(|item| super::same_attention_source(item, selected));
         let (item, resolved) =
@@ -814,10 +860,83 @@ impl Board {
                 StatusLevel::Info,
             );
         }
-        self.view = View::Agent;
+        // NEEDS YOU is a BUILDING decision inbox. Keep the selected floor and
+        // row visible while the right pane shows the bounded decision card.
+        self.view = View::Building;
         self.pane_mode = PaneMode::Board;
         self.terminal_maximized = false;
         true
+    }
+
+    fn choose_attention(&mut self, index: usize) -> Intent {
+        let Some(focus) = self
+            .attention_focus
+            .as_ref()
+            .filter(|focus| !focus.resolved)
+        else {
+            return Intent::None;
+        };
+        let decision = focus.item.decision();
+        let Some(choice) = decision.choices.get(index) else {
+            self.set_status("that decision choice is not available", StatusLevel::Error);
+            return Intent::Redraw;
+        };
+        match choice.action {
+            factory_core::status::AttentionAction::RetryTask => {
+                let (Some(task_id), Some(project_id)) = (
+                    focus.item.task_id.clone(),
+                    Some(focus.item.project_id.clone()),
+                ) else {
+                    self.set_status("retry choice has no exact task", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                Intent::Send(LocalRequest::RetryTask {
+                    project_id,
+                    task_id,
+                })
+            }
+            factory_core::status::AttentionAction::ResumeAgent => {
+                let Some(agent_id) = focus.item.agent_id.clone() else {
+                    self.set_status("resume choice has no exact agent", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                Intent::Send(LocalRequest::ResumeAgent {
+                    project_id: focus.item.project_id.clone(),
+                    agent_id,
+                })
+            }
+            factory_core::status::AttentionAction::ResetBudget => {
+                let Some(agent_id) = focus.item.agent_id.clone() else {
+                    self.set_status("budget choice has no exact agent", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                Intent::Send(LocalRequest::ResetAgentBudget {
+                    project_id: focus.item.project_id.clone(),
+                    agent_id,
+                })
+            }
+            factory_core::status::AttentionAction::AnswerInTerminal
+            | factory_core::status::AttentionAction::ReviewProviderPermission => {
+                let Some(session_id) = focus.item.session_id.clone() else {
+                    self.set_status("provider choice has no exact session", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                self.mode = Mode::Prompt(PromptState::attention_answer(
+                    focus.item.project_id.clone(),
+                    session_id,
+                    choice.action
+                        == factory_core::status::AttentionAction::ReviewProviderPermission,
+                ));
+                Intent::Redraw
+            }
+            _ => {
+                self.set_status(
+                    "this decision has no client-side mutation",
+                    StatusLevel::Info,
+                );
+                Intent::Redraw
+            }
+        }
     }
 
     // -- Confirm ----------------------------------------------------------------------------
@@ -988,6 +1107,28 @@ impl Board {
                     title: None,
                     body: None,
                     priority: Some(priority),
+                })
+            }
+            PromptKind::AttentionAnswer {
+                project_id,
+                session_id,
+            } => {
+                let answer = prompt
+                    .values
+                    .first()
+                    .map(String::as_str)
+                    .map(str::trim)
+                    .unwrap_or_default();
+                if answer.is_empty() {
+                    self.set_status("answer can't be empty", StatusLevel::Error);
+                    return Intent::Redraw;
+                }
+                let mut bytes = answer.as_bytes().to_vec();
+                bytes.push(b'\n');
+                Intent::Send(LocalRequest::TerminalInput {
+                    project_id,
+                    session_id,
+                    bytes: factory_core::runner::encode_terminal_bytes(&bytes),
                 })
             }
             PromptKind::EditModel(agent_id) => {
@@ -1444,12 +1585,130 @@ mod tests {
             board.focused_project.as_ref().map(ProjectId::as_str),
             Some("proj")
         );
-        assert_eq!(board.view, View::Agent);
+        assert_eq!(board.view, View::Building);
         assert_eq!(board.pane_mode, PaneMode::Board);
         assert!(!board.terminal_maximized);
         assert!(board.attention_focus.as_ref().is_some_and(|focus| {
             !focus.resolved && focus.item.reason.kind == AttentionReasonKind::WorkerBlocked
         }));
+    }
+
+    #[test]
+    fn building_decision_enter_sends_the_typed_recommended_retry_without_opening_agent() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item];
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('g'))),
+            Intent::Redraw
+        ));
+        let Intent::Send(LocalRequest::RetryTask {
+            project_id,
+            task_id,
+        }) = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("recommended retry was not a typed local request");
+        };
+        assert_eq!(project_id.as_str(), "proj");
+        assert_eq!(task_id.as_str(), "blocked");
+        assert_eq!(board.view, View::Building);
+    }
+
+    #[test]
+    fn provider_decision_uses_a_typed_local_answer_request_without_terminal_detour() {
+        let mut board = board();
+        board.attention = vec![attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        )];
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Enter)),
+            Intent::Redraw
+        ));
+        assert!(matches!(board.mode, Mode::Prompt(_)));
+        for character in "use the stable branch".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        let Intent::Send(LocalRequest::TerminalInput {
+            project_id,
+            session_id,
+            bytes,
+        }) = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("provider decision did not become a typed local request");
+        };
+        assert_eq!(project_id.as_str(), "proj");
+        assert_eq!(session_id.as_str(), "session");
+        assert_eq!(
+            factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
+            b"use the stable branch\n"
+        );
+        assert_eq!(board.view, View::Building);
+    }
+
+    #[test]
+    fn manual_pause_decision_emits_resume_request_only_after_explicit_choice() {
+        let mut board = board();
+        board.attention = vec![attention(
+            AttentionReasonKind::PausedWithWork,
+            Some("alice"),
+            Some("queued"),
+            None,
+            10,
+        )];
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(
+            matches!(board.handle_key(key(KeyCode::Char('1'))), Intent::Send(LocalRequest::ResumeAgent { project_id, agent_id }) if project_id.as_str() == "proj" && agent_id.as_str() == "alice")
+        );
+        assert_eq!(board.view, View::Building);
+    }
+
+    #[test]
+    fn mouse_choice_uses_the_same_typed_path_as_keyboard_choice() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item.clone()];
+        let Intent::Send(LocalRequest::RetryTask { task_id, .. }) =
+            board.handle_mouse_target(MouseTarget::AttentionChoice(item, 0))
+        else {
+            panic!("mouse choice did not use the typed retry request");
+        };
+        assert_eq!(task_id.as_str(), "blocked");
+        assert_eq!(board.view, View::Building);
+    }
+
+    #[test]
+    fn machine_recovery_does_not_enter_the_building_decision_inbox() {
+        let mut board = board();
+        board.attention = vec![attention(
+            AttentionReasonKind::DeliveryRecovery,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        )];
+        assert!(board.decision_items().is_empty());
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('g'))),
+            Intent::Redraw
+        ));
+        assert!(board.attention_focus.is_none());
     }
 
     #[test]
@@ -2007,13 +2266,14 @@ mod tests {
                 .summary
                 .starts_with("local terminal attach failed: ")
         );
+        assert!(board.decision_items().is_empty());
 
         board.handle_key(key(KeyCode::Char('g')));
         assert!(
             board
                 .attention_focus
                 .as_ref()
-                .is_some_and(|focus| !focus.resolved)
+                .is_some_and(|focus| focus.resolved)
         );
         assert_eq!(board.pane_mode, PaneMode::Board);
 
