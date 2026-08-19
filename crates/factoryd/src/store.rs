@@ -2152,6 +2152,20 @@ impl Store {
         task_id: &TaskId,
         now_ms: i64,
     ) -> Result<OpenedEpisode> {
+        self.open_run_episode_with_message_ids(session_id, task_id, None, now_ms)
+    }
+
+    /// Opens a task episode and delivers only the message ids captured by
+    /// the durable delivery attempt. `None` retains the legacy operation's
+    /// meaning of delivering the whole current inbox; delivery retries pass
+    /// `Some` so messages arriving after composition remain queued.
+    pub fn open_run_episode_with_message_ids(
+        &mut self,
+        session_id: &SessionId,
+        task_id: &TaskId,
+        message_ids: Option<&[MessageId]>,
+        now_ms: i64,
+    ) -> Result<OpenedEpisode> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2217,14 +2231,25 @@ impl Store {
         task.snapshot.status = TaskStatus::Running;
         task.snapshot.updated_at_ms = now_ms;
 
-        let agent_messages = Self::deliver_agent_messages_in_transaction(
-            &transaction,
-            &session.project_id,
-            &session.agent_id,
-            session_id,
-            Some(&run_id),
-            now_ms,
-        )?;
+        let agent_messages = match message_ids {
+            Some(message_ids) => Self::deliver_agent_messages_by_ids_in_transaction(
+                &transaction,
+                &session.project_id,
+                &session.agent_id,
+                session_id,
+                Some(&run_id),
+                message_ids,
+                now_ms,
+            )?,
+            None => Self::deliver_agent_messages_in_transaction(
+                &transaction,
+                &session.project_id,
+                &session.agent_id,
+                session_id,
+                Some(&run_id),
+                now_ms,
+            )?,
+        };
         let agent = load_agent(&transaction, &session.agent_id)?
             .ok_or(StoreError::AgentNotFound)?
             .snapshot;
@@ -2369,6 +2394,34 @@ impl Store {
                     DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
                 ) && attempt.next_attempt_at_ms.is_none_or(|at| at <= now_ms)
             }))
+    }
+
+    /// Atomically claims a retryable attempt before any PTY bytes are
+    /// written. An interrupted claim is recovered as an in-flight attempt,
+    /// so a daemon restart cannot replay the same retry without consuming
+    /// the bounded failure budget. Initial attempts are already in-flight;
+    /// returning them here keeps the admission rule explicit for every
+    /// caller that is about to write.
+    pub fn begin_delivery_attempt(
+        &mut self,
+        attempt_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<DeliveryAttempt>> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'in_flight', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state = 'retryable'",
+            params![now_ms, attempt_id],
+        )?;
+        let attempt = load_delivery_attempt(&transaction, attempt_id)?;
+        transaction.commit()?;
+        if changed == 1 {
+            return Ok(attempt);
+        }
+        Ok(attempt.filter(|attempt| attempt.state == DeliveryAttemptState::InFlight))
     }
 
     pub fn record_delivery_failure(&mut self, attempt_id: &str, now_ms: i64) -> Result<()> {
@@ -2714,23 +2767,50 @@ impl Store {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
-        for id in &ids {
-            transaction.execute(
+        Self::deliver_agent_messages_by_ids_in_transaction(
+            transaction,
+            project_id,
+            agent_id,
+            session_id,
+            run_id,
+            &ids,
+            delivered_at_ms,
+        )
+    }
+
+    fn deliver_agent_messages_by_ids_in_transaction(
+        transaction: &Transaction<'_>,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        run_id: Option<&RunId>,
+        message_ids: &[MessageId],
+        delivered_at_ms: i64,
+    ) -> Result<Vec<AgentMessage>> {
+        let mut messages = Vec::with_capacity(message_ids.len());
+        for message_id in message_ids {
+            let changed = transaction.execute(
                 "UPDATE agent_messages
                  SET delivered_at_ms = ?1, delivered_session_id = ?2, delivered_run_id = ?3
-                 WHERE id = ?4 AND project_id = ?5 AND delivered_at_ms IS NULL",
+                 WHERE id = ?4 AND project_id = ?5 AND recipient_agent_id = ?6
+                   AND delivered_at_ms IS NULL",
                 params![
                     delivered_at_ms,
                     session_id.as_str(),
                     run_id.map(RunId::as_str),
-                    id.as_str(),
-                    project_id.as_str()
+                    message_id.as_str(),
+                    project_id.as_str(),
+                    agent_id.as_str(),
                 ],
             )?;
+            if changed == 1 {
+                messages.push(
+                    load_agent_message(transaction, message_id)?
+                        .ok_or(StoreError::InvalidAgentMessage)?,
+                );
+            }
         }
-        ids.into_iter()
-            .map(|id| load_agent_message(transaction, &id)?.ok_or(StoreError::InvalidAgentMessage))
-            .collect()
+        Ok(messages)
     }
 
     /// Delivers every undelivered inbox message as a standalone nudge (no
@@ -2771,29 +2851,15 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let mut messages = Vec::with_capacity(message_ids.len());
-        for message_id in message_ids {
-            let changed = transaction.execute(
-                "UPDATE agent_messages
-                 SET delivered_at_ms = ?1, delivered_session_id = ?2,
-                     delivered_run_id = NULL
-                 WHERE id = ?3 AND project_id = ?4 AND recipient_agent_id = ?5
-                   AND delivered_at_ms IS NULL",
-                params![
-                    delivered_at_ms,
-                    session_id.as_str(),
-                    message_id.as_str(),
-                    project_id.as_str(),
-                    agent_id.as_str(),
-                ],
-            )?;
-            if changed == 1 {
-                messages.push(
-                    load_agent_message(&transaction, message_id)?
-                        .ok_or(StoreError::InvalidAgentMessage)?,
-                );
-            }
-        }
+        let messages = Self::deliver_agent_messages_by_ids_in_transaction(
+            &transaction,
+            project_id,
+            agent_id,
+            session_id,
+            None,
+            message_ids,
+            delivered_at_ms,
+        )?;
         transaction.commit()?;
         Ok(messages)
     }
@@ -6161,15 +6227,28 @@ mod tests {
             1
         );
 
-        // A failed retry reaches the terminal bound. Only the explicit
-        // operator resume/reset clears that durable terminal state.
-        store.record_delivery_failure("attempt-1", 6_000).unwrap();
+        // A retry must be claimed durably before its first PTY write. If the
+        // daemon dies again after that claim, recovery consumes the final
+        // allowance; another restart cannot replay it without an explicit
+        // operator resume/reset.
+        let claimed = store.begin_delivery_attempt("attempt-1", 5_100).unwrap();
+        assert_eq!(
+            claimed.as_ref().map(|a| a.state),
+            Some(DeliveryAttemptState::InFlight)
+        );
+        store.recover_delivery_attempts(5_200).unwrap();
         let terminal = store
             .delivery_attempt_for_session(&project_id, &agent_id, &session_id)
             .unwrap()
             .unwrap();
         assert_eq!(terminal.failure_count, 2);
         assert_eq!(terminal.state, DeliveryAttemptState::Terminal);
+        assert!(
+            store
+                .begin_delivery_attempt("attempt-1", 5_300)
+                .unwrap()
+                .is_none()
+        );
         store
             .reset_delivery_attempt(&project_id, &agent_id, 7_000)
             .unwrap();
@@ -6180,6 +6259,14 @@ mod tests {
         assert_eq!(resumed.failure_count, 0);
         assert_eq!(resumed.state, DeliveryAttemptState::Retryable);
         assert_eq!(resumed.next_attempt_at_ms, Some(7_000));
+        assert_eq!(
+            store
+                .begin_delivery_attempt("attempt-1", 7_000)
+                .unwrap()
+                .unwrap()
+                .state,
+            DeliveryAttemptState::InFlight
+        );
 
         // Stop intent is durable and cancels the same attempt before any
         // later run admission can win the race.

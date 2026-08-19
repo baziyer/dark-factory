@@ -102,6 +102,11 @@ const STARTUP_GRACE: Duration = Duration::from_secs(30);
 /// make a PTY-typed delivery itself fail; long content stays fully readable
 /// via `factoryctl task get`/`agent inbox`, just not fully retyped.
 const MAX_DELIVERY_TEXT_BYTES: usize = 48_000;
+/// Invisible prompt suffix used to bind a provider's prompt hook to the
+/// immutable durable attempt that wrote it. Providers echo the submitted
+/// prompt in `UserPromptSubmit`; if they normalize away the nonce, the
+/// daemon refuses to guess and leaves the attempt retryable instead.
+pub(crate) const DELIVERY_ATTEMPT_MARKER: &str = "\u{2063}dark-factory-attempt:";
 /// Per-task-body budget inside a composed delivery, leaving room for
 /// guidance sections within [`MAX_DELIVERY_TEXT_BYTES`].
 const MAX_DELIVERY_TASK_BODY_BYTES: usize = 16_384;
@@ -402,13 +407,30 @@ impl Handle {
         )
         .await?;
 
+        let attempt_id = attempt.id.clone();
+        let claim_now_ms = now_ms()?;
+        let attempt = self
+            .state
+            .commit_and_publish(move |store| {
+                let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
+                Ok((attempt, Vec::new()))
+            })
+            .await?
+            .ok_or(Error::DeliveryInProgress)?;
+
         let opened_at_ms = now_ms()?;
         let session_id = session.id.clone();
         let open_task_id = task_id.clone();
+        let message_ids = attempt.message_ids.clone();
         let opened = self
             .state
             .commit_and_publish(move |store| {
-                let opened = store.open_run_episode(&session_id, &open_task_id, opened_at_ms)?;
+                let opened = store.open_run_episode_with_message_ids(
+                    &session_id,
+                    &open_task_id,
+                    Some(&message_ids),
+                    opened_at_ms,
+                )?;
                 let events = opened.events.clone();
                 Ok((opened, events))
             })
@@ -2085,8 +2107,9 @@ async fn ensure_delivery_attempt(
     delivery: Delivery,
     now_ms: i64,
 ) -> Result<DeliveryAttempt, DaemonStateError> {
+    let id = Uuid::new_v4().hyphenated().to_string();
     let input = NewDeliveryAttempt {
-        id: Uuid::new_v4().hyphenated().to_string(),
+        id: id.clone(),
         project_id: project_id.clone(),
         agent_id: agent_id.clone(),
         session_id: session_id.clone(),
@@ -2094,7 +2117,10 @@ async fn ensure_delivery_attempt(
         task_incarnation_id: delivery.task_incarnation_id,
         prior_run_count: delivery.prior_run_count,
         message_ids: delivery.message_ids,
-        text: delivery.text,
+        text: format!(
+            "{}\n{}{}\u{2063}",
+            delivery.text, DELIVERY_ATTEMPT_MARKER, id
+        ),
         created_at_ms: now_ms,
     };
     state
@@ -2137,7 +2163,12 @@ async fn commit_delivery(
                 delivery.prior_run_count,
             ) {
                 (Some(task_id), Some(task_incarnation_id), Some(prior_run_count)) => {
-                    match store.open_run_episode(&session_id, &task_id, now_ms) {
+                    match store.open_run_episode_with_message_ids(
+                        &session_id,
+                        &task_id,
+                        Some(&delivery.message_ids),
+                        now_ms,
+                    ) {
                         Ok(opened) => {
                             let run_id = opened.run.id.clone();
                             store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
@@ -2348,6 +2379,17 @@ async fn deliver_pending(
     {
         return Ok(());
     }
+    let attempt_id = attempt.id.clone();
+    let claim_now_ms = now_ms()?;
+    let claimed = state
+        .commit_and_publish(move |store| {
+            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
+            Ok((attempt, Vec::new()))
+        })
+        .await?;
+    let Some(attempt) = claimed else {
+        return Ok(());
+    };
     let target = state
         .with_store({
             let project_id = project_id.clone();

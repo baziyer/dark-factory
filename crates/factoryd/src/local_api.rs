@@ -3236,7 +3236,13 @@ mod deletion_gate_tests {
     use factory_core::{AgentRole, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus};
 
     use super::*;
-    use crate::store::{NewAgent, NewProject, NewSession, NewTask, Store};
+    use crate::{
+        execution::DELIVERY_ATTEMPT_MARKER,
+        store::{
+            DeliveryAttemptState, NewAgent, NewDeliveryAttempt, NewProject, NewSession, NewTask,
+            Store,
+        },
+    };
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -3408,6 +3414,140 @@ mod deletion_gate_tests {
         );
 
         execution.end_delete(&agent_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_same_text_hook_cannot_commit_a_recreated_task_attempt() {
+        let directory = private_tempdir();
+        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let visible_text = "same prompt";
+        let old_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-a\u{2063}");
+        let old_attempt_text = old_text.clone();
+        let (old_incarnation, old_run_count) = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.task_delivery_marker(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "attempt-a".to_owned(),
+                        project_id,
+                        agent_id,
+                        session_id,
+                        task_id: Some(task_id),
+                        task_incarnation_id: Some(old_incarnation),
+                        prior_run_count: Some(old_run_count),
+                        message_ids: Vec::new(),
+                        text: old_attempt_text,
+                        created_at_ms: 1_001,
+                    })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+
+        // Delete/recreate the same operator-facing id. Deletion cancels A;
+        // B has the same visible prompt but a different immutable attempt
+        // nonce and task incarnation.
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.delete_task(&project_id, &task_id, 1_002)?;
+                    store.create_task(
+                        NewTask {
+                            id: task_id.clone(),
+                            project_id: project_id.clone(),
+                            parent_task_id: None,
+                            title: "Replacement".to_owned(),
+                            body: visible_text.to_owned(),
+                            priority: 0,
+                        },
+                        1_003,
+                    )?;
+                    store.assign_task(&project_id, &task_id, Some(&agent_id), 1_004)?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+        let (incarnation, prior_run_count) = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.task_delivery_marker(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+        let new_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-b\u{2063}");
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| {
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "attempt-b".to_owned(),
+                        project_id,
+                        agent_id,
+                        session_id,
+                        task_id: Some(task_id),
+                        task_incarnation_id: Some(incarnation),
+                        prior_run_count: Some(prior_run_count),
+                        message_ids: Vec::new(),
+                        text: new_text,
+                        created_at_ms: 1_005,
+                    })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+
+        let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::UserPromptSubmit,
+                payload: serde_json::json!({"prompt": old_text}),
+            },
+        )
+        .await;
+        assert!(response.is_ok());
+        let task = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.get_task(&project_id, &task_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.snapshot.status, TaskStatus::Queued);
+        assert_eq!(
+            state
+                .with_store(|store| store.delivery_attempt_state("attempt-b"))
+                .await
+                .unwrap(),
+            Some(DeliveryAttemptState::InFlight)
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
