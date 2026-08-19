@@ -2222,15 +2222,33 @@ async fn commit_delivery(
                     }
                 }
                 (None, None, None) => {
-                    store.deliver_agent_messages_by_ids_with_delivery_attempt(
+                    match store.deliver_agent_messages_by_ids_with_delivery_attempt(
                         &project_id,
                         &agent_id,
                         &session_id,
                         &delivery.message_ids,
                         Some(&attempt_id),
                         now_ms,
-                    )?;
-                    Ok((None, Vec::new()))
+                    ) {
+                        Ok(_) => Ok((None, Vec::new())),
+                        // Recovery can cancel the attempt after the exact
+                        // prompt lookup but before this transaction. The
+                        // message delivery rolls back with its lost CAS; turn
+                        // that fence result into the same explicit hook denial
+                        // as the task-backed path.
+                        Err(StoreError::InvalidExecutionMetadata)
+                            if !matches!(
+                                store.delivery_attempt_state(&attempt_id)?,
+                                Some(
+                                    DeliveryAttemptState::InFlight
+                                        | DeliveryAttemptState::Retryable
+                                )
+                            ) =>
+                        {
+                            Ok((None, Vec::new()))
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 _ => Err(StoreError::InvalidExecutionMetadata),
             }
@@ -3347,10 +3365,10 @@ fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Erro
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use factory_core::TaskId;
+    use factory_core::{MessageId, TaskId};
 
     use super::*;
-    use crate::store::Store;
+    use crate::store::{NewAgentMessage, Store};
 
     struct RecoveryStopFixture {
         _directory: tempfile::TempDir,
@@ -3360,7 +3378,20 @@ mod tests {
         stale_in_flight_attempt: DeliveryAttempt,
     }
 
+    enum RecoveryFixtureDelivery {
+        Task,
+        Message,
+    }
+
     fn recovery_stop_fixture() -> RecoveryStopFixture {
+        recovery_stop_fixture_with(RecoveryFixtureDelivery::Task)
+    }
+
+    fn message_recovery_stop_fixture() -> RecoveryStopFixture {
+        recovery_stop_fixture_with(RecoveryFixtureDelivery::Message)
+    }
+
+    fn recovery_stop_fixture_with(delivery: RecoveryFixtureDelivery) -> RecoveryStopFixture {
         let directory = private_tempdir();
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
@@ -3434,34 +3465,54 @@ mod tests {
                 5,
             )
             .unwrap();
-        let task_id = TaskId::try_from("recovery-task").unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Recover".into(),
-                    body: String::new(),
-                    priority: 0,
-                },
-                6,
-            )
-            .unwrap();
-        store
-            .assign_task(&project_id, &task_id, Some(&agent_id), 6)
-            .unwrap();
-        let (incarnation, count) = store.task_delivery_marker(&resumed.id, &task_id).unwrap();
+        let (task_id, task_incarnation_id, prior_run_count, message_ids) = match delivery {
+            RecoveryFixtureDelivery::Task => {
+                let task_id = TaskId::try_from("recovery-task").unwrap();
+                store
+                    .create_task(
+                        crate::store::NewTask {
+                            id: task_id.clone(),
+                            project_id: project_id.clone(),
+                            parent_task_id: None,
+                            title: "Recover".into(),
+                            body: String::new(),
+                            priority: 0,
+                        },
+                        6,
+                    )
+                    .unwrap();
+                store
+                    .assign_task(&project_id, &task_id, Some(&agent_id), 6)
+                    .unwrap();
+                let (incarnation, count) =
+                    store.task_delivery_marker(&resumed.id, &task_id).unwrap();
+                (Some(task_id), Some(incarnation), Some(count), Vec::new())
+            }
+            RecoveryFixtureDelivery::Message => {
+                let message_id = MessageId::try_from("recovery-message").unwrap();
+                store
+                    .send_agent_message(NewAgentMessage {
+                        id: message_id.clone(),
+                        project_id: project_id.clone(),
+                        sender_agent_id: None,
+                        recipient_agent_id: agent_id.clone(),
+                        body: "recover me".into(),
+                        created_at_ms: 6,
+                    })
+                    .unwrap();
+                (None, None, None, vec![message_id])
+            }
+        };
         store
             .ensure_delivery_attempt(NewDeliveryAttempt {
                 id: "recovery-attempt".into(),
                 project_id: project_id.clone(),
                 agent_id: agent_id.clone(),
                 session_id: resumed.id.clone(),
-                task_id: Some(task_id),
-                task_incarnation_id: Some(incarnation),
-                prior_run_count: Some(count),
-                message_ids: Vec::new(),
+                task_id,
+                task_incarnation_id,
+                prior_run_count,
+                message_ids,
                 text: "recover me".into(),
                 created_at_ms: 6,
             })
@@ -4727,6 +4778,53 @@ mod tests {
             runs.is_empty(),
             "the denied old turn must open no duplicate run"
         );
+    }
+
+    #[tokio::test]
+    async fn late_message_only_prompt_hook_is_denied_without_delivering_the_inbox() {
+        let fixture = message_recovery_stop_fixture();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = fixture.recovered.session_id.clone();
+        let session = fixture
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let session_id = session_id.clone();
+                move |store| store.session_snapshot(&project_id, &session_id)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admit_delivery_attempt(&fixture.state, &session, fixture.stale_in_flight_attempt,)
+                .await
+                .unwrap(),
+            PromptDeliveryAdmission::Denied,
+            "the lost message-attempt CAS must become an explicit provider denial"
+        );
+        let (pending, attempt, runs) = fixture
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    Ok((
+                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
+                        store.delivery_attempt_state("recovery-attempt")?,
+                        store.list_runs(&project_id, None, 10)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the fresh conversation must retain the message"
+        );
+        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
+        assert!(runs.is_empty(), "a message-only denial must not open a run");
     }
 
     /// Issue #85 and PR #90 review: only a run created after candidate

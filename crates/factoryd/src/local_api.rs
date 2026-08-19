@@ -3227,14 +3227,16 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
 mod deletion_gate_tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use factory_core::{AgentRole, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus};
+    use factory_core::{
+        AgentRole, MessageId, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus,
+    };
 
     use super::*;
     use crate::{
         execution::DELIVERY_ATTEMPT_MARKER,
         store::{
-            DeliveryAttemptState, NewAgent, NewDeliveryAttempt, NewProject, NewSession, NewTask,
-            Store,
+            DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject,
+            NewSession, NewTask, Store,
         },
     };
 
@@ -3243,7 +3245,6 @@ mod deletion_gate_tests {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
-
     fn config(directory: &Path) -> execution::Config {
         execution::Config {
             runner_program: directory.join("factory-runner"),
@@ -3258,15 +3259,38 @@ mod deletion_gate_tests {
 
     const HOOK_TOKEN_LEN: usize = 64;
 
+    #[derive(Clone, Copy)]
+    enum ProviderFixture {
+        Shell,
+        ResumedCodex,
+    }
+
     /// A project, one agent, one live session (with a fixed, known hook
     /// token so a test can address it via `LocalRequest::ProviderHook`
     /// exactly like a real provider process would), and one task assigned
     /// to that agent -- pending work for `compose_delivery` to find, so a
     /// gate decline is distinguishable from "nothing to deliver anyway".
     async fn setup(directory: &Path) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
+        setup_with_provider(directory, ProviderFixture::Shell).await
+    }
+
+    async fn setup_resumed_codex(
+        directory: &Path,
+    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
+        setup_with_provider(directory, ProviderFixture::ResumedCodex).await
+    }
+
+    async fn setup_with_provider(
+        directory: &Path,
+        provider_fixture: ProviderFixture,
+    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
+        let provider = match provider_fixture {
+            ProviderFixture::Shell => Provider::Shell,
+            ProviderFixture::ResumedCodex => Provider::Codex,
+        };
 
         let mut store = Store::open_in_memory().unwrap();
         store
@@ -3286,11 +3310,40 @@ mod deletion_gate_tests {
                     project_id: project_id.clone(),
                     parent_agent_id: None,
                     role: AgentRole::Worker,
-                    provider: Provider::Shell,
+                    provider,
                 },
                 1_000,
             )
             .unwrap();
+        if matches!(provider_fixture, ProviderFixture::ResumedCodex) {
+            let thread_id = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+            let (prior, _) = store
+                .create_session(
+                    NewSession {
+                        id: SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
+                        project_id: project_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider,
+                        runtime_model: None,
+                        runtime_reasoning_effort: None,
+                        runtime_permission_mode: None,
+                        runtime_control_mode: None,
+                        provider_session_id: Some(thread_id.into()),
+                        worktree: directory.to_string_lossy().into_owned(),
+                        codex_home: None,
+                        hook_token: "b".repeat(HOOK_TOKEN_LEN),
+                        runner_instance_id: RunnerInstanceId::try_from(
+                            "44444444-4444-4444-8444-444444444444",
+                        )
+                        .unwrap(),
+                        runner_runtime: directory.join("old").to_string_lossy().into_owned(),
+                        runner_protocol_version: 1,
+                    },
+                    999,
+                )
+                .unwrap();
+            store.end_session(&prior.id, Some(0), None, 999).unwrap();
+        }
         store
             .create_task(
                 NewTask {
@@ -3328,12 +3381,16 @@ mod deletion_gate_tests {
                         id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
                         project_id: session_project_id.clone(),
                         agent_id: session_agent_id.clone(),
-                        provider: Provider::Shell,
+                        provider,
                         runtime_model: None,
                         runtime_reasoning_effort: None,
                         runtime_permission_mode: None,
                         runtime_control_mode: None,
-                        provider_session_id: None,
+                        provider_session_id: matches!(
+                            provider_fixture,
+                            ProviderFixture::ResumedCodex
+                        )
+                        .then(|| "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".into()),
                         worktree: session_worktree,
                         codex_home: None,
                         hook_token: "a".repeat(HOOK_TOKEN_LEN),
@@ -3445,6 +3502,102 @@ mod deletion_gate_tests {
         );
 
         execution.end_delete(&agent_id);
+    }
+
+    /// The execution-layer sibling forces the narrower load-before-cancel /
+    /// commit-after-cancel message CAS. This request-level test places a
+    /// durable recovery commit as the barrier before the real provider hook,
+    /// proving the externally observable contract is an explicit block and
+    /// the inbox remains available to the fresh conversation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_only_recovery_win_blocks_the_hook_and_preserves_the_inbox() {
+        let directory = private_tempdir();
+        let (state, execution, project_id, agent_id, task_id) =
+            setup_resumed_codex(directory.path()).await;
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let message_id = MessageId::try_from("recovery-message").unwrap();
+        let text =
+            format!("message only\n{DELIVERY_ATTEMPT_MARKER}message-recovery-attempt\u{2063}");
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                let message_id = message_id.clone();
+                let text = text.clone();
+                move |store| {
+                    store.delete_task(&project_id, &task_id, 1_001)?;
+                    store.send_agent_message(NewAgentMessage {
+                        id: message_id.clone(),
+                        project_id: project_id.clone(),
+                        sender_agent_id: None,
+                        recipient_agent_id: agent_id.clone(),
+                        body: "message only".into(),
+                        created_at_ms: 1_002,
+                    })?;
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "message-recovery-attempt".into(),
+                        project_id: project_id.clone(),
+                        agent_id,
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        task_incarnation_id: None,
+                        prior_run_count: None,
+                        message_ids: vec![message_id],
+                        text,
+                        created_at_ms: 1_002,
+                    })?;
+                    let (_, event) = store.request_fresh_provider_recovery(
+                        &project_id,
+                        &session_id,
+                        "message-recovery-attempt",
+                        1_003,
+                    )?;
+                    Ok(((), event.into_iter().collect()))
+                }
+            })
+            .await
+            .unwrap();
+
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::UserPromptSubmit,
+                payload: serde_json::json!({"prompt": text}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            LocalResponse::ProviderHookReply { reply }
+                if reply == serde_json::json!({
+                    "decision": "block",
+                    "reason": "Dark Factory rejected this stale delivery"
+                })
+        ));
+
+        let (pending, attempt, runs) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    Ok((
+                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
+                        store.delivery_attempt_state("message-recovery-attempt")?,
+                        store.list_runs(&project_id, None, 10)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
+        assert!(runs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
