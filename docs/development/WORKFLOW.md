@@ -424,10 +424,13 @@ them.
    seam. Normal keyboard/mouse detach is delayed and the update worker is
    joined. Before activation and at reload/health boundaries it atomically
    records the prior runtime/job in a private recovery file. On next viewer
-   start, pre-health phases roll back and verify the exact old managed daemon;
-   an awaiting-relaunch phase is committed only if the exact new daemon is
-   healthy. Download-only interruption has not mutated the runtime and its
-   staging directory is replaced on the next attempt.
+   start, the canonical factory home, socket, plist, operator UID, and launchd
+   job label must match the saved authority before the record can be consumed
+   or any rollback starts. Pre-health phases then roll back and verify the
+   exact old managed daemon; an awaiting-relaunch phase is committed only if
+   the socket responder is the launchd-owned PID using the active sibling
+   executables. Download-only interruption has not mutated the runtime and
+   its staging directory is replaced on the next attempt.
 7. **Homebrew bootstrap substrate**: this repository renders the exact
    custom-tap formula from the two archive checksums and the update-manifest
    checksum, then publishes it as `dark-factory.rb`. The versioned manifest

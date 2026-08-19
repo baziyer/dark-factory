@@ -8,7 +8,7 @@
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -76,6 +76,24 @@ struct PendingUpdate {
     archive_sha256: String,
     phase: PendingPhase,
     snapshot: runtime::MutationSnapshot,
+    authority: RecoveryAuthority,
+}
+
+/// Exact local authority allowed to consume and act on a pending mutation.
+/// Socket and plist paths identify replaceable endpoints, while the canonical
+/// home plus its inode identifies the state directory that owns the record.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryAuthority {
+    home: PathBuf,
+    home_device: u64,
+    home_inode: u64,
+    user_home: PathBuf,
+    socket: PathBuf,
+    plist: PathBuf,
+    uid: u32,
+    launchd_domain: String,
+    launchd_label: String,
 }
 
 /// Successful transaction. The rollback authority is retained across the
@@ -153,6 +171,7 @@ struct RollbackPlan {
     home: PathBuf,
     plist: PathBuf,
     socket: PathBuf,
+    target: launchd::LaunchdTarget,
     installed_version: String,
     snapshot: runtime::MutationSnapshot,
 }
@@ -191,13 +210,15 @@ impl InstalledUpdate {
                 plan.installed_version
             ));
         }
-        runtime::rollback_after_health_failure(
+        runtime::rollback_after_health_failure_for(
+            &plan.target,
             &plan.home,
             &plan.plist,
             &plan.snapshot,
             &plan.installed_version,
             |previous| {
-                probes::wait_for_managed_daemon(
+                probes::wait_for_managed_daemon_for(
+                    &plan.target,
                     &plan.socket,
                     HEALTH_WAIT,
                     Some(previous),
@@ -209,6 +230,77 @@ impl InstalledUpdate {
         remove_pending(&plan.home)?;
         Ok(ReexecRecovery::Restored)
     }
+}
+
+fn canonical_endpoint(path: &Path, description: &str) -> Result<PathBuf, String> {
+    let name = path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("{description} has no file name"))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("canonicalizing {description} parent: {error}"))?;
+    Ok(parent.join(name))
+}
+
+fn recovery_authority(
+    home: &Path,
+    socket: &Path,
+    user_home: &Path,
+    target: &launchd::LaunchdTarget,
+) -> Result<RecoveryAuthority, String> {
+    let home = fs::canonicalize(home)
+        .map_err(|error| format!("canonicalizing Dark Factory home: {error}"))?;
+    let metadata = fs::metadata(&home)
+        .map_err(|error| format!("inspecting canonical Dark Factory home: {error}"))?;
+    if !metadata.is_dir() {
+        return Err("canonical Dark Factory home is not a directory".to_owned());
+    }
+    let user_home = fs::canonicalize(user_home)
+        .map_err(|error| format!("canonicalizing operator home: {error}"))?;
+    let plist = launchd::plist_path_for(&user_home, target);
+    let plist = if plist.parent().is_some_and(Path::exists) {
+        canonical_endpoint(&plist, "launchd plist")?
+    } else {
+        plist
+    };
+    Ok(RecoveryAuthority {
+        home,
+        home_device: metadata.dev(),
+        home_inode: metadata.ino(),
+        user_home,
+        socket: canonical_endpoint(socket, "daemon socket")?,
+        plist,
+        uid: rustix::process::getuid().as_raw(),
+        launchd_domain: target.domain().to_owned(),
+        launchd_label: target.label().to_owned(),
+    })
+}
+
+fn require_recovery_authority(
+    pending: &PendingUpdate,
+    current: &RecoveryAuthority,
+) -> Result<(), String> {
+    if &pending.authority != current {
+        return Err(
+            "interrupted update belongs to a different home, socket, or managed launchd job"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn managed_job_under_lock(
+    _lock: &runtime::MutationLock,
+    plist: &Path,
+    home: &Path,
+    user_home: &Path,
+) -> Result<Option<launchd::ExistingJob>, String> {
+    let existing = launchd::read_existing(plist)?;
+    if let Some(existing) = &existing {
+        launchd::check_home(existing, home, user_home)?;
+    }
+    Ok(existing)
 }
 
 fn pending_path(home: &Path) -> PathBuf {
@@ -288,20 +380,28 @@ fn rollback_pending(
     home: &Path,
     plist: &Path,
     socket: &Path,
+    target: &launchd::LaunchdTarget,
     pending: &PendingUpdate,
 ) -> Result<(), String> {
     match (
         pending.snapshot.active_version.as_deref(),
         pending.snapshot.plist.as_deref(),
     ) {
-        (Some(_), Some(_)) => runtime::rollback_after_health_failure(
+        (Some(_), Some(_)) => runtime::rollback_after_health_failure_for(
+            target,
             home,
             plist,
             &pending.snapshot,
             &pending.version,
             |previous| {
-                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), home)
-                    .map(|_| ())
+                probes::wait_for_managed_daemon_for(
+                    target,
+                    socket,
+                    HEALTH_WAIT,
+                    Some(previous),
+                    home,
+                )
+                .map(|_| ())
             },
         ),
         (_, None) => pending.snapshot.restore_runtime(home),
@@ -315,6 +415,7 @@ fn recover_pending_locked(
     home: &Path,
     plist: &Path,
     socket: &Path,
+    target: &launchd::LaunchdTarget,
     pending: &PendingUpdate,
 ) -> Result<(), String> {
     let active = install::active_version(home)?;
@@ -335,12 +436,18 @@ fn recover_pending_locked(
             &pending.archive_sha256,
         )
         .is_ok()
-        && probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(&pending.version), home)
-            .is_ok()
+        && probes::wait_for_managed_daemon_for(
+            target,
+            socket,
+            HEALTH_WAIT,
+            Some(&pending.version),
+            home,
+        )
+        .is_ok()
     {
         return remove_pending(home);
     }
-    rollback_pending(home, plist, socket, pending)?;
+    rollback_pending(home, plist, socket, target, pending)?;
     remove_pending(home)
 }
 
@@ -348,15 +455,32 @@ fn recover_pending_locked(
 /// mutation. Pre-health phases roll back; a post-health relaunch handoff is
 /// committed only when the exact target daemon is still healthy.
 pub fn recover_pending(home: &Path, socket: &Path) -> Result<(), String> {
-    let Some(pending) = read_pending(home)? else {
-        return Ok(());
-    };
     let user_home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or("HOME is not set")?;
-    let plist = launchd::plist_path(&user_home);
-    let (_lock, _) = runtime::MutationLock::begin(home, &plist)?;
-    recover_pending_locked(home, &plist, socket, &pending)
+    let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+    recover_pending_for(home, socket, &user_home, &target)
+}
+
+fn recover_pending_for(
+    home: &Path,
+    socket: &Path,
+    user_home: &Path,
+    target: &launchd::LaunchdTarget,
+) -> Result<(), String> {
+    let Some(pending) = read_pending(home)? else {
+        return Ok(());
+    };
+    let authority = recovery_authority(home, socket, user_home, target)?;
+    require_recovery_authority(&pending, &authority)?;
+    let (_lock, _) = runtime::MutationLock::begin(&authority.home, &authority.plist)?;
+    recover_pending_locked(
+        &authority.home,
+        &authority.plist,
+        &authority.socket,
+        target,
+        &pending,
+    )
 }
 
 /// Install and activate `manifest`. `require_managed_daemon` is true for the
@@ -389,7 +513,14 @@ pub fn install(
     let user_home = env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| InstallError::Message("HOME is not set".to_owned()))?;
-    let plist = launchd::plist_path(&user_home);
+    let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+    let authority = recovery_authority(home, socket, &user_home, &target)?;
+    let canonical_home = authority.home.clone();
+    let canonical_socket = authority.socket.clone();
+    let user_home = authority.user_home.clone();
+    let home = canonical_home.as_path();
+    let socket = canonical_socket.as_path();
+    let plist = authority.plist.clone();
     let existing = launchd::read_existing(&plist)?;
     if let Some(existing) = &existing {
         launchd::check_home(existing, home, &user_home)?;
@@ -402,27 +533,42 @@ pub fn install(
 
     if install::active_version(home)?.as_deref() == Some(manifest.version.as_str()) {
         let (runtime_lock, current) = runtime::MutationLock::begin(home, &plist)?;
-        if current.active_version.as_deref() == Some(manifest.version.as_str())
-            && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version))
-                .is_ok()
-        {
-            let installed = install::version_dir(home, &manifest.version);
-            if retain_for_reexec {
-                install::verify_release_identity(&installed, &manifest.version, &archive_sha256)?;
-            }
-            log(&format!(
-                "{} is already installed and running",
-                manifest.version
+        let locked_existing = managed_job_under_lock(&runtime_lock, &plist, home, &user_home)?;
+        if locked_existing.is_none() && require_managed_daemon {
+            return Err(InstallError::Message(
+                "managed launchd job disappeared before the already-active runtime was verified"
+                    .to_owned(),
             ));
-            return Ok(InstalledUpdate {
-                version: manifest.version.clone(),
-                installed,
-                daemon: ManagedDaemon::Unchanged,
-                health_version: Some(manifest.version.clone()),
-                archive_sha256,
-                runtime_lock: Some(runtime_lock),
-                rollback: None,
-            });
+        }
+        if current.active_version.as_deref() == Some(manifest.version.as_str()) {
+            let installed = install::version_dir(home, &manifest.version);
+            let health = if locked_existing.is_some() {
+                probes::wait_for_managed_daemon_for(
+                    &target,
+                    socket,
+                    Duration::from_secs(2),
+                    Some(&manifest.version),
+                    home,
+                )
+            } else {
+                probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version))
+            };
+            if health.is_ok() {
+                install::verify_release_identity(&installed, &manifest.version, &archive_sha256)?;
+                log(&format!(
+                    "{} is already installed and running",
+                    manifest.version
+                ));
+                return Ok(InstalledUpdate {
+                    version: manifest.version.clone(),
+                    installed,
+                    daemon: ManagedDaemon::Unchanged,
+                    health_version: Some(manifest.version.clone()),
+                    archive_sha256,
+                    runtime_lock: Some(runtime_lock),
+                    rollback: None,
+                });
+            }
         }
     }
 
@@ -436,10 +582,8 @@ pub fn install(
 
     let (runtime_lock, snapshot) = runtime::MutationLock::begin(home, &plist)?;
     let previous_version = snapshot.active_version.clone();
-    let existing = launchd::read_existing(&plist)?;
-    if let Some(existing) = &existing {
-        launchd::check_home(existing, home, &user_home)?;
-    } else if require_managed_daemon {
+    let existing = managed_job_under_lock(&runtime_lock, &plist, home, &user_home)?;
+    if existing.is_none() && require_managed_daemon {
         return Err(InstallError::Message(
             "managed launchd job disappeared while the update was downloading".to_owned(),
         ));
@@ -458,6 +602,7 @@ pub fn install(
         archive_sha256: archive_sha256.clone(),
         phase: PendingPhase::for_progress(UpdateProgress::Activating).unwrap(),
         snapshot: snapshot.clone(),
+        authority,
     };
     write_pending(home, &pending)?;
     progress(UpdateProgress::Activating);
@@ -481,21 +626,30 @@ pub fn install(
     pending.phase = PendingPhase::for_progress(UpdateProgress::Reloading).unwrap();
     write_pending(home, &pending)?;
     progress(UpdateProgress::Reloading);
-    if let Err(error) = launchd::apply_with_rollback(
-        home,
-        &plist,
-        Some(&existing),
-        &probes::provider_directories(),
-        &std::collections::BTreeMap::new(),
-        None,
+    if let Err(error) = launchd::apply_with_rollback_for(
+        launchd::ApplyRequest {
+            target: &target,
+            home,
+            plist: &plist,
+            existing: Some(&existing),
+            provider_directories: &probes::provider_directories(),
+            extra_environment: &std::collections::BTreeMap::new(),
+            capacity: None,
+        },
         || snapshot.restore_runtime(home),
     ) {
         return Err(InstallError::Message(runtime::rollback_report(
             &error,
             previous_version.as_deref(),
             |previous| {
-                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), home)
-                    .map(|_| ())
+                probes::wait_for_managed_daemon_for(
+                    &target,
+                    socket,
+                    HEALTH_WAIT,
+                    Some(previous),
+                    home,
+                )
+                .map(|_| ())
             },
         )));
     }
@@ -503,7 +657,13 @@ pub fn install(
     pending.phase = PendingPhase::for_progress(UpdateProgress::CheckingHealth).unwrap();
     write_pending(home, &pending)?;
     progress(UpdateProgress::CheckingHealth);
-    match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
+    match probes::wait_for_managed_daemon_for(
+        &target,
+        socket,
+        HEALTH_WAIT,
+        Some(&manifest.version),
+        home,
+    ) {
         Ok(version) => {
             if retain_for_reexec {
                 pending.phase = PendingPhase::AwaitingRelaunch;
@@ -522,20 +682,28 @@ pub fn install(
                     home: home.to_owned(),
                     plist,
                     socket: socket.to_owned(),
+                    target,
                     installed_version: manifest.version.clone(),
                     snapshot,
                 }),
             })
         }
         Err(error) => {
-            let rollback = runtime::rollback_after_health_failure(
+            let rollback = runtime::rollback_after_health_failure_for(
+                &target,
                 home,
                 &plist,
                 &snapshot,
                 &manifest.version,
                 |previous| {
-                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), home)
-                        .map(|_| ())
+                    probes::wait_for_managed_daemon_for(
+                        &target,
+                        socket,
+                        HEALTH_WAIT,
+                        Some(previous),
+                        home,
+                    )
+                    .map(|_| ())
                 },
             );
             if rollback.is_ok() {
@@ -557,7 +725,14 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
     use std::process::Command;
+
+    fn test_authority(home: &Path) -> (launchd::LaunchdTarget, RecoveryAuthority) {
+        let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+        let authority = recovery_authority(home, &home.join("f.sock"), home, &target).unwrap();
+        (target, authority)
+    }
 
     #[test]
     fn exec_failure_after_an_unchanged_runtime_needs_no_rollback() {
@@ -619,6 +794,7 @@ mod tests {
         }
         install::install_from_dir(home.path(), &source, "0.2.5").unwrap();
         install::install_from_dir(home.path(), &source, "0.2.6").unwrap();
+        let (target, authority) = test_authority(home.path());
         for phase in [
             PendingPhase::Activating,
             PendingPhase::Reloading,
@@ -634,6 +810,7 @@ mod tests {
                     active_version: Some("0.2.5".to_owned()),
                     plist: None,
                 },
+                authority: authority.clone(),
             };
             write_pending(home.path(), &pending).unwrap();
             install::activate(home.path(), "0.2.6").unwrap();
@@ -641,6 +818,7 @@ mod tests {
                 home.path(),
                 &home.path().join("unused.plist"),
                 &home.path().join("unused.sock"),
+                &target,
                 &pending,
             )
             .unwrap();
@@ -655,6 +833,7 @@ mod tests {
     #[test]
     fn recovery_record_rejects_an_unsafe_previous_runtime_path() {
         let home = tempfile::tempdir().unwrap();
+        let (_, authority) = test_authority(home.path());
         let pending = PendingUpdate {
             version: "0.2.6".to_owned(),
             archive_sha256: "00".repeat(32),
@@ -663,10 +842,100 @@ mod tests {
                 active_version: Some("../../outside".to_owned()),
                 plist: None,
             },
+            authority,
         };
         write_pending(home.path(), &pending).unwrap();
         let error = read_pending(home.path()).unwrap_err();
         assert!(error.contains("release version"), "{error}");
+    }
+
+    #[test]
+    fn recovery_refuses_socket_or_operator_home_substitution_before_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("factory-home");
+        let user_a = root.path().join("user-a");
+        let user_b = root.path().join("user-b");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_a).unwrap();
+        fs::create_dir_all(&user_b).unwrap();
+        let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+        let plist_a = launchd::plist_path_for(&user_a, &target);
+        fs::create_dir_all(plist_a.parent().unwrap()).unwrap();
+        fs::write(&plist_a, "saved managed job").unwrap();
+        let plist_b = launchd::plist_path_for(&user_b, &target);
+        fs::create_dir_all(plist_b.parent().unwrap()).unwrap();
+        fs::write(&plist_b, "different managed job").unwrap();
+        let socket_a = home.join("a.sock");
+        let socket_b = home.join("b.sock");
+        let _listener_a = UnixListener::bind(&socket_a).unwrap();
+        let _listener_b = UnixListener::bind(&socket_b).unwrap();
+
+        let source = root.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        for name in install::BINARIES {
+            let path = source.join(name);
+            fs::write(&path, format!("#!/bin/sh\necho {name}\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        install::install_from_dir(&home, &source, "0.2.5").unwrap();
+        install::install_from_dir(&home, &source, "0.2.6").unwrap();
+        install::activate(&home, "0.2.5").unwrap();
+        let (_lock, snapshot) = runtime::MutationLock::begin(&home, &plist_a).unwrap();
+        let pending = PendingUpdate {
+            version: "0.2.6".to_owned(),
+            archive_sha256: "00".repeat(32),
+            phase: PendingPhase::Reloading,
+            snapshot,
+            authority: recovery_authority(&home, &socket_a, &user_a, &target).unwrap(),
+        };
+        write_pending(&home, &pending).unwrap();
+        install::activate(&home, "0.2.6").unwrap();
+
+        for (socket, user_home) in [(&socket_b, &user_a), (&socket_a, &user_b)] {
+            let error = recover_pending_for(&home, socket, user_home, &target).unwrap_err();
+            assert!(error.contains("different home, socket, or managed launchd job"));
+            assert_eq!(
+                install::active_version(&home).unwrap().as_deref(),
+                Some("0.2.6")
+            );
+            assert_eq!(fs::read_to_string(&plist_a).unwrap(), "saved managed job");
+            assert_eq!(
+                fs::read_to_string(&plist_b).unwrap(),
+                "different managed job"
+            );
+            assert!(pending_path(&home).exists());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn already_active_health_rereads_job_presence_under_the_mutation_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("factory-home");
+        let user_home = root.path().join("user-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+        let plist = launchd::plist_path_for(&user_home, &target);
+        assert!(launchd::read_existing(&plist).unwrap().is_none());
+
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(
+            &plist,
+            format!(
+                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
+                home.display(),
+                home.display()
+            ),
+        )
+        .unwrap();
+        let (lock, _) = runtime::MutationLock::begin(&home, &plist).unwrap();
+        assert!(
+            managed_job_under_lock(&lock, &plist, &home, &user_home)
+                .unwrap()
+                .is_some(),
+            "the post-preflight job must select managed PID/path health"
+        );
     }
 
     #[test]

@@ -202,6 +202,11 @@ still offers the action when the matching runtime was already installed from
 Detach is delayed while this transaction owns the runtime. A private durable
 phase record lets the next viewer roll back a crash-interrupted mutation, or
 commit a handoff only when the exact new managed daemon is already healthy.
+That record is bound to the canonical factory home, socket, launchd plist,
+operator UID, and job label; a viewer aimed at another daemon cannot consume
+or act on it. Managed health requires the socket responder to be launchd's
+exact job PID using the active runtime's sibling executables, not merely a
+daemon that reports the expected version.
 
 `factoryctl update` reports the invoking bootstrap, active runtime, latest
 release, and install availability in human-readable lines. Use

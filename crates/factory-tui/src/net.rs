@@ -571,6 +571,7 @@ pub fn manual_update_candidate<'a>(
     let latest = check.latest.as_ref()?;
     if update::validate_manifest(latest).is_err()
         || !latest.assets.contains_key(update::platform_key())
+        || update::is_newer(&check.current, &latest.version)
         || active.is_some_and(|active| update::is_newer(active, &latest.version))
     {
         return None;
@@ -685,6 +686,15 @@ mod tests {
         assert!(
             manual_update_candidate(&check, Some("0.2.7")).is_none(),
             "a stable manifest must never downgrade a newer active runtime"
+        );
+
+        let newer_viewer = UpdateCheck {
+            current: "0.2.7".to_owned(),
+            ..check
+        };
+        assert!(
+            manual_update_candidate(&newer_viewer, Some("0.2.5")).is_none(),
+            "a 0.2.7 viewer must not install a 0.2.6 manifest over a 0.2.5 runtime"
         );
     }
 

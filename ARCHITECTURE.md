@@ -31,8 +31,11 @@ catalogue.
    the same verified active-runtime transaction as `factoryctl`, then execs
    only the digest-verified immutable version-directory viewer after exact
    daemon health succeeds; the mutation lock spans that seam and a private
-   phase record makes a crashed handoff recoverable. Local attach panes are
-   closed, but runner and provider process identities are unchanged.
+   phase record bound to the canonical home/socket/plist/UID/job identity
+   makes a crashed handoff recoverable only by its original authority. Managed
+   health proves the launchd PID and active sibling executables, not just a
+   version string. Local attach panes are closed, but runner and provider
+   process identities are unchanged.
 4. A **session**, not a run, is the unit `factory-runner` supervises: one
    resident, interactive provider process per agent (Claude Code, Codex, or
    the minimal `shell` provider), spawned under a PTY and living across many

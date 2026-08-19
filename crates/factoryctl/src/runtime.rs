@@ -79,6 +79,27 @@ pub fn rollback_after_health_failure(
     current_version: &str,
     health: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<(), String> {
+    rollback_after_health_failure_for(
+        &crate::launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+        home,
+        plist,
+        snapshot,
+        current_version,
+        health,
+    )
+}
+
+/// Restores a runtime and one explicitly selected managed launchd job.
+/// Recovery callers use the same target identity captured by their durable
+/// transaction rather than re-deriving authority after a crash.
+pub fn rollback_after_health_failure_for(
+    target: &crate::launchd::LaunchdTarget,
+    home: &Path,
+    plist: &Path,
+    snapshot: &MutationSnapshot,
+    current_version: &str,
+    health: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
     let previous = snapshot
         .active_version
         .as_deref()
@@ -90,7 +111,7 @@ pub fn rollback_after_health_failure(
     snapshot.restore_runtime(home)?;
     let rollback_home = home.to_owned();
     let current_version = current_version.to_owned();
-    crate::launchd::restore_with_rollback(plist, home, previous_plist, move || {
+    crate::launchd::restore_with_rollback_for(target, plist, home, previous_plist, move || {
         crate::install::activate(&rollback_home, &current_version)
     })
     .map_err(|error| error.to_string())?;
