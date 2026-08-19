@@ -424,8 +424,8 @@ local_ci_lease_run() {
         helper=$1
         common_dir=$2
         shift 2
-        rmdir "$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null || true
         . "$helper"
+        rmdir "$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null || true
         set +e
         local_ci_lease_holder "$common_dir" "$@"
         status=$?
