@@ -1450,7 +1450,7 @@ mod tests {
     use crate::test_fixtures::{agent, attention, project, session, task};
     use factory_core::{
         AgentRole, ObserverHealth, ProviderHookEvent, ProviderNotificationKind, SessionState,
-        TaskStatus, status::AttentionReasonKind,
+        TaskStatus, local::LocalResponse, status::AttentionReasonKind,
     };
 
     fn key(code: KeyCode) -> KeyEvent {

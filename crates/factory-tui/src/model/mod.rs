@@ -496,7 +496,7 @@ impl Board {
     fn complete_attention_request_if(
         &mut self,
         action: factory_core::status::AttentionAction,
-        mut source_matches: impl FnMut(&AttentionItem) -> bool,
+        source_matches: impl FnOnce(&AttentionItem) -> bool,
     ) {
         let matches = self.pending_attention_action == Some(action)
             && self.pending_attention.as_ref().is_some_and(source_matches);
