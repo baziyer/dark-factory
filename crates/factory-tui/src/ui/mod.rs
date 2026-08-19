@@ -89,7 +89,37 @@ pub(super) fn render_tabs(frame: &mut Frame, area: Rect, board: &Board, hits: &m
     }
 }
 
+/// Returns the terminal columns occupied by `text`.
+pub(super) fn display_width(text: &str) -> usize {
+    Line::from(text).width()
+}
+
+/// Truncates `text` to at most `max` terminal columns, appending an ellipsis if it was cut.
+///
+/// This deliberately measures the candidate through Ratatui rather than counting Unicode scalar
+/// values: CJK and emoji can occupy two columns, while combining marks can occupy none.
+pub(super) fn truncate_width(text: &str, max: usize) -> String {
+    if display_width(text) <= max {
+        return text.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+
+    let budget = max.saturating_sub(display_width("\u{2026}"));
+    let mut head = String::new();
+    for ch in text.chars() {
+        head.push(ch);
+        if display_width(&head) > budget {
+            head.pop();
+            break;
+        }
+    }
+    format!("{head}\u{2026}")
+}
+
 /// Truncates `text` to at most `max` characters, appending an ellipsis if it was cut.
+/// Prefer [`truncate_width`] for strings rendered into a measured terminal row.
 pub(super) fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
@@ -542,6 +572,18 @@ mod tests {
     }
 
     #[test]
+    fn footer_makes_a_runtime_mismatch_actionable() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        board.set_daemon_version("0.0.1");
+        let (_, terminal) = render_frame(&board, 120, 24);
+        let footer = (0..120)
+            .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+            .collect::<String>();
+        assert!(footer.contains("STALE TUI"));
+        assert!(footer.contains("detach + relaunch"));
+    }
+
+    #[test]
     fn agent_settings_keep_auditable_policy_fields_legible_at_24_rows() {
         let mut board = Board::new(false, 0, crate::theme::PLAIN);
         let project = project("proj", 0);
@@ -591,5 +633,14 @@ mod tests {
         assert!(screen.contains("effort:"));
         assert!(screen.contains("audit: release� integration"));
         assert!(!screen.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn truncate_width_measures_terminal_columns_not_unicode_scalars() {
+        assert_eq!(display_width("界界"), 4);
+        assert_eq!(truncate_width("界界", 3), "界…");
+        assert_eq!(display_width(&truncate_width("界界", 3)), 3);
+        assert_eq!(truncate_width("e\u{301}x", 1), "…");
+        assert_eq!(display_width(&truncate_width("e\u{301}x", 2)), 2);
     }
 }

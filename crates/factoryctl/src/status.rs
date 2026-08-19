@@ -5,10 +5,35 @@ use factory_core::{
     status::{FleetStatus, WorktreeStatus, age_text, display_text},
 };
 
-pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String> {
+pub fn write_with_daemon_version(
+    output: &mut impl Write,
+    status: &FleetStatus,
+    daemon_version: Option<&str>,
+) -> Result<(), String> {
+    let versions = daemon_version.map_or_else(
+        || {
+            format!(
+                "factoryctl v{} | active runtime version unknown",
+                env!("CARGO_PKG_VERSION")
+            )
+        },
+        |version| {
+            if version.is_empty() {
+                format!(
+                    "factoryctl v{} | active runtime version unknown",
+                    env!("CARGO_PKG_VERSION")
+                )
+            } else {
+                format!(
+                    "factoryctl v{} | active runtime v{version}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            }
+        },
+    );
     writeln!(
         output,
-        "Dark Factory: auto {} | sessions {}/{} | projects {} | attention {}",
+        "Dark Factory: {versions} | auto {} | sessions {}/{} | projects {} | attention {}",
         if status.auto_mode { "on" } else { "off" },
         status.live_sessions,
         status.live_session_cap,
@@ -304,12 +329,14 @@ mod tests {
         };
 
         let mut output = Vec::new();
-        write(&mut output, &status).unwrap();
+        write_with_daemon_version(&mut output, &status, None).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
             output,
             concat!(
-                "Dark Factory: auto on | sessions 2/4 | projects 2 | attention 2\n",
+                "Dark Factory: factoryctl v",
+                env!("CARGO_PKG_VERSION"),
+                " | active runtime version unknown | auto on | sessions 2/4 | projects 2 | attention 2\n",
                 "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | backlog 5\n",
                 "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
@@ -353,10 +380,35 @@ mod tests {
             attention: Vec::new(),
         };
         let mut output = Vec::new();
-        write(&mut output, &status).unwrap();
+        write_with_daemon_version(&mut output, &status, None).unwrap();
         assert_eq!(
             String::from_utf8(output).unwrap(),
-            "Dark Factory: auto off | sessions 0/3 | projects 0 | attention 0\n"
+            concat!(
+                "Dark Factory: factoryctl v",
+                env!("CARGO_PKG_VERSION"),
+                " | active runtime version unknown | auto off | sessions 0/3 | projects 0 | attention 0\n"
+            )
         );
+    }
+
+    #[test]
+    fn human_status_names_client_and_daemon_versions() {
+        let status = FleetStatus {
+            generated_at_ms: 1,
+            event_sequence: 0,
+            auto_mode: false,
+            live_session_cap: 1,
+            live_sessions: 0,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_with_daemon_version(&mut output, &status, Some("0.3.0")).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.starts_with(concat!(
+            "Dark Factory: factoryctl v",
+            env!("CARGO_PKG_VERSION"),
+            " | active runtime v0.3.0 |"
+        )));
     }
 }

@@ -22,10 +22,20 @@ floor. The NEEDS YOU list includes agents and tasks. It lists attention items
 globally, most urgent and then oldest first. Each row names the actionable
 reason instead of collapsing every condition into a generic input request.
 
-BUILDING activity sparklines are event-driven: each bar is a five-second bucket,
-with eight visible bars covering the most recent 40 seconds. Durable hook/tool
-events add counts; idle time only advances empty buckets, so a silent agent
-ages out without decorative animation.
+BUILDING separates durable lifecycle from current activity. Each row names the
+most recent bounded hook/tool activity and its age; it says `no recent activity`
+when there is no sample and `stale activity … ago` after a minute without one.
+The sparkline is event-driven: each bar is a five-second bucket, with eight
+visible bars covering the most recent 40 seconds. Durable events add counts;
+idle time only advances empty buckets, so a silent agent ages out without
+decorative animation. Assigned work is shown as `queue N`, never an opaque
+counter.
+
+The footer identifies the selected screen and shows a red `STALE TUI … detach
++ relaunch` banner when the connected daemon's active runtime is a different
+version. Detach and relaunch the client; the TUI never restarts the daemon or
+its agents. A daemon that cannot report its version is also called out rather
+than presented as current.
 
 AGENT shows the selected agent. It includes the live terminal, assigned and
 active work, durable messages, and settings. Settings distinguish the

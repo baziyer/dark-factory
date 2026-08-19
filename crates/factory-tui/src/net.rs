@@ -89,6 +89,9 @@ pub fn resolve_socket_path(explicit: Option<&str>) -> Result<PathBuf, String> {
 pub enum NetMsg {
     ConnectionRetrying(String),
     ConnectionLive,
+    DaemonHealth {
+        version: String,
+    },
     FleetSnapshot {
         projects: Vec<ProjectSnapshot>,
         agents: Vec<AgentSnapshot>,
@@ -332,11 +335,26 @@ fn load_consistent_fleet_snapshot(client: &Client) -> Result<FleetSnapshotData, 
     Err("daemon state changed while loading the fleet snapshot".into())
 }
 
+fn load_daemon_health(client: &Client) -> Result<String, String> {
+    match request_response(client, LocalRequest::Health)? {
+        LocalResponse::Health { version, .. } => Ok(version),
+        other => Err(format!("unexpected response to Health: {other:?}")),
+    }
+}
+
 /// Owns the whole network lifecycle: bootstrap the fleet snapshot, then subscribe to the
 /// daemon's event stream forever with reconnect/backoff. Never returns while `tx` is alive.
 pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
     thread::spawn(move || {
         let mut delay = MIN_BACKOFF;
+        if tx
+            .send(NetMsg::DaemonHealth {
+                version: load_daemon_health(&client).unwrap_or_default(),
+            })
+            .is_err()
+        {
+            return;
+        }
         let (projects, agents, tasks, runs, sessions, mut after_sequence) = loop {
             match load_consistent_fleet_snapshot(&client) {
                 Ok(snapshot) => break snapshot,
@@ -383,6 +401,14 @@ pub fn spawn_fleet_session(client: Client, tx: Sender<NetMsg>) {
         loop {
             match client.subscribe(after_sequence) {
                 Ok(subscription) => {
+                    if tx
+                        .send(NetMsg::DaemonHealth {
+                            version: load_daemon_health(&client).unwrap_or_default(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
                     let _ = tx.send(NetMsg::ConnectionLive);
                     let mut failure = "event stream ended".to_owned();
                     for frame in subscription {

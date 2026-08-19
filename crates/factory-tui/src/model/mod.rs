@@ -28,7 +28,7 @@ use factory_core::local::{
     AgentDetail, AgentMessage, AttachRefusal, AttachRefusalReason, ErrorCode, LocalResponse,
 };
 use factory_core::status::{
-    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, display_text,
+    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, age_text, display_text,
 };
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
@@ -112,6 +112,9 @@ pub struct Board {
 
     pub connection: Connection,
     pub connection_detail: Option<String>,
+    /// Version reported by the connected daemon's health response. An empty
+    /// value means an older daemon that cannot identify itself.
+    pub daemon_version: Option<String>,
     /// A newer release's version, once the hourly manifest check has found one
     /// (`net::spawn_update_check`); shown in the status line.
     pub update_available: Option<String>,
@@ -184,6 +187,7 @@ impl Board {
             theme,
             connection: Connection::Connecting,
             connection_detail: None,
+            daemon_version: None,
             update_available: None,
             live_session_cap: None,
             projects: Vec::new(),
@@ -867,6 +871,54 @@ impl Board {
         self.connection_detail = None;
     }
 
+    pub fn set_daemon_version(&mut self, version: impl Into<String>) {
+        self.daemon_version = Some(version.into());
+    }
+
+    /// A stale client must be explicit and actionable. The daemon version is
+    /// also the active runtime version because health is answered by the
+    /// running factoryd binary, so relaunching only this TUI is sufficient.
+    #[must_use]
+    pub fn version_mismatch(&self) -> Option<String> {
+        let daemon = self.daemon_version.as_deref()?;
+        if daemon.is_empty() {
+            return Some("STALE TUI — daemon version unknown; detach + relaunch".to_owned());
+        }
+        (daemon != env!("CARGO_PKG_VERSION")).then(|| {
+            format!(
+                "STALE TUI v{} / active runtime v{} — detach + relaunch",
+                env!("CARGO_PKG_VERSION"),
+                daemon
+            )
+        })
+    }
+
+    /// Current activity is deliberately separate from durable lifecycle state.
+    /// A recent named hook is useful; an old hook is explicitly stale, and no
+    /// sample is explicitly reported rather than rendered as evidence of inactivity.
+    #[must_use]
+    pub fn activity_label(&self, agent: &AgentSnapshot) -> String {
+        let Some(session_id) = agent.current_session_id.as_ref() else {
+            return "no recent activity".to_owned();
+        };
+        let Some(session) = self.sessions.get(session_id) else {
+            return "no recent activity".to_owned();
+        };
+        let Some(at_ms) = session.last_hook_at_ms else {
+            return "no recent activity".to_owned();
+        };
+        let age = age_text(self.now_ms, at_ms);
+        if self.now_ms.saturating_sub(at_ms) > 60_000 {
+            return format!("stale activity {age} ago");
+        }
+        let activity = session
+            .activity
+            .as_deref()
+            .map(display_text)
+            .unwrap_or_else(|| "recent activity".to_owned());
+        format!("{activity} {age} ago")
+    }
+
     /// Sessions that have not ended, fleet-wide — what the daemon's live-session cap counts.
     #[must_use]
     pub fn live_session_count(&self) -> usize {
@@ -1305,11 +1357,10 @@ impl Board {
         }
         self.activity_identities
             .insert(agent_id.clone(), identity.clone());
-        let now_ms = self.now_ms;
-        let occurred_at_ms = occurred_at_ms.min(now_ms);
+        let occurred_at_ms = occurred_at_ms.min(self.now_ms);
         let series = self.activity.entry(agent_id.clone()).or_default();
         series.record(occurred_at_ms);
-        series.roll_to(now_ms);
+        series.roll_to(self.now_ms);
     }
 
     fn event_agent_identity(&self, event: &FactoryEvent) -> Option<(AgentId, ActivityIdentity)> {
