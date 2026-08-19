@@ -10,19 +10,132 @@ temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-local-ci-lease-test.XXXXXX")
 first="$temporary/first"
 second="$temporary/second"
 background_pids=
+wait_timeout_seconds=5
+
+process_parent() {
+    ps -p "$1" -o ppid= 2>/dev/null | tr -d ' '
+}
+
+process_start() {
+    ps -p "$1" -o lstart= 2>/dev/null | sed 's/^ *//'
+}
+
+process_command() {
+    ps -p "$1" -o command= 2>/dev/null | sed 's/^ *//'
+}
+
+process_identity_matches() {
+    local identity_pid=$1
+    local identity_parent=$2
+    local identity_start=$3
+    local identity_command=$4
+    [ "$(process_parent "$identity_pid")" = "$identity_parent" ] \
+        && [ "$(process_start "$identity_pid")" = "$identity_start" ] \
+        && [ "$(process_command "$identity_pid")" = "$identity_command" ]
+}
 
 kill_tree() {
-    for child in $(pgrep -P "$1" 2>/dev/null || true); do
-        kill_tree "$child"
+    tree_pid=$1
+    tree_parent=${2-}
+    tree_start=${3-}
+    tree_command=${4-}
+    tree_signal=${5-KILL}
+    if [ -z "$tree_start" ]; then
+        tree_parent=$(process_parent "$tree_pid")
+        tree_start=$(process_start "$tree_pid")
+        tree_command=$(process_command "$tree_pid")
+    fi
+    [ -n "$tree_start" ] && [ -n "$tree_command" ] || return 1
+    process_identity_matches "$tree_pid" "$tree_parent" "$tree_start" "$tree_command" || return 1
+
+    tree_directory="$temporary/.kill-tree-$tree_pid"
+    rm -rf "$tree_directory"
+    mkdir "$tree_directory"
+    tree_nodes="$tree_directory/nodes"
+    printf '%s\n' "$tree_pid" >"$tree_nodes"
+    printf '%s\n' "$tree_parent" >"$tree_directory/$tree_pid.parent"
+    printf '%s\n' "$tree_start" >"$tree_directory/$tree_pid.start"
+    printf '%s\n' "$tree_command" >"$tree_directory/$tree_pid.command"
+    printf '0\n' >"$tree_directory/$tree_pid.depth"
+    tree_queue=$tree_pid
+    tree_max_depth=0
+    while [ -n "$tree_queue" ]; do
+        tree_next=
+        for tree_current in $tree_queue; do
+            tree_current_depth=$(cat "$tree_directory/$tree_current.depth")
+            for child in $(pgrep -P "$tree_current" 2>/dev/null || true); do
+                [ ! -e "$tree_directory/$child.start" ] || continue
+                child_parent=$(process_parent "$child")
+                child_start=$(process_start "$child")
+                child_command=$(process_command "$child")
+                [ "$child_parent" = "$tree_current" ] || {
+                    rm -rf "$tree_directory"
+                    return 1
+                }
+                printf '%s\n' "$child" >>"$tree_nodes"
+                printf '%s\n' "$child_parent" >"$tree_directory/$child.parent"
+                printf '%s\n' "$child_start" >"$tree_directory/$child.start"
+                printf '%s\n' "$child_command" >"$tree_directory/$child.command"
+                child_depth=$((tree_current_depth + 1))
+                printf '%s\n' "$child_depth" >"$tree_directory/$child.depth"
+                tree_next="$tree_next $child"
+                [ "$child_depth" -le "$tree_max_depth" ] || tree_max_depth=$child_depth
+            done
+        done
+        tree_queue=$tree_next
     done
-    kill -KILL "$1" 2>/dev/null || true
+
+    tree_depth=$tree_max_depth
+    while [ "$tree_depth" -ge 0 ]; do
+        while IFS= read -r tree_current; do
+            [ "$(cat "$tree_directory/$tree_current.depth")" -eq "$tree_depth" ] || continue
+            tree_current_parent=$(cat "$tree_directory/$tree_current.parent")
+            tree_current_start=$(cat "$tree_directory/$tree_current.start")
+            tree_current_command=$(cat "$tree_directory/$tree_current.command")
+            [ -n "$(process_start "$tree_current")" ] || continue
+            process_identity_matches "$tree_current" "$tree_current_parent" \
+                "$tree_current_start" "$tree_current_command" || {
+                rm -rf "$tree_directory"
+                return 1
+            }
+            kill -"$tree_signal" "$tree_current" 2>/dev/null || true
+        done <"$tree_nodes"
+        tree_depth=$((tree_depth - 1))
+    done
+    rm -rf "$tree_directory"
+}
+
+wait_bounded() {
+    wait_phase=$1
+    wait_pid=$2
+    wait_timed_out=0
+    wait_timer_pid=
+    wait_alarm() {
+        wait_timed_out=1
+    }
+    trap wait_alarm 14
+    ( sleep "$wait_timeout_seconds"; kill -14 "$$" ) &
+    wait_timer_pid=$!
+    if wait "$wait_pid"; then
+        wait_status=0
+    else
+        wait_status=$?
+    fi
+    trap - 14
+    kill "$wait_timer_pid" 2>/dev/null || true
+    wait "$wait_timer_pid" 2>/dev/null || true
+    if [ "$wait_timed_out" -ne 0 ]; then
+        echo "local-ci lease test failed: $wait_phase: timed out after ${wait_timeout_seconds}s waiting for child pid=$wait_pid" >&2
+        return 124
+    fi
+    return "$wait_status"
 }
 
 cleanup() {
     status=$?
     trap - EXIT HUP INT TERM
     for pid in $background_pids; do
-        kill_tree "$pid"
+        kill_tree "$pid" || true
         wait "$pid" 2>/dev/null || true
     done
     rm -rf "$temporary"
@@ -39,7 +152,7 @@ fail() {
 wait_checked() {
     phase=$1
     pid=$2
-    if wait "$pid"; then
+    if wait_bounded "$phase" "$pid"; then
         return 0
     else
         status=$?
@@ -50,7 +163,7 @@ wait_checked() {
 wait_terminated() {
     phase=$1
     pid=$2
-    if wait "$pid"; then
+    if wait_bounded "$phase" "$pid"; then
         fail "$phase: killed process-tree root pid=$pid exited status=0"
     else
         status=$?
@@ -72,6 +185,22 @@ wait_for_file() {
 assert_absent() {
     [ ! -e "$1" ] && [ ! -L "$1" ] || fail "unexpected path exists: $1"
 }
+
+# Exercise the internal deadline itself; the outer Perl alarm is only an
+# independent safety bound and must not be the phase's causal timeout.
+timeout_probe_stderr="$temporary/timeout-probe.stderr"
+sleep 30 &
+timeout_probe_pid=$!
+if wait_bounded "timeout probe" "$timeout_probe_pid" 2>"$timeout_probe_stderr"; then
+    fail "bounded wait timeout probe unexpectedly completed"
+else
+    timeout_probe_status=$?
+fi
+[ "$timeout_probe_status" -eq 124 ] || fail "bounded wait timeout returned status $timeout_probe_status"
+kill -KILL "$timeout_probe_pid" 2>/dev/null || true
+wait "$timeout_probe_pid" 2>/dev/null || true
+grep -Fq 'timeout probe: timed out after' "$timeout_probe_stderr" \
+    || fail "bounded wait timeout had no causal phase diagnostic"
 
 git init -q "$temporary/repository"
 git -C "$temporary/repository" config user.email test@example.invalid
@@ -126,6 +255,7 @@ starting_marker="$lock_path/.starting"
 starting_held="$temporary/starting-held"
 starting_waiter="$temporary/starting-waiter"
 starting_waiter_stderr="$temporary/starting-waiter.stderr"
+waiter_stderr="$starting_waiter_stderr"
 mkfifo "$starting_pause_fifo"
 (
     cd "$first"
@@ -204,6 +334,16 @@ tree_pid=$!
 background_pids="$background_pids $tree_pid"
 wait_for_file "$tree_child_pid_file"
 tree_child_pid=$(cat "$tree_child_pid_file")
+tree_parent=$(process_parent "$tree_pid")
+tree_start=$(process_start "$tree_pid")
+tree_command=$(process_command "$tree_pid")
+if kill_tree "$tree_pid" "$tree_parent" "identity-mutated-start" "$tree_command"; then
+    fail "identity mutation was allowed to signal a live process"
+fi
+if kill_tree "$tree_pid" "$tree_parent" "$tree_start" "identity-mutated-command"; then
+    fail "command-path mutation was allowed to signal a live process"
+fi
+kill -0 "$tree_pid" 2>/dev/null || fail "identity mutation probe unexpectedly killed the process"
 kill_tree "$tree_pid"
 wait_terminated "process-tree cleanup phase" "$tree_pid"
 kill -0 "$tree_child_pid" 2>/dev/null && fail "fixture descendant survived process-tree cleanup"
@@ -315,8 +455,16 @@ sh -c 'cd "$1" && exec ./scripts/with-local-ci-lease.sh "$2" "$3"' \
 term_pid=$!
 background_pids="$background_pids $term_pid"
 wait_for_file "$term_marker"
+term_parent=$(process_parent "$term_pid")
+term_start=$(process_start "$term_pid")
+term_command_line=$(process_command "$term_pid")
+process_identity_matches "$term_pid" "$term_parent" "$term_start" "$term_command_line" \
+    || fail "TERM cleanup phase: root identity changed before signal"
 kill -TERM "$term_pid"
 wait_terminated "TERM cleanup phase" "$term_pid"
+term_live_processes=$(ps -axo pid=,command= | awk -v root="$temporary" \
+    'index($0, root) && ($0 ~ /term\.sh/ || $0 ~ /local-ci-lease\.sh/) { print }')
+[ -z "$term_live_processes" ] || fail "TERM cleanup phase left owned descendants:\n$term_live_processes"
 acquire_and_release "$second" "$temporary/term-recovered"
 
 # A SIGKILLed wrapper cannot release a lock inherited by a surviving command

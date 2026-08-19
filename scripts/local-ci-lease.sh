@@ -432,6 +432,22 @@ local_ci_lease_release_owner() {
     fi
 }
 
+local_ci_lease_start_child() {
+    # A forked child creates its own session before publishing its PID.  This
+    # avoids both a parent-side setpgid race and observing the child before the
+    # process-group identity is established.
+    command -v perl >/dev/null 2>&1 || {
+        echo "local-ci: Perl is required to establish the command process group" >&2
+        return 1
+    }
+    local_ci_lease_pid_file=$1
+    local_ci_lease_release_fifo=$2
+    shift 2
+    perl -MPOSIX -e \
+        'my ($pid_file, $release_fifo) = splice @ARGV, 0, 2; my $pid = fork(); die "fork: $!\n" unless defined $pid; if ($pid) { waitpid($pid, 0); my $status = $?; exit(($status & 127) ? 128 + ($status & 127) : ($status >> 8)); } POSIX::setsid() == -1 and die "setsid: $!\n"; open my $fh, ">", $pid_file or die "pid file: $!\n"; print $fh "$$\n"; close $fh; open my $release, "<", $release_fifo or die "release fifo: $!\n"; <$release>; close $release; exec @ARGV or die "exec: $!\n"' \
+        -- "$local_ci_lease_pid_file" "$local_ci_lease_release_fifo" "$@"
+}
+
 local_ci_lease_holder() {
     LOCAL_CI_LEASE_COMMON_DIR=$1
     LOCAL_CI_LEASE_PATH="$LOCAL_CI_LEASE_COMMON_DIR/$LOCAL_CI_LEASE_NAME"
@@ -485,6 +501,43 @@ local_ci_lease_holder() {
     return "$local_ci_lease_status"
 }
 
+local_ci_lease_lock_holder() {
+    local_ci_lease_group_common_dir=$1
+    local_ci_lease_group_working_directory=$2
+    shift 2
+    LOCAL_CI_LEASE_COMMON_DIR=$local_ci_lease_group_common_dir
+    LOCAL_CI_LEASE_PATH="$LOCAL_CI_LEASE_COMMON_DIR/$LOCAL_CI_LEASE_NAME"
+    LOCAL_CI_LEASE_LOCK="$LOCAL_CI_LEASE_COMMON_DIR/$LOCAL_CI_LEASE_LOCK_NAME"
+    local_ci_lease_enter_lock_object || return 1
+    exec lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c '
+        set -eu
+        helper=$1
+        common_dir=$2
+        working_directory=$3
+        shift 3
+        . "$helper"
+        mkdir "$LOCAL_CI_LEASE_STARTING_NAME"
+        LOCAL_CI_LEASE_STARTING_IDENTITY=$(stat -f "%d:%i" "$LOCAL_CI_LEASE_STARTING_NAME")
+        local_ci_lease_write_starting_marker
+        # This seam pauses only after this shell owns lockf.  A killed starter
+        # therefore cannot later acquire the descriptor after recovery.
+        if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF-}" ]; then
+            read -r local_ci_lease_test_pause_token <"$DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF" || true
+        fi
+        local_ci_lease_remove_starting "$LOCAL_CI_LEASE_STARTING_IDENTITY" || exit 1
+        CDPATH= cd -P -- "$working_directory"
+        set +e
+        local_ci_lease_holder "$common_dir" "$@"
+        status=$?
+        set -e
+        local_ci_lease_release_owner
+        local_ci_lease_remove_lock_object
+        rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
+        exit "$status"
+    ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
+        "$local_ci_lease_group_working_directory" "$@"
+}
+
 local_ci_lease_run() {
     [ "$#" -gt 0 ] || {
         echo "local-ci: lease wrapper requires a command" >&2
@@ -507,53 +560,84 @@ local_ci_lease_run() {
     local_ci_lease_acquire_lock_object || return 1
     local_ci_lease_working_directory=$(pwd -P)
 
-    # The holder is a child of this wrapper.  Its lock descriptor is inherited
-    # by the command, so an abnormal wrapper exit cannot release a surviving
-    # command descendant's lease.
-    (
-        local_ci_lease_enter_lock_object || exit 1
-        exec lockf -k "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c '
-        set -eu
-        helper=$1
-        common_dir=$2
-        working_directory=$3
-        shift 3
-        . "$helper"
-        mkdir "$LOCAL_CI_LEASE_STARTING_NAME"
-        LOCAL_CI_LEASE_STARTING_IDENTITY=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_STARTING_NAME")
-        local_ci_lease_write_starting_marker
-        # This seam pauses only after this shell owns lockf.  A killed starter
-        # therefore cannot later acquire the descriptor after recovery.
-        if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF-}" ]; then
-            read -r local_ci_lease_test_pause_token <"$DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF" || true
+    # The complete lock-holder tree lives in one owned process group.  The
+    # descriptor still stays inherited until every descendant exits, while a
+    # wrapper signal can now reach lockf, its holder shell, and the command
+    # without following mutable parent-PID relationships.
+    local_ci_lease_group_pid_file="$LOCAL_CI_LEASE_COMMON_DIR/.dark-factory-local-ci-group-$$"
+    local_ci_lease_group_release_fifo="$LOCAL_CI_LEASE_COMMON_DIR/.dark-factory-local-ci-release-$$"
+    rm -f "$local_ci_lease_group_pid_file"
+    rm -f "$local_ci_lease_group_release_fifo"
+    mkfifo "$local_ci_lease_group_release_fifo" || return 1
+    local_ci_lease_start_child "$local_ci_lease_group_pid_file" \
+        "$local_ci_lease_group_release_fifo" sh -c \
+        '. "$1"; shift; local_ci_lease_lock_holder "$@"' \
+        local-ci-lease-group "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
+        "$local_ci_lease_working_directory" "$@" &
+    local_ci_lease_holder_wait_pid=$!
+    local_ci_lease_group_attempts=0
+    while [ ! -s "$local_ci_lease_group_pid_file" ]; do
+        [ "$local_ci_lease_group_attempts" -lt 100 ] || {
+            echo "local-ci: lock-holder process-group startup timed out" >&2
+            kill "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+            wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+            rm -f "$local_ci_lease_group_pid_file" "$local_ci_lease_group_release_fifo"
+            return 1
+        }
+        sleep 0.01
+        local_ci_lease_group_attempts=$((local_ci_lease_group_attempts + 1))
+    done
+    local_ci_lease_holder_pid=$(cat "$local_ci_lease_group_pid_file")
+    rm -f "$local_ci_lease_group_pid_file"
+    local_ci_lease_identity_attempts=0
+    local_ci_lease_holder_start=
+    local_ci_lease_holder_pgid=
+    while [ -z "$local_ci_lease_holder_start" ] || [ -z "$local_ci_lease_holder_pgid" ]; do
+        [ "$local_ci_lease_identity_attempts" -lt 100 ] || break
+        local_ci_lease_holder_start=$(/bin/ps -p "$local_ci_lease_holder_pid" -o lstart= 2>/dev/null | sed 's/^ *//')
+        local_ci_lease_holder_pgid=$(/bin/ps -p "$local_ci_lease_holder_pid" -o pgid= 2>/dev/null | tr -d ' ')
+        local_ci_lease_identity_attempts=$((local_ci_lease_identity_attempts + 1))
+        [ -n "$local_ci_lease_holder_start" ] && [ -n "$local_ci_lease_holder_pgid" ] || sleep 0.01
+    done
+
+    local_ci_lease_holder_is_owned() {
+        [ -n "$local_ci_lease_holder_start" ] || return 1
+        local_ci_lease_current_start=$(/bin/ps -p "$local_ci_lease_holder_pid" -o lstart= 2>/dev/null | sed 's/^ *//')
+        local_ci_lease_current_pgid=$(/bin/ps -p "$local_ci_lease_holder_pid" -o pgid= 2>/dev/null | tr -d ' ')
+        [ "$local_ci_lease_current_start" = "$local_ci_lease_holder_start" ] \
+            && [ "$local_ci_lease_current_pgid" = "$local_ci_lease_holder_pgid" ] \
+            && [ "$local_ci_lease_current_pgid" = "$local_ci_lease_holder_pid" ]
+    }
+    local_ci_lease_signal_holder() {
+        local_ci_lease_signal=$1
+        if local_ci_lease_holder_is_owned; then
+            /bin/kill -"$local_ci_lease_signal" -"$local_ci_lease_holder_pgid" 2>/dev/null || true
+        else
+            echo "local-ci: refusing to signal an unverified lock-holder process group" >&2
         fi
-        local_ci_lease_remove_starting "$LOCAL_CI_LEASE_STARTING_IDENTITY" || exit 1
-        CDPATH= cd -P -- "$working_directory"
-        set +e
-        local_ci_lease_holder "$common_dir" "$@"
-        status=$?
-        set -e
-        local_ci_lease_release_owner
-        local_ci_lease_remove_lock_object
-        rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
-        exit "$status"
-    ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
-        "$local_ci_lease_working_directory" "$@"
-    ) &
-    local_ci_lease_holder_pid=$!
+    }
+    local_ci_lease_holder_is_owned || {
+        echo "local-ci: lock holder did not enter its owned process group" >&2
+        kill "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        rm -f "$local_ci_lease_group_release_fifo"
+        return 1
+    }
 
     local_ci_lease_wrapper_cleanup() {
         local_ci_lease_status=$?
         trap - EXIT HUP INT TERM
-        kill -TERM "$local_ci_lease_holder_pid" 2>/dev/null || true
-        wait "$local_ci_lease_holder_pid" 2>/dev/null || true
+        local_ci_lease_signal_holder 15
+        wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        rm -f "$local_ci_lease_group_release_fifo"
         exit "$local_ci_lease_status"
     }
     local_ci_lease_wrapper_signal() {
         local_ci_lease_signal=$1
         trap - EXIT HUP INT TERM
-        kill -"$local_ci_lease_signal" "$local_ci_lease_holder_pid" 2>/dev/null || true
-        wait "$local_ci_lease_holder_pid" 2>/dev/null || true
+        local_ci_lease_signal_holder "$local_ci_lease_signal"
+        wait "$local_ci_lease_holder_wait_pid" 2>/dev/null || true
+        rm -f "$local_ci_lease_group_release_fifo"
         exit $((128 + local_ci_lease_signal))
     }
     trap local_ci_lease_wrapper_cleanup EXIT
@@ -561,8 +645,11 @@ local_ci_lease_run() {
     trap 'local_ci_lease_wrapper_signal 2' INT
     trap 'local_ci_lease_wrapper_signal 15' TERM
 
+    printf 'go\n' >"$local_ci_lease_group_release_fifo"
+    rm -f "$local_ci_lease_group_release_fifo"
+
     set +e
-    wait "$local_ci_lease_holder_pid"
+    wait "$local_ci_lease_holder_wait_pid"
     local_ci_lease_status=$?
     set -e
     trap - EXIT HUP INT TERM
