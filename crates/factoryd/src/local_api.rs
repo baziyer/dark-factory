@@ -3463,7 +3463,12 @@ mod deletion_gate_tests {
     };
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let base = if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        };
+        let directory = tempfile::tempdir_in(base).unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
