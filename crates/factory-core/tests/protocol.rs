@@ -1,6 +1,7 @@
 use factory_core::{
     AgentId, EventEnvelope, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
     RunFailureReason, RunId, RunSnapshot, RunStatus, TaskId, TaskStatus,
+    local::{LocalRequest, RequestEnvelope},
 };
 
 fn id<T>(value: &str) -> T
@@ -9,6 +10,68 @@ where
     for<'a> <T as TryFrom<&'a str>>::Error: std::fmt::Debug,
 {
     T::try_from(value).unwrap()
+}
+
+#[test]
+fn task_binding_requests_are_rejected_by_pre_binding_daemons() {
+    let request = RequestEnvelope::new(LocalRequest::CreateTask {
+        id: id("task-binding"),
+        project_id: id("project"),
+        parent_task_id: None,
+        title: "bound".into(),
+        body: "body".into(),
+        priority: 1,
+        agent_id: None,
+        worktree: Some("/worktree".into()),
+        branch: Some("agent/worker".into()),
+        starting_head: Some("0123456789012345678901234567890123456789".into()),
+    });
+    let wire = serde_json::to_value(request).unwrap();
+    assert_eq!(wire["protocol_version"], PROTOCOL_VERSION);
+    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_ne!(wire["protocol_version"], 2);
+}
+
+#[test]
+fn task_snapshot_projects_only_operator_target_context() {
+    let snapshot = factory_core::TaskSnapshot {
+        id: id("task-binding"),
+        project_id: id("project"),
+        parent_task_id: None,
+        assigned_agent_id: None,
+        title: "bound".into(),
+        worktree_binding: Some(factory_core::WorktreeBinding {
+            branch: "agent/worker".into(),
+            starting_head: "0123456789012345678901234567890123456789".into(),
+        }),
+        status: TaskStatus::Queued,
+        priority: 1,
+        created_at_ms: 1,
+        updated_at_ms: 1,
+    };
+    let value = serde_json::to_value(snapshot).unwrap();
+    let binding = &value["worktree_binding"];
+    assert_eq!(binding["branch"], "agent/worker");
+    assert_eq!(
+        binding["starting_head"],
+        "0123456789012345678901234567890123456789"
+    );
+    for private in [
+        "path",
+        "git_dir",
+        "common_dir",
+        "worktree_device",
+        "worktree_inode",
+        "git_dir_device",
+        "git_dir_inode",
+        "common_dir_device",
+        "common_dir_inode",
+    ] {
+        assert!(
+            binding.get(private).is_none(),
+            "private field leaked: {private}"
+        );
+    }
 }
 
 #[test]
@@ -31,7 +94,7 @@ fn all_run_status_values_have_stable_wire_names() {
 
 #[test]
 fn all_run_failure_reasons_have_stable_wire_names() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+    assert_eq!(PROTOCOL_VERSION, 3);
 
     let cases = [
         (RunFailureReason::Protocol, "protocol"),

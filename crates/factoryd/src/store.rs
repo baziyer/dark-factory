@@ -5,7 +5,7 @@ use factory_core::{
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
     ProviderNotificationKind, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
     RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
-    TaskStatus, WorktreeBinding,
+    TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     model_policy,
@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -342,6 +342,34 @@ pub struct RepositoryAuthority {
     pub remote_url: String,
     pub base_branch: String,
 }
+
+/// Private task target authority. Only the minimal branch/head projection is
+/// copied into `factory_core::TaskSnapshot`; the daemon uses the rest to
+/// reject path and repository replacement after restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskWorktreeBinding {
+    pub path: String,
+    pub branch: String,
+    pub starting_head: String,
+    pub git_dir: String,
+    pub common_dir: String,
+    pub worktree_device: u64,
+    pub worktree_inode: u64,
+    pub git_dir_device: u64,
+    pub git_dir_inode: u64,
+    pub common_dir_device: u64,
+    pub common_dir_inode: u64,
+}
+
+impl TaskWorktreeBinding {
+    #[must_use]
+    pub fn public_context(&self) -> factory_core::WorktreeBinding {
+        factory_core::WorktreeBinding {
+            branch: self.branch.clone(),
+            starting_head: self.starting_head.clone(),
+        }
+    }
+}
 // --- Sessions -------------------------------------------------------------
 //
 // One resident interactive provider process per agent (PTY-backed,
@@ -362,6 +390,7 @@ pub struct SessionRow {
     pub runtime_control_mode: Option<String>,
     pub provider_session_id: Option<String>,
     pub worktree: String,
+    pub target_binding: Option<TaskWorktreeBinding>,
     pub codex_home: Option<String>,
     pub hook_token: String,
     pub state: SessionState,
@@ -443,6 +472,7 @@ pub struct NewSession {
     pub runtime_control_mode: Option<String>,
     pub provider_session_id: Option<String>,
     pub worktree: String,
+    pub target_binding: Option<TaskWorktreeBinding>,
     pub codex_home: Option<String>,
     pub hook_token: String,
     pub runner_instance_id: RunnerInstanceId,
@@ -905,7 +935,7 @@ impl Store {
         &mut self,
         input: NewTask,
         assigned_agent_id: Option<AgentId>,
-        worktree_binding: Option<WorktreeBinding>,
+        worktree_binding: Option<TaskWorktreeBinding>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
@@ -1382,6 +1412,9 @@ impl Store {
                 id, project_id, agent_id, provider, runtime_model,
                 runtime_reasoning_effort, runtime_permission_mode, runtime_control_mode,
                 provider_session_id, worktree,
+                target_branch, target_starting_head, target_git_dir, target_common_dir,
+                target_device, target_inode, target_git_dir_device, target_git_dir_inode,
+                target_common_dir_device, target_common_dir_inode,
                 codex_home, hook_token, state, state_since_ms, activity,
                 activity_inferred, wait_reason, observer_health,
                 observer_health_since_ms, runner_instance_id, runner_runtime,
@@ -1389,9 +1422,10 @@ impl Store {
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
                 stop_requested_at_ms, resumed_provider_session
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
-                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, NULL, ?13,
-                ?13, NULL, NULL, NULL, NULL, ?18
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'starting', ?23,
+                NULL, 0, NULL, ?24, ?23, ?25, ?26, ?27, NULL, NULL, NULL, ?23,
+                ?23, NULL, NULL, NULL, NULL, ?28
              )",
             params![
                 input.id.as_str(),
@@ -1404,6 +1438,37 @@ impl Store {
                 input.runtime_control_mode,
                 input.provider_session_id,
                 input.worktree,
+                input.target_binding.as_ref().map(|b| b.branch.as_str()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .map(|b| b.starting_head.as_str()),
+                input.target_binding.as_ref().map(|b| b.git_dir.as_str()),
+                input.target_binding.as_ref().map(|b| b.common_dir.as_str()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.worktree_device).ok()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.worktree_inode).ok()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.git_dir_device).ok()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.git_dir_inode).ok()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.common_dir_device).ok()),
+                input
+                    .target_binding
+                    .as_ref()
+                    .and_then(|b| i64::try_from(b.common_dir_inode).ok()),
                 input.codex_home,
                 input.hook_token,
                 now_ms,
@@ -2463,11 +2528,11 @@ impl Store {
         self.session_snapshot(project_id, &session_id)
     }
 
-    pub fn task_worktree_binding_for_session(
+    pub(crate) fn task_worktree_binding_for_session(
         &self,
         project_id: &ProjectId,
         session_id: &SessionId,
-    ) -> Result<Option<WorktreeBinding>> {
+    ) -> Result<Option<TaskWorktreeBinding>> {
         let task_id: Option<String> = self
             .connection
             .query_row(
@@ -2481,8 +2546,38 @@ impl Store {
         let Some(task_id) = task_id else {
             return Ok(None);
         };
-        Ok(load_task(&self.connection, &parse_id(task_id, 0)?)?
-            .and_then(|task| task.snapshot.worktree_binding))
+        self.task_worktree_binding(project_id, &parse_id(task_id, 0)?)
+    }
+
+    pub fn task_worktree_binding(
+        &self,
+        project_id: &ProjectId,
+        task_id: &TaskId,
+    ) -> Result<Option<TaskWorktreeBinding>> {
+        let mut statement = self.connection.prepare(
+            "SELECT worktree_path, worktree_branch, worktree_starting_head,
+                    worktree_git_dir, worktree_common_dir, worktree_device,
+                    worktree_inode, worktree_git_dir_device, worktree_git_dir_inode,
+                    worktree_common_dir_device, worktree_common_dir_inode
+             FROM tasks WHERE project_id = ?1 AND id = ?2",
+        )?;
+        statement
+            .query_row(params![project_id.as_str(), task_id.as_str()], |row| {
+                task_binding_from_columns(row, 0)
+            })
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(StoreError::from)
+    }
+
+    pub(crate) fn session_target_binding(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<Option<TaskWorktreeBinding>> {
+        Ok(load_session(&self.connection, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .and_then(|session| session.target_binding))
     }
 
     // --- Task episodes (runs) ------------------------------------------
@@ -2902,6 +2997,10 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn delivery_attempt(&self, attempt_id: &str) -> Result<Option<DeliveryAttempt>> {
+        Ok(load_delivery_attempt(&self.connection, attempt_id)?)
     }
 
     fn cancel_delivery_attempts_for_task(
@@ -3929,7 +4028,9 @@ impl Store {
                         parent_task_id: parse_optional_id(parent_id, 2)?,
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
-                        worktree_binding,
+                        worktree_binding: worktree_binding
+                            .as_ref()
+                            .map(TaskWorktreeBinding::public_context),
                         status: parse_task_status(&status, 7)?,
                         priority: row.get(8)?,
                         created_at_ms: row.get(9)?,
@@ -4141,14 +4242,14 @@ impl Store {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn update_task_with_binding(
+    pub(crate) fn update_task_with_binding(
         &mut self,
         project_id: &ProjectId,
         task_id: &TaskId,
         title: Option<String>,
         body: Option<String>,
         priority: Option<i32>,
-        worktree_binding: Option<WorktreeBinding>,
+        worktree_binding: Option<TaskWorktreeBinding>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
@@ -5512,7 +5613,7 @@ fn insert_task(
     transaction: &Transaction<'_>,
     input: NewTask,
     assigned_agent_id: Option<AgentId>,
-    worktree_binding: Option<WorktreeBinding>,
+    worktree_binding: Option<TaskWorktreeBinding>,
     now_ms: i64,
 ) -> Result<(TaskDetail, FactoryEvent)> {
     let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
@@ -5533,7 +5634,9 @@ fn insert_task(
             parent_task_id: input.parent_task_id,
             assigned_agent_id,
             title,
-            worktree_binding: worktree_binding.clone(),
+            worktree_binding: worktree_binding
+                .as_ref()
+                .map(TaskWorktreeBinding::public_context),
             status: TaskStatus::Queued,
             priority: input.priority,
             created_at_ms: now_ms,
@@ -5622,7 +5725,9 @@ fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDet
                         parent_task_id: parse_optional_id(parent_id, 2)?,
                         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
                         title: row.get(4)?,
-                        worktree_binding,
+                        worktree_binding: worktree_binding
+                            .as_ref()
+                            .map(TaskWorktreeBinding::public_context),
                         status: parse_task_status(&status, 7)?,
                         priority: row.get(8)?,
                         created_at_ms: row.get(9)?,
@@ -5689,7 +5794,11 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
             "SELECT s.id, s.project_id, s.agent_id, s.provider,
                     s.runtime_model, s.runtime_reasoning_effort,
                     s.runtime_permission_mode, s.runtime_control_mode,
-                    s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
+                    s.provider_session_id, s.worktree, s.target_branch,
+                    s.target_starting_head, s.target_git_dir, s.target_common_dir,
+                    s.target_device, s.target_inode, s.target_git_dir_device,
+                    s.target_git_dir_inode, s.target_common_dir_device,
+                    s.target_common_dir_inode, s.codex_home, s.hook_token,
                     s.state, s.state_since_ms,
                     s.activity, s.activity_inferred, s.wait_reason, s.observer_reason,
                     s.observer_health, s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
@@ -5699,7 +5808,7 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.exit_signal, s.stop_requested_at_ms,
                     s.delivery_recovery_stop_requested_at_ms,
                     (SELECT r.id FROM runs r
-                     WHERE r.session_id = s.id AND r.ended_at_ms IS NULL LIMIT 1)
+                    WHERE r.session_id = s.id AND r.ended_at_ms IS NULL LIMIT 1)
              FROM sessions s WHERE s.id = ?1",
             params![session_id.as_str()],
             session_row_from_row,
@@ -5710,12 +5819,12 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
-    let state: String = row.get(12)?;
-    let observer_health: String = row.get(18)?;
-    let protocol: i64 = row.get(22)?;
-    let last_hook_event: Option<String> = row.get(23)?;
-    let notification_kind: Option<String> = row.get(24)?;
-    let current_run_id: Option<String> = row.get(33)?;
+    let state: String = row.get(22)?;
+    let observer_health: String = row.get(28)?;
+    let protocol: i64 = row.get(32)?;
+    let last_hook_event: Option<String> = row.get(33)?;
+    let notification_kind: Option<String> = row.get(34)?;
+    let current_run_id: Option<String> = row.get(43)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -5727,35 +5836,36 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         runtime_control_mode: row.get(7)?,
         provider_session_id: row.get(8)?,
         worktree: row.get(9)?,
-        codex_home: row.get(10)?,
-        hook_token: row.get(11)?,
-        state: parse_session_state(&state, 12)?,
-        state_since_ms: row.get(13)?,
-        activity: row.get(14)?,
-        activity_inferred: row.get(15)?,
-        wait_reason: row.get(16)?,
-        observer_reason: row.get(17)?,
-        observer_health: parse_observer_health(&observer_health, 18)?,
-        observer_health_since_ms: row.get(19)?,
-        runner_instance_id: parse_id(row.get(20)?, 20)?,
-        runner_runtime: row.get(21)?,
+        target_binding: session_binding_from_columns(row, 9, 10)?,
+        codex_home: row.get(20)?,
+        hook_token: row.get(21)?,
+        state: parse_session_state(&state, 22)?,
+        state_since_ms: row.get(23)?,
+        activity: row.get(24)?,
+        activity_inferred: row.get(25)?,
+        wait_reason: row.get(26)?,
+        observer_reason: row.get(27)?,
+        observer_health: parse_observer_health(&observer_health, 28)?,
+        observer_health_since_ms: row.get(29)?,
+        runner_instance_id: parse_id(row.get(30)?, 30)?,
+        runner_runtime: row.get(31)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(22, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(32, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 23))
+            .map(|value| parse_provider_hook_event(&value, 33))
             .transpose()?,
         notification_kind: notification_kind
-            .map(|value| parse_provider_notification_kind(&value, 24))
+            .map(|value| parse_provider_notification_kind(&value, 34))
             .transpose()?,
-        last_hook_at_ms: row.get(25)?,
-        started_at_ms: row.get(26)?,
-        updated_at_ms: row.get(27)?,
-        ended_at_ms: row.get(28)?,
-        exit_code: row.get(29)?,
-        exit_signal: row.get(30)?,
-        stop_requested_at_ms: row.get(31)?,
-        delivery_recovery_stop_requested_at_ms: row.get(32)?,
+        last_hook_at_ms: row.get(35)?,
+        started_at_ms: row.get(36)?,
+        updated_at_ms: row.get(37)?,
+        ended_at_ms: row.get(38)?,
+        exit_code: row.get(39)?,
+        exit_signal: row.get(40)?,
+        stop_requested_at_ms: row.get(41)?,
+        delivery_recovery_stop_requested_at_ms: row.get(42)?,
         current_run_id: parse_optional_id(current_run_id, 33)?,
     })
 }
@@ -5860,7 +5970,7 @@ fn load_active_delivery_attempt(
 }
 
 fn load_delivery_attempt(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     attempt_id: &str,
 ) -> rusqlite::Result<Option<DeliveryAttempt>> {
     transaction
@@ -6269,6 +6379,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         }
         transaction.pragma_update(None, "user_version", 29)?;
         transaction.commit()?;
+        current = 29;
+    }
+    if current == 29 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'target_branch'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_present {
+            transaction.execute_batch(include_str!(
+                "../migrations/0030_session_worktree_identity.sql"
+            ))?;
+        }
+        transaction.pragma_update(None, "user_version", 30)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6501,7 +6629,9 @@ fn task_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnaps
         parent_task_id: parse_optional_id(parent_id, 2)?,
         assigned_agent_id: parse_optional_id(assigned_id, 3)?,
         title: row.get(4)?,
-        worktree_binding: task_binding_from_columns(row, 9)?,
+        worktree_binding: task_binding_from_columns(row, 9)?
+            .as_ref()
+            .map(TaskWorktreeBinding::public_context),
         status: parse_task_status(&status, 5)?,
         priority: row.get(6)?,
         created_at_ms: row.get(7)?,
@@ -6512,10 +6642,10 @@ fn task_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnaps
 fn task_binding_from_columns(
     row: &rusqlite::Row<'_>,
     offset: usize,
-) -> rusqlite::Result<Option<WorktreeBinding>> {
+) -> rusqlite::Result<Option<TaskWorktreeBinding>> {
     let path: Option<String> = row.get(offset)?;
     let Some(path) = path else { return Ok(None) };
-    Ok(Some(WorktreeBinding {
+    Ok(Some(TaskWorktreeBinding {
         path,
         branch: row.get(offset + 1)?,
         starting_head: row.get(offset + 2)?,
@@ -6538,6 +6668,42 @@ fn task_binding_from_columns(
         })?,
         common_dir_inode: u64::try_from(row.get::<_, i64>(offset + 10)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(offset + 10, Type::Integer, Box::new(error))
+        })?,
+    }))
+}
+
+fn session_binding_from_columns(
+    row: &rusqlite::Row<'_>,
+    path_column: usize,
+    offset: usize,
+) -> rusqlite::Result<Option<TaskWorktreeBinding>> {
+    let branch: Option<String> = row.get(offset)?;
+    let Some(branch) = branch else {
+        return Ok(None);
+    };
+    Ok(Some(TaskWorktreeBinding {
+        path: row.get(path_column)?,
+        branch,
+        starting_head: row.get(offset + 1)?,
+        git_dir: row.get(offset + 2)?,
+        common_dir: row.get(offset + 3)?,
+        worktree_device: u64::try_from(row.get::<_, i64>(offset + 4)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 4, Type::Integer, Box::new(error))
+        })?,
+        worktree_inode: u64::try_from(row.get::<_, i64>(offset + 5)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 5, Type::Integer, Box::new(error))
+        })?,
+        git_dir_device: u64::try_from(row.get::<_, i64>(offset + 6)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 6, Type::Integer, Box::new(error))
+        })?,
+        git_dir_inode: u64::try_from(row.get::<_, i64>(offset + 7)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 7, Type::Integer, Box::new(error))
+        })?,
+        common_dir_device: u64::try_from(row.get::<_, i64>(offset + 8)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 8, Type::Integer, Box::new(error))
+        })?,
+        common_dir_inode: u64::try_from(row.get::<_, i64>(offset + 9)?).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(offset + 9, Type::Integer, Box::new(error))
         })?,
     }))
 }
@@ -6830,6 +6996,7 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner".to_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1,
             )

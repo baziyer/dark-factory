@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId, WorktreeBinding};
+use factory_core::{AgentId, ProjectId, ProjectSnapshot, SessionId};
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::store::{RepositoryAuthority, SessionRow};
+use crate::store::{RepositoryAuthority, SessionRow, TaskWorktreeBinding};
 
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -77,21 +77,30 @@ pub fn validate_authority(
 /// Pins an existing worktree to the repository authority. Callers provide
 /// only the intended path/branch/HEAD; all identities are observed here and
 /// persisted by the daemon.
-pub async fn validate_worktree_binding(
+pub(crate) async fn validate_worktree_binding(
     project: &ProjectSnapshot,
     authority: RepositoryAuthority,
     path: &Path,
     branch: &str,
     starting_head: &str,
-) -> Result<WorktreeBinding, Error> {
+) -> Result<TaskWorktreeBinding, Error> {
     validate_worktree_binding_at(project, authority, path, branch, Some(starting_head)).await
 }
 
-pub async fn revalidate_worktree_binding(
+pub(crate) async fn observe_worktree_binding(
     project: &ProjectSnapshot,
     authority: RepositoryAuthority,
-    binding: &WorktreeBinding,
-) -> Result<WorktreeBinding, Error> {
+    path: &Path,
+    branch: &str,
+) -> Result<TaskWorktreeBinding, Error> {
+    validate_worktree_binding_at(project, authority, path, branch, None).await
+}
+
+pub(crate) async fn revalidate_worktree_binding(
+    project: &ProjectSnapshot,
+    authority: RepositoryAuthority,
+    binding: &TaskWorktreeBinding,
+) -> Result<TaskWorktreeBinding, Error> {
     validate_worktree_binding_at(
         project,
         authority,
@@ -108,7 +117,7 @@ async fn validate_worktree_binding_at(
     path: &Path,
     branch: &str,
     expected_head: Option<&str>,
-) -> Result<WorktreeBinding, Error> {
+) -> Result<TaskWorktreeBinding, Error> {
     let authority = validate_authority(authority.remote_url, authority.base_branch)?;
     validate_ref(branch, "worktree branch")?;
     if branch == authority.base_branch {
@@ -197,7 +206,7 @@ async fn validate_worktree_binding_at(
         .map_err(|_| Error::Rejected("task Git directory disappeared".into()))?;
     let common_metadata = std::fs::metadata(&common_dir)
         .map_err(|_| Error::Rejected("task common Git directory disappeared".into()))?;
-    Ok(WorktreeBinding {
+    Ok(TaskWorktreeBinding {
         path: worktree.to_string_lossy().into_owned(),
         branch: branch.to_owned(),
         starting_head: head.to_owned(),
@@ -221,11 +230,11 @@ impl Target {
         Self::validate_at(session, project, authority, None).await
     }
 
-    pub async fn validate_with_binding(
+    pub(crate) async fn validate_with_binding(
         session: SessionRow,
         project: ProjectSnapshot,
         authority: RepositoryAuthority,
-        binding: WorktreeBinding,
+        binding: TaskWorktreeBinding,
     ) -> Result<Self, Error> {
         Self::validate_at(session, project, authority, Some(binding)).await
     }
@@ -234,7 +243,7 @@ impl Target {
         session: SessionRow,
         project: ProjectSnapshot,
         authority: RepositoryAuthority,
-        binding: Option<WorktreeBinding>,
+        binding: Option<TaskWorktreeBinding>,
     ) -> Result<Self, Error> {
         let authority = validate_authority(authority.remote_url, authority.base_branch)?;
         let expected_path = binding
@@ -293,6 +302,19 @@ impl Target {
     }
 
     async fn revalidate(&self) -> Result<String, Error> {
+        let leaf = std::fs::symlink_metadata(&self.worktree)
+            .map_err(|_| Error::Rejected("session worktree disappeared".into()))?;
+        if leaf.file_type().is_symlink() || !leaf.is_dir() {
+            return Err(Error::Rejected(
+                "session worktree leaf was replaced or is not a directory".into(),
+            ));
+        }
+        if std::fs::canonicalize(&self.worktree)
+            .map_err(|_| Error::Rejected("session worktree disappeared".into()))?
+            != self.worktree
+        {
+            return Err(Error::Rejected("session worktree path changed".into()));
+        }
         let metadata = std::fs::metadata(&self.worktree)
             .map_err(|_| Error::Rejected("session worktree disappeared".into()))?;
         if metadata.dev() != self.worktree_device || metadata.ino() != self.worktree_inode {
@@ -802,6 +824,7 @@ async fn safe_git_inner(
     deadline: Duration,
     trusted_helper: Option<&str>,
 ) -> Result<String, Error> {
+    reject_replaced_leaf(cwd)?;
     let mut fixed = vec![
         "-c",
         "core.hooksPath=/dev/null",
@@ -855,6 +878,17 @@ async fn safe_git_inner(
         }
     }
     run_command(Path::new("git"), cwd, &fixed, &envs, stdin, deadline).await
+}
+
+fn reject_replaced_leaf(path: &Path) -> Result<(), Error> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| Error::Rejected("Git working directory disappeared".into()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::Rejected(
+            "Git working-directory leaf was replaced or is not a directory".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn gh(
@@ -1080,6 +1114,7 @@ mod tests {
             runner_instance_id: RunnerInstanceId::try_from("runner".to_owned()).unwrap(),
             runner_runtime: "/tmp/runner".into(),
             runner_protocol_version: 1,
+            target_binding: None,
             last_hook_event: None,
             notification_kind: None,
             last_hook_at_ms: None,
@@ -1211,6 +1246,18 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(error.to_string().contains("branch mismatch"));
+    }
+
+    #[tokio::test]
+    async fn git_use_rejects_a_deterministic_worktree_leaf_swap() {
+        let (temp, target, _) = fixture().await;
+        let original = target.worktree.clone();
+        let replacement = temp.path().join("worktree-moved");
+        fs::rename(&original, &replacement).unwrap();
+        std::os::unix::fs::symlink(&replacement, &original).unwrap();
+
+        let error = target.status().await.unwrap_err();
+        assert!(error.to_string().contains("leaf was replaced"));
     }
 
     #[tokio::test]

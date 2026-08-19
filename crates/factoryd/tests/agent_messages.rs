@@ -71,6 +71,7 @@ fn operator_message_is_durable_and_delivered_once() {
                 runner_instance_id: RunnerInstanceId::try_from("instance-god").unwrap(),
                 runner_runtime: "/private/runners/god".into(),
                 runner_protocol_version: 1,
+                target_binding: None,
             },
             3,
         )
@@ -159,6 +160,7 @@ fn opening_a_run_episode_delivers_messages_into_the_new_episode() {
                 runner_instance_id: RunnerInstanceId::try_from("instance-worker").unwrap(),
                 runner_runtime: "/private/runners/worker".into(),
                 runner_protocol_version: 1,
+                target_binding: None,
             },
             6,
         )

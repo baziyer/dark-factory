@@ -372,7 +372,7 @@ impl Handle {
         if existing_attempt.is_some() {
             return Err(Error::DeliveryInProgress);
         }
-        let (task, messages, (task_incarnation_id, prior_run_count)) = self
+        let (task, task_binding, messages, (task_incarnation_id, prior_run_count)) = self
             .state
             .with_store({
                 let project_id = project_id.clone();
@@ -386,13 +386,15 @@ impl Handle {
                     {
                         return Err(StoreError::TaskNotQueued);
                     }
+                    let task_binding = store.task_worktree_binding(&project_id, &task_id)?;
                     let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
                     let marker = store.task_delivery_marker(&session_id, &task_id)?;
-                    Ok((task, messages, marker))
+                    Ok((task, task_binding, messages, marker))
                 }
             })
             .await?;
-        ensure_task_target(&self.state, &task, &session.worktree).await?;
+        ensure_task_target(&self.state, &task, task_binding.as_ref(), &session.worktree).await?;
+        ensure_session_target(&self.state, &session.snapshot(), Some(&task_id)).await?;
         let text = compose_text(
             &self.config.guidance_root,
             &project_id,
@@ -460,9 +462,11 @@ impl Handle {
             session_run_id(&session.id)?,
             target.runner_instance_id,
         );
+        let session_snapshot = session.snapshot();
         if type_and_await_ack(
             &self.state,
             &client,
+            &session_snapshot,
             &session.id,
             &attempt.id,
             &attempt.text,
@@ -1528,9 +1532,10 @@ async fn enforce_start_deadline(
 async fn ensure_task_target(
     state: &DaemonState,
     task: &TaskDetail,
+    binding: Option<&crate::store::TaskWorktreeBinding>,
     session_worktree: &str,
 ) -> Result<(), Error> {
-    let Some(binding) = task.snapshot.worktree_binding.as_ref() else {
+    let Some(binding) = binding else {
         return Ok(());
     };
     let session_path = std::fs::canonicalize(session_worktree)
@@ -1566,6 +1571,130 @@ async fn ensure_task_target(
         ));
     }
     Ok(())
+}
+
+/// The resident session is a durable target lease, not a generic pipe. Every
+/// delivery rechecks that the queued task still names the same managed target
+/// (or, for an unbound task, the agent's ordinary worktree). This rejects a
+/// bound-to-unbound successor and a deleted/reassigned task before any text
+/// is composed or typed.
+async fn ensure_session_target(
+    state: &DaemonState,
+    session: &SessionSnapshot,
+    task_id: Option<&factory_core::TaskId>,
+) -> Result<(), Error> {
+    let project_id = session.project_id.clone();
+    let agent_id = session.agent_id.clone();
+    let session_id = session.id.clone();
+    let session_path = std::fs::canonicalize(&session.worktree)
+        .map_err(|_| Error::WorktreeBinding("live session worktree disappeared".into()))?;
+    let (agent_worktree, session_binding, binding) = state
+        .with_store({
+            let project_id = project_id.clone();
+            let agent_id = agent_id.clone();
+            let task_id = task_id.cloned();
+            move |store| {
+                let agent_worktree = store
+                    .get_agent_detail(&project_id, &agent_id)?
+                    .snapshot
+                    .worktree;
+                let session_binding = store.session_target_binding(&project_id, &session_id)?;
+                let binding = task_id
+                    .as_ref()
+                    .map(|id| store.task_worktree_binding(&project_id, id))
+                    .transpose()?;
+                Ok((agent_worktree, session_binding, binding.flatten()))
+            }
+        })
+        .await?;
+    if let Some(session_binding) = session_binding {
+        let binding = if let Some(binding) = binding {
+            binding
+        } else if task_id.is_none() {
+            session_binding.clone()
+        } else {
+            return Err(Error::WorktreeBinding(
+                "bound resident session cannot receive an unbound task; rotate the session".into(),
+            ));
+        };
+        if task_id.is_some() && session_binding != binding {
+            return Err(Error::WorktreeBinding(
+                "task target differs from the resident session target; rotate the session".into(),
+            ));
+        }
+        if session_path != Path::new(&binding.path) {
+            return Err(Error::WorktreeBinding(
+                "live session target does not match the task's managed worktree".into(),
+            ));
+        }
+        let authority_project_id = project_id.clone();
+        let (project, authority) = state
+            .with_store(move |store| {
+                Ok((
+                    store.get_project(&authority_project_id)?,
+                    store.repository_authority(&authority_project_id)?,
+                ))
+            })
+            .await?;
+        let observed =
+            crate::repository::revalidate_worktree_binding(&project, authority, &binding)
+                .await
+                .map_err(|error| Error::WorktreeBinding(error.to_string()))?;
+        if observed != binding {
+            return Err(Error::WorktreeBinding(
+                "managed task worktree identity changed; rotate the session before delivery".into(),
+            ));
+        }
+    } else if let Some(binding) = binding {
+        if session_path != Path::new(&binding.path) {
+            return Err(Error::WorktreeBinding(
+                "live session target does not match the task's managed worktree".into(),
+            ));
+        }
+        let authority_project_id = project_id.clone();
+        let (project, authority) = state
+            .with_store(move |store| {
+                Ok((
+                    store.get_project(&authority_project_id)?,
+                    store.repository_authority(&authority_project_id)?,
+                ))
+            })
+            .await?;
+        let observed =
+            crate::repository::revalidate_worktree_binding(&project, authority, &binding)
+                .await
+                .map_err(|error| Error::WorktreeBinding(error.to_string()))?;
+        if observed != binding {
+            return Err(Error::WorktreeBinding(
+                "managed task worktree identity changed; rotate the session before delivery".into(),
+            ));
+        }
+    } else {
+        let Some(agent_worktree) = agent_worktree else {
+            return Err(Error::NoWorktree);
+        };
+        let agent_path = std::fs::canonicalize(agent_worktree)
+            .map_err(|_| Error::WorktreeBinding("agent worktree disappeared".into()))?;
+        if agent_path != session_path {
+            return Err(Error::WorktreeBinding(
+                "live session is bound to a different target; rotate it before an unbound task"
+                    .into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_next_delivery_target(
+    state: &DaemonState,
+    session: &SessionSnapshot,
+) -> Result<(), Error> {
+    let project_id = session.project_id.clone();
+    let agent_id = session.agent_id.clone();
+    let task_id = state
+        .with_store(move |store| store.next_deliverable(&project_id, &agent_id))
+        .await?;
+    ensure_session_target(state, session, task_id.as_ref()).await
 }
 
 async fn has_pending_work(
@@ -1660,12 +1789,19 @@ async fn spawn_session_for_agent(
         .with_store(move |store| {
             store
                 .next_deliverable(&pending_project_id, &pending_agent_id)?
-                .map(|task_id| store.get_task(&pending_project_id, &task_id))
+                .map(|task_id| {
+                    let task = store.get_task(&pending_project_id, &task_id)?;
+                    let binding = store.task_worktree_binding(&pending_project_id, &task_id)?;
+                    Ok((task, binding))
+                })
                 .transpose()
         })
         .await?;
-    let worktree = match pending.and_then(|task| task.snapshot.worktree_binding) {
-        Some(binding) => {
+    let target_binding = pending.as_ref().and_then(|(_, binding)| binding.clone());
+    let pending_task_id = pending.as_ref().map(|(task, _)| task.snapshot.id.clone());
+    let worktree = match pending.and_then(|(task, binding)| binding.map(|binding| (task, binding)))
+    {
+        Some((_task, binding)) => {
             let authority_project_id = project_id.clone();
             let (project, authority) = state
                 .with_store(move |store| {
@@ -1695,6 +1831,29 @@ async fn spawn_session_for_agent(
         None => agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?,
     };
     let worktree_path = PathBuf::from(&worktree);
+    let target_binding = if let Some(binding) = target_binding {
+        Some(binding)
+    } else {
+        let authority_project_id = project_id.clone();
+        let (project, authority) = state
+            .with_store(move |store| {
+                Ok((
+                    store.get_project(&authority_project_id)?,
+                    store.repository_authority(&authority_project_id)?,
+                ))
+            })
+            .await?;
+        Some(
+            crate::repository::observe_worktree_binding(
+                &project,
+                authority,
+                &worktree_path,
+                &format!("agent/{agent_id}"),
+            )
+            .await
+            .map_err(|error| Error::WorktreeBinding(error.to_string()))?,
+        )
+    };
 
     let provider_impl = select_provider(agent.snapshot.provider);
     let capabilities = provider_impl.capabilities();
@@ -1807,6 +1966,25 @@ async fn spawn_session_for_agent(
             rows: 50,
         }),
     };
+    if let Some(task_id) = pending_task_id {
+        let current_project_id = project_id.clone();
+        let current_agent_id = agent_id.clone();
+        let lookup_task_id = task_id.clone();
+        let current = state
+            .with_store(move |store| {
+                let current_id = store.next_deliverable(&current_project_id, &current_agent_id)?;
+                let current_binding =
+                    store.task_worktree_binding(&current_project_id, &lookup_task_id)?;
+                Ok((current_id, current_binding))
+            })
+            .await?;
+        if current.0.as_ref() != Some(&task_id) || current.1 != target_binding {
+            let _ = fs::remove_dir_all(&runtime_dir);
+            return Err(Error::WorktreeBinding(
+                "queued task target changed during session spawn; retry to rotate safely".into(),
+            ));
+        }
+    }
     // Created *before* the process spawn attempt (this track's item 1): a
     // `starting` session row makes a spawn failure durably visible
     // (`session list`/the TUI, an announcement + a red X) instead of
@@ -1816,6 +1994,7 @@ async fn spawn_session_for_agent(
     // with no visible trace and no runtime-directory cleanup (18 leaked
     // `runs/<uuid>/` directories in the repro that motivated this).
     let created_at_ms = now_ms()?;
+    let launch_binding = target_binding.clone();
     let new_session = crate::store::NewSession {
         id: session_id.clone(),
         project_id: project_id.clone(),
@@ -1832,6 +2011,7 @@ async fn spawn_session_for_agent(
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         runner_protocol_version: 1,
+        target_binding,
     };
     let snapshot = state
         .commit_and_publish(move |store| {
@@ -1839,6 +2019,44 @@ async fn spawn_session_for_agent(
             Ok((snapshot, vec![event]))
         })
         .await?;
+
+    // Final guard immediately before crossing into the runner. The earlier
+    // validation selects the provider/cwd; this second, adjacent check makes
+    // a deterministic worktree leaf replacement fail before the child can
+    // inherit the pathname. Git operations apply the same boundary in
+    // `repository::Target`.
+    if let Some(binding) = launch_binding {
+        let authority_project_id = project_id.clone();
+        let (project, authority) = state
+            .with_store(move |store| {
+                Ok((
+                    store.get_project(&authority_project_id)?,
+                    store.repository_authority(&authority_project_id)?,
+                ))
+            })
+            .await?;
+        let guard = crate::repository::revalidate_worktree_binding(&project, authority, &binding)
+            .await
+            .map_err(|error| Error::WorktreeBinding(error.to_string()));
+        if let Err(error) = guard {
+            let _ = fs::remove_dir_all(&runtime_dir);
+            let failed_session_id = session_id.clone();
+            let failed_at_ms = now_ms().unwrap_or(created_at_ms);
+            let _ = state
+                .commit_and_publish(move |store| {
+                    let (snapshot, events) = store.end_session_with_reason(
+                        &failed_session_id,
+                        None,
+                        None,
+                        Some("session target changed before launch".to_owned()),
+                        failed_at_ms,
+                    )?;
+                    Ok((snapshot, events))
+                })
+                .await;
+            return Err(error);
+        }
+    }
 
     let child = match runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await {
         Ok(child) => child,
@@ -2491,6 +2709,7 @@ async fn deliver_pending(
     let attempt = if let Some(attempt) = existing {
         attempt
     } else {
+        ensure_next_delivery_target(state, session).await?;
         if !backoff.try_begin_preparation(agent_id) {
             return Ok(());
         }
@@ -2506,6 +2725,7 @@ async fn deliver_pending(
         let Some(delivery) = delivery_result? else {
             return Ok(());
         };
+        ensure_session_target(state, session, delivery.task_id.as_ref()).await?;
         ensure_delivery_attempt(
             state,
             project_id,
@@ -2548,9 +2768,20 @@ async fn deliver_pending(
         session_run_id(&session.id)?,
         target.runner_instance_id,
     );
+    if let Some(task_id) = attempt.task_id.as_ref() {
+        if ensure_session_target(state, session, Some(task_id))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+    } else if ensure_session_target(state, session, None).await.is_err() {
+        return Ok(());
+    }
     if type_and_await_ack(
         state,
         &client,
+        session,
         &session.id,
         &attempt.id,
         &attempt.text,
@@ -2697,6 +2928,7 @@ async fn deliver_pending(
 async fn type_and_await_ack(
     state: &DaemonState,
     client: &RunnerClient,
+    session: &SessionSnapshot,
     session_id: &SessionId,
     attempt_id: &str,
     text: &str,
@@ -2705,6 +2937,26 @@ async fn type_and_await_ack(
     let body = encode_terminal_bytes(text.as_bytes());
     let submit = encode_terminal_bytes(b"\r");
     let mut events = state.subscribe();
+    let target_ok = state
+        .with_store({
+            let attempt_id = attempt_id.to_owned();
+            move |store| store.delivery_attempt(&attempt_id)
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|attempt| async move {
+            ensure_session_target(state, session, attempt.task_id.as_ref())
+                .await
+                .is_ok()
+        });
+    if let Some(check) = target_ok {
+        if !check.await {
+            return false;
+        }
+    } else {
+        return false;
+    }
     if !delivery_attempt_active(state, attempt_id).await {
         return false;
     }
@@ -2853,6 +3105,22 @@ pub async fn stop_hook_reply(
     let Some(_delivery_slot) = state.try_delivery_slot(&session.agent_id) else {
         return Ok(serde_json::json!({}));
     };
+    let project_id = session.project_id.clone();
+    let agent_id = session.agent_id.clone();
+    let has_pending = state
+        .with_store(move |store| {
+            Ok(store.next_deliverable(&project_id, &agent_id)?.is_some()
+                || !store
+                    .undelivered_messages_for_agent(&project_id, &agent_id)?
+                    .is_empty())
+        })
+        .await?;
+    if !has_pending {
+        return Ok(serde_json::json!({}));
+    }
+    ensure_next_delivery_target(state, session)
+        .await
+        .map_err(|_error| DaemonStateError::Store(StoreError::InvalidExecutionMetadata))?;
     let Some(delivery) = compose_delivery(
         state,
         guidance_root,
@@ -2920,8 +3188,8 @@ fn compose_text(
         ));
         if let Some(binding) = task.snapshot.worktree_binding.as_ref() {
             sections.push(format!(
-                "Daemon-pinned target (do not substitute a path or branch):\n  worktree: {}\n  branch: {}\n  starting HEAD: {}",
-                binding.path, binding.branch, binding.starting_head
+                "Daemon-pinned target (do not substitute a path or branch):\n  branch: {}\n  starting HEAD: {}",
+                binding.branch, binding.starting_head
             ));
         }
     }
@@ -3530,6 +3798,7 @@ mod tests {
                 .unwrap(),
             runner_runtime: directory.path().join("old").to_string_lossy().into_owned(),
             runner_protocol_version: 1,
+            target_binding: None,
         };
         let (initial, _) = store.create_session(initial, 3).unwrap();
         store.end_session(&initial.id, Some(0), None, 4).unwrap();
@@ -3552,6 +3821,7 @@ mod tests {
                     runner_instance_id: instance_id.clone(),
                     runner_runtime: runtime_dir.to_string_lossy().into_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 5,
             )
@@ -3805,6 +4075,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1_000,
             )
@@ -4344,6 +4615,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1_000,
             )
@@ -4431,6 +4703,7 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory/runs/session-1".to_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1_000,
             )
@@ -4556,6 +4829,7 @@ mod tests {
                         runner_instance_id: RunnerInstanceId::try_from(session_uuid).unwrap(),
                         runner_runtime: format!("/tmp/factory/runs/{agent_name}"),
                         runner_protocol_version: 1,
+                        target_binding: None,
                     },
                     1_000,
                 )
@@ -4693,6 +4967,7 @@ mod tests {
                     runner_instance_id: runner_instance_id.clone(),
                     runner_runtime: runtime_dir.to_string_lossy().into_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1_000,
             )
@@ -4975,6 +5250,7 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner".to_owned(),
                     runner_protocol_version: 1,
+                    target_binding: None,
                 },
                 1_000,
             )

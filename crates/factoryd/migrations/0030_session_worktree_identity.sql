@@ -1,0 +1,10 @@
+ALTER TABLE sessions ADD COLUMN target_branch TEXT;
+ALTER TABLE sessions ADD COLUMN target_starting_head TEXT;
+ALTER TABLE sessions ADD COLUMN target_git_dir TEXT;
+ALTER TABLE sessions ADD COLUMN target_common_dir TEXT;
+ALTER TABLE sessions ADD COLUMN target_device INTEGER;
+ALTER TABLE sessions ADD COLUMN target_inode INTEGER;
+ALTER TABLE sessions ADD COLUMN target_git_dir_device INTEGER;
+ALTER TABLE sessions ADD COLUMN target_git_dir_inode INTEGER;
+ALTER TABLE sessions ADD COLUMN target_common_dir_device INTEGER;
+ALTER TABLE sessions ADD COLUMN target_common_dir_inode INTEGER;

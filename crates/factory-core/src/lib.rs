@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -344,21 +344,12 @@ pub struct TaskSnapshot {
     pub updated_at_ms: i64,
 }
 
-/// A repository target captured by the daemon, never inferred from task prose.
-/// Filesystem identities make a path replacement fail closed after restart.
+/// Minimal operator context for a daemon-pinned repository target. The daemon
+/// keeps the canonical paths and filesystem identities private.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorktreeBinding {
-    pub path: String,
     pub branch: String,
     pub starting_head: String,
-    pub git_dir: String,
-    pub common_dir: String,
-    pub worktree_device: u64,
-    pub worktree_inode: u64,
-    pub git_dir_device: u64,
-    pub git_dir_inode: u64,
-    pub common_dir_device: u64,
-    pub common_dir_inode: u64,
 }
 
 /// A task snapshot together with the instructions supplied to its agent.

@@ -42,6 +42,7 @@ fn new_session(seed: &str, project: &str, agent: &str) -> NewSession {
         runner_instance_id: RunnerInstanceId::try_from(format!("instance-{seed}")).unwrap(),
         runner_runtime: format!("/private/runners/{seed}"),
         runner_protocol_version: 1,
+        target_binding: None,
     }
 }
 
@@ -210,7 +211,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 28 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 30 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, provider resume recovery, observer
 /// reason, typed notification cause, and the widened Claude notification
@@ -314,7 +315,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -387,7 +388,7 @@ fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 30);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -483,7 +484,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 30);
     let message_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
@@ -603,7 +604,7 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

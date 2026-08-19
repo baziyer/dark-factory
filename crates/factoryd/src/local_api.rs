@@ -48,7 +48,7 @@ use crate::{
     runner_client::{RunnerClient, RunnerClientError},
     store::{
         AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
-        SessionControlTarget, StoreError, UpdateAgentProfile,
+        SessionControlTarget, StoreError, TaskWorktreeBinding, UpdateAgentProfile,
     },
 };
 
@@ -2892,7 +2892,7 @@ async fn task_worktree_binding(
     worktree: Option<String>,
     branch: Option<String>,
     starting_head: Option<String>,
-) -> Result<Option<factory_core::WorktreeBinding>, ApiFailure> {
+) -> Result<Option<TaskWorktreeBinding>, ApiFailure> {
     if worktree.is_none() && branch.is_none() && starting_head.is_none() {
         return Ok(None);
     }
@@ -2933,12 +2933,14 @@ async fn validate_task_result_target(
     project_id: &ProjectId,
     task_id: &factory_core::TaskId,
 ) -> Result<(), ApiFailure> {
-    let lookup_project_id = project_id.clone();
-    let lookup_task_id = task_id.clone();
-    let task = state
-        .with_store(move |store| store.get_task(&lookup_project_id, &lookup_task_id))
-        .await?;
-    let Some(binding) = task.snapshot.worktree_binding else {
+    let Some(binding) = state
+        .with_store({
+            let project_id = project_id.clone();
+            let task_id = task_id.clone();
+            move |store| store.task_worktree_binding(&project_id, &task_id)
+        })
+        .await?
+    else {
         return Ok(());
     };
     let authority_project_id = project_id.clone();
@@ -3638,6 +3640,7 @@ mod deletion_gate_tests {
                         .unwrap(),
                         runner_runtime: directory.join("old").to_string_lossy().into_owned(),
                         runner_protocol_version: 1,
+                        target_binding: None,
                     },
                     999,
                 )
@@ -3700,6 +3703,7 @@ mod deletion_gate_tests {
                         .unwrap(),
                         runner_runtime: session_runtime,
                         runner_protocol_version: 1,
+                        target_binding: None,
                     },
                     1_000,
                 )?;
@@ -4335,6 +4339,7 @@ mod deletion_gate_tests {
                             .unwrap(),
                         runner_runtime: format!("/tmp/runner-{name}"),
                         runner_protocol_version: 1,
+                        target_binding: None,
                     },
                     4,
                 )

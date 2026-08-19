@@ -112,6 +112,11 @@ catalogue.
    branch, and starting HEAD; dispatch and repository publication revalidate
    that target before a provider starts or a result is claimed, so prose or a
    parent-agent checkout cannot redirect the change.
+   A resident session durably leases the same target identity for every
+   episode: compose, PTY input, and Stop-hook replies reject unbound,
+   reassigned, deleted, or replaced successors until the session is rotated.
+   Public task snapshots project only branch and starting-HEAD context; the
+   canonical paths and device/inode authority remain daemon-private.
    Fleet and per-agent status both expose the same live git summary for
    that worktree and the same structured operator-attention reasons. Those
    reasons separate provider questions/permissions from worker blocks,
@@ -193,7 +198,9 @@ catalogue.
    update. Remote and PR base come from write-once operator-pinned durable state configured before any session, never
    mutable `origin` metadata. It serializes repository operations through one
    committer, rejects protected/detached/mismatched refs, and writes
-   credential- and content-free request/result events. Review and merge remain
+   credential- and content-free request/result events. Path validation is
+   repeated at the final launch/Git-use boundary and rejects a replaced
+   worktree leaf. Review and merge remain
    outside this API, preserving the independent-review invariant.
 9. Once deletion of an agent or project begins, every known writer of files
    under its identity is blocked from starting a new write and drained if

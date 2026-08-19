@@ -1,10 +1,10 @@
 use factory_core::{
     AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, RunId, RunnerInstanceId,
-    SessionId, TaskId, TaskStatus, WorktreeBinding, local::MAX_TASK_BODY_BYTES,
+    SessionId, TaskId, TaskStatus, local::MAX_TASK_BODY_BYTES,
 };
 use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
-    NewTask, Store, StoreError, UpdateAgentProfile,
+    NewTask, Store, StoreError, TaskWorktreeBinding, UpdateAgentProfile,
 };
 use std::sync::{Arc, Barrier};
 
@@ -464,6 +464,7 @@ fn open_episode(
                 runner_instance_id: RunnerInstanceId::try_from(format!("instance-{seed}")).unwrap(),
                 runner_runtime: format!("/private/runners/{seed}"),
                 runner_protocol_version: 1,
+                target_binding: None,
             },
             now,
         )
@@ -550,7 +551,7 @@ fn project_task_and_events_survive_reopen() {
 fn task_worktree_binding_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("factory.db");
-    let binding = WorktreeBinding {
+    let binding = TaskWorktreeBinding {
         path: "/tmp/nested-pr".into(),
         branch: "pr/nested".into(),
         starting_head: "a".repeat(40),
@@ -599,6 +600,15 @@ fn task_worktree_binding_survives_restart() {
             .unwrap()
             .snapshot
             .worktree_binding,
+        Some(factory_core::WorktreeBinding {
+            branch: "pr/nested".into(),
+            starting_head: "a".repeat(40),
+        })
+    );
+    assert_eq!(
+        store
+            .task_worktree_binding(&project_id("factory"), &task_id)
+            .unwrap(),
         Some(binding)
     );
 }
