@@ -535,6 +535,8 @@ fn create_codex_agent(client: &Client, agent_id: &str) -> factory_core::AgentSna
             role: AgentRole::Worker,
             provider: Provider::Codex,
             model: None,
+            reasoning_effort: None,
+            model_selection_reason: None,
             worktree: None,
         })
         .unwrap();
@@ -992,7 +994,7 @@ fn a_standalone_message_delivers_without_opening_a_run() {
             .then_some(())
     });
 
-    wait_for_stable_idle(&client, "curie");
+    wait_for_session_state(&client, "curie", SessionState::Idle);
     let prompt_submits = events_after(&client, 0)
         .into_iter()
         .filter(|envelope| {
@@ -2004,7 +2006,7 @@ fn a_refused_delete_project_leaves_every_file_intact() {
     // shell-agent.sh completes the task and settles back to Idle -- still
     // live (`ended_at_ms IS NULL`), which is exactly what
     // `ProjectHasActiveRun` checks for.
-    wait_for_session_state(&client, "curie", SessionState::Idle);
+    wait_for_stable_idle(&client, "curie");
 
     let deleted = client
         .request(LocalRequest::DeleteProject {
