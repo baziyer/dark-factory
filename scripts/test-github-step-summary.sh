@@ -86,5 +86,8 @@ grep -F 'cargo +1.88.0 build --locked --release --workspace --target "$INTEL_TAR
 grep -F '"$PUBLISHER" "$TAG" "$SOURCE_SHA" "$GITHUB_REPOSITORY" dist/*' .github/workflows/release.yml >/dev/null
 grep -F 'if: always()' .github/workflows/ci.yml >/dev/null
 grep -F 'if: always()' .github/workflows/release.yml >/dev/null
+for state in queued in-progress blocked review release-ready; do
+    grep -F "state:$state|" scripts/github-repo-settings.sh >/dev/null
+done
 
 echo 'github step summary and workflow-preservation checks passed'
