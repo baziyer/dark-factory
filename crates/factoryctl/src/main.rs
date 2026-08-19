@@ -6,7 +6,7 @@ use std::{
 };
 
 use factory_core::local::{
-    LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
+    GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
     MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
     ServerFrame,
 };
@@ -522,7 +522,9 @@ run; the queued tasks assigned to it (oldest first, first 10 listed, full
 depth alongside); undelivered inbox messages; structured bounded attention
 reasons with source IDs, age, and safe actions (the same projection shown by
 `factoryctl status` and `factory-tui`); and, when it has a worktree, `git
-status` summarized (branch, changed files, dirty).
+status` summarized (branch, changed files, dirty). Memory is projected with
+bounded health (`ok`, `near_limit`, `oversized`, `invalid_utf8`, or
+`path_error`); unhealthy content is omitted, never allowed to hide status.
 
 Required:
   --project ID           Project the agent belongs to
@@ -531,8 +533,10 @@ Options:
   -h, --help             Show this help";
 const AGENT_GET_HELP: &str = "usage: factoryctl agent get --project ID --agent ID
 
-Fetch one agent, including the absolute paths of its `instructions.md` and
-`memory.md` guidance files and their current contents.
+Fetch one agent, including the absolute paths of its `instructions.md`,
+`memory.md`, and private lossless memory archive, plus current memory health.
+Healthy memory content is included; oversized or invalid content is omitted
+so the mechanical lookup still succeeds.
 
 Required:
   --project ID           Project the agent belongs to
@@ -1334,11 +1338,21 @@ fn agent_profile_set_frame(
     };
     let instructions = match instructions_file {
         Some(path) => read_guidance_file(&path)?,
-        None => agent.profile.instructions,
+        None => reusable_guidance(
+            &agent.profile.instructions,
+            agent.instructions_health.state,
+            "instructions",
+            "--instructions-file",
+        )?,
     };
     let memory = match memory_file {
         Some(path) => read_guidance_file(&path)?,
-        None => agent.profile.memory,
+        None => reusable_guidance(
+            &agent.profile.memory,
+            agent.memory_health.state,
+            "memory",
+            "--memory-file",
+        )?,
     };
     let selected_model = model.clone().or_else(|| agent.profile.model.clone());
     let model_changed = model.is_some() && selected_model != agent.profile.model;
@@ -1359,6 +1373,24 @@ fn agent_profile_set_frame(
             memory,
         })
         .map_err(|error| error.to_string())
+}
+
+fn reusable_guidance(
+    content: &str,
+    state: GuidanceHealthState,
+    label: &str,
+    replacement_option: &str,
+) -> Result<String, String> {
+    if matches!(
+        state,
+        GuidanceHealthState::Ok | GuidanceHealthState::NearLimit
+    ) {
+        Ok(content.to_owned())
+    } else {
+        Err(format!(
+            "{label} is {state:?}; supply {replacement_option} to replace it instead of clearing it"
+        ))
+    }
 }
 
 fn read_guidance_file(path: &str) -> Result<String, String> {
@@ -3655,6 +3687,19 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn unhealthy_guidance_cannot_be_silently_cleared_by_profile_update() {
+        let error = reusable_guidance(
+            "",
+            GuidanceHealthState::Oversized,
+            "memory",
+            "--memory-file",
+        )
+        .unwrap_err();
+        assert!(error.contains("memory is Oversized"));
+        assert!(error.contains("--memory-file"));
     }
 
     #[test]

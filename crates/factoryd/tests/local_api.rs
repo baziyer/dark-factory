@@ -62,13 +62,23 @@ async fn raw_request(socket: &Path, payload: &[u8]) -> ServerFrame {
     read_frame(&mut BufReader::new(stream)).await
 }
 
+fn private_tempdir() -> tempfile::TempDir {
+    let base = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let directory = tempfile::tempdir_in(base).unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    directory
+}
+
 async fn with_server<F, Fut>(test: F)
 where
     F: FnOnce(std::path::PathBuf) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
@@ -95,8 +105,7 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_events() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let database = directory.path().join("factory.db");
     let project_id = project_id("factory");
     {
@@ -553,8 +562,7 @@ async fn the_frame_limit_counts_json_but_not_the_newline_delimiter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_closes_idle_connections_before_returning() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
@@ -584,8 +592,7 @@ async fn shutdown_closes_idle_connections_before_returning() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_a_blocked_historical_replay() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let directory = private_tempdir();
     let socket = directory.path().join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let mut store = Store::open_in_memory().unwrap();
@@ -2344,6 +2351,26 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
             );
         }
 
+        // Mechanical status remains available when an old install has a
+        // memory file beyond the provider guidance bound; the response carries
+        // health instead of echoing unbounded content or failing the lookup.
+        let memory_path = factory_core::paths::agent_memory_path(
+            socket.parent().unwrap(),
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        std::fs::write(
+            &memory_path,
+            vec![b'x'; factoryd::guidance::MAX_GUIDANCE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        let instructions_path = factory_core::paths::agent_instructions_path(
+            socket.parent().unwrap(),
+            &project_id("factory"),
+            &agent_id("curie"),
+        );
+        std::fs::write(&instructions_path, [0xff]).unwrap();
+
         let ServerFrame::Response {
             response: LocalResponse::FleetStatus { status },
             ..
@@ -2406,6 +2433,16 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         };
         assert_eq!(detail.status, *curie, "the same picture the fleet view had");
         assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert_eq!(
+            detail.detail.memory_health.state,
+            factory_core::local::GuidanceHealthState::Oversized
+        );
+        assert_eq!(
+            detail.detail.instructions_health.state,
+            factory_core::local::GuidanceHealthState::InvalidUtf8
+        );
+        assert!(detail.detail.profile.instructions.is_empty());
+        assert!(detail.detail.profile.memory.is_empty());
         assert_eq!(detail.attention, vec![item.clone()]);
         assert!(detail.generated_at_ms > 0);
         assert!(detail.detail.instructions_path.ends_with("instructions.md"));

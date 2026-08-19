@@ -101,6 +101,7 @@ impl Daemon {
             .arg(runner)
             .arg("--factoryctl")
             .arg(factoryctl_path())
+            .env_remove("DARK_FACTORY_SOCKET")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -343,7 +344,12 @@ impl Drop for ManagedLaunchdGuard {
 /// `tempfile::tempdir()`'s own default mode also depends on the calling
 /// process's umask, which is not reliably `0700` under `cargo test`.
 fn private_tempdir() -> tempfile::TempDir {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let base = if cfg!(target_os = "macos") {
+        "/private/tmp"
+    } else {
+        "/tmp"
+    };
+    let directory = tempfile::tempdir_in(base).unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     directory
 }

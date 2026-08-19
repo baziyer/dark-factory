@@ -1164,8 +1164,16 @@ async fn handle_request(
                     .await;
             execution.end_agent_write(&agent_id);
             write_result?;
+            let instructions_health = guidance::health_for_valid_bytes(instructions.len());
             Ok(LocalResponse::AgentProfileUpdated {
-                agent: local_agent_detail(agent, instructions, memory, agent_paths),
+                agent: local_agent_detail(
+                    agent,
+                    instructions,
+                    instructions_health,
+                    memory.clone(),
+                    guidance::health_for_valid_bytes(memory.len()),
+                    agent_paths,
+                ),
             })
         }
         LocalRequest::GetProject { project_id } => {
@@ -2353,6 +2361,7 @@ fn repository_failure(error: repository::Error) -> ApiFailure {
 
 /// Absolute guidance-file paths for one agent, computed from the daemon's
 /// state root; never touches the filesystem itself.
+#[derive(Clone)]
 struct AgentGuidancePaths {
     instructions: PathBuf,
     memory: PathBuf,
@@ -2398,22 +2407,49 @@ async fn agent_detail_with_guidance(
     let agent_paths = AgentGuidancePaths::new(guidance_root, project_id, agent_id);
     let guidance = read_agent_guidance_files(&agent_paths).await;
     execution.end_agent_write(agent_id);
-    let (instructions, memory) = guidance?;
-    Ok(local_agent_detail(agent, instructions, memory, agent_paths))
+    let (instructions, instructions_health, memory, memory_health) = guidance?;
+    Ok(local_agent_detail(
+        agent,
+        instructions,
+        instructions_health,
+        memory,
+        memory_health,
+        agent_paths,
+    ))
 }
 
 async fn read_agent_guidance_files(
     paths: &AgentGuidancePaths,
-) -> Result<(String, String), ApiFailure> {
-    let instructions = read_guidance_file(paths.instructions.clone()).await?;
-    let memory = read_guidance_file(paths.memory.clone()).await?;
-    Ok((instructions, memory))
+) -> Result<
+    (
+        String,
+        factory_core::local::GuidanceHealth,
+        String,
+        factory_core::local::GuidanceHealth,
+    ),
+    ApiFailure,
+> {
+    let paths = paths.clone();
+    tokio::task::spawn_blocking(move || {
+        let instructions = guidance::inspect(&paths.instructions);
+        let memory = guidance::inspect(&paths.memory);
+        Ok((
+            instructions.content.unwrap_or_default(),
+            instructions.health,
+            memory.content.unwrap_or_default(),
+            memory.health,
+        ))
+    })
+    .await
+    .map_err(|error| ApiFailure::Internal(format!("guidance worker failed: {error}")))?
 }
 
 fn local_agent_detail(
     agent: crate::store::AgentDetail,
     instructions: String,
+    instructions_health: factory_core::local::GuidanceHealth,
     memory: String,
+    memory_health: factory_core::local::GuidanceHealth,
     paths: AgentGuidancePaths,
 ) -> LocalAgentDetail {
     LocalAgentDetail {
@@ -2428,7 +2464,10 @@ fn local_agent_detail(
             updated_at_ms: agent.profile.updated_at_ms,
         },
         instructions_path: path_to_string(&paths.instructions),
+        instructions_health,
         memory_path: path_to_string(&paths.memory),
+        memory_archive_path: path_to_string(&guidance::memory_archive_path(&paths.memory)),
+        memory_health,
         project_guidance_path: path_to_string(&paths.project_guidance),
     }
 }
@@ -3424,7 +3463,12 @@ mod deletion_gate_tests {
     };
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let base = if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        };
+        let directory = tempfile::tempdir_in(base).unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }

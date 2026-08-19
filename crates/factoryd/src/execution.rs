@@ -239,6 +239,8 @@ pub enum Error {
     InvalidClock,
     #[error("provider launch failed: {0}")]
     Provider(#[from] providers::ProviderError),
+    #[error("memory compaction failed: {0}")]
+    MemoryCompaction(#[from] guidance::GuidanceError),
     #[error("could not write session hook token: {0}")]
     HookToken(#[from] hooks::HookTokenError),
     #[error("runner launch failed: {0}")]
@@ -1607,6 +1609,13 @@ async fn spawn_session_for_agent(
     let agent = state
         .with_store(move |store| store.get_agent_detail(&detail_project_id, &detail_agent_id))
         .await?;
+    // This function is reached only for an agent with no live session and is
+    // already protected by the per-agent preparation gate. Repair oversized
+    // memory before constructing any provider launch, so a safe relaunch is
+    // also the self-healing boundary for old installs.
+    let memory_path =
+        factory_core::paths::agent_memory_path(&config.guidance_root, project_id, agent_id);
+    let _ = guidance::compact_memory(&memory_path)?;
     let auto_mode = state.with_store(|store| store.auto_mode()).await?;
     let worktree = agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?;
     let worktree_path = PathBuf::from(&worktree);
@@ -2848,24 +2857,23 @@ fn compose_text(
     }
     if let Ok(project_guidance) = guidance::read_or_create(
         &factory_core::paths::project_guidance_path(guidance_root, project_id),
-    ) {
-        if !project_guidance.trim().is_empty() {
-            sections.push(format!(
-                "Project guidance (PROJECT.md):\n{project_guidance}"
-            ));
-        }
+    ) && !project_guidance.trim().is_empty()
+    {
+        sections.push(format!(
+            "Project guidance (PROJECT.md):\n{project_guidance}"
+        ));
     }
     if let Ok(instructions) = guidance::read_or_create(
         &factory_core::paths::agent_instructions_path(guidance_root, project_id, agent_id),
-    ) {
-        if !instructions.trim().is_empty() {
-            sections.push(format!("Standing instructions:\n{instructions}"));
-        }
+    ) && !instructions.trim().is_empty()
+    {
+        sections.push(format!("Standing instructions:\n{instructions}"));
     }
     let memory_path = factory_core::paths::agent_memory_path(guidance_root, project_id, agent_id);
     sections.push(format!(
-        "Append durable lessons to your memory file: {}",
-        memory_path.display()
+        "Curate and merge durable lessons in your memory file instead of appending indefinitely: {}. Keep the active file below {} bytes; concise summaries are authoritative and older exact bytes are preserved in the private archive by the daemon.",
+        memory_path.display(),
+        guidance::MEMORY_COMPACTION_HIGH_WATER_BYTES
     ));
     if matches!(role, AgentRole::Orchestrator) {
         sections.push(ORCHESTRATOR_FOOTER.to_owned());
@@ -3558,7 +3566,12 @@ mod tests {
     }
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        let base = if cfg!(target_os = "macos") {
+            "/private/tmp"
+        } else {
+            "/tmp"
+        };
+        let directory = tempfile::tempdir_in(base).unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
@@ -3790,6 +3803,87 @@ mod tests {
                 .await
                 .unwrap(),
             "ending occupant's session must free the slot immediately"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_repairs_oversized_memory_before_spawn_preparation() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: directory.path().to_string_lossy().into_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: TaskId::try_from("task-1").unwrap(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Do the thing".to_owned(),
+                    body: "Do the thing.".to_owned(),
+                    priority: 0,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id,
+                &TaskId::try_from("task-1").unwrap(),
+                Some(&agent_id),
+                1_000,
+            )
+            .unwrap();
+        let state = DaemonState::new(store);
+        let memory_path =
+            factory_core::paths::agent_memory_path(directory.path(), &project_id, &agent_id);
+        guidance::ensure_agent(directory.path(), &project_id, &agent_id).unwrap();
+        fs::write(
+            &memory_path,
+            format!(
+                "old lesson\n{}",
+                "x".repeat(guidance::MAX_GUIDANCE_FILE_BYTES)
+            ),
+        )
+        .unwrap();
+        let cfg = config(directory.path());
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let backoff = SpawnBackoff::new();
+
+        // This fixture deliberately has no worktree, so preparation records a
+        // spawn failure after the memory repair. The assertion isolates the
+        // dispatch boundary and would fail if compaction moved after launch.
+        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
+            .await
+            .unwrap();
+        assert!(
+            (fs::metadata(&memory_path).unwrap().len() as usize)
+                < guidance::MEMORY_COMPACTION_HIGH_WATER_BYTES
+        );
+        assert_eq!(
+            guidance::inspect(&memory_path).health.state,
+            factory_core::local::GuidanceHealthState::Ok
         );
     }
 
@@ -5237,7 +5331,7 @@ mod tests {
 
     #[test]
     fn compose_text_embeds_the_task_colon_id_marker_the_shell_fixture_looks_for() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5250,12 +5344,15 @@ mod tests {
         assert!(text.contains("factoryctl task done --task task-1"));
         assert!(text.contains("factoryctl task blocked --task task-1"));
         assert!(text.contains("Do the work."));
+        assert!(text.contains("Curate and merge durable lessons"));
+        assert!(text.contains("Keep the active file below 12288 bytes"));
+        assert!(!text.contains("Append durable lessons to your memory file"));
         assert!(!text.contains("As the orchestrator"));
     }
 
     #[test]
     fn compose_text_appends_the_orchestrator_footer_only_for_orchestrators() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5275,7 +5372,7 @@ mod tests {
 
     #[test]
     fn compose_text_never_exceeds_the_delivery_bound() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_tempdir();
         let text = compose_text(
             directory.path(),
             &ProjectId::try_from("factory").unwrap(),
@@ -5286,5 +5383,35 @@ mod tests {
         );
         assert!(text.len() <= MAX_DELIVERY_TEXT_BYTES + "\n...[truncated]".len());
         assert!(text.starts_with("Task task-1"));
+    }
+
+    #[test]
+    fn composing_guidance_does_not_rewrite_project_or_standing_instructions() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let project_path =
+            factory_core::paths::project_guidance_path(directory.path(), &project_id);
+        let instructions_path =
+            factory_core::paths::agent_instructions_path(directory.path(), &project_id, &agent_id);
+        guidance::write(&project_path, "Rules stay byte-identical.\n").unwrap();
+        guidance::write(&instructions_path, "Standing instructions stay put.\n").unwrap();
+        let project_before = std::fs::read(&project_path).unwrap();
+        let instructions_before = std::fs::read(&instructions_path).unwrap();
+
+        let _ = compose_text(
+            directory.path(),
+            &project_id,
+            &agent_id,
+            None,
+            &[],
+            AgentRole::Worker,
+        );
+
+        assert_eq!(std::fs::read(project_path).unwrap(), project_before);
+        assert_eq!(
+            std::fs::read(instructions_path).unwrap(),
+            instructions_before
+        );
     }
 }

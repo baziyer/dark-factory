@@ -303,7 +303,11 @@ fn agent_profile_is_available_only_through_private_local_detail() {
             },
             instructions_path:
                 "/home/user/.dark-factory/projects/factory/agents/god/instructions.md".into(),
+            instructions_health: Default::default(),
             memory_path: "/home/user/.dark-factory/projects/factory/agents/god/memory.md".into(),
+            memory_archive_path:
+                "/home/user/.dark-factory/projects/factory/agents/god/memory-archive".into(),
+            memory_health: Default::default(),
             project_guidance_path: "/home/user/.dark-factory/projects/factory/PROJECT.md".into(),
         },
     };
