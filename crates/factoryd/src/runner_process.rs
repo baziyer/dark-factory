@@ -1010,7 +1010,8 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(runner_argv.contains("--run-id\nrun-safe-launch\n"));
         assert!(runner_argv.contains("--runner-instance-id\nrunner-safe-launch\n"));
         assert!(runner_argv.contains("--safe-provider-flag"));
-        assert!(runner_argv.contains(directory.path().join("provider-probe").to_str().unwrap()));
+        let expected_provider = fs::canonicalize(directory.path().join("provider-probe")).unwrap();
+        assert!(runner_argv.contains(expected_provider.to_str().unwrap()));
     }
 
     #[tokio::test]
