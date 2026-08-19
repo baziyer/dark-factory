@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 import tty
 
 factoryctl = os.environ.get("DARK_FACTORY_FACTORYCTL", "factoryctl")
@@ -62,6 +63,9 @@ hook("SessionStart", {"session_id": thread_id})
 ignored_resumed_deliveries = 1 if resumed else 0
 buffer = bytearray()
 prompt_log = os.path.join(os.path.dirname(token), "fake-codex-prompts.jsonl")
+delay_hook = os.path.exists(
+    os.path.join(os.path.dirname(sys.argv[0]), "delay-user-prompt-submit")
+)
 while True:
     data = os.read(sys.stdin.fileno(), 1)
     if not data:
@@ -78,6 +82,8 @@ while True:
         if prompt_log:
             with open(prompt_log, "a", encoding="utf-8") as log:
                 log.write(json.dumps(text) + "\n")
+        if delay_hook:
+            time.sleep(3)
         hook("UserPromptSubmit", {"prompt": text})
         hook("PreToolUse", {"tool_name": "Bash"})
         hook("PostToolUse", {"tool_name": "Bash"})

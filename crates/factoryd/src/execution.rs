@@ -64,10 +64,10 @@ use crate::{
 };
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-/// How long PTY-typed delivery waits for a matching `UserPromptSubmit` hook
-/// before retrying once (TRACK5-DESIGN.md §3/A3).
+/// How long a PTY delivery waits for a matching `UserPromptSubmit` hook.
+/// Recovery uses the same bound after its bare CR and never retypes an input
+/// that the provider may already have accepted.
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
-const RECOVERY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Gap between a composed delivery's text and its submitting `\r`, sent as
 /// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
 /// has the why: real Claude Code's paste-vs-keystroke heuristic otherwise
@@ -2455,6 +2455,8 @@ async fn deliver_pending(
 /// Types `text` into `session_id`'s PTY, then submits it with a trailing
 /// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for the
 /// exact delivery attempt's `UserPromptSubmit` hook to confirm receipt.
+/// Recovery submits only a bare CR to an already-buffered prompt and waits
+/// for the same bound; it never retypes the body after that possible submit.
 /// Subscribing to the daemon's event stream *before* writing (not after)
 /// avoids missing a hook that fires between the write and the subscribe
 /// call.
@@ -2500,7 +2502,12 @@ async fn type_and_await_ack(
         let Ok(flush_started_at_ms) = now_ms() else {
             return false;
         };
-        if client
+        // The CR may already have been accepted by the provider even when
+        // its hook is slow. Never retype the body after that admission: a
+        // second body+CR could submit the same model turn twice. If the
+        // normal acknowledgement bound expires, the caller records a
+        // durable failure and explicit resume is required to re-arm it.
+        return client
             .terminal_input(encode_terminal_bytes(b"\r"))
             .await
             .is_ok()
@@ -2510,12 +2517,9 @@ async fn type_and_await_ack(
                 session_id,
                 attempt_id,
                 flush_started_at_ms,
-                RECOVERY_FLUSH_TIMEOUT,
+                ACK_TIMEOUT,
             )
-            .await
-        {
-            return true;
-        }
+            .await;
     }
     let Ok(write_started_at_ms) = now_ms() else {
         return false;

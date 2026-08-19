@@ -144,8 +144,10 @@ them into `factory_core::ProviderHookEvent` values (see
      event, then launches the successor with `ctx.resume` when supported. If
      the resumed provider does not acknowledge the first delivery, the shared
      path records the exact prompt as a durable delivery attempt, makes one
-     bounded delayed recovery retry, and leaves `delivery unacknowledged`
-     durably visible if it still fails. A daemon restart consumes an
+     bounded recovery submission using a bare CR, and leaves
+     `delivery unacknowledged` durably visible if its hook still fails. It
+     never retypes a body after that CR because the provider may already have
+     accepted it. A daemon restart consumes an
      interrupted attempt rather than resetting its retry budget; only an
      explicit operator resume resets a terminal attempt. A provider must not
      silently consume a prompt without its exact hook acknowledgement. The
