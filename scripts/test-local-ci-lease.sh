@@ -36,6 +36,29 @@ fail() {
     exit 1
 }
 
+wait_checked() {
+    phase=$1
+    pid=$2
+    if wait "$pid"; then
+        return 0
+    else
+        status=$?
+    fi
+    fail "$phase: child pid=$pid exited status=$status"
+}
+
+wait_terminated() {
+    phase=$1
+    pid=$2
+    if wait "$pid"; then
+        fail "$phase: killed process-tree root pid=$pid exited status=0"
+    else
+        status=$?
+    fi
+    printf 'local-ci lease test: %s child pid=%s exited status=%s after tree teardown\n' \
+        "$phase" "$pid" "$status" >&2
+}
+
 wait_for_file() {
     file=$1
     attempts=0
@@ -114,17 +137,17 @@ background_pids="$background_pids $starting_pid"
 wait_for_file "$starting_marker/owner"
 starting_owner_pid=$(sed -n 's/^pid=//p' "$starting_marker/owner")
 case "$starting_owner_pid" in
-    ''|*[!0-9]*) fail "startup marker did not contain a numeric owner PID" ;;
+    ''|*[!0-9]*) fail "startup-kill phase: marker did not contain a numeric owner PID" ;;
 esac
-kill -KILL "$starting_owner_pid"
-wait "$starting_pid" 2>/dev/null || true
+kill_tree "$starting_pid"
+wait_terminated "startup-kill phase" "$starting_pid"
 (
     cd "$second"
     ./scripts/with-local-ci-lease.sh "$short_command" "$starting_waiter"
 ) 2>"$starting_waiter_stderr" &
 starting_waiter_pid=$!
 background_pids="$background_pids $starting_waiter_pid"
-wait "$starting_waiter_pid" || fail "waiter did not recover a killed startup holder"
+wait_checked "startup-recovery waiter" "$starting_waiter_pid"
 [ -f "$starting_waiter" ] || fail "recovered waiter did not run its command"
 assert_absent "$starting_marker"
 assert_absent "$lease_path"
@@ -182,7 +205,7 @@ background_pids="$background_pids $tree_pid"
 wait_for_file "$tree_child_pid_file"
 tree_child_pid=$(cat "$tree_child_pid_file")
 kill_tree "$tree_pid"
-wait "$tree_pid" 2>/dev/null || true
+wait_terminated "process-tree cleanup phase" "$tree_pid"
 kill -0 "$tree_child_pid" 2>/dev/null && fail "fixture descendant survived process-tree cleanup"
 
 fake_ps_bin="$temporary/fake-bin"
@@ -236,7 +259,7 @@ waiter_pid=$!
 background_pids="$background_pids $waiter_pid"
 sleep 0.2
 [ ! -f "$waiter_marker" ] || fail "waiter acquired before the owner released"
-wait "$waiter_pid" || fail "waiter did not continue after the holder released"
+wait_checked "ordinary waiter" "$waiter_pid"
 [ "$(grep -c 'current owner:' "$waiter_stderr")" -eq 1 ] || fail "owner diagnostic count changed"
 [ "$(wc -c <"$waiter_stderr" | tr -d ' ')" -le 2300 ] || fail "owner diagnostic was not bounded"
 grep -Fq "head=$head" "$waiter_stderr" || fail "owner head was not reported"
@@ -252,7 +275,7 @@ if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.s
 fi
 ! grep -Fq 'ghp_secret' "$invalid_id_stderr" || fail "secret-looking agent identifier leaked"
 ! grep -Fq 'agent:token' "$invalid_id_stderr" || fail "invalid task identifier leaked"
-wait "$last_holder_pid"
+wait_checked "invalid-owner diagnostic holder" "$last_holder_pid"
 
 # A diagnostic record must be a regular file, never a symlink to arbitrary
 # readable content.
@@ -293,7 +316,7 @@ term_pid=$!
 background_pids="$background_pids $term_pid"
 wait_for_file "$term_marker"
 kill -TERM "$term_pid"
-wait "$term_pid" 2>/dev/null || true
+wait_terminated "TERM cleanup phase" "$term_pid"
 acquire_and_release "$second" "$temporary/term-recovered"
 
 # A SIGKILLed wrapper cannot release a lock inherited by a surviving command
@@ -308,7 +331,7 @@ background_pids="$background_pids $descendant_wrapper_pid"
 wait_for_file "$descendant_marker"
 wait_for_file "$descendant_pid_file"
 kill -KILL "$descendant_wrapper_pid"
-wait "$descendant_wrapper_pid" 2>/dev/null || true
+wait_terminated "surviving-descendant phase" "$descendant_wrapper_pid"
 sleep 0.3
 if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) 2>"$temporary/descendant.stderr"; then
     fail "waiter acquired while a killed-owner descendant survived"
@@ -339,12 +362,8 @@ wait_for_file "$temporary/stale-second"
 assert_absent "$stale_record"
 wait_for_file "$stale_first_done"
 wait_for_file "$stale_second_done"
-if ! wait "$stale_first_pid"; then
-    fail "first stale-recovery contender failed"
-fi
-if ! wait "$stale_second_pid"; then
-    fail "second stale-recovery contender failed"
-fi
+wait_checked "first stale-recovery contender" "$stale_first_pid"
+wait_checked "second stale-recovery contender" "$stale_second_pid"
 assert_absent "$lock_path/.recovery"
 assert_absent "$lease_path"
 assert_absent "$lock_path"
@@ -361,7 +380,7 @@ if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.s
 fi
 grep -Fq 'without its lock object' "$temporary/replacement-missing.stderr" || fail "live lock-object removal refusal was unexplained"
 mv "$temporary/original-lock-object" "$lock_path"
-wait
+wait_checked "live lock-object removal holder" "$last_holder_pid"
 
 replacement_held="$temporary/replacement-symlink-held"
 start_holder "$first" "$replacement_held" 2
@@ -374,7 +393,7 @@ if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.s
 fi
 grep -Fq 'unsafe lock object path' "$temporary/replacement-symlink.stderr" || fail "live symlink replacement refusal was unexplained"
 rm -f "$lock_path"
-wait
+wait_checked "live lock-object symlink holder" "$last_holder_pid"
 rm -rf "$temporary/original-lock-object"
 
 replacement_held="$temporary/replacement-directory-held"
@@ -389,7 +408,7 @@ if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.s
 fi
 grep -Fq 'lock object replacement' "$temporary/replacement-directory.stderr" || fail "live directory replacement refusal was unexplained"
 rm -rf "$lock_path"
-wait
+wait_checked "live lock-object directory holder" "$last_holder_pid"
 rm -rf "$temporary/original-lock-object"
 
 # Malformed metadata is fail-closed rather than silently treated as stale.
