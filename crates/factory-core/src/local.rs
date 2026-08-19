@@ -48,6 +48,19 @@ pub struct AgentDetail {
     pub project_guidance_path: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ManagedChange {
+    pub project_id: ProjectId,
+    pub task_id: TaskId,
+    pub agent_id: AgentId,
+    pub worktree: String,
+    pub branch: String,
+    pub base_sha: String,
+    pub head_sha: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub published_head_sha: Option<String>,
+}
+
 /// Project-level guidance, file-backed under `$DARK_FACTORY_HOME/projects`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProjectDetail {
@@ -397,6 +410,16 @@ pub enum LocalRequest {
     GitPush {
         token: String,
     },
+    /// Creates or returns the one daemon-owned issue-change worktree for the
+    /// authenticated session's current task.
+    CreateManagedChange {
+        token: String,
+    },
+    /// Abandons the authenticated session's registered change after proving
+    /// its worktree is clean and has no unpublished commit.
+    AbandonManagedChange {
+        token: String,
+    },
     /// Open a PR from the session branch to the repository's default base.
     PrOpen {
         token: String,
@@ -503,6 +526,9 @@ pub enum LocalResponse {
     GitOutput {
         operation: String,
         output: String,
+    },
+    ManagedChange {
+        change: ManagedChange,
     },
     ProjectCreated {
         project: ProjectSnapshot,

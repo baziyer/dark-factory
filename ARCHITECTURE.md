@@ -185,6 +185,20 @@ catalogue.
    committer, rejects protected/detached/mismatched refs, and writes
    credential- and content-free request/result events. Review and merge remain
    outside this API, preserving the independent-review invariant.
+   For an issue task, `factoryctl change create` registers one daemon-derived
+   `issue/<task-id>` branch and nested worktree under the project-managed
+   state. The authenticated session's current run supplies the task; no
+   client can select a project, path, ref, remote, or repository. SQLite keeps
+   the canonical worktree/gitdir/common-dir identity and exact base SHA across
+   restart, and existing commit/push/PR operations then target that record.
+   Publication requires a clean tree, unchanged remote base, and exact prior
+   remote head (or no branch for first publication); ordinary Git push remains
+   non-force and same-head retries are idempotent. Collisions, stale leases,
+   detached/dirty/swapped worktrees, wrong-task/cross-agent requests, and
+   protected refs fail closed and are audited. Abandonment is explicit and
+   refuses dirty or unpublished work. Review, merge, and release remain
+   outside this API; the #159 readiness projection consumes this target rather
+   than being duplicated here.
 9. Once deletion of an agent or project begins, every known writer of files
    under its identity is blocked from starting a new write and drained if
    one is already running, before any of those files are removed. The

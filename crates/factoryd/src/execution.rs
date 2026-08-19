@@ -2831,7 +2831,10 @@ fn compose_text(
         sections.push(format!(
             "Task {id}: {title} (task:{id})\nWhen finished, run: factoryctl task done --task {id} \
              --result \"<summary>\"\nIf blocked, run: factoryctl task blocked --task {id} --reason \
-             \"<why>\"\n\n{body}"
+             \"<why>\"\n\nFor an issue change, first run `factoryctl change create`; use the returned \
+             worktree with the daemon-owned `factoryctl git commit`, `git push`, and \
+             `factoryctl pr` operations. Do not choose a path, branch, remote, or \
+             repository yourself.\n\n{body}"
         ));
     }
     if !messages.is_empty() {

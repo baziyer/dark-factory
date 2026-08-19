@@ -36,7 +36,7 @@ const SESSION_TOKEN_FILE_ENV: &str = "DARK_FACTORY_SESSION_TOKEN_FILE";
 
 use attach::AttachTarget;
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|change|git|pr|run|session|hook|attach|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -56,6 +56,7 @@ Commands:
                                                Manage and run tasks
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
+  change create|abandon                       Create or abandon the authenticated task's daemon-owned issue change
   git status|diff|commit|push                  Session-authenticated daemon-owned Git operations
   pr open|update                               Session-authenticated daemon-owned pull requests
   run list|stop                               List and stop process attempts
@@ -192,6 +193,15 @@ Actions:
   diff [--staged]           Show an unstaged or staged diff
   commit --message TEXT     Stage all worktree changes and commit them
   push                      Push the managed branch to origin without force";
+const CHANGE_HELP: &str = "usage: factoryctl change <create|abandon>
+
+Create or abandon the current task's daemon-owned issue-change worktree.
+The session token selects the project, agent, task, path, branch, and remote;
+none can be supplied by the caller.
+
+Actions:
+  create                    Register an issue/<task-id> worktree (idempotent)
+  abandon                   Remove a clean, fully published registered worktree";
 const PR_HELP: &str = "usage: factoryctl pr <open|update> [options]
 
 Open or update a pull request through factoryd for the calling session branch.
@@ -943,6 +953,8 @@ enum CliCommand {
         message: String,
     },
     GitPush,
+    ChangeCreate,
+    ChangeAbandon,
     PrOpen {
         title: String,
         body: String,
@@ -1487,6 +1499,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         }
         "agent" => parse_agent(args).map(|command| (socket, command)),
         "git" => parse_git(args).map(|command| (socket, command)),
+        "change" => parse_change(args).map(|command| (socket, command)),
         "pr" => parse_pr(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
         "session" => parse_session(args).map(|command| (socket, command)),
@@ -1503,6 +1516,22 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             parse_events(args).map(|command| (socket, command))
         }
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
+    }
+}
+
+fn parse_change(mut args: Vec<String>) -> Result<CliCommand, String> {
+    if args.is_empty() || is_help_flag(&args[0]) {
+        return Ok(CliCommand::Help(CHANGE_HELP));
+    }
+    let action = take_action(&mut args, "change")?;
+    if wants_help(&args) {
+        return Ok(CliCommand::Help(CHANGE_HELP));
+    }
+    require_empty(&args)?;
+    match action.as_str() {
+        "create" => Ok(CliCommand::ChangeCreate),
+        "abandon" => Ok(CliCommand::ChangeAbandon),
+        _ => Err(format!("unknown change action {action:?}")),
     }
 }
 
@@ -2538,6 +2567,12 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::GitPush => Ok(LocalRequest::GitPush {
             token: session_token()?,
         }),
+        CliCommand::ChangeCreate => Ok(LocalRequest::CreateManagedChange {
+            token: session_token()?,
+        }),
+        CliCommand::ChangeAbandon => Ok(LocalRequest::AbandonManagedChange {
+            token: session_token()?,
+        }),
         CliCommand::PrOpen { title, body } => Ok(LocalRequest::PrOpen {
             token: session_token()?,
             title,
@@ -2814,6 +2849,18 @@ mod tests {
                 "open".into(),
                 "--repo".into(),
                 "other/repo".into()
+            ])
+            .is_err()
+        );
+
+        let (_, command) = parse_args(vec!["change".into(), "create".into()]).unwrap();
+        assert!(matches!(command, CliCommand::ChangeCreate));
+        assert!(
+            parse_args(vec![
+                "change".into(),
+                "create".into(),
+                "--task".into(),
+                "other-task".into(),
             ])
             .is_err()
         );

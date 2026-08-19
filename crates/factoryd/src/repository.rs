@@ -22,7 +22,7 @@ use tokio::{
     time::timeout,
 };
 
-use crate::store::{RepositoryAuthority, SessionRow};
+use crate::store::{ManagedChangeRecord, RepositoryAuthority, SessionRow};
 
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -60,6 +60,7 @@ pub struct Target {
     authority: RepositoryAuthority,
     github_repo: Option<String>,
     gh_program: PathBuf,
+    registered_change: Option<ManagedChangeRecord>,
 }
 
 pub fn validate_authority(
@@ -74,14 +75,201 @@ pub fn validate_authority(
     })
 }
 
+/// Creates the one daemon-derived issue branch for a task.  The remote, base,
+/// repository, and path are all supplied by daemon state; the task id is
+/// already validated by the caller as the authenticated session's current
+/// run task.
+pub async fn create_managed_change(
+    project: &ProjectSnapshot,
+    authority: RepositoryAuthority,
+    task_id: &factory_core::TaskId,
+    agent_id: &AgentId,
+    worktree_path: &Path,
+) -> Result<ManagedChangeRecord, Error> {
+    let authority = validate_authority(authority.remote_url, authority.base_branch)?;
+    let project_root = canonical_directory(Path::new(&project.root), "project root")?;
+    let branch = format!("issue/{}", task_id.as_str());
+    validate_ref(&branch, "managed issue branch")?;
+    if matches!(authority.base_branch.as_str(), "main" | "master")
+        && branch == authority.base_branch
+    {
+        return Err(Error::Rejected("managed issue branch is protected".into()));
+    }
+    if worktree_path.exists() {
+        return Err(Error::Rejected(
+            "managed change worktree already exists".into(),
+        ));
+    }
+    let parent = worktree_path
+        .parent()
+        .ok_or_else(|| Error::Rejected("managed change path has no parent".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|_| Error::Rejected("managed change directory is unavailable".into()))?;
+    let daemon_root = worktree_path
+        .ancestors()
+        .nth(2)
+        .ok_or_else(|| Error::Rejected("managed change path is invalid".into()))?;
+    let daemon_root = canonical_directory(daemon_root, "managed change root")?;
+    if !canonical_directory(parent, "managed change parent")?.starts_with(daemon_root) {
+        return Err(Error::Rejected(
+            "managed change path escaped its daemon root".into(),
+        ));
+    }
+    let base_ref = format!("refs/heads/{}", authority.base_branch);
+    let base_output = safe_git(
+        &project_root,
+        None,
+        &["ls-remote", &authority.remote_url, &base_ref],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let base_sha = parse_remote_head(&base_output, &base_ref)?
+        .ok_or_else(|| Error::Rejected("configured base branch is absent remotely".into()))?;
+    let local_base = safe_git(
+        &project_root,
+        None,
+        &["rev-parse", "--verify", &format!("{base_sha}^{{commit}}")],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    if local_base.trim() != base_sha {
+        return Err(Error::Rejected(
+            "configured base commit is not present locally".into(),
+        ));
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    if safe_git(
+        &project_root,
+        None,
+        &["show-ref", "--verify", "--quiet", &branch_ref],
+        None,
+        READ_TIMEOUT,
+    )
+    .await
+    .is_ok()
+    {
+        return Err(Error::Rejected(
+            "managed issue branch collides locally".into(),
+        ));
+    }
+    let branch_output = safe_git(
+        &project_root,
+        None,
+        &["ls-remote", &authority.remote_url, &branch_ref],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    if parse_remote_head(&branch_output, &branch_ref)?.is_some() {
+        return Err(Error::Rejected(
+            "managed issue branch collides remotely".into(),
+        ));
+    }
+    let worktree = worktree_path.to_string_lossy().into_owned();
+    safe_git(
+        &project_root,
+        None,
+        &["worktree", "add", "-b", &branch, &worktree, &base_sha],
+        None,
+        MUTATION_TIMEOUT,
+    )
+    .await?;
+    let git_dir = safe_git(
+        worktree_path,
+        None,
+        &["rev-parse", "--absolute-git-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let common_dir = safe_git(
+        worktree_path,
+        None,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let git_dir = canonical_directory(Path::new(git_dir.trim()), "Git directory")?;
+    let common_dir = resolve_git_path(worktree_path, common_dir.trim())?;
+    let head = safe_git(
+        worktree_path,
+        None,
+        &["rev-parse", "--verify", "HEAD"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let worktree_metadata = std::fs::metadata(worktree_path)
+        .map_err(|_| Error::Rejected("managed worktree disappeared".into()))?;
+    let git_dir_metadata = std::fs::metadata(&git_dir)
+        .map_err(|_| Error::Rejected("managed Git directory disappeared".into()))?;
+    let common_dir_metadata = std::fs::metadata(&common_dir)
+        .map_err(|_| Error::Rejected("managed common Git directory disappeared".into()))?;
+    Ok(ManagedChangeRecord {
+        project_id: project.id.clone(),
+        task_id: task_id.clone(),
+        agent_id: agent_id.clone(),
+        worktree,
+        branch,
+        git_dir: git_dir.to_string_lossy().into_owned(),
+        common_dir: common_dir.to_string_lossy().into_owned(),
+        worktree_device: worktree_metadata.dev(),
+        worktree_inode: worktree_metadata.ino(),
+        git_dir_device: git_dir_metadata.dev(),
+        git_dir_inode: git_dir_metadata.ino(),
+        common_dir_device: common_dir_metadata.dev(),
+        common_dir_inode: common_dir_metadata.ino(),
+        base_sha,
+        head_sha: head.trim().to_owned(),
+        published_head_sha: None,
+    })
+}
+
+fn parse_remote_head(output: &str, reference: &str) -> Result<Option<String>, Error> {
+    let Some(line) = output.lines().next() else {
+        return Ok(None);
+    };
+    let mut fields = line.split_ascii_whitespace();
+    let head = fields
+        .next()
+        .ok_or_else(|| Error::Command("malformed remote ref".into()))?;
+    if fields.next() != Some(reference) || fields.next().is_some() {
+        return Err(Error::Command("malformed remote ref".into()));
+    }
+    Ok(Some(head.to_owned()))
+}
+
 impl Target {
     pub async fn validate(
         session: SessionRow,
         project: ProjectSnapshot,
         authority: RepositoryAuthority,
     ) -> Result<Self, Error> {
+        Self::validate_with_change(session, project, authority, None).await
+    }
+
+    pub async fn validate_with_change(
+        session: SessionRow,
+        project: ProjectSnapshot,
+        authority: RepositoryAuthority,
+        registered_change: Option<ManagedChangeRecord>,
+    ) -> Result<Self, Error> {
         let authority = validate_authority(authority.remote_url, authority.base_branch)?;
-        let worktree = canonical_directory(Path::new(&session.worktree), "session worktree")?;
+        if let Some(change) = &registered_change {
+            if change.project_id != session.project_id || change.agent_id != session.agent_id {
+                return Err(Error::Rejected(
+                    "managed change owner identity changed".into(),
+                ));
+            }
+        }
+        let worktree_path = registered_change.as_ref().map_or_else(
+            || session.worktree.as_str(),
+            |change| change.worktree.as_str(),
+        );
+        let worktree = canonical_directory(Path::new(worktree_path), "managed worktree")?;
         let project_root = canonical_directory(Path::new(&project.root), "project root")?;
         let top = safe_git(
             &worktree,
@@ -127,6 +315,14 @@ impl Target {
                 "session worktree does not belong to its project repository".into(),
             ));
         }
+        if let Some(change) = &registered_change {
+            if Path::new(&change.git_dir) != git_dir || Path::new(&change.common_dir) != common_dir
+            {
+                return Err(Error::Rejected(
+                    "managed Git directory identity changed".into(),
+                ));
+            }
+        }
         let branch = safe_git(
             &worktree,
             None,
@@ -136,7 +332,10 @@ impl Target {
         )
         .await?;
         let branch = branch.trim().to_owned();
-        let expected = format!("agent/{}", session.agent_id);
+        let expected = registered_change.as_ref().map_or_else(
+            || format!("agent/{}", session.agent_id),
+            |change| change.branch.clone(),
+        );
         if branch != expected {
             return Err(Error::Rejected(format!(
                 "session must be on its managed branch {expected}"
@@ -157,6 +356,19 @@ impl Target {
             .map_err(|_| Error::Rejected("session Git directory disappeared".into()))?;
         let common_dir_metadata = std::fs::metadata(&common_dir)
             .map_err(|_| Error::Rejected("common Git directory disappeared".into()))?;
+        if let Some(change) = &registered_change {
+            if metadata.dev() != change.worktree_device
+                || metadata.ino() != change.worktree_inode
+                || git_dir_metadata.dev() != change.git_dir_device
+                || git_dir_metadata.ino() != change.git_dir_inode
+                || common_dir_metadata.dev() != change.common_dir_device
+                || common_dir_metadata.ino() != change.common_dir_inode
+            {
+                return Err(Error::Rejected(
+                    "managed filesystem identity changed".into(),
+                ));
+            }
+        }
         let github_repo = github_slug(&authority.remote_url);
         Ok(Self {
             project_id: session.project_id,
@@ -176,6 +388,7 @@ impl Target {
             authority,
             github_repo,
             gh_program: trusted_program("gh")?,
+            registered_change,
         })
     }
 
@@ -323,6 +536,64 @@ impl Target {
         let head = self.revalidate().await?;
         let sandbox = self.sandbox().await?;
         let refspec = format!("refs/heads/{0}:refs/heads/{0}", self.branch);
+        if let Some(change) = &self.registered_change {
+            if !self.worktree_is_clean(&sandbox).await? {
+                return Err(Error::Rejected(
+                    "managed change worktree is dirty; commit before publishing".into(),
+                ));
+            }
+            if sandbox
+                .git(
+                    &["merge-base", "--is-ancestor", &change.base_sha, &head],
+                    None,
+                    READ_TIMEOUT,
+                )
+                .await
+                .is_err()
+            {
+                return Err(Error::Rejected(
+                    "managed change HEAD is not based on its registered base".into(),
+                ));
+            }
+            if let Some(published) = &change.published_head_sha {
+                if sandbox
+                    .git(
+                        &["merge-base", "--is-ancestor", published, &head],
+                        None,
+                        READ_TIMEOUT,
+                    )
+                    .await
+                    .is_err()
+                {
+                    return Err(Error::Rejected(
+                        "managed change HEAD rewrites its published history".into(),
+                    ));
+                }
+            }
+            let base = self
+                .remote_head(
+                    &sandbox,
+                    &format!("refs/heads/{}", self.authority.base_branch),
+                )
+                .await?;
+            if base.as_deref() != Some(change.base_sha.as_str()) {
+                return Err(Error::Rejected(
+                    "managed change base is stale; re-register from the current base".into(),
+                ));
+            }
+            let remote = self
+                .remote_head(&sandbox, &format!("refs/heads/{}", self.branch))
+                .await?;
+            if remote.as_deref() == Some(head.as_str()) {
+                return Ok(self.branch.clone());
+            }
+            if remote.as_deref() != change.published_head_sha.as_deref() {
+                return Err(Error::Rejected(
+                    "managed change remote branch is stale or collides with an existing branch"
+                        .into(),
+                ));
+            }
+        }
         if self.github_repo.is_some() {
             let helper = format!(
                 "credential.https://github.com.helper=!{} auth git-credential",
@@ -351,7 +622,109 @@ impl Target {
                 "HEAD changed while push was running".into(),
             ));
         }
+        let remote = self
+            .remote_head(&sandbox, &format!("refs/heads/{}", self.branch))
+            .await?;
+        if remote.as_deref() != Some(head.as_str()) {
+            return Err(Error::Rejected(
+                "remote branch did not match the published managed commit".into(),
+            ));
+        }
         Ok(self.branch.clone())
+    }
+
+    async fn remote_head(
+        &self,
+        sandbox: &GitSandbox,
+        reference: &str,
+    ) -> Result<Option<String>, Error> {
+        let args = ["ls-remote", self.authority.remote_url.as_str(), reference];
+        let output = if self.github_repo.is_some() {
+            let helper = format!(
+                "credential.https://github.com.helper=!{} auth git-credential",
+                self.gh_program.display()
+            );
+            safe_git_with_trusted_helper(
+                &self.worktree,
+                Some(sandbox),
+                &args,
+                None,
+                READ_TIMEOUT,
+                &helper,
+            )
+            .await?
+        } else {
+            sandbox.git(&args, None, READ_TIMEOUT).await?
+        };
+        let Some(line) = output.lines().next() else {
+            return Ok(None);
+        };
+        let mut fields = line.split_ascii_whitespace();
+        let head = fields
+            .next()
+            .ok_or_else(|| Error::Command("malformed remote ref".into()))?;
+        if fields.next() != Some(reference) || fields.next().is_some() {
+            return Err(Error::Command("malformed remote ref".into()));
+        }
+        Ok(Some(head.to_owned()))
+    }
+
+    pub fn registered_change(&self) -> Option<&ManagedChangeRecord> {
+        self.registered_change.as_ref()
+    }
+
+    pub async fn revalidate_head_for_audit(&self) -> Result<String, Error> {
+        self.revalidate().await
+    }
+
+    pub async fn ensure_abandonable(&self) -> Result<(), Error> {
+        let Some(change) = &self.registered_change else {
+            return Err(Error::Rejected("no managed change is registered".into()));
+        };
+        let head = self.revalidate().await?;
+        let sandbox = self.sandbox().await?;
+        if !self.worktree_is_clean(&sandbox).await? {
+            return Err(Error::Rejected(
+                "cannot abandon a dirty managed change worktree".into(),
+            ));
+        }
+        let remote = self
+            .remote_head(&sandbox, &format!("refs/heads/{}", self.branch))
+            .await?;
+        if head != change.base_sha && change.published_head_sha.as_deref() != Some(head.as_str()) {
+            return Err(Error::Rejected(
+                "cannot abandon unpublished managed commits".into(),
+            ));
+        }
+        if remote != change.published_head_sha {
+            return Err(Error::Rejected(
+                "cannot abandon with a stale remote branch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn worktree_is_clean(&self, sandbox: &GitSandbox) -> Result<bool, Error> {
+        if sandbox
+            .git(
+                &["diff", "--quiet", "--no-ext-diff", "--"],
+                None,
+                READ_TIMEOUT,
+            )
+            .await
+            .is_err()
+        {
+            return Ok(false);
+        }
+        Ok(sandbox
+            .git(
+                &["ls-files", "--others", "--exclude-standard"],
+                None,
+                READ_TIMEOUT,
+            )
+            .await?
+            .trim()
+            .is_empty())
     }
 
     pub async fn pr_open(&self, title: &str, body: &str) -> Result<String, Error> {
@@ -988,6 +1361,150 @@ mod tests {
             validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
         let target = Target::validate(session, project, authority).await.unwrap();
         (temp, target, remote)
+    }
+
+    #[tokio::test]
+    async fn managed_change_is_derived_from_the_authenticated_task_and_rejects_collisions() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175");
+        let record = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.branch, "issue/issue-175");
+        assert_eq!(record.head_sha, record.base_sha);
+        assert_eq!(record.worktree, path.to_string_lossy());
+        let collision =
+            create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+                .await
+                .unwrap_err();
+        assert!(collision.to_string().contains("worktree already exists"));
+    }
+
+    #[tokio::test]
+    async fn managed_change_publish_is_clean_idempotent_and_non_rewriting() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-publish".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-publish");
+        let record = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap();
+        let session = SessionRow {
+            id: target.session_id.clone(),
+            project_id: target.project_id.clone(),
+            agent_id: target.agent_id.clone(),
+            provider: Provider::Shell,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            provider_session_id: None,
+            worktree: target.worktree.to_string_lossy().into_owned(),
+            codex_home: None,
+            hook_token: "a".repeat(64),
+            state: SessionState::Idle,
+            state_since_ms: 1,
+            activity: None,
+            activity_inferred: false,
+            wait_reason: None,
+            observer_health: ObserverHealth::Healthy,
+            observer_health_since_ms: 1,
+            runner_instance_id: RunnerInstanceId::try_from("runner".to_owned()).unwrap(),
+            runner_runtime: "/tmp/runner".into(),
+            runner_protocol_version: 1,
+            last_hook_event: None,
+            last_hook_at_ms: None,
+            started_at_ms: 1,
+            updated_at_ms: 1,
+            ended_at_ms: None,
+            exit_code: None,
+            exit_signal: None,
+            stop_requested_at_ms: None,
+            current_run_id: None,
+        };
+        let registered = Target::validate_with_change(
+            session,
+            project.clone(),
+            authority.clone(),
+            Some(record.clone()),
+        )
+        .await
+        .unwrap();
+        registered.push().await.unwrap();
+        registered.push().await.unwrap();
+        std::fs::write(path.join("dirty"), "must not publish\n").unwrap();
+        let dirty = Target::validate_with_change(
+            SessionRow {
+                id: target.session_id.clone(),
+                project_id: target.project_id.clone(),
+                agent_id: target.agent_id.clone(),
+                provider: Provider::Shell,
+                runtime_model: None,
+                runtime_reasoning_effort: None,
+                runtime_permission_mode: None,
+                runtime_control_mode: None,
+                provider_session_id: None,
+                worktree: target.worktree.to_string_lossy().into_owned(),
+                codex_home: None,
+                hook_token: "a".repeat(64),
+                state: SessionState::Idle,
+                state_since_ms: 1,
+                activity: None,
+                activity_inferred: false,
+                wait_reason: None,
+                observer_health: ObserverHealth::Healthy,
+                observer_health_since_ms: 1,
+                runner_instance_id: RunnerInstanceId::try_from("runner".to_owned()).unwrap(),
+                runner_runtime: "/tmp/runner".into(),
+                runner_protocol_version: 1,
+                last_hook_event: None,
+                last_hook_at_ms: None,
+                started_at_ms: 1,
+                updated_at_ms: 1,
+                ended_at_ms: None,
+                exit_code: None,
+                exit_signal: None,
+                stop_requested_at_ms: None,
+                current_run_id: None,
+            },
+            project,
+            authority,
+            Some(record),
+        )
+        .await
+        .unwrap();
+        let error = dirty.push().await.unwrap_err();
+        assert!(error.to_string().contains("dirty"));
     }
 
     #[tokio::test]

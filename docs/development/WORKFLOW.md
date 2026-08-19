@@ -17,6 +17,17 @@
    `AGENTS.md`'s "Critical rules" for the exact steps.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
+### Publishing an issue change
+
+An assigned session gets one daemon-owned issue change. From that session,
+run `factoryctl change create`; the daemon derives the task branch and nested
+worktree from the authenticated current task. Use the returned worktree with
+`factoryctl git commit` and `factoryctl git push`, then open or update a PR
+through `factoryctl pr`. The client cannot select a repository, remote,
+branch, or path, and the daemon refuses dirty, detached, stale, swapped, or
+unregistered worktrees. `factoryctl change abandon` is explicit and refuses
+dirty or unpublished work so a failed publication remains recoverable.
+
 ### Testing resident sessions
 
 An E2E harness must not stop `factoryd` immediately after a `StopSession`
