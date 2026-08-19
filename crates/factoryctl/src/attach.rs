@@ -255,28 +255,33 @@ fn spawn_stdin_reader(
                     return;
                 }
             }
-            match stdin.read(&mut buffer) {
-                Ok(0) => continue,
-                Err(_) => {
-                    let _ = sender.send(StdinEvent::Eof);
+            let read = match classify_stdin_read(stdin.read(&mut buffer)) {
+                Ok(read) => read,
+                Err(event) => {
+                    let _ = sender.send(event);
                     return;
                 }
-                Ok(read) => {
-                    let chunk = &buffer[..read];
-                    if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
-                        if detach_at > 0 {
-                            let _ = sender.send(StdinEvent::Bytes(chunk[..detach_at].to_vec()));
-                        }
-                        let _ = sender.send(StdinEvent::Detach);
-                        return;
-                    }
-                    if sender.send(StdinEvent::Bytes(chunk.to_vec())).is_err() {
-                        return;
-                    }
+            };
+            let chunk = &buffer[..read];
+            if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
+                if detach_at > 0 {
+                    let _ = sender.send(StdinEvent::Bytes(chunk[..detach_at].to_vec()));
                 }
+                let _ = sender.send(StdinEvent::Detach);
+                return;
+            }
+            if sender.send(StdinEvent::Bytes(chunk.to_vec())).is_err() {
+                return;
             }
         }
     })
+}
+
+fn classify_stdin_read(read: std::io::Result<usize>) -> Result<usize, StdinEvent> {
+    match read {
+        Ok(0) | Err(_) => Err(StdinEvent::Eof),
+        Ok(read) => Ok(read),
+    }
 }
 
 /// Waits for either operator input or the lifecycle cancellation signal.
@@ -510,5 +515,13 @@ mod tests {
         thread::sleep(Duration::from_millis(25));
         cancel_writer.write_all(&[1]).unwrap();
         assert!(handle.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn stdin_eof_is_a_terminal_input_event() {
+        assert!(matches!(
+            super::classify_stdin_read(Ok(0)),
+            Err(super::StdinEvent::Eof)
+        ));
     }
 }
