@@ -1739,6 +1739,125 @@ mod tests {
     }
 
     #[test]
+    fn accepted_provider_question_waits_for_unchanged_authoritative_projection() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('1'))),
+            Intent::Redraw
+        ));
+        for character in "use the stable branch".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("provider question did not produce an identified answer request");
+        };
+
+        board.apply_operation_response(
+            operation_id,
+            request.clone(),
+            Ok(LocalResponse::TerminalInputAccepted {
+                session_id: SessionId::try_from("session").unwrap(),
+            }),
+        );
+        assert_eq!(board.decision_items(), vec![item.clone()]);
+        assert_eq!(board.pending_attention_operation_id, Some(operation_id));
+        assert_eq!(board.pending_attention_request.as_ref(), Some(&request));
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![item],
+        });
+        assert_eq!(board.decision_items().len(), 1);
+        assert_eq!(board.pending_attention_operation_id, Some(operation_id));
+        assert!(
+            !board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved)
+        );
+    }
+
+    #[test]
+    fn changed_provider_question_summary_replaces_pending_source_without_retiring_card() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::ProviderQuestion,
+            Some("alice"),
+            None,
+            Some("session"),
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        board.handle_key(key(KeyCode::Char('1')));
+        for character in "use the stable branch".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        let Intent::SendWithIdentity {
+            operation_id: old_operation,
+            request: old_request,
+        } = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("provider question did not produce an identified answer request");
+        };
+
+        let mut changed = item;
+        changed.reason.summary = "Which worktree should I use?".to_owned();
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![changed.clone()],
+        });
+        assert!(board.pending_attention_operation_id.is_none());
+        assert_eq!(board.decision_items(), vec![changed]);
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| !focus.resolved)
+        );
+
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('1'))),
+            Intent::Redraw
+        ));
+        for character in "use the new worktree".chars() {
+            board.handle_key(key(KeyCode::Char(character)));
+        }
+        let Intent::SendWithIdentity {
+            operation_id: new_operation,
+            request: new_request,
+        } = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("replacement provider question did not produce an identified request");
+        };
+        assert_ne!(old_operation, new_operation);
+        assert_ne!(old_request, new_request);
+    }
+
+    #[test]
     fn delayed_success_and_error_cannot_clear_a_replaced_pending_source() {
         let mut board = board();
         let item = attention(

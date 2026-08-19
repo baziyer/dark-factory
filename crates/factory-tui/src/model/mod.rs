@@ -1246,12 +1246,6 @@ impl Board {
                 format!("stop requested for session {session_id}")
             }
             LocalResponse::TerminalInputAccepted { session_id } => {
-                self.complete_attention_request_if(
-                    operation_id,
-                    request,
-                    factory_core::status::AttentionAction::AnswerInTerminal,
-                    |item| item.session_id.as_ref() == Some(&session_id),
-                );
                 format!("answer sent to session {session_id}")
             }
             LocalResponse::Sessions { sessions, .. } => {
