@@ -10,14 +10,28 @@ file is just the shortest path to a useful first change.
 ./scripts/new-worktree.sh <slug>
 cd .worktrees/<slug>
 cargo build --workspace
+```
+
+On macOS, run the complete release-compatible gate:
+
+```sh
 ./scripts/local-ci.sh
 ```
 
-`local-ci.sh` is the authoritative gate (`cargo +1.88.0 fmt --check`,
+On Ubuntu x86-64, run the source-only gate and contributor smoke instead:
+
+```sh
+./scripts/local-ci.sh --linux-source
+./scripts/linux-contributor-smoke.sh
+```
+
+The source gate runs `cargo +1.88.0 fmt --check`,
 `clippy --all-targets --all-features -D warnings` across the whole
-workspace, every test with `--test-threads=1`, and `git diff --check`).
-CI runs the same script on every pull request (the aggregate `required`
-context `main` requires), so a local pass is what makes a PR mergeable.
+workspace, every test with `--test-threads=1`, and `git diff --check`.
+The macOS path additionally checks release-source, publisher, and package
+fixtures. CI requires both platform jobs through the aggregate `required`
+context, so contributors should run the command for their platform before
+opening a PR.
 
 A few workspace-wide rules the gate enforces, worth knowing up front:
 

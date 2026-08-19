@@ -3,6 +3,7 @@ set -eu
 
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 gate="$repository_root/scripts/local-ci.sh"
+contributing="$repository_root/CONTRIBUTING.md"
 
 fail() {
     echo "local-ci mode test failed: $*" >&2
@@ -31,6 +32,13 @@ for mac_fixture in test-prepare-release-source.sh test-publish-release.sh test-p
     printf '%s\n' "$macos_mode" | grep -Fq "$mac_fixture" \
         || fail "macOS mode lost fixture $mac_fixture"
 done
+
+grep -Fxq './scripts/local-ci.sh' "$contributing" \
+    || fail "CONTRIBUTING lost the macOS gate command"
+grep -Fxq './scripts/local-ci.sh --linux-source' "$contributing" \
+    || fail "CONTRIBUTING does not use the Linux source gate"
+grep -Fxq './scripts/linux-contributor-smoke.sh' "$contributing" \
+    || fail "CONTRIBUTING lost the Linux source smoke"
 
 sh -n "$gate"
 echo "local-ci mode tests passed"
