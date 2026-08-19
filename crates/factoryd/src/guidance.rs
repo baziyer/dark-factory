@@ -1459,6 +1459,21 @@ mod tests {
         directory
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_fixture_is_not_the_lexical_tmp_alias() {
+        let directory = private_tempdir();
+        assert_eq!(
+            fs::canonicalize(directory.path()).unwrap(),
+            directory.path()
+        );
+        assert!(!directory.path().starts_with("/tmp"));
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
+
     #[test]
     fn ensure_project_creates_a_private_empty_file_idempotently() {
         let home = private_tempdir();
