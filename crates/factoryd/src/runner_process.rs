@@ -1246,7 +1246,7 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         scripts(directory.path());
         executable(
             &directory.path().join("provider-probe"),
-            "#!/bin/sh\nprintf ready > \"$TMPDIR/ready\"\nwhile [ ! -e \"$TMPDIR/release\" ]; do sleep 0.01; done\nprintf survived > \"$TMPDIR/survived\"\n",
+            "#!/bin/sh\nprintf ready > \"$TMPDIR/ready\"\nwhile [ ! -e \"$TMPDIR/release\" ]; do sleep 0.01; done\nprintf survived > \"$TMPDIR/survived.tmp\"\nmv \"$TMPDIR/survived.tmp\" \"$TMPDIR/survived\"\n",
         );
         let captured = probe_environment(directory.path(), directory.path());
         let mut child = spawn_runner_with_environment(spec(directory.path(), Vec::new()), captured)
