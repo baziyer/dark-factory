@@ -110,8 +110,16 @@ fn runner_alive(runtime_dir: &Path) -> bool {
 }
 
 fn runner_control_ready(runtime_dir: &Path) -> bool {
-    runner_alive(runtime_dir)
-        && std::os::unix::net::UnixStream::connect(runtime_dir.join("control.sock")).is_ok()
+    std::os::unix::net::UnixStream::connect(runtime_dir.join("control.sock")).is_ok()
+}
+
+#[test]
+fn control_readiness_does_not_depend_on_process_table_observation() {
+    let directory = private_tempdir();
+    let _listener =
+        std::os::unix::net::UnixListener::bind(directory.path().join("control.sock")).unwrap();
+
+    assert!(runner_control_ready(directory.path()));
 }
 
 // --- Local protocol helpers (same technique as `tests/local_api.rs`) ----
@@ -456,7 +464,7 @@ async fn wait_for_runner_control(runtime_dir: &Path) {
     .await;
     assert!(
         ready.is_ok(),
-        "runner stayed alive but did not bind its control socket within 5s: {}",
+        "runner did not make its control socket ready within 5s: {}",
         runtime_dir.display()
     );
 }
