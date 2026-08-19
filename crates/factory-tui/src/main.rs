@@ -1121,7 +1121,7 @@ mod main_tests {
                                 project_id: factory_core::ProjectId::try_from("proj").unwrap(),
                                 session_id: factory_core::SessionId::try_from("session-1").unwrap(),
                                 runner_instance_id: Some(
-                                    factory_core::RunnerInstanceId::try_from("runner-1").unwrap(),
+                                    factory_core::RunnerInstanceId::try_from("runner").unwrap(),
                                 ),
                                 session_state: Some(SessionState::Idle),
                                 reason: factory_core::local::AttachRefusalReason::RunnerUnavailable,
