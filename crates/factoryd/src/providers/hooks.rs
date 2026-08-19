@@ -13,7 +13,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -110,6 +110,12 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
             .mode(mode)
             .custom_flags(nofollow_flag())
             .open(&temp_path)?;
+        // `OpenOptions::mode` is filtered by the process umask when the
+        // temporary file is created. Apply the explicit mode to the open
+        // file afterward so callers that are preserving an existing file's
+        // permissions do not silently tighten them under a restrictive
+        // daemon umask. Private-file callers still pass `0600` here.
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         file.sync_all()
     })();
@@ -189,19 +195,19 @@ pub fn hook_command(
     )
 }
 
-/// The eight hook events Dark Factory wires into every generated provider
+/// The nine hook events Dark Factory wires into every generated provider
 /// configuration, in the order the daemon's state machine reasons about
 /// them (see `TRACK5-DESIGN.md` sections 2 and 3): boot, delivery
 /// acknowledgement, tool activity (start/finish), idle-wait, turn-complete,
-/// subagent-complete, and process shutdown. Codex additionally wires one
-/// more, Codex-only event (`PermissionRequest`) on top of this shared set
-/// -- see `providers::codex::CODEX_ONLY_HOOK_EVENTS`.
-pub const HOOK_EVENTS: [factory_core::ProviderHookEvent; 8] = [
+/// subagent-complete, provider approval, and process shutdown. The immediate
+/// `PermissionRequest` hook is shared by current Claude and Codex configs.
+pub const HOOK_EVENTS: [factory_core::ProviderHookEvent; 9] = [
     factory_core::ProviderHookEvent::SessionStart,
     factory_core::ProviderHookEvent::UserPromptSubmit,
     factory_core::ProviderHookEvent::PreToolUse,
     factory_core::ProviderHookEvent::PostToolUse,
     factory_core::ProviderHookEvent::Notification,
+    factory_core::ProviderHookEvent::PermissionRequest,
     factory_core::ProviderHookEvent::Stop,
     factory_core::ProviderHookEvent::SubagentStop,
     factory_core::ProviderHookEvent::SessionEnd,

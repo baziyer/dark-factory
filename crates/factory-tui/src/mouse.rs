@@ -8,9 +8,10 @@ use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEven
 use ratatui::layout::Rect;
 use tui_term::vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use factory_core::status::AttentionItem;
 use factory_core::{AgentId, SessionId, TaskId};
 
-use crate::model::{AttentionTarget, View};
+use crate::model::View;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Target {
@@ -19,7 +20,7 @@ pub enum Target {
     Detach,
     Agent(AgentId),
     Task(TaskId),
-    Attention(AttentionTarget),
+    Attention(AttentionItem),
     Pane(SessionId),
 }
 

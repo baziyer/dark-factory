@@ -177,10 +177,11 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
 mod tests {
     use super::*;
     use crate::mouse::{Route, Target, route};
-    use crate::test_fixtures::{agent, project, task};
+    use crate::test_fixtures::{agent, attention, project, session, task};
     use factory_core::{
-        AgentId, AgentRole, TaskId, TaskStatus,
+        AgentId, AgentRole, ProjectId, RunId, SessionId, SessionState, TaskId, TaskStatus,
         local::{AgentDetail, AgentProfile},
+        status::AttentionReasonKind,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -242,6 +243,14 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
+        let attention = attention(
+            AttentionReasonKind::WorkerBlocked,
+            None,
+            Some("blocked"),
+            None,
+            0,
+        );
+        board.attention = vec![attention.clone()];
         let hits = render(&board, 120, 24);
         assert_eq!(hits.target_at(0, 23), Some(Target::View(View::Building)));
         assert_eq!(hits.target_at(11, 23), Some(Target::View(View::Agent)));
@@ -249,12 +258,129 @@ mod tests {
             hits.target_at(1, 2),
             Some(Target::Agent(AgentId::try_from("alice").unwrap()))
         );
-        assert_eq!(
-            hits.target_at(83, 1),
-            Some(Target::Attention(crate::model::AttentionTarget::Task(
-                TaskId::try_from("blocked").unwrap()
-            )))
+        assert_eq!(hits.target_at(83, 1), Some(Target::Attention(attention)));
+    }
+
+    #[test]
+    fn agent_action_card_keeps_reason_and_safe_action_visible_without_an_attached_pane() {
+        let mut board = Board::new(false, 65_000, crate::theme::PLAIN);
+        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
+        alice.current_session_id = Some(SessionId::try_from("session-1").unwrap());
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![alice],
+            Vec::new(),
+            Vec::new(),
+            vec![session(
+                "session-1",
+                "alice",
+                "proj",
+                SessionState::WaitingForInput,
+            )],
         );
+        let item = attention(
+            AttentionReasonKind::ProviderPermission,
+            Some("alice"),
+            Some("task-1"),
+            Some("session-1"),
+            5_000,
+        );
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.attention_focus = Some(crate::model::AttentionFocus {
+            item,
+            resolved: false,
+        });
+        let (_, terminal) = render_frame(&board, 140, 30);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("attaching…"));
+        assert!(text.contains("provider permission"));
+        assert!(text.contains("Approve the requested"));
+        assert!(text.contains("command?"));
+        assert!(text.contains("task: task-1"));
+        assert!(text.contains("session: session-1"));
+        assert!(text.contains("age: 1m"));
+        assert!(text.contains("safe action:"));
+        assert!(text.contains("typing off; Ctrl-] to enter"));
+    }
+
+    #[test]
+    fn narrow_action_card_reserves_source_action_and_control_rows_for_maximum_reason() {
+        let project_id = "p".repeat(128);
+        let agent_id = "a".repeat(128);
+        let task_id = "t".repeat(128);
+        let session_id = "s".repeat(128);
+        let run_id = "r".repeat(128);
+        let mut selected = agent(&agent_id, &project_id, AgentRole::Worker, None);
+        selected.current_session_id = Some(SessionId::try_from(session_id.as_str()).unwrap());
+        let mut board = Board::new(false, 65_000, crate::theme::PLAIN);
+        board.apply_fleet_snapshot(
+            vec![project(&project_id, 0)],
+            vec![selected],
+            Vec::new(),
+            Vec::new(),
+            vec![session(
+                &session_id,
+                &agent_id,
+                &project_id,
+                SessionState::WaitingForInput,
+            )],
+        );
+        let mut item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some(&agent_id),
+            Some(&task_id),
+            Some(&session_id),
+            5_000,
+        );
+        item.project_id = ProjectId::try_from(project_id.as_str()).unwrap();
+        item.run_id = Some(RunId::try_from(run_id.as_str()).unwrap());
+        item.reason.summary = "界".repeat(factory_core::status::MAX_ATTENTION_SUMMARY_CHARS);
+        board.view = View::Agent;
+        board.selected_agent = Some(AgentId::try_from(agent_id.as_str()).unwrap());
+        board.attention_focus = Some(crate::model::AttentionFocus {
+            item,
+            resolved: false,
+        });
+
+        let (_, terminal) = render_frame(&board, 80, 24);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let project_fragment = truncate_middle(&project_id, 30);
+        let agent_fragment = truncate_middle(&agent_id, 30);
+        let task_fragment = truncate_middle(&task_id, 30);
+        let session_fragment = truncate_middle(&session_id, 31);
+        let run_fragment = truncate_middle(&run_id, 33);
+        for visible in [
+            "worker blocked",
+            "project:",
+            &project_fragment,
+            "agent:",
+            &agent_fragment,
+            "task:",
+            &task_fragment,
+            "session:",
+            &session_fragment,
+            "run:",
+            &run_fragment,
+            "age:",
+            "safe action: factoryctl task retry",
+            "terminal typing is not an action",
+        ] {
+            assert!(text.contains(visible), "missing {visible:?}: {text}");
+        }
+        assert!(!text.contains("typing off; Ctrl-] to enter"));
     }
 
     #[test]

@@ -3,8 +3,9 @@ use std::path::Path;
 use factory_core::{
     AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
-    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ProviderNotificationKind, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
+    RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
+    TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     model_policy,
@@ -23,10 +24,10 @@ pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
     pub backlog: Vec<TaskSnapshot>,
-    pub blocked: Vec<TaskSnapshot>,
+    pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 27;
+const SCHEMA_VERSION: i64 = 30;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -394,12 +395,14 @@ pub struct SessionRow {
     /// be marked, not silently presented as exact.
     pub activity_inferred: bool,
     pub wait_reason: Option<String>,
+    pub observer_reason: Option<String>,
     pub observer_health: ObserverHealth,
     pub observer_health_since_ms: i64,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub runner_protocol_version: u16,
     pub last_hook_event: Option<ProviderHookEvent>,
+    pub notification_kind: Option<ProviderNotificationKind>,
     pub last_hook_at_ms: Option<i64>,
     pub started_at_ms: i64,
     pub updated_at_ms: i64,
@@ -434,8 +437,10 @@ impl SessionRow {
             activity: self.activity.clone(),
             activity_inferred: self.activity_inferred,
             last_hook_event: self.last_hook_event,
+            notification_kind: self.notification_kind,
             last_hook_at_ms: self.last_hook_at_ms,
             wait_reason: self.wait_reason.clone(),
+            observer_reason: self.observer_reason.clone(),
             observer_health: self.observer_health,
             observer_health_since_ms: self.observer_health_since_ms,
             started_at_ms: self.started_at_ms,
@@ -1384,13 +1389,13 @@ impl Store {
                 codex_home, hook_token, state, state_since_ms, activity,
                 activity_inferred, wait_reason, observer_health,
                 observer_health_since_ms, runner_instance_id, runner_runtime,
-                runner_protocol_version, last_hook_event, last_hook_at_ms,
+                runner_protocol_version, last_hook_event, notification_kind, last_hook_at_ms,
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
                 stop_requested_at_ms, resumed_provider_session
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
-                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, ?13, ?13,
-                NULL, NULL, NULL, NULL, ?18
+                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, NULL, ?13,
+                ?13, NULL, NULL, NULL, NULL, ?18
              )",
             params![
                 input.id.as_str(),
@@ -1456,7 +1461,8 @@ impl Store {
 
     /// Implements the hook state machine: `SessionStart` -> `idle` (only
     /// from `starting`); `UserPromptSubmit`/`PreToolUse`/`PostToolUse` ->
-    /// `working`; `Notification` -> `waiting_for_input`; `Stop` -> `idle`
+    /// `working`; typed actionable `Notification` -> `waiting_for_input`,
+    /// routine/unknown `Notification` -> `idle`; `Stop` -> `idle`
     /// (clears activity); `SubagentStop`/`SessionEnd` record only, without
     /// changing session state. Never closes a run.
     pub fn record_hook_event(
@@ -1466,6 +1472,31 @@ impl Store {
         activity: Option<String>,
         inferred: bool,
         wait_reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        self.record_hook_event_with_notification(
+            session_id,
+            event,
+            activity,
+            inferred,
+            wait_reason,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Records a provider hook with its typed notification cause. The cause
+    /// is durable session state; free-form wait text is never consulted to
+    /// decide whether a notification is answerable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_hook_event_with_notification(
+        &mut self,
+        session_id: &SessionId,
+        event: ProviderHookEvent,
+        activity: Option<String>,
+        inferred: bool,
+        wait_reason: Option<String>,
+        notification_kind: Option<ProviderNotificationKind>,
         now_ms: i64,
     ) -> Result<(SessionSnapshot, EventEnvelope)> {
         if activity
@@ -1491,6 +1522,7 @@ impl Store {
         let mut next_activity = session.activity.clone();
         let mut next_inferred = session.activity_inferred;
         let mut next_wait_reason = session.wait_reason.clone();
+        let mut next_notification_kind = session.notification_kind;
         match event {
             ProviderHookEvent::SessionStart => {
                 if session.state == SessionState::Starting {
@@ -1498,6 +1530,7 @@ impl Store {
                     next_activity = None;
                     next_inferred = false;
                     next_wait_reason = None;
+                    next_notification_kind = None;
                 }
             }
             ProviderHookEvent::UserPromptSubmit
@@ -1507,16 +1540,39 @@ impl Store {
                 next_activity = activity;
                 next_inferred = inferred;
                 next_wait_reason = None;
+                next_notification_kind = None;
             }
-            ProviderHookEvent::Notification | ProviderHookEvent::PermissionRequest => {
+            ProviderHookEvent::Notification => {
+                if matches!(
+                    notification_kind,
+                    Some(
+                        ProviderNotificationKind::PermissionPrompt
+                            | ProviderNotificationKind::ElicitationDialog
+                            | ProviderNotificationKind::ElicitationUrlDialog
+                            | ProviderNotificationKind::AgentNeedsInput
+                    )
+                ) {
+                    state = SessionState::WaitingForInput;
+                    next_wait_reason = wait_reason;
+                } else {
+                    state = SessionState::Idle;
+                    next_activity = None;
+                    next_inferred = false;
+                    next_wait_reason = None;
+                }
+                next_notification_kind = notification_kind;
+            }
+            ProviderHookEvent::PermissionRequest => {
                 state = SessionState::WaitingForInput;
                 next_wait_reason = wait_reason;
+                next_notification_kind = None;
             }
             ProviderHookEvent::Stop => {
                 state = SessionState::Idle;
                 next_activity = None;
                 next_inferred = false;
                 next_wait_reason = None;
+                next_notification_kind = None;
             }
             ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => {
                 // Records only: a subagent finishing does not mean the
@@ -1533,9 +1589,9 @@ impl Store {
         transaction.execute(
             "UPDATE sessions
              SET state = ?1, state_since_ms = ?2, activity = ?3, activity_inferred = ?4,
-                 wait_reason = ?5, last_hook_event = ?6, last_hook_at_ms = ?7,
-                 updated_at_ms = ?7
-             WHERE id = ?8",
+                 wait_reason = ?5, last_hook_event = ?6, notification_kind = ?7,
+                 last_hook_at_ms = ?8, updated_at_ms = ?8
+             WHERE id = ?9",
             params![
                 session_state_value(state),
                 state_since_ms,
@@ -1543,6 +1599,7 @@ impl Store {
                 next_inferred,
                 next_wait_reason,
                 provider_hook_event_value(event),
+                next_notification_kind.map(provider_notification_kind_value),
                 now_ms,
                 session_id.as_str(),
             ],
@@ -2233,7 +2290,7 @@ impl Store {
         transaction.execute(
             "UPDATE sessions
              SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
-                 wait_reason = ?2
+                 wait_reason = ?2, notification_kind = NULL
              WHERE id = ?3",
             params![now_ms, wait_reason, session_id.as_str()],
         )?;
@@ -2253,6 +2310,79 @@ impl Store {
                 event,
             },
         ))
+    }
+
+    /// Records whether the daemon can attach to a live session's runner PTY.
+    /// Attach failures are shared durable observer state, not a TUI-only note;
+    /// the next successful attach clears the exact daemon-owned failure reason.
+    pub fn record_terminal_attach_health(
+        &mut self,
+        session_id: &SessionId,
+        failure: Option<String>,
+        now_ms: i64,
+    ) -> Result<Option<(SessionSnapshot, EventEnvelope)>> {
+        if failure
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > MAX_WAIT_REASON_BYTES)
+        {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        let attach_was_degraded = session
+            .observer_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("terminal attach failed: "));
+        let (health, next_reason) = match failure {
+            Some(reason) => (ObserverHealth::Degraded, Some(reason)),
+            None if attach_was_degraded => (ObserverHealth::Healthy, None),
+            None if session.observer_health == ObserverHealth::Unknown => {
+                (ObserverHealth::Healthy, session.observer_reason.clone())
+            }
+            None => (session.observer_health, session.observer_reason.clone()),
+        };
+        if session.observer_health == health && session.observer_reason == next_reason {
+            return Ok(None);
+        }
+        let health_since_ms = if session.observer_health == health {
+            session.observer_health_since_ms
+        } else {
+            now_ms
+        };
+        transaction.execute(
+            "UPDATE sessions
+             SET observer_health = ?1, observer_health_since_ms = ?2,
+                 observer_reason = ?3, updated_at_ms = ?4
+             WHERE id = ?5",
+            params![
+                observer_health_value(health),
+                health_since_ms,
+                next_reason,
+                now_ms,
+                session_id.as_str(),
+            ],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        transaction.commit()?;
+        Ok(Some((
+            snapshot,
+            EventEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event: changed,
+            },
+        )))
     }
 
     /// Every session the daemon must reconnect to after a restart.
@@ -4089,7 +4219,7 @@ impl Store {
         reject_active_managed_change(&transaction, task_id)?;
         if !matches!(
             task.snapshot.status,
-            TaskStatus::Failed | TaskStatus::Cancelled
+            TaskStatus::Blocked | TaskStatus::Failed | TaskStatus::Cancelled
         ) {
             return Err(StoreError::TaskNotRetryable);
         }
@@ -4099,7 +4229,7 @@ impl Store {
              SET status = 'queued', result = NULL, started_at_ms = NULL,
                  completed_at_ms = NULL, blocked_reason = NULL, updated_at_ms = ?1
              WHERE id = ?2 AND project_id = ?3
-               AND status IN ('failed', 'cancelled')",
+               AND status IN ('blocked', 'failed', 'cancelled')",
             params![now_ms, task_id.as_str(), project_id.as_str()],
         )?;
         if changed != 1 {
@@ -4774,6 +4904,7 @@ impl Store {
             worktree: None,
             session,
             current_run,
+            latest_run,
             queue_depth: u32::try_from(queue.len()).unwrap_or(u32::MAX),
             queue: queue.into_iter().take(MAX_QUEUE_PREVIEW).collect(),
             inbox_pending: u32::try_from(inbox_pending).unwrap_or(u32::MAX),
@@ -4853,15 +4984,23 @@ impl Store {
     }
 
     /// Tasks an agent marked blocked, oldest update first.
-    fn blocked_tasks(&self, project_id: &ProjectId) -> Result<Vec<TaskSnapshot>> {
+    pub fn blocked_tasks(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<Vec<factory_core::status::BlockedTaskStatus>> {
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
-                    created_at_ms, updated_at_ms
+                    created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
              WHERE project_id = ?1 AND status = 'blocked'
              ORDER BY updated_at_ms, id",
         )?;
-        let rows = statement.query_map(params![project_id.as_str()], task_snapshot_from_row)?;
+        let rows = statement.query_map(params![project_id.as_str()], |row| {
+            Ok(factory_core::status::BlockedTaskStatus {
+                task: task_snapshot_from_row(row)?,
+                reason: row.get(9)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -5820,9 +5959,10 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.runtime_permission_mode, s.runtime_control_mode,
                     s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
                     s.state, s.state_since_ms,
-                    s.activity, s.activity_inferred, s.wait_reason, s.observer_health,
-                    s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
-                    s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
+                    s.activity, s.activity_inferred, s.wait_reason, s.observer_reason,
+                    s.observer_health, s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
+                    s.runner_protocol_version, s.last_hook_event, s.notification_kind,
+                    s.last_hook_at_ms,
                     s.started_at_ms, s.updated_at_ms, s.ended_at_ms, s.exit_code,
                     s.exit_signal, s.stop_requested_at_ms,
                     s.delivery_recovery_stop_requested_at_ms,
@@ -5839,10 +5979,11 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
     let state: String = row.get(12)?;
-    let observer_health: String = row.get(17)?;
-    let protocol: i64 = row.get(21)?;
-    let last_hook_event: Option<String> = row.get(22)?;
-    let current_run_id: Option<String> = row.get(31)?;
+    let observer_health: String = row.get(18)?;
+    let protocol: i64 = row.get(22)?;
+    let last_hook_event: Option<String> = row.get(23)?;
+    let notification_kind: Option<String> = row.get(24)?;
+    let current_run_id: Option<String> = row.get(33)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -5861,25 +6002,29 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         activity: row.get(14)?,
         activity_inferred: row.get(15)?,
         wait_reason: row.get(16)?,
-        observer_health: parse_observer_health(&observer_health, 17)?,
-        observer_health_since_ms: row.get(18)?,
-        runner_instance_id: parse_id(row.get(19)?, 19)?,
-        runner_runtime: row.get(20)?,
+        observer_reason: row.get(17)?,
+        observer_health: parse_observer_health(&observer_health, 18)?,
+        observer_health_since_ms: row.get(19)?,
+        runner_instance_id: parse_id(row.get(20)?, 20)?,
+        runner_runtime: row.get(21)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(21, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(22, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 22))
+            .map(|value| parse_provider_hook_event(&value, 23))
             .transpose()?,
-        last_hook_at_ms: row.get(23)?,
-        started_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
-        ended_at_ms: row.get(26)?,
-        exit_code: row.get(27)?,
-        exit_signal: row.get(28)?,
-        stop_requested_at_ms: row.get(29)?,
-        delivery_recovery_stop_requested_at_ms: row.get(30)?,
-        current_run_id: parse_optional_id(current_run_id, 31)?,
+        notification_kind: notification_kind
+            .map(|value| parse_provider_notification_kind(&value, 24))
+            .transpose()?,
+        last_hook_at_ms: row.get(25)?,
+        started_at_ms: row.get(26)?,
+        updated_at_ms: row.get(27)?,
+        ended_at_ms: row.get(28)?,
+        exit_code: row.get(29)?,
+        exit_signal: row.get(30)?,
+        stop_requested_at_ms: row.get(31)?,
+        delivery_recovery_stop_requested_at_ms: row.get(32)?,
+        current_run_id: parse_optional_id(current_run_id, 33)?,
     })
 }
 
@@ -6345,7 +6490,9 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if current == 25 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(include_str!("../migrations/0026_managed_changes.sql"))?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0026_session_observer_reason.sql"
+        ))?;
         transaction.pragma_update(None, "user_version", 26)?;
         transaction.commit()?;
         current = 26;
@@ -6353,9 +6500,40 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     if current == 26 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
-            "../migrations/0027_recoverable_managed_changes.sql"
+            "../migrations/0027_session_notification_kind.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 27)?;
+        transaction.commit()?;
+        current = 27;
+    }
+    if current == 27 {
+        // The rebuild drops the sessions parent of populated child tables;
+        // disable foreign-key enforcement for the transaction and verify the
+        // restored graph before returning to normal operation.
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0028_widen_session_notification_kind.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 28)?;
+        transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
+        current = 28;
+    }
+    if current == 28 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0029_managed_changes.sql"))?;
+        transaction.pragma_update(None, "user_version", 29)?;
+        transaction.commit()?;
+        current = 29;
+    }
+    if current == 29 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0030_recoverable_managed_changes.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 30)?;
         transaction.commit()?;
     }
     Ok(())
@@ -6650,6 +6828,15 @@ fn parse_provider_hook_event(value: &str, column: usize) -> rusqlite::Result<Pro
     })
 }
 
+fn parse_provider_notification_kind(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<ProviderNotificationKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
 fn parse_optional_failure_reason(
     value: Option<String>,
     column: usize,
@@ -6714,6 +6901,20 @@ const fn observer_health_value(value: ObserverHealth) -> &'static str {
         ObserverHealth::Unknown => "unknown",
         ObserverHealth::Healthy => "healthy",
         ObserverHealth::Degraded => "degraded",
+    }
+}
+
+const fn provider_notification_kind_value(value: ProviderNotificationKind) -> &'static str {
+    match value {
+        ProviderNotificationKind::PermissionPrompt => "permission_prompt",
+        ProviderNotificationKind::ElicitationDialog => "elicitation_dialog",
+        ProviderNotificationKind::ElicitationUrlDialog => "elicitation_url_dialog",
+        ProviderNotificationKind::AgentNeedsInput => "agent_needs_input",
+        ProviderNotificationKind::IdlePrompt => "idle_prompt",
+        ProviderNotificationKind::AuthSuccess => "auth_success",
+        ProviderNotificationKind::ElicitationComplete => "elicitation_complete",
+        ProviderNotificationKind::ElicitationResponse => "elicitation_response",
+        ProviderNotificationKind::AgentCompleted => "agent_completed",
     }
 }
 

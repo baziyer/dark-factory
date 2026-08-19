@@ -558,6 +558,11 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  DROP TABLE delivery_attempts;
                  DROP TABLE managed_changes;
+                 ALTER TABLE sessions DROP COLUMN observer_reason;
+                 ALTER TABLE sessions DROP COLUMN notification_kind;
+                 DROP TABLE managed_changes;
+                 ALTER TABLE sessions DROP COLUMN observer_reason;
+                 ALTER TABLE sessions DROP COLUMN notification_kind;
                  UPDATE events SET schema_version = 1;
                  PRAGMA user_version = 22;",
             )
@@ -2818,8 +2823,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         assert_eq!(status.attention.len(), 1);
         let item = &status.attention[0];
         assert_eq!(
-            item.kind,
-            factory_core::status::AttentionKind::PausedWithWork
+            item.reason.kind,
+            factory_core::status::AttentionReasonKind::PausedWithWork
         );
         assert_eq!(item.agent_id, Some(agent_id("curie")));
         assert_eq!(item.task_id, Some(task_id("t-assigned")));
@@ -2840,6 +2845,8 @@ async fn fleet_and_agent_status_are_one_consistent_read() {
         };
         assert_eq!(detail.status, *curie, "the same picture the fleet view had");
         assert_eq!(detail.detail.snapshot.id, agent_id("curie"));
+        assert_eq!(detail.attention, vec![item.clone()]);
+        assert!(detail.generated_at_ms > 0);
         assert!(detail.detail.instructions_path.ends_with("instructions.md"));
         // The project root is not a git repository, so the agent runs in the
         // root itself; the status says so instead of pretending a clean tree.

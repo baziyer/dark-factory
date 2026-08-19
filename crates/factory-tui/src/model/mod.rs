@@ -11,13 +11,12 @@
 //! project's agents/tasks/runs/sessions at once. BUILDING is fleet-wide; AGENT follows the
 //! selected agent while `focused_project` supplies scope for project actions.
 //!
-//! ## Deriving agent state and attention
+//! ## Deriving agent state
 //!
-//! [`Board::agent_state`] and [`Board::agent_attention`] are the two functions everything else in
-//! this crate goes through instead of inspecting [`SessionState`]/[`RunStatus`] itself: "session
-//! state wins over run-status inference when a session exists" (design brief §5). Both return a
-//! [`attention::Rated`] value so callers can show the `~` prefix the brief asks for whenever the
-//! answer was inferred from run/task lifecycle state rather than observed from a session's hooks.
+//! [`Board::agent_state`] is the one function everything else in this crate goes through instead
+//! of inspecting [`SessionState`]/[`RunStatus`] itself. Operator attention is not derived here:
+//! it is the shared CLI-first [`factory_core::status::AttentionItem`] projection received in
+//! fleet status.
 
 pub mod announcements;
 mod keymap;
@@ -26,13 +25,16 @@ pub mod state;
 use std::collections::{BTreeMap, HashMap};
 
 use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalResponse};
+use factory_core::status::{
+    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, display_text,
+};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
     Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
 };
 
 pub use announcements::Announcement;
-pub use factory_core::attention::{self, Attention, Rated};
+pub use factory_core::attention::Rated;
 pub use keymap::{
     Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
     TaskMenuState, View,
@@ -77,18 +79,9 @@ pub enum Connection {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AttentionTarget {
-    Agent(AgentId),
-    Task(TaskId),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AttentionItem {
-    pub target: AttentionTarget,
-    pub project_id: ProjectId,
-    pub attention: Attention,
-    pub inferred: bool,
-    pub since_ms: i64,
+pub struct AttentionFocus {
+    pub item: AttentionItem,
+    pub resolved: bool,
 }
 
 /// Durable ownership for an activity series. `None` is retained only for replay events received
@@ -130,17 +123,31 @@ pub struct Board {
     pub sessions: BTreeMap<SessionId, SessionSnapshot>,
     pub agent_details: BTreeMap<AgentId, AgentDetail>,
     pub messages: BTreeMap<AgentId, Vec<AgentMessage>>,
+    /// Authoritative CLI-first attention projection from `FleetStatus`.
+    pub attention: Vec<AttentionItem>,
+    /// Client-only attach failures that the unreachable daemon cannot own.
+    local_attention: BTreeMap<SessionId, AttentionItem>,
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
     activity_identities: BTreeMap<AgentId, ActivityIdentity>,
     seen_event_sequences: state::RingBuffer<i64>,
+    /// Causal revision of the currently displayed attention projection.
+    attention_revision: i64,
+    /// Highest live event sequence folded into the state maps. A FleetStatus
+    /// at the same sequence may have arrived first; it must not block the
+    /// corresponding live event from updating task/session state.
+    event_revision: i64,
+    /// Bounded retry deadlines for client-side terminal attach failures.
+    attach_retry_after: BTreeMap<SessionId, i64>,
 
     pub view: View,
     /// The one agent selection shared by BUILDING and AGENT.
     pub selected_agent: Option<AgentId>,
     /// Task targeted by a task action modal.
     pub selected_task: Option<TaskId>,
+    /// Explicit action card selected by `g` or a NEEDS YOU click.
+    pub attention_focus: Option<AttentionFocus>,
     pub mode: Mode,
     /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
@@ -175,13 +182,19 @@ impl Board {
             sessions: BTreeMap::new(),
             agent_details: BTreeMap::new(),
             messages: BTreeMap::new(),
+            attention: Vec::new(),
+            local_attention: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
+            attention_revision: 0,
+            event_revision: -1,
+            attach_retry_after: BTreeMap::new(),
             view: View::Building,
             selected_agent: None,
             selected_task: None,
+            attention_focus: None,
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
             pane_ready: false,
@@ -194,12 +207,33 @@ impl Board {
 
     pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
         self.live_session_cap = Some(status.live_session_cap);
+        if status.event_sequence < 0
+            || (status.event_sequence >= self.attention_revision
+                && status.event_sequence >= self.event_revision)
+        {
+            if status.event_sequence >= 0 {
+                self.attention_revision = self.attention_revision.max(status.event_sequence);
+            }
+            self.attention = status.attention;
+            self.reconcile_attention_focus();
+        }
         self.worktrees = status
             .projects
             .into_iter()
             .flat_map(|project| project.agents)
             .filter_map(|agent| agent.worktree.map(|worktree| (agent.agent.id, worktree)))
             .collect();
+    }
+
+    /// Records the durable head paired with the authoritative bootstrap.
+    /// Replay may fill historical activity, but cannot lower this causal
+    /// boundary or allow an older independently requested status to win.
+    pub fn note_fleet_snapshot_sequence(&mut self, event_sequence: i64) {
+        if event_sequence > self.attention_revision {
+            self.attention_revision = event_sequence;
+            self.attention.clear();
+            self.reconcile_attention_focus();
+        }
     }
 
     // -- derived views: projects/agents/tasks -----------------------------------------------
@@ -371,74 +405,125 @@ impl Board {
         ))
     }
 
-    /// The agent's newest session by start time, live or ended.
-    #[must_use]
-    pub fn latest_session_for(&self, agent_id: &AgentId) -> Option<&SessionSnapshot> {
-        self.sessions
-            .values()
-            .filter(|session| &session.agent_id == agent_id)
-            .max_by_key(|session| (session.started_at_ms, session.id.clone()))
-    }
-
-    /// The [`Attention`] taxonomy's precedence rule, shared with `factoryctl status`
-    /// (`factory_core::attention::agent_attention`).
-    #[must_use]
-    pub fn agent_attention(&self, agent: &AgentSnapshot) -> Rated<Attention> {
-        attention::agent_attention(
-            self.latest_session_for(&agent.id),
-            self.latest_run_for(&agent.id),
-        )
-    }
-
     #[must_use]
     pub fn attention_items(&self) -> Vec<AttentionItem> {
-        let mut items = Vec::new();
-        for agent in self.agents.values() {
-            let rated = self.agent_attention(agent);
-            if rated.value.needs_operator() {
-                let since_ms = self
-                    .session_for(agent)
-                    .map_or(agent.updated_at_ms, |session| session.state_since_ms);
-                items.push(AttentionItem {
-                    target: AttentionTarget::Agent(agent.id.clone()),
-                    project_id: agent.project_id.clone(),
-                    attention: rated.value,
-                    inferred: rated.inferred,
-                    since_ms,
-                });
-            }
-        }
-        for task in self.tasks.values() {
-            let level = attention::task_attention(task.snapshot.status);
-            if level.needs_operator() {
-                items.push(AttentionItem {
-                    target: AttentionTarget::Task(task.snapshot.id.clone()),
-                    project_id: task.snapshot.project_id.clone(),
-                    attention: level,
-                    inferred: false,
-                    since_ms: task.snapshot.updated_at_ms,
-                });
-            }
-        }
-        items.sort_by(|a, b| {
-            a.since_ms
-                .cmp(&b.since_ms)
-                .then_with(|| match (&a.target, &b.target) {
-                    (AttentionTarget::Agent(a), AttentionTarget::Agent(b)) => {
-                        a.as_str().cmp(b.as_str())
-                    }
-                    (AttentionTarget::Task(a), AttentionTarget::Task(b)) => {
-                        a.as_str().cmp(b.as_str())
-                    }
-                    (AttentionTarget::Agent(_), AttentionTarget::Task(_)) => {
-                        std::cmp::Ordering::Less
-                    }
-                    (AttentionTarget::Task(_), AttentionTarget::Agent(_)) => {
-                        std::cmp::Ordering::Greater
-                    }
+        let mut items: Vec<_> = self
+            .attention
+            .iter()
+            .filter(|item| {
+                item.session_id.as_ref().is_none_or(|session_id| {
+                    !self.local_attention.contains_key(session_id)
+                        || item.reason.kind == AttentionReasonKind::ObserverProblem
                 })
-        });
+            })
+            .chain(self.local_attention.values().filter(|local| {
+                !self.attention.iter().any(|item| {
+                    item.session_id == local.session_id
+                        && item.reason.kind == AttentionReasonKind::ObserverProblem
+                })
+            }))
+            .filter(|item| item.level.needs_operator())
+            .cloned()
+            .collect();
+        factory_core::status::sort_attention(&mut items);
         items
+    }
+
+    fn reconcile_attention_focus(&mut self) {
+        let Some(source) = self
+            .attention_focus
+            .as_ref()
+            .map(|focus| focus.item.clone())
+        else {
+            return;
+        };
+        let current = self
+            .attention_items()
+            .into_iter()
+            .find(|item| same_attention_source(item, &source));
+        let focus = self.attention_focus.as_mut().expect("focus checked above");
+        if let Some(current) = current {
+            focus.item = current.clone();
+            focus.resolved = false;
+        } else if !focus.resolved {
+            focus.resolved = true;
+            self.set_status(
+                "attention changed or resolved before action",
+                StatusLevel::Info,
+            );
+        }
+    }
+
+    fn invalidate_attention(&mut self, mut invalid: impl FnMut(&AttentionItem) -> bool) {
+        self.attention.retain(|item| !invalid(item));
+        self.reconcile_attention_focus();
+    }
+
+    /// Surfaces a client-local socket failure through the same action list as
+    /// daemon-owned attention. Runner-side attach failures are persisted by
+    /// `factoryd`; this covers the only case it cannot record because the TUI
+    /// could not reach it at all.
+    pub fn note_local_attach_failure(&mut self, session_id: &SessionId, error: &str) {
+        let Some(session) = self.sessions.get(session_id) else {
+            return;
+        };
+        self.attach_retry_after
+            .entry(session_id.clone())
+            .or_insert(self.now_ms.saturating_add(1_000));
+        if self.local_attention.contains_key(session_id) {
+            return;
+        }
+        self.local_attention.insert(
+            session_id.clone(),
+            AttentionItem {
+                level: factory_core::attention::Attention::Failed,
+                project_id: session.project_id.clone(),
+                agent_id: Some(session.agent_id.clone()),
+                task_id: None,
+                session_id: Some(session_id.clone()),
+                run_id: session.current_run_id.clone(),
+                since_ms: self.now_ms,
+                reason: AttentionReason {
+                    kind: AttentionReasonKind::ObserverProblem,
+                    summary: display_text(&format!("local terminal attach failed: {error}")),
+                    action: AttentionAction::InspectObserver,
+                },
+            },
+        );
+        self.reconcile_attention_focus();
+    }
+
+    pub fn clear_local_attach_failure(&mut self, session_id: &SessionId) {
+        self.attach_retry_after.remove(session_id);
+        self.local_attention.remove(session_id);
+        self.reconcile_attention_focus();
+    }
+
+    pub fn clear_undesired_attach_failures(&mut self, desired: &[SessionId]) -> bool {
+        let previous = self.local_attention.len();
+        self.local_attention
+            .retain(|session_id, _| desired.contains(session_id));
+        self.attach_retry_after
+            .retain(|session_id, _| desired.contains(session_id));
+        let changed = self.local_attention.len() != previous;
+        if changed {
+            self.reconcile_attention_focus();
+        }
+        changed
+    }
+
+    /// Returns true for a first attempt or once a failed attach's bounded
+    /// retry deadline has elapsed. Taking an elapsed deadline lets the next
+    /// failure establish a fresh delay instead of spinning every frame.
+    pub fn take_attach_retry(&mut self, session_id: &SessionId) -> bool {
+        match self.attach_retry_after.get(session_id).copied() {
+            Some(deadline) if self.now_ms < deadline => false,
+            Some(_) => {
+                self.attach_retry_after.remove(session_id);
+                true
+            }
+            None => true,
+        }
     }
 
     // -- derived views: terminal attach targets ----------------------------------------------
@@ -731,7 +816,7 @@ impl Board {
         // transition at the time.
         let mut last_session_state: HashMap<SessionId, SessionState> = HashMap::new();
         for event in events {
-            if !self.remember_event_sequence(event.sequence) {
+            if !self.admit_event_sequence(event.sequence, false) {
                 continue;
             }
             self.apply_event_activity(&event.event, event.occurred_at_ms);
@@ -747,13 +832,53 @@ impl Board {
     }
 
     pub fn apply_event(&mut self, event: EventEnvelope) {
-        if !self.remember_event_sequence(event.sequence) {
+        if !self.admit_event_sequence(event.sequence, true) {
             return;
         }
         self.apply_event_activity(&event.event, event.occurred_at_ms);
 
         let worth_announcing = self.should_announce(&event);
         self.maybe_announce(&event, worth_announcing);
+
+        match &event.event {
+            FactoryEvent::AgentBudgetChanged { agent_id, .. } => {
+                self.invalidate_attention(|item| {
+                    item.agent_id.as_ref() == Some(agent_id)
+                        && item.reason.kind == AttentionReasonKind::BudgetExhausted
+                })
+            }
+            FactoryEvent::AgentChanged { agent } => self.invalidate_attention(|item| {
+                item.agent_id.as_ref() == Some(&agent.id)
+                    && item.reason.kind == AttentionReasonKind::PausedWithWork
+            }),
+            FactoryEvent::TaskChanged { task } => {
+                self.invalidate_attention(|item| item.task_id.as_ref() == Some(&task.id));
+            }
+            FactoryEvent::RunChanged { run } => {
+                self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
+            }
+            FactoryEvent::SessionChanged { session } => {
+                let retain_reason = factory_core::status::session_attention_reason_kind(session);
+                self.invalidate_attention(|item| {
+                    item.session_id.as_ref() == Some(&session.id)
+                        && (retain_reason != Some(item.reason.kind))
+                });
+            }
+            FactoryEvent::TaskDeleted { task_id, .. } => {
+                self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
+            }
+            FactoryEvent::AgentDeleted { agent_id, .. } => {
+                self.invalidate_attention(|item| item.agent_id.as_ref() == Some(agent_id));
+            }
+            FactoryEvent::ProjectDeleted { project_id } => {
+                self.invalidate_attention(|item| &item.project_id == project_id);
+            }
+            FactoryEvent::AutoModeChanged { .. }
+            | FactoryEvent::PolicyDecision { .. }
+            | FactoryEvent::RepositoryOperation { .. }
+            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::ProjectChanged { .. } => {}
+        }
 
         match event.event {
             FactoryEvent::AutoModeChanged { .. } | FactoryEvent::PolicyDecision { .. } => {}
@@ -934,10 +1059,10 @@ impl Board {
         }
     }
 
-    /// Returns false for a recently seen durable event. The event stream's sequence is the
-    /// stable identity shared by connect-time replay and live delivery, so this keeps both the
-    /// activity projection and the ordinary state fold idempotent across their handoff.
-    fn remember_event_sequence(&mut self, sequence: i64) -> bool {
+    /// Admits durable events through the live state-folding sequence boundary.
+    /// Attention snapshots use a separate boundary: a snapshot at sequence N
+    /// must not reject the live event N that carries the corresponding state.
+    fn admit_event_sequence(&mut self, sequence: i64, advances_attention: bool) -> bool {
         if self
             .seen_event_sequences
             .iter()
@@ -945,7 +1070,16 @@ impl Board {
         {
             return false;
         }
+        if advances_attention
+            && (sequence < self.attention_revision || sequence <= self.event_revision)
+        {
+            return false;
+        }
         self.seen_event_sequences.push(sequence);
+        if advances_attention {
+            self.event_revision = sequence;
+            self.attention_revision = self.attention_revision.max(sequence);
+        }
         true
     }
 
@@ -1114,6 +1248,16 @@ impl Board {
                     .is_none_or(|created_at_ms| created_at_ms == agent.created_at_ms)
         })
     }
+}
+
+pub(crate) fn same_attention_source(a: &AttentionItem, b: &AttentionItem) -> bool {
+    a.reason.kind == b.reason.kind
+        && a.project_id == b.project_id
+        && a.agent_id == b.agent_id
+        && a.task_id == b.task_id
+        && a.session_id == b.session_id
+        && a.run_id == b.run_id
+        && a.since_ms == b.since_ms
 }
 
 fn truncate_status(text: &str, max: usize) -> String {

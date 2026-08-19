@@ -358,7 +358,7 @@ fn session_changed_event_with_a_new_state_announces_again() {
     );
     b.apply_event(EventEnvelope {
         protocol_version: 1,
-        sequence: 0,
+        sequence: 1,
         occurred_at_ms: 0,
         event: FactoryEvent::SessionChanged {
             session: session("sess-1", "alice", "a", SessionState::Working),
@@ -366,7 +366,7 @@ fn session_changed_event_with_a_new_state_announces_again() {
     });
     b.apply_event(EventEnvelope {
         protocol_version: 1,
-        sequence: 1,
+        sequence: 2,
         occurred_at_ms: 1,
         event: FactoryEvent::SessionChanged {
             session: session("sess-1", "alice", "a", SessionState::Working),
@@ -374,7 +374,7 @@ fn session_changed_event_with_a_new_state_announces_again() {
     });
     b.apply_event(EventEnvelope {
         protocol_version: 1,
-        sequence: 2,
+        sequence: 3,
         occurred_at_ms: 2,
         event: FactoryEvent::SessionChanged {
             session: session("sess-1", "alice", "a", SessionState::WaitingForInput),
@@ -397,7 +397,7 @@ fn first_session_changed_event_for_a_session_always_announces() {
     );
     b.apply_event(EventEnvelope {
         protocol_version: 1,
-        sequence: 0,
+        sequence: 1,
         occurred_at_ms: 0,
         event: FactoryEvent::SessionChanged {
             session: session("sess-1", "alice", "a", SessionState::Starting),
@@ -668,7 +668,7 @@ fn apply_replay_drops_activity_for_an_agent_deleted_during_the_replay_window() {
     );
 }
 
-// -- state/attention precedence ----------------------------------------------------------------
+// -- state precedence --------------------------------------------------------------------------
 
 #[test]
 fn session_state_wins_over_run_status_when_both_exist() {
@@ -693,10 +693,6 @@ fn session_state_wins_over_run_status_when_both_exist() {
         !rated_state.inferred,
         "observed from a session, not inferred"
     );
-
-    let rated_attention = b.agent_attention(agent);
-    assert_eq!(rated_attention.value, Attention::Routine);
-    assert!(!rated_attention.inferred);
 }
 
 #[test]

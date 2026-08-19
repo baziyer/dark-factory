@@ -450,6 +450,8 @@ mod provider_tests {
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PostToolUse"}]}],
                 "Notification": [{"hooks": [{"type": "command",
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Notification"}]}],
+                "PermissionRequest": [{"hooks": [{"type": "command",
+                    "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PermissionRequest"}]}],
                 "Stop": [{"hooks": [{"type": "command",
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Stop"}]}],
                 "SubagentStop": [{"hooks": [{"type": "command",
@@ -496,6 +498,8 @@ mod provider_tests {
     }
 
     mod pretrust_worktree_tests {
+        use std::{env, process::Command};
+
         use super::*;
 
         fn write_fake_claude_json(home: &std::path::Path, contents: &str) {
@@ -596,6 +600,43 @@ mod provider_tests {
 
             let metadata = std::fs::metadata(&path).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+        }
+
+        #[test]
+        fn preserves_the_files_existing_mode_under_umask_0077_and_0022() {
+            const UMASK_ENV: &str = "FACTORYD_CLAUDE_MODE_UMASK";
+
+            if let Some(mask) = env::var_os(UMASK_ENV) {
+                let mask = u16::from_str_radix(mask.to_str().unwrap(), 8).unwrap();
+                let previous = rustix::process::umask(rustix::fs::Mode::from_bits_retain(mask));
+
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join(".claude.json");
+                std::fs::write(&path, r#"{"projects": {}}"#).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+                pretrust_worktree(&PathBuf::from("/Users/op/worktree"), home.path());
+
+                let metadata = std::fs::metadata(&path).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o644);
+
+                let private_path = home.path().join("private-file");
+                hooks::write_private_file(&private_path, b"private").unwrap();
+                let private_metadata = std::fs::metadata(private_path).unwrap();
+                assert_eq!(private_metadata.permissions().mode() & 0o777, 0o600);
+
+                rustix::process::umask(previous);
+                return;
+            }
+
+            for mask in [0o077_u16, 0o022_u16] {
+                let status = Command::new(env::current_exe().unwrap())
+                    .arg("preserves_the_files_existing_mode_under_umask_0077_and_0022")
+                    .env(UMASK_ENV, format!("{mask:o}"))
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "child test failed under umask {mask:03o}");
+            }
         }
 
         #[test]
