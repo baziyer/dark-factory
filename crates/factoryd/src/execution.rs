@@ -1759,8 +1759,8 @@ async fn spawn_session_for_agent(
     };
     let snapshot = state
         .commit_and_publish(move |store| {
-            let (snapshot, event) = store.create_session(new_session, created_at_ms)?;
-            Ok((snapshot, vec![event]))
+            let (snapshot, events) = store.create_session(new_session, created_at_ms)?;
+            Ok((snapshot, events))
         })
         .await?;
 

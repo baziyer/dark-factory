@@ -79,6 +79,13 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         ));
         spans.push(Span::raw(" "));
     }
+    if let Some(mismatch) = board.version_mismatch() {
+        spans.push(Span::styled(
+            format!(" {mismatch} "),
+            Style::default().fg(Color::Black).bg(Color::Red),
+        ));
+        spans.push(Span::raw(" "));
+    }
     spans.push(Span::styled(
         board.status_line_text(),
         Style::default().fg(text_color),
