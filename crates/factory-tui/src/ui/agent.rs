@@ -25,7 +25,7 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, h
         return;
     }
     let area = if let Some(focus) = &board.attention_focus {
-        let card_height = area.height.min(9);
+        let card_height = area.height.min(10);
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(card_height), Constraint::Min(0)])
@@ -338,8 +338,11 @@ pub(crate) fn render_attention_card(
     hits: &mut HitMap,
 ) {
     let item = &focus.item;
+    let pending = board.attention_is_pending(item);
     let title = if focus.resolved {
         " ACTION — STALE "
+    } else if pending {
+        " ACTION — PENDING "
     } else {
         " ACTION — NEEDS YOU "
     };
@@ -362,6 +365,7 @@ pub(crate) fn render_attention_card(
         .as_ref()
         .map_or("—", factory_core::RunId::as_str);
     let age = factory_core::status::age_text(board.now_ms, item.since_ms);
+    let decision = item.decision();
     let mut lines = vec![
         Line::from(Span::styled(
             if focus.resolved {
@@ -379,7 +383,7 @@ pub(crate) fn render_attention_card(
             if focus.resolved {
                 "changed or resolved; refresh NEEDS YOU before acting"
             } else {
-                &item.reason.summary
+                &format!("{} | evidence: {}", decision.cause, decision.evidence)
             },
             inner_width,
         )),
@@ -400,7 +404,6 @@ pub(crate) fn render_attention_card(
         Line::from(compact_pair("run:", run, "age:", &age, inner_width)),
     ];
     if !focus.resolved {
-        let decision = item.decision();
         for (index, choice) in decision.choices.iter().enumerate() {
             hits.add_row(
                 ui::block("").inner(area),
@@ -422,10 +425,11 @@ pub(crate) fn render_attention_card(
                 inner_width,
             )));
         }
-        let typing = if matches!(
+        let typing = if pending {
+            "request pending; wait for response"
+        } else if matches!(
             item.reason.action,
             factory_core::status::AttentionAction::AnswerInTerminal
-                | factory_core::status::AttentionAction::ReviewProviderPermission
         ) {
             "typing off; Ctrl-] to enter answer"
         } else {
@@ -447,7 +451,7 @@ pub(crate) fn render_attention_card(
     }
     // Every field owns one row. Paragraph clipping therefore cannot let a
     // bounded-but-long reason push source identity or the safe action below
-    // the nine-row full-width card at the tested 80-column board width.
+    // the ten-row full-width card at the tested 80-column board width.
     frame.render_widget(Paragraph::new(lines).block(ui::block(title)), area);
 }
 

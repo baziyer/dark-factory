@@ -204,6 +204,8 @@ impl AttentionReasonKind {
 pub enum AttentionAction {
     AnswerInTerminal,
     ReviewProviderPermission,
+    ApproveProviderPermission,
+    RejectProviderPermission,
     InspectRecovery,
     InspectObserver,
     ResetBudget,
@@ -349,7 +351,6 @@ impl AttentionItem {
                 | AttentionReasonKind::WorkerBlocked
                 | AttentionReasonKind::BudgetExhausted
                 | AttentionReasonKind::PausedWithWork
-                | AttentionReasonKind::Inferred
         )
     }
 
@@ -358,7 +359,7 @@ impl AttentionItem {
     #[must_use]
     pub fn decision(&self) -> AttentionDecision {
         let evidence = display_text(&format!(
-            "project={} agent={} task={} session={} run={}",
+            "project: {} agent: {} task: {} session: {} run: {}",
             self.project_id,
             self.agent_id.as_ref().map_or("—", AgentId::as_str),
             self.task_id.as_ref().map_or("—", TaskId::as_str),
@@ -386,17 +387,19 @@ impl AttentionItem {
                 action: AttentionAction::AnswerInTerminal,
                 consequence: "sends the answer to the waiting provider session".to_owned(),
             }],
-            AttentionReasonKind::ProviderPermission => vec![AttentionChoice {
-                label: "Review permission".to_owned(),
-                action: AttentionAction::ReviewProviderPermission,
-                consequence: "leaves the provider approval under explicit operator control"
-                    .to_owned(),
-            }],
-            AttentionReasonKind::Inferred => vec![AttentionChoice {
-                label: "Inspect state".to_owned(),
-                action: AttentionAction::InspectInferredState,
-                consequence: "opens the recorded run evidence before a recovery choice".to_owned(),
-            }],
+            AttentionReasonKind::ProviderPermission => vec![
+                AttentionChoice {
+                    label: "Approve".to_owned(),
+                    action: AttentionAction::ApproveProviderPermission,
+                    consequence: "allows the exact provider request to continue".to_owned(),
+                },
+                AttentionChoice {
+                    label: "Reject".to_owned(),
+                    action: AttentionAction::RejectProviderPermission,
+                    consequence: "denies the exact provider request".to_owned(),
+                },
+            ],
+            AttentionReasonKind::Inferred => Vec::new(),
             AttentionReasonKind::DeliveryRecovery
             | AttentionReasonKind::ObserverProblem
             | AttentionReasonKind::WaitingForCapacity => Vec::new(),
@@ -440,6 +443,12 @@ impl AttentionItem {
             }
             AttentionAction::ReviewProviderPermission => {
                 "review the provider prompt before entering terminal typing".to_owned()
+            }
+            AttentionAction::ApproveProviderPermission => {
+                "approve the provider request with the exact yes decision".to_owned()
+            }
+            AttentionAction::RejectProviderPermission => {
+                "reject the provider request with the exact no decision".to_owned()
             }
             AttentionAction::InspectRecovery => self.session_id.as_ref().map_or_else(
                 || "inspect daemon recovery; no human answer is pending".to_owned(),

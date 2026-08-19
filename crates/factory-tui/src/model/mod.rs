@@ -148,6 +148,12 @@ pub struct Board {
     pub selected_task: Option<TaskId>,
     /// Explicit action card selected by `g` or a NEEDS YOU click.
     pub attention_focus: Option<AttentionFocus>,
+    /// Exact decision source awaiting a daemon response. This closes the
+    /// duplicate-action window between a successful request and its event.
+    pending_attention: Option<AttentionItem>,
+    /// Recently completed exact sources suppressed until a newer projection
+    /// proves a new decision exists.
+    completed_attention: Vec<AttentionItem>,
     pub mode: Mode,
     /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
@@ -195,6 +201,8 @@ impl Board {
             selected_agent: None,
             selected_task: None,
             attention_focus: None,
+            pending_attention: None,
+            completed_attention: Vec::new(),
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
             pane_ready: false,
@@ -438,7 +446,39 @@ impl Board {
         self.attention_items()
             .into_iter()
             .filter(AttentionItem::needs_operator_decision)
+            .filter(|item| {
+                !self
+                    .completed_attention
+                    .iter()
+                    .any(|completed| same_attention_source(completed, item))
+            })
             .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn attention_is_pending(&self, item: &AttentionItem) -> bool {
+        self.pending_attention
+            .as_ref()
+            .is_some_and(|pending| same_attention_source(pending, item))
+    }
+
+    pub(crate) fn begin_attention_request(&mut self, item: &AttentionItem) {
+        self.pending_attention = Some(item.clone());
+    }
+
+    pub(crate) fn clear_attention_request(&mut self) {
+        self.pending_attention = None;
+    }
+
+    pub(crate) fn complete_attention_request(&mut self) {
+        let Some(item) = self.pending_attention.take() else {
+            return;
+        };
+        self.completed_attention.push(item);
+        if self.completed_attention.len() > 32 {
+            self.completed_attention.remove(0);
+        }
+        self.reconcile_attention_focus();
     }
 
     fn reconcile_attention_focus(&mut self) {
@@ -963,6 +1003,7 @@ impl Board {
     pub fn apply_response(&mut self, result: Result<LocalResponse, String>) {
         match result {
             Ok(LocalResponse::Error { code, message }) => {
+                self.clear_attention_request();
                 self.set_status(
                     format!("{}: {message}", error_code_word(code)),
                     StatusLevel::Error,
@@ -973,6 +1014,7 @@ impl Board {
                 self.set_status(text, StatusLevel::Info);
             }
             Err(error) => {
+                self.clear_attention_request();
                 self.set_status(format!("request failed: {error}"), StatusLevel::Error);
             }
         }
@@ -991,7 +1033,6 @@ impl Board {
                 format!("created task#{id}")
             }
             LocalResponse::Task { task }
-            | LocalResponse::TaskRetried { task }
             | LocalResponse::TaskCancelled { task }
             | LocalResponse::TaskUpdated { task }
             | LocalResponse::TaskAssigned { task }
@@ -1000,6 +1041,13 @@ impl Board {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
                 self.tasks.insert(task.snapshot.id.clone(), task);
+                format!("task#{id} {}", announcements::task_status_word(status))
+            }
+            LocalResponse::TaskRetried { task } => {
+                let id = task.snapshot.id.clone();
+                let status = task.snapshot.status;
+                self.tasks.insert(task.snapshot.id.clone(), task);
+                self.complete_attention_request();
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
             LocalResponse::TaskDeleted { task_id, .. } => {
@@ -1022,11 +1070,21 @@ impl Board {
                 self.remove_activity(&agent_id);
                 format!("removed agent {agent_id}")
             }
-            LocalResponse::AgentPaused { agent } | LocalResponse::AgentResumed { agent } => {
+            LocalResponse::AgentPaused { agent } => {
                 let id = agent.id.clone();
                 let paused = agent.paused;
                 self.agents.insert(agent.id.clone(), agent);
                 format!("agent {id} {}", if paused { "paused" } else { "resumed" })
+            }
+            LocalResponse::AgentResumed { agent } => {
+                let id = agent.id.clone();
+                self.agents.insert(agent.id.clone(), agent);
+                self.complete_attention_request();
+                format!("agent {id} resumed")
+            }
+            LocalResponse::AgentBudgetUpdated { budget } => {
+                self.complete_attention_request();
+                format!("agent budget updated at {}", budget.updated_at_ms)
             }
             LocalResponse::AgentMessageSent { message } => {
                 format!("message sent to {}", message.recipient_agent_id)
@@ -1047,6 +1105,10 @@ impl Board {
             LocalResponse::RunCancelled { run_id } => format!("run {run_id} cancelled"),
             LocalResponse::SessionStopped { session_id } => {
                 format!("stop requested for session {session_id}")
+            }
+            LocalResponse::TerminalInputAccepted { session_id } => {
+                self.complete_attention_request();
+                format!("answer sent to session {session_id}")
             }
             LocalResponse::Sessions { sessions, .. } => {
                 for session in sessions {

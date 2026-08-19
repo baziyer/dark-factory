@@ -214,17 +214,13 @@ impl PromptState {
     }
 
     #[must_use]
-    fn attention_answer(project_id: ProjectId, session_id: SessionId, permission: bool) -> Self {
+    fn attention_answer(project_id: ProjectId, session_id: SessionId) -> Self {
         Self {
             kind: PromptKind::AttentionAnswer {
                 project_id,
                 session_id,
             },
-            labels: vec![if permission {
-                "approval (yes/no)"
-            } else {
-                "answer"
-            }],
+            labels: vec!["answer"],
             values: vec![String::new()],
             field: 0,
         }
@@ -869,14 +865,19 @@ impl Board {
     }
 
     fn choose_attention(&mut self, index: usize) -> Intent {
-        let Some(focus) = self
+        let Some(source) = self
             .attention_focus
             .as_ref()
             .filter(|focus| !focus.resolved)
+            .map(|focus| focus.item.clone())
         else {
             return Intent::None;
         };
-        let decision = focus.item.decision();
+        if self.attention_is_pending(&source) {
+            self.set_status("decision request is still pending", StatusLevel::Info);
+            return Intent::Redraw;
+        }
+        let decision = source.decision();
         let Some(choice) = decision.choices.get(index) else {
             self.set_status("that decision choice is not available", StatusLevel::Error);
             return Intent::Redraw;
@@ -884,49 +885,77 @@ impl Board {
         match choice.action {
             factory_core::status::AttentionAction::RetryTask => {
                 let (Some(task_id), Some(project_id)) = (
-                    focus.item.task_id.clone(),
-                    Some(focus.item.project_id.clone()),
+                    source.task_id.clone(),
+                    Some(source.project_id.clone()),
                 ) else {
                     self.set_status("retry choice has no exact task", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                Intent::Send(LocalRequest::RetryTask {
+                let request = LocalRequest::RetryTask {
                     project_id,
                     task_id,
-                })
+                };
+                self.begin_attention_request(&source);
+                Intent::Send(request)
             }
             factory_core::status::AttentionAction::ResumeAgent => {
-                let Some(agent_id) = focus.item.agent_id.clone() else {
+                let Some(agent_id) = source.agent_id.clone() else {
                     self.set_status("resume choice has no exact agent", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                Intent::Send(LocalRequest::ResumeAgent {
-                    project_id: focus.item.project_id.clone(),
+                let request = LocalRequest::ResumeAgent {
+                    project_id: source.project_id.clone(),
                     agent_id,
-                })
+                };
+                self.begin_attention_request(&source);
+                Intent::Send(request)
             }
             factory_core::status::AttentionAction::ResetBudget => {
-                let Some(agent_id) = focus.item.agent_id.clone() else {
+                let Some(agent_id) = source.agent_id.clone() else {
                     self.set_status("budget choice has no exact agent", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                Intent::Send(LocalRequest::ResetAgentBudget {
-                    project_id: focus.item.project_id.clone(),
+                let request = LocalRequest::ResetAgentBudget {
+                    project_id: source.project_id.clone(),
                     agent_id,
-                })
+                };
+                self.begin_attention_request(&source);
+                Intent::Send(request)
             }
-            factory_core::status::AttentionAction::AnswerInTerminal
-            | factory_core::status::AttentionAction::ReviewProviderPermission => {
-                let Some(session_id) = focus.item.session_id.clone() else {
+            factory_core::status::AttentionAction::AnswerInTerminal => {
+                let Some(session_id) = source.session_id.clone() else {
                     self.set_status("provider choice has no exact session", StatusLevel::Error);
                     return Intent::Redraw;
                 };
                 self.mode = Mode::Prompt(PromptState::attention_answer(
-                    focus.item.project_id.clone(),
+                    source.project_id.clone(),
                     session_id,
-                    choice.action
-                        == factory_core::status::AttentionAction::ReviewProviderPermission,
                 ));
+                Intent::Redraw
+            }
+            factory_core::status::AttentionAction::ApproveProviderPermission
+            | factory_core::status::AttentionAction::RejectProviderPermission => {
+                let Some(session_id) = source.session_id.clone() else {
+                    self.set_status("permission choice has no exact session", StatusLevel::Error);
+                    return Intent::Redraw;
+                };
+                let bytes = if choice.action
+                    == factory_core::status::AttentionAction::ApproveProviderPermission
+                {
+                    b"y\n".as_slice()
+                } else {
+                    b"n\n".as_slice()
+                };
+                let request = LocalRequest::TerminalInput {
+                    project_id: source.project_id.clone(),
+                    session_id,
+                    bytes: factory_core::runner::encode_terminal_bytes(bytes),
+                };
+                self.begin_attention_request(&source);
+                Intent::Send(request)
+            }
+            factory_core::status::AttentionAction::ReviewProviderPermission => {
+                self.set_status("choose approve or reject", StatusLevel::Info);
                 Intent::Redraw
             }
             _ => {
@@ -1125,6 +1154,16 @@ impl Board {
                 }
                 let mut bytes = answer.as_bytes().to_vec();
                 bytes.push(b'\n');
+                if let Some(source) = self
+                    .attention_focus
+                    .as_ref()
+                    .map(|focus| focus.item.clone())
+                    .filter(|source| {
+                        source.project_id == project_id && source.session_id.as_ref() == Some(&session_id)
+                    })
+                {
+                    self.begin_attention_request(&source);
+                }
                 Intent::Send(LocalRequest::TerminalInput {
                     project_id,
                     session_id,

@@ -56,22 +56,15 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                 subject.push('/');
                 subject.push_str(agent_id.as_str());
             }
+            let decision = item.decision();
             writeln!(
                 output,
-                "  {} | {} | task {} | session {} | run {} | age {} | {} | action: {}",
+                "  {} | {} | age {} | cause: {} | evidence: {} | action: {}",
                 item.reason.kind.label(),
                 subject,
-                item.task_id
-                    .as_ref()
-                    .map_or("—", factory_core::TaskId::as_str),
-                item.session_id
-                    .as_ref()
-                    .map_or("—", factory_core::SessionId::as_str),
-                item.run_id
-                    .as_ref()
-                    .map_or("—", factory_core::RunId::as_str),
                 age_text(status.generated_at_ms, item.since_ms),
-                display_text(&item.reason.summary),
+                display_text(&decision.cause),
+                display_text(&decision.evidence),
                 item.action_text(),
             )
             .map_err(|error| error.to_string())?;

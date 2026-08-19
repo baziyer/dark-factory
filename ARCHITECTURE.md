@@ -115,9 +115,10 @@ catalogue.
    inference; every client receives the same bounded control-safe summary,
    source IDs, age, and safe action. NEEDS YOU is a decision inbox: only
    authority/ambiguity reasons (provider decisions, explicit worker blocks,
-   budget intervention, manual pause, or unproven lifecycle inference) enter
-   it. Delivery, observer, capacity, and other deterministic recovery remains
-   a control-plane concern. Selecting a row keeps BUILDING visible and shows
+   budget intervention, or manual pause) enter it. Unproven lifecycle
+   inference has no valid typed operator action and remains a control-plane
+   concern alongside delivery, observer, capacity, and other deterministic
+   recovery. Selecting a row keeps BUILDING visible and shows
    the same bounded cause, exact evidence, typed choices, recommendation, and
    consequences in both `factoryctl status` and the TUI. Attention is not
    permission to stop or replace a worker; recovery begins by preserving or
