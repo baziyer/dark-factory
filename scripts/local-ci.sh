@@ -32,6 +32,11 @@ case "$mode" in
         ;;
 esac
 
+# Measure after the macOS repository lease is held, so another linked worktree
+# cannot begin a broad gate between this read-only preflight and our compile.
+./scripts/check-build-headroom.sh
+./scripts/test-build-headroom.sh
+
 # The authoritative source gate is shared by macOS and Linux. Keep this
 # seam explicit so a platform mode cannot silently omit a core check.
 ./scripts/test-github-step-summary.sh

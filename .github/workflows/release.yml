@@ -81,6 +81,9 @@ jobs:
           rustup toolchain install 1.88.0 --profile minimal --no-self-update
           rustup target add --toolchain 1.88.0 "$ARM_TARGET" "$INTEL_TARGET"
 
+      - name: Check build headroom
+        run: ./scripts/check-build-headroom.sh
+
       - name: Check that the tag matches the workspace version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
