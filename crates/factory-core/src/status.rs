@@ -412,11 +412,8 @@ impl AttentionItem {
                 .take(MAX_ATTENTION_EVIDENCE_CHARS)
                 .collect(),
             choices,
-            recommended: (!matches!(
-                self.reason.kind,
-                AttentionReasonKind::ProviderPermission
-            ))
-            .then_some(0),
+            recommended: (!matches!(self.reason.kind, AttentionReasonKind::ProviderPermission))
+                .then_some(0),
         }
     }
 
@@ -1344,9 +1341,11 @@ mod tests {
             decision.choices[1].action,
             AttentionAction::RejectProviderPermission
         );
-        assert!(permission_item
-            .action_text()
-            .contains("choose Approve or Reject"));
+        assert!(
+            permission_item
+                .action_text()
+                .contains("choose Approve or Reject")
+        );
 
         let mut idle = session(SessionState::Idle, 25);
         idle.last_hook_event = Some(ProviderHookEvent::Notification);

@@ -1686,9 +1686,12 @@ mod tests {
             board.handle_key(key(KeyCode::Enter)),
             Intent::Redraw
         ));
-        assert!(board.status.as_ref().is_some_and(|status| {
-            status.text.contains("explicit decision")
-        }));
+        assert!(
+            board
+                .status
+                .as_ref()
+                .is_some_and(|status| { status.text.contains("explicit decision") })
+        );
         assert!(matches!(
             board.handle_key(key(KeyCode::Char('1'))),
             Intent::Send(LocalRequest::TerminalInput { .. })

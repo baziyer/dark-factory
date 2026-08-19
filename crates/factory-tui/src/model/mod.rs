@@ -547,10 +547,7 @@ impl Board {
     }
 
     fn invalidate_attention(&mut self, mut invalid: impl FnMut(&AttentionItem) -> bool) {
-        let pending_invalid = self
-            .pending_attention
-            .as_ref()
-            .is_some_and(&mut invalid);
+        let pending_invalid = self.pending_attention.as_ref().is_some_and(&mut invalid);
         self.attention.retain(|item| !invalid(item));
         if pending_invalid {
             self.clear_attention_request();
@@ -957,10 +954,8 @@ impl Board {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
             FactoryEvent::SessionChanged { session } => {
-                let provider_projection_changed = self
-                    .pending_attention
-                    .as_ref()
-                    .is_some_and(|item| {
+                let provider_projection_changed =
+                    self.pending_attention.as_ref().is_some_and(|item| {
                         item.reason.kind == AttentionReasonKind::ProviderPermission
                             && item.session_id.as_ref() == Some(&session.id)
                             && self.sessions.get(&session.id).is_none_or(|previous| {
