@@ -1283,7 +1283,7 @@ mod tests {
         let decision = worker.decision();
         assert_eq!(decision.choices[0].action, AttentionAction::RetryTask);
         assert_eq!(decision.recommended, 0);
-        assert!(decision.evidence.contains("project=p"));
+        assert!(decision.evidence.contains("project: p"));
         assert!(!decision.cause.contains('\u{1b}'));
         items.push(worker);
         items.push(delivery);
