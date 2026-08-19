@@ -992,7 +992,7 @@ fn a_standalone_message_delivers_without_opening_a_run() {
             .then_some(())
     });
 
-    wait_for_session_state(&client, "curie", SessionState::Idle);
+    wait_for_stable_idle(&client, "curie");
     let prompt_submits = events_after(&client, 0)
         .into_iter()
         .filter(|envelope| {

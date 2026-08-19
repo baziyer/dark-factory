@@ -149,7 +149,7 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     // `Store::open` above intentionally created the newest schema so the
     // fixture can seed a real profile. Rewind it as an actual pre-0022
     // database, including removing the post-0022 table; otherwise migration
-    // 0023 quite correctly rejects a duplicate CREATE TABLE.
+    // 0024 quite correctly rejects a duplicate CREATE TABLE.
     connection
         .execute_batch("DROP TABLE delivery_attempts;")
         .unwrap();
