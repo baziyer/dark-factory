@@ -608,6 +608,8 @@ mod provider_tests {
 
             if let Some(mask) = env::var_os(UMASK_ENV) {
                 let mask = u16::from_str_radix(mask.to_str().unwrap(), 8).unwrap();
+                #[cfg(target_os = "linux")]
+                let mask = u32::from(mask);
                 let previous = rustix::process::umask(rustix::fs::Mode::from_bits_retain(mask));
 
                 let home = tempfile::tempdir().unwrap();

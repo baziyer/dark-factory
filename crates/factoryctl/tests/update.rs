@@ -140,6 +140,7 @@ impl Fixture {
         command
     }
 
+    #[cfg(target_os = "macos")]
     fn write_launchd_job(&self) {
         let user_home = self.root.path().join("user-home");
         let plist = user_home.join("Library/LaunchAgents/com.dark-factory.factoryd.plist");
@@ -160,6 +161,7 @@ impl Fixture {
         .unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn write_malformed_launchd_job(&self) {
         let user_home = self.root.path().join("user-home");
         let plist = user_home.join("Library/LaunchAgents/com.dark-factory.factoryd.plist");
@@ -175,6 +177,7 @@ impl Fixture {
         .unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn fake_launchctl(&self, success: bool) -> (PathBuf, PathBuf) {
         let tools = self.root.path().join(if success {
             "tools-success"
@@ -196,6 +199,7 @@ impl Fixture {
         (tools, log)
     }
 
+    #[cfg(target_os = "macos")]
     fn fake_launchctl_first_reload_fails(&self) -> (PathBuf, PathBuf) {
         let tools = self.root.path().join("tools-first-reload-fails");
         fs::create_dir_all(&tools).unwrap();
@@ -283,6 +287,7 @@ fn serve_managed_health_once(
     })
 }
 
+#[cfg(target_os = "macos")]
 fn prepend_path(command: &mut Command, directory: &Path) {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let paths = std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited));
