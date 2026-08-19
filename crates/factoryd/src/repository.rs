@@ -95,16 +95,17 @@ pub async fn create_managed_change(
     {
         return Err(Error::Rejected("managed issue branch is protected".into()));
     }
-    if worktree_path.exists() {
-        return Err(Error::Rejected(
-            "managed change worktree already exists".into(),
-        ));
-    }
+    // A daemon crash can leave the exact derived worktree after the SQLite
+    // insert failed. Reuse it only after proving its path and branch are the
+    // expected managed identity; unrelated occupants remain a hard collision.
+    let reuse_existing = worktree_path.exists();
     let parent = worktree_path
         .parent()
         .ok_or_else(|| Error::Rejected("managed change path has no parent".into()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|_| Error::Rejected("managed change directory is unavailable".into()))?;
+    if !reuse_existing {
+        std::fs::create_dir_all(parent)
+            .map_err(|_| Error::Rejected("managed change directory is unavailable".into()))?;
+    }
     let daemon_root = worktree_path
         .ancestors()
         .nth(2)
@@ -116,14 +117,8 @@ pub async fn create_managed_change(
         ));
     }
     let base_ref = format!("refs/heads/{}", authority.base_branch);
-    let base_output = safe_git(
-        &project_root,
-        None,
-        &["ls-remote", &authority.remote_url, &base_ref],
-        None,
-        READ_TIMEOUT,
-    )
-    .await?;
+    let base_output =
+        trusted_remote_ls_remote(&project_root, &authority.remote_url, &base_ref).await?;
     let base_sha = parse_remote_head(&base_output, &base_ref)?
         .ok_or_else(|| Error::Rejected("configured base branch is absent remotely".into()))?;
     let local_base = safe_git(
@@ -140,7 +135,22 @@ pub async fn create_managed_change(
         ));
     }
     let branch_ref = format!("refs/heads/{branch}");
-    if safe_git(
+    if reuse_existing {
+        let existing_root = canonical_directory(worktree_path, "managed change worktree")?;
+        let existing_branch = safe_git(
+            &existing_root,
+            None,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        if existing_branch.trim() != branch {
+            return Err(Error::Rejected(
+                "managed change path is occupied by another branch".into(),
+            ));
+        }
+    } else if safe_git(
         &project_root,
         None,
         &["show-ref", "--verify", "--quiet", &branch_ref],
@@ -154,28 +164,24 @@ pub async fn create_managed_change(
             "managed issue branch collides locally".into(),
         ));
     }
-    let branch_output = safe_git(
-        &project_root,
-        None,
-        &["ls-remote", &authority.remote_url, &branch_ref],
-        None,
-        READ_TIMEOUT,
-    )
-    .await?;
+    let branch_output =
+        trusted_remote_ls_remote(&project_root, &authority.remote_url, &branch_ref).await?;
     if parse_remote_head(&branch_output, &branch_ref)?.is_some() {
         return Err(Error::Rejected(
             "managed issue branch collides remotely".into(),
         ));
     }
     let worktree = worktree_path.to_string_lossy().into_owned();
-    safe_git(
-        &project_root,
-        None,
-        &["worktree", "add", "-b", &branch, &worktree, &base_sha],
-        None,
-        MUTATION_TIMEOUT,
-    )
-    .await?;
+    if !reuse_existing {
+        safe_git(
+            &project_root,
+            None,
+            &["worktree", "add", "-b", &branch, &worktree, &base_sha],
+            None,
+            MUTATION_TIMEOUT,
+        )
+        .await?;
+    }
     let git_dir = safe_git(
         worktree_path,
         None,
@@ -225,6 +231,7 @@ pub async fn create_managed_change(
         base_sha,
         head_sha: head.trim().to_owned(),
         published_head_sha: None,
+        state: "active".into(),
     })
 }
 
@@ -240,6 +247,24 @@ fn parse_remote_head(output: &str, reference: &str) -> Result<Option<String>, Er
         return Err(Error::Command("malformed remote ref".into()));
     }
     Ok(Some(head.to_owned()))
+}
+
+async fn trusted_remote_ls_remote(
+    cwd: &Path,
+    remote: &str,
+    reference: &str,
+) -> Result<String, Error> {
+    let args = ["ls-remote", remote, reference];
+    if github_slug(remote).is_some() {
+        let gh = trusted_program("gh")?;
+        let helper = format!(
+            "credential.https://github.com.helper=!{} auth git-credential",
+            gh.display()
+        );
+        safe_git_with_trusted_helper(cwd, None, &args, None, READ_TIMEOUT, &helper).await
+    } else {
+        safe_git(cwd, None, &args, None, READ_TIMEOUT).await
+    }
 }
 
 impl Target {
@@ -594,28 +619,41 @@ impl Target {
                 ));
             }
         }
+        let managed_lease = self.registered_change.as_ref().map(|change| {
+            format!(
+                "--force-with-lease=refs/heads/{}:{}",
+                self.branch,
+                change.published_head_sha.as_deref().unwrap_or_default()
+            )
+        });
         if self.github_repo.is_some() {
             let helper = format!(
                 "credential.https://github.com.helper=!{} auth git-credential",
                 self.gh_program.display()
             );
+            let mut args = vec!["push", "--porcelain"];
+            if let Some(lease) = managed_lease.as_deref() {
+                args.push(lease);
+            }
+            args.push(&self.authority.remote_url);
+            args.push(&refspec);
             safe_git_with_trusted_helper(
                 &self.worktree,
                 Some(&sandbox),
-                &["push", "--porcelain", &self.authority.remote_url, &refspec],
+                &args,
                 None,
                 MUTATION_TIMEOUT,
                 &helper,
             )
             .await?;
         } else {
-            sandbox
-                .git(
-                    &["push", "--porcelain", &self.authority.remote_url, &refspec],
-                    None,
-                    MUTATION_TIMEOUT,
-                )
-                .await?;
+            let mut args = vec!["push", "--porcelain"];
+            if let Some(lease) = managed_lease.as_deref() {
+                args.push(lease);
+            }
+            args.push(&self.authority.remote_url);
+            args.push(&refspec);
+            sandbox.git(&args, None, MUTATION_TIMEOUT).await?;
         }
         if self.revalidate().await? != head {
             return Err(Error::Rejected(
@@ -732,7 +770,7 @@ impl Target {
         let repo = self.github_repo.as_deref().ok_or_else(|| {
             Error::Rejected("pull requests require a configured GitHub HTTPS remote".into())
         })?;
-        let head = self.revalidate().await?;
+        let head = self.ensure_published_pr_head().await?;
         gh(
             &self.gh_program,
             &self.worktree,
@@ -763,17 +801,15 @@ impl Target {
                 "--repo",
                 repo,
                 "--json",
-                "headRefName,baseRefName,url",
+                "headRefName,baseRefName,headRefOid,url",
                 "--jq",
-                "[.headRefName,.baseRefName,.url]|@tsv",
+                "[.headRefName,.baseRefName,.headRefOid,.url]|@tsv",
             ],
             READ_TIMEOUT,
         )
         .await?;
-        let url = verify_pr(&verified, &self.branch, &self.authority.base_branch)?;
-        if self.revalidate().await? != head {
-            return Err(Error::Rejected("HEAD changed while PR was opened".into()));
-        }
+        let url = verify_pr_sha(&verified, &self.branch, &self.authority.base_branch, &head)?;
+        self.ensure_published_pr_head().await?;
         Ok(url)
     }
 
@@ -786,6 +822,7 @@ impl Target {
             Error::Rejected("pull requests require a configured GitHub HTTPS remote".into())
         })?;
         let number_text = number.to_string();
+        let head = self.ensure_published_pr_head().await?;
         let before = gh(
             &self.gh_program,
             &self.worktree,
@@ -796,15 +833,14 @@ impl Target {
                 "--repo",
                 repo,
                 "--json",
-                "headRefName,baseRefName,url",
+                "headRefName,baseRefName,headRefOid,url",
                 "--jq",
-                "[.headRefName,.baseRefName,.url]|@tsv",
+                "[.headRefName,.baseRefName,.headRefOid,.url]|@tsv",
             ],
             READ_TIMEOUT,
         )
         .await?;
-        verify_pr(&before, &self.branch, &self.authority.base_branch)?;
-        let head = self.revalidate().await?;
+        verify_pr_sha(&before, &self.branch, &self.authority.base_branch, &head)?;
         gh(
             &self.gh_program,
             &self.worktree,
@@ -832,18 +868,38 @@ impl Target {
                 "--repo",
                 repo,
                 "--json",
-                "headRefName,baseRefName,url",
+                "headRefName,baseRefName,headRefOid,url",
                 "--jq",
-                "[.headRefName,.baseRefName,.url]|@tsv",
+                "[.headRefName,.baseRefName,.headRefOid,.url]|@tsv",
             ],
             READ_TIMEOUT,
         )
         .await?;
-        verify_pr(&after, &self.branch, &self.authority.base_branch)?;
-        if self.revalidate().await? != head {
-            return Err(Error::Rejected("HEAD changed while PR was updated".into()));
-        }
+        verify_pr_sha(&after, &self.branch, &self.authority.base_branch, &head)?;
+        self.ensure_published_pr_head().await?;
         Ok(number_text)
+    }
+
+    async fn ensure_published_pr_head(&self) -> Result<String, Error> {
+        let head = self.revalidate().await?;
+        let Some(change) = &self.registered_change else {
+            return Ok(head);
+        };
+        if change.published_head_sha.as_deref() != Some(head.as_str()) {
+            return Err(Error::Rejected(
+                "publish the exact local HEAD before changing its PR".into(),
+            ));
+        }
+        let sandbox = self.sandbox().await?;
+        let remote = self
+            .remote_head(&sandbox, &format!("refs/heads/{}", self.branch))
+            .await?;
+        if remote.as_deref() != Some(head.as_str()) {
+            return Err(Error::Rejected(
+                "PR target branch is not at the exact published HEAD".into(),
+            ));
+        }
+        Ok(head)
     }
 }
 
@@ -901,14 +957,19 @@ impl GitSandbox {
     }
 }
 
-fn verify_pr(value: &str, head: &str, base: &str) -> Result<String, Error> {
+fn verify_pr_sha(value: &str, head: &str, base: &str, expected_sha: &str) -> Result<String, Error> {
     let mut fields = value.trim().split('\t');
     let actual_head = fields.next().unwrap_or_default();
     let actual_base = fields.next().unwrap_or_default();
+    let actual_sha = fields.next().unwrap_or_default();
     let url = fields.next().unwrap_or_default();
-    if actual_head != head || actual_base != base || !url.starts_with("https://github.com/") {
+    if actual_head != head
+        || actual_base != base
+        || actual_sha != expected_sha
+        || !url.starts_with("https://github.com/")
+    {
         return Err(Error::Rejected(
-            "PR identity changed during the request".into(),
+            "PR identity or published commit changed during the request".into(),
         ));
     }
     Ok(url.to_owned())
@@ -1364,7 +1425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_change_is_derived_from_the_authenticated_task_and_rejects_collisions() {
+    async fn managed_change_is_derived_and_recovers_an_exact_db_gap_retry() {
         let (temp, target, remote) = fixture().await;
         let project = ProjectSnapshot {
             id: target.project_id.clone(),
@@ -1389,11 +1450,13 @@ mod tests {
         assert_eq!(record.branch, "issue/issue-175");
         assert_eq!(record.head_sha, record.base_sha);
         assert_eq!(record.worktree, path.to_string_lossy());
-        let collision =
-            create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
-                .await
-                .unwrap_err();
-        assert!(collision.to_string().contains("worktree already exists"));
+        let retry = create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            retry, record,
+            "a DB-gap retry must recover the exact worktree"
+        );
     }
 
     #[tokio::test]
@@ -1460,6 +1523,21 @@ mod tests {
         )
         .await
         .unwrap();
+        registered.commit("first managed commit").await.unwrap();
+        run(
+            &remote,
+            &[
+                "update-ref",
+                "refs/heads/issue/issue-175-publish",
+                &record.base_sha,
+            ],
+        );
+        let stale = registered.push().await.unwrap_err();
+        assert!(stale.to_string().contains("stale or collides"));
+        run(
+            &remote,
+            &["update-ref", "-d", "refs/heads/issue/issue-175-publish"],
+        );
         registered.push().await.unwrap();
         registered.push().await.unwrap();
         std::fs::write(path.join("dirty"), "must not publish\n").unwrap();
@@ -1692,7 +1770,7 @@ mod tests {
         target.github_repo = Some("owner/repo".into());
         let fake = temp.path().join("gh");
         let log = temp.path().join("gh.log");
-        fs::write(&fake, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n 'pr view') printf 'agent/worker\\tmain\\thttps://github.com/owner/repo/pull/7\\n' ;;\nesac\n", log.display())).unwrap();
+        fs::write(&fake, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$1 $2\" in\n 'pr view') printf 'agent/worker\\tmain\\t{}\\thttps://github.com/owner/repo/pull/7\\n' ;;\nesac\n", log.display(), target.head)).unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o500)).unwrap();
         target.gh_program = std::fs::canonicalize(fake).unwrap();
         assert_eq!(

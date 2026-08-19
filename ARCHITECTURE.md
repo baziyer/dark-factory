@@ -192,13 +192,18 @@ catalogue.
    the canonical worktree/gitdir/common-dir identity and exact base SHA across
    restart, and existing commit/push/PR operations then target that record.
    Publication requires a clean tree, unchanged remote base, and exact prior
-   remote head (or no branch for first publication); ordinary Git push remains
-   non-force and same-head retries are idempotent. Collisions, stale leases,
-   detached/dirty/swapped worktrees, wrong-task/cross-agent requests, and
-   protected refs fail closed and are audited. Abandonment is explicit and
-   refuses dirty or unpublished work. Review, merge, and release remain
-   outside this API; the #159 readiness projection consumes this target rather
-   than being duplicated here.
+   remote head (or no branch for first publication). Git's server-enforced
+   `--force-with-lease` supplies the compare-and-swap; local ancestry checks
+   still forbid history rewrites, and same-head retries are idempotent. PR
+   open/update requires local HEAD, durable published HEAD, remote branch HEAD,
+   and the hosted PR head SHA to agree before and after the GitHub side effect.
+   Collisions, stale leases, detached/dirty/swapped worktrees,
+   wrong-task/cross-agent requests, and protected refs fail closed and are
+   audited. Abandonment durably enters `removing` before filesystem cleanup;
+   restart retries that state, while a create retry revalidates an exact
+   derived worktree left by a database-gap crash. Review, merge, and release
+   remain outside this API; the #159 readiness projection consumes this target
+   rather than being duplicated here.
 9. Once deletion of an agent or project begins, every known writer of files
    under its identity is blocked from starting a new write and drained if
    one is already running, before any of those files are removed. The

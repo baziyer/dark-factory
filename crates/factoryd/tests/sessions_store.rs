@@ -210,15 +210,15 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 25 after the
-/// connector-event, runtime metadata, legacy permission repair, durable
-/// delivery-attempt, and provider-resume recovery migrations
+/// which always migrates to the current `SCHEMA_VERSION`, 26 after the
+/// connector-event migration, runtime metadata, legacy permission repair,
+/// delivery-attempt, provider-resume recovery, and managed-change migrations
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
 /// chain including 0015's `sessions` rebuild, 0016's task incarnations, and
-/// 0021's historical runtime metadata columns and 0022's legacy permission
-/// repair.
+/// 0021's historical runtime metadata columns, 0022's legacy permission
+/// repair, and 0024/0025/0026's delivery and managed-change ownership schema.
 #[test]
 fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
     let directory = tempfile::tempdir().unwrap();
@@ -305,14 +305,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0025.
+    // Opening through the real store runs migrations 0014 through 0026.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -371,6 +371,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
                  DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
+                 DROP TABLE managed_changes;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  PRAGMA user_version = 18;",
@@ -383,7 +384,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -476,14 +477,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0025 migrations.
+    // Opening through the real store runs the 0015 through 0026 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 26);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

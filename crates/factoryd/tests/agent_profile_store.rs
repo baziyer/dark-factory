@@ -144,6 +144,9 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
         )
         .unwrap();
     connection
+        .execute_batch("DROP TABLE managed_changes;")
+        .unwrap();
+    connection
         .execute(
             "UPDATE agent_profiles SET permission_mode = 'bypass' WHERE agent_id = 'god'",
             [],
