@@ -836,8 +836,8 @@ pub fn sort_attention(items: &mut [AttentionItem]) {
 mod tests {
     use super::*;
     use crate::{
-        AgentRole, ObserverHealth, Provider, ProviderHookEvent, RunId, RunStatus, SessionState,
-        TaskStatus, attention::session_attention,
+        AgentRole, ObserverHealth, Provider, ProviderHookEvent, RunId, RunStatus, RunnerInstanceId,
+        SessionState, TaskStatus, attention::session_attention,
     };
 
     fn agent(id: &str, paused: bool) -> AgentSnapshot {
@@ -870,7 +870,7 @@ mod tests {
             state_since_ms: since,
             worktree: "/w".to_owned(),
             provider_session_id: None,
-            runner_instance_id: Some(id("runner")),
+            runner_instance_id: Some(RunnerInstanceId::try_from("runner").unwrap()),
             current_run_id: None,
             activity: None,
             activity_inferred: false,
