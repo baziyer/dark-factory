@@ -61,6 +61,8 @@ pub struct Target {
     github_repo: Option<String>,
     gh_program: PathBuf,
     registered_change: Option<ManagedChangeRecord>,
+    #[cfg(test)]
+    test_push_race: std::sync::Mutex<Option<(PathBuf, String, String)>>,
 }
 
 pub fn validate_authority(
@@ -134,6 +136,15 @@ pub async fn create_managed_change(
             "configured base commit is not present locally".into(),
         ));
     }
+    let project_common = safe_git(
+        &project_root,
+        None,
+        &["rev-parse", "--git-common-dir"],
+        None,
+        READ_TIMEOUT,
+    )
+    .await?;
+    let project_common = resolve_git_path(&project_root, project_common.trim())?;
     let branch_ref = format!("refs/heads/{branch}");
     if reuse_existing {
         let existing_root = canonical_directory(worktree_path, "managed change worktree")?;
@@ -148,6 +159,33 @@ pub async fn create_managed_change(
         if existing_branch.trim() != branch {
             return Err(Error::Rejected(
                 "managed change path is occupied by another branch".into(),
+            ));
+        }
+        let existing_common = safe_git(
+            &existing_root,
+            None,
+            &["rev-parse", "--git-common-dir"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        let existing_common = resolve_git_path(&existing_root, existing_common.trim())?;
+        if existing_common != project_common {
+            return Err(Error::Rejected(
+                "managed change path belongs to another repository".into(),
+            ));
+        }
+        let existing_head = safe_git(
+            &existing_root,
+            None,
+            &["rev-parse", "--verify", "HEAD"],
+            None,
+            READ_TIMEOUT,
+        )
+        .await?;
+        if existing_head.trim() != base_sha {
+            return Err(Error::Rejected(
+                "managed change recovery worktree is not at the configured base".into(),
             ));
         }
     } else if safe_git(
@@ -414,6 +452,8 @@ impl Target {
             github_repo,
             gh_program: trusted_program("gh")?,
             registered_change,
+            #[cfg(test)]
+            test_push_race: std::sync::Mutex::new(None),
         })
     }
 
@@ -626,6 +666,20 @@ impl Target {
                 change.published_head_sha.as_deref().unwrap_or_default()
             )
         });
+        #[cfg(test)]
+        let test_push_race = { self.test_push_race.lock().unwrap().take() };
+        #[cfg(test)]
+        if let Some((remote, branch, sha)) = test_push_race {
+            let reference = format!("refs/heads/{branch}");
+            safe_git(
+                &remote,
+                None,
+                &["update-ref", &reference, &sha],
+                None,
+                MUTATION_TIMEOUT,
+            )
+            .await?;
+        }
         if self.github_repo.is_some() {
             let helper = format!(
                 "credential.https://github.com.helper=!{} auth git-credential",
@@ -709,6 +763,12 @@ impl Target {
 
     pub fn registered_change(&self) -> Option<&ManagedChangeRecord> {
         self.registered_change.as_ref()
+    }
+
+    #[cfg(test)]
+    fn with_push_race(mut self, remote: PathBuf, branch: &str, sha: &str) -> Self {
+        *self.test_push_race.get_mut().unwrap() = Some((remote, branch.to_owned(), sha.to_owned()));
+        self
     }
 
     pub async fn revalidate_head_for_audit(&self) -> Result<String, Error> {
@@ -1459,6 +1519,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_change_rejects_an_exact_path_from_another_repository() {
+        let (temp, target, remote) = fixture().await;
+        let project = ProjectSnapshot {
+            id: target.project_id.clone(),
+            name: "Project".into(),
+            root: temp.path().join("repo").to_string_lossy().into_owned(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        let authority =
+            validate_authority(remote.to_string_lossy().into_owned(), "main".into()).unwrap();
+        let task_id = factory_core::TaskId::try_from("issue-175-foreign".to_owned()).unwrap();
+        let path = temp.path().join("changes").join("issue-175-foreign");
+        let foreign = temp.path().join("foreign");
+        run(
+            temp.path(),
+            &["init", "-b", "main", foreign.to_str().unwrap()],
+        );
+        run(&foreign, &["config", "user.name", "Foreign"]);
+        run(
+            &foreign,
+            &["config", "user.email", "foreign@example.invalid"],
+        );
+        fs::write(foreign.join("README"), "foreign\n").unwrap();
+        run(&foreign, &["add", "README"]);
+        run(&foreign, &["commit", "-m", "foreign"]);
+        run(
+            &foreign,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "issue/issue-175-foreign",
+                path.to_str().unwrap(),
+            ],
+        );
+
+        let error = create_managed_change(
+            &project,
+            authority.clone(),
+            &task_id,
+            &target.agent_id,
+            &path,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("another repository"));
+
+        run(
+            &foreign,
+            &["worktree", "remove", "--force", path.to_str().unwrap()],
+        );
+        let recovered =
+            create_managed_change(&project, authority, &task_id, &target.agent_id, &path)
+                .await
+                .unwrap();
+        assert_eq!(recovered.base_sha, recovered.head_sha);
+    }
+
+    #[tokio::test]
     async fn managed_change_publish_is_clean_idempotent_and_non_rewriting() {
         let (temp, target, remote) = fixture().await;
         let project = ProjectSnapshot {
@@ -1523,6 +1643,25 @@ mod tests {
         .await
         .unwrap();
         registered.commit("first managed commit").await.unwrap();
+        let registered =
+            registered.with_push_race(remote.clone(), "issue/issue-175-publish", &record.base_sha);
+        let raced = registered.push().await.unwrap_err();
+        assert!(!raced.to_string().is_empty());
+        let remote_after_race = StdCommand::new("git")
+            .args([
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "show-ref",
+                "--hash",
+                "--verify",
+                "refs/heads/issue/issue-175-publish",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&remote_after_race.stdout).trim(),
+            record.base_sha
+        );
         run(
             &remote,
             &[
