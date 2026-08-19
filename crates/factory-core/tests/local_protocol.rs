@@ -624,6 +624,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
             "state": "idle",
             "state_since_ms": 10,
             "worktree": "/work/agent-1",
+            "runner_instance_id": "runner-1",
             "activity_inferred": false,
             "observer_health": "unknown",
             "observer_health_since_ms": 0,
