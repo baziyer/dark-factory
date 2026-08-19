@@ -20,14 +20,12 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use factoryctl::update::UpdateCheck;
-use factoryctl::{install, launchd, probes, runtime, update};
+use factoryctl::{install, managed_update, update};
 use serde_json::json;
 
-const HEALTH_WAIT: Duration = Duration::from_secs(30);
 const HUMAN_FIELD_MAX: usize = 160;
 
 pub struct Options {
@@ -64,142 +62,52 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
         return Ok(check_exit_code(&check));
     };
 
-    // Read-only preflight, before anything changes on disk.
-    let user_home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or("HOME is not set")?;
-    let plist = launchd::plist_path(&user_home);
-    let existing = launchd::read_existing(&plist)?;
-    if let Some(existing) = &existing {
-        launchd::check_home(existing, &home, &user_home)?;
-    }
     let mut log = |line: &str| eprintln!("update: {line}");
-    if active_version.as_deref() == Some(manifest.version.as_str())
-        && probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version)).is_ok()
-    {
-        log(&format!(
-            "{} is already installed and running",
-            manifest.version
-        ));
-        print_result(
-            options,
-            json!({
-                "installed": manifest.version,
+    let mut progress = |stage| eprintln!("update: {stage:?}");
+    match managed_update::install(&home, socket, &manifest, false, &mut progress, &mut log) {
+        Ok(outcome) => {
+            let launchd = match outcome.daemon {
+                managed_update::ManagedDaemon::NotInstalled => "not_installed",
+                managed_update::ManagedDaemon::Unchanged => "unchanged",
+                managed_update::ManagedDaemon::Reloaded => "reloaded",
+            };
+            let action = match outcome.daemon {
+                managed_update::ManagedDaemon::NotInstalled => {
+                    format!(
+                        "installed {} (restart the daemon yourself)",
+                        outcome.version
+                    )
+                }
+                managed_update::ManagedDaemon::Unchanged => {
+                    "already up to date (daemon healthy)".to_owned()
+                }
+                managed_update::ManagedDaemon::Reloaded => {
+                    format!("installed {} (launchd reloaded)", outcome.version)
+                }
+            };
+            let mut report = json!({
+                "installed": outcome.version,
+                "bin": outcome.installed,
                 "current": install::current_link(&home),
-                "launchd": "unchanged",
-                "health": { "ok": true, "version": manifest.version },
-            }),
-            &check,
-            Some(manifest.version.as_str()),
-            "already up to date (daemon healthy)",
-        );
-        return Ok(0);
-    }
-
-    let installed = install::install_release(&home, &manifest, &mut log)?;
-    let (_runtime_lock, snapshot) = runtime::MutationLock::begin(&home, &plist)?;
-    let previous_version = snapshot.active_version.clone();
-    let existing = launchd::read_existing(&plist)?;
-    if let Some(existing) = &existing {
-        launchd::check_home(existing, &home, &user_home)?;
-    }
-    if let Some(active) = snapshot.active_version.as_deref()
-        && active != manifest.version
-        && !update::is_newer(&manifest.version, active)
-    {
-        log(&format!(
-            "active runtime {active} is newer than downloaded {}; not activating a downgrade",
-            manifest.version
-        ));
-        print_result(
-            options,
-            json!({
-                "installed": false,
-                "current": install::current_link(&home),
-                "active": active,
-                "launchd": "unchanged",
-                "skipped": "active runtime is newer than the selected release",
-            }),
-            &check,
-            Some(active),
-            "not needed (active runtime is newer)",
-        );
-        return Ok(0);
-    }
-    install::activate(&home, &manifest.version)?;
-    log(&format!("bin/current -> {}", manifest.version));
-
-    let Some(existing) = existing else {
-        log("no launchd job installed; restart the daemon yourself to run the new version");
-        print_result(
-            options,
-            json!({
-                "installed": manifest.version,
-                "bin": installed,
-                "current": install::current_link(&home),
-                "launchd": "not_installed",
-            }),
-            &check,
-            Some(manifest.version.as_str()),
-            &format!(
-                "installed {} (restart the daemon yourself)",
-                manifest.version
-            ),
-        );
-        return Ok(0);
-    };
-
-    if let Err(error) = launchd::apply_with_rollback(
-        &home,
-        &plist,
-        Some(&existing),
-        &probes::provider_directories(),
-        &std::collections::BTreeMap::new(),
-        None,
-        || snapshot.restore_runtime(&home),
-    ) {
-        return Err(runtime::rollback_report(
-            &error,
-            previous_version.as_deref(),
-            |previous| {
-                probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
-                    .map(|_| ())
-            },
-        ));
-    }
-    log(&format!("rewrote and reloaded {}", plist.display()));
-    match probes::wait_for_daemon(socket, HEALTH_WAIT, Some(&manifest.version)) {
-        Ok(version) => {
-            print_result(
-                options,
-                json!({
-                    "installed": manifest.version,
-                    "bin": installed,
-                    "current": install::current_link(&home),
-                    "launchd": "reloaded",
-                    "health": { "ok": true, "version": version },
-                }),
-                &check,
-                Some(manifest.version.as_str()),
-                &format!("installed {} (launchd reloaded)", manifest.version),
-            );
+                "launchd": launchd,
+            });
+            if let Some(version) = &outcome.health_version {
+                report["health"] = json!({ "ok": true, "version": version });
+            }
+            print_result(options, report, &check, Some(&outcome.version), &action);
             Ok(0)
         }
-        Err(error) => {
-            let rollback = runtime::rollback_after_health_failure(
-                &home,
-                &plist,
-                &snapshot,
-                &manifest.version,
-                |previous| {
-                    probes::wait_for_managed_daemon(socket, HEALTH_WAIT, Some(previous), &home)
-                        .map(|_| ())
-                },
-            );
+        Err(managed_update::InstallError::Health {
+            version,
+            installed,
+            error,
+            previous_version,
+            rollback,
+        }) => {
             print_result(
                 options,
                 json!({
-                    "installed": manifest.version,
+                    "installed": version,
                     "bin": installed,
                     "current": install::current_link(&home),
                     "launchd": "reloaded",
@@ -221,16 +129,28 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
                 eprintln!("update: rollback failed: {rollback_error}");
             }
             eprintln!(
-                "update: the new daemon did not answer within {}s ({error}); see {}/logs/factoryd.stderr.log, \
-                 or roll back with `ln -sfn {} {}` and `launchctl kickstart -k gui/$(id -u)/{}`",
-                HEALTH_WAIT.as_secs(),
+                "update: the new daemon did not answer ({error}); see {}/logs/factoryd.stderr.log",
                 home.display(),
-                previous_version.as_deref().unwrap_or("<previous-version>"),
-                install::current_link(&home).display(),
-                launchd::LABEL
             );
             Ok(1)
         }
+        Err(managed_update::InstallError::Stale { active }) => {
+            print_result(
+                options,
+                json!({
+                    "installed": false,
+                    "current": install::current_link(&home),
+                    "active": active,
+                    "launchd": "unchanged",
+                    "skipped": "active runtime is newer than the selected release",
+                }),
+                &check,
+                Some(&active),
+                "not needed (active runtime is newer)",
+            );
+            Ok(0)
+        }
+        Err(managed_update::InstallError::Message(error)) => Err(error),
     }
 }
 

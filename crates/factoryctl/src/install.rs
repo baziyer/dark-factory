@@ -29,6 +29,16 @@ pub use crate::update::RELEASE_BINARIES as BINARIES;
 use crate::update::{self, Manifest};
 use sha2::{Digest, Sha256};
 
+/// Observable boundaries of the archive install. Emitted immediately before
+/// the named work starts, so a caller never labels checksum or unpack time as
+/// download time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseInstallStage {
+    Downloading,
+    Verifying,
+    Unpacking,
+}
+
 /// Downloads larger than this are refused before verification even starts.
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -66,6 +76,17 @@ pub fn install_release(
     manifest: &Manifest,
     log: &mut dyn FnMut(&str),
 ) -> Result<PathBuf, String> {
+    install_release_with_progress(home, manifest, log, &mut |_| {})
+}
+
+/// [`install_release`] with typed, truthful progress boundaries for operator
+/// clients. The original wrapper remains for callers that only need logs.
+pub fn install_release_with_progress(
+    home: &Path,
+    manifest: &Manifest,
+    log: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(ReleaseInstallStage),
+) -> Result<PathBuf, String> {
     let key = update::platform_key();
     let asset = manifest
         .assets
@@ -84,6 +105,7 @@ pub fn install_release(
     }
     stage(home, &manifest.version, |staging| {
         let archive = staging.join("release.tar.gz");
+        progress(ReleaseInstallStage::Downloading);
         log(&format!("downloading {}", asset.url));
         update::curl_to_file(&asset.url, &archive, MAX_ARCHIVE_BYTES)?;
         let size = fs::metadata(&archive)
@@ -95,6 +117,7 @@ pub fn install_release(
                 asset.url
             ));
         }
+        progress(ReleaseInstallStage::Verifying);
         let digest = sha256_file(&archive)?;
         if !digest.eq_ignore_ascii_case(asset.sha256.trim()) {
             return Err(format!(
@@ -103,6 +126,7 @@ pub fn install_release(
             ));
         }
         log(&format!("verified sha256 {digest}"));
+        progress(ReleaseInstallStage::Unpacking);
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -370,7 +394,20 @@ mod tests {
         assert!(install_release(home.path(), &unreachable, &mut log).is_err());
         assert!(!bin_dir(home.path()).join(".staging-0.3.0").exists());
 
-        let installed = install_release(home.path(), &manifest(&sha), &mut log).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let installed =
+            install_release_with_progress(home.path(), &manifest(&sha), &mut log, &mut |stage| {
+                stages.borrow_mut().push(stage)
+            })
+            .unwrap();
+        assert_eq!(
+            *stages.borrow(),
+            [
+                ReleaseInstallStage::Downloading,
+                ReleaseInstallStage::Verifying,
+                ReleaseInstallStage::Unpacking,
+            ]
+        );
         assert_eq!(installed, version_dir(home.path(), "0.3.0"));
         verify_binaries(&installed).unwrap();
         assert!(!installed.join("release.tar.gz").exists());
