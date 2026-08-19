@@ -14,6 +14,31 @@ This file contains product direction and ordering, not a second backlog.
 The linked GitHub issues own scope and acceptance. Current defects and
 decisions remain in the [`known-issue` backlog](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue+is%3Aopen+label%3Aknown-issue).
 
+## Current actions and release targets
+
+GitHub milestones are the release plan and the linked issues are the action
+list. This table intentionally contains no copied task descriptions, so the
+GitHub views remain the current source of truth:
+
+| Target | Open actions |
+| --- | --- |
+| [v0.2.5 — seamless dogfood update](https://github.com/baziyer/dark-factory/milestone/3) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.2.5%20%E2%80%94%20seamless%20dogfood%20update%22) |
+| [v0.3.0 — autonomous dogfood](https://github.com/baziyer/dark-factory/milestone/1) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.3.0%20%E2%80%94%20autonomous%20dogfood%22) |
+| [v0.3.1 — Linux contributor preview](https://github.com/baziyer/dark-factory/milestone/5) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.3.1%20%E2%80%94%20Linux%20contributor%20preview%22) |
+| [v0.4.0 — GitHub-connected factory](https://github.com/baziyer/dark-factory/milestone/2) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.4.0%20%E2%80%94%20GitHub-connected%20factory%22) |
+| [v1.0.0 — production-ready](https://github.com/baziyer/dark-factory/milestone/4) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v1.0.0%20%E2%80%94%20production-ready%22) |
+
+For a participating issue or pull request, exactly one `state:*` label is
+the public workflow state: `state:queued`, `state:in-progress`,
+`state:blocked`, `state:review`, or `state:release-ready`. The milestone is
+the release target; area, size, security, and `known-issue` labels retain
+their existing meanings. The projection is deliberately bounded: public
+state, target, exact ref/SHA, checks, and links are useful to contributors;
+agent/session details, prompts, guidance, transcripts, raw provider output,
+credentials, and private review deliberation remain internal. See the
+[GitHub projection contract](https://github.com/baziyer/dark-factory/issues/208)
+for idempotency and reconciliation requirements.
+
 ## Product direction
 
 Dark Factory should be a capability-controlled operating system for local
