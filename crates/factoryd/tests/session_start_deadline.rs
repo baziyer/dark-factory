@@ -428,11 +428,50 @@ async fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) {
 
 /// A `Starting` event is durable session state, not proof that the runner's
 /// control socket has finished binding. Wait for that causal readiness signal
-/// without imposing an arbitrary startup-duration bound.
+/// while failing immediately if the runner exits before binding and bounding
+/// a wedged live process.
 async fn wait_for_runner_control(runtime_dir: &Path) {
-    while !runner_control_ready(runtime_dir) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let ready = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_runner = false;
+        loop {
+            if runner_control_ready(runtime_dir) {
+                return;
+            }
+            if runner_alive(runtime_dir) {
+                saw_runner = true;
+            } else if saw_runner {
+                panic!(
+                    "runner exited before binding its control socket: {}",
+                    runtime_dir.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        ready.is_ok(),
+        "runner stayed alive but did not bind its control socket within 5s: {}",
+        runtime_dir.display()
+    );
+}
+
+/// A failed deadline is durable daemon state, but the runner's supervisor may
+/// still be reaping its child. Do not admit the next cycle until that process
+/// has actually exited; bound the barrier so a wedged teardown fails rather
+/// than allowing the test to hang.
+async fn wait_for_runner_exit(runtime_dir: &Path) {
+    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+        while runner_alive(runtime_dir) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        exited.is_ok(),
+        "runner did not exit within 5s after its session failed: {}",
+        runtime_dir.display()
+    );
 }
 
 // --- Harness: a real daemon (execution + local_api), in-process ---------
@@ -728,6 +767,7 @@ async fn three_consecutive_start_deadlines_pause_the_agent_and_resume_retries() 
                 .is_some_and(|reason| reason.contains("SessionStart hook not received")),
             "unexpected deadline failure: {failed:?}"
         );
+        wait_for_runner_exit(&runtime_dir).await;
     }
 
     let paused = next_event(
