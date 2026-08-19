@@ -53,15 +53,34 @@ The manifest subscribes only to these event families:
 
 The receiver rejects every unlisted action, validates the webhook signature over the exact bytes, binds every payload to its installation and repository, and records a bounded immutable delivery before any work candidate or projection. GitHub documents `installation_repositories` as an automatic App delivery rather than a manually selected event; it must still be handled for scope changes.
 
+### Immutable identity pin
+
+Every connector mutation must carry and durably audit one immutable identity tuple:
+
+```text
+app_id
+app_slug
+installation_id
+installation_account_id
+repository_id
+repository_full_name
+repository_selection = selected
+permission_revision = digest(github-app-manifest.json.default_permissions)
+event_revision = digest(github-app-manifest.json.default_events + receiver action allowlist)
+key_fingerprint
+```
+
+The connector rejects a missing, unknown, or changed tuple before minting or using a token. It verifies the installation account, repository ID/full name, selected-repository membership, granted permission response, manifest revision, event revision, and key fingerprint against daemon-owned operator state. The tuple is copied into the mutation's request/result audit record and run-bundle metadata; no mutation is accepted merely because a token exists. An installation, repository selection, permission, event, or key change creates a new revision and invalidates outstanding mutation proposals.
+
 ## Credential and token boundary
 
 The future daemon-owned connector, not a provider session, owns this material:
 
 1. Store the App ID, installation ID, key fingerprint, selected repository IDs, permission revision, and last rotation/revocation times as non-secret daemon state.
-2. Store the private key and webhook secret in the operator's OS secret store (macOS Keychain in the supported product), under a Dark Factory service/account namespace. A keychain-unavailable setup fails closed; it never falls back to a worktree, task body, database blob, log, argv, provider environment, or `gh` configuration.
-3. Keep any encrypted export outside all project and agent worktrees, owner-readable only, with its encryption key held separately by the OS secret store. Do not add a secret file to the repository. Provider processes receive neither the private key nor an installation token.
+2. Store the private key and webhook secret in the operator's OS secret store (macOS Keychain in the supported product), under a Dark Factory service/account namespace. A keychain-unavailable setup fails closed; it never falls back to a provider worktree, task body, database blob, isolated provider config, log, event, run bundle, argv, provider environment, or `gh` configuration.
+3. Keep any encrypted export outside all project and agent worktrees, owner-readable only, with its encryption key held separately by the OS secret store. Do not add a secret file to the repository. Provider processes receive neither the private key nor an installation token; neither may appear in provider argv/env/config, worktrees, task bodies, logs, public events, crash/retry diagnostics, or run bundles.
 4. Mint an installation JWT/token only in the connector. Pin every token request to the selected repository ID and the smallest permission subset; do not rely on GitHub's default “all repositories/all granted permissions” token behavior. Keep the token in memory, refresh before its one-hour expiry, and erase it after the request or on shutdown.
-5. Audit every GitHub mutation with installation ID, repository ID, API operation kind, result, request/correlation ID, originating Dark Factory task/change, and exact target SHA where applicable. Never log Authorization headers, JWTs, private keys, webhook secrets, issue bodies, or full request payloads.
+5. Audit every GitHub mutation with the full identity tuple, API operation kind, result, request/correlation ID, originating Dark Factory task/change, and exact target SHA where applicable. Never log Authorization headers, JWTs, private keys, webhook secrets, issue bodies, or full request payloads.
 
 ### Rotation
 
@@ -71,7 +90,7 @@ Webhook-secret rotation keeps the previous verifier only for a short, recorded o
 
 ### Revocation and degraded behavior
 
-The operator can suspend/uninstall the App, delete all App keys, remove the secret-store entries, and mark the connector revoked. A `401`, `403`, `404`, suspended-installation event, or failed signature causes the connector to stop GitHub mutation immediately, preserve the durable candidate/task state, and expose a `NEEDS YOU` recovery item. It must not silently fall back to an operator token, `gh`, a provider credential, or a different repository. Reconciliation resumes only after the operator verifies the installation ID, repository allowlist, permission revision, key fingerprint, and webhook health.
+The connector has explicit durable states: `healthy`; `degraded_rate_limited`; `degraded_unavailable`; `permission_mismatch`; and `revoked`. A `429` or provider rate-limit response records the server-provided retry time, stops new mutation attempts, and schedules one bounded reconciliation after that time; it never mints tokens in a tight loop. Network timeout, DNS/TLS failure, GitHub `5xx`, or connector crash records `degraded_unavailable` with bounded exponential retry and visible evidence. Retry exhaustion becomes one actionable `NEEDS YOU` item, not a silent fallback. A `401`, `403`, `404`, suspended/uninstalled-installation event, failed signature, or identity-tuple mismatch stops GitHub mutation immediately, records `revoked` or `permission_mismatch` as appropriate, preserves durable candidate/task state, and exposes recovery. Lost external responses are reconciled by exact identity/idempotency before retrying. It must not silently fall back to an operator token, `gh`, a provider credential, or a different repository. Reconciliation resumes only after the operator verifies the installation ID, repository allowlist, permission and event revisions, key fingerprint, rate-limit state, and webhook health.
 
 ## Attribution and identity verification seam
 
@@ -114,7 +133,9 @@ No action below should be automated by this preparation.
 - [ ] Install it with selected-repository scope only; record installation ID and the GitHub audit event.
 - [ ] Store the private key/webhook secret in the daemon-owned OS secret store and verify file/worktree/process scans contain no secret.
 - [ ] Run the disposable bot identity/co-author verification before changing generated attribution.
-- [ ] Exercise invalid signature, replay, cross-repository, revoked-installation, edited-payload, and App-unavailable paths in a fixture before any real mutation.
+- [ ] Exercise invalid signature, replay, cross-repository, revoked-installation, permission/event-revision mismatch, edited-payload, `429`/Retry-After, provider `5xx`, connector crash/restart, and App-unavailable paths in a fixture before any real mutation.
+- [ ] Inspect provider argv, env, isolated config, worktrees, task bodies, logs, public events, crash/retry diagnostics, and run bundles; assert that private keys and installation tokens are absent from every surface.
+- [ ] Verify every mutation audit record pins app ID/slug, installation ID/account, repository ID/name, selected scope, permission revision, event revision, key fingerprint, operation, result, task/change, and target SHA.
 - [ ] Obtain a separate Sol/xhigh security review for credential/auth implementation and a separate independent security review of its PR.
 - [ ] Request the serialized clean full local-ci slot, then require hosted green at the exact head before merge. This preparation has not requested or used that slot.
 
