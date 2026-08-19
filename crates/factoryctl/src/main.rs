@@ -2715,8 +2715,15 @@ fn required_option_or_env(
     name: &str,
     env_var: &str,
 ) -> Result<String, String> {
-    take_option_or_env(args, name, env_var)?
-        .ok_or_else(|| format!("{name} is required (or set ${env_var})"))
+    require_option_or_env_value(take_option_or_env(args, name, env_var)?, name, env_var)
+}
+
+fn require_option_or_env_value(
+    value: Option<String>,
+    name: &str,
+    env_var: &str,
+) -> Result<String, String> {
+    value.ok_or_else(|| format!("{name} is required (or set ${env_var})"))
 }
 
 fn take_option_or_env(
@@ -3478,7 +3485,6 @@ mod tests {
                 }
             )
         );
-        assert!(parse_args(args(&["attach", "--session", "session-1"])).is_err());
         assert!(
             request_for(CliCommand::Attach {
                 project_id: "project-1".into(),
@@ -4148,6 +4154,10 @@ mod tests {
         );
         assert_eq!(resolve_or_env(None, Some(String::new())), None);
         assert_eq!(resolve_or_env(None, None), None);
+        assert_eq!(
+            require_option_or_env_value(None, "--project", "DARK_FACTORY_PROJECT").unwrap_err(),
+            "--project is required (or set $DARK_FACTORY_PROJECT)"
+        );
     }
 
     #[test]
