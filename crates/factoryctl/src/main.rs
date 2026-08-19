@@ -291,7 +291,7 @@ Actions:
   list      List tasks in a project
   get       Fetch one task
   start     Start a queued task on an agent
-  retry     Requeue a failed or cancelled task
+  retry     Requeue a blocked, failed, or cancelled task
   reorder   Change a queued task's priority/order
   assign    Assign or return a queued task; assignment wakes delivery
   cancel    Cancel a queued or blocked task
@@ -358,7 +358,7 @@ Options:
   -h, --help                 Show this help";
 const TASK_RETRY_HELP: &str = "usage: factoryctl task retry --project ID --task ID
 
-Requeue a failed or cancelled task.
+Requeue a blocked, failed, or cancelled task.
 
 Required:
   --project ID           Project the task belongs to
@@ -519,9 +519,10 @@ One agent at one instant: its snapshot and profile (as `agent get`), its
 live session -- or the most recent ended one, so a failure stays visible --
 with state, activity, last hook event and time, and wait reason; its current
 run; the queued tasks assigned to it (oldest first, first 10 listed, full
-depth alongside); undelivered inbox messages; its attention level (and
-whether that was read from the session or inferred from the run); and, when
-it has a worktree, `git status` summarized (branch, changed files, dirty).
+depth alongside); undelivered inbox messages; structured bounded attention
+reasons with source IDs, age, and safe actions (the same projection shown by
+`factoryctl status` and `factory-tui`); and, when it has a worktree, `git
+status` summarized (branch, changed files, dirty).
 
 Required:
   --project ID           Project the agent belongs to

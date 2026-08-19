@@ -183,18 +183,11 @@ impl SessionState {
 
 /// The provider hook event a `factoryctl hook` invocation was called for.
 ///
-/// `PermissionRequest` is Codex-only (added in Codex 0.147.0, alongside the
-/// existing events every provider wires): Codex fires it when its own
-/// approval prompt is about to block the session on the operator (a shell
-/// command, a file edit, ...), before that tool call's own `PreToolUse`.
-/// Claude Code has no equivalent event name — its permission prompts
-/// already surface through `Notification` — so `PermissionRequest` is
-/// wired only into the Codex provider's generated hooks
-/// (`providers::codex::hooks_block_toml`), not the shared
-/// `providers::hooks::HOOK_EVENTS` both providers iterate. Either way the
-/// daemon only observes `PermissionRequest`; auto mode avoids the native
-/// prompt, while the separate `PreToolUse` hook is where the daemon answers
-/// its own allow/deny policy.
+/// `PermissionRequest` is the immediate provider approval hook. Current
+/// Claude and Codex configurations both emit it before a native approval
+/// prompt; the daemon observes it and never answers that provider prompt.
+/// The separate `PreToolUse` hook is where the daemon answers its own
+/// allow/deny policy.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHookEvent {
@@ -207,6 +200,23 @@ pub enum ProviderHookEvent {
     Stop,
     SubagentStop,
     SessionEnd,
+}
+
+/// Claude's typed `Notification` cause. The provider sends these as an
+/// opaque payload field; keeping the parsed cause beside the session state
+/// prevents operator-facing status from guessing answerability from prose.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderNotificationKind {
+    PermissionPrompt,
+    ElicitationDialog,
+    ElicitationUrlDialog,
+    AgentNeedsInput,
+    IdlePrompt,
+    AuthSuccess,
+    ElicitationComplete,
+    ElicitationResponse,
+    AgentCompleted,
 }
 
 impl ProviderHookEvent {
@@ -475,6 +485,10 @@ pub struct SessionSnapshot {
     pub activity_inferred: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_hook_event: Option<ProviderHookEvent>,
+    /// Parsed provider notification cause, when the last hook was a typed
+    /// Claude `Notification`. It is deliberately separate from free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_kind: Option<ProviderNotificationKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_hook_at_ms: Option<i64>,
     /// Bounded operator-facing explanation of why the session is waiting,
@@ -482,6 +496,9 @@ pub struct SessionSnapshot {
     /// bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
+    /// Independent bounded explanation for degraded terminal observation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_reason: Option<String>,
     #[serde(default)]
     pub observer_health: ObserverHealth,
     #[serde(default)]

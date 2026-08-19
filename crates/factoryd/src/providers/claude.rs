@@ -450,6 +450,8 @@ mod provider_tests {
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PostToolUse"}]}],
                 "Notification": [{"hooks": [{"type": "command",
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Notification"}]}],
+                "PermissionRequest": [{"hooks": [{"type": "command",
+                    "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PermissionRequest"}]}],
                 "Stop": [{"hooks": [{"type": "command",
                     "command": "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Stop"}]}],
                 "SubagentStop": [{"hooks": [{"type": "command",

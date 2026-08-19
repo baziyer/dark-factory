@@ -812,20 +812,11 @@ fn insert_root_level_line(document: &str, line: &str) -> String {
     result
 }
 
-/// Codex-only hook events, wired in addition to [`hooks::HOOK_EVENTS`]
-/// (which both providers share): `PermissionRequest` is a Codex 0.147.0
-/// addition with no Claude Code equivalent name (Claude's permission
-/// prompts already surface through the shared `Notification` event) -- see
-/// `ProviderHookEvent`'s own doc comment for the observe-only contract
-/// this relies on.
-const CODEX_ONLY_HOOK_EVENTS: [factory_core::ProviderHookEvent; 1] =
-    [factory_core::ProviderHookEvent::PermissionRequest];
-
 fn hooks_block_toml(factoryctl_path: &Path, hook_token_path: &Path) -> String {
     let mut block = String::new();
     block.push_str(HOOKS_BEGIN_MARKER);
     block.push('\n');
-    for event in hooks::HOOK_EVENTS.into_iter().chain(CODEX_ONLY_HOOK_EVENTS) {
+    for event in hooks::HOOK_EVENTS {
         push_hook_entry(&mut block, factoryctl_path, hook_token_path, event);
     }
     block.push_str(HOOKS_END_MARKER);
@@ -1352,17 +1343,11 @@ mod provider_tests {
         ));
     }
 
-    /// `PermissionRequest` (this track's fix for
-    /// docs/dogfood/2026-08-17.md's "a session blocked on a provider
-    /// approval prompt still shows `working`") is Codex-only -- wired in
-    /// addition to `hooks::HOOK_EVENTS`, not a member of it (Claude Code
-    /// has no equivalent event name; see `ProviderHookEvent`'s doc
-    /// comment) -- so this asserts it separately from the shared-shape
-    /// test above, same command/timeout shape, un-clamped 30s timeout
-    /// (only `SessionEnd` is clamped, to 3s, confirmed against the real
-    /// Codex 0.147.0 binary's own log line).
+    /// `PermissionRequest` is part of the shared provider hook set, with the
+    /// same command/timeout shape and an unclamped 30s timeout (only
+    /// `SessionEnd` is clamped, to 3s).
     #[test]
-    fn hooks_block_toml_includes_the_codex_only_permission_request_event() {
+    fn hooks_block_toml_includes_the_shared_permission_request_event() {
         let block = hooks_block_toml(
             Path::new("/abs/factoryctl"),
             Path::new("/abs/runs/session-1/hook.token"),

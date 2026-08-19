@@ -132,6 +132,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     let listener = UnixListener::bind(&socket).unwrap();
     let status = FleetStatus {
         generated_at_ms: 123,
+        event_sequence: 0,
         auto_mode: true,
         live_session_cap: 4,
         live_sessions: 0,

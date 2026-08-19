@@ -1,8 +1,7 @@
-//! The one attention taxonomy: what counts as urgent, ranked. `factoryd`
-//! uses it to build `factoryctl status`'s attention list and `factory-tui`
-//! uses it for fortress badges, announcement ordering, `g`/`G`, and
-//! WORKSHOP's `!` filter — the same enum and the same mappings, so the CLI
-//! and the board can never quietly disagree about what needs an operator.
+//! The one attention urgency taxonomy: what counts as urgent, ranked.
+//! `factoryd` uses it to build the structured status projection and
+//! `factory-tui` consumes those projected levels for NEEDS YOU routing; the
+//! board does not independently rebuild operator attention from raw states.
 //!
 //! Session state wins over run-status inference when a session exists
 //! (hooks supersede inference); [`Rated`] carries which one a value came
@@ -96,9 +95,8 @@ pub const fn task_attention(status: TaskStatus) -> Attention {
     }
 }
 
-/// The one precedence rule for an agent's attention, used by `factoryd`'s
-/// status responses and by `factory-tui`'s badges alike: a live session's
-/// hook-driven state wins (observed); with no live session, a most recent
+/// The precedence rule used while `factoryd` builds status responses: a live
+/// session's hook-driven state wins (observed); with no live session, a most recent
 /// session that ended in failure still counts as failed (observed) until a
 /// new session starts; otherwise the most recent run's status is the best
 /// guess (inferred), `Routine` when the agent has never run.

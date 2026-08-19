@@ -1,8 +1,8 @@
 //! Track 5A: sessions store, migration 0014, and the hook state machine.
 
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, ProviderHookEvent, RunId,
-    RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
+    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, ProviderHookEvent,
+    ProviderNotificationKind, RunId, RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
 use factoryd::store::{
     DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession,
@@ -210,9 +210,11 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 25 after the
-/// connector-event, runtime metadata, legacy permission repair, durable
-/// delivery-attempt, and provider-resume recovery migrations
+/// which always migrates to the current `SCHEMA_VERSION`, 28 after the
+/// connector-event migration, runtime metadata, legacy permission repair,
+/// model policy, delivery attempts, provider resume recovery, observer
+/// reason, typed notification cause, and the widened Claude notification
+/// constraint
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -305,14 +307,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0025.
+    // Opening through the real store runs migrations 0014 through 0028.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 28);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -357,7 +359,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -373,6 +375,8 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN observer_reason;
+                 ALTER TABLE sessions DROP COLUMN notification_kind;
                  PRAGMA user_version = 18;",
             )
             .unwrap();
@@ -383,7 +387,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 28);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -396,6 +400,122 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
         })
         .unwrap();
     assert_eq!(violations, 0);
+}
+
+#[test]
+fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("populated-v26.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        let (session, _) = store
+            .create_session(new_session("migration-session", "factory", "curie"), 3)
+            .unwrap();
+        store
+            .record_hook_event(
+                &session.id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                4,
+            )
+            .unwrap();
+        let message_id = MessageId::try_from("migration-message").unwrap();
+        store
+            .send_agent_message(NewAgentMessage {
+                id: message_id.clone(),
+                project_id: project_id("factory"),
+                sender_agent_id: None,
+                recipient_agent_id: agent_id("curie"),
+                body: "message retained across the rebuild".into(),
+                created_at_ms: 5,
+            })
+            .unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "migration-delivery".into(),
+                project_id: project_id("factory"),
+                agent_id: agent_id("curie"),
+                session_id: session.id,
+                task_id: None,
+                task_incarnation_id: None,
+                prior_run_count: Some(0),
+                message_ids: vec![message_id],
+                text: "deliver this message".into(),
+                created_at_ms: 6,
+            })
+            .unwrap();
+    }
+
+    // Round-3's schema is v27. Lowering the version on this populated v27
+    // shape forces the real 0028 rebuild; the child rows make an FK-on DROP
+    // fail with SQLite 787, so this fixture specifically guards the
+    // foreign_keys-off/rebuild/foreign_keys-on discipline.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.pragma_update(None, "user_version", 27).unwrap();
+    }
+    let store = Store::open(&database).unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 28);
+    let message_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let delivery_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM delivery_attempts WHERE id = 'migration-delivery'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(message_count, 1);
+    assert_eq!(delivery_count, 1);
+    connection
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .unwrap();
+    let violations: i64 = connection
+        .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(violations, 0);
+    assert!(
+        store
+            .list_sessions(&project_id("factory"), None, 10)
+            .unwrap()
+            .iter()
+            .any(|session| session.id == session_id("migration-session"))
+    );
 }
 
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s
@@ -476,14 +596,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0025 migrations.
+    // Opening through the real store runs the 0015 through 0028 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 25);
+    assert_eq!(version, 28);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -1051,17 +1171,204 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
         .create_session(new_session("s1", "factory", "curie"), 5)
         .unwrap();
     let (session, _) = store
-        .record_hook_event(
+        .record_hook_event_with_notification(
             &snapshot.id,
             ProviderHookEvent::Notification,
             None,
             false,
             Some("permission prompt".into()),
+            Some(ProviderNotificationKind::PermissionPrompt),
             6,
         )
         .unwrap();
     assert_eq!(session.state, SessionState::WaitingForInput);
     assert_eq!(session.wait_reason.as_deref(), Some("permission prompt"));
+}
+
+#[test]
+fn routine_claude_notification_causes_do_not_create_attention_waits() {
+    for kind in [
+        ProviderNotificationKind::AgentCompleted,
+        ProviderNotificationKind::IdlePrompt,
+        ProviderNotificationKind::AuthSuccess,
+        ProviderNotificationKind::ElicitationComplete,
+        ProviderNotificationKind::ElicitationResponse,
+    ] {
+        let mut store = fixture();
+        let (snapshot, _) = store
+            .create_session(new_session("s1", "factory", "curie"), 5)
+            .unwrap();
+        let (session, _) = store
+            .record_hook_event_with_notification(
+                &snapshot.id,
+                ProviderHookEvent::Notification,
+                None,
+                false,
+                Some("Approve delivery?".into()),
+                Some(kind),
+                6,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::Idle);
+        assert_eq!(session.wait_reason, None);
+        assert_eq!(session.notification_kind, Some(kind));
+    }
+}
+
+#[test]
+fn current_claude_actionable_notification_causes_wait_for_input() {
+    for kind in [
+        ProviderNotificationKind::ElicitationUrlDialog,
+        ProviderNotificationKind::AgentNeedsInput,
+    ] {
+        let mut store = fixture();
+        let (snapshot, _) = store
+            .create_session(new_session("s1", "factory", "curie"), 5)
+            .unwrap();
+        let (session, _) = store
+            .record_hook_event_with_notification(
+                &snapshot.id,
+                ProviderHookEvent::Notification,
+                None,
+                false,
+                Some("answer required".into()),
+                Some(kind),
+                6,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::WaitingForInput);
+        assert_eq!(session.notification_kind, Some(kind));
+    }
+}
+
+#[test]
+fn terminal_attach_failure_is_durable_actionable_and_clears_on_recovery() {
+    use factory_core::status::{AttentionAction, AttentionReasonKind, attention_items};
+
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let (failed, _) = store
+        .record_terminal_attach_health(
+            &snapshot.id,
+            Some("terminal attach failed: runner socket unavailable".into()),
+            6,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.observer_health,
+        factory_core::ObserverHealth::Degraded
+    );
+    assert_eq!(failed.observer_health_since_ms, 6);
+    assert_eq!(
+        failed.observer_reason.as_deref(),
+        Some("terminal attach failed: runner socket unavailable")
+    );
+
+    let agent = store
+        .agent_status(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    let item = attention_items(&project_id("factory"), &[agent], &[], false)
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(item.reason.kind, AttentionReasonKind::ObserverProblem);
+    assert_eq!(item.reason.action, AttentionAction::InspectObserver);
+    assert_eq!(item.session_id.as_ref(), Some(&snapshot.id));
+    assert_eq!(item.since_ms, 6);
+
+    let (healthy, _) = store
+        .record_terminal_attach_health(&snapshot.id, None, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        healthy.observer_health,
+        factory_core::ObserverHealth::Healthy
+    );
+    assert!(healthy.wait_reason.is_none());
+    assert!(healthy.observer_reason.is_none());
+    let agent = store
+        .agent_status(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    assert!(attention_items(&project_id("factory"), &[agent], &[], false).is_empty());
+}
+
+#[test]
+fn terminal_attach_health_preserves_independent_wait_causes() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    let cases = [
+        (
+            ProviderHookEvent::Notification,
+            "Which branch?",
+            Some(ProviderNotificationKind::ElicitationDialog),
+        ),
+        (
+            ProviderHookEvent::PermissionRequest,
+            "Approve shell command?",
+            None,
+        ),
+    ];
+    let mut now = 6;
+    for (hook, reason, notification_kind) in cases {
+        store
+            .record_hook_event_with_notification(
+                &snapshot.id,
+                hook,
+                None,
+                false,
+                Some(reason.to_owned()),
+                notification_kind,
+                now,
+            )
+            .unwrap();
+        now += 1;
+        let (failed, _) = store
+            .record_terminal_attach_health(
+                &snapshot.id,
+                Some("terminal attach failed: runner unavailable".into()),
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.wait_reason.as_deref(), Some(reason));
+        now += 1;
+        let (recovered, _) = store
+            .record_terminal_attach_health(&snapshot.id, None, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.wait_reason.as_deref(), Some(reason));
+        assert!(recovered.observer_reason.is_none());
+        now += 1;
+    }
+
+    store
+        .mark_session_waiting(&snapshot.id, "delivery unacknowledged".to_owned(), now)
+        .unwrap();
+    let (failed, _) = store
+        .record_terminal_attach_health(
+            &snapshot.id,
+            Some("terminal attach failed: runner unavailable".into()),
+            now + 1,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        failed.wait_reason.as_deref(),
+        Some("delivery unacknowledged")
+    );
+    let (recovered, _) = store
+        .record_terminal_attach_health(&snapshot.id, None, now + 2)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        recovered.wait_reason.as_deref(),
+        Some("delivery unacknowledged")
+    );
 }
 
 #[test]
@@ -1396,7 +1703,7 @@ fn complete_task_without_an_open_episode_is_a_conflict() {
 }
 
 #[test]
-fn block_task_closes_the_episode_stopped_with_a_blocked_reason() {
+fn block_task_closes_the_episode_and_retry_requeues_it_after_resolution() {
     let mut store = fixture();
     let (snapshot, _) = store
         .create_session(new_session("s1", "factory", "curie"), 5)
@@ -1419,6 +1726,24 @@ fn block_task_closes_the_episode_stopped_with_a_blocked_reason() {
         Some(factory_core::RunClosedBy::TaskBlocked)
     );
     assert_eq!(closed.task.snapshot.status, TaskStatus::Blocked);
+    assert_eq!(closed.task.blocked_reason.as_deref(), Some("needs input"));
+    let blocked = store.blocked_tasks(&project_id("factory")).unwrap();
+    assert_eq!(blocked.len(), 1);
+    assert_eq!(blocked[0].task.id, task_id("task-1"));
+    assert_eq!(blocked[0].reason.as_deref(), Some("needs input"));
+
+    let (retried, event) = store
+        .retry_task(&project_id("factory"), &task_id("task-1"), 8)
+        .unwrap();
+    assert_eq!(retried.snapshot.status, TaskStatus::Queued);
+    assert_eq!(retried.blocked_reason, None);
+    assert!(matches!(event.event, FactoryEvent::TaskChanged { .. }));
+    assert!(
+        store
+            .blocked_tasks(&project_id("factory"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]

@@ -591,8 +591,10 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         activity: None,
         activity_inferred: false,
         last_hook_event: None,
+        notification_kind: None,
         last_hook_at_ms: None,
         wait_reason: None,
+        observer_reason: None,
         observer_health: ObserverHealth::Unknown,
         observer_health_since_ms: 0,
         started_at_ms: 5,
@@ -678,8 +680,10 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
         activity: Some("tool: Read".into()),
         activity_inferred: true,
         last_hook_event: Some(ProviderHookEvent::Notification),
+        notification_kind: None,
         last_hook_at_ms: Some(19),
         wait_reason: Some("permission prompt".into()),
+        observer_reason: None,
         observer_health: ObserverHealth::Healthy,
         observer_health_since_ms: 15,
         started_at_ms: 5,
@@ -857,6 +861,7 @@ fn status_requests_have_stable_shapes() {
     let status = factory_core::status::FleetStatus {
         auto_mode: true,
         generated_at_ms: 7,
+        event_sequence: 9,
         live_session_cap: 4,
         live_sessions: 1,
         projects: Vec::new(),
@@ -870,9 +875,77 @@ fn status_requests_have_stable_shapes() {
     assert_eq!(value["data"]["status"]["live_session_cap"], 4);
     assert_eq!(value["data"]["status"]["auto_mode"], true);
     assert_eq!(value["data"]["status"]["live_sessions"], 1);
+    assert_eq!(value["data"]["status"]["event_sequence"], 9);
     assert_eq!(value["data"]["status"]["projects"], serde_json::json!([]));
     assert_eq!(
         serde_json::from_value::<LocalResponse>(value).unwrap(),
         LocalResponse::FleetStatus { status }
     );
+}
+
+#[test]
+fn protocol_v1_attention_rows_decode_in_both_old_and_new_shapes() {
+    use factory_core::status::{AttentionAction, AttentionKind, AttentionReasonKind};
+    use serde::Deserialize;
+
+    let old_daemon = serde_json::json!({
+        "type": "fleet_status",
+        "data": {"status": {
+            "generated_at_ms": 7,
+            "auto_mode": true,
+            "live_session_cap": 4,
+            "live_sessions": 1,
+            "projects": [],
+            "attention": [{
+                "kind": "needs_input",
+                "level": "needs_input",
+                "project_id": "project-1",
+                "agent_id": "agent-1",
+                "session_id": "session-1",
+                "since_ms": 6,
+                "detail": "legacy provider wait"
+            }]
+        }}
+    });
+    let LocalResponse::FleetStatus { status } =
+        serde_json::from_value::<LocalResponse>(old_daemon).unwrap()
+    else {
+        panic!("expected fleet status")
+    };
+    assert_eq!(status.event_sequence, -1);
+    assert_eq!(status.attention.len(), 1);
+    assert_eq!(
+        status.attention[0].reason.kind,
+        AttentionReasonKind::Inferred
+    );
+    assert_eq!(
+        status.attention[0].reason.action,
+        AttentionAction::InspectInferredState
+    );
+
+    #[derive(Deserialize)]
+    struct OldAttentionItem {
+        kind: AttentionKind,
+        detail: String,
+    }
+    #[derive(Deserialize)]
+    struct OldFleetStatus {
+        attention: Vec<OldAttentionItem>,
+    }
+    let new_daemon = serde_json::to_value(LocalResponse::FleetStatus {
+        status: factory_core::status::FleetStatus {
+            generated_at_ms: 8,
+            event_sequence: 12,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: status.attention,
+        },
+    })
+    .unwrap();
+    let old = OldFleetStatus::deserialize(&new_daemon["data"]["status"]).unwrap();
+    assert_eq!(old.attention.len(), 1);
+    assert_eq!(old.attention[0].kind, AttentionKind::NeedsInput);
+    assert_eq!(old.attention[0].detail, "legacy provider wait");
 }

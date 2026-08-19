@@ -7,7 +7,66 @@ use factory_core::{
     AgentId, AgentRole, AgentSnapshot, ObserverHealth, ProjectId, ProjectSnapshot, Provider, RunId,
     RunSnapshot, RunStatus, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
     TaskSnapshot, TaskStatus,
+    attention::Attention,
+    status::{AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind},
 };
+
+pub(crate) fn attention(
+    kind: AttentionReasonKind,
+    agent_id: Option<&str>,
+    task_id: Option<&str>,
+    session_id: Option<&str>,
+    since_ms: i64,
+) -> AttentionItem {
+    let (summary, action) = match kind {
+        AttentionReasonKind::ProviderQuestion => (
+            "Which branch should I use?",
+            AttentionAction::AnswerInTerminal,
+        ),
+        AttentionReasonKind::ProviderPermission => (
+            "Approve the requested command?",
+            AttentionAction::ReviewProviderPermission,
+        ),
+        AttentionReasonKind::WorkerBlocked => {
+            ("dependency unavailable", AttentionAction::RetryTask)
+        }
+        AttentionReasonKind::DeliveryRecovery => {
+            ("delivery unacknowledged", AttentionAction::InspectRecovery)
+        }
+        AttentionReasonKind::ObserverProblem => (
+            "runner observation degraded",
+            AttentionAction::InspectObserver,
+        ),
+        AttentionReasonKind::BudgetExhausted => {
+            ("tool-call budget exhausted", AttentionAction::ResetBudget)
+        }
+        AttentionReasonKind::Inferred => (
+            "lifecycle state needs attention",
+            AttentionAction::InspectInferredState,
+        ),
+        AttentionReasonKind::PausedWithWork => {
+            ("paused with queued work", AttentionAction::ResumeAgent)
+        }
+        AttentionReasonKind::WaitingForCapacity => (
+            "queued work is waiting for capacity",
+            AttentionAction::WaitForCapacity,
+        ),
+    };
+    AttentionItem {
+        level: Attention::NeedsInput,
+        project_id: ProjectId::try_from("proj").unwrap(),
+        agent_id: agent_id.map(|id| AgentId::try_from(id).unwrap()),
+        task_id: task_id.map(|id| TaskId::try_from(id).unwrap()),
+        session_id: session_id.map(|id| SessionId::try_from(id).unwrap()),
+        run_id: None,
+        since_ms,
+        reason: AttentionReason {
+            kind,
+            summary: summary.to_owned(),
+            action,
+        },
+    }
+}
 
 pub(crate) fn project(id: &str, created_at_ms: i64) -> ProjectSnapshot {
     ProjectSnapshot {
@@ -63,8 +122,10 @@ pub(crate) fn session(
         activity: None,
         activity_inferred: false,
         last_hook_event: None,
+        notification_kind: None,
         last_hook_at_ms: None,
         wait_reason: None,
+        observer_reason: None,
         observer_health: ObserverHealth::Unknown,
         observer_health_since_ms: 0,
         started_at_ms: 0,
