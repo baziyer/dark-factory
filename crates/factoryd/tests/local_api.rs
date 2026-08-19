@@ -278,6 +278,13 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
         .await
         .unwrap();
 
+    // This fixture installs a synthetic session without a real runner process.
+    // Stop startup recovery before that row exists, just as the authoritative
+    // local-API recovery fixtures do; otherwise recovery can legitimately end
+    // the runner-less Starting row between create and the first hook.
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+
     let session_id = SessionId::try_from("session-1").unwrap();
     let token = "a".repeat(64);
     let session_events = state
@@ -418,8 +425,6 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
 
     let _ = shutdown_tx.send(());
     server.await.unwrap().unwrap();
-    execution.shutdown().await.unwrap();
-    execution_join.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
