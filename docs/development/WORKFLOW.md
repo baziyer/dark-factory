@@ -9,6 +9,16 @@
    `-D warnings`, the full test suite, `git diff --check`) — this is the
    authoritative gate; CI runs the exact same script (see "CI and GitHub"
    below).
+
+`local-ci.sh` takes a repository-wide lease in Git's common directory before
+running any release probe, compiler, or test. This serializes linked
+worktrees while leaving independent clones independent. A second invocation
+waits and prints one bounded owner record (PID, worktree, start time, and
+available agent/task labels); set `DARK_FACTORY_LOCAL_CI_WAIT=0` to fail
+explicitly instead. A nested child refuses rather than waiting on its own
+ancestor, and a dead owner is recovered only after its recorded process is
+confirmed gone. The focused lease checks run as the first step inside the
+lease.
 4. Push the branch, open a PR (the template carries the review checklist).
 5. **Adversarial review before merge**: a second agent or person reads the
    diff cold and tries to break it — correctness, missed simplification,
