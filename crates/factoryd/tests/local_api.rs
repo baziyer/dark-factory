@@ -280,7 +280,7 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
 
     let session_id = SessionId::try_from("session-1").unwrap();
     let token = "a".repeat(64);
-    let (_, session_events) = state
+    let session_events = state
         .commit_and_publish({
             let project = project.clone();
             let agent = agent.clone();
@@ -308,7 +308,7 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
                     },
                     3,
                 )?;
-                Ok(((), events))
+                Ok((events.clone(), events))
             }
         })
         .await
@@ -385,12 +385,12 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
             if session.id == session_id && session.activity.as_deref() == Some("tool: Read")
     )));
 
-    let (_, end_events) = state
+    let end_events = state
         .commit_and_publish({
             let session_id = session_id.clone();
             move |store| {
-                let (session, events) = store.end_session(&session_id, Some(0), None, 7)?;
-                Ok((session, events))
+                let (_, events) = store.end_session(&session_id, Some(0), None, 7)?;
+                Ok((events.clone(), events))
             }
         })
         .await
