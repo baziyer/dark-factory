@@ -391,10 +391,9 @@ fn matching_active_release_reports_no_install_work_human_and_json() {
         .unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        stdout.contains("update --install: already up to date (daemon healthy)\n"),
-        "{stdout}"
-    );
+    assert!(stdout.contains(&format!(
+        "update --install: installed {version} (restart the daemon yourself)\n"
+    )));
 }
 
 #[test]
