@@ -1,10 +1,11 @@
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, SessionId, SessionSnapshot, SessionState,
-    TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunnerInstanceId, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
-        AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
-        MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope, RunTerminal, ServerFrame,
+        AgentDetail, AgentMessage, AgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
+        LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope,
+        RunTerminal, ServerFrame,
     },
 };
 
@@ -26,6 +27,10 @@ fn run_id(value: &str) -> RunId {
 
 fn session_id(value: &str) -> SessionId {
     SessionId::try_from(value).unwrap()
+}
+
+fn runner_instance_id(value: &str) -> RunnerInstanceId {
+    RunnerInstanceId::try_from(value).unwrap()
 }
 
 #[test]
@@ -591,6 +596,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
         state_since_ms: 10,
         worktree: "/work/agent-1".into(),
         provider_session_id: None,
+        runner_instance_id: Some(runner_instance_id("runner-1")),
         current_run_id: None,
         activity: None,
         activity_inferred: false,
@@ -618,6 +624,7 @@ fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
             "state": "idle",
             "state_since_ms": 10,
             "worktree": "/work/agent-1",
+            "runner_instance_id": "runner-1",
             "activity_inferred": false,
             "observer_health": "unknown",
             "observer_health_since_ms": 0,
@@ -680,6 +687,7 @@ fn session_snapshot_carries_its_bounded_optionals_when_set() {
         state_since_ms: 20,
         worktree: "/work/agent-1".into(),
         provider_session_id: Some("thread-1".into()),
+        runner_instance_id: Some(runner_instance_id("runner-1")),
         current_run_id: Some(run_id("run-1")),
         activity: Some("tool: Read".into()),
         activity_inferred: true,
@@ -773,6 +781,28 @@ fn terminal_requests_and_frames_are_keyed_by_session_id() {
                 "bytes": ""
             }
         })
+    );
+}
+
+#[test]
+fn attach_refusal_is_a_bounded_typed_frame_with_session_and_runner_identity() {
+    let response = LocalResponse::AttachRefused {
+        refusal: AttachRefusal {
+            project_id: project_id("project-1"),
+            session_id: session_id("session-1"),
+            runner_instance_id: Some(RunnerInstanceId::try_from("runner-1").unwrap()),
+            session_state: Some(SessionState::Idle),
+            reason: AttachRefusalReason::RunnerReplaced,
+        },
+    };
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["type"], "attach_refused");
+    assert_eq!(value["data"]["refusal"]["reason"], "runner_replaced");
+    assert_eq!(value["data"]["refusal"]["session_id"], "session-1");
+    assert_eq!(value["data"]["refusal"]["runner_instance_id"], "runner-1");
+    assert_eq!(
+        serde_json::from_value::<LocalResponse>(value).unwrap(),
+        response
     );
 }
 

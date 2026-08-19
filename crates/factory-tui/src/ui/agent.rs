@@ -16,7 +16,7 @@ use tui_term::widget::PseudoTerminal;
 
 use crate::model::{Board, PaneMode};
 use crate::mouse::{HitMap, Target};
-use crate::pane::PaneMap;
+use crate::pane::{PaneMap, PaneObservation};
 use crate::ui;
 
 pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, hits: &mut HitMap) {
@@ -61,7 +61,45 @@ fn render_terminal(
         return;
     };
 
-    let exited = pane.has_exited();
+    let observation = pane.observation();
+    match &observation {
+        PaneObservation::Connecting => {
+            render_placeholder(frame, area, board, "attaching…");
+            return;
+        }
+        PaneObservation::AttachRefused(_) => {
+            render_placeholder(
+                frame,
+                area,
+                board,
+                "terminal attach refused — see board status",
+            );
+            return;
+        }
+        PaneObservation::Error(error) => {
+            let block = ui::block(" terminal attach error ");
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    error,
+                    Style::default().fg(Color::Red),
+                ))),
+                inner,
+            );
+            return;
+        }
+        PaneObservation::Attached
+        | PaneObservation::LocalPtyExited
+        | PaneObservation::Disconnected => {}
+    }
+
+    let exited = match pane.kind {
+        crate::pane::PaneKind::LocalPty => {
+            matches!(observation, PaneObservation::LocalPtyExited)
+        }
+        crate::pane::PaneKind::Daemon => matches!(observation, PaneObservation::Disconnected),
+    };
     let marker = if exited { " [exited]" } else { "" };
     let command = match pane.kind {
         crate::pane::PaneKind::LocalPty => format!(" — {}", pane.command.join(" ")),
@@ -93,18 +131,6 @@ fn render_terminal(
     let inner = block.inner(area);
     if inner.width > 0 && inner.height > 0 {
         let _ = pane.resize(inner.height, inner.width);
-    }
-
-    if let Some(error) = pane.attach_error() {
-        frame.render_widget(block, area);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                error,
-                Style::default().fg(Color::Red),
-            ))),
-            inner,
-        );
-        return;
     }
 
     let parser = pane.lock_parser();

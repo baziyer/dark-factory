@@ -8,13 +8,14 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
 };
 
 use factory_core::{
     AgentId, ProjectId, SessionId,
-    local::{LocalRequest, LocalResponse, ServerFrame},
+    local::{AttachRefusal, AttachRefusalReason, LocalRequest, LocalResponse, ServerFrame},
     runner::{decode_terminal_bytes, encode_terminal_bytes},
 };
 use factoryctl::Client;
@@ -59,7 +60,7 @@ pub fn run(
         AttachTarget::Agent(agent_id) => resolve_agent_session(client, &project_id, agent_id)?,
     };
 
-    let frames = client
+    let mut frames = client
         .attach_terminal(LocalRequest::AttachTerminal {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
@@ -67,18 +68,47 @@ pub fn run(
         })
         .map_err(|error| error.to_string())?;
 
+    let first_frame = frames
+        .next()
+        .ok_or_else(|| "daemon closed the attach connection before readiness".to_owned())?;
+    match &first_frame {
+        Ok(ServerFrame::TerminalOutput { .. }) => {}
+        Ok(ServerFrame::Response {
+            response: LocalResponse::AttachRefused { refusal },
+            ..
+        }) => return Err(format_attach_refusal(refusal)),
+        Ok(ServerFrame::Response {
+            response: LocalResponse::Error { message, .. },
+            ..
+        }) => return Err(message.clone()),
+        Ok(_) => return Err("daemon sent an unexpected attach readiness frame".into()),
+        Err(error) => return Err(error.to_string()),
+    }
+
     let raw_mode = RawMode::enable().map_err(|error| error.to_string())?;
 
     let failed = Arc::new(AtomicBool::new(false));
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let output_thread = spawn_output_thread(frames, Arc::clone(&failed), Arc::clone(&failure));
+    let output_thread = spawn_output_thread(
+        Some(first_frame),
+        frames,
+        Arc::clone(&failed),
+        Arc::clone(&failure),
+    );
 
     send_resize(client, &project_id, &session_id);
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
-    let exit_code = forward_stdin(client, &project_id, &session_id, &failed);
+    let stdin_rx = spawn_stdin_reader();
+    let exit_code = forward_with_guard(
+        raw_mode,
+        client,
+        &project_id,
+        &session_id,
+        &failed,
+        &stdin_rx,
+    );
 
-    drop(raw_mode);
     let _ = output_thread.join();
     if let Some(message) = failure
         .lock()
@@ -90,14 +120,18 @@ pub fn run(
     Ok(exit_code)
 }
 
-fn spawn_output_thread(
-    frames: factoryctl::TerminalFrames,
+fn spawn_output_thread<I>(
+    first_frame: Option<Result<ServerFrame, factoryctl::ClientError>>,
+    frames: I,
     done: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
-) -> thread::JoinHandle<()> {
+) -> thread::JoinHandle<()>
+where
+    I: Iterator<Item = Result<ServerFrame, factoryctl::ClientError>> + Send + 'static,
+{
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
-        for frame in frames {
+        for frame in first_frame.into_iter().chain(frames) {
             match frame {
                 Ok(ServerFrame::TerminalOutput { bytes, .. }) => {
                     match decode_terminal_bytes(&bytes) {
@@ -111,6 +145,13 @@ fn spawn_output_thread(
                             break;
                         }
                     }
+                }
+                Ok(ServerFrame::Response {
+                    response: LocalResponse::AttachRefused { refusal },
+                    ..
+                }) => {
+                    set_failure(&failure, format_attach_refusal(&refusal));
+                    break;
                 }
                 Ok(ServerFrame::Response {
                     response: LocalResponse::Error { message, .. },
@@ -130,8 +171,59 @@ fn spawn_output_thread(
     })
 }
 
+/// Runs the forwarding loop while owning the terminal-mode guard. Keeping this production seam
+/// generic lets the refusal-frame regression prove that the same wake path drops its guard
+/// without requiring a provider prompt or a real TTY in the test process.
+fn forward_with_guard<G>(
+    guard: G,
+    client: &Client,
+    project_id: &ProjectId,
+    session_id: &SessionId,
+    failed: &AtomicBool,
+    input: &Receiver<Vec<u8>>,
+) -> i32 {
+    let exit_code = forward_stdin(client, project_id, session_id, failed, input);
+    drop(guard);
+    exit_code
+}
+
+fn format_attach_refusal(refusal: &AttachRefusal) -> String {
+    let reason = match refusal.reason {
+        AttachRefusalReason::SessionNotFound => "session no longer exists",
+        AttachRefusalReason::SessionEnded => "session has ended",
+        AttachRefusalReason::RunnerRejected => "runner rejected terminal attach",
+        AttachRefusalReason::RunnerReplaced => "runner was replaced before attach",
+        AttachRefusalReason::RunnerUnavailable => "runner is unavailable",
+    };
+    format!(
+        "cannot attach session {} ({}); task/session state was not changed",
+        refusal.session_id, reason
+    )
+}
+
 fn set_failure(failure: &Mutex<Option<String>>, message: String) {
     *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
+}
+
+/// Reads stdin on its own blocking descriptor so the forwarding loop can also observe a late
+/// attach refusal. The reader may remain blocked until the process exits, but the controlling
+/// loop is wakeable and drops [`RawMode`] as soon as the output side reports failure.
+fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
+        loop {
+            let read = match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            if tx.send(buffer[..read].to_vec()).is_err() {
+                return;
+            }
+        }
+    });
+    rx
 }
 
 /// Reads stdin and forwards it as `TerminalInput` until EOF, `Ctrl-]`, or the
@@ -141,25 +233,24 @@ fn forward_stdin(
     project_id: &ProjectId,
     session_id: &SessionId,
     failed: &AtomicBool,
+    input: &Receiver<Vec<u8>>,
 ) -> i32 {
-    let mut stdin = std::io::stdin();
-    let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
         if failed.load(Ordering::SeqCst) {
             return 2;
         }
-        let read = match stdin.read(&mut buffer) {
-            Ok(0) | Err(_) => return 0,
-            Ok(read) => read,
+        let chunk = match input.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(chunk) => chunk,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return 0,
         };
-        let chunk = &buffer[..read];
         if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
             if detach_at > 0 {
                 send_input(client, project_id, session_id, &chunk[..detach_at]);
             }
             return 0;
         }
-        send_input(client, project_id, session_id, chunk);
+        send_input(client, project_id, session_id, &chunk);
     }
 }
 
@@ -271,5 +362,68 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         let stdin = std::io::stdin();
         let _ = termios::tcsetattr(&stdin, OptionalActions::Flush, &self.original);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn late_refusal_frame_wakes_forwarding_and_drops_terminal_guard() {
+        struct RestoreProbe(Arc<AtomicBool>);
+
+        impl Drop for RestoreProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let failed = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let refusal = AttachRefusal {
+            project_id: ProjectId::try_from("project-1").unwrap(),
+            session_id: SessionId::try_from("session-1").unwrap(),
+            runner_instance_id: None,
+            session_state: None,
+            reason: AttachRefusalReason::RunnerRejected,
+        };
+        let output_thread = spawn_output_thread(
+            None,
+            std::iter::once(Ok(ServerFrame::Response {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                response: LocalResponse::AttachRefused { refusal },
+            })),
+            Arc::clone(&failed),
+            Arc::clone(&failure),
+        );
+        let (_input_tx, input_rx) = mpsc::channel();
+        let client = Client::new("/tmp/factoryctl-attach-test.sock");
+        let project_id = ProjectId::try_from("project-1").unwrap();
+        let session_id = SessionId::try_from("session-1").unwrap();
+        let restored = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+
+        let exit_code = forward_with_guard(
+            RestoreProbe(Arc::clone(&restored)),
+            &client,
+            &project_id,
+            &session_id,
+            &failed,
+            &input_rx,
+        );
+        output_thread.join().unwrap();
+
+        assert_eq!(exit_code, 2);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(restored.load(Ordering::SeqCst));
+        assert!(
+            failure
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|message| message.contains("runner rejected terminal attach"))
+        );
     }
 }
