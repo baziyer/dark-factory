@@ -243,8 +243,8 @@ pub enum LocalRequest {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<TaskId>,
-        /// When present, list only this agent's assigned tasks. Pages use
-        /// The active queue order is running-first, priority-descending,
+        /// When present, list only this agent's assigned tasks. The active
+        /// queue order is running-first, priority-descending,
         /// creation time, then ID. Pages carry a durable revision so any
         /// mutation makes a cursor explicitly stale instead of skipping work.
         #[serde(default, skip_serializing_if = "Option::is_none")]

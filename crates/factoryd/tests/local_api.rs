@@ -594,7 +594,7 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             &socket,
             LocalRequest::ListTasks {
                 project_id: project_id("bounded-project"),
-                after_id: Some(next.0),
+                after_id: Some(next.0.clone()),
                 agent_id: None,
                 queue_revision: Some(next.1),
                 history: false,
@@ -602,6 +602,27 @@ async fn task_bodies_and_collection_pages_are_bounded_before_commit() {
             },
         )
         .await;
+        assert!(matches!(
+            request(
+                &socket,
+                LocalRequest::ListTasks {
+                    project_id: project_id("bounded-project"),
+                    after_id: Some(next.0.clone()),
+                    agent_id: None,
+                    queue_revision: None,
+                    history: false,
+                    limit: 10,
+                },
+            )
+            .await,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                },
+                ..
+            }
+        ));
         assert!(matches!(
             second,
             ServerFrame::Response {

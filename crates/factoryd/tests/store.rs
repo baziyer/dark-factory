@@ -729,7 +729,9 @@ fn list_pages_use_a_stable_id_cursor() {
         .unwrap();
     assert_eq!(projects[0].id, project_id("project-c"));
 
-    let tasks = store.list_tasks(&project_id("project-a"), None, 2).unwrap();
+    let (tasks, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("project-a"), None, None, true, 2, None)
+        .unwrap();
     assert_eq!(
         tasks
             .iter()
@@ -738,8 +740,16 @@ fn list_pages_use_a_stable_id_cursor() {
         ["task-a", "task-b"]
     );
     let tasks = store
-        .list_tasks(&project_id("project-a"), Some(&task_id("task-b")), 2)
-        .unwrap();
+        .list_tasks_filtered_at_revision(
+            &project_id("project-a"),
+            Some(&task_id("task-b")),
+            None,
+            true,
+            2,
+            Some(revision),
+        )
+        .unwrap()
+        .0;
     assert_eq!(tasks[0].snapshot.id, task_id("task-c"));
 }
 
@@ -1036,6 +1046,16 @@ fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
             Some(revision),
         ),
         Err(StoreError::StaleTaskCursor)
+    ));
+    assert!(matches!(
+        store.list_tasks_filtered(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            false,
+            10,
+        ),
+        Err(StoreError::MissingTaskCursorRevision)
     ));
     let second_page = store
         .list_tasks_filtered(&project_id("factory"), None, Some(&alice), false, 10)

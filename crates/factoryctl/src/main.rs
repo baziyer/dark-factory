@@ -324,8 +324,8 @@ Required:
   --project ID           Project to list tasks from
 
 Options:
-  --after ID               Resume after this task ID
-  --revision N             Revision returned with the previous page
+  --after ID               Resume after this task ID (requires --revision)
+  --revision N             Revision returned with the previous page (requires --after)
   --agent ID               Show only tasks assigned to this agent
   --history                Include terminal task history
   --limit N                  Page size (default and max: 10)
@@ -1677,6 +1677,9 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 .map(|value| parse_number(&value, "--revision"))
                 .transpose()?;
             let agent_id = take_option(&mut args, "--agent")?;
+            if after_id.is_some() != queue_revision.is_some() {
+                return Err("--after and --revision must be supplied together".into());
+            }
             let history = take_flag(&mut args, "--history")?;
             let (limit, _) = take_limit(&mut args, TASK_LIST_LIMIT, TASK_LIST_LIMIT)?;
             require_empty(&args)?;
@@ -2243,14 +2246,19 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             agent_id,
             history,
             limit,
-        } => Ok(LocalRequest::ListTasks {
-            project_id: parse_id(project_id, "project")?,
-            after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
-            agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
-            queue_revision,
-            history,
-            limit,
-        }),
+        } => {
+            if after_id.is_some() != queue_revision.is_some() {
+                return Err("--after and --revision must be supplied together".into());
+            }
+            Ok(LocalRequest::ListTasks {
+                project_id: parse_id(project_id, "project")?,
+                after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
+                agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
+                queue_revision,
+                history,
+                limit,
+            })
+        }
         CliCommand::TaskStart {
             project_id,
             task_id,
@@ -3731,6 +3739,8 @@ mod tests {
                 "project-1",
                 "--after",
                 "task-9",
+                "--revision",
+                "12",
             ]))
             .unwrap(),
             (
@@ -3738,12 +3748,24 @@ mod tests {
                 CliCommand::TaskList {
                     project_id: "project-1".into(),
                     after_id: Some("task-9".into()),
-                    queue_revision: None,
+                    queue_revision: Some(12),
                     agent_id: None,
                     history: false,
                     limit: 10,
                 }
             )
+        );
+
+        assert!(
+            parse_args(args(&[
+                "task",
+                "list",
+                "--project",
+                "project-1",
+                "--after",
+                "task-9",
+            ]))
+            .is_err()
         );
 
         assert!(

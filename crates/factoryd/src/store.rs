@@ -458,6 +458,10 @@ pub enum StoreError {
     TaskNotFound,
     #[error("task page cursor is stale; restart the listing")]
     StaleTaskCursor,
+    #[error("task page cursor requires its queue revision")]
+    MissingTaskCursorRevision,
+    #[error("task page revision requires its cursor")]
+    UnexpectedTaskCursorRevision,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
@@ -2946,6 +2950,11 @@ impl Store {
     ) -> Result<(Vec<TaskDetail>, i64)> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
+        }
+        match (after_id, expected_revision) {
+            (Some(_), None) => return Err(StoreError::MissingTaskCursorRevision),
+            (None, Some(_)) => return Err(StoreError::UnexpectedTaskCursorRevision),
+            _ => {}
         }
         let revision: i64 =
             self.connection

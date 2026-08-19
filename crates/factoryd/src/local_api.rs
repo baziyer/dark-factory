@@ -219,6 +219,11 @@ impl ApiFailure {
                 ErrorCode::Conflict,
                 "task page cursor is stale; restart the listing".into(),
             ),
+            Self::Store(StoreError::MissingTaskCursorRevision)
+            | Self::Store(StoreError::UnexpectedTaskCursorRevision) => (
+                ErrorCode::InvalidRequest,
+                "task cursor and queue revision must be supplied together".into(),
+            ),
             Self::Store(StoreError::RunNotFound) => (
                 ErrorCode::NotFound,
                 "run was not found in the project".into(),
