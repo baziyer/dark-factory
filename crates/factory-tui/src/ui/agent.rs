@@ -11,7 +11,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use factory_core::TaskDetail;
+use factory_core::{TaskDetail, TaskStatus};
 use tui_term::widget::PseudoTerminal;
 
 use crate::model::{Board, PaneMode};
@@ -182,7 +182,12 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         queue.push(Line::from("history:"));
         for (offset, task) in history.iter().enumerate() {
             let row = history_header + 1 + offset;
-            hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
+            if matches!(
+                task.snapshot.status,
+                TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
+            }
             queue.push(Line::from(format!(
                 "  {:?} p={}  {}",
                 task.snapshot.status, task.snapshot.priority, task.snapshot.title

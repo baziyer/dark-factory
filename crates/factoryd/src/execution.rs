@@ -414,11 +414,8 @@ impl Handle {
 
     /// Serializes assignment mutations for one task across all local API
     /// request handlers.
-    pub async fn lock_assignment_slot(
-        &self,
-        task_id: &factory_core::TaskId,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.state.lock_assignment_slot(task_id).await
+    pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.state.lock_assignment_slot().await
     }
 
     /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's

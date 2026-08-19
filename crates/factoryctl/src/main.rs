@@ -2214,35 +2214,19 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             priority,
             agent_id,
         } => {
-            let request = if let Some(agent_id) = agent_id {
-                LocalRequest::CreateAssignedTask {
-                    id: id
-                        .map(|id| parse_id(id, "task"))
-                        .transpose()?
-                        .unwrap_or(generated_id()?),
-                    project_id: parse_id(project_id, "project")?,
-                    parent_task_id: parent_task_id
-                        .map(|id| parse_id(id, "parent task"))
-                        .transpose()?,
-                    title,
-                    body,
-                    priority,
-                    agent_id: parse_id(agent_id, "agent")?,
-                }
-            } else {
-                LocalRequest::CreateTask {
-                    id: id
-                        .map(|id| parse_id(id, "task"))
-                        .transpose()?
-                        .unwrap_or(generated_id()?),
-                    project_id: parse_id(project_id, "project")?,
-                    parent_task_id: parent_task_id
-                        .map(|id| parse_id(id, "parent task"))
-                        .transpose()?,
-                    title,
-                    body,
-                    priority,
-                }
+            let request = LocalRequest::CreateTask {
+                id: id
+                    .map(|id| parse_id(id, "task"))
+                    .transpose()?
+                    .unwrap_or(generated_id()?),
+                project_id: parse_id(project_id, "project")?,
+                parent_task_id: parent_task_id
+                    .map(|id| parse_id(id, "parent task"))
+                    .transpose()?,
+                title,
+                body,
+                priority,
+                agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
             };
             Ok(request)
         }
@@ -2256,6 +2240,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             after_id: after_id.map(|id| parse_id(id, "task cursor")).transpose()?,
             agent_id: agent_id.map(|id| parse_id(id, "agent")).transpose()?,
+            queue_revision: None,
             history,
             limit,
         }),
@@ -3666,8 +3651,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             request_for(add).unwrap(),
-            LocalRequest::CreateAssignedTask { agent_id, .. }
-                if agent_id == "curie".try_into().unwrap()
+            LocalRequest::CreateTask { agent_id, .. }
+                if agent_id == Some("curie".try_into().unwrap())
         ));
 
         let (_, list) = parse_args(args(&[
@@ -3685,6 +3670,7 @@ mod tests {
                 project_id: "project-1".try_into().unwrap(),
                 after_id: None,
                 agent_id: Some("curie".try_into().unwrap()),
+                queue_revision: None,
                 history: false,
                 limit: 10,
             }

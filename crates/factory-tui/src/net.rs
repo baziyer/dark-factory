@@ -25,7 +25,7 @@ use factory_core::local::{LocalRequest, LocalResponse, MAX_TASK_PAGE_ITEMS, Serv
 use factory_core::status::FleetStatus;
 use factory_core::{
     AgentSnapshot, EventEnvelope, ProjectId, ProjectSnapshot, RunSnapshot, SessionSnapshot,
-    TaskDetail,
+    TaskDetail, TaskId,
 };
 
 use factoryctl::Client;
@@ -202,26 +202,39 @@ fn load_agents(client: &Client, project_id: &ProjectId) -> Result<Vec<AgentSnaps
 }
 
 fn load_tasks(client: &Client, project_id: &ProjectId) -> Result<Vec<TaskDetail>, String> {
-    paginate(
-        client,
-        |after_id| LocalRequest::ListTasks {
+    let mut all = Vec::new();
+    let mut cursor: Option<(TaskId, i64)> = None;
+    loop {
+        let request = LocalRequest::ListTasks {
             project_id: project_id.clone(),
-            after_id,
+            after_id: cursor.as_ref().map(|(id, _)| id.clone()),
             agent_id: None,
+            queue_revision: cursor.as_ref().map(|(_, revision)| *revision),
             // The board keeps history separately in the task map so failed
             // and cancelled rows remain actionable; the visible worker
             // queue still comes only from Board::active_tasks_for_agent.
             history: true,
             limit: MAX_TASK_PAGE_ITEMS,
-        },
-        |response| match response {
+        };
+        let response = request_response(client, request)?;
+        let (tasks, next_after_id, revision) = match response {
             LocalResponse::Tasks {
                 tasks,
                 next_after_id,
-            } => Ok((tasks, next_after_id)),
-            other => Err(format!("unexpected response to ListTasks: {other:?}")),
-        },
-    )
+                queue_revision,
+            } => (tasks, next_after_id, queue_revision),
+            other => return Err(format!("unexpected response to ListTasks: {other:?}")),
+        };
+        let done = next_after_id.is_none() || tasks.is_empty();
+        all.extend(tasks);
+        if done {
+            return Ok(all);
+        }
+        cursor = Some((
+            next_after_id.expect("non-empty paginated task response has a cursor"),
+            revision.ok_or_else(|| "daemon omitted the task page revision".to_owned())?,
+        ));
+    }
 }
 
 fn load_runs(client: &Client, project_id: &ProjectId) -> Result<Vec<RunSnapshot>, String> {

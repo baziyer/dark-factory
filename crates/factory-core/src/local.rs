@@ -163,19 +163,10 @@ pub enum LocalRequest {
         title: String,
         body: String,
         priority: i32,
-    },
-    /// Creates a queued task and assigns it in the same durable transaction.
-    /// The daemon wakes only this agent after the commit, so a restart cannot
-    /// expose an intermediate backlog task or deliver it to another agent.
-    CreateAssignedTask {
-        id: TaskId,
-        project_id: ProjectId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_task_id: Option<TaskId>,
-        title: String,
-        body: String,
-        priority: i32,
-        agent_id: AgentId,
+        /// When present, create-and-assign is one durable transaction. The
+        /// daemon wakes only this agent after the commit.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<AgentId>,
     },
     CreateAgent {
         id: AgentId,
@@ -252,10 +243,14 @@ pub enum LocalRequest {
         project_id: ProjectId,
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<TaskId>,
-        /// When present, list only this agent's assigned tasks. The same
-        /// stable `(created_at_ms, id)` order is used for queue delivery.
+        /// When present, list only this agent's assigned tasks. Pages use
+        /// The active queue order is running-first, priority-descending,
+        /// creation time, then ID. Pages carry a durable revision so any
+        /// mutation makes a cursor explicitly stale instead of skipping work.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_id: Option<AgentId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_revision: Option<i64>,
         /// Include terminal/history rows. The default is the active queue
         /// only; active work is never hidden by a history view.
         #[serde(default)]
@@ -612,6 +607,8 @@ pub enum LocalResponse {
         tasks: Vec<TaskDetail>,
         #[serde(skip_serializing_if = "Option::is_none")]
         next_after_id: Option<TaskId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_revision: Option<i64>,
     },
     Runs {
         runs: Vec<RunSnapshot>,

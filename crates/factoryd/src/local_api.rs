@@ -84,7 +84,7 @@ mod protocol_tests {
         let payload = serde_json::json!({
             "protocol_version": PROTOCOL_VERSION - 1,
             "request": {
-                "type": "create_assigned_task",
+                "type": "future_unknown_request",
                 "data": {"future_field": "future-shape"}
             }
         });
@@ -214,6 +214,10 @@ impl ApiFailure {
             Self::Store(StoreError::TaskNotFound) => (
                 ErrorCode::NotFound,
                 "task was not found in the project".into(),
+            ),
+            Self::Store(StoreError::StaleTaskCursor) => (
+                ErrorCode::Conflict,
+                "task page cursor is stale; restart the listing".into(),
             ),
             Self::Store(StoreError::RunNotFound) => (
                 ErrorCode::NotFound,
@@ -877,42 +881,6 @@ async fn handle_request(
             title,
             body,
             priority,
-        } => {
-            let title = normalize_task_title(title).ok_or_else(|| {
-                ApiFailure::Invalid(format!(
-                    "task title must be between 1 and {MAX_TASK_TITLE_BYTES} bytes"
-                ))
-            })?;
-            if body.len() > MAX_TASK_BODY_BYTES {
-                return Err(ApiFailure::Invalid(format!(
-                    "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
-                )));
-            }
-            let task = state
-                .commit_and_publish(move |store| {
-                    let (task, event) = store.create_task(
-                        NewTask {
-                            id,
-                            project_id,
-                            parent_task_id,
-                            title,
-                            body,
-                            priority,
-                        },
-                        now_ms()?,
-                    )?;
-                    Ok((task, vec![event]))
-                })
-                .await?;
-            Ok(LocalResponse::TaskCreated { task })
-        }
-        LocalRequest::CreateAssignedTask {
-            id,
-            project_id,
-            parent_task_id,
-            title,
-            body,
-            priority,
             agent_id,
         } => {
             let title = normalize_task_title(title).ok_or_else(|| {
@@ -929,7 +897,7 @@ async fn handle_request(
             let wake_agent_id = agent_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
-                    let (task, event) = store.create_assigned_task(
+                    let (task, event) = store.create_task_with_assignment(
                         NewTask {
                             id,
                             project_id,
@@ -944,7 +912,9 @@ async fn handle_request(
                     Ok((task, vec![event]))
                 })
                 .await?;
-            execution.wake(wake_project_id, wake_agent_id);
+            if let Some(agent_id) = wake_agent_id {
+                execution.wake(wake_project_id, agent_id);
+            }
             Ok(LocalResponse::TaskCreated { task })
         }
         LocalRequest::CreateAgent {
@@ -1248,24 +1218,28 @@ async fn handle_request(
             after_id,
             agent_id,
             history,
+            queue_revision,
             limit,
         } => {
             let limit = page_limit("task", limit, MAX_TASK_PAGE_ITEMS)?;
-            let mut tasks = state
+            let (mut tasks, queue_revision) = state
                 .with_store(move |store| {
-                    store.list_tasks_filtered(
+                    store.list_tasks_filtered_at_revision(
                         &project_id,
                         after_id.as_ref(),
                         agent_id.as_ref(),
                         history,
                         limit + 1,
+                        queue_revision,
                     )
                 })
                 .await?;
             let next_after_id = next_cursor(&mut tasks, limit, |task| task.snapshot.id.clone());
+            let has_next = next_after_id.is_some();
             Ok(LocalResponse::Tasks {
                 tasks,
                 next_after_id,
+                queue_revision: has_next.then_some(queue_revision),
             })
         }
         LocalRequest::GetTask {
@@ -1444,7 +1418,7 @@ async fn handle_request(
             task_id,
             agent_id,
         } => {
-            let _assignment_slot = execution.lock_assignment_slot(&task_id).await;
+            let _assignment_slot = execution.lock_assignment_slot().await;
             let lookup_project_id = project_id.clone();
             let lookup_task_id = task_id.clone();
             let previous_owner = state

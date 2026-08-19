@@ -1011,21 +1011,59 @@ fn assigned_creation_is_atomic_and_filtered_queue_order_survives_restart() {
         ));
     }
 
-    let store = Store::open(&database).unwrap();
-    let first_page = store
-        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), false, 1)
+    let mut store = Store::open(&database).unwrap();
+    let (first_page, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("factory"), None, Some(&alice), false, 1, None)
         .unwrap();
     assert_eq!(first_page[0].snapshot.id, task_id("alice-first"));
-    let second_page = store
-        .list_tasks_filtered(
+    store
+        .update_task(
+            &project_id("factory"),
+            &task_id("alice-first"),
+            None,
+            None,
+            Some(-1),
+            7,
+        )
+        .unwrap();
+    assert!(matches!(
+        store.list_tasks_filtered_at_revision(
             &project_id("factory"),
             Some(&first_page[0].snapshot.id),
             Some(&alice),
             false,
             10,
-        )
+            Some(revision),
+        ),
+        Err(StoreError::StaleTaskCursor)
+    ));
+    let second_page = store
+        .list_tasks_filtered(&project_id("factory"), None, Some(&alice), false, 10)
         .unwrap();
-    assert_eq!(second_page[0].snapshot.id, task_id("alice-second"));
+    assert_eq!(
+        second_page
+            .iter()
+            .map(|task| task.snapshot.id.clone())
+            .collect::<Vec<_>>(),
+        vec![task_id("alice-second"), task_id("alice-first")]
+    );
+    store
+        .assign_task(&project_id("factory"), &task_id("alice-first"), None, 8)
+        .unwrap();
+    let (_, revision) = store
+        .list_tasks_filtered_at_revision(&project_id("factory"), None, None, false, 1, None)
+        .unwrap();
+    assert!(matches!(
+        store.list_tasks_filtered_at_revision(
+            &project_id("factory"),
+            Some(&first_page[0].snapshot.id),
+            Some(&alice),
+            false,
+            10,
+            Some(revision - 1),
+        ),
+        Err(StoreError::StaleTaskCursor)
+    ));
     assert_eq!(
         store
             .list_tasks_filtered(&project_id("factory"), None, None, false, 10)

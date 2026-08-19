@@ -392,7 +392,10 @@ impl Board {
                 let Some(task) = self.tasks.get(&task_id).filter(|task| {
                     matches!(
                         task.snapshot.status,
-                        TaskStatus::Queued | TaskStatus::Running
+                        TaskStatus::Queued
+                            | TaskStatus::Running
+                            | TaskStatus::Failed
+                            | TaskStatus::Cancelled
                     )
                 }) else {
                     return Intent::None;
@@ -907,25 +910,14 @@ impl Board {
                     self.set_status("failed to generate a task id", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                let request = if let Some(agent_id) = agent_id {
-                    LocalRequest::CreateAssignedTask {
-                        id,
-                        project_id,
-                        parent_task_id: None,
-                        title,
-                        body,
-                        priority: 0,
-                        agent_id,
-                    }
-                } else {
-                    LocalRequest::CreateTask {
-                        id,
-                        project_id,
-                        parent_task_id: None,
-                        title,
-                        body,
-                        priority: 0,
-                    }
+                let request = LocalRequest::CreateTask {
+                    id,
+                    project_id,
+                    parent_task_id: None,
+                    title,
+                    body,
+                    priority: 0,
+                    agent_id,
                 };
                 Intent::Send(request)
             }
@@ -1573,6 +1565,24 @@ mod tests {
             Intent::None
         ));
         assert!(board.selected_task.is_none());
+
+        board.tasks.insert(
+            TaskId::try_from("retryable").unwrap(),
+            task("retryable", "proj", TaskStatus::Failed, Some("alice"), 0),
+        );
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("retryable").unwrap())),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('t'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            &board.mode,
+            Mode::TaskMenu(TaskMenuState { items, .. }) if items.contains(&"retry")
+        ));
+        board.mode = Mode::Normal;
 
         board.view = View::Agent;
         board.selected_agent = Some(AgentId::try_from("alice").unwrap());

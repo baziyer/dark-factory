@@ -456,6 +456,8 @@ pub enum StoreError {
     RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
+    #[error("task page cursor is stale; restart the listing")]
+    StaleTaskCursor,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
@@ -802,7 +804,7 @@ impl Store {
         self.create_task_with_assignment(input, Some(agent_id), now_ms)
     }
 
-    fn create_task_with_assignment(
+    pub fn create_task_with_assignment(
         &mut self,
         input: NewTask,
         assigned_agent_id: Option<AgentId>,
@@ -2922,8 +2924,36 @@ impl Store {
         include_history: bool,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
+        self.list_tasks_filtered_at_revision(
+            project_id,
+            after_id,
+            agent_id,
+            include_history,
+            limit,
+            None,
+        )
+        .map(|(tasks, _)| tasks)
+    }
+
+    pub fn list_tasks_filtered_at_revision(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&TaskId>,
+        agent_id: Option<&AgentId>,
+        include_history: bool,
+        limit: usize,
+        expected_revision: Option<i64>,
+    ) -> Result<(Vec<TaskDetail>, i64)> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
+        }
+        let revision: i64 = self.connection.query_row(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events",
+            [],
+            |row| row.get(0),
+        )?;
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(StoreError::StaleTaskCursor);
         }
         if let Some(agent_id) = agent_id {
             let exists = load_agent(&self.connection, agent_id)?
@@ -2934,8 +2964,18 @@ impl Store {
         }
         if let Some(after_id) = after_id {
             let cursor_exists: bool = self.connection.query_row(
-                "SELECT EXISTS(SELECT 1 FROM tasks WHERE project_id = ?1 AND id = ?2)",
-                params![project_id.as_str(), after_id.as_str()],
+                "SELECT EXISTS(
+                    SELECT 1 FROM tasks
+                    WHERE project_id = ?1 AND id = ?2
+                      AND (?3 IS NULL OR assigned_agent_id = ?3)
+                      AND (?4 OR status IN ('queued', 'running'))
+                )",
+                params![
+                    project_id.as_str(),
+                    after_id.as_str(),
+                    agent_id.map(AgentId::as_str),
+                    include_history,
+                ],
                 |row| row.get(0),
             )?;
             if !cursor_exists {
@@ -2949,20 +2989,10 @@ impl Store {
             WHERE project_id = ?1
                AND (?2 IS NULL OR assigned_agent_id = ?2)
                AND (?3 OR status IN ('queued', 'running'))
-               AND (?4 IS NULL OR
-                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
-                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                        FROM tasks WHERE project_id = ?1 AND id = ?4
-                    ) OR (
-                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
-                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                            FROM tasks WHERE project_id = ?1 AND id = ?4
-                        )
-                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
-                                                             WHERE project_id = ?1 AND id = ?4)))
-                    ))
+               AND (?4 IS NULL OR (created_at_ms, id) > (
+                    SELECT created_at_ms, id FROM tasks
+                    WHERE project_id = ?1 AND id = ?4
+               ))
              ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
              LIMIT ?5",
         )?;
@@ -2997,7 +3027,7 @@ impl Store {
             },
         )?;
 
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, revision))
     }
 
     pub fn get_task(&self, project_id: &ProjectId, task_id: &TaskId) -> Result<TaskDetail> {
