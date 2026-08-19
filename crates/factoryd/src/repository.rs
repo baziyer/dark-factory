@@ -1905,7 +1905,7 @@ mod tests {
 
         let tree = String::from_utf8(
             StdCommand::new("git")
-                .current_dir(&temp.path().join("repo"))
+                .current_dir(temp.path().join("repo"))
                 .args(["rev-parse", &format!("{old_head}^{{tree}}")])
                 .output()
                 .unwrap()
@@ -1914,7 +1914,7 @@ mod tests {
         .unwrap();
         let unique_head = String::from_utf8(
             StdCommand::new("git")
-                .current_dir(&temp.path().join("repo"))
+                .current_dir(temp.path().join("repo"))
                 .args([
                     "commit-tree",
                     tree.trim(),
