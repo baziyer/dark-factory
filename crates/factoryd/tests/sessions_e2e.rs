@@ -1200,6 +1200,7 @@ fn task_assigned_during_a_clean_stop_delivers_after_the_session_is_replaced() {
 #[test]
 fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     const FAKE_CODEX_THREAD_ID: &str = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+    const RECOVERY_THREAD_ID: &str = "f31a566f-544b-46f0-bd03-9c9ec3231c90";
 
     let home = private_tempdir();
     let fake_bin = install_fake_codex(home.path());
@@ -1217,9 +1218,11 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
         Some(FAKE_CODEX_THREAD_ID)
     );
 
-    // Delay only the resumed provider's prompt hook. The recovery CR is
-    // accepted immediately, but its acknowledgement arrives three seconds
-    // later; a retry that retypes the body would submit the same nonce twice.
+    // Delay prompt hooks so the replacement path also proves that a slow
+    // positive acknowledgement cannot duplicate the exact task attempt. The
+    // fixture makes the one fresh replacement miss its first CR while keeping
+    // the composer intact; unlike a resumed launch, it must take the ordinary
+    // bounded retry in the same session rather than churn fresh conversations.
     std::fs::write(fake_bin.join("delay-user-prompt-submit"), b"3").unwrap();
     let stopped = client
         .request(LocalRequest::StopSession {
@@ -1239,10 +1242,11 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
         session_by_agent(&client, "curie").filter(|session| !session.state.is_live())
     });
 
-    // The fake resumed thread drops the first two PTY submissions after
-    // `codex resume <thread-id>`, reproducing the observed no-run/no-prompt
-    // delivery loss. The shared dispatcher must make one delayed outer retry
-    // and deliver the still-queued task rather than leave it wedged forever.
+    // The fake resumed thread accepts the first submission CR only as a UI
+    // recovery/repaint boundary and clears the composer, matching the live
+    // "Conversation interrupted" failure. A bare-CR retry therefore cannot
+    // submit task-2. The daemon must retire this poisoned resumed thread and
+    // deliver the still-queued task once in a fresh provider conversation.
     create_task(&client, "task-2", "Second", "deliver after resuming");
     assign_task(&client, "task-2", "curie");
     wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
@@ -1277,13 +1281,35 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     });
     assert_eq!(
         successor.provider_session_id.as_deref(),
-        Some(FAKE_CODEX_THREAD_ID),
-        "the successor must preserve provider-thread continuity"
+        Some(RECOVERY_THREAD_ID),
+        "delivery recovery must use a fresh provider thread"
     );
-    let task2_run = list_runs(&client)
+    let sessions = list_sessions(&client);
+    assert_eq!(
+        sessions.len(),
+        3,
+        "one rejected resume must create exactly one fresh conversation"
+    );
+    let poisoned = sessions
+        .iter()
+        .find(|session| {
+            session.id != first_session.id
+                && session.provider_session_id.as_deref() == Some(FAKE_CODEX_THREAD_ID)
+        })
+        .expect("the poisoned resumed session remains in history");
+    assert_eq!(poisoned.state, SessionState::Stopped);
+    assert!(
+        poisoned
+            .ended_at_ms
+            .is_some_and(|ended| ended <= successor.started_at_ms),
+        "the fresh session must not spawn until the poisoned runner's exit is durable"
+    );
+    let task2_runs: Vec<_> = list_runs(&client)
         .into_iter()
-        .find(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
-        .expect("run for task-2");
+        .filter(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-2"))
+        .collect();
+    assert_eq!(task2_runs.len(), 1, "task-2 must open exactly one run");
+    let task2_run = &task2_runs[0];
     assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
 
     cleanup_session(&project.daemon, "curie");

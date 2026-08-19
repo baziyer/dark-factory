@@ -1719,21 +1719,15 @@ async fn handle_request(
             } else {
                 false
             };
-            if event == ProviderHookEvent::UserPromptSubmit {
+            let prompt_admission = if event == ProviderHookEvent::UserPromptSubmit {
                 // Bind and commit the exact durable delivery before
                 // publishing the hook event. The ack waiter then observes
                 // `acknowledged`, never merely an unrelated prompt event.
-                if execution.try_begin_agent_write(&agent_id) {
-                    let result = execution::commit_pending_delivery_on_prompt(
-                        state,
-                        &session.snapshot(),
-                        &payload,
-                    )
-                    .await;
-                    execution.end_agent_write(&agent_id);
-                    result?;
-                }
-            }
+                execution::commit_pending_delivery_on_prompt(state, &session.snapshot(), &payload)
+                    .await?
+            } else {
+                execution::PromptDeliveryAdmission::Ignored
+            };
             let record_session_id = session_id.clone();
             let updated_session = state
                 .commit_and_publish(move |store| {
@@ -1748,7 +1742,16 @@ async fn handle_request(
                     Ok((session, vec![event_envelope]))
                 })
                 .await?;
-            let reply = if let Some(decision) = policy_decision {
+            let reply = if prompt_admission == execution::PromptDeliveryAdmission::Denied {
+                // UserPromptSubmit is synchronous and pre-execution in both
+                // supported hook contracts. This exact stale prompt lost the
+                // durable admission fence, so block it before the provider can
+                // begin model or tool work.
+                serde_json::json!({
+                    "decision": "block",
+                    "reason": "Dark Factory rejected this stale delivery"
+                })
+            } else if let Some(decision) = policy_decision {
                 let denied_by = decision.denied_by.map(str::to_owned);
                 let policy_event = FactoryEvent::PolicyDecision {
                     project_id: project_id.clone(),
@@ -3215,32 +3218,25 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
     })
 }
 
-/// Wiring-level tests for the two deletion-gate call sites this file adds
-/// around `execution::stop_hook_reply`/`execution::commit_pending_delivery_on_prompt`
-/// (PR #50 review, round 3's nit): every existing `tests/local_api.rs`/
-/// `tests/sessions_e2e.rs` suite still passes even if `try_begin_agent_write`'s
-/// result is discarded at both call sites (the reviewer verified this by
-/// mutation), because neither hook path's *ordinary* behavior depends on
-/// the gate -- only the race this PR closes does, and that race needs a
-/// second, concurrent request to observe. These tests drive
-/// `handle_request` directly (visible here, not from the external
-/// `tests/` crate, since it is module-private) with the agent already
-/// marked deleting, so no real race or timing is needed: the assertion is
-/// "this exact call, with the mark already set, must not touch the store
-/// the way it normally would" -- exactly what the mutation the reviewer
-/// tried would break.
+/// Wiring-level tests for hook admission while the broad agent-write gate is
+/// held. Stop hooks still honor that deletion gate. Exact nonce-bearing
+/// `UserPromptSubmit` hooks deliberately bypass it and reach the durable
+/// attempt fence; otherwise gate contention could fail open while recovery
+/// concurrently retires the provider thread.
 #[cfg(test)]
 mod deletion_gate_tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use factory_core::{AgentRole, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus};
+    use factory_core::{
+        AgentRole, MessageId, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus,
+    };
 
     use super::*;
     use crate::{
         execution::DELIVERY_ATTEMPT_MARKER,
         store::{
-            DeliveryAttemptState, NewAgent, NewDeliveryAttempt, NewProject, NewSession, NewTask,
-            Store,
+            DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject,
+            NewSession, NewTask, Store,
         },
     };
 
@@ -3249,7 +3245,6 @@ mod deletion_gate_tests {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         directory
     }
-
     fn config(directory: &Path) -> execution::Config {
         execution::Config {
             runner_program: directory.join("factory-runner"),
@@ -3264,15 +3259,38 @@ mod deletion_gate_tests {
 
     const HOOK_TOKEN_LEN: usize = 64;
 
+    #[derive(Clone, Copy)]
+    enum ProviderFixture {
+        Shell,
+        ResumedCodex,
+    }
+
     /// A project, one agent, one live session (with a fixed, known hook
     /// token so a test can address it via `LocalRequest::ProviderHook`
     /// exactly like a real provider process would), and one task assigned
     /// to that agent -- pending work for `compose_delivery` to find, so a
     /// gate decline is distinguishable from "nothing to deliver anyway".
     async fn setup(directory: &Path) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
+        setup_with_provider(directory, ProviderFixture::Shell).await
+    }
+
+    async fn setup_resumed_codex(
+        directory: &Path,
+    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
+        setup_with_provider(directory, ProviderFixture::ResumedCodex).await
+    }
+
+    async fn setup_with_provider(
+        directory: &Path,
+        provider_fixture: ProviderFixture,
+    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
+        let provider = match provider_fixture {
+            ProviderFixture::Shell => Provider::Shell,
+            ProviderFixture::ResumedCodex => Provider::Codex,
+        };
 
         let mut store = Store::open_in_memory().unwrap();
         store
@@ -3292,11 +3310,40 @@ mod deletion_gate_tests {
                     project_id: project_id.clone(),
                     parent_agent_id: None,
                     role: AgentRole::Worker,
-                    provider: Provider::Shell,
+                    provider,
                 },
                 1_000,
             )
             .unwrap();
+        if matches!(provider_fixture, ProviderFixture::ResumedCodex) {
+            let thread_id = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+            let (prior, _) = store
+                .create_session(
+                    NewSession {
+                        id: SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
+                        project_id: project_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider,
+                        runtime_model: None,
+                        runtime_reasoning_effort: None,
+                        runtime_permission_mode: None,
+                        runtime_control_mode: None,
+                        provider_session_id: Some(thread_id.into()),
+                        worktree: directory.to_string_lossy().into_owned(),
+                        codex_home: None,
+                        hook_token: "b".repeat(HOOK_TOKEN_LEN),
+                        runner_instance_id: RunnerInstanceId::try_from(
+                            "44444444-4444-4444-8444-444444444444",
+                        )
+                        .unwrap(),
+                        runner_runtime: directory.join("old").to_string_lossy().into_owned(),
+                        runner_protocol_version: 1,
+                    },
+                    999,
+                )
+                .unwrap();
+            store.end_session(&prior.id, Some(0), None, 999).unwrap();
+        }
         store
             .create_task(
                 NewTask {
@@ -3334,12 +3381,16 @@ mod deletion_gate_tests {
                         id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
                         project_id: session_project_id.clone(),
                         agent_id: session_agent_id.clone(),
-                        provider: Provider::Shell,
+                        provider,
                         runtime_model: None,
                         runtime_reasoning_effort: None,
                         runtime_permission_mode: None,
                         runtime_control_mode: None,
-                        provider_session_id: None,
+                        provider_session_id: matches!(
+                            provider_fixture,
+                            ProviderFixture::ResumedCodex
+                        )
+                        .then(|| "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".into()),
                         worktree: session_worktree,
                         codex_home: None,
                         hook_token: "a".repeat(HOOK_TOKEN_LEN),
@@ -3365,20 +3416,49 @@ mod deletion_gate_tests {
         (state, execution, project_id, agent_id, task_id)
     }
 
-    /// `commit_pending_delivery_on_prompt`'s gated call site
-    /// (`UserPromptSubmit`): with `curie` marked deleting, a
-    /// `UserPromptSubmit` hook -- even with a delivery genuinely in
-    /// flight (`try_delivery_slot` held, satisfying
-    /// `commit_pending_delivery_on_prompt`'s own precondition) and a task
-    /// assigned and waiting -- must not open the run episode. Verified by
-    /// mutation: discarding `try_begin_agent_write`'s result at that call
-    /// site (matching the reviewer's own repro) makes this test's final
-    /// assertion fail (`task-1` moves to `Running`); restoring the gate
-    /// makes it pass again.
+    /// An exact provider prompt is already past the filesystem-write
+    /// boundary. Even if that broad agent gate is held, nonce admission must
+    /// reach the store fence instead of replying `{}` while leaving recovery
+    /// free to win afterward. This deterministic ordering makes the hook win;
+    /// the sibling execution test covers recovery winning and blocking it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn commit_pending_delivery_on_prompt_declines_while_the_agent_is_deleting() {
+    async fn exact_prompt_admission_bypasses_the_unrelated_agent_write_gate() {
         let directory = private_tempdir();
         let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let text = format!("exact prompt\n{DELIVERY_ATTEMPT_MARKER}gate-race\u{2063}");
+        let (incarnation, prior_run_count) = state
+            .with_store({
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                move |store| store.task_delivery_marker(&session_id, &task_id)
+            })
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let task_id = task_id.clone();
+                let text = text.clone();
+                move |store| {
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "gate-race".into(),
+                        project_id,
+                        agent_id,
+                        session_id,
+                        task_id: Some(task_id),
+                        task_incarnation_id: Some(incarnation),
+                        prior_run_count: Some(prior_run_count),
+                        message_ids: Vec::new(),
+                        text,
+                        created_at_ms: 1_001,
+                    })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
 
         let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
         execution.begin_delete(&agent_id).await.unwrap();
@@ -3390,14 +3470,15 @@ mod deletion_gate_tests {
             LocalRequest::ProviderHook {
                 token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::UserPromptSubmit,
-                payload: serde_json::json!({}),
+                payload: serde_json::json!({"prompt": text}),
             },
         )
-        .await;
-        assert!(
-            response.is_ok(),
-            "a declined gate must not surface as the hook request's own error, got {response:?}"
-        );
+        .await
+        .unwrap();
+        let LocalResponse::ProviderHookReply { reply } = response else {
+            panic!("unexpected response")
+        };
+        assert_eq!(reply, serde_json::json!({}));
 
         let task = state
             .with_store({
@@ -3409,11 +3490,114 @@ mod deletion_gate_tests {
             .unwrap();
         assert_eq!(
             task.snapshot.status,
-            TaskStatus::Queued,
-            "no run episode must open for a deleting agent's UserPromptSubmit hook"
+            TaskStatus::Running,
+            "the exact hook must win admission instead of failing open"
+        );
+        assert_eq!(
+            state
+                .with_store(|store| store.delivery_attempt_state("gate-race"))
+                .await
+                .unwrap(),
+            Some(DeliveryAttemptState::Acknowledged)
         );
 
         execution.end_delete(&agent_id);
+    }
+
+    /// The execution-layer sibling forces the narrower load-before-cancel /
+    /// commit-after-cancel message CAS. This request-level test places a
+    /// durable recovery commit as the barrier before the real provider hook,
+    /// proving the externally observable contract is an explicit block and
+    /// the inbox remains available to the fresh conversation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_only_recovery_win_blocks_the_hook_and_preserves_the_inbox() {
+        let directory = private_tempdir();
+        let (state, execution, project_id, agent_id, task_id) =
+            setup_resumed_codex(directory.path()).await;
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let message_id = MessageId::try_from("recovery-message").unwrap();
+        let text =
+            format!("message only\n{DELIVERY_ATTEMPT_MARKER}message-recovery-attempt\u{2063}");
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                let task_id = task_id.clone();
+                let message_id = message_id.clone();
+                let text = text.clone();
+                move |store| {
+                    store.delete_task(&project_id, &task_id, 1_001)?;
+                    store.send_agent_message(NewAgentMessage {
+                        id: message_id.clone(),
+                        project_id: project_id.clone(),
+                        sender_agent_id: None,
+                        recipient_agent_id: agent_id.clone(),
+                        body: "message only".into(),
+                        created_at_ms: 1_002,
+                    })?;
+                    store.ensure_delivery_attempt(NewDeliveryAttempt {
+                        id: "message-recovery-attempt".into(),
+                        project_id: project_id.clone(),
+                        agent_id,
+                        session_id: session_id.clone(),
+                        task_id: None,
+                        task_incarnation_id: None,
+                        prior_run_count: None,
+                        message_ids: vec![message_id],
+                        text,
+                        created_at_ms: 1_002,
+                    })?;
+                    let (_, event) = store.request_fresh_provider_recovery(
+                        &project_id,
+                        &session_id,
+                        "message-recovery-attempt",
+                        1_003,
+                    )?;
+                    Ok(((), event.into_iter().collect()))
+                }
+            })
+            .await
+            .unwrap();
+
+        let response = handle_request(
+            &state,
+            &execution,
+            directory.path(),
+            LocalRequest::ProviderHook {
+                token: "a".repeat(HOOK_TOKEN_LEN),
+                event: ProviderHookEvent::UserPromptSubmit,
+                payload: serde_json::json!({"prompt": text}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            response,
+            LocalResponse::ProviderHookReply { reply }
+                if reply == serde_json::json!({
+                    "decision": "block",
+                    "reason": "Dark Factory rejected this stale delivery"
+                })
+        ));
+
+        let (pending, attempt, runs) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    Ok((
+                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
+                        store.delivery_attempt_state("message-recovery-attempt")?,
+                        store.list_runs(&project_id, None, 10)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
+        assert!(runs.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

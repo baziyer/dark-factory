@@ -12,8 +12,27 @@ import tty
 
 factoryctl = os.environ.get("DARK_FACTORY_FACTORYCTL", "factoryctl")
 token = os.environ["DARK_FACTORY_SESSION_TOKEN_FILE"]
-thread_id = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"
 resumed = "resume" in sys.argv
+
+# A fresh Codex process creates a fresh thread; `codex resume` keeps the
+# requested one. Persist the tiny counter in the per-agent CODEX_HOME so the
+# fixture models both sides of that contract across resident processes.
+thread_ids = [
+    "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+    "f31a566f-544b-46f0-bd03-9c9ec3231c90",
+]
+thread_counter = os.path.join(os.environ["CODEX_HOME"], "fake-thread-count")
+if resumed:
+    thread_id = sys.argv[-1]
+else:
+    try:
+        with open(thread_counter, encoding="utf-8") as saved:
+            generation = int(saved.read())
+    except (FileNotFoundError, ValueError):
+        generation = 0
+    thread_id = thread_ids[min(generation, len(thread_ids) - 1)]
+    with open(thread_counter, "w", encoding="utf-8") as saved:
+        saved.write(str(generation + 1))
 
 
 def hook(event, payload):
@@ -61,6 +80,7 @@ hook("SessionStart", {"session_id": thread_id})
 # composer is ready. The first bounded delivery intentionally models the
 # observed no-prompt/no-run loss; the daemon's one outer retry must recover.
 ignored_resumed_deliveries = 1 if resumed else 0
+ignored_fresh_deliveries = 1 if not resumed and generation > 0 else 0
 buffer = bytearray()
 prompt_log = os.path.join(os.path.dirname(token), "fake-codex-prompts.jsonl")
 delay_hook = os.path.exists(
@@ -74,9 +94,17 @@ while True:
         text = buffer.decode("utf-8")
         if resumed and ignored_resumed_deliveries:
             ignored_resumed_deliveries -= 1
-            # The live failure leaves the exact pasted prompt in the
-            # provider's input buffer. A recovery bare CR submits that same
-            # prompt; it must not cause a second prompt body to be typed.
+            # Real Codex can accept this CR as a recovery/repaint boundary
+            # after displaying "Conversation interrupted" while leaving an
+            # empty composer. The submitted task body is gone: a following
+            # bare CR cannot recover it.
+            buffer.clear()
+            continue
+        if ignored_fresh_deliveries:
+            ignored_fresh_deliveries -= 1
+            # A fresh conversation remains eligible for the ordinary bounded
+            # same-composer retry. Keep the text buffered so its recovery CR
+            # can acknowledge this transient miss without spawning again.
             continue
         buffer.clear()
         if prompt_log:

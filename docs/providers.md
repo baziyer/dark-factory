@@ -206,6 +206,27 @@ them into `factory_core::ProviderHookEvent` values (see
    sign the boundary needs to grow — raise it rather than routing around
    it with provider-specific glue elsewhere in the daemon.
 
+Resumed Codex input has one deliberate fail-safe at the generic delivery
+boundary. The Codex TUI can consume a CR as recovery from a `Conversation
+interrupted` repaint while discarding the text already pasted into its
+composer. Terminal output cannot prove whether that text is still present, so
+Dark Factory does not guess with another bare CR or risk duplicate work by
+retyping it. If a resumed Codex session does not emit the exact
+`UserPromptSubmit` acknowledgement for a delivery, the daemon stops
+that runner, durably excludes that provider thread from resume selection, and
+delivers the still-queued task in a fresh Codex conversation only after the old
+runner has exited. Session creation durably records whether the launch used a
+resume target; learning a new thread id from a fresh session's `SessionStart`
+does not change that provenance. A transient miss in the fresh conversation
+therefore takes the ordinary bounded same-composer retry instead of spawning a
+loop of replacements. The task/run is committed only by the exact nonce-bearing
+hook, preserving one durable run. That acknowledgement and timeout recovery are
+serialized as a durable fence: if the hook wins, recovery cannot cancel its run;
+if recovery wins, a late exact `UserPromptSubmit` receives a blocking response
+before Codex begins the turn. Recovery-stop intent survives daemon and control
+socket failures and is replayed after reconnect until the poisoned runner's
+actual exit is observed.
+
 ## Codex: `CODEX_HOME` seeding is filtered, not a raw copy
 
 `CodexProvider` seeds each agent's isolated `CODEX_HOME` once

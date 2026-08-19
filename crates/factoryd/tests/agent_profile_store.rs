@@ -136,7 +136,10 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
-            "ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+            "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
+             ALTER TABLE sessions DROP COLUMN resumed_provider_session;
+             ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+             ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
              ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
         )
         .unwrap();
@@ -149,7 +152,7 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     // `Store::open` above intentionally created the newest schema so the
     // fixture can seed a real profile. Rewind it as an actual pre-0022
     // database, including removing the post-0022 table; otherwise migration
-    // 0024 quite correctly rejects a duplicate CREATE TABLE.
+    // 0024/0025 quite correctly reject duplicate schema changes.
     connection
         .execute_batch("DROP TABLE delivery_attempts;")
         .unwrap();

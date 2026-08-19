@@ -58,10 +58,17 @@ use crate::{
     runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
     runner_process::{self, LaunchSpec, ProviderEnvironment},
     store::{
-        DeliveryAttempt, DeliveryAttemptState, NewDeliveryAttempt, RecoverableSession, SessionRow,
-        StoreError,
+        DeliveryAttempt, DeliveryAttemptState, NewDeliveryAttempt, ProviderDeliveryRecovery,
+        RecoverableSession, SessionRow, StoreError,
     },
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PromptDeliveryAdmission {
+    Ignored,
+    Acknowledged,
+    Denied,
+}
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// How long a PTY delivery waits for a matching `UserPromptSubmit` hook.
@@ -1231,6 +1238,20 @@ async fn dispatch_agent(
             // dying session; end_session_now will wake the agent after the
             // durable successor can be spawned (and, for resumable
             // providers, resume the same provider thread).
+            if session.delivery_recovery_stop_requested_at_ms.is_some() {
+                let client = RunnerClient::new(
+                    &session.runner_runtime,
+                    session_run_id(&session.id)?,
+                    session.runner_instance_id.clone(),
+                );
+                if let Err(error) = client.stop(2_000).await {
+                    tracing::warn!(
+                        %error,
+                        session_id = %session.id,
+                        "durable delivery-recovery stop remains pending"
+                    );
+                }
+            }
             Ok(())
         }
         Some(session)
@@ -2163,15 +2184,15 @@ async fn commit_delivery(
                 delivery.prior_run_count,
             ) {
                 (Some(task_id), Some(task_incarnation_id), Some(prior_run_count)) => {
-                    match store.open_run_episode_with_message_ids(
+                    match store.open_run_episode_with_delivery_attempt(
                         &session_id,
                         &task_id,
                         Some(&delivery.message_ids),
+                        Some(&attempt_id),
                         now_ms,
                     ) {
                         Ok(opened) => {
                             let run_id = opened.run.id.clone();
-                            store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
                             Ok((Some(run_id), opened.events))
                         }
                         // The synchronous `UserPromptSubmit` hook commit can
@@ -2201,15 +2222,33 @@ async fn commit_delivery(
                     }
                 }
                 (None, None, None) => {
-                    store.deliver_agent_messages_by_ids(
+                    match store.deliver_agent_messages_by_ids_with_delivery_attempt(
                         &project_id,
                         &agent_id,
                         &session_id,
                         &delivery.message_ids,
+                        Some(&attempt_id),
                         now_ms,
-                    )?;
-                    store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
-                    Ok((None, Vec::new()))
+                    ) {
+                        Ok(_) => Ok((None, Vec::new())),
+                        // Recovery can cancel the attempt after the exact
+                        // prompt lookup but before this transaction. The
+                        // message delivery rolls back with its lost CAS; turn
+                        // that fence result into the same explicit hook denial
+                        // as the task-backed path.
+                        Err(StoreError::InvalidExecutionMetadata)
+                            if !matches!(
+                                store.delivery_attempt_state(&attempt_id)?,
+                                Some(
+                                    DeliveryAttemptState::InFlight
+                                        | DeliveryAttemptState::Retryable
+                                )
+                            ) =>
+                        {
+                            Ok((None, Vec::new()))
+                        }
+                        Err(error) => Err(error),
+                    }
                 }
                 _ => Err(StoreError::InvalidExecutionMetadata),
             }
@@ -2250,41 +2289,50 @@ async fn commit_delivery(
 /// idempotent commit once its own ack-wait notices (the
 /// `StoreError::AgentUnavailable` tolerance above).
 ///
-/// Gated on [`DaemonState::delivery_in_flight`]: *every* `UserPromptSubmit`
-/// reaches this function (an operator's own direct keystroke into an
-/// attached terminal fires the identical hook, indistinguishable from the
-/// dispatcher's own typed delivery from inside the hook payload alone), so
-/// composing and committing unconditionally would auto-attach whatever
-/// task happens to be next in this agent's queue to a turn that has
-/// nothing to do with it -- silently "delivering" a task nobody typed,
-/// permanently blocking its real delivery behind `runs_one_open_per_agent`
-/// with no way for the agent to ever complete it (it does not know the
-/// task exists). Only when the dispatcher's own `deliver_pending`/
-/// `Handle::start_task` is actively holding the slot -- meaning this
-/// prompt submission is at least plausibly the one they just typed -- is
-/// it safe to treat as that delivery's ack.
+/// Exact nonce-bearing prompt lookup is the admission authority. An
+/// operator's unrelated prompt has no matching durable attempt and is
+/// ignored; the broad agent filesystem-write gate must not sit in this
+/// path because contention there could otherwise let an exact provider
+/// prompt fail open before recovery commits.
 pub(crate) async fn commit_pending_delivery_on_prompt(
     state: &DaemonState,
     session: &SessionSnapshot,
     payload: &serde_json::Value,
-) -> Result<(), DaemonStateError> {
+) -> Result<PromptDeliveryAdmission, DaemonStateError> {
+    let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str) else {
+        return Ok(PromptDeliveryAdmission::Ignored);
+    };
     let Some(attempt) = state
         .with_store({
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
             let session_id = session.id.clone();
-            move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+            let prompt = prompt.to_owned();
+            move |store| {
+                store.delivery_attempt_for_prompt(&project_id, &agent_id, &session_id, &prompt)
+            }
         })
         .await?
     else {
-        return Ok(());
+        return Ok(PromptDeliveryAdmission::Ignored);
     };
+    admit_delivery_attempt(state, session, attempt).await
+}
+
+async fn admit_delivery_attempt(
+    state: &DaemonState,
+    session: &SessionSnapshot,
+    attempt: DeliveryAttempt,
+) -> Result<PromptDeliveryAdmission, DaemonStateError> {
     if !matches!(
         attempt.state,
         DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
-    ) || payload.get("prompt").and_then(serde_json::Value::as_str) != Some(attempt.text.as_str())
-    {
-        return Ok(());
+    ) {
+        return Ok(if attempt.state == DeliveryAttemptState::Acknowledged {
+            PromptDeliveryAdmission::Acknowledged
+        } else {
+            PromptDeliveryAdmission::Denied
+        });
     }
     let now =
         now_ms().map_err(|_| DaemonStateError::Store(StoreError::InvalidExecutionMetadata))?;
@@ -2298,7 +2346,20 @@ pub(crate) async fn commit_pending_delivery_on_prompt(
         now,
     )
     .await?;
-    Ok(())
+    let state_after = state
+        .with_store({
+            let attempt_id = attempt.id.clone();
+            move |store| store.delivery_attempt_state(&attempt_id)
+        })
+        .await?;
+    match state_after {
+        Some(DeliveryAttemptState::Acknowledged) => Ok(PromptDeliveryAdmission::Acknowledged),
+        // Recovery can win after the exact prompt lookup above but before
+        // `commit_delivery` acquires the serialized store. Its own durable
+        // state re-check then no-ops; this second read converts that precise
+        // ordering to an explicit provider block, never a hook failure.
+        _ => Ok(PromptDeliveryAdmission::Denied),
+    }
 }
 
 /// The passive per-agent auto-delivery path: compose, type, wait for
@@ -2423,6 +2484,71 @@ async fn deliver_pending(
         )
         .await?;
     } else {
+        // A resumed Codex TUI can consume the submit CR as recovery from its
+        // "Conversation interrupted" screen while discarding the composer.
+        // Its input state is not observable through the PTY, so a bare-CR
+        // retry is guesswork and replaying the body risks duplicate model
+        // work. Retire that poisoned provider thread instead: stop this
+        // runner, block this exact thread identity from future resume, and
+        // let the still-queued task deliver once into a fresh conversation.
+        let resumed_codex = if session.provider == Provider::Codex {
+            state
+                .with_store({
+                    let project_id = project_id.clone();
+                    let session_id = session.id.clone();
+                    move |store| store.session_resumed_provider_thread(&project_id, &session_id)
+                })
+                .await?
+        } else {
+            false
+        };
+        if resumed_codex {
+            let recovery_project_id = project_id.clone();
+            let recovery_session_id = session.id.clone();
+            let recovery_at_ms = now_ms()?;
+            let recovery = state
+                .commit_and_publish(move |store| {
+                    match store.request_fresh_provider_recovery(
+                        &recovery_project_id,
+                        &recovery_session_id,
+                        &attempt.id,
+                        recovery_at_ms,
+                    )? {
+                        (ProviderDeliveryRecovery::Acknowledged, _) => Ok((false, Vec::new())),
+                        (ProviderDeliveryRecovery::StopRequested, event) => {
+                            Ok((true, event.into_iter().collect()))
+                        }
+                    }
+                })
+                .await?;
+            if !recovery {
+                // The synchronous hook committed while the broadcast ack
+                // waiter was delayed or lagged. Its durable admission wins;
+                // never cancel or stop that accepted turn.
+                return Ok(());
+            }
+            if let Err(error) = client.stop(2_000).await {
+                tracing::error!(
+                    %error,
+                    %project_id,
+                    %agent_id,
+                    session_id = %session.id,
+                    "could not stop a Codex session whose resumed input state rejected delivery"
+                );
+                let failed_session_id = session.id.clone();
+                let failed_at_ms = now_ms()?;
+                let reason =
+                    "automatic delivery recovery could not stop the Codex runner".to_owned();
+                state
+                    .commit_and_publish(move |store| {
+                        let (_, event) =
+                            store.mark_session_waiting(&failed_session_id, reason, failed_at_ms)?;
+                        Ok(((), vec![event]))
+                    })
+                    .await?;
+            }
+            return Ok(());
+        }
         let attempt_id = attempt.id.clone();
         let failure = state
             .commit_and_publish(move |store| {
@@ -2567,7 +2693,7 @@ async fn wait_for_ack(
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return delivery_attempt_acknowledged(state, attempt_id).await;
         }
         match timeout(remaining, events.recv()).await {
             Ok(Ok(envelope)) => {
@@ -2589,10 +2715,26 @@ async fn wait_for_ack(
                     }
                 }
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
-            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => return false,
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                if delivery_attempt_acknowledged(state, attempt_id).await {
+                    return true;
+                }
+            }
+            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                return delivery_attempt_acknowledged(state, attempt_id).await;
+            }
         }
     }
+}
+
+async fn delivery_attempt_acknowledged(state: &DaemonState, attempt_id: &str) -> bool {
+    state
+        .with_store({
+            let attempt_id = attempt_id.to_owned();
+            move |store| store.delivery_attempt_state(&attempt_id)
+        })
+        .await
+        .is_ok_and(|state| state == Some(DeliveryAttemptState::Acknowledged))
 }
 
 /// Composes the `Stop`/`SubagentStop` hook reply for a session that is
@@ -2902,7 +3044,27 @@ async fn supervise_recovered(
                 continue;
             }
         };
-        match consume_until_exit(
+        let stop_replay_failed = if recovered.delivery_recovery_stop_requested {
+            // Recovery intent was committed before the runner command. A
+            // daemon crash or a transient control failure in that window
+            // must replay this idempotent stop after reconnect, before the
+            // dispatcher may ever consider a successor conversation.
+            if let Err(error) = client.stop(2_000).await {
+                attempt += 1;
+                tracing::warn!(
+                    %error,
+                    session_id = %recovered.session_id,
+                    attempt,
+                    "could not replay durable delivery-recovery stop"
+                );
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let consume = consume_until_exit(
             &state,
             &wake_tx,
             &recovered.session_id,
@@ -2910,9 +3072,23 @@ async fn supervise_recovered(
             &client,
             subscription,
             &mut shutdown_rx,
-        )
-        .await
-        {
+        );
+        // A stop command can lose a race with the runner's actual exit and
+        // return Conflict even though the subscribed stream already contains
+        // the authoritative terminal event. Give that event priority; only
+        // reconnect/retry when no exit arrives within the retry bound.
+        let outcome = if stop_replay_failed {
+            match timeout(retry_delay, consume).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    retry_delay = next_retry_delay(retry_delay);
+                    continue;
+                }
+            }
+        } else {
+            consume.await
+        };
+        match outcome {
             ExitOutcome::Exited {
                 exit_code,
                 exit_signal,
@@ -3189,10 +3365,197 @@ fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Erro
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use factory_core::TaskId;
+    use factory_core::{MessageId, TaskId};
 
     use super::*;
-    use crate::store::Store;
+    use crate::store::{NewAgentMessage, Store};
+
+    struct RecoveryStopFixture {
+        _directory: tempfile::TempDir,
+        state: DaemonState,
+        recovered: RecoverableSession,
+        runner: factory_runner::Config,
+        stale_in_flight_attempt: DeliveryAttempt,
+    }
+
+    enum RecoveryFixtureDelivery {
+        Task,
+        Message,
+    }
+
+    fn recovery_stop_fixture() -> RecoveryStopFixture {
+        recovery_stop_fixture_with(RecoveryFixtureDelivery::Task)
+    }
+
+    fn message_recovery_stop_fixture() -> RecoveryStopFixture {
+        recovery_stop_fixture_with(RecoveryFixtureDelivery::Message)
+    }
+
+    fn recovery_stop_fixture_with(delivery: RecoveryFixtureDelivery) -> RecoveryStopFixture {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: directory.path().to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let initial = crate::store::NewSession {
+            id: SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            provider: Provider::Codex,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            provider_session_id: Some(thread.into()),
+            worktree: directory.path().to_string_lossy().into_owned(),
+            codex_home: None,
+            hook_token: "b".repeat(64),
+            runner_instance_id: RunnerInstanceId::try_from("44444444-4444-4444-8444-444444444444")
+                .unwrap(),
+            runner_runtime: directory.path().join("old").to_string_lossy().into_owned(),
+            runner_protocol_version: 1,
+        };
+        let (initial, _) = store.create_session(initial, 3).unwrap();
+        store.end_session(&initial.id, Some(0), None, 4).unwrap();
+        let runtime_dir = directory.path().join("runner");
+        let (resumed, _) = store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Codex,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: Some(thread.into()),
+                    worktree: directory.path().to_string_lossy().into_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: instance_id.clone(),
+                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
+                    runner_protocol_version: 1,
+                },
+                5,
+            )
+            .unwrap();
+        let (task_id, task_incarnation_id, prior_run_count, message_ids) = match delivery {
+            RecoveryFixtureDelivery::Task => {
+                let task_id = TaskId::try_from("recovery-task").unwrap();
+                store
+                    .create_task(
+                        crate::store::NewTask {
+                            id: task_id.clone(),
+                            project_id: project_id.clone(),
+                            parent_task_id: None,
+                            title: "Recover".into(),
+                            body: String::new(),
+                            priority: 0,
+                        },
+                        6,
+                    )
+                    .unwrap();
+                store
+                    .assign_task(&project_id, &task_id, Some(&agent_id), 6)
+                    .unwrap();
+                let (incarnation, count) =
+                    store.task_delivery_marker(&resumed.id, &task_id).unwrap();
+                (Some(task_id), Some(incarnation), Some(count), Vec::new())
+            }
+            RecoveryFixtureDelivery::Message => {
+                let message_id = MessageId::try_from("recovery-message").unwrap();
+                store
+                    .send_agent_message(NewAgentMessage {
+                        id: message_id.clone(),
+                        project_id: project_id.clone(),
+                        sender_agent_id: None,
+                        recipient_agent_id: agent_id.clone(),
+                        body: "recover me".into(),
+                        created_at_ms: 6,
+                    })
+                    .unwrap();
+                (None, None, None, vec![message_id])
+            }
+        };
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "recovery-attempt".into(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: resumed.id.clone(),
+                task_id,
+                task_incarnation_id,
+                prior_run_count,
+                message_ids,
+                text: "recover me".into(),
+                created_at_ms: 6,
+            })
+            .unwrap();
+        let stale_in_flight_attempt = store
+            .delivery_attempt_for_prompt(&project_id, &agent_id, &resumed.id, "recover me")
+            .unwrap()
+            .unwrap();
+        store
+            .request_fresh_provider_recovery(&project_id, &resumed.id, "recovery-attempt", 7)
+            .unwrap();
+        let recovered = store.recoverable_sessions().unwrap().remove(0);
+        let runner = factory_runner::Config {
+            run_id: session_run_id(&session_id).unwrap(),
+            runner_instance_id: instance_id,
+            runtime_dir,
+            cwd: directory.path().to_path_buf(),
+            startup_input: None,
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".into(), "while :; do sleep 1; done".into()],
+            terminal: None,
+        };
+        RecoveryStopFixture {
+            _directory: directory,
+            state: DaemonState::new(store),
+            recovered,
+            runner,
+            stale_in_flight_attempt,
+        }
+    }
+
+    async fn start_test_runner(config: factory_runner::Config) -> JoinHandle<()> {
+        let socket = config.runtime_dir.join("control.sock");
+        let runner = tokio::spawn(async move { factory_runner::run(config).await.unwrap() });
+        timeout(Duration::from_secs(2), async {
+            while !socket.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runner
+    }
 
     fn private_tempdir() -> tempfile::TempDir {
         let directory = tempfile::tempdir_in("/tmp").unwrap();
@@ -4256,6 +4619,7 @@ mod tests {
             runner_runtime: runtime_dir.to_string_lossy().into_owned(),
             runner_protocol_version: 1,
             observer_health: factory_core::ObserverHealth::Unknown,
+            delivery_recovery_stop_requested: false,
         };
 
         supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
@@ -4270,6 +4634,197 @@ mod tests {
             .expect("the recovered session must still exist");
         assert_eq!(session.state, SessionState::Failed);
         assert!(!session.state.is_live());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_replays_a_recovery_stop_committed_before_the_runner_command() {
+        let fixture = recovery_stop_fixture();
+        let runner = start_test_runner(fixture.runner).await;
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        supervise_recovered(
+            fixture.state.clone(),
+            wake_tx,
+            fixture.recovered,
+            shutdown_rx,
+            1,
+        )
+        .await;
+        timeout(Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        let session = fixture
+            .state
+            .with_store(|store| store.recoverable_sessions())
+            .await
+            .unwrap();
+        assert!(
+            session.is_empty(),
+            "replayed stop must reach durable runner exit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_retries_a_recovery_stop_after_the_first_control_call_failed() {
+        let fixture = recovery_stop_fixture();
+        let client = RunnerClient::new(
+            &fixture.recovered.runner_runtime,
+            session_run_id(&fixture.recovered.session_id).unwrap(),
+            fixture.recovered.runner_instance_id.clone(),
+        );
+        assert!(
+            client.stop(2_000).await.is_err(),
+            "the pre-restart control call intentionally runs before the runner socket exists"
+        );
+
+        let runner = start_test_runner(fixture.runner).await;
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        supervise_recovered(
+            fixture.state.clone(),
+            wake_tx,
+            fixture.recovered,
+            shutdown_rx,
+            1,
+        )
+        .await;
+        timeout(Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .with_store(|store| store.recoverable_sessions())
+                .await
+                .unwrap()
+                .is_empty(),
+            "durable intent must survive the failed call and be replayed after restart"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_exit_wins_when_the_replayed_stop_is_already_too_late() {
+        let mut fixture = recovery_stop_fixture();
+        fixture.runner.arguments = vec!["-c".into(), "exit 0".into()];
+        let runner = start_test_runner(fixture.runner).await;
+        // Let the provider exit before recovery supervision reconnects. The
+        // runner retains the terminal event until the new daemon acknowledges
+        // it, while a concurrent Stop may legitimately return Conflict.
+        tokio::task::yield_now().await;
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        supervise_recovered(
+            fixture.state.clone(),
+            wake_tx,
+            fixture.recovered,
+            shutdown_rx,
+            1,
+        )
+        .await;
+        timeout(Duration::from_secs(2), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            fixture
+                .state
+                .with_store(|store| store.recoverable_sessions())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the retained terminal event must complete recovery despite Stop conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_exact_prompt_hook_is_denied_after_recovery_wins() {
+        let fixture = recovery_stop_fixture();
+        let session = fixture
+            .state
+            .with_store({
+                let session_id = fixture.recovered.session_id.clone();
+                move |store| {
+                    store.session_snapshot(&ProjectId::try_from("factory").unwrap(), &session_id)
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admit_delivery_attempt(&fixture.state, &session, fixture.stale_in_flight_attempt,)
+                .await
+                .unwrap(),
+            PromptDeliveryAdmission::Denied,
+            "a delayed UserPromptSubmit must be blocked before model/tool execution"
+        );
+        let (task, runs) = fixture
+            .state
+            .with_store(|store| {
+                Ok((
+                    store.get_task(
+                        &ProjectId::try_from("factory").unwrap(),
+                        &TaskId::try_from("recovery-task").unwrap(),
+                    )?,
+                    store.list_runs(&ProjectId::try_from("factory").unwrap(), None, 10)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Queued);
+        assert!(
+            runs.is_empty(),
+            "the denied old turn must open no duplicate run"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_message_only_prompt_hook_is_denied_without_delivering_the_inbox() {
+        let fixture = message_recovery_stop_fixture();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = fixture.recovered.session_id.clone();
+        let session = fixture
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let session_id = session_id.clone();
+                move |store| store.session_snapshot(&project_id, &session_id)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            admit_delivery_attempt(&fixture.state, &session, fixture.stale_in_flight_attempt,)
+                .await
+                .unwrap(),
+            PromptDeliveryAdmission::Denied,
+            "the lost message-attempt CAS must become an explicit provider denial"
+        );
+        let (pending, attempt, runs) = fixture
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                move |store| {
+                    Ok((
+                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
+                        store.delivery_attempt_state("recovery-attempt")?,
+                        store.list_runs(&project_id, None, 10)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "the fresh conversation must retain the message"
+        );
+        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
+        assert!(runs.is_empty(), "a message-only denial must not open a run");
     }
 
     /// Issue #85 and PR #90 review: only a run created after candidate
@@ -4466,6 +5021,19 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result, None);
+        let mut delayed_events = state.subscribe();
+        assert!(
+            wait_for_ack(
+                &state,
+                &mut delayed_events,
+                &session_id,
+                &race_attempt.id,
+                0,
+                Duration::from_millis(1),
+            )
+            .await,
+            "durable acknowledgement must win even when its broadcast is delayed or lost"
+        );
         let events = state
             .with_store(move |store| store.events_after(0, 100))
             .await

@@ -5,7 +5,8 @@ use factory_core::{
     RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
 use factoryd::store::{
-    NewAgent, NewAgentMessage, NewProject, NewSession, NewTask, Store, StoreError,
+    DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession,
+    NewTask, ProviderDeliveryRecovery, Store, StoreError,
 };
 
 fn project_id(value: &str) -> ProjectId {
@@ -124,12 +125,94 @@ fn fixture() -> Store {
     store
 }
 
+#[test]
+fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
+    let mut store = fixture();
+    let thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+    let mut initial = new_session("ack-initial", "factory", "curie");
+    initial.provider_session_id = Some(thread.into());
+    let (initial, _) = store.create_session(initial, 5).unwrap();
+    store.end_session(&initial.id, Some(0), None, 6).unwrap();
+    let mut resumed = new_session("ack-resumed", "factory", "curie");
+    resumed.provider_session_id = Some(thread.into());
+    let (resumed, _) = store.create_session(resumed, 7).unwrap();
+    let task = task_id("ack-task");
+    store
+        .create_task(
+            NewTask {
+                id: task.clone(),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Ack first".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            8,
+        )
+        .unwrap();
+    store
+        .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 8)
+        .unwrap();
+    let (incarnation, count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    store
+        .ensure_delivery_attempt(NewDeliveryAttempt {
+            id: "ack-attempt".into(),
+            project_id: project_id("factory"),
+            agent_id: agent_id("curie"),
+            session_id: resumed.id.clone(),
+            task_id: Some(task.clone()),
+            task_incarnation_id: Some(incarnation),
+            prior_run_count: Some(count),
+            message_ids: Vec::new(),
+            text: "accepted prompt".into(),
+            created_at_ms: 8,
+        })
+        .unwrap();
+    store
+        .open_run_episode_with_delivery_attempt(
+            &resumed.id,
+            &task,
+            Some(&[]),
+            Some("ack-attempt"),
+            9,
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store
+            .request_fresh_provider_recovery(
+                &project_id("factory"),
+                &resumed.id,
+                "ack-attempt",
+                10,
+            )
+            .unwrap(),
+        (ProviderDeliveryRecovery::Acknowledged, None)
+    ));
+    let live = store
+        .live_session_for_agent(&project_id("factory"), &agent_id("curie"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.stop_requested_at_ms, None);
+    assert_eq!(live.delivery_recovery_stop_requested_at_ms, None);
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task)
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Running,
+        "recovery must not cancel an admitted prompt or its run"
+    );
+}
+
 // --- Migration -------------------------------------------------------
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 24 after the
-/// connector-event migration, runtime metadata, and legacy permission repair
+/// which always migrates to the current `SCHEMA_VERSION`, 25 after the
+/// connector-event, runtime metadata, legacy permission repair, durable
+/// delivery-attempt, and provider-resume recovery migrations
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -222,14 +305,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0024.
+    // Opening through the real store runs migrations 0014 through 0025.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -282,7 +365,10 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE delivery_attempts;
+                "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
+                 ALTER TABLE sessions DROP COLUMN resumed_provider_session;
+                 ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+                 DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
@@ -297,7 +383,7 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -390,14 +476,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0024 migrations.
+    // Opening through the real store runs the 0015 through 0025 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 24);
+    assert_eq!(version, 25);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -543,6 +629,115 @@ fn set_provider_session_id_is_a_no_op_once_already_set() {
     assert_eq!(
         stored.as_deref(),
         Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d")
+    );
+}
+
+#[test]
+fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() {
+    let mut store = fixture();
+    let old_thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
+    let new_thread = "f31a566f-544b-46f0-bd03-9c9ec3231c90";
+    let mut initial = new_session("initial", "factory", "curie");
+    initial.provider_session_id = Some(old_thread.to_owned());
+    let (initial, _) = store.create_session(initial, 5).unwrap();
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &initial.id)
+            .unwrap()
+    );
+    store.end_session(&initial.id, Some(0), None, 6).unwrap();
+
+    let mut resumed = new_session("resumed", "factory", "curie");
+    resumed.provider_session_id = Some(old_thread.to_owned());
+    let (resumed, _) = store.create_session(resumed, 7).unwrap();
+    assert!(
+        store
+            .session_resumed_provider_thread(&project_id("factory"), &resumed.id)
+            .unwrap()
+    );
+
+    let task = task_id("recovery-task");
+    store
+        .create_task(
+            NewTask {
+                id: task.clone(),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Recover delivery".into(),
+                body: String::new(),
+                priority: 0,
+            },
+            7,
+        )
+        .unwrap();
+    store
+        .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 7)
+        .unwrap();
+    let (incarnation, prior_run_count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    store
+        .ensure_delivery_attempt(NewDeliveryAttempt {
+            id: "recovery-attempt".into(),
+            project_id: project_id("factory"),
+            agent_id: agent_id("curie"),
+            session_id: resumed.id.clone(),
+            task_id: Some(task),
+            task_incarnation_id: Some(incarnation),
+            prior_run_count: Some(prior_run_count),
+            message_ids: Vec::new(),
+            text: "recover me".into(),
+            created_at_ms: 7,
+        })
+        .unwrap();
+
+    store
+        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, "recovery-attempt", 8)
+        .unwrap();
+    assert_eq!(
+        store.delivery_attempt_state("recovery-attempt").unwrap(),
+        Some(DeliveryAttemptState::Cancelled),
+        "recovery must durably fence a late exact prompt hook"
+    );
+    let recoverable = store.recoverable_sessions().unwrap();
+    assert!(
+        recoverable
+            .iter()
+            .any(|session| session.session_id == resumed.id
+                && session.delivery_recovery_stop_requested),
+        "a crash before runner control must leave replayable stop work"
+    );
+    assert_eq!(
+        store
+            .last_provider_session_id(&project_id("factory"), &agent_id("curie"))
+            .unwrap(),
+        None,
+        "the poisoned provider thread must not be selected again"
+    );
+
+    store.end_session(&resumed.id, Some(0), None, 9).unwrap();
+    let (fresh, _) = store
+        .create_session(new_session("fresh", "factory", "curie"), 10)
+        .unwrap();
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &fresh.id)
+            .unwrap()
+    );
+    store
+        .set_provider_session_id(&fresh.id, new_thread, 11)
+        .unwrap()
+        .expect("fresh Codex session confirms a new thread");
+    assert!(
+        !store
+            .session_resumed_provider_thread(&project_id("factory"), &fresh.id)
+            .unwrap(),
+        "SessionStart identity assignment must not rewrite launch provenance"
+    );
+    assert_eq!(
+        store
+            .last_provider_session_id(&project_id("factory"), &agent_id("curie"))
+            .unwrap()
+            .as_deref(),
+        Some(new_thread)
     );
 }
 
