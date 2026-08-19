@@ -1,4 +1,4 @@
-CREATE TABLE managed_changes (
+CREATE TABLE IF NOT EXISTS managed_changes (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id),
     project_id TEXT NOT NULL REFERENCES projects(id),
     agent_id TEXT NOT NULL REFERENCES agents(id),
@@ -21,5 +21,5 @@ CREATE TABLE managed_changes (
     UNIQUE(project_id, branch)
 ) STRICT;
 
-CREATE UNIQUE INDEX managed_changes_one_active_agent
+CREATE UNIQUE INDEX IF NOT EXISTS managed_changes_one_active_agent
     ON managed_changes(project_id, agent_id) WHERE state IN ('active', 'removing');

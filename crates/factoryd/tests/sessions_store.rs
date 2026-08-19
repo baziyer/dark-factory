@@ -210,7 +210,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 28 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 30 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, provider resume recovery, observer
 /// reason, typed notification cause, and the widened Claude notification
@@ -307,7 +307,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0028.
+    // Opening through the real store runs migrations 0014 through 0030.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
@@ -472,7 +472,8 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
     }
 
     // Round-3's schema is v27. Lowering the version on this populated v27
-    // shape forces the real 0028 rebuild; the child rows make an FK-on DROP
+    // shape forces the real 0028 rebuild, followed by the managed-change
+    // migrations; the child rows make an FK-on DROP
     // fail with SQLite 787, so this fixture specifically guards the
     // foreign_keys-off/rebuild/foreign_keys-on discipline.
     {
@@ -484,7 +485,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 30);
     let message_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
@@ -597,7 +598,7 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0028 migrations.
+    // Opening through the real store runs the 0015 through 0030 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
