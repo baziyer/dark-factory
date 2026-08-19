@@ -924,7 +924,7 @@ fn delayed_refusal_from_old_runner_generation_is_ignored() {
         },
     });
     assert!(b.attention_items().is_empty());
-    assert!(b.note_attach_refusal(&old_refusal) == false);
+    assert!(!b.note_attach_refusal(&old_refusal));
     assert!(b.take_attach_retry(&session_id));
 }
 
