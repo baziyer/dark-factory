@@ -68,7 +68,10 @@ catalogue.
    attempt nonce that the acknowledgement must echo, binding the hook to the
    immutable attempt even when task ids are deleted and recreated. Retry state is durable: a daemon
    restart consumes an interrupted in-flight attempt, and only an explicit
-   operator resume resets a terminal attempt. The hook must match that
+   operator resume resets a terminal attempt. Recovery submits a bare CR to
+   the existing provider buffer and waits the normal acknowledgement bound;
+   it never retypes a body whose submission may already have been accepted.
+   The hook must match that
    stored prompt exactly before acknowledging it, so a stale hook cannot
    recompose a newer queue head. A single pending-delivery slot per agent
    keeps the dispatcher's PTY-typed path and a hook-reply delivery from ever

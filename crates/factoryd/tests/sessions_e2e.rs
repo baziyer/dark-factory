@@ -1220,6 +1220,10 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
         Some(FAKE_CODEX_THREAD_ID)
     );
 
+    // Delay only the resumed provider's prompt hook. The recovery CR is
+    // accepted immediately, but its acknowledgement arrives three seconds
+    // later; a retry that retypes the body would submit the same nonce twice.
+    std::fs::write(fake_bin.join("delay-user-prompt-submit"), b"3").unwrap();
     let stopped = client
         .request(LocalRequest::StopSession {
             project_id: project_id(),
