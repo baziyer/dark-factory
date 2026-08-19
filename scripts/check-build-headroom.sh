@@ -7,7 +7,11 @@ set -eu
 minimum_free_bytes=12884901888 # 12 GiB
 
 repository_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
-configured_target=${CARGO_TARGET_DIR:-target}
+if [ "${CARGO_TARGET_DIR+x}" = x ]; then
+    configured_target=$CARGO_TARGET_DIR
+else
+    configured_target=target
+fi
 
 fail() {
     echo "build headroom preflight: $*" >&2

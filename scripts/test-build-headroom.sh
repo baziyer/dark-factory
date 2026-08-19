@@ -18,12 +18,14 @@ mkdir -p "$fake_bin" "$target"
 cat >"$fake_bin/df" <<'EOF'
 #!/bin/sh
 test "$1" = -Pk
+[ -z "${DF_FAKE_MEASUREMENT_MARKER-}" ] || : >"$DF_FAKE_MEASUREMENT_MARKER"
 printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on'
 printf 'fixture 20000000 1 %s 1%% /fixture\n' "$DF_FAKE_FREE_KIB"
 EOF
 cat >"$fake_bin/du" <<'EOF'
 #!/bin/sh
 test "$1" = -sk
+[ -z "${DF_FAKE_MEASUREMENT_MARKER-}" ] || : >"$DF_FAKE_MEASUREMENT_MARKER"
 printf '%s\t%s\n' "$DF_FAKE_TARGET_KIB" "$2"
 EOF
 chmod +x "$fake_bin/df" "$fake_bin/du"
@@ -71,6 +73,24 @@ grep -F 'no files were changed' "$fail_output" >/dev/null \
     || fail "failure output did not state its read-only contract"
 grep -F 'Result: <code>failure</code>' "$fail_summary" >/dev/null \
     || fail "failure summary omitted its result"
+
+# An explicitly empty target is invalid to Cargo and must not be mistaken for
+# the unset/default target. Refuse before either measurement command runs.
+empty_output=$temporary/empty.output
+empty_measurement=$temporary/empty.measurement
+if PATH="$fake_bin:$PATH" \
+    DF_FAKE_MEASUREMENT_MARKER=$empty_measurement \
+    CARGO_TARGET_DIR= \
+    "$preflight" >"$empty_output" 2>&1; then
+    fail "an explicitly empty Cargo target passed"
+fi
+grep -F 'CARGO_TARGET_DIR must not be empty' "$empty_output" >/dev/null \
+    || fail "an empty Cargo target lacked its fail-closed reason"
+[ ! -e "$empty_measurement" ] \
+    || fail "an empty Cargo target invoked df or du"
+if grep -F "target=$repository_root/target" "$empty_output" >/dev/null; then
+    fail "an empty Cargo target measured the repository default"
+fi
 
 # Malformed platform output fails closed rather than accidentally treating an
 # unavailable measurement as zero or enough space.
