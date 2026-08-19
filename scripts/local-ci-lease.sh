@@ -44,6 +44,7 @@ local_ci_lease_identifier() {
     local_ci_lease_identifier_value=$1
     case "$local_ci_lease_identifier_value" in
         '') printf '\n' ;;
+        ghp_*|github_pat_*|xox[baprs]-*|sk-*) printf '<redacted>\n' ;;
         *[!A-Za-z0-9_-]*) printf '<redacted>\n' ;;
         *)
             [ "${#local_ci_lease_identifier_value}" -le "$LOCAL_CI_LEASE_MAX_IDENTIFIER_BYTES" ] \

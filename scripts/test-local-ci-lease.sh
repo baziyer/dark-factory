@@ -133,15 +133,15 @@ grep -Fq "head=$head" "$waiter_stderr" || fail "owner head was not reported"
 ! grep -Fq SECRET "$waiter_stderr" || fail "hostile owner labels leaked"
 
 # Identifier punctuation is not an owner-record escape hatch.
-start_holder "$first" "$temporary/invalid-id-held" 2 'agent:token' 'task:token'
+start_holder "$first" "$temporary/invalid-id-held" 2 'ghp_secret' 'agent:token'
 wait_for_file "$temporary/invalid-id-held"
 invalid_id_stderr="$temporary/invalid-id.stderr"
 if (cd "$second" && DARK_FACTORY_LOCAL_CI_WAIT=0 ./scripts/with-local-ci-lease.sh true) \
     2>"$invalid_id_stderr"; then
     fail "invalid owner identifiers unexpectedly acquired"
 fi
-! grep -Fq 'agent:token' "$invalid_id_stderr" || fail "invalid agent identifier leaked"
-! grep -Fq 'task:token' "$invalid_id_stderr" || fail "invalid task identifier leaked"
+! grep -Fq 'ghp_secret' "$invalid_id_stderr" || fail "secret-looking agent identifier leaked"
+! grep -Fq 'agent:token' "$invalid_id_stderr" || fail "invalid task identifier leaked"
 wait "$last_holder_pid"
 
 # A diagnostic record must be a regular file, never a symlink to arbitrary
