@@ -33,9 +33,12 @@ catalogue.
    provider's only way to reach `factoryctl` and identify itself), and
    creates a private socket and
    bounded, retained `terminal.log` before spawning one process group under
-   the PTY. The runner does not publish its terminal `Exited` event until
-   that owned group is empty, including after hard-stop escalation, so the
-   session remains the durable owner until provider tools are gone. A
+   the PTY. The runner creates an in-session witness and inherited cleanup
+   lease; it does not publish terminal `Exited` until the witness, lease, and
+   owned group all reach their final gone/free state. An unprovable
+   reparented or `setsid` descendant fails closed instead of being treated as
+   gone, so the session remains the durable owner until provider tools are
+   verified gone. A
    `starting` session row exists before the spawn is even
    attempted, so a failure is always durably visible (`session list`/the
    TUI, an announcement, the error as `wait_reason`); a persistently broken
@@ -297,8 +300,12 @@ clear that state. Recovery never terminalizes or makes the agent deletable
 from that state. An operator must inspect the private runtime and explicitly
 run `factoryctl session resolve-cleanup` (or the matching TUI remediation),
 which records `verified` and closes the session transactionally. The runner
-uses a private process-group witness where the PTY implementation permits it;
-permission errors and unprovable ownership fail closed.
+uses an in-session process-group witness plus an inherited private lease for
+PTY runs; cleanup is event-driven during supervision and has no global
+`/bin/ps` polling hot path. The daemon's resolution check requires the
+recorded leader/group to be absent and the lease to be exclusively acquirable;
+permission errors, reused identities, held leases, and unprovable ownership
+fail closed.
 
 ## Deliberately unresolved
 

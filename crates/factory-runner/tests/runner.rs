@@ -204,6 +204,9 @@ fn runner_command(
 
 impl Drop for RunningRunner {
     fn drop(&mut self) {
+        // Teardown is scoped to this fixture's private runtime; never turn a
+        // test failure into a process-name or host-wide cleanup sweep.
+        assert!(self.runtime.starts_with(self._directory.path()));
         let started_pid = fs::read_to_string(self.spool()).ok().and_then(|spool| {
             let mut started_pid = None;
             for line in spool.lines() {

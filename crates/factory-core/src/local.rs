@@ -361,8 +361,7 @@ pub enum LocalRequest {
         limit: Option<usize>,
     },
     /// Kills a session's PTY-backed provider process group (graceful, like
-    /// `StopRun`) and completes only after the runner confirms terminal
-    /// cleanup; any open run closes with `closed_by = operator_stop`.
+    /// `StopRun`); any open run closes with `closed_by = operator_stop`.
     StopSession {
         project_id: ProjectId,
         session_id: SessionId,

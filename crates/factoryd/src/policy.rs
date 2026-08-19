@@ -30,6 +30,8 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
+    } else if resolves_cleanup(commands.as_deref().unwrap_or_default()) {
+        Some("cleanup_resolution_operator_only")
     } else if changes_capacity(commands.as_deref().unwrap_or_default()) {
         Some("capacity_operator_only")
     } else if changes_repository_authority(commands.as_deref().unwrap_or_default()) {
@@ -49,6 +51,18 @@ pub fn decide(payload: &Value, worktree: &Path) -> Decision {
         tool_name: tool_name.to_owned(),
         denied_by,
     }
+}
+
+fn resolves_cleanup(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        let Some((program, args)) = resolve_command(words) else {
+            return false;
+        };
+        program == "factoryctl"
+            && args
+                .windows(2)
+                .any(|words| words == ["session", "resolve-cleanup"])
+    })
 }
 
 fn changes_capacity(commands: &[Vec<ShellWord>]) -> bool {
@@ -718,6 +732,27 @@ mod tests {
         }
         assert_eq!(
             decide(&bash("factoryctl capacity status"), root).denied_by,
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_resolution_is_denied_to_provider_shells() {
+        let root = Path::new("/tmp/worktree");
+        for command in [
+            "factoryctl session resolve-cleanup --project factory --session s",
+            "env FOO=1 factoryctl session resolve-cleanup --project factory --session s",
+            "command factoryctl session resolve-cleanup --project factory --session s",
+            "exec factoryctl session resolve-cleanup --project factory --session s",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("cleanup_resolution_operator_only"),
+                "{command}"
+            );
+        }
+        assert_eq!(
+            decide(&bash("factoryctl session list --project factory"), root).denied_by,
             None
         );
     }

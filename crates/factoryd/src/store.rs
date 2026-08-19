@@ -8,6 +8,7 @@ use factory_core::{
     TaskSnapshot, TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
+    model_policy,
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -17,16 +18,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
-/// its agents' statuses, its unassigned queue, and its blocked tasks (see
+/// its agents' statuses, its project backlog, and its blocked tasks (see
 /// [`Store::fleet_status`]).
 pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
-    pub unassigned: Vec<TaskSnapshot>,
+    pub backlog: Vec<TaskSnapshot>,
     pub blocked: Vec<TaskSnapshot>,
 }
 
-const SCHEMA_VERSION: i64 = 23;
+const SCHEMA_VERSION: i64 = 24;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -98,6 +99,8 @@ pub struct NewAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
     pub updated_at_ms: i64,
 }
@@ -109,6 +112,8 @@ pub struct AgentDetail {
 
 pub struct UpdateAgentProfile {
     pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
 }
 
@@ -460,10 +465,18 @@ pub enum StoreError {
     RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
+    #[error("task page cursor is stale; restart the listing")]
+    StaleTaskCursor,
+    #[error("task page cursor requires its queue revision")]
+    MissingTaskCursorRevision,
+    #[error("task page revision requires its cursor")]
+    UnexpectedTaskCursorRevision,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
+    #[error("agent model policy rejected the profile: {0}")]
+    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
     UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
@@ -618,6 +631,7 @@ impl Store {
                         body,
                         priority,
                     },
+                    None,
                     now_ms,
                 )?;
                 ("task", id.to_string(), Some(event))
@@ -797,10 +811,28 @@ impl Store {
         input: NewTask,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
+        self.create_task_with_assignment(input, None, now_ms)
+    }
+
+    pub fn create_assigned_task(
+        &mut self,
+        input: NewTask,
+        agent_id: AgentId,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        self.create_task_with_assignment(input, Some(agent_id), now_ms)
+    }
+
+    pub fn create_task_with_assignment(
+        &mut self,
+        input: NewTask,
+        assigned_agent_id: Option<AgentId>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (record, event) = insert_task(&transaction, input, now_ms)?;
+        let (record, event) = insert_task(&transaction, input, assigned_agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
 
@@ -820,7 +852,7 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.insert_agent(input, None, now_ms)
+        self.insert_agent(input, None, None, None, now_ms)
     }
 
     pub fn create_agent_with_model(
@@ -829,14 +861,43 @@ impl Store {
         model: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
+        self.create_agent_with_profile(input, model, None, None, now_ms)
+    }
+
+    pub fn create_agent_with_profile(
+        &mut self,
+        input: NewAgent,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(AgentSnapshot, EventEnvelope)> {
         validate_agent_model(model.as_deref())?;
-        self.insert_agent(input, model, now_ms)
+        let selection = model_policy::normalize_profile(
+            input.provider,
+            input.role,
+            model_policy::ModelSelection {
+                model,
+                reasoning_effort,
+                reason: model_selection_reason,
+            },
+            true,
+        )?;
+        self.insert_agent(
+            input,
+            selection.model,
+            selection.reasoning_effort,
+            selection.reason,
+            now_ms,
+        )
     }
 
     fn insert_agent(
         &mut self,
         input: NewAgent,
         model: Option<String>,
+        reasoning_effort: Option<String>,
+        model_selection_reason: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         let agent = AgentSnapshot {
@@ -873,9 +934,16 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, updated_at_ms)
-             VALUES (?1, ?2, ?3)",
-            params![agent.id.as_str(), model, agent.updated_at_ms],
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                agent.id.as_str(),
+                model,
+                reasoning_effort,
+                model_selection_reason,
+                agent.updated_at_ms
+            ],
         )?;
         transaction.execute(
             "INSERT INTO agent_budgets (agent_id, max_tool_calls, reset_at_ms, updated_at_ms)
@@ -1147,9 +1215,8 @@ impl Store {
         ))
     }
 
-    /// The oldest queued task assigned to `agent_id`, in delivery order
-    /// (`created_at_ms, id`), or `None` when the agent is paused or has no
-    /// queued work.
+    /// The next queued task assigned to `agent_id`, in the canonical active
+    /// queue order, or `None` when the agent is paused or has no queued work.
     pub fn next_deliverable(
         &self,
         project_id: &ProjectId,
@@ -1163,7 +1230,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM tasks
                  WHERE project_id = ?1 AND assigned_agent_id = ?2 AND status = 'queued'
-                 ORDER BY created_at_ms, id
+                 ORDER BY priority DESC, created_at_ms, id
                  LIMIT 1",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get(0),
@@ -1868,6 +1935,17 @@ impl Store {
         )))
     }
 
+    pub fn get_session(
+        &self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+    ) -> Result<SessionSnapshot> {
+        let session = load_session(&self.connection, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .ok_or(StoreError::SessionNotFound)?;
+        Ok(session.snapshot())
+    }
+
     pub fn list_sessions(
         &self,
         project_id: &ProjectId,
@@ -1901,17 +1979,6 @@ impl Store {
                     .ok_or(StoreError::SessionNotFound)
             })
             .collect()
-    }
-
-    pub fn get_session(
-        &self,
-        project_id: &ProjectId,
-        session_id: &SessionId,
-    ) -> Result<SessionSnapshot> {
-        load_session(&self.connection, session_id)?
-            .filter(|session| session.project_id == *project_id)
-            .map(|session| session.snapshot())
-            .ok_or(StoreError::SessionNotFound)
     }
 
     /// The agent's current live session, if any.
@@ -3036,22 +3103,111 @@ impl Store {
         after_id: Option<&TaskId>,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
+        self.list_tasks_filtered(project_id, after_id, None, true, limit)
+    }
+
+    pub fn list_tasks_filtered(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&TaskId>,
+        agent_id: Option<&AgentId>,
+        include_history: bool,
+        limit: usize,
+    ) -> Result<Vec<TaskDetail>> {
+        self.list_tasks_filtered_at_revision(
+            project_id,
+            after_id,
+            agent_id,
+            include_history,
+            limit,
+            None,
+        )
+        .map(|(tasks, _)| tasks)
+    }
+
+    pub fn list_tasks_filtered_at_revision(
+        &self,
+        project_id: &ProjectId,
+        after_id: Option<&TaskId>,
+        agent_id: Option<&AgentId>,
+        include_history: bool,
+        limit: usize,
+        expected_revision: Option<i64>,
+    ) -> Result<(Vec<TaskDetail>, i64)> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
+        }
+        match (after_id, expected_revision) {
+            (Some(_), None) => return Err(StoreError::MissingTaskCursorRevision),
+            (None, Some(_)) => return Err(StoreError::UnexpectedTaskCursorRevision),
+            _ => {}
+        }
+        let revision: i64 =
+            self.connection
+                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
+                    row.get(0)
+                })?;
+        if expected_revision.is_some_and(|expected| expected != revision) {
+            return Err(StoreError::StaleTaskCursor);
+        }
+        if let Some(agent_id) = agent_id {
+            let exists = load_agent(&self.connection, agent_id)?
+                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
+            if !exists {
+                return Err(StoreError::AgentNotFound);
+            }
+        }
+        if let Some(after_id) = after_id {
+            let cursor_exists: bool = self.connection.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM tasks
+                    WHERE project_id = ?1 AND id = ?2
+                      AND (?3 IS NULL OR assigned_agent_id = ?3)
+                      AND (?4 OR status IN ('queued', 'running'))
+                )",
+                params![
+                    project_id.as_str(),
+                    after_id.as_str(),
+                    agent_id.map(AgentId::as_str),
+                    include_history,
+                ],
+                |row| row.get(0),
+            )?;
+            if !cursor_exists {
+                return Err(StoreError::TaskNotFound);
+            }
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
-             WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
-             ORDER BY id
-             LIMIT ?3",
+            WHERE project_id = ?1
+               AND (?2 IS NULL OR assigned_agent_id = ?2)
+               AND (?3 OR status IN ('queued', 'running'))
+               AND (?4 IS NULL OR
+                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
+                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                        FROM tasks WHERE project_id = ?1 AND id = ?4
+                    ) OR (
+                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
+                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
+                            FROM tasks WHERE project_id = ?1 AND id = ?4
+                        )
+                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
+                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
+                                                             WHERE project_id = ?1 AND id = ?4)))
+                    ))
+             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
+             LIMIT ?5",
         )?;
         let rows = statement.query_map(
             params![
                 project_id.as_str(),
+                agent_id.map(AgentId::as_str),
+                include_history,
                 after_id.map(TaskId::as_str),
-                limit as i64
+                limit as i64,
             ],
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
@@ -3076,7 +3232,7 @@ impl Store {
             },
         )?;
 
-        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, revision))
     }
 
     pub fn get_task(&self, project_id: &ProjectId, task_id: &TaskId) -> Result<TaskDetail> {
@@ -3265,6 +3421,7 @@ impl Store {
         task_id: &TaskId,
         title: Option<String>,
         body: Option<String>,
+        priority: Option<i32>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
@@ -3276,9 +3433,16 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks
              SET title = COALESCE(?1, title), body = COALESCE(?2, body),
-                 updated_at_ms = ?3
-             WHERE id = ?4 AND project_id = ?5 AND status = 'queued'",
-            params![title, body, now_ms, task_id.as_str(), project_id.as_str()],
+                 priority = COALESCE(?3, priority), updated_at_ms = ?4
+             WHERE id = ?5 AND project_id = ?6 AND status = 'queued'",
+            params![
+                title,
+                body,
+                priority,
+                now_ms,
+                task_id.as_str(),
+                project_id.as_str()
+            ],
         )?;
         if changed != 1 {
             return Err(StoreError::TaskNotEditable);
@@ -3675,7 +3839,7 @@ impl Store {
 
     /// Every project's live picture in one read: agents with their live
     /// (or, failing that, most recent) session, current run, queued tasks,
-    /// and undelivered inbox count; per-project unassigned queue; the
+    /// and undelivered inbox count; per-project backlog; the
     /// project's blocked tasks (for the attention list). One connection,
     /// so every field is from the same instant. See
     /// `factory_core::status`.
@@ -3710,12 +3874,12 @@ impl Store {
                 .iter()
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
-            let unassigned = self.queued_tasks(&project.id, None)?;
+            let backlog = self.active_tasks(&project.id, None)?;
             let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
                 agents,
-                unassigned,
+                backlog,
                 blocked,
             });
         }
@@ -3735,7 +3899,7 @@ impl Store {
             Some(run_id) => load_run(&self.connection, run_id)?,
             None => None,
         };
-        let queue = self.queued_tasks(project_id, Some(agent_id))?;
+        let queue = self.active_tasks(project_id, Some(agent_id))?;
         let inbox_pending: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM agent_messages
              WHERE project_id = ?1 AND recipient_agent_id = ?2 AND delivered_at_ms IS NULL",
@@ -3811,9 +3975,10 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
-    /// Queued tasks assigned to `agent_id` (or unassigned when `None`),
-    /// oldest first -- the same order the dispatcher delivers them.
-    fn queued_tasks(
+    /// Active tasks assigned to `agent_id` (or unassigned when `None`): the
+    /// canonical queue projection used by status and the TUI. Running work
+    /// is first, followed by queued work in priority/creation order.
+    fn active_tasks(
         &self,
         project_id: &ProjectId,
         agent_id: Option<&AgentId>,
@@ -3822,9 +3987,9 @@ impl Store {
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
                     created_at_ms, updated_at_ms
              FROM tasks
-             WHERE project_id = ?1 AND status = 'queued'
+             WHERE project_id = ?1 AND status IN ('queued', 'running')
                AND ((?2 IS NULL AND assigned_agent_id IS NULL) OR assigned_agent_id = ?2)
-             ORDER BY created_at_ms, id",
+             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id",
         )?;
         let rows = statement.query_map(
             params![project_id.as_str(), agent_id.map(AgentId::as_str)],
@@ -3858,6 +4023,8 @@ impl Store {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
+                reasoning_effort: None,
+                model_selection_reason: None,
                 permission_mode: None,
                 updated_at_ms: 0,
             }),
@@ -3887,16 +4054,32 @@ impl Store {
                 });
             }
         }
+        let selection = model_policy::normalize_profile(
+            agent.snapshot.provider,
+            agent.snapshot.role,
+            model_policy::ModelSelection {
+                model: input.model,
+                reasoning_effort: input.reasoning_effort,
+                reason: input.model_selection_reason,
+            },
+            false,
+        )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO agent_profiles (
+                agent_id, model, reasoning_effort, model_selection_reason,
+                permission_mode, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
+                reasoning_effort = excluded.reasoning_effort,
+                model_selection_reason = excluded.model_selection_reason,
                 permission_mode = excluded.permission_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
-                input.model,
+                selection.model,
+                selection.reasoning_effort,
+                selection.reason,
                 input.permission_mode,
                 now_ms
             ],
@@ -4526,14 +4709,17 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, permission_mode, updated_at_ms
+            "SELECT model, reasoning_effort, model_selection_reason,
+                    permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
                 Ok(AgentProfile {
                     model: row.get(0)?,
-                    permission_mode: row.get(1)?,
-                    updated_at_ms: row.get(2)?,
+                    reasoning_effort: row.get(1)?,
+                    model_selection_reason: row.get(2)?,
+                    permission_mode: row.get(3)?,
+                    updated_at_ms: row.get(4)?,
                 })
             },
         )
@@ -4544,18 +4730,26 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
 fn insert_task(
     transaction: &Transaction<'_>,
     input: NewTask,
+    assigned_agent_id: Option<AgentId>,
     now_ms: i64,
 ) -> Result<(TaskDetail, FactoryEvent)> {
     let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
     if input.body.len() > MAX_TASK_BODY_BYTES {
         return Err(StoreError::InvalidTaskInput);
     }
+    if let Some(agent_id) = assigned_agent_id.as_ref() {
+        let valid = load_agent(transaction, agent_id)?
+            .is_some_and(|agent| agent.snapshot.project_id == input.project_id);
+        if !valid {
+            return Err(StoreError::AgentNotFound);
+        }
+    }
     let record = TaskDetail {
         snapshot: TaskSnapshot {
             id: input.id,
             project_id: input.project_id,
             parent_task_id: input.parent_task_id,
-            assigned_agent_id: None,
+            assigned_agent_id,
             title,
             status: TaskStatus::Queued,
             priority: input.priority,
@@ -4570,11 +4764,16 @@ fn insert_task(
         "INSERT INTO tasks (
             id, project_id, parent_task_id, assigned_agent_id, title, body,
             status, priority, created_at_ms, updated_at_ms, incarnation_id
-         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
         params![
             record.snapshot.id.as_str(),
             record.snapshot.project_id.as_str(),
             record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
+            record
+                .snapshot
+                .assigned_agent_id
+                .as_ref()
+                .map(AgentId::as_str),
             &record.snapshot.title,
             &record.body,
             record.snapshot.priority,
@@ -5107,18 +5306,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if current == 22 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let already_present: bool = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'cleanup_state'
-             )",
-            [],
-            |row| row.get(0),
-        )?;
-        if !already_present {
-            transaction
-                .execute_batch(include_str!("../migrations/0023_session_cleanup_state.sql"))?;
-        }
+        transaction.execute_batch(include_str!("../migrations/0023_agent_model_policy.sql"))?;
         transaction.pragma_update(None, "user_version", 23)?;
+        transaction.commit()?;
+        current = 23;
+    }
+    if current == 23 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0024_session_cleanup_state.sql"))?;
+        transaction.pragma_update(None, "user_version", 24)?;
         transaction.commit()?;
     }
     Ok(())

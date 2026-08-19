@@ -1373,6 +1373,25 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_resolution_is_two_press_operator_action() {
+        let mut board = board();
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board
+            .sessions
+            .get_mut(&SessionId::try_from("session").unwrap())
+            .unwrap()
+            .cleanup_state = factory_core::SessionCleanupState::Failed;
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('r'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Enter)),
+            Intent::Send(LocalRequest::ResolveSessionCleanup { .. })
+        ));
+    }
+
+    #[test]
     fn capacity_setting_is_an_operator_prompt_and_shared_intent() {
         let mut board = board();
         board.live_session_cap = Some(8);

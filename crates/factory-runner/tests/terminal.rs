@@ -158,7 +158,9 @@ impl RunningTerminalRunner {
 impl Drop for RunningTerminalRunner {
     fn drop(&mut self) {
         // Safety net: reap the PTY child's process group even if a test
-        // fails before stopping it cleanly, mirroring runner.rs.
+        // fails before stopping it cleanly, mirroring runner.rs. The runtime
+        // is fixture-private, so this cannot signal an unrelated process.
+        assert!(self.runtime.starts_with(self._directory.path()));
         let started_pid = fs::read_to_string(self.spool()).ok().and_then(|spool| {
             spool.lines().find_map(|line| {
                 let event: RunnerEventEnvelope = serde_json::from_str(line).ok()?;

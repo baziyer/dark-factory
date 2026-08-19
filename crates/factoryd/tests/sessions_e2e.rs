@@ -27,11 +27,12 @@ use factory_core::{
     AgentId, AgentRole, ProjectId, Provider, RunSnapshot, SessionSnapshot, SessionState,
     TaskDetail, TaskId, TaskStatus,
     local::{LocalRequest, LocalResponse, ServerFrame},
-    runner::decode_terminal_bytes,
+    runner::{RunnerEvent, RunnerEventEnvelope, decode_terminal_bytes},
 };
 use factoryctl::Client;
 #[cfg(target_os = "macos")]
 use factoryctl::{capacity, launchd, probes};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
@@ -435,6 +436,49 @@ fn wait_for_no_runners_under(home: &Path, deadline: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn runner_pid_for_runtime(runtime: &Path) -> Pid {
+    let needle = format!("--runtime-dir {}", runtime.display());
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .expect("ps");
+    let raw = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.contains("factory-runner") && line.contains(&needle))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|value| value.parse::<i32>().ok())
+        .and_then(Pid::from_raw)
+        .unwrap_or_else(|| panic!("no runner owned by {}", runtime.display()));
+    raw
+}
+
+fn started_group_for_runtime(runtime: &Path) -> Pid {
+    let spool = std::fs::read_to_string(runtime.join("events.ndjson")).unwrap();
+    spool
+        .lines()
+        .filter_map(|line| serde_json::from_str::<RunnerEventEnvelope>(line).ok())
+        .find_map(|event| match event.event {
+            RunnerEvent::Started { child_pid } => {
+                i32::try_from(child_pid).ok().and_then(Pid::from_raw)
+            }
+            _ => None,
+        })
+        .expect("runner Started event")
+}
+
+fn wait_for_private_group_gone(group: Pid) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match test_kill_process_group(group) {
+            Err(error) if error == rustix::io::Errno::SRCH => return,
+            Err(rustix::io::Errno::PERM) | Ok(()) => {}
+            Err(error) => panic!("private cleanup group probe failed: {error}"),
+        }
+        assert!(Instant::now() < deadline, "private cleanup group remained");
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -1147,6 +1191,98 @@ fn factoryd_restart_does_not_lose_a_live_session() {
     );
 
     cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+#[test]
+fn abrupt_runner_loss_survives_restart_until_private_cleanup_is_verified() {
+    let home = private_tempdir();
+    let Project { daemon, .. } = setup_project(home.path());
+    let client = daemon.client();
+    create_shell_agent(&client, "curie");
+    create_task(
+        &client,
+        "abrupt-loss-task",
+        "Abrupt loss",
+        "exercise cleanup recovery",
+    );
+    assign_task(&client, "abrupt-loss-task", "curie");
+    wait_for_task_status(&client, "abrupt-loss-task", TaskStatus::Succeeded);
+    let before = wait_for_session_state(&client, "curie", SessionState::Idle);
+    let runtime = home.path().join("runs").join(before.id.as_str());
+    let runner_pid = runner_pid_for_runtime(&runtime);
+    let provider_group = started_group_for_runtime(&runtime);
+
+    // This is deliberately scoped to the runner whose private runtime was
+    // just read; it simulates an abrupt runner loss without a process-name or
+    // host-wide signal. The provider tree and its lease remain behind.
+    kill_process(runner_pid, Signal::KILL).unwrap();
+    daemon.stop();
+
+    let daemon = Daemon::start(home.path());
+    let client = daemon.client();
+    let blocked = poll_until(DELIVERY_TIMEOUT, || {
+        session_by_agent(&client, "curie").filter(|session| {
+            session.state.is_live()
+                && session.cleanup_state == factory_core::SessionCleanupState::Failed
+        })
+    });
+    assert!(
+        blocked
+            .wait_reason
+            .as_deref()
+            .is_some_and(|reason| { reason.contains("cleanup") || reason.contains("runner") })
+    );
+
+    let deletion = client
+        .request(LocalRequest::DeleteAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+        })
+        .unwrap();
+    assert!(matches!(
+        deletion,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: factory_core::local::ErrorCode::Conflict,
+                ..
+            },
+            ..
+        }
+    ));
+
+    // Resolve only after the private provider group is actually gone. The
+    // daemon's ResolveSessionCleanup path independently checks the recorded
+    // identity and inherited lease; this test does not supply either as a
+    // caller assertion.
+    kill_process_group(provider_group, Signal::KILL).unwrap();
+    wait_for_private_group_gone(provider_group);
+    let resolved = client
+        .request(LocalRequest::ResolveSessionCleanup {
+            project_id: project_id(),
+            session_id: blocked.id.clone(),
+        })
+        .unwrap();
+    assert!(matches!(
+        resolved,
+        ServerFrame::Response {
+            response: LocalResponse::SessionCleanupResolved { .. },
+            ..
+        }
+    ));
+    let deleted = client
+        .request(LocalRequest::DeleteAgent {
+            project_id: project_id(),
+            agent_id: AgentId::try_from("curie").unwrap(),
+        })
+        .unwrap();
+    assert!(matches!(
+        deleted,
+        ServerFrame::Response {
+            response: LocalResponse::AgentDeleted { .. },
+            ..
+        }
+    ));
     daemon.stop();
 }
 

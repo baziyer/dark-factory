@@ -6,8 +6,10 @@
    directly on `main`.
 2. Build and iterate: `cargo build --workspace`.
    A runner's terminal event is emitted only after its provider process group
-   has been reaped; a stop response therefore does not make an agent
-   deletable until the owned provider tools are gone.
+   has been reaped and its private descendant lease is free; a stop response
+   therefore does not make an agent deletable until the owned provider tools
+   are gone. PTY supervision uses an in-session witness and event-driven
+   waits; it does not run global `/bin/ps` snapshots on the terminal hot path.
 3. Before opening a PR: `./scripts/local-ci.sh` (fmt, clippy at
    `-D warnings`, the full test suite, `git diff --check`) — this is the
    authoritative gate; CI runs the exact same script (see "CI and GitHub"
@@ -41,9 +43,11 @@ fixed sleep or a bare `daemon.stop()`.
 If a runner disappears before cleanup is proven, the session remains owned and
 visible as a cleanup failure across daemon restart. Tests must exercise that
 state through recovery and resolve it only through the explicit operator
-verification API after checking the fixture's private runtime. Process-sensitive
-tests also audit and remove only runners descended from their own temporary
-runtime at teardown; they must not use process-name or host-wide signalling.
+verification API after checking the fixture's private runtime; the API checks
+the durable runner evidence, absent leader/group, and free descendant lease,
+not a caller-supplied assertion. Process-sensitive tests also audit and remove
+only runners descended from their own temporary runtime at teardown; they
+must not use process-name or host-wide signalling.
 
 ### Developing the daemon without disrupting a running factory
 

@@ -133,11 +133,13 @@ const MAX_CONSECUTIVE_START_DEADLINES: u32 = 3;
 const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
 (DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
-agent add --role worker --provider <claude|codex|shell>`, `factoryctl task assign --task <id> \
---agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, `factoryctl session \
-list`. A worker in `waiting_for_input` needs operator attention: message it or surface its request; \
-do not stop, restart, replace, or duplicate it. Before stopping or replacing any worker, inspect \
-`factoryctl agent status --agent <agent>` and preserve or explicitly resolve any dirty worktree.";
+task assign --task <id> --agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, \
+`factoryctl session list`. The operator must create and reconfigure agents; do not attempt agent \
+creation or model-policy changes from the orchestrator. Message the operator with a concrete \
+request when a worker is needed. A worker in `waiting_for_input` needs operator attention: \
+message it or surface its request; do not stop, restart, replace, or duplicate it. Before stopping \
+or replacing any worker, inspect `factoryctl agent status --agent <agent>` and preserve or \
+explicitly resolve any dirty worktree.";
 
 /// Fixed process and durability bounds for the dispatcher.
 pub struct Config {
@@ -396,6 +398,23 @@ impl Handle {
     /// a full wake queue silently defers to the 5 second safety tick.
     pub fn wake(&self, project_id: ProjectId, agent_id: AgentId) {
         send_wake(&self.wake_tx, project_id, agent_id);
+    }
+
+    /// Waits for all delivery work owned by `agent_id` to finish. Local API
+    /// assignment/deletion handlers hold this barrier while changing task
+    /// ownership, so a delivery that loses the race cannot type the task to
+    /// the old worker after the move has committed.
+    pub async fn lock_delivery_slot(
+        &self,
+        agent_id: &AgentId,
+    ) -> crate::daemon_state::DeliverySlot {
+        self.state.lock_delivery_slot(agent_id).await
+    }
+
+    /// Serializes assignment mutations for one task across all local API
+    /// request handlers.
+    pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.state.lock_assignment_slot().await
     }
 
     /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's
@@ -1435,6 +1454,7 @@ async fn spawn_session_for_agent(
         session_id: session_id.clone(),
         worktree: worktree_path.clone(),
         model: agent.profile.model.clone(),
+        reasoning_effort: agent.profile.reasoning_effort.clone(),
         permission_mode: agent.profile.permission_mode.clone(),
         auto_mode,
         resume: resume.clone(),
@@ -1702,33 +1722,22 @@ async fn supervise_child(
     )
     .await;
     let wait_status = child.wait().await;
-    let Some((exit_code, exit_signal)) = event_exit else {
-        let status = wait_status
-            .map(|status| status.to_string())
-            .unwrap_or_else(|error| format!("runner wait failed: {error}"));
-        let reason =
-            format!("provider cleanup was not confirmed; runner ended without Exited ({status})");
-        let session_id_for_update = session_id.clone();
-        let Ok(failed_at_ms) = now_ms() else {
-            tracing::error!(
-                %session_id,
-                "could not timestamp provider cleanup failure"
-            );
-            return;
-        };
-        let _ = state
-            .commit_and_publish(move |store| {
-                let (snapshot, event) = store.mark_session_cleanup_failed(
-                    &session_id_for_update,
-                    reason,
-                    failed_at_ms,
-                )?;
-                Ok((snapshot, vec![event]))
-            })
-            .await;
-        return;
-    };
-    end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
+    match event_exit {
+        Some((exit_code, exit_signal)) => {
+            end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
+        }
+        None => {
+            let status = wait_status.ok();
+            if status.is_some_and(|status| !status.success()) {
+                mark_recovered_cleanup_failed(
+                    &state,
+                    &session_id,
+                    "runner exited before durable cleanup proof".to_owned(),
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Whether `event` is the trigger [`synthesize_codex_session_start`] exists
@@ -2457,13 +2466,6 @@ async fn supervise_recovered(
     mut shutdown_rx: watch::Receiver<bool>,
     max_attempts: u32,
 ) {
-    if recovered.cleanup_failed {
-        tracing::warn!(
-            session_id = %recovered.session_id,
-            "leaving cleanup-failed session live until an operator verifies provider cleanup"
-        );
-        return;
-    }
     let runtime_dir = PathBuf::from(&recovered.runner_runtime);
     let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
         return;
@@ -2493,7 +2495,12 @@ async fn supervise_recovered(
                 // (`unverifiable`, like every other "gave up" exit in this
                 // function) instead of just logging and abandoning it.
                 tracing::warn!(%error, session_id = %recovered.session_id, "recovery attach failed");
-                end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                mark_recovered_cleanup_failed(
+                    &state,
+                    &recovered.session_id,
+                    format!("runner recovery could not prove cleanup: {error}"),
+                )
+                .await;
                 return;
             }
         };
@@ -2501,7 +2508,12 @@ async fn supervise_recovered(
             Attach::Connected(subscription) => subscription,
             Attach::Shutdown => return,
             Attach::Missing => {
-                end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                mark_recovered_cleanup_failed(
+                    &state,
+                    &recovered.session_id,
+                    "runner recovery found no control endpoint".to_owned(),
+                )
+                .await;
                 return;
             }
             Attach::Unreachable => {
@@ -2512,7 +2524,12 @@ async fn supervise_recovered(
                         attempt,
                         "recovered session's runner stayed unreachable; giving up"
                     );
-                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                    mark_recovered_cleanup_failed(
+                        &state,
+                        &recovered.session_id,
+                        "runner stayed unreachable during recovery".to_owned(),
+                    )
+                    .await;
                     return;
                 }
                 tokio::select! {
@@ -2557,7 +2574,12 @@ async fn supervise_recovered(
                         attempt,
                         "recovered session's runner connection kept dropping; giving up"
                     );
-                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
+                    mark_recovered_cleanup_failed(
+                        &state,
+                        &recovered.session_id,
+                        "runner connection dropped before cleanup was proven".to_owned(),
+                    )
+                    .await;
                     return;
                 }
                 tokio::select! {
@@ -2577,6 +2599,21 @@ enum ExitOutcome {
     },
     Shutdown,
     Reconnect,
+}
+
+async fn mark_recovered_cleanup_failed(
+    state: &DaemonState,
+    session_id: &SessionId,
+    reason: String,
+) {
+    let Ok(now) = now_ms() else { return };
+    let session_id = session_id.clone();
+    let _ = state
+        .commit_and_publish(move |store| {
+            let (_, event) = store.mark_session_cleanup_failed(&session_id, reason, now)?;
+            Ok(((), vec![event]))
+        })
+        .await;
 }
 
 /// Like `wait_for_runner_exit`, but for a session recovered after a daemon
@@ -4297,7 +4334,8 @@ mod tests {
             AgentRole::Orchestrator,
         );
         assert!(text.contains("As the orchestrator"));
-        assert!(text.contains("factoryctl agent add"));
+        assert!(!text.contains("factoryctl agent add"));
+        assert!(text.contains("operator must create and reconfigure agents"));
         assert!(text.contains("waiting_for_input"));
         assert!(text.contains("do not stop, restart, replace, or duplicate it"));
         assert!(text.contains("factoryctl agent status"));
