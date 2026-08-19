@@ -11,11 +11,18 @@ first="$temporary/first"
 second="$temporary/second"
 background_pids=
 
+kill_tree() {
+    for child in $(pgrep -P "$1" 2>/dev/null || true); do
+        kill_tree "$child"
+    done
+    kill -KILL "$1" 2>/dev/null || true
+}
+
 cleanup() {
     status=$?
     trap - EXIT HUP INT TERM
     for pid in $background_pids; do
-        kill "$pid" 2>/dev/null || true
+        kill_tree "$pid"
         wait "$pid" 2>/dev/null || true
     done
     rm -rf "$temporary"
@@ -88,8 +95,8 @@ fi
 grep -Fq 'unsafe lock object path' "$temporary/initial-symlink.stderr" || fail "initial symlink refusal was unexplained"
 rm -f "$lock_path"
 
-# A starter publishes an identity-bound directory marker before it can invoke
-# lockf.  Kill that starter at the narrow pre-lockf seam; a waiter must not
+# A holder publishes an identity-bound directory marker only after it owns
+# lockf. Kill that holder at the narrow post-lockf seam; a waiter must not
 # inherit the dead marker forever or split authority with a late starter.
 starting_pause_fifo="$temporary/starting-pause"
 starting_marker="$lock_path/.starting"
@@ -99,7 +106,7 @@ starting_waiter_stderr="$temporary/starting-waiter.stderr"
 mkfifo "$starting_pause_fifo"
 (
     cd "$first"
-    DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_LOCKF="$starting_pause_fifo" \
+    DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF="$starting_pause_fifo" \
         ./scripts/with-local-ci-lease.sh "$short_command" "$starting_held"
 ) &
 starting_pid=$!
@@ -117,7 +124,7 @@ wait "$starting_pid" 2>/dev/null || true
 ) 2>"$starting_waiter_stderr" &
 starting_waiter_pid=$!
 background_pids="$background_pids $starting_waiter_pid"
-wait "$starting_waiter_pid" || fail "waiter did not recover a killed pre-lockf starter"
+wait "$starting_waiter_pid" || fail "waiter did not recover a killed startup holder"
 [ -f "$starting_waiter" ] || fail "recovered waiter did not run its command"
 assert_absent "$starting_marker"
 assert_absent "$lease_path"
@@ -162,6 +169,56 @@ acquire_and_release() {
         ./scripts/with-local-ci-lease.sh "$short_command" "$marker"
     )
 }
+
+# Interruption cleanup must kill descendants before deleting the throwaway
+# tree; killing only the recorded shell can orphan a fixture child.
+tree_command="$temporary/tree.sh"
+tree_child_pid_file="$temporary/tree-child.pid"
+printf '%s\n' '#!/bin/sh' 'set -eu' '(while :; do sleep 1; done) &' 'child=$!' 'printf "%s\\n" "$child" >"$1"' 'while :; do sleep 1; done' >"$tree_command"
+chmod +x "$tree_command"
+sh "$tree_command" "$tree_child_pid_file" &
+tree_pid=$!
+background_pids="$background_pids $tree_pid"
+wait_for_file "$tree_child_pid_file"
+tree_child_pid=$(cat "$tree_child_pid_file")
+kill_tree "$tree_pid"
+wait "$tree_pid" 2>/dev/null || true
+kill -0 "$tree_child_pid" 2>/dev/null && fail "fixture descendant survived process-tree cleanup"
+
+fake_ps_bin="$temporary/fake-bin"
+mkdir "$fake_ps_bin"
+printf '%s\n' '#!/bin/sh' 'exit 1' >"$fake_ps_bin/ps"
+chmod +x "$fake_ps_bin/ps"
+
+recover_starting_case() {
+    case_name=$1
+    case_marker="$temporary/starting-$case_name-recovered"
+    mkdir "$lock_path"
+    : >"$lock_path/descriptor"
+    mkdir "$lock_path/.recovery"
+    mkdir "$lock_path/.starting"
+    case "$case_name" in
+        missing) : ;;
+        partial) printf 'pid=\n' >"$lock_path/.starting/owner" ;;
+        malformed) printf 'not an owner record\n' >"$lock_path/.starting/owner" ;;
+        *) fail "unknown startup fixture $case_name" ;;
+    esac
+    if [ "$case_name" = malformed ]; then
+        (cd "$second" && PATH="$fake_ps_bin:$PATH" ./scripts/with-local-ci-lease.sh "$short_command" "$case_marker") \
+            || fail "$case_name startup artifact was not recovered"
+    else
+        (cd "$second" && ./scripts/with-local-ci-lease.sh "$short_command" "$case_marker") \
+            || fail "$case_name startup artifact was not recovered"
+    fi
+    [ -f "$case_marker" ] || fail "$case_name recovery command did not run"
+    assert_absent "$lock_path/.starting"
+    assert_absent "$lock_path/.recovery"
+    assert_absent "$lock_path"
+}
+
+recover_starting_case missing
+recover_starting_case partial
+recover_starting_case malformed
 
 # Linked worktrees share one kernel lease and one bounded, sanitized owner
 # diagnostic that includes the exact owner head.

@@ -15,9 +15,11 @@ any release probe, compiler, or test. This serializes linked worktrees while
 leaving independent clones independent. Acquisition first creates the lock
 object as an atomic directory; symlinked, substituted, or otherwise
 unverifiable objects fail closed rather than letting contenders lock different
-inodes. The `lockf` descriptor inside that object is held by a child wrapper
-and inherited by the owned command, so a killed wrapper cannot release the
-gate while an owned descendant remains. A second invocation waits and prints
+inodes. The child obtains the `lockf` descriptor before publishing its
+`.starting` marker, then inherits that descriptor into the owned command, so
+no live starter can race stale-marker recovery and a killed wrapper cannot
+release the gate while an owned descendant remains. A second invocation waits
+and prints
 one bounded, field-validated owner record (PID, exact head, worktree, start
 time, lock identity, and safe agent/task labels); set
 `DARK_FACTORY_LOCAL_CI_WAIT=0` to fail explicitly instead. The symlink record

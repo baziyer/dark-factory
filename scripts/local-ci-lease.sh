@@ -220,44 +220,10 @@ local_ci_lease_prepare_lock_object() {
     )
 }
 
-local_ci_lease_starting_field() {
-    local_ci_lease_starting_record=$1
-    local_ci_lease_starting_key=$2
-    sed -n "s/^${local_ci_lease_starting_key}=//p" "$local_ci_lease_starting_record" \
-        | head -n 1
-}
-
-local_ci_lease_starting_status() {
-    local_ci_lease_expected_identity=$1
-    if [ ! -e "$LOCAL_CI_LEASE_STARTING_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_STARTING_NAME" ]; then
-        return 1
-    fi
-    [ -d "$LOCAL_CI_LEASE_STARTING_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_STARTING_NAME" ] || return 2
-    local_ci_lease_current_identity=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null) || return 2
-    [ "$local_ci_lease_current_identity" = "$local_ci_lease_expected_identity" ] || return 2
-    local_ci_lease_starting_record="$LOCAL_CI_LEASE_STARTING_NAME/$LOCAL_CI_LEASE_STARTING_OWNER_NAME"
-    [ -f "$local_ci_lease_starting_record" ] && [ ! -L "$local_ci_lease_starting_record" ] || return 2
-    local_ci_lease_starting_pid=$(local_ci_lease_starting_field "$local_ci_lease_starting_record" pid)
-    local_ci_lease_starting_process_start=$(local_ci_lease_starting_field "$local_ci_lease_starting_record" process_start)
-    case "$local_ci_lease_starting_pid" in
-        ''|*[!0-9]*) return 2 ;;
-    esac
-    [ -n "$local_ci_lease_starting_process_start" ] || return 2
-    [ -n "$(ps -p "$local_ci_lease_starting_pid" -o pid= 2>/dev/null)" ] || return 1
-    kill -0 "$local_ci_lease_starting_pid" 2>/dev/null || return 2
-    local_ci_lease_current_process_start=$(ps -p "$local_ci_lease_starting_pid" -o lstart= 2>/dev/null | sed 's/^ *//')
-    [ -n "$local_ci_lease_current_process_start" ] || return 2
-    [ "$local_ci_lease_current_process_start" = "$local_ci_lease_starting_process_start" ] || return 1
-    return 0
-}
-
 local_ci_lease_write_starting_marker() {
     local_ci_lease_starting_record="$LOCAL_CI_LEASE_STARTING_NAME/$LOCAL_CI_LEASE_STARTING_OWNER_NAME"
-    local_ci_lease_starting_process_start=$(ps -p "$$" -o lstart= 2>/dev/null | sed 's/^ *//')
-    [ -n "$local_ci_lease_starting_process_start" ] || return 1
     {
         printf 'pid=%s\n' "$$"
-        printf 'process_start=%s\n' "$local_ci_lease_starting_process_start"
     } >"$local_ci_lease_starting_record"
 }
 
@@ -277,12 +243,36 @@ local_ci_lease_remove_starting() {
     rmdir "$LOCAL_CI_LEASE_STARTING_NAME"
 }
 
+local_ci_lease_remove_starting_stale() {
+    if [ ! -e "$LOCAL_CI_LEASE_STARTING_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_STARTING_NAME" ]; then
+        return 0
+    fi
+    [ -d "$LOCAL_CI_LEASE_STARTING_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_STARTING_NAME" ] || return 1
+    local_ci_lease_starting_record="$LOCAL_CI_LEASE_STARTING_NAME/$LOCAL_CI_LEASE_STARTING_OWNER_NAME"
+    if [ -e "$local_ci_lease_starting_record" ] || [ -L "$local_ci_lease_starting_record" ]; then
+        [ -f "$local_ci_lease_starting_record" ] && [ ! -L "$local_ci_lease_starting_record" ] || return 1
+        rm -f "$local_ci_lease_starting_record"
+    fi
+    rmdir "$LOCAL_CI_LEASE_STARTING_NAME"
+}
+
 local_ci_lease_remove_recovery_guard() {
     local_ci_lease_expected_identity=$1
     [ -n "$local_ci_lease_expected_identity" ] || return 0
     [ -d "$LOCAL_CI_LEASE_RECOVERY_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_RECOVERY_NAME" ] || return 0
     [ "$(stat -f '%d:%i' "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null)" = "$local_ci_lease_expected_identity" ] || return 0
     rmdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || true
+}
+
+local_ci_lease_reclaim_stale_recovery_guard() {
+    [ -d "$LOCAL_CI_LEASE_RECOVERY_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_RECOVERY_NAME" ] || return 1
+    local_ci_lease_recovery_identity=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null) || return 1
+    local_ci_lease_recovery_quarantine="$LOCAL_CI_LEASE_RECOVERY_NAME-reclaim-$$"
+    [ ! -e "$local_ci_lease_recovery_quarantine" ] && [ ! -L "$local_ci_lease_recovery_quarantine" ] || return 1
+    mv "$LOCAL_CI_LEASE_RECOVERY_NAME" "$local_ci_lease_recovery_quarantine" || return 1
+    [ -d "$local_ci_lease_recovery_quarantine" ] && [ ! -L "$local_ci_lease_recovery_quarantine" ] || return 1
+    [ "$(stat -f '%d:%i' "$local_ci_lease_recovery_quarantine" 2>/dev/null)" = "$local_ci_lease_recovery_identity" ] || return 1
+    rmdir "$local_ci_lease_recovery_quarantine"
 }
 
 local_ci_lease_remove_lock_object() {
@@ -301,6 +291,9 @@ local_ci_lease_remove_lock_object() {
 }
 
 local_ci_lease_lock_probe() {
+    # Tri-state contract: 0 means the descriptor is currently unlocked, 1
+    # means lockf reports it held, and 2 means the object cannot be validated.
+    # Process enumeration is diagnostic only and never changes this result.
     local_ci_lease_lock_file_is_safe || return 2
     (
         local_ci_lease_enter_lock_object &&
@@ -313,46 +306,33 @@ local_ci_lease_recover_lock_object() {
     (
         local_ci_lease_enter_lock_object || exit 2
         local_ci_lease_object_identity=$(stat -f '%d:%i' . 2>/dev/null) || exit 2
-        local_ci_lease_starting_identity=
-        if [ -d "$LOCAL_CI_LEASE_STARTING_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_STARTING_NAME" ]; then
-            local_ci_lease_starting_identity=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null) || exit 2
-        elif [ -e "$LOCAL_CI_LEASE_STARTING_NAME" ] || [ -L "$LOCAL_CI_LEASE_STARTING_NAME" ]; then
-            exit 2
-        fi
-        mkdir "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null || exit 1
-        local_ci_lease_recovery_identity=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_RECOVERY_NAME" 2>/dev/null) || exit 2
         if lockf -k -t 0 "$LOCAL_CI_LEASE_LOCK_FILE_NAME" sh -c '
             set -eu
             helper=$1
             common_dir=$2
             object_identity=$3
-            recovery_identity=$4
-            starting_identity=$5
             . "$helper"
             LOCAL_CI_LEASE_COMMON_DIR=$common_dir
             LOCAL_CI_LEASE_PATH="$common_dir/$LOCAL_CI_LEASE_NAME"
             LOCAL_CI_LEASE_LOCK="$common_dir/$LOCAL_CI_LEASE_LOCK_NAME"
-            if local_ci_lease_starting_status "$starting_identity"; then
-                starting_status=0
-            else
-                starting_status=$?
+            if [ -e "$LOCAL_CI_LEASE_RECOVERY_NAME" ] || [ -L "$LOCAL_CI_LEASE_RECOVERY_NAME" ]; then
+                [ -d "$LOCAL_CI_LEASE_RECOVERY_NAME" ] && [ ! -L "$LOCAL_CI_LEASE_RECOVERY_NAME" ] || exit 2
+                local_ci_lease_reclaim_stale_recovery_guard || exit 2
             fi
-            [ "$starting_status" -ne 0 ] || exit 1
-            [ "$starting_status" -ne 2 ] || exit 2
+            mkdir "$LOCAL_CI_LEASE_RECOVERY_NAME"
+            recovery_identity=$(stat -f "%d:%i" "$LOCAL_CI_LEASE_RECOVERY_NAME")
             local_ci_lease_clear_metadata || exit 2
-            local_ci_lease_remove_starting "$starting_identity" || exit 2
+            local_ci_lease_remove_starting_stale || exit 2
             rm -f "$LOCAL_CI_LEASE_LOCK_FILE_NAME"
             local_ci_lease_remove_recovery_guard "$recovery_identity" || exit 2
             CDPATH= cd -- "$LOCAL_CI_LEASE_COMMON_DIR"
             [ "$(stat -f "%d:%i" "$LOCAL_CI_LEASE_LOCK" 2>/dev/null)" = "$object_identity" ] || exit 2
             rmdir "$(basename "$LOCAL_CI_LEASE_LOCK")"
         ' local-ci-lease-recover "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
-            "$local_ci_lease_object_identity" "$local_ci_lease_recovery_identity" \
-            "$local_ci_lease_starting_identity"; then
+            "$local_ci_lease_object_identity"; then
             exit 0
         else
             local_ci_lease_status=$?
-            local_ci_lease_remove_recovery_guard "$local_ci_lease_recovery_identity"
             exit "$local_ci_lease_status"
         fi
     )
@@ -368,27 +348,6 @@ local_ci_lease_acquire_lock_object() {
             local_ci_lease_prepare_lock_object || {
                 rmdir "$LOCAL_CI_LEASE_LOCK" 2>/dev/null || true
                 echo "local-ci: cannot create a substitution-resistant lock object at $LOCAL_CI_LEASE_LOCK" >&2
-                return 1
-            }
-            (
-                local_ci_lease_enter_lock_object &&
-                    mkdir "$LOCAL_CI_LEASE_STARTING_NAME"
-            ) || {
-                local_ci_lease_remove_lock_object
-                echo "local-ci: cannot reserve the lock object for the holder" >&2
-                return 1
-            }
-            local_ci_lease_starting_identity=$(stat -f '%d:%i' \
-                "$LOCAL_CI_LEASE_LOCK/$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null) || {
-                local_ci_lease_remove_lock_object
-                echo "local-ci: cannot identify the startup marker" >&2
-                return 1
-            }
-            (
-                local_ci_lease_enter_lock_object && local_ci_lease_write_starting_marker
-            ) || {
-                local_ci_lease_remove_lock_object
-                echo "local-ci: cannot write the startup marker" >&2
                 return 1
             }
             return 0
@@ -548,13 +507,6 @@ local_ci_lease_run() {
     local_ci_lease_acquire_lock_object || return 1
     local_ci_lease_working_directory=$(pwd -P)
 
-    # Test-only seam: a FIFO read pauses this starter after the marker is
-    # published and before the production lockf handoff.  No normal invocation
-    # sets it, and the paused process owns no child or kernel lease yet.
-    if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_LOCKF-}" ]; then
-        read -r local_ci_lease_test_pause_token <"$DARK_FACTORY_LOCAL_CI_TEST_PAUSE_BEFORE_LOCKF" || true
-    fi
-
     # The holder is a child of this wrapper.  Its lock descriptor is inherited
     # by the command, so an abnormal wrapper exit cannot release a surviving
     # command descendant's lease.
@@ -565,10 +517,16 @@ local_ci_lease_run() {
         helper=$1
         common_dir=$2
         working_directory=$3
-        starting_identity=$4
-        shift 4
+        shift 3
         . "$helper"
-        LOCAL_CI_LEASE_STARTING_IDENTITY=$starting_identity
+        mkdir "$LOCAL_CI_LEASE_STARTING_NAME"
+        LOCAL_CI_LEASE_STARTING_IDENTITY=$(stat -f '%d:%i' "$LOCAL_CI_LEASE_STARTING_NAME")
+        local_ci_lease_write_starting_marker
+        # This seam pauses only after this shell owns lockf.  A killed starter
+        # therefore cannot later acquire the descriptor after recovery.
+        if [ -n "${DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF-}" ]; then
+            read -r local_ci_lease_test_pause_token <"$DARK_FACTORY_LOCAL_CI_TEST_PAUSE_AFTER_LOCKF" || true
+        fi
         local_ci_lease_remove_starting "$LOCAL_CI_LEASE_STARTING_IDENTITY" || exit 1
         CDPATH= cd -P -- "$working_directory"
         set +e
@@ -580,7 +538,7 @@ local_ci_lease_run() {
         rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
         exit "$status"
     ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
-        "$local_ci_lease_working_directory" "$local_ci_lease_starting_identity" "$@"
+        "$local_ci_lease_working_directory" "$@"
     ) &
     local_ci_lease_holder_pid=$!
 
