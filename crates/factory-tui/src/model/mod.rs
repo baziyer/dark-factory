@@ -499,10 +499,7 @@ impl Board {
         mut source_matches: impl FnMut(&AttentionItem) -> bool,
     ) {
         let matches = self.pending_attention_action == Some(action)
-            && self
-                .pending_attention
-                .as_ref()
-                .is_some_and(source_matches);
+            && self.pending_attention.as_ref().is_some_and(source_matches);
         if matches {
             self.complete_attention_request();
         }
