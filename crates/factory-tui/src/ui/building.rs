@@ -54,48 +54,64 @@ fn render_floors(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap
             } else {
                 " "
             };
+            let compact = inner.width < 70;
             let glyph = if agent.role == factory_core::AgentRole::Orchestrator {
                 board.theme.orchestrator
             } else {
                 provider_letter(agent.provider)
             };
-            let spark = board
-                .activity
-                .get(&agent_id)
-                .map(|series| state::braille_sparkline(&series.counts(), 8))
-                .unwrap_or_else(|| "        ".to_owned());
+            let spark = if compact {
+                String::new()
+            } else {
+                board
+                    .activity
+                    .get(&agent_id)
+                    .map(|series| state::braille_sparkline(&series.counts(), 8))
+                    .unwrap_or_else(|| "        ".to_owned())
+            };
             let assigned = board.active_tasks_for_agent(&agent_id);
             let current = assigned
                 .iter()
                 .find(|task| task.snapshot.status == factory_core::TaskStatus::Running)
                 .or_else(|| assigned.first())
                 .map(|task| ui::truncate(&task.snapshot.title, 24));
-            let queue = (!assigned.is_empty()).then(|| format!(" queue {}", assigned.len()));
+            let queue = (!assigned.is_empty()).then(|| format!("queue {}", assigned.len()));
             let activity = board.activity_label(agent);
             let route = if agent.parent_agent_id.is_some() {
                 "══ "
             } else {
                 ""
             };
-            lines.push(Line::from(vec![
-                Span::raw(format!(
-                    "{selected} {}{route}",
-                    "  ".repeat(usize::from(depth))
-                )),
-                Span::styled(
-                    format!("{glyph} {:<18}", ui::truncate_middle(agent_id.as_str(), 18)),
-                    state_style(state),
-                ),
-                Span::raw(format!(
-                    " {:?} {:<8} {spark} {}{}{}",
+            let prefix = if compact {
+                format!(
+                    "{selected} {}{route}{glyph} {:<10} {}",
+                    "  ".repeat(usize::from(depth)),
+                    ui::truncate_middle(agent_id.as_str(), 10),
+                    state.label(),
+                )
+            } else {
+                format!(
+                    "{selected} {}{route}{glyph} {:<18} {:?} {:<8} {spark}",
+                    "  ".repeat(usize::from(depth)),
+                    ui::truncate_middle(agent_id.as_str(), 18),
                     agent.provider,
                     state.label(),
-                    activity,
-                    queue.as_deref().unwrap_or(""),
-                    current
-                        .as_deref()
-                        .map_or(String::new(), |title| format!(" task {title}"))
-                )),
+                )
+            };
+            let priority = match (queue, current) {
+                (Some(queue), Some(title)) => format!(" {queue} task {title}"),
+                (Some(queue), None) => format!(" {queue}"),
+                (None, Some(title)) => format!(" task {title}"),
+                (None, None) => String::new(),
+            };
+            let activity_width = usize::from(inner.width)
+                .saturating_sub(prefix.chars().count())
+                .saturating_sub(priority.chars().count())
+                .saturating_sub(1);
+            lines.push(Line::from(vec![
+                Span::styled(prefix, state_style(state)),
+                Span::raw(priority),
+                Span::raw(format!(" {}", ui::truncate(&activity, activity_width))),
             ]));
             hits.add_row(inner, row, Target::Agent(agent_id));
             row += 1;
@@ -154,6 +170,30 @@ mod tests {
     use factory_core::{AgentRole, RunStatus, TaskStatus, status::AttentionReasonKind};
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn rendered_building_text(width: u16) -> String {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        let mut current = task("task", "proj", TaskStatus::Running, Some("alice"), 0);
+        current.snapshot.title = "current task".to_owned();
+        board.apply_fleet_snapshot(
+            vec![project("proj", 0)],
+            vec![agent("alice", "proj", AgentRole::Worker, None)],
+            vec![current],
+            vec![run("alice", "proj", RunStatus::Running, 0)],
+            Vec::new(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| draw(frame, frame.area(), &board, &mut HitMap::default()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
     #[test]
     fn building_renders_project_floor_queue_and_needs_you() {
         let mut board = Board::new(false, 0, crate::theme::PLAIN);
@@ -186,8 +226,27 @@ mod tests {
         assert!(text.contains("NEEDS YOU"));
         assert!(text.contains("alice"));
         assert!(text.contains("queue 1"));
-        assert!(text.contains("no recent activity"));
+        assert!(text.contains("task task"));
+        assert!(
+            text.contains("no rece"),
+            "activity should remain visible after priority text"
+        );
         assert!(text.contains("inference"));
         assert!(text.contains("lifecycle state"));
+    }
+
+    #[test]
+    fn building_keeps_queue_and_current_task_visible_at_narrow_widths() {
+        for width in [120, 80] {
+            let text = rendered_building_text(width);
+            assert!(
+                text.contains("queue 1"),
+                "queue missing at width {width}: {text}"
+            );
+            assert!(
+                text.contains("task current task"),
+                "current task missing at width {width}: {text}"
+            );
+        }
     }
 }
