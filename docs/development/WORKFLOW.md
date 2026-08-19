@@ -15,6 +15,22 @@
    security — and posts findings on the PR. The author addresses each one
    or explains why not. The reviewer re-checks. Only then merge. See
    `AGENTS.md`'s "Critical rules" for the exact steps.
+
+### Posting GitHub comments
+
+Pass comment Markdown as literal bytes through the repository helper. It
+accepts one issue or PR target and either stdin or an explicit body file:
+
+```sh
+printf '%s\n' 'Reviewed: `literal` and $(not shell syntax)' |
+  scripts/github-comment.sh pr 209
+scripts/github-comment.sh issue 212 docs/comment.md
+```
+
+Do not pass Markdown through a GitHub CLI shell argument or embed it in a
+shell command. The helper validates the target, supplies `--body-file` exactly
+once, and never echoes the body. Run `scripts/test-github-comment.sh` when
+changing this workflow.
 6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
 
 ### Testing resident sessions

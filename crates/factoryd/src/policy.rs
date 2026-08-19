@@ -527,7 +527,7 @@ mod tests {
             "git push origin :obsolete",
             "/usr/bin/git push --force origin main",
             "cd repo && git push --force origin main",
-            "gh issue comment 80 --body 'literal << EOF'\ngit push --force origin main",
+            "scripts/github-comment.sh issue 80 comment.md\ngit push --force origin main",
         ] {
             assert_eq!(
                 decide(&bash(command), root).denied_by,
@@ -571,21 +571,11 @@ mod tests {
         );
         assert_eq!(decide(&bash("echo git push --force"), root).denied_by, None);
         assert_eq!(
-            decide(
-                &bash(
-                    "gh issue comment 80 --body 'reviewed git push --force and ~/.ssh/id_ed25519'"
-                ),
-                root
-            )
-            .denied_by,
+            decide(&bash("scripts/github-comment.sh issue 80 comment.md"), root).denied_by,
             None
         );
         assert_eq!(
-            decide(
-                &bash("gh pr comment 95 --body-file - <<'EOF'\nI tried git push --force and it was denied.\nI also checked ~/.ssh/id_ed25519 and rm -rf /tmp/other prose.\nEOF"),
-                root
-            )
-            .denied_by,
+            decide(&bash("scripts/github-comment.sh pr 95 comment.md"), root).denied_by,
             None
         );
         assert_eq!(
@@ -664,30 +654,17 @@ mod tests {
             ),
             ("echo >", Some("unsupported_shell_syntax")),
             ("env git status --short", None),
-            (
-                "FOO=1 gh issue comment 80 --body 'git push --force ~/.ssh/id'",
-                None,
-            ),
+            ("FOO=1 scripts/github-comment.sh issue 80 comment.md", None),
             ("command git status --short", None),
             ("sudo echo reviewed", None),
             ("printf safe | cat", None),
             ("echo reviewed>report.txt", None),
             ("printf '%s' '>'", None),
             ("printf '%s' '<'", None),
-            ("gh issue comment 80 --body '>'", None),
-            (
-                "gh issue comment 80 --body 'literal > ~/.aws/credentials'",
-                None,
-            ),
+            ("scripts/github-comment.sh issue 80 comment.md", None),
             ("printf '%s' 'foo>bar'", None),
-            (
-                "gh pr comment 95 --body-file - <<EOF\nplain git push --force prose\nEOF",
-                None,
-            ),
-            (
-                "gh pr comment 95 --body-file - <<'EOF'\n$(rm -rf /tmp/other) is prose\nEOF",
-                None,
-            ),
+            ("scripts/github-comment.sh pr 95 comment.md", None),
+            ("scripts/github-comment.sh pr 95 comment.md", None),
         ];
         for (command, expected) in cases {
             assert_eq!(
