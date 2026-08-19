@@ -417,6 +417,7 @@ local_ci_lease_run() {
 
     local_ci_lease_reported_wait=0
     local_ci_lease_acquire_lock_object || return 1
+    local_ci_lease_working_directory=$(pwd -P)
 
     # The holder is a child of this wrapper.  Its lock descriptor is inherited
     # by the command, so an abnormal wrapper exit cannot release a surviving
@@ -427,16 +428,19 @@ local_ci_lease_run() {
         set -eu
         helper=$1
         common_dir=$2
-        shift 2
+        working_directory=$3
+        shift 3
         . "$helper"
         rmdir "$LOCAL_CI_LEASE_STARTING_NAME" 2>/dev/null || true
+        CDPATH= cd -P -- "$working_directory"
         set +e
         local_ci_lease_holder "$common_dir" "$@"
         status=$?
         set -e
         local_ci_lease_remove_lock_object
         exit "$status"
-    ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" "$@"
+    ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
+        "$local_ci_lease_working_directory" "$@"
     ) &
     local_ci_lease_holder_pid=$!
 
