@@ -3770,14 +3770,14 @@ mod tests {
     /// what a runner process's own OS-level teardown can leave behind if
     /// it never gets the chance to run its normal cleanup) must not stay
     /// dangling in whatever state it was recovered in forever; it must
-    /// durably fail. Drives `supervise_recovered` directly with
+    /// stay live but durably record cleanup failure. Drives
+    /// `supervise_recovered` directly with
     /// `max_attempts: 1` so this test only waits through one
     /// `CONNECT_GRACE` window (~5s) instead of production's real
     /// `MAX_RECOVERY_ATTEMPTS` -- see `supervise_recovered`'s own doc
     /// comment for why that parameter exists at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_recovered_session_whose_runner_stays_unreachable_is_durably_failed_not_left_dangling()
-     {
+    async fn a_recovered_session_whose_runner_stays_unreachable_stays_owned_and_durably_failed() {
         let directory = private_tempdir();
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
@@ -3871,8 +3871,11 @@ mod tests {
             .into_iter()
             .find(|session| session.id == session_id)
             .expect("the recovered session must still exist");
-        assert_eq!(session.state, SessionState::Failed);
-        assert!(!session.state.is_live());
+        assert!(session.state.is_live());
+        assert_eq!(
+            session.cleanup_state,
+            factory_core::SessionCleanupState::Failed
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
