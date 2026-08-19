@@ -1777,7 +1777,8 @@ async fn handle_request(
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
             let session_id = session.id.clone();
-            let (activity, inferred, wait_reason) = compute_hook_fields(event, &payload);
+            let (activity, inferred, wait_reason, notification_kind) =
+                compute_hook_fields(event, &payload);
             let policy_decision = (event == ProviderHookEvent::PreToolUse)
                 .then(|| crate::policy::decide(&payload, Path::new(&session.worktree)));
             let budget_denied = if event == ProviderHookEvent::PreToolUse {
@@ -1814,12 +1815,13 @@ async fn handle_request(
             let record_session_id = session_id.clone();
             let updated_session = state
                 .commit_and_publish(move |store| {
-                    let (session, event_envelope) = store.record_hook_event(
+                    let (session, event_envelope) = store.record_hook_event_with_notification(
                         &record_session_id,
                         event,
                         activity,
                         inferred,
                         wait_reason,
+                        notification_kind,
                         now_ms()?,
                     )?;
                     Ok((session, vec![event_envelope]))
@@ -2869,11 +2871,16 @@ fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {
 fn compute_hook_fields(
     event: ProviderHookEvent,
     payload: &serde_json::Value,
-) -> (Option<String>, bool, Option<String>) {
+) -> (
+    Option<String>,
+    bool,
+    Option<String>,
+    Option<factory_core::ProviderNotificationKind>,
+) {
     match event {
-        ProviderHookEvent::SessionStart | ProviderHookEvent::Stop => (None, false, None),
+        ProviderHookEvent::SessionStart | ProviderHookEvent::Stop => (None, false, None, None),
         ProviderHookEvent::UserPromptSubmit | ProviderHookEvent::PostToolUse => {
-            (Some("thinking".into()), true, None)
+            (Some("thinking".into()), true, None, None)
         }
         ProviderHookEvent::PreToolUse => {
             let tool_name = payload
@@ -2884,6 +2891,7 @@ fn compute_hook_fields(
                 Some(bounded_hook_field(&format!("tool: {tool_name}"))),
                 false,
                 None,
+                None,
             )
         }
         ProviderHookEvent::Notification => {
@@ -2891,19 +2899,31 @@ fn compute_hook_fields(
                 .get("message")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("waiting for input");
-            let cause = match payload
+            let notification_kind = match payload
                 .get("notification_type")
                 .and_then(serde_json::Value::as_str)
             {
-                Some("permission_prompt") => "provider permission: ",
-                Some("elicitation_dialog") => "provider question: ",
-                Some("idle_prompt") => "provider idle: ",
-                _ => "provider notification: ",
+                Some("permission_prompt") => {
+                    Some(factory_core::ProviderNotificationKind::PermissionPrompt)
+                }
+                Some("elicitation_dialog") => {
+                    Some(factory_core::ProviderNotificationKind::ElicitationDialog)
+                }
+                Some("idle_prompt") => Some(factory_core::ProviderNotificationKind::IdlePrompt),
+                Some("auth_success") => Some(factory_core::ProviderNotificationKind::AuthSuccess),
+                Some("elicitation_complete") => {
+                    Some(factory_core::ProviderNotificationKind::ElicitationComplete)
+                }
+                Some("elicitation_response") => {
+                    Some(factory_core::ProviderNotificationKind::ElicitationResponse)
+                }
+                _ => None,
             };
             (
                 None,
                 false,
-                Some(bounded_hook_field(&format!("{cause}{message}"))),
+                Some(bounded_hook_field(message)),
+                notification_kind,
             )
         }
         ProviderHookEvent::PermissionRequest => {
@@ -2924,9 +2944,12 @@ fn compute_hook_fields(
                 Some(bounded_hook_field(&format!(
                     "provider approval prompt: {tool_name}"
                 ))),
+                None,
             )
         }
-        ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => (None, false, None),
+        ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => {
+            (None, false, None, None)
+        }
     }
 }
 
@@ -3312,29 +3335,30 @@ mod hook_field_tests {
 
     #[test]
     fn claude_notification_subtype_is_the_only_answerability_authority() {
-        for (notification_type, prefix) in [
-            ("permission_prompt", "provider permission: "),
-            ("elicitation_dialog", "provider question: "),
-            ("idle_prompt", "provider idle: "),
-            ("unknown", "provider notification: "),
+        for notification_type in [
+            "permission_prompt",
+            "elicitation_dialog",
+            "idle_prompt",
+            "auth_success",
+            "elicitation_complete",
+            "elicitation_response",
         ] {
-            let (_, _, reason) = compute_hook_fields(
+            let (_, _, reason, kind) = compute_hook_fields(
                 ProviderHookEvent::Notification,
                 &serde_json::json!({
                     "notification_type": notification_type,
                     "message": "Approve delivery?"
                 }),
             );
-            assert!(reason.unwrap().starts_with(prefix));
+            assert_eq!(reason.as_deref(), Some("Approve delivery?"));
+            assert!(kind.is_some());
         }
-        let (_, _, reason) = compute_hook_fields(
+        let (_, _, reason, kind) = compute_hook_fields(
             ProviderHookEvent::Notification,
             &serde_json::json!({"message": "Which branch?"}),
         );
-        assert_eq!(
-            reason.as_deref(),
-            Some("provider notification: Which branch?")
-        );
+        assert_eq!(reason.as_deref(), Some("Which branch?"));
+        assert!(kind.is_none());
     }
 
     #[test]

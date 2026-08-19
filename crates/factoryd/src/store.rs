@@ -3,8 +3,9 @@ use std::path::Path;
 use factory_core::{
     AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
-    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    ProviderNotificationKind, RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus,
+    RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot,
+    TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
     model_policy,
@@ -26,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 24;
+const SCHEMA_VERSION: i64 = 26;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -371,6 +372,7 @@ pub struct SessionRow {
     pub runner_runtime: String,
     pub runner_protocol_version: u16,
     pub last_hook_event: Option<ProviderHookEvent>,
+    pub notification_kind: Option<ProviderNotificationKind>,
     pub last_hook_at_ms: Option<i64>,
     pub started_at_ms: i64,
     pub updated_at_ms: i64,
@@ -402,6 +404,7 @@ impl SessionRow {
             activity: self.activity.clone(),
             activity_inferred: self.activity_inferred,
             last_hook_event: self.last_hook_event,
+            notification_kind: self.notification_kind,
             last_hook_at_ms: self.last_hook_at_ms,
             wait_reason: self.wait_reason.clone(),
             observer_reason: self.observer_reason.clone(),
@@ -1321,12 +1324,12 @@ impl Store {
                 codex_home, hook_token, state, state_since_ms, activity,
                 activity_inferred, wait_reason, observer_health,
                 observer_health_since_ms, runner_instance_id, runner_runtime,
-                runner_protocol_version, last_hook_event, last_hook_at_ms,
+                runner_protocol_version, last_hook_event, notification_kind, last_hook_at_ms,
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
                 stop_requested_at_ms
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
-                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, ?13, ?13,
+                NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, NULL, ?13, ?13,
                 NULL, NULL, NULL, NULL
              )",
             params![
@@ -1392,7 +1395,8 @@ impl Store {
 
     /// Implements the hook state machine: `SessionStart` -> `idle` (only
     /// from `starting`); `UserPromptSubmit`/`PreToolUse`/`PostToolUse` ->
-    /// `working`; `Notification` -> `waiting_for_input`; `Stop` -> `idle`
+    /// `working`; typed actionable `Notification` -> `waiting_for_input`,
+    /// routine/unknown `Notification` -> `idle`; `Stop` -> `idle`
     /// (clears activity); `SubagentStop`/`SessionEnd` record only, without
     /// changing session state. Never closes a run.
     pub fn record_hook_event(
@@ -1402,6 +1406,31 @@ impl Store {
         activity: Option<String>,
         inferred: bool,
         wait_reason: Option<String>,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, EventEnvelope)> {
+        self.record_hook_event_with_notification(
+            session_id,
+            event,
+            activity,
+            inferred,
+            wait_reason,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Records a provider hook with its typed notification cause. The cause
+    /// is durable session state; free-form wait text is never consulted to
+    /// decide whether a notification is answerable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_hook_event_with_notification(
+        &mut self,
+        session_id: &SessionId,
+        event: ProviderHookEvent,
+        activity: Option<String>,
+        inferred: bool,
+        wait_reason: Option<String>,
+        notification_kind: Option<ProviderNotificationKind>,
         now_ms: i64,
     ) -> Result<(SessionSnapshot, EventEnvelope)> {
         if activity
@@ -1427,6 +1456,7 @@ impl Store {
         let mut next_activity = session.activity.clone();
         let mut next_inferred = session.activity_inferred;
         let mut next_wait_reason = session.wait_reason.clone();
+        let mut next_notification_kind = session.notification_kind;
         match event {
             ProviderHookEvent::SessionStart => {
                 if session.state == SessionState::Starting {
@@ -1434,6 +1464,7 @@ impl Store {
                     next_activity = None;
                     next_inferred = false;
                     next_wait_reason = None;
+                    next_notification_kind = None;
                 }
             }
             ProviderHookEvent::UserPromptSubmit
@@ -1443,16 +1474,37 @@ impl Store {
                 next_activity = activity;
                 next_inferred = inferred;
                 next_wait_reason = None;
+                next_notification_kind = None;
             }
-            ProviderHookEvent::Notification | ProviderHookEvent::PermissionRequest => {
+            ProviderHookEvent::Notification => {
+                if matches!(
+                    notification_kind,
+                    Some(
+                        ProviderNotificationKind::PermissionPrompt
+                            | ProviderNotificationKind::ElicitationDialog
+                    )
+                ) {
+                    state = SessionState::WaitingForInput;
+                    next_wait_reason = wait_reason;
+                } else {
+                    state = SessionState::Idle;
+                    next_activity = None;
+                    next_inferred = false;
+                    next_wait_reason = None;
+                }
+                next_notification_kind = notification_kind;
+            }
+            ProviderHookEvent::PermissionRequest => {
                 state = SessionState::WaitingForInput;
                 next_wait_reason = wait_reason;
+                next_notification_kind = None;
             }
             ProviderHookEvent::Stop => {
                 state = SessionState::Idle;
                 next_activity = None;
                 next_inferred = false;
                 next_wait_reason = None;
+                next_notification_kind = None;
             }
             ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => {
                 // Records only: a subagent finishing does not mean the
@@ -1469,9 +1521,9 @@ impl Store {
         transaction.execute(
             "UPDATE sessions
              SET state = ?1, state_since_ms = ?2, activity = ?3, activity_inferred = ?4,
-                 wait_reason = ?5, last_hook_event = ?6, last_hook_at_ms = ?7,
-                 updated_at_ms = ?7
-             WHERE id = ?8",
+                 wait_reason = ?5, last_hook_event = ?6, notification_kind = ?7,
+                 last_hook_at_ms = ?8, updated_at_ms = ?8
+             WHERE id = ?9",
             params![
                 session_state_value(state),
                 state_since_ms,
@@ -1479,6 +1531,7 @@ impl Store {
                 next_inferred,
                 next_wait_reason,
                 provider_hook_event_value(event),
+                next_notification_kind.map(provider_notification_kind_value),
                 now_ms,
                 session_id.as_str(),
             ],
@@ -2033,7 +2086,7 @@ impl Store {
         transaction.execute(
             "UPDATE sessions
              SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
-                 wait_reason = ?2
+                 wait_reason = ?2, notification_kind = NULL
              WHERE id = ?3",
             params![now_ms, wait_reason, session_id.as_str()],
         )?;
@@ -5233,7 +5286,8 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.state, s.state_since_ms,
                     s.activity, s.activity_inferred, s.wait_reason, s.observer_reason,
                     s.observer_health, s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
-                    s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
+                    s.runner_protocol_version, s.last_hook_event, s.notification_kind,
+                    s.last_hook_at_ms,
                     s.started_at_ms, s.updated_at_ms, s.ended_at_ms, s.exit_code,
                     s.exit_signal, s.stop_requested_at_ms,
                     (SELECT r.id FROM runs r
@@ -5252,7 +5306,8 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
     let observer_health: String = row.get(18)?;
     let protocol: i64 = row.get(22)?;
     let last_hook_event: Option<String> = row.get(23)?;
-    let current_run_id: Option<String> = row.get(31)?;
+    let notification_kind: Option<String> = row.get(24)?;
+    let current_run_id: Option<String> = row.get(32)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -5282,13 +5337,16 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         last_hook_event: last_hook_event
             .map(|value| parse_provider_hook_event(&value, 23))
             .transpose()?,
-        last_hook_at_ms: row.get(24)?,
-        started_at_ms: row.get(25)?,
-        updated_at_ms: row.get(26)?,
-        ended_at_ms: row.get(27)?,
-        exit_code: row.get(28)?,
-        exit_signal: row.get(29)?,
-        stop_requested_at_ms: row.get(30)?,
+        notification_kind: notification_kind
+            .map(|value| parse_provider_notification_kind(&value, 24))
+            .transpose()?,
+        last_hook_at_ms: row.get(25)?,
+        started_at_ms: row.get(26)?,
+        updated_at_ms: row.get(27)?,
+        ended_at_ms: row.get(28)?,
+        exit_code: row.get(29)?,
+        exit_signal: row.get(30)?,
+        stop_requested_at_ms: row.get(31)?,
         current_run_id: parse_optional_id(current_run_id, 31)?,
     })
 }
@@ -5742,6 +5800,24 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.execute_batch(include_str!("../migrations/0024_delivery_attempts.sql"))?;
         transaction.pragma_update(None, "user_version", 24)?;
         transaction.commit()?;
+        current = 24;
+    }
+    if current == 24 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0025_session_observer_reason.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 25)?;
+        transaction.commit()?;
+        current = 25;
+    }
+    if current == 25 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0026_session_notification_kind.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 26)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6029,6 +6105,15 @@ fn parse_provider_hook_event(value: &str, column: usize) -> rusqlite::Result<Pro
     })
 }
 
+fn parse_provider_notification_kind(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<ProviderNotificationKind> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
 fn parse_optional_failure_reason(
     value: Option<String>,
     column: usize,
@@ -6093,6 +6178,17 @@ const fn observer_health_value(value: ObserverHealth) -> &'static str {
         ObserverHealth::Unknown => "unknown",
         ObserverHealth::Healthy => "healthy",
         ObserverHealth::Degraded => "degraded",
+    }
+}
+
+const fn provider_notification_kind_value(value: ProviderNotificationKind) -> &'static str {
+    match value {
+        ProviderNotificationKind::PermissionPrompt => "permission_prompt",
+        ProviderNotificationKind::ElicitationDialog => "elicitation_dialog",
+        ProviderNotificationKind::IdlePrompt => "idle_prompt",
+        ProviderNotificationKind::AuthSuccess => "auth_success",
+        ProviderNotificationKind::ElicitationComplete => "elicitation_complete",
+        ProviderNotificationKind::ElicitationResponse => "elicitation_response",
     }
 }
 

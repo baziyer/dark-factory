@@ -968,6 +968,7 @@ mod tests {
             runner_runtime: "/tmp/runner".into(),
             runner_protocol_version: 1,
             last_hook_event: None,
+            notification_kind: None,
             last_hook_at_ms: None,
             started_at_ms: 1,
             updated_at_ms: 1,

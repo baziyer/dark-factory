@@ -15,8 +15,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::{
-    AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
-    SessionSnapshot, TaskId, TaskSnapshot,
+    AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, ProviderNotificationKind,
+    RunSnapshot, SessionId, SessionSnapshot, TaskId, TaskSnapshot,
     attention::{Attention, task_attention},
     local::AgentDetail,
 };
@@ -657,41 +657,48 @@ fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReas
                 ),
             ));
         }
-        if session.last_hook_event == Some(ProviderHookEvent::Notification)
-            && summary
-                .as_deref()
-                .is_some_and(|value| value.starts_with("provider permission: "))
-        {
-            return Some((
-                Attention::NeedsInput,
-                reason(
-                    AttentionReasonKind::ProviderPermission,
-                    summary
-                        .unwrap()
-                        .trim_start_matches("provider permission: ")
-                        .to_owned(),
-                    "provider approval prompt",
-                    AttentionAction::ReviewProviderPermission,
-                ),
-            ));
+        match (
+            session.last_hook_event,
+            session.notification_kind,
+            summary.clone(),
+        ) {
+            (
+                Some(ProviderHookEvent::Notification),
+                Some(ProviderNotificationKind::PermissionPrompt),
+                Some(summary),
+            ) => {
+                return Some((
+                    Attention::NeedsInput,
+                    reason(
+                        AttentionReasonKind::ProviderPermission,
+                        summary,
+                        "provider approval prompt",
+                        AttentionAction::ReviewProviderPermission,
+                    ),
+                ));
+            }
+            (
+                Some(ProviderHookEvent::Notification),
+                Some(ProviderNotificationKind::ElicitationDialog),
+                Some(summary),
+            ) => {
+                return Some((
+                    Attention::NeedsInput,
+                    reason(
+                        AttentionReasonKind::ProviderQuestion,
+                        summary,
+                        "provider is waiting for an answer",
+                        AttentionAction::AnswerInTerminal,
+                    ),
+                ));
+            }
+            _ => {}
         }
-        if session.last_hook_event == Some(ProviderHookEvent::Notification)
-            && summary
-                .as_deref()
-                .is_some_and(|value| value.starts_with("provider question: "))
-        {
-            return Some((
-                Attention::NeedsInput,
-                reason(
-                    AttentionReasonKind::ProviderQuestion,
-                    summary
-                        .unwrap()
-                        .trim_start_matches("provider question: ")
-                        .to_owned(),
-                    "provider is waiting for an answer",
-                    AttentionAction::AnswerInTerminal,
-                ),
-            ));
+        // A legacy or malformed Notification without a typed cause is not
+        // evidence of an answerable prompt. Keep it routine until a typed
+        // actionable hook arrives.
+        if session.last_hook_event == Some(ProviderHookEvent::Notification) {
+            return None;
         }
         return Some((
             Attention::NeedsInput,
@@ -856,6 +863,7 @@ mod tests {
             activity: None,
             activity_inferred: false,
             last_hook_event: None,
+            notification_kind: None,
             last_hook_at_ms: None,
             wait_reason: None,
             observer_reason: None,
@@ -1025,7 +1033,8 @@ mod tests {
         let project = ProjectId::try_from("p").unwrap();
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
-        question.wait_reason = Some("provider question: Which branch?".to_owned());
+        question.notification_kind = Some(ProviderNotificationKind::ElicitationDialog);
+        question.wait_reason = Some("Which branch?".to_owned());
         let mut permission = session(SessionState::WaitingForInput, 20);
         permission.id = SessionId::try_from("s2").unwrap();
         permission.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
@@ -1109,8 +1118,8 @@ mod tests {
     fn authoritative_wait_causes_do_not_infer_answers_from_notification_text() {
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
-        question.wait_reason =
-            Some("provider question: Which recovery branch should I use?".to_owned());
+        question.notification_kind = Some(ProviderNotificationKind::ElicitationDialog);
+        question.wait_reason = Some("Which recovery branch should I use?".to_owned());
         let (_, question) = session_reason(&question).unwrap();
         assert_eq!(question.kind, AttentionReasonKind::ProviderQuestion);
         assert_eq!(question.action, AttentionAction::AnswerInTerminal);
@@ -1122,18 +1131,15 @@ mod tests {
         assert_eq!(permission.kind, AttentionReasonKind::ProviderPermission);
         assert_eq!(permission.action, AttentionAction::ReviewProviderPermission);
 
-        let mut idle = session(SessionState::WaitingForInput, 25);
+        let mut idle = session(SessionState::Idle, 25);
         idle.last_hook_event = Some(ProviderHookEvent::Notification);
-        idle.wait_reason = Some("provider idle: waiting for operator".to_owned());
-        let (_, idle) = session_reason(&idle).unwrap();
-        assert_eq!(idle.kind, AttentionReasonKind::Inferred);
-        assert_eq!(idle.action, AttentionAction::InspectInferredState);
+        idle.notification_kind = Some(ProviderNotificationKind::IdlePrompt);
+        assert!(session_reason(&idle).is_none());
 
         let mut old_notification = session(SessionState::WaitingForInput, 26);
         old_notification.last_hook_event = Some(ProviderHookEvent::Notification);
         old_notification.wait_reason = Some("Approve delivery?".to_owned());
-        let (_, old_notification) = session_reason(&old_notification).unwrap();
-        assert_eq!(old_notification.kind, AttentionReasonKind::Inferred);
+        assert!(session_reason(&old_notification).is_none());
 
         let mut synthetic_delivery = session(SessionState::WaitingForInput, 30);
         synthetic_delivery.last_hook_event = Some(ProviderHookEvent::Notification);
