@@ -28,6 +28,11 @@ repo="$scratch/repo"
 socket="$home/f.sock"
 mkdir -p "$home" "$repo" "$scratch/user"
 chmod 700 "$home" "$scratch/user"
+# A contributor may invoke this from inside an agent session. Do not let that
+# session's authenticated identity, outbox, or trusted helper leak into the
+# throwaway smoke; the daemon will supply fresh values to its shell session.
+unset DARK_FACTORY_AGENT DARK_FACTORY_PROJECT DARK_FACTORY_SESSION_TOKEN_FILE \
+    DARK_FACTORY_AGENT_DIR DARK_FACTORY_FACTORYCTL DARK_FACTORY_FORCE_OUTBOX
 export DARK_FACTORY_HOME="$home"
 export DARK_FACTORY_SOCKET="$socket"
 export HOME="$scratch/user"
