@@ -372,7 +372,6 @@ local_ci_lease_release_owner() {
     local_ci_lease_expected_ref=$(basename "${LOCAL_CI_LEASE_OWNER_RECORD-}")
     if [ -n "$local_ci_lease_expected_ref" ] && [ "$local_ci_lease_current_ref" = "$local_ci_lease_expected_ref" ]; then
         rm -f "$LOCAL_CI_LEASE_PATH"
-        rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
     fi
 }
 
@@ -471,6 +470,7 @@ local_ci_lease_run() {
         set -e
         local_ci_lease_release_owner
         local_ci_lease_remove_lock_object
+        rm -f "$LOCAL_CI_LEASE_OWNER_RECORD"
         exit "$status"
     ' local-ci-lease-holder "$LOCAL_CI_LEASE_HELPER" "$LOCAL_CI_LEASE_COMMON_DIR" \
         "$local_ci_lease_working_directory" "$@"
