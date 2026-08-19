@@ -285,6 +285,13 @@ fn migrations_0019_and_0020_follow_the_budget_schema_in_order() {
             .execute_batch(
                 "DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
+                 ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
+                 ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN runtime_model;
+                 ALTER TABLE sessions DROP COLUMN runtime_reasoning_effort;
+                 ALTER TABLE sessions DROP COLUMN runtime_permission_mode;
+                 ALTER TABLE sessions DROP COLUMN runtime_control_mode;
+                 ALTER TABLE sessions DROP COLUMN cleanup_state;
                  PRAGMA user_version = 18;",
             )
             .unwrap();
