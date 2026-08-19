@@ -57,19 +57,17 @@ use crate::{
     providers::{self, SpawnContext, hooks},
     runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
     runner_process::{self, LaunchSpec, ProviderEnvironment},
-    store::{RecoverableSession, SessionRow, StoreError},
+    store::{
+        DeliveryAttempt, DeliveryAttemptState, NewDeliveryAttempt, RecoverableSession, SessionRow,
+        StoreError,
+    },
 };
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// How long PTY-typed delivery waits for a matching `UserPromptSubmit` hook
 /// before retrying once (TRACK5-DESIGN.md §3/A3).
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
-/// One outer retry after `type_and_await_ack` has already exhausted its two
-/// immediate attempts. A resumed provider can report its terminal as ready
-/// before it has restored the prior thread's input surface; retry once on the
-/// safety tick, then leave the exact durable wait reason for operator action.
-const MAX_AUTOMATIC_DELIVERY_FAILURES: u32 = 2;
-const DELIVERY_RETRY_DELAY: Duration = Duration::from_secs(5);
+const RECOVERY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Gap between a composed delivery's text and its submitting `\r`, sent as
 /// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
 /// has the why: real Claude Code's paste-vs-keystroke heuristic otherwise
@@ -347,9 +345,62 @@ impl Handle {
         // never independently compose and deliver the same pending
         // task/messages while this explicit operator request is already
         // mid-flight.
-        let Some(_delivery_slot) = self.state.try_delivery_slot(&agent_id) else {
+        let _delivery_slot = self.state.lock_delivery_slot(&agent_id).await;
+        let existing_attempt = self
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session.id.clone();
+                move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+            })
+            .await?;
+        if existing_attempt.is_some() {
             return Err(Error::DeliveryInProgress);
-        };
+        }
+        let (task, messages, (task_incarnation_id, prior_run_count)) = self
+            .state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let task_id = task_id.clone();
+                let session_id = session.id.clone();
+                move |store| {
+                    let task = store.get_task(&project_id, &task_id)?;
+                    if task.snapshot.status != factory_core::TaskStatus::Queued
+                        || task.snapshot.assigned_agent_id.as_ref() != Some(&agent_id)
+                    {
+                        return Err(StoreError::TaskNotQueued);
+                    }
+                    let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
+                    let marker = store.task_delivery_marker(&session_id, &task_id)?;
+                    Ok((task, messages, marker))
+                }
+            })
+            .await?;
+        let text = compose_text(
+            &self.config.guidance_root,
+            &project_id,
+            &agent_id,
+            Some(&task),
+            &messages,
+            role_hint(&self.state, &project_id, &agent_id).await,
+        );
+        let attempt = ensure_delivery_attempt(
+            &self.state,
+            &project_id,
+            &agent_id,
+            &session.id,
+            Delivery {
+                task_id: Some(task_id.clone()),
+                task_incarnation_id: Some(task_incarnation_id),
+                prior_run_count: Some(prior_run_count),
+                message_ids: messages.iter().map(|message| message.id.clone()).collect(),
+                text,
+            },
+            now_ms()?,
+        )
+        .await?;
 
         let opened_at_ms = now_ms()?;
         let session_id = session.id.clone();
@@ -364,14 +415,6 @@ impl Handle {
             .await?;
         let run_id = opened.run.id.clone();
 
-        let text = compose_text(
-            &self.config.guidance_root,
-            &project_id,
-            &agent_id,
-            Some(&opened.task),
-            &opened.agent_messages,
-            role_hint(&self.state, &project_id, &agent_id).await,
-        );
         let target = self
             .state
             .with_store({
@@ -385,7 +428,36 @@ impl Handle {
             session_run_id(&session.id)?,
             target.runner_instance_id,
         );
-        if !type_and_await_ack(&self.state, &client, &session.id, &text).await {
+        if type_and_await_ack(
+            &self.state,
+            &client,
+            &session.id,
+            &attempt.id,
+            &attempt.text,
+            false,
+        )
+        .await
+        {
+            commit_delivery(
+                &self.state,
+                &project_id,
+                &agent_id,
+                &session.id,
+                &attempt.id,
+                Delivery::from_attempt(&attempt),
+                now_ms()?,
+            )
+            .await?;
+        } else {
+            let attempt_id = attempt.id.clone();
+            let failure_now = now_ms()?;
+            let _ = self
+                .state
+                .commit_and_publish(move |store| {
+                    store.record_delivery_failure(&attempt_id, failure_now)?;
+                    Ok(((), Vec::new()))
+                })
+                .await;
             let reason = "delivery unacknowledged".to_owned();
             let wait_session_id = session.id.clone();
             let wait_at_ms = now_ms()?;
@@ -540,7 +612,30 @@ impl Handle {
     /// streak).
     pub fn resume_backoff(&self, agent_id: &AgentId) {
         self.backoff.record_success(agent_id);
-        self.backoff.reset_delivery_failures(agent_id);
+    }
+
+    pub async fn reset_delivery_attempt(
+        &self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+    ) -> Result<(), Error> {
+        let now = now_ms()?;
+        let project_id = project_id.clone();
+        let agent_id = agent_id.clone();
+        self.state
+            .commit_and_publish(move |store| {
+                store.reset_delivery_attempt(&project_id, &agent_id, now)?;
+                Ok(((), Vec::new()))
+            })
+            .await?;
+        Ok(())
+    }
+
+    pub async fn lock_delivery_admission(
+        &self,
+        agent_id: &AgentId,
+    ) -> crate::daemon_state::DeliverySlot {
+        self.state.lock_delivery_slot(agent_id).await
     }
 
     /// Stops the dispatcher. Live sessions are untouched: closing/crashing
@@ -651,12 +746,6 @@ struct BackoffTiming {
     /// deadline failures since the last success", not "3 in an unbroken
     /// row with literally nothing else in between".
     consecutive_start_deadlines: u32,
-    /// Bounded recovery for a delivery whose provider never acknowledged the
-    /// typed prompt. Kept beside spawn pacing so the same agent-scoped gate
-    /// and operator resume reset apply, but it is deliberately not part of
-    /// the spawn-failure curve.
-    delivery_failures: u32,
-    next_delivery_attempt_at: Option<Instant>,
 }
 
 impl Default for BackoffTiming {
@@ -666,8 +755,6 @@ impl Default for BackoffTiming {
             delay: Duration::ZERO,
             consecutive_failures: 0,
             consecutive_start_deadlines: 0,
-            delivery_failures: 0,
-            next_delivery_attempt_at: None,
         }
     }
 }
@@ -777,68 +864,7 @@ impl SpawnBackoff {
             .timing
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = timing.get_mut(agent_id) {
-            entry.next_attempt_at = Instant::now();
-            entry.delay = Duration::ZERO;
-            entry.consecutive_failures = 0;
-            entry.consecutive_start_deadlines = 0;
-            if entry.delivery_failures == 0 {
-                timing.remove(agent_id);
-            }
-        }
-    }
-
-    /// Whether the dispatcher may make the one bounded retry for a delivery
-    /// currently parked at `delivery unacknowledged`.
-    fn delivery_retry_ready(&self, agent_id: &AgentId) -> bool {
-        let timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        timing.get(agent_id).is_some_and(|entry| {
-            entry.delivery_failures < MAX_AUTOMATIC_DELIVERY_FAILURES
-                && entry
-                    .next_delivery_attempt_at
-                    .is_some_and(|at| Instant::now() >= at)
-        })
-    }
-
-    fn record_delivery_failure(&self, agent_id: &AgentId) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = timing.entry(agent_id.clone()).or_default();
-        entry.delivery_failures = entry.delivery_failures.saturating_add(1);
-        entry.next_delivery_attempt_at = Some(Instant::now() + DELIVERY_RETRY_DELAY);
-    }
-
-    fn record_delivery_success(&self, agent_id: &AgentId) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = timing.get_mut(agent_id) {
-            entry.delivery_failures = 0;
-            entry.next_delivery_attempt_at = None;
-            if entry.consecutive_failures == 0 {
-                timing.remove(agent_id);
-            }
-        }
-    }
-
-    fn reset_delivery_failures(&self, agent_id: &AgentId) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = timing.get_mut(agent_id) {
-            entry.delivery_failures = 0;
-            // ResumeAgent is the operator's explicit retry decision. Keep
-            // the entry armed so the wake sent by local_api reaches the
-            // waiting-for-input dispatch arm immediately.
-            entry.next_delivery_attempt_at = Some(Instant::now());
-        }
+        timing.remove(agent_id);
     }
 
     fn try_begin_preparation(&self, agent_id: &AgentId) -> bool {
@@ -994,6 +1020,13 @@ async fn run_dispatcher(
     mut shutdown_rx: watch::Receiver<bool>,
     backoff: Arc<SpawnBackoff>,
 ) -> Result<(), Error> {
+    let recovery_now = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            store.recover_delivery_attempts(recovery_now)?;
+            Ok(((), Vec::new()))
+        })
+        .await?;
     recover_sessions(&state, &wake_tx, &shutdown_rx).await;
 
     let mut tick = tokio::time::interval(TICK_INTERVAL);
@@ -1182,7 +1215,22 @@ async fn dispatch_agent(
             if session.state == SessionState::WaitingForInput
                 && session.wait_reason.as_deref() == Some("delivery unacknowledged") =>
         {
-            if backoff.delivery_retry_ready(agent_id) {
+            let due = state
+                .with_store({
+                    let project_id = project_id.clone();
+                    let agent_id = agent_id.clone();
+                    let session_id = session.id.clone();
+                    move |store| {
+                        store.delivery_attempt_due(
+                            &project_id,
+                            &agent_id,
+                            &session_id,
+                            now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
+                        )
+                    }
+                })
+                .await?;
+            if due {
                 deliver_pending(
                     config,
                     state,
@@ -1961,7 +2009,20 @@ struct Delivery {
     task_id: Option<factory_core::TaskId>,
     task_incarnation_id: Option<String>,
     prior_run_count: Option<usize>,
+    message_ids: Vec<factory_core::MessageId>,
     text: String,
+}
+
+impl Delivery {
+    fn from_attempt(attempt: &DeliveryAttempt) -> Self {
+        Self {
+            task_id: attempt.task_id.clone(),
+            task_incarnation_id: attempt.task_incarnation_id.clone(),
+            prior_run_count: attempt.prior_run_count,
+            message_ids: attempt.message_ids.clone(),
+            text: attempt.text.clone(),
+        }
+    }
 }
 
 async fn compose_delivery(
@@ -2009,8 +2070,37 @@ async fn compose_delivery(
                 task_id,
                 task_incarnation_id,
                 prior_run_count,
+                message_ids: messages.iter().map(|message| message.id.clone()).collect(),
                 text,
             }))
+        })
+        .await
+}
+
+async fn ensure_delivery_attempt(
+    state: &DaemonState,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+    session_id: &SessionId,
+    delivery: Delivery,
+    now_ms: i64,
+) -> Result<DeliveryAttempt, DaemonStateError> {
+    let input = NewDeliveryAttempt {
+        id: Uuid::new_v4().hyphenated().to_string(),
+        project_id: project_id.clone(),
+        agent_id: agent_id.clone(),
+        session_id: session_id.clone(),
+        task_id: delivery.task_id,
+        task_incarnation_id: delivery.task_incarnation_id,
+        prior_run_count: delivery.prior_run_count,
+        message_ids: delivery.message_ids,
+        text: delivery.text,
+        created_at_ms: now_ms,
+    };
+    state
+        .commit_and_publish(move |store| {
+            let attempt = store.ensure_delivery_attempt(input)?;
+            Ok((attempt, Vec::new()))
         })
         .await
 }
@@ -2024,14 +2114,23 @@ async fn commit_delivery(
     project_id: &ProjectId,
     agent_id: &AgentId,
     session_id: &SessionId,
+    attempt_id: &str,
     delivery: Delivery,
     now_ms: i64,
 ) -> Result<Option<RunId>, DaemonStateError> {
     let project_id = project_id.clone();
     let agent_id = agent_id.clone();
     let session_id = session_id.clone();
+    let attempt_id = attempt_id.to_owned();
     state
         .commit_and_publish(move |store| {
+            let attempt_state = store.delivery_attempt_state(&attempt_id)?;
+            if !matches!(
+                attempt_state,
+                Some(DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable)
+            ) {
+                return Ok((None, Vec::new()));
+            }
             match (
                 delivery.task_id,
                 delivery.task_incarnation_id,
@@ -2041,6 +2140,7 @@ async fn commit_delivery(
                     match store.open_run_episode(&session_id, &task_id, now_ms) {
                         Ok(opened) => {
                             let run_id = opened.run.id.clone();
+                            store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
                             Ok((Some(run_id), opened.events))
                         }
                         // The synchronous `UserPromptSubmit` hook commit can
@@ -2060,13 +2160,24 @@ async fn commit_delivery(
                                 prior_run_count,
                             )? =>
                         {
+                            store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
+                            Ok((None, Vec::new()))
+                        }
+                        Err(StoreError::SessionStopping | StoreError::SessionNotLive) => {
                             Ok((None, Vec::new()))
                         }
                         Err(error) => Err(error),
                     }
                 }
                 (None, None, None) => {
-                    store.deliver_agent_messages(&project_id, &agent_id, &session_id, now_ms)?;
+                    store.deliver_agent_messages_by_ids(
+                        &project_id,
+                        &agent_id,
+                        &session_id,
+                        &delivery.message_ids,
+                        now_ms,
+                    )?;
+                    store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
                     Ok((None, Vec::new()))
                 }
                 _ => Err(StoreError::InvalidExecutionMetadata),
@@ -2123,36 +2234,36 @@ async fn commit_delivery(
 /// it safe to treat as that delivery's ack.
 pub(crate) async fn commit_pending_delivery_on_prompt(
     state: &DaemonState,
-    guidance_root: &Path,
     session: &SessionSnapshot,
+    payload: &serde_json::Value,
 ) -> Result<(), DaemonStateError> {
-    if !state.delivery_in_flight(&session.agent_id) {
-        return Ok(());
-    }
-    let Some(delivery) = compose_delivery(
-        state,
-        guidance_root,
-        &session.project_id,
-        &session.agent_id,
-        &session.id,
-    )
-    .await?
+    let Some(attempt) = state
+        .with_store({
+            let project_id = session.project_id.clone();
+            let agent_id = session.agent_id.clone();
+            let session_id = session.id.clone();
+            move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+        })
+        .await?
     else {
         return Ok(());
     };
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(0);
+    if !matches!(
+        attempt.state,
+        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+    ) || payload.get("prompt").and_then(serde_json::Value::as_str) != Some(attempt.text.as_str())
+    {
+        return Ok(());
+    }
+    let now =
+        now_ms().map_err(|_| DaemonStateError::Store(StoreError::InvalidExecutionMetadata))?;
     commit_delivery(
         state,
         &session.project_id,
         &session.agent_id,
         &session.id,
-        delivery,
+        &attempt.id,
+        Delivery::from_attempt(&attempt),
         now,
     )
     .await?;
@@ -2192,21 +2303,51 @@ async fn deliver_pending(
     // is silent, matching the delivery-slot miss above: whatever wake this
     // was for gets retried once the delete (or whatever else is deleting
     // this agent) finishes.
-    if !backoff.try_begin_preparation(agent_id) {
+    let existing = state
+        .with_store({
+            let project_id = project_id.clone();
+            let agent_id = agent_id.clone();
+            let session_id = session.id.clone();
+            move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+        })
+        .await?;
+    let attempt = if let Some(attempt) = existing {
+        attempt
+    } else {
+        if !backoff.try_begin_preparation(agent_id) {
+            return Ok(());
+        }
+        let delivery_result = compose_delivery(
+            state,
+            &config.guidance_root,
+            project_id,
+            agent_id,
+            &session.id,
+        )
+        .await;
+        backoff.end_preparation(agent_id);
+        let Some(delivery) = delivery_result? else {
+            return Ok(());
+        };
+        ensure_delivery_attempt(
+            state,
+            project_id,
+            agent_id,
+            &session.id,
+            delivery,
+            now_ms()?,
+        )
+        .await?
+    };
+    if !matches!(
+        attempt.state,
+        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+    ) || attempt
+        .next_attempt_at_ms
+        .is_some_and(|at| at > now_ms().unwrap_or(i64::MAX))
+    {
         return Ok(());
     }
-    let delivery_result = compose_delivery(
-        state,
-        &config.guidance_root,
-        project_id,
-        agent_id,
-        &session.id,
-    )
-    .await;
-    backoff.end_preparation(agent_id);
-    let Some(delivery) = delivery_result? else {
-        return Ok(());
-    };
     let target = state
         .with_store({
             let project_id = project_id.clone();
@@ -2219,20 +2360,42 @@ async fn deliver_pending(
         session_run_id(&session.id)?,
         target.runner_instance_id,
     );
-    let text = delivery.text.clone();
-    if type_and_await_ack(state, &client, &session.id, &text).await {
-        backoff.record_delivery_success(agent_id);
+    if type_and_await_ack(
+        state,
+        &client,
+        &session.id,
+        &attempt.id,
+        &attempt.text,
+        attempt.failure_count > 0,
+    )
+    .await
+    {
         commit_delivery(
             state,
             project_id,
             agent_id,
             &session.id,
-            delivery,
+            &attempt.id,
+            Delivery::from_attempt(&attempt),
             now_ms()?,
         )
         .await?;
     } else {
-        backoff.record_delivery_failure(agent_id);
+        let attempt_id = attempt.id.clone();
+        let failure = state
+            .commit_and_publish(move |store| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+                    .ok_or(StoreError::InvalidExecutionMetadata)?;
+                store.record_delivery_failure(&attempt_id, now)?;
+                Ok(((), Vec::new()))
+            })
+            .await;
+        if failure.is_err() {
+            return Ok(());
+        }
         let reason = "delivery unacknowledged".to_owned();
         let wait_session_id = session.id.clone();
         let wait_at_ms = now_ms()?;
@@ -2248,8 +2411,8 @@ async fn deliver_pending(
 }
 
 /// Types `text` into `session_id`'s PTY, then submits it with a trailing
-/// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for a
-/// `UserPromptSubmit` hook to confirm receipt; retries once on timeout.
+/// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for the
+/// exact delivery attempt's `UserPromptSubmit` hook to confirm receipt.
 /// Subscribing to the daemon's event stream *before* writing (not after)
 /// avoids missing a hook that fires between the write and the subscribe
 /// call.
@@ -2280,32 +2443,77 @@ async fn type_and_await_ack(
     state: &DaemonState,
     client: &RunnerClient,
     session_id: &SessionId,
+    attempt_id: &str,
     text: &str,
+    recovery: bool,
 ) -> bool {
     let body = encode_terminal_bytes(text.as_bytes());
     let submit = encode_terminal_bytes(b"\r");
-    for _attempt in 0..2 {
-        let mut events = state.subscribe();
-        let Ok(write_started_at_ms) = now_ms() else {
+    let mut events = state.subscribe();
+    if !delivery_attempt_active(state, attempt_id).await {
+        return false;
+    }
+    if recovery {
+        let mut flush_events = state.subscribe();
+        let Ok(flush_started_at_ms) = now_ms() else {
             return false;
         };
-        if client.terminal_input(body.clone()).await.is_err() {
-            continue;
-        }
-        sleep_until(Instant::now() + SUBMIT_DELAY).await;
-        if client.terminal_input(submit.clone()).await.is_err() {
-            continue;
-        }
-        if wait_for_ack(&mut events, session_id, write_started_at_ms, ACK_TIMEOUT).await {
+        if client
+            .terminal_input(encode_terminal_bytes(b"\r"))
+            .await
+            .is_ok()
+            && wait_for_ack(
+                state,
+                &mut flush_events,
+                session_id,
+                attempt_id,
+                flush_started_at_ms,
+                RECOVERY_FLUSH_TIMEOUT,
+            )
+            .await
+        {
             return true;
         }
     }
-    false
+    let Ok(write_started_at_ms) = now_ms() else {
+        return false;
+    };
+    if client.terminal_input(body).await.is_err() {
+        return false;
+    }
+    sleep_until(Instant::now() + SUBMIT_DELAY).await;
+    if client.terminal_input(submit).await.is_err() {
+        return false;
+    }
+    wait_for_ack(
+        state,
+        &mut events,
+        session_id,
+        attempt_id,
+        write_started_at_ms,
+        ACK_TIMEOUT,
+    )
+    .await
+}
+
+async fn delivery_attempt_active(state: &DaemonState, attempt_id: &str) -> bool {
+    let attempt_id = attempt_id.to_owned();
+    state
+        .with_store(move |store| {
+            Ok(matches!(
+                store.delivery_attempt_state(&attempt_id)?,
+                Some(DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable)
+            ))
+        })
+        .await
+        .unwrap_or(false)
 }
 
 async fn wait_for_ack(
+    state: &DaemonState,
     events: &mut broadcast::Receiver<EventEnvelope>,
     session_id: &SessionId,
+    attempt_id: &str,
     after_ms: i64,
     ack_timeout: Duration,
 ) -> bool {
@@ -2321,6 +2529,15 @@ async fn wait_for_ack(
                     if &session.id == session_id
                         && session.last_hook_event == Some(ProviderHookEvent::UserPromptSubmit)
                         && session.last_hook_at_ms.is_some_and(|at| at >= after_ms)
+                        && matches!(
+                            state
+                                .with_store({
+                                    let attempt_id = attempt_id.to_owned();
+                                    move |store| store.delivery_attempt_state(&attempt_id)
+                                })
+                                .await,
+                            Ok(Some(DeliveryAttemptState::Acknowledged))
+                        )
                     {
                         return true;
                     }
@@ -2374,7 +2591,22 @@ pub async fn stop_hook_reply(
     else {
         return Ok(serde_json::json!({}));
     };
-    let reason = delivery.text.clone();
+    let attempt = ensure_delivery_attempt(
+        state,
+        &session.project_id,
+        &session.agent_id,
+        &session.id,
+        delivery,
+        now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
+    )
+    .await?;
+    if !matches!(
+        attempt.state,
+        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+    ) {
+        return Ok(serde_json::json!({}));
+    }
+    let reason = attempt.text.clone();
     let now = i64::try_from(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2387,7 +2619,8 @@ pub async fn stop_hook_reply(
         &session.project_id,
         &session.agent_id,
         &session.id,
-        delivery,
+        &attempt.id,
+        Delivery::from_attempt(&attempt),
         now,
     )
     .await?;
@@ -2933,6 +3166,36 @@ mod tests {
         }
     }
 
+    async fn test_delivery_attempt(
+        state: &DaemonState,
+        id: &str,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        delivery: &Delivery,
+        created_at_ms: i64,
+    ) -> DeliveryAttempt {
+        let input = NewDeliveryAttempt {
+            id: id.to_owned(),
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            session_id: session_id.clone(),
+            task_id: delivery.task_id.clone(),
+            task_incarnation_id: delivery.task_incarnation_id.clone(),
+            prior_run_count: delivery.prior_run_count,
+            message_ids: delivery.message_ids.clone(),
+            text: delivery.text.clone(),
+            created_at_ms,
+        };
+        state
+            .commit_and_publish(move |store| {
+                let attempt = store.ensure_delivery_attempt(input)?;
+                Ok((attempt, Vec::new()))
+            })
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn spawn_rejects_zero_concurrency() {
         let directory = private_tempdir();
@@ -2940,6 +3203,32 @@ mod tests {
         let mut cfg = config(directory.path());
         cfg.max_active_runs = 0;
         assert!(matches!(spawn(cfg, state), Err(Error::InvalidConcurrency)));
+    }
+
+    #[tokio::test]
+    async fn delivery_admission_blocks_a_later_stop_until_the_current_delivery_finishes() {
+        let state = DaemonState::new(Store::open_in_memory().unwrap());
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let held = state.lock_delivery_slot(&agent_id).await;
+        let waiting_state = state.clone();
+        let waiting_agent = agent_id.clone();
+        let waiter = tokio::spawn(async move {
+            let _slot = waiting_state.lock_delivery_slot(&waiting_agent).await;
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), waiter)
+                .await
+                .is_err(),
+            "a stop-side admission must not pass while delivery owns the slot"
+        );
+        drop(held);
+
+        // The timeout consumed the JoinHandle future, so the task itself is
+        // still running and completes as soon as the delivery slot releases.
+        // A second, fresh admission proves the mutex is usable after the
+        // barrier rather than relying on the timed-out handle.
+        let _released = state.lock_delivery_slot(&agent_id).await;
     }
 
     /// This track's item 2: `max_active_runs` must actually bound live
@@ -3380,27 +3669,6 @@ mod tests {
             !backoff.try_begin_preparation(&agent_id),
             "the deleting mark must survive a concurrent record_success"
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn delivery_retry_is_delayed_once_then_bounded_until_operator_resume() {
-        let backoff = SpawnBackoff::new();
-        let agent_id = AgentId::try_from("curie").unwrap();
-
-        assert!(!backoff.delivery_retry_ready(&agent_id));
-        backoff.record_delivery_failure(&agent_id);
-        assert!(!backoff.delivery_retry_ready(&agent_id));
-        tokio::time::advance(DELIVERY_RETRY_DELAY).await;
-        assert!(backoff.delivery_retry_ready(&agent_id));
-
-        backoff.record_delivery_failure(&agent_id);
-        tokio::time::advance(DELIVERY_RETRY_DELAY).await;
-        assert!(
-            !backoff.delivery_retry_ready(&agent_id),
-            "the automatic recovery must stop after one outer retry"
-        );
-        backoff.reset_delivery_failures(&agent_id);
-        assert!(backoff.delivery_retry_ready(&agent_id));
     }
 
     /// PR #50 review, blocking finding 2, reproduced verbatim: the retry
@@ -4048,24 +4316,33 @@ mod tests {
                 .unwrap();
         }
 
-        // Original race: the candidate observes no prior episode, then the
-        // hook opens one and the fast client finishes it before this commit.
-        let (race_incarnation, prior_run_count) = store
-            .task_delivery_marker(&session_id, &race_task_id)
-            .unwrap();
-        store
-            .open_run_episode(&session_id, &race_task_id, 1_004)
-            .unwrap();
-        store
-            .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_005)
-            .unwrap();
-
         // ABA counterexample: retain a delivery marker for the old row,
         // delete it, then create and run a different task with the same
         // operator-facing id. Its replacement run must not prove the old
         // composed text was delivered.
         let (old_incarnation, old_run_count) = store
             .task_delivery_marker(&session_id, &aba_task_id)
+            .unwrap();
+        let aba_delivery = Delivery {
+            task_id: Some(aba_task_id.clone()),
+            task_incarnation_id: Some(old_incarnation.clone()),
+            prior_run_count: Some(old_run_count),
+            message_ids: Vec::new(),
+            text: "old task body".to_owned(),
+        };
+        let aba_attempt = store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "aba-attempt".to_owned(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: aba_delivery.task_id.clone(),
+                task_incarnation_id: aba_delivery.task_incarnation_id.clone(),
+                prior_run_count: aba_delivery.prior_run_count,
+                message_ids: aba_delivery.message_ids.clone(),
+                text: aba_delivery.text.clone(),
+                created_at_ms: 1_005,
+            })
             .unwrap();
         store.delete_task(&project_id, &aba_task_id, 1_006).unwrap();
         store
@@ -4095,6 +4372,39 @@ mod tests {
                 1_010,
             )
             .unwrap();
+        // Original race: the candidate observes no prior episode, then the
+        // hook opens one and the fast client finishes it before this commit.
+        // The durable attempt is created while the task is still queued.
+        let (race_incarnation, prior_run_count) = store
+            .task_delivery_marker(&session_id, &race_task_id)
+            .unwrap();
+        let race_delivery = Delivery {
+            task_id: Some(race_task_id.clone()),
+            task_incarnation_id: Some(race_incarnation.clone()),
+            prior_run_count: Some(prior_run_count),
+            message_ids: Vec::new(),
+            text: "already delivered".to_owned(),
+        };
+        let race_attempt = store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "race-attempt".to_owned(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: race_delivery.task_id.clone(),
+                task_incarnation_id: race_delivery.task_incarnation_id.clone(),
+                prior_run_count: race_delivery.prior_run_count,
+                message_ids: race_delivery.message_ids.clone(),
+                text: race_delivery.text.clone(),
+                created_at_ms: 1_010,
+            })
+            .unwrap();
+        store
+            .open_run_episode(&session_id, &race_task_id, 1_011)
+            .unwrap();
+        store
+            .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_012)
+            .unwrap();
         let event_count = store.events_after(0, 100).unwrap().len();
         let state = DaemonState::new(store);
 
@@ -4103,12 +4413,8 @@ mod tests {
             &project_id,
             &agent_id,
             &session_id,
-            Delivery {
-                task_id: Some(race_task_id),
-                task_incarnation_id: Some(race_incarnation),
-                prior_run_count: Some(prior_run_count),
-                text: "already delivered".to_owned(),
-            },
+            &race_attempt.id,
+            race_delivery,
             1_011,
         )
         .await
@@ -4125,20 +4431,16 @@ mod tests {
             &project_id,
             &agent_id,
             &session_id,
-            Delivery {
-                task_id: Some(aba_task_id),
-                task_incarnation_id: Some(old_incarnation),
-                prior_run_count: Some(old_run_count),
-                text: "old task body".to_owned(),
-            },
+            &aba_attempt.id,
+            aba_delivery,
             1_012,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            aba,
-            DaemonStateError::Store(StoreError::TaskNotQueued)
-        ));
+        .unwrap();
+        assert_eq!(
+            aba, None,
+            "a cancelled old attempt cannot open replacement work"
+        );
 
         // Historical episode -> retry -> unrelated cancellation. The run
         // count did not advance after this candidate was composed.
@@ -4183,6 +4485,23 @@ mod tests {
             })
             .await
             .unwrap();
+        let cancelled_delivery = Delivery {
+            task_id: Some(task_id.clone()),
+            task_incarnation_id: Some(task_incarnation.clone()),
+            prior_run_count: Some(retry_run_count),
+            message_ids: Vec::new(),
+            text: "cancelled retry".to_owned(),
+        };
+        let cancelled_attempt = test_delivery_attempt(
+            &state,
+            "cancelled-attempt",
+            &project_id,
+            &agent_id,
+            &session_id,
+            &cancelled_delivery,
+            1_009,
+        )
+        .await;
         state
             .commit_and_publish({
                 let project_id = project_id.clone();
@@ -4199,20 +4518,16 @@ mod tests {
             &project_id,
             &agent_id,
             &session_id,
-            Delivery {
-                task_id: Some(task_id.clone()),
-                task_incarnation_id: Some(task_incarnation),
-                prior_run_count: Some(retry_run_count),
-                text: "cancelled retry".to_owned(),
-            },
+            &cancelled_attempt.id,
+            cancelled_delivery,
             1_011,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            task_not_queued,
-            DaemonStateError::Store(StoreError::TaskNotQueued)
-        ));
+        .unwrap();
+        assert_eq!(
+            task_not_queued, None,
+            "task cancellation invalidates the attempt"
+        );
 
         // Historical episode -> retry -> a different current run. The old
         // task/session match must not hide the resulting AgentUnavailable.
@@ -4235,6 +4550,23 @@ mod tests {
             })
             .await
             .unwrap();
+        let unavailable_delivery = Delivery {
+            task_id: Some(task_id.clone()),
+            task_incarnation_id: Some(task_incarnation),
+            prior_run_count: Some(retry_run_count),
+            message_ids: Vec::new(),
+            text: "blocked by another run".to_owned(),
+        };
+        let unavailable_attempt = test_delivery_attempt(
+            &state,
+            "unavailable-attempt",
+            &project_id,
+            &agent_id,
+            &session_id,
+            &unavailable_delivery,
+            1_012,
+        )
+        .await;
         state
             .commit_and_publish({
                 let session_id = session_id.clone();
@@ -4251,12 +4583,8 @@ mod tests {
             &project_id,
             &agent_id,
             &session_id,
-            Delivery {
-                task_id: Some(task_id),
-                task_incarnation_id: Some(task_incarnation),
-                prior_run_count: Some(retry_run_count),
-                text: "blocked by another run".to_owned(),
-            },
+            &unavailable_attempt.id,
+            unavailable_delivery,
             1_014,
         )
         .await

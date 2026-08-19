@@ -143,9 +143,12 @@ them into `factory_core::ProviderHookEvent` values (see
      process has exited. The dispatcher holds queued work until that terminal
      event, then launches the successor with `ctx.resume` when supported. If
      the resumed provider does not acknowledge the first delivery, the shared
-     path makes one bounded delayed retry and leaves `delivery unacknowledged`
-     durably visible if it still fails; a provider must not silently consume a
-     prompt without its hook acknowledgement.
+     path records the exact prompt as a durable delivery attempt, makes one
+     bounded delayed recovery retry, and leaves `delivery unacknowledged`
+     durably visible if it still fails. A daemon restart consumes an
+     interrupted attempt rather than resetting its retry budget; only an
+     explicit operator resume resets a terminal attempt. A provider must not
+     silently consume a prompt without its exact hook acknowledgement.
    - **Provider A1** — a session's own `factoryctl` calls (an agent's own
      `task done`/`task blocked`, or an operator typing one directly) use a
      bare `factoryctl`, not `ctx.factoryctl_path`: that trusted absolute

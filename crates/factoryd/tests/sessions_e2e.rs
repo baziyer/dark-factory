@@ -416,6 +416,13 @@ fn shell_agent_path() -> String {
         .into_owned()
 }
 
+fn exact_shell_agent_path() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/exact-shell-agent.py")
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn install_fake_codex(home: &Path) -> PathBuf {
     let bin = home.join("fake-bin");
     std::fs::create_dir(&bin).unwrap();
@@ -1239,6 +1246,27 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     assign_task(&client, "task-2", "curie");
     wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
 
+    let submitted_prompts: Vec<String> = std::fs::read_dir(home.path().join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("fake-codex-prompts.jsonl"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fake Codex prompt log is JSONL"))
+                .collect::<Vec<String>>()
+        })
+        .collect();
+    let task2_prompts = submitted_prompts
+        .iter()
+        .filter(|prompt| prompt.contains("task:task-2"))
+        .count();
+    assert_eq!(
+        task2_prompts, 1,
+        "the resumed provider must submit exactly one task-2 prompt, got {submitted_prompts:?}"
+    );
+
     let successor = poll_until(DELIVERY_TIMEOUT, || {
         list_sessions(&client).into_iter().find(|session| {
             session.agent_id.as_str() == "curie"
@@ -1268,7 +1296,11 @@ fn factoryd_restart_does_not_lose_a_live_session() {
     let home = private_tempdir();
     let project = setup_project(home.path());
     let client = project.daemon.client();
-    create_shell_agent(&client, "curie");
+    create_shell_agent_with_command(
+        &client,
+        "curie",
+        format!("python3 {}", exact_shell_agent_path()),
+    );
 
     create_task(&client, "task-1", "First", "before the restart");
     assign_task(&client, "task-1", "curie");
