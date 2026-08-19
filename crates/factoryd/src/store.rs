@@ -27,7 +27,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 26;
+const SCHEMA_VERSION: i64 = 27;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -1482,6 +1482,8 @@ impl Store {
                     Some(
                         ProviderNotificationKind::PermissionPrompt
                             | ProviderNotificationKind::ElicitationDialog
+                            | ProviderNotificationKind::ElicitationUrlDialog
+                            | ProviderNotificationKind::AgentNeedsInput
                     )
                 ) {
                     state = SessionState::WaitingForInput;
@@ -5818,6 +5820,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         ))?;
         transaction.pragma_update(None, "user_version", 26)?;
         transaction.commit()?;
+        current = 26;
+    }
+    if current == 26 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0027_widen_session_notification_kind.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 27)?;
+        transaction.commit()?;
     }
     Ok(())
 }
@@ -6185,10 +6196,13 @@ const fn provider_notification_kind_value(value: ProviderNotificationKind) -> &'
     match value {
         ProviderNotificationKind::PermissionPrompt => "permission_prompt",
         ProviderNotificationKind::ElicitationDialog => "elicitation_dialog",
+        ProviderNotificationKind::ElicitationUrlDialog => "elicitation_url_dialog",
+        ProviderNotificationKind::AgentNeedsInput => "agent_needs_input",
         ProviderNotificationKind::IdlePrompt => "idle_prompt",
         ProviderNotificationKind::AuthSuccess => "auth_success",
         ProviderNotificationKind::ElicitationComplete => "elicitation_complete",
         ProviderNotificationKind::ElicitationResponse => "elicitation_response",
+        ProviderNotificationKind::AgentCompleted => "agent_completed",
     }
 }
 

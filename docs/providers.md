@@ -589,18 +589,18 @@ Two different test doubles exist at two different layers, easy to conflate:
 - They do not own a PTY, call `send_input`/`resize`/`stop`, or read process
   output — that is generic, implemented once.
 - They do not guess precise session state when the underlying CLI does not
-  expose it. Codex's `PermissionRequest` hook (added in Codex 0.147.0) is an
-  authoritative approval prompt. Claude reports permissions, elicitation,
-  and idle waits through `Notification`; the daemon durably retains its typed
-  `notification_type`. Only `permission_prompt` and `elicitation_dialog`
-  enter `waiting_for_input` and the actionable attention projection;
-  `idle_prompt`, `auth_success`, `elicitation_complete`, and
-  `elicitation_response` return the session to routine idle state. An absent
-  or unknown subtype remains non-actionable rather than being presented as a
-  question. A provider
-  does not answer `PermissionRequest` approval prompts; auto mode prevents
-  those prompts. The separate `PreToolUse` hook always receives the
-  factory's allow/deny policy answer and is durably audited.
+  expose it. The immediate `PermissionRequest` hook is authoritative for
+  Claude and Codex approval prompts. Claude also reports permissions,
+  elicitation, agent input, completion, and idle waits through `Notification`;
+  the daemon durably retains its typed `notification_type`. The actionable
+  values are `permission_prompt`, `elicitation_dialog`,
+  `elicitation_url_dialog`, and `agent_needs_input`. The routine values are
+  `idle_prompt`, `auth_success`, `elicitation_complete`,
+  `elicitation_response`, and `agent_completed`; unknown values remain
+  non-actionable. A provider does not answer `PermissionRequest` approval
+  prompts; auto mode prevents those prompts. The separate `PreToolUse` hook
+  always receives the factory's allow/deny policy answer and is durably
+  audited.
 - They do not manage ambient environment (`HOME`, `PATH`, ...); that is the
   session runner's sanitized-environment concern.
   `InteractiveLaunch::env` is only for provider-specific additions, like

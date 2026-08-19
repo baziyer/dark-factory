@@ -2909,6 +2909,12 @@ fn compute_hook_fields(
                 Some("elicitation_dialog") => {
                     Some(factory_core::ProviderNotificationKind::ElicitationDialog)
                 }
+                Some("elicitation_url_dialog") => {
+                    Some(factory_core::ProviderNotificationKind::ElicitationUrlDialog)
+                }
+                Some("agent_needs_input") => {
+                    Some(factory_core::ProviderNotificationKind::AgentNeedsInput)
+                }
                 Some("idle_prompt") => Some(factory_core::ProviderNotificationKind::IdlePrompt),
                 Some("auth_success") => Some(factory_core::ProviderNotificationKind::AuthSuccess),
                 Some("elicitation_complete") => {
@@ -2916,6 +2922,9 @@ fn compute_hook_fields(
                 }
                 Some("elicitation_response") => {
                     Some(factory_core::ProviderNotificationKind::ElicitationResponse)
+                }
+                Some("agent_completed") => {
+                    Some(factory_core::ProviderNotificationKind::AgentCompleted)
                 }
                 _ => None,
             };
@@ -2927,13 +2936,9 @@ fn compute_hook_fields(
             )
         }
         ProviderHookEvent::PermissionRequest => {
-            // Codex's own approval prompt (`docs/providers.md`'s
-            // observe-only contract: this daemon never answers it, only
-            // records that the session is now blocked on one). Claude
-            // Code's equivalent surfaces through `Notification` above --
-            // both land the session in the same `waiting_for_input` state
-            // via `Store::record_hook_event`, with a wait reason an
-            // operator can read at a glance.
+            // The provider's immediate approval prompt is observe-only: this
+            // daemon records that the session is blocked and never answers
+            // the provider prompt. Both Claude and Codex use this hook.
             let tool_name = payload
                 .get("tool_name")
                 .and_then(serde_json::Value::as_str)
@@ -3338,10 +3343,13 @@ mod hook_field_tests {
         for notification_type in [
             "permission_prompt",
             "elicitation_dialog",
+            "elicitation_url_dialog",
+            "agent_needs_input",
             "idle_prompt",
             "auth_success",
             "elicitation_complete",
             "elicitation_response",
+            "agent_completed",
         ] {
             let (_, _, reason, kind) = compute_hook_fields(
                 ProviderHookEvent::Notification,

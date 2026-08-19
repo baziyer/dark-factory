@@ -679,7 +679,11 @@ fn session_reason(session: &SessionSnapshot) -> Option<(Attention, AttentionReas
             }
             (
                 Some(ProviderHookEvent::Notification),
-                Some(ProviderNotificationKind::ElicitationDialog),
+                Some(
+                    ProviderNotificationKind::ElicitationDialog
+                    | ProviderNotificationKind::ElicitationUrlDialog
+                    | ProviderNotificationKind::AgentNeedsInput,
+                ),
                 Some(summary),
             ) => {
                 return Some((
@@ -1033,8 +1037,16 @@ mod tests {
         let project = ProjectId::try_from("p").unwrap();
         let mut question = session(SessionState::WaitingForInput, 10);
         question.last_hook_event = Some(ProviderHookEvent::Notification);
-        question.notification_kind = Some(ProviderNotificationKind::ElicitationDialog);
         question.wait_reason = Some("Which branch?".to_owned());
+        for kind in [
+            ProviderNotificationKind::ElicitationDialog,
+            ProviderNotificationKind::ElicitationUrlDialog,
+            ProviderNotificationKind::AgentNeedsInput,
+        ] {
+            question.notification_kind = Some(kind);
+            let (_, reason) = session_reason(&question).unwrap();
+            assert_eq!(reason.kind, AttentionReasonKind::ProviderQuestion);
+        }
         let mut permission = session(SessionState::WaitingForInput, 20);
         permission.id = SessionId::try_from("s2").unwrap();
         permission.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
@@ -1135,6 +1147,11 @@ mod tests {
         idle.last_hook_event = Some(ProviderHookEvent::Notification);
         idle.notification_kind = Some(ProviderNotificationKind::IdlePrompt);
         assert!(session_reason(&idle).is_none());
+
+        let mut completed = session(SessionState::Idle, 26);
+        completed.last_hook_event = Some(ProviderHookEvent::Notification);
+        completed.notification_kind = Some(ProviderNotificationKind::AgentCompleted);
+        assert!(session_reason(&completed).is_none());
 
         let mut old_notification = session(SessionState::WaitingForInput, 26);
         old_notification.last_hook_event = Some(ProviderHookEvent::Notification);

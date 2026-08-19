@@ -30,7 +30,8 @@ use factory_core::status::{
 };
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
-    Provider, RunId, RunSnapshot, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    Provider, ProviderHookEvent, ProviderNotificationKind, RunId, RunSnapshot, SessionId,
+    SessionSnapshot, SessionState, TaskDetail, TaskId,
 };
 
 pub use announcements::Announcement;
@@ -209,10 +210,10 @@ impl Board {
         self.live_session_cap = Some(status.live_session_cap);
         if status.event_sequence < 0
             || (status.event_sequence >= self.attention_revision
-                && status.event_sequence > self.event_revision)
+                && status.event_sequence >= self.event_revision)
         {
             if status.event_sequence >= 0 {
-                self.attention_revision = status.event_sequence;
+                self.attention_revision = self.attention_revision.max(status.event_sequence);
             }
             self.attention = status.attention;
             self.reconcile_attention_focus();
@@ -858,7 +859,11 @@ impl Board {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
             FactoryEvent::SessionChanged { session } => {
-                self.invalidate_attention(|item| item.session_id.as_ref() == Some(&session.id));
+                let retain_reason = session_actionable_reason(session);
+                self.invalidate_attention(|item| {
+                    item.session_id.as_ref() == Some(&session.id)
+                        && (retain_reason != Some(item.reason.kind))
+                });
             }
             FactoryEvent::TaskDeleted { task_id, .. } => {
                 self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
@@ -1254,6 +1259,30 @@ pub(crate) fn same_attention_source(a: &AttentionItem, b: &AttentionItem) -> boo
         && a.session_id == b.session_id
         && a.run_id == b.run_id
         && a.since_ms == b.since_ms
+}
+
+fn session_actionable_reason(session: &SessionSnapshot) -> Option<AttentionReasonKind> {
+    if session.state != SessionState::WaitingForInput {
+        return None;
+    }
+    match (session.last_hook_event, session.notification_kind) {
+        (Some(ProviderHookEvent::PermissionRequest), _) => {
+            Some(AttentionReasonKind::ProviderPermission)
+        }
+        (
+            Some(ProviderHookEvent::Notification),
+            Some(ProviderNotificationKind::PermissionPrompt),
+        ) => Some(AttentionReasonKind::ProviderPermission),
+        (
+            Some(ProviderHookEvent::Notification),
+            Some(
+                ProviderNotificationKind::ElicitationDialog
+                | ProviderNotificationKind::ElicitationUrlDialog
+                | ProviderNotificationKind::AgentNeedsInput,
+            ),
+        ) => Some(AttentionReasonKind::ProviderQuestion),
+        _ => None,
+    }
 }
 
 fn truncate_status(text: &str, max: usize) -> String {

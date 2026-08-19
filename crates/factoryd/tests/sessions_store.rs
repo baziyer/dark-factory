@@ -128,10 +128,10 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 26 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 27 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, observer reason, and typed notification
-/// cause
+/// cause and the widened Claude notification constraint
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
@@ -224,14 +224,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0026.
+    // Opening through the real store runs migrations 0014 through 0027.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -276,7 +276,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_through_0026_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0027_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -301,7 +301,7 @@ fn migrations_0019_through_0026_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -394,14 +394,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0026 migrations.
+    // Opening through the real store runs the 0015 through 0027 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 26);
+    assert_eq!(version, 27);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -877,6 +877,7 @@ fn notification_moves_to_waiting_for_input_with_a_wait_reason() {
 #[test]
 fn routine_claude_notification_causes_do_not_create_attention_waits() {
     for kind in [
+        ProviderNotificationKind::AgentCompleted,
         ProviderNotificationKind::IdlePrompt,
         ProviderNotificationKind::AuthSuccess,
         ProviderNotificationKind::ElicitationComplete,
@@ -899,6 +900,32 @@ fn routine_claude_notification_causes_do_not_create_attention_waits() {
             .unwrap();
         assert_eq!(session.state, SessionState::Idle);
         assert_eq!(session.wait_reason, None);
+        assert_eq!(session.notification_kind, Some(kind));
+    }
+}
+
+#[test]
+fn current_claude_actionable_notification_causes_wait_for_input() {
+    for kind in [
+        ProviderNotificationKind::ElicitationUrlDialog,
+        ProviderNotificationKind::AgentNeedsInput,
+    ] {
+        let mut store = fixture();
+        let (snapshot, _) = store
+            .create_session(new_session("s1", "factory", "curie"), 5)
+            .unwrap();
+        let (session, _) = store
+            .record_hook_event_with_notification(
+                &snapshot.id,
+                ProviderHookEvent::Notification,
+                None,
+                false,
+                Some("answer required".into()),
+                Some(kind),
+                6,
+            )
+            .unwrap();
+        assert_eq!(session.state, SessionState::WaitingForInput);
         assert_eq!(session.notification_kind, Some(kind));
     }
 }
