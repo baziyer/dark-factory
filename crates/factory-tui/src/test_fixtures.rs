@@ -56,6 +56,7 @@ pub(crate) fn session(
         runtime_permission_mode: None,
         runtime_control_mode: None,
         state,
+        cleanup_state: factory_core::SessionCleanupState::None,
         state_since_ms: 0,
         worktree: "/work".into(),
         provider_session_id: None,

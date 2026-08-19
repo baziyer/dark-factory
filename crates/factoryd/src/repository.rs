@@ -957,6 +957,7 @@ mod tests {
             codex_home: None,
             hook_token: "a".repeat(64),
             state: SessionState::Idle,
+            cleanup_state: factory_core::SessionCleanupState::None,
             state_since_ms: 1,
             activity: None,
             activity_inferred: false,

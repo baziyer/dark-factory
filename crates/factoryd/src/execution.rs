@@ -133,13 +133,11 @@ const MAX_CONSECUTIVE_START_DEADLINES: u32 = 3;
 const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
 (DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
 --project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
-task assign --task <id> --agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, \
-`factoryctl session list`. The operator must create and reconfigure agents; do not attempt agent \
-creation or model-policy changes from the orchestrator. Message the operator with a concrete \
-request when a worker is needed. A worker in `waiting_for_input` needs operator attention: \
-message it or surface its request; do not stop, restart, replace, or duplicate it. Before stopping \
-or replacing any worker, inspect `factoryctl agent status --agent <agent>` and preserve or \
-explicitly resolve any dirty worktree.";
+agent add --role worker --provider <claude|codex|shell>`, `factoryctl task assign --task <id> \
+--agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, `factoryctl session \
+list`. A worker in `waiting_for_input` needs operator attention: message it or surface its request; \
+do not stop, restart, replace, or duplicate it. Before stopping or replacing any worker, inspect \
+`factoryctl agent status --agent <agent>` and preserve or explicitly resolve any dirty worktree.";
 
 /// Fixed process and durability bounds for the dispatcher.
 pub struct Config {
@@ -398,23 +396,6 @@ impl Handle {
     /// a full wake queue silently defers to the 5 second safety tick.
     pub fn wake(&self, project_id: ProjectId, agent_id: AgentId) {
         send_wake(&self.wake_tx, project_id, agent_id);
-    }
-
-    /// Waits for all delivery work owned by `agent_id` to finish. Local API
-    /// assignment/deletion handlers hold this barrier while changing task
-    /// ownership, so a delivery that loses the race cannot type the task to
-    /// the old worker after the move has committed.
-    pub async fn lock_delivery_slot(
-        &self,
-        agent_id: &AgentId,
-    ) -> crate::daemon_state::DeliverySlot {
-        self.state.lock_delivery_slot(agent_id).await
-    }
-
-    /// Serializes assignment mutations for one task across all local API
-    /// request handlers.
-    pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.state.lock_assignment_slot().await
     }
 
     /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's
@@ -1454,7 +1435,6 @@ async fn spawn_session_for_agent(
         session_id: session_id.clone(),
         worktree: worktree_path.clone(),
         model: agent.profile.model.clone(),
-        reasoning_effort: agent.profile.reasoning_effort.clone(),
         permission_mode: agent.profile.permission_mode.clone(),
         auto_mode,
         resume: resume.clone(),
@@ -2477,6 +2457,13 @@ async fn supervise_recovered(
     mut shutdown_rx: watch::Receiver<bool>,
     max_attempts: u32,
 ) {
+    if recovered.cleanup_failed {
+        tracing::warn!(
+            session_id = %recovered.session_id,
+            "leaving cleanup-failed session live until an operator verifies provider cleanup"
+        );
+        return;
+    }
     let runtime_dir = PathBuf::from(&recovered.runner_runtime);
     let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
         return;
@@ -3834,6 +3821,7 @@ mod tests {
             runner_runtime: runtime_dir.to_string_lossy().into_owned(),
             runner_protocol_version: 1,
             observer_health: factory_core::ObserverHealth::Unknown,
+            cleanup_failed: false,
         };
 
         supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
@@ -3848,6 +3836,100 @@ mod tests {
             .expect("the recovered session must still exist");
         assert_eq!(session.state, SessionState::Failed);
         assert!(!session.state.is_live());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_failed_session_stays_owned_when_recovery_restarts() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.clone(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id,
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree,
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id,
+                    runner_runtime: directory.path().join("missing").display().to_string(),
+                    runner_protocol_version: 1,
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .mark_session_cleanup_failed(
+                &session_id,
+                "provider cleanup was not confirmed".to_owned(),
+                1_001,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let recovered = state
+            .with_store(|store| Ok(store.recoverable_sessions()?.pop().unwrap()))
+            .await
+            .unwrap();
+        assert!(recovered.cleanup_failed);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
+
+        let session = state
+            .with_store(move |store| store.get_session(&project_id, &session_id))
+            .await
+            .unwrap();
+        assert!(session.state.is_live());
+        assert_eq!(
+            session.cleanup_state,
+            factory_core::SessionCleanupState::Failed
+        );
+        assert!(matches!(
+            state
+                .with_store(|store| {
+                    store.check_agent_deletable(
+                        &ProjectId::try_from("factory").unwrap(),
+                        &AgentId::try_from("curie").unwrap(),
+                    )
+                })
+                .await,
+            Err(DaemonStateError::Store(StoreError::AgentHasLiveSession))
+        ));
     }
 
     /// Issue #85 and PR #90 review: only a run created after candidate
@@ -4215,8 +4297,7 @@ mod tests {
             AgentRole::Orchestrator,
         );
         assert!(text.contains("As the orchestrator"));
-        assert!(!text.contains("factoryctl agent add"));
-        assert!(text.contains("operator must create and reconfigure agents"));
+        assert!(text.contains("factoryctl agent add"));
         assert!(text.contains("waiting_for_input"));
         assert!(text.contains("do not stop, restart, replace, or duplicate it"));
         assert!(text.contains("factoryctl agent status"));

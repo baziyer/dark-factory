@@ -3,11 +3,11 @@ use std::path::Path;
 use factory_core::{
     AgentBudget, AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, MessageId,
     ObserverHealth, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent,
-    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    RunClosedBy, RunFailureReason, RunId, RunSnapshot, RunStatus, RunnerInstanceId,
+    SessionCleanupState, SessionId, SessionSnapshot, SessionState, TaskDetail, TaskId,
+    TaskSnapshot, TaskStatus,
     attention::agent_attention,
     local::{MAX_TASK_BODY_BYTES, normalize_task_title},
-    model_policy,
     status::{AgentPauseReason, AgentStatus, MAX_QUEUE_PREVIEW},
 };
 use rusqlite::{
@@ -17,12 +17,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
-/// its agents' statuses, its project backlog, and its blocked tasks (see
+/// its agents' statuses, its unassigned queue, and its blocked tasks (see
 /// [`Store::fleet_status`]).
 pub struct ProjectStatusRows {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
-    pub backlog: Vec<TaskSnapshot>,
+    pub unassigned: Vec<TaskSnapshot>,
     pub blocked: Vec<TaskSnapshot>,
 }
 
@@ -98,8 +98,6 @@ pub struct NewAgent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentProfile {
     pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
     pub updated_at_ms: i64,
 }
@@ -111,8 +109,6 @@ pub struct AgentDetail {
 
 pub struct UpdateAgentProfile {
     pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
-    pub model_selection_reason: Option<String>,
     pub permission_mode: Option<String>,
 }
 
@@ -314,6 +310,7 @@ pub struct SessionRow {
     pub codex_home: Option<String>,
     pub hook_token: String,
     pub state: SessionState,
+    pub cleanup_state: SessionCleanupState,
     pub state_since_ms: i64,
     /// Bounded free-text activity label (e.g. `"tool: Read"`), durable but
     /// not yet part of `SessionSnapshot`.
@@ -353,6 +350,7 @@ impl SessionRow {
             runtime_permission_mode: self.runtime_permission_mode.clone(),
             runtime_control_mode: self.runtime_control_mode.clone(),
             state: self.state,
+            cleanup_state: self.cleanup_state,
             state_since_ms: self.state_since_ms,
             worktree: self.worktree.clone(),
             provider_session_id: self.provider_session_id.clone(),
@@ -411,6 +409,7 @@ pub struct RecoverableSession {
     pub runner_runtime: String,
     pub runner_protocol_version: u16,
     pub observer_health: ObserverHealth,
+    pub cleanup_failed: bool,
 }
 
 /// Result of opening a task-episode inside a live session.
@@ -461,18 +460,10 @@ pub enum StoreError {
     RepositoryAuthorityRequiresIdleProject,
     #[error("task was not found in the requested project")]
     TaskNotFound,
-    #[error("task page cursor is stale; restart the listing")]
-    StaleTaskCursor,
-    #[error("task page cursor requires its queue revision")]
-    MissingTaskCursorRevision,
-    #[error("task page revision requires its cursor")]
-    UnexpectedTaskCursorRevision,
     #[error("agent provider does not match the requested execution provider")]
     AgentProviderMismatch,
     #[error("agent profile is invalid or exceeds its bound")]
     InvalidAgentProfile,
-    #[error("agent model policy rejected the profile: {0}")]
-    InvalidAgentModelPolicy(#[from] model_policy::ModelPolicyError),
     #[error("permission mode {mode:?} is not supported by provider {provider:?}")]
     UnsupportedAgentPermissionMode { provider: Provider, mode: String },
     #[error("agent budget is invalid or exceeds its bound")]
@@ -505,6 +496,10 @@ pub enum StoreError {
     SessionAlreadyLive,
     #[error("session is not live")]
     SessionNotLive,
+    #[error("provider cleanup is unverified; run the explicit cleanup verification first")]
+    SessionCleanupUnverified,
+    #[error("session does not need cleanup verification")]
+    SessionCleanupNotFailed,
     #[error("session hook token is invalid")]
     InvalidHookToken,
     #[error("run is not in the required state")]
@@ -623,7 +618,6 @@ impl Store {
                         body,
                         priority,
                     },
-                    None,
                     now_ms,
                 )?;
                 ("task", id.to_string(), Some(event))
@@ -803,28 +797,10 @@ impl Store {
         input: NewTask,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
-        self.create_task_with_assignment(input, None, now_ms)
-    }
-
-    pub fn create_assigned_task(
-        &mut self,
-        input: NewTask,
-        agent_id: AgentId,
-        now_ms: i64,
-    ) -> Result<(TaskDetail, EventEnvelope)> {
-        self.create_task_with_assignment(input, Some(agent_id), now_ms)
-    }
-
-    pub fn create_task_with_assignment(
-        &mut self,
-        input: NewTask,
-        assigned_agent_id: Option<AgentId>,
-        now_ms: i64,
-    ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let (record, event) = insert_task(&transaction, input, assigned_agent_id, now_ms)?;
+        let (record, event) = insert_task(&transaction, input, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
 
@@ -844,7 +820,7 @@ impl Store {
         input: NewAgent,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.insert_agent(input, None, None, None, now_ms)
+        self.insert_agent(input, None, now_ms)
     }
 
     pub fn create_agent_with_model(
@@ -853,43 +829,14 @@ impl Store {
         model: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
-        self.create_agent_with_profile(input, model, None, None, now_ms)
-    }
-
-    pub fn create_agent_with_profile(
-        &mut self,
-        input: NewAgent,
-        model: Option<String>,
-        reasoning_effort: Option<String>,
-        model_selection_reason: Option<String>,
-        now_ms: i64,
-    ) -> Result<(AgentSnapshot, EventEnvelope)> {
         validate_agent_model(model.as_deref())?;
-        let selection = model_policy::normalize_profile(
-            input.provider,
-            input.role,
-            model_policy::ModelSelection {
-                model,
-                reasoning_effort,
-                reason: model_selection_reason,
-            },
-            true,
-        )?;
-        self.insert_agent(
-            input,
-            selection.model,
-            selection.reasoning_effort,
-            selection.reason,
-            now_ms,
-        )
+        self.insert_agent(input, model, now_ms)
     }
 
     fn insert_agent(
         &mut self,
         input: NewAgent,
         model: Option<String>,
-        reasoning_effort: Option<String>,
-        model_selection_reason: Option<String>,
         now_ms: i64,
     ) -> Result<(AgentSnapshot, EventEnvelope)> {
         let agent = AgentSnapshot {
@@ -926,16 +873,9 @@ impl Store {
             ],
         )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (
-                agent_id, model, reasoning_effort, model_selection_reason, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                agent.id.as_str(),
-                model,
-                reasoning_effort,
-                model_selection_reason,
-                agent.updated_at_ms
-            ],
+            "INSERT INTO agent_profiles (agent_id, model, updated_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![agent.id.as_str(), model, agent.updated_at_ms],
         )?;
         transaction.execute(
             "INSERT INTO agent_budgets (agent_id, max_tool_calls, reset_at_ms, updated_at_ms)
@@ -1207,8 +1147,9 @@ impl Store {
         ))
     }
 
-    /// The next queued task assigned to `agent_id`, in the canonical active
-    /// queue order, or `None` when the agent is paused or has no queued work.
+    /// The oldest queued task assigned to `agent_id`, in delivery order
+    /// (`created_at_ms, id`), or `None` when the agent is paused or has no
+    /// queued work.
     pub fn next_deliverable(
         &self,
         project_id: &ProjectId,
@@ -1222,7 +1163,7 @@ impl Store {
             .query_row(
                 "SELECT id FROM tasks
                  WHERE project_id = ?1 AND assigned_agent_id = ?2 AND status = 'queued'
-                 ORDER BY priority DESC, created_at_ms, id
+                 ORDER BY created_at_ms, id
                  LIMIT 1",
                 params![project_id.as_str(), agent_id.as_str()],
                 |row| row.get(0),
@@ -1377,6 +1318,9 @@ impl Store {
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
+        }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
         }
 
         let mut state = session.state;
@@ -1667,6 +1611,9 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
+        }
         let operator_stopped = session.stop_requested_at_ms.is_some();
         let graceful = operator_stopped || (exit_code == Some(0) && exit_signal.is_none());
         let state = if graceful {
@@ -1732,6 +1679,71 @@ impl Store {
             events.extend(closed.events);
         }
 
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let snapshot = session.snapshot();
+        let changed = FactoryEvent::SessionChanged {
+            session: snapshot.clone(),
+        };
+        let sequence = append_event(&transaction, now_ms, &changed)?;
+        events.push(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event: changed,
+        });
+        transaction.commit()?;
+        Ok((snapshot, events))
+    }
+
+    /// Resolves a live cleanup failure only after an operator has verified
+    /// that the provider tree is gone. This is the sole transition out of
+    /// the durable failed ownership state; it closes the session and its
+    /// open run in one transaction, so deletion cannot race a half-resolved
+    /// row. The terminal session remains marked `verified` for auditability.
+    pub fn resolve_session_cleanup(
+        &mut self,
+        project_id: &ProjectId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?
+            .filter(|session| session.project_id == *project_id)
+            .ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        if session.cleanup_state != SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupNotFailed);
+        }
+        let reason = "operator verified provider cleanup after an unconfirmed runner exit";
+        transaction.execute(
+            "UPDATE sessions
+             SET cleanup_state = 'verified', state = 'failed', state_since_ms = ?1,
+                 updated_at_ms = ?1, ended_at_ms = ?1, activity = NULL,
+                 activity_inferred = 0, wait_reason = ?2, observer_health = 'degraded',
+                 observer_health_since_ms = ?1, exit_code = NULL, exit_signal = NULL
+             WHERE id = ?3 AND cleanup_state = 'failed' AND ended_at_ms IS NULL",
+            params![now_ms, reason, session_id.as_str()],
+        )?;
+        let mut events = Vec::new();
+        if let Some(run_id) = session.current_run_id {
+            let run = load_run(&transaction, &run_id)?.ok_or(StoreError::RunNotFound)?;
+            let closed = close_run_in_transaction(
+                &transaction,
+                &run,
+                RunStatus::Failed,
+                RunClosedBy::SessionEnded,
+                Some(RunFailureReason::Unverifiable),
+                TaskStatus::Failed,
+                None,
+                None,
+                now_ms,
+            )?;
+            events.extend(closed.events);
+        }
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
         let changed = FactoryEvent::SessionChanged {
@@ -1983,6 +1995,9 @@ impl Store {
         if !session.state.is_live() {
             return Err(StoreError::SessionNotLive);
         }
+        if session.cleanup_state == SessionCleanupState::Failed {
+            return Err(StoreError::SessionCleanupUnverified);
+        }
         transaction.execute(
             "UPDATE sessions
              SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
@@ -2031,7 +2046,7 @@ impl Store {
         }
         transaction.execute(
             "UPDATE sessions
-             SET activity = 'cleanup_failed', activity_inferred = 1,
+             SET cleanup_state = 'failed', activity_inferred = 1,
                  wait_reason = ?1, observer_health = 'degraded',
                  observer_health_since_ms = ?2, updated_at_ms = ?2
              WHERE id = ?3",
@@ -2059,7 +2074,7 @@ impl Store {
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
             "SELECT id, provider, provider_session_id, worktree, runner_instance_id,
-                    runner_runtime, runner_protocol_version, observer_health
+                    runner_runtime, runner_protocol_version, observer_health, cleanup_state
              FROM sessions
              WHERE ended_at_ms IS NULL
              ORDER BY project_id, started_at_ms, id",
@@ -2068,6 +2083,7 @@ impl Store {
             let provider: String = row.get(1)?;
             let protocol: i64 = row.get(6)?;
             let observer_health: String = row.get(7)?;
+            let cleanup_state: String = row.get(8)?;
             Ok(RecoverableSession {
                 session_id: parse_id(row.get(0)?, 0)?,
                 provider: parse_provider(&provider, 1)?,
@@ -2079,6 +2095,8 @@ impl Store {
                     rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
                 })?,
                 observer_health: parse_observer_health(&observer_health, 7)?,
+                cleanup_failed: parse_cleanup_state(&cleanup_state, 8)?
+                    == SessionCleanupState::Failed,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3018,111 +3036,22 @@ impl Store {
         after_id: Option<&TaskId>,
         limit: usize,
     ) -> Result<Vec<TaskDetail>> {
-        self.list_tasks_filtered(project_id, after_id, None, true, limit)
-    }
-
-    pub fn list_tasks_filtered(
-        &self,
-        project_id: &ProjectId,
-        after_id: Option<&TaskId>,
-        agent_id: Option<&AgentId>,
-        include_history: bool,
-        limit: usize,
-    ) -> Result<Vec<TaskDetail>> {
-        self.list_tasks_filtered_at_revision(
-            project_id,
-            after_id,
-            agent_id,
-            include_history,
-            limit,
-            None,
-        )
-        .map(|(tasks, _)| tasks)
-    }
-
-    pub fn list_tasks_filtered_at_revision(
-        &self,
-        project_id: &ProjectId,
-        after_id: Option<&TaskId>,
-        agent_id: Option<&AgentId>,
-        include_history: bool,
-        limit: usize,
-        expected_revision: Option<i64>,
-    ) -> Result<(Vec<TaskDetail>, i64)> {
         if !(1..=MAX_STATE_PAGE).contains(&limit) {
             return Err(StoreError::InvalidStateLimit);
-        }
-        match (after_id, expected_revision) {
-            (Some(_), None) => return Err(StoreError::MissingTaskCursorRevision),
-            (None, Some(_)) => return Err(StoreError::UnexpectedTaskCursorRevision),
-            _ => {}
-        }
-        let revision: i64 =
-            self.connection
-                .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |row| {
-                    row.get(0)
-                })?;
-        if expected_revision.is_some_and(|expected| expected != revision) {
-            return Err(StoreError::StaleTaskCursor);
-        }
-        if let Some(agent_id) = agent_id {
-            let exists = load_agent(&self.connection, agent_id)?
-                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
-            if !exists {
-                return Err(StoreError::AgentNotFound);
-            }
-        }
-        if let Some(after_id) = after_id {
-            let cursor_exists: bool = self.connection.query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM tasks
-                    WHERE project_id = ?1 AND id = ?2
-                      AND (?3 IS NULL OR assigned_agent_id = ?3)
-                      AND (?4 OR status IN ('queued', 'running'))
-                )",
-                params![
-                    project_id.as_str(),
-                    after_id.as_str(),
-                    agent_id.map(AgentId::as_str),
-                    include_history,
-                ],
-                |row| row.get(0),
-            )?;
-            if !cursor_exists {
-                return Err(StoreError::TaskNotFound);
-            }
         }
         let mut statement = self.connection.prepare(
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, body, result,
                     status, priority, created_at_ms, updated_at_ms, blocked_reason
              FROM tasks
-            WHERE project_id = ?1
-               AND (?2 IS NULL OR assigned_agent_id = ?2)
-               AND (?3 OR status IN ('queued', 'running'))
-               AND (?4 IS NULL OR
-                    (CASE WHEN status = 'running' THEN 1 ELSE 0 END) < (
-                        SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                        FROM tasks WHERE project_id = ?1 AND id = ?4
-                    ) OR (
-                        (CASE WHEN status = 'running' THEN 1 ELSE 0 END) = (
-                            SELECT CASE WHEN status = 'running' THEN 1 ELSE 0 END
-                            FROM tasks WHERE project_id = ?1 AND id = ?4
-                        )
-                        AND (priority < (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                             OR (priority = (SELECT priority FROM tasks WHERE project_id = ?1 AND id = ?4)
-                                 AND (created_at_ms, id) > (SELECT created_at_ms, id FROM tasks
-                                                             WHERE project_id = ?1 AND id = ?4)))
-                    ))
-             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id
-             LIMIT ?5",
+             WHERE project_id = ?1 AND (?2 IS NULL OR id > ?2)
+             ORDER BY id
+             LIMIT ?3",
         )?;
         let rows = statement.query_map(
             params![
                 project_id.as_str(),
-                agent_id.map(AgentId::as_str),
-                include_history,
                 after_id.map(TaskId::as_str),
-                limit as i64,
+                limit as i64
             ],
             |row| {
                 let parent_id: Option<String> = row.get(2)?;
@@ -3147,7 +3076,7 @@ impl Store {
             },
         )?;
 
-        Ok((rows.collect::<std::result::Result<Vec<_>, _>>()?, revision))
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn get_task(&self, project_id: &ProjectId, task_id: &TaskId) -> Result<TaskDetail> {
@@ -3336,7 +3265,6 @@ impl Store {
         task_id: &TaskId,
         title: Option<String>,
         body: Option<String>,
-        priority: Option<i32>,
         now_ms: i64,
     ) -> Result<(TaskDetail, EventEnvelope)> {
         let transaction = self
@@ -3348,16 +3276,9 @@ impl Store {
         let changed = transaction.execute(
             "UPDATE tasks
              SET title = COALESCE(?1, title), body = COALESCE(?2, body),
-                 priority = COALESCE(?3, priority), updated_at_ms = ?4
-             WHERE id = ?5 AND project_id = ?6 AND status = 'queued'",
-            params![
-                title,
-                body,
-                priority,
-                now_ms,
-                task_id.as_str(),
-                project_id.as_str()
-            ],
+                 updated_at_ms = ?3
+             WHERE id = ?4 AND project_id = ?5 AND status = 'queued'",
+            params![title, body, now_ms, task_id.as_str(), project_id.as_str()],
         )?;
         if changed != 1 {
             return Err(StoreError::TaskNotEditable);
@@ -3754,7 +3675,7 @@ impl Store {
 
     /// Every project's live picture in one read: agents with their live
     /// (or, failing that, most recent) session, current run, queued tasks,
-    /// and undelivered inbox count; per-project backlog; the
+    /// and undelivered inbox count; per-project unassigned queue; the
     /// project's blocked tasks (for the attention list). One connection,
     /// so every field is from the same instant. See
     /// `factory_core::status`.
@@ -3789,12 +3710,12 @@ impl Store {
                 .iter()
                 .map(|agent_id| self.agent_status(&project.id, agent_id))
                 .collect::<Result<Vec<_>>>()?;
-            let backlog = self.active_tasks(&project.id, None)?;
+            let unassigned = self.queued_tasks(&project.id, None)?;
             let blocked = self.blocked_tasks(&project.id)?;
             out.push(ProjectStatusRows {
                 project,
                 agents,
-                backlog,
+                unassigned,
                 blocked,
             });
         }
@@ -3814,7 +3735,7 @@ impl Store {
             Some(run_id) => load_run(&self.connection, run_id)?,
             None => None,
         };
-        let queue = self.active_tasks(project_id, Some(agent_id))?;
+        let queue = self.queued_tasks(project_id, Some(agent_id))?;
         let inbox_pending: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM agent_messages
              WHERE project_id = ?1 AND recipient_agent_id = ?2 AND delivered_at_ms IS NULL",
@@ -3890,10 +3811,9 @@ impl Store {
         load_session(&self.connection, &parse_id(id, 0)?)
     }
 
-    /// Active tasks assigned to `agent_id` (or unassigned when `None`): the
-    /// canonical queue projection used by status and the TUI. Running work
-    /// is first, followed by queued work in priority/creation order.
-    fn active_tasks(
+    /// Queued tasks assigned to `agent_id` (or unassigned when `None`),
+    /// oldest first -- the same order the dispatcher delivers them.
+    fn queued_tasks(
         &self,
         project_id: &ProjectId,
         agent_id: Option<&AgentId>,
@@ -3902,9 +3822,9 @@ impl Store {
             "SELECT id, project_id, parent_task_id, assigned_agent_id, title, status, priority,
                     created_at_ms, updated_at_ms
              FROM tasks
-             WHERE project_id = ?1 AND status IN ('queued', 'running')
+             WHERE project_id = ?1 AND status = 'queued'
                AND ((?2 IS NULL AND assigned_agent_id IS NULL) OR assigned_agent_id = ?2)
-             ORDER BY (status = 'running') DESC, priority DESC, created_at_ms, id",
+             ORDER BY created_at_ms, id",
         )?;
         let rows = statement.query_map(
             params![project_id.as_str(), agent_id.map(AgentId::as_str)],
@@ -3938,8 +3858,6 @@ impl Store {
             snapshot: agent.snapshot,
             profile: load_agent_profile(&self.connection, agent_id)?.unwrap_or(AgentProfile {
                 model: None,
-                reasoning_effort: None,
-                model_selection_reason: None,
                 permission_mode: None,
                 updated_at_ms: 0,
             }),
@@ -3969,32 +3887,16 @@ impl Store {
                 });
             }
         }
-        let selection = model_policy::normalize_profile(
-            agent.snapshot.provider,
-            agent.snapshot.role,
-            model_policy::ModelSelection {
-                model: input.model,
-                reasoning_effort: input.reasoning_effort,
-                reason: input.model_selection_reason,
-            },
-            false,
-        )?;
         transaction.execute(
-            "INSERT INTO agent_profiles (
-                agent_id, model, reasoning_effort, model_selection_reason,
-                permission_mode, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO agent_profiles (agent_id, model, permission_mode, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(agent_id) DO UPDATE SET
                 model = excluded.model,
-                reasoning_effort = excluded.reasoning_effort,
-                model_selection_reason = excluded.model_selection_reason,
                 permission_mode = excluded.permission_mode,
                 updated_at_ms = excluded.updated_at_ms",
             params![
                 agent_id.as_str(),
-                selection.model,
-                selection.reasoning_effort,
-                selection.reason,
+                input.model,
                 input.permission_mode,
                 now_ms
             ],
@@ -4624,17 +4526,14 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
 fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Option<AgentProfile>> {
     connection
         .query_row(
-            "SELECT model, reasoning_effort, model_selection_reason,
-                    permission_mode, updated_at_ms
+            "SELECT model, permission_mode, updated_at_ms
              FROM agent_profiles WHERE agent_id = ?1",
             params![agent_id.as_str()],
             |row| {
                 Ok(AgentProfile {
                     model: row.get(0)?,
-                    reasoning_effort: row.get(1)?,
-                    model_selection_reason: row.get(2)?,
-                    permission_mode: row.get(3)?,
-                    updated_at_ms: row.get(4)?,
+                    permission_mode: row.get(1)?,
+                    updated_at_ms: row.get(2)?,
                 })
             },
         )
@@ -4645,26 +4544,18 @@ fn load_agent_profile(connection: &Connection, agent_id: &AgentId) -> Result<Opt
 fn insert_task(
     transaction: &Transaction<'_>,
     input: NewTask,
-    assigned_agent_id: Option<AgentId>,
     now_ms: i64,
 ) -> Result<(TaskDetail, FactoryEvent)> {
     let title = normalize_task_title(input.title).ok_or(StoreError::InvalidTaskInput)?;
     if input.body.len() > MAX_TASK_BODY_BYTES {
         return Err(StoreError::InvalidTaskInput);
     }
-    if let Some(agent_id) = assigned_agent_id.as_ref() {
-        let valid = load_agent(transaction, agent_id)?
-            .is_some_and(|agent| agent.snapshot.project_id == input.project_id);
-        if !valid {
-            return Err(StoreError::AgentNotFound);
-        }
-    }
     let record = TaskDetail {
         snapshot: TaskSnapshot {
             id: input.id,
             project_id: input.project_id,
             parent_task_id: input.parent_task_id,
-            assigned_agent_id,
+            assigned_agent_id: None,
             title,
             status: TaskStatus::Queued,
             priority: input.priority,
@@ -4679,16 +4570,11 @@ fn insert_task(
         "INSERT INTO tasks (
             id, project_id, parent_task_id, assigned_agent_id, title, body,
             status, priority, created_at_ms, updated_at_ms, incarnation_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10)",
+         ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, 'queued', ?6, ?7, ?8, ?9)",
         params![
             record.snapshot.id.as_str(),
             record.snapshot.project_id.as_str(),
             record.snapshot.parent_task_id.as_ref().map(TaskId::as_str),
-            record
-                .snapshot
-                .assigned_agent_id
-                .as_ref()
-                .map(AgentId::as_str),
             &record.snapshot.title,
             &record.body,
             record.snapshot.priority,
@@ -4788,7 +4674,7 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
                     s.runtime_model, s.runtime_reasoning_effort,
                     s.runtime_permission_mode, s.runtime_control_mode,
                     s.provider_session_id, s.worktree, s.codex_home, s.hook_token,
-                    s.state, s.state_since_ms,
+                    s.state, s.cleanup_state, s.state_since_ms,
                     s.activity, s.activity_inferred, s.wait_reason, s.observer_health,
                     s.observer_health_since_ms, s.runner_instance_id, s.runner_runtime,
                     s.runner_protocol_version, s.last_hook_event, s.last_hook_at_ms,
@@ -4807,10 +4693,11 @@ fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Optio
 fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
     let provider: String = row.get(3)?;
     let state: String = row.get(12)?;
-    let observer_health: String = row.get(17)?;
-    let protocol: i64 = row.get(21)?;
-    let last_hook_event: Option<String> = row.get(22)?;
-    let current_run_id: Option<String> = row.get(30)?;
+    let cleanup_state: String = row.get(13)?;
+    let observer_health: String = row.get(18)?;
+    let protocol: i64 = row.get(22)?;
+    let last_hook_event: Option<String> = row.get(23)?;
+    let current_run_id: Option<String> = row.get(31)?;
     Ok(SessionRow {
         id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
@@ -4825,28 +4712,29 @@ fn session_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow>
         codex_home: row.get(10)?,
         hook_token: row.get(11)?,
         state: parse_session_state(&state, 12)?,
-        state_since_ms: row.get(13)?,
-        activity: row.get(14)?,
-        activity_inferred: row.get(15)?,
-        wait_reason: row.get(16)?,
-        observer_health: parse_observer_health(&observer_health, 17)?,
-        observer_health_since_ms: row.get(18)?,
-        runner_instance_id: parse_id(row.get(19)?, 19)?,
-        runner_runtime: row.get(20)?,
+        cleanup_state: parse_cleanup_state(&cleanup_state, 13)?,
+        state_since_ms: row.get(14)?,
+        activity: row.get(15)?,
+        activity_inferred: row.get(16)?,
+        wait_reason: row.get(17)?,
+        observer_health: parse_observer_health(&observer_health, 18)?,
+        observer_health_since_ms: row.get(19)?,
+        runner_instance_id: parse_id(row.get(20)?, 20)?,
+        runner_runtime: row.get(21)?,
         runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(21, Type::Integer, Box::new(error))
+            rusqlite::Error::FromSqlConversionFailure(22, Type::Integer, Box::new(error))
         })?,
         last_hook_event: last_hook_event
-            .map(|value| parse_provider_hook_event(&value, 22))
+            .map(|value| parse_provider_hook_event(&value, 23))
             .transpose()?,
-        last_hook_at_ms: row.get(23)?,
-        started_at_ms: row.get(24)?,
-        updated_at_ms: row.get(25)?,
-        ended_at_ms: row.get(26)?,
-        exit_code: row.get(27)?,
-        exit_signal: row.get(28)?,
-        stop_requested_at_ms: row.get(29)?,
-        current_run_id: parse_optional_id(current_run_id, 30)?,
+        last_hook_at_ms: row.get(24)?,
+        started_at_ms: row.get(25)?,
+        updated_at_ms: row.get(26)?,
+        ended_at_ms: row.get(27)?,
+        exit_code: row.get(28)?,
+        exit_signal: row.get(29)?,
+        stop_requested_at_ms: row.get(30)?,
+        current_run_id: parse_optional_id(current_run_id, 31)?,
     })
 }
 
@@ -5219,7 +5107,17 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
     if current == 22 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute_batch(include_str!("../migrations/0023_agent_model_policy.sql"))?;
+        let already_present: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'cleanup_state'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !already_present {
+            transaction
+                .execute_batch(include_str!("../migrations/0023_session_cleanup_state.sql"))?;
+        }
         transaction.pragma_update(None, "user_version", 23)?;
         transaction.commit()?;
     }
@@ -5492,6 +5390,12 @@ fn parse_observer_health(value: &str, column: usize) -> rusqlite::Result<Observe
 }
 
 fn parse_session_state(value: &str, column: usize) -> rusqlite::Result<SessionState> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
+fn parse_cleanup_state(value: &str, column: usize) -> rusqlite::Result<SessionCleanupState> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
     })

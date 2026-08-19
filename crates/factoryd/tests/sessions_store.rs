@@ -128,13 +128,14 @@ fn fixture() -> Store {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 22 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 23 after the
 /// connector-event migration, runtime metadata, and legacy permission repair
 /// (0015 widened `last_hook_event` for `permission_request`) -- and
 /// asserts: the legacy open run is force-closed by 0014 (not left
 /// dangling), and `PRAGMA foreign_key_check` is clean after the full
 /// chain including 0015's `sessions` rebuild, 0016's task incarnations, and
-/// 0021's historical runtime metadata columns and 0022's legacy permission
+/// 0021's historical runtime metadata columns, 0022's legacy permission
+/// repair, and 0023's cleanup ownership state.
 /// repair.
 #[test]
 fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
@@ -1165,7 +1166,10 @@ fn cleanup_failure_keeps_session_owned_and_blocks_agent_deletion() {
         .mark_session_cleanup_failed(&snapshot.id, "owned group did not disappear".into(), 6)
         .unwrap();
     assert!(session.state.is_live());
-    assert_eq!(session.activity.as_deref(), Some("cleanup_failed"));
+    assert_eq!(
+        session.cleanup_state,
+        factory_core::SessionCleanupState::Failed
+    );
     assert_eq!(
         session.wait_reason.as_deref(),
         Some("owned group did not disappear")
@@ -1176,6 +1180,49 @@ fn cleanup_failure_keeps_session_owned_and_blocks_agent_deletion() {
         store.check_agent_deletable(&project_id("factory"), &agent_id("curie")),
         Err(StoreError::AgentHasLiveSession)
     ));
+}
+
+#[test]
+fn cleanup_failure_is_monotonic_against_late_hooks_and_has_explicit_resolution() {
+    let mut store = fixture();
+    let (snapshot, _) = store
+        .create_session(new_session("s1", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .mark_session_cleanup_failed(&snapshot.id, "runner vanished before cleanup".into(), 6)
+        .unwrap();
+
+    let late = store.record_hook_event(
+        &snapshot.id,
+        ProviderHookEvent::SessionStart,
+        None,
+        false,
+        None,
+        7,
+    );
+    assert!(matches!(late, Err(StoreError::SessionCleanupUnverified)));
+    let still_owned = store
+        .get_session(&project_id("factory"), &snapshot.id)
+        .unwrap();
+    assert_eq!(
+        still_owned.cleanup_state,
+        factory_core::SessionCleanupState::Failed
+    );
+    assert!(still_owned.state.is_live());
+
+    let (resolved, _) = store
+        .resolve_session_cleanup(&project_id("factory"), &snapshot.id, 8)
+        .unwrap();
+    assert_eq!(
+        resolved.cleanup_state,
+        factory_core::SessionCleanupState::Verified
+    );
+    assert!(!resolved.state.is_live());
+    assert!(
+        store
+            .check_agent_deletable(&project_id("factory"), &agent_id("curie"))
+            .is_ok()
+    );
 }
 
 // --- complete_task / block_task / cancel_run -----------------------------

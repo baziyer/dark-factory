@@ -8,7 +8,7 @@
 //! queued and blocked tasks (the full task/run/session ledgers stay behind
 //! the paginated `List*` requests), per-agent queue previews truncated to
 //! [`MAX_QUEUE_PREVIEW`] with the true depth alongside — but not paginated:
-//! project backlogs and blocked tasks are listed in full, so a factory with
+//! unassigned queues and blocked tasks are listed in full, so a factory with
 //! thousands of open tasks would push one frame past
 //! `MAX_LOCAL_FRAME_BYTES`; that is where pagination would go.
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgentBudget, AgentId, AgentSnapshot, ProjectId, ProjectSnapshot, RunSnapshot, SessionId,
     SessionSnapshot, TaskId, TaskSnapshot,
-    attention::{Attention, session_attention, task_attention},
+    attention::{Attention, session_snapshot_attention, task_attention},
     local::AgentDetail,
 };
 
@@ -46,10 +46,10 @@ pub struct FleetStatus {
 pub struct ProjectStatus {
     pub project: ProjectSnapshot,
     pub agents: Vec<AgentStatus>,
-    /// Project-backlog tasks not assigned to any agent (the operator's or an
+    /// Queued tasks not assigned to any agent (the operator's or an
     /// orchestrator's to hand out).
-    pub backlog_depth: u32,
-    pub backlog: Vec<TaskSnapshot>,
+    pub unassigned_queue_depth: u32,
+    pub unassigned_queue: Vec<TaskSnapshot>,
 }
 
 /// One agent's live picture: its session (if any), current run, and what is
@@ -71,8 +71,8 @@ pub struct AgentStatus {
     pub session: Option<SessionSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run: Option<RunSnapshot>,
-    /// Active tasks assigned to this agent in the canonical queue order (see
-    /// [`MAX_QUEUE_PREVIEW`]): running first, then priority/creation order.
+    /// Queued tasks assigned to this agent, oldest first (see
+    /// [`MAX_QUEUE_PREVIEW`]).
     pub queue_depth: u32,
     pub queue: Vec<TaskSnapshot>,
     /// Inbox messages not yet delivered into a session.
@@ -184,7 +184,7 @@ pub fn attention_items(
             });
         }
         if let Some(session) = &status.session {
-            match session_attention(session.state) {
+            match session_snapshot_attention(session) {
                 Attention::NeedsInput => items.push(AttentionItem {
                     kind: AttentionKind::NeedsInput,
                     level: Attention::NeedsInput,
@@ -192,7 +192,11 @@ pub fn attention_items(
                     agent_id: Some(agent.id.clone()),
                     task_id: None,
                     session_id: Some(session.id.clone()),
-                    since_ms: session.state_since_ms,
+                    since_ms: if session.cleanup_state == crate::SessionCleanupState::Failed {
+                        session.observer_health_since_ms
+                    } else {
+                        session.state_since_ms
+                    },
                     detail: session
                         .wait_reason
                         .clone()
@@ -282,7 +286,9 @@ pub fn sort_attention(items: &mut [AttentionItem]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AgentRole, ObserverHealth, Provider, SessionState, TaskStatus};
+    use crate::{
+        AgentRole, ObserverHealth, Provider, SessionCleanupState, SessionState, TaskStatus,
+    };
 
     fn agent(id: &str, paused: bool) -> AgentSnapshot {
         AgentSnapshot {
@@ -311,6 +317,7 @@ mod tests {
             runtime_permission_mode: None,
             runtime_control_mode: None,
             state,
+            cleanup_state: SessionCleanupState::None,
             state_since_ms: since,
             worktree: "/w".to_owned(),
             provider_session_id: None,
@@ -355,7 +362,7 @@ mod tests {
             queue_depth: u32::try_from(queue.len()).unwrap(),
             attention: session
                 .as_ref()
-                .map_or(Attention::Routine, |s| session_attention(s.state)),
+                .map_or(Attention::Routine, session_snapshot_attention),
             attention_inferred: session.is_none(),
             agent,
             worktree: None,
@@ -449,5 +456,23 @@ mod tests {
             vec![],
         )];
         assert!(attention_items(&project, &agents, &[], true).is_empty());
+    }
+
+    #[test]
+    fn cleanup_failed_live_session_is_shared_failed_attention() {
+        let project = ProjectId::try_from("p").unwrap();
+        let mut cleanup = session(SessionState::Idle, 1);
+        cleanup.cleanup_state = crate::SessionCleanupState::Failed;
+        cleanup.wait_reason = Some("provider cleanup was not confirmed".to_owned());
+        let items = attention_items(
+            &project,
+            &[status(agent("a", false), Some(cleanup), vec![])],
+            &[],
+            true,
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, AttentionKind::SessionFailed);
+        assert_eq!(items[0].level, Attention::Failed);
+        assert_eq!(items[0].detail, "provider cleanup was not confirmed");
     }
 }

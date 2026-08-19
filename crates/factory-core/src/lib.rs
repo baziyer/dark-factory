@@ -209,6 +209,26 @@ pub enum ProviderHookEvent {
     SessionEnd,
 }
 
+/// Durable ownership state for a provider process tree. `Failed` is separate
+/// from mutable provider activity: authenticated hooks cannot make an
+/// unverified cleanup look safe again. Only explicit operator verification
+/// may move it to `Verified`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCleanupState {
+    #[default]
+    None,
+    Failed,
+    Verified,
+}
+
+impl SessionCleanupState {
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
 impl ProviderHookEvent {
     /// The exact event name Claude Code and Codex use in their own hook
     /// wire protocols and configuration files (`SessionStart`,
@@ -459,6 +479,8 @@ pub struct SessionSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_control_mode: Option<String>,
     pub state: SessionState,
+    #[serde(default, skip_serializing_if = "SessionCleanupState::is_none")]
+    pub cleanup_state: SessionCleanupState,
     pub state_since_ms: i64,
     pub worktree: String,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -288,6 +288,18 @@ a run or typing the new task body. Its regression shape is completed task →
 stop resident session → resume the same provider thread → assign the next task;
 the acceptance condition is the new task body entering a running task.
 
+### Provider cleanup ownership
+
+Runner cleanup is a durable ownership boundary, not provider activity. A
+session whose provider tree was not proven gone remains live with
+`cleanup_state = failed`; authenticated late hooks are rejected and cannot
+clear that state. Recovery never terminalizes or makes the agent deletable
+from that state. An operator must inspect the private runtime and explicitly
+run `factoryctl session resolve-cleanup` (or the matching TUI remediation),
+which records `verified` and closes the session transactionally. The runner
+uses a private process-group witness where the PTY implementation permits it;
+permission errors and unprovable ownership fail closed.
+
 ## Deliberately unresolved
 
 - Zero-downtime handoff between two daemon binaries is deferred (see

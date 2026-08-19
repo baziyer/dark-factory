@@ -112,6 +112,27 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
         .map(|(row, item)| {
             hits.add_row(inner, row, Target::Attention(item.target.clone()));
             let inferred = if item.inferred { "~" } else { "" };
+            let remediation = match &item.target {
+                AttentionTarget::Agent(agent_id) => board
+                    .agents
+                    .get(agent_id)
+                    .and_then(|agent| agent.current_session_id.as_ref())
+                    .and_then(|session_id| board.sessions.get(session_id))
+                    .filter(|session| {
+                        session.cleanup_state == factory_core::SessionCleanupState::Failed
+                    })
+                    .map(|session| {
+                        format!(
+                            " — {}; press r after verifying descendants are gone",
+                            session
+                                .wait_reason
+                                .as_deref()
+                                .unwrap_or("provider cleanup is unverified")
+                        )
+                    })
+                    .unwrap_or_default(),
+                AttentionTarget::Task(_) => String::new(),
+            };
             let (selected, label) = match item.target {
                 AttentionTarget::Agent(id) => (
                     board.selected_agent.as_ref() == Some(&id) && board.selected_task.is_none(),
@@ -131,7 +152,7 @@ fn render_needs_you(frame: &mut Frame, area: Rect, board: &Board, hits: &mut Hit
                     format!("{inferred}{:?} ", item.attention),
                     Style::default().fg(Color::Yellow),
                 ),
-                Span::raw(format!("{} :: {label}", item.project_id)),
+                Span::raw(format!("{} :: {label}{remediation}", item.project_id)),
             ])
         })
         .collect::<Vec<_>>();

@@ -77,6 +77,8 @@ pub enum Action {
     SwitchProject,
     /// `x`: stop the selected agent (2-press confirm).
     StopSelected,
+    /// `r`: verify and resolve a cleanup-failed session (2-press confirm).
+    ResolveCleanup,
     Detach,
     JumpNeedsAttention,
     ToggleHelp,
@@ -114,6 +116,7 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('o') => Some(Action::MessageOrchestrator),
         KeyCode::Char('p') => Some(Action::SwitchProject),
         KeyCode::Char('x') => Some(Action::StopSelected),
+        KeyCode::Char('r') => Some(Action::ResolveCleanup),
         KeyCode::Char('q') => Some(Action::Detach),
         KeyCode::Char('g') => Some(Action::JumpNeedsAttention),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
@@ -301,6 +304,10 @@ pub enum PendingAction {
         project_id: ProjectId,
         run_id: RunId,
     },
+    ResolveSessionCleanup {
+        project_id: ProjectId,
+        session_id: SessionId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -467,6 +474,7 @@ impl Board {
             Action::MessageOrchestrator => self.begin_message_orchestrator(),
             Action::SwitchProject => self.begin_switch_project(),
             Action::StopSelected => self.begin_stop_selected(),
+            Action::ResolveCleanup => self.begin_resolve_cleanup(),
             Action::Detach => {
                 self.quit = true;
                 Intent::Quit
@@ -764,6 +772,36 @@ impl Board {
         Intent::Redraw
     }
 
+    fn begin_resolve_cleanup(&mut self) -> Intent {
+        let Some(agent_id) = self.pane_target_agent() else {
+            self.set_status("no agent selected", StatusLevel::Error);
+            return Intent::Redraw;
+        };
+        let Some(agent) = self.agents.get(&agent_id) else {
+            return Intent::Redraw;
+        };
+        let Some(session_id) = agent.current_session_id.clone() else {
+            self.set_status("agent has no cleanup-failed session", StatusLevel::Error);
+            return Intent::Redraw;
+        };
+        let Some(session) = self.sessions.get(&session_id) else {
+            self.set_status("session status is still loading", StatusLevel::Error);
+            return Intent::Redraw;
+        };
+        if session.cleanup_state != factory_core::SessionCleanupState::Failed {
+            self.set_status(
+                "session does not need cleanup verification",
+                StatusLevel::Error,
+            );
+            return Intent::Redraw;
+        }
+        self.mode = Mode::Confirm(PendingAction::ResolveSessionCleanup {
+            project_id: agent.project_id.clone(),
+            session_id,
+        });
+        Intent::Redraw
+    }
+
     fn jump_to_attention(&mut self) -> Intent {
         let items = self.attention_items();
         if items.is_empty() {
@@ -846,6 +884,13 @@ impl Board {
                 project_id,
                 run_id,
                 grace_ms: 5_000,
+            }),
+            PendingAction::ResolveSessionCleanup {
+                project_id,
+                session_id,
+            } => Intent::Send(LocalRequest::ResolveSessionCleanup {
+                project_id,
+                session_id,
             }),
         }
     }

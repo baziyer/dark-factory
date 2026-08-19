@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use factory_core::{
-    SessionState,
+    SessionSnapshot, SessionState,
     status::{AttentionKind, FleetStatus, WorktreeStatus},
 };
 
@@ -25,11 +25,11 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
     for project in &status.projects {
         writeln!(
             output,
-            "\n{} ({}) | agents {} | backlog {}",
+            "\n{} ({}) | agents {} | unassigned {}",
             display_text(&project.project.name),
             project.project.id,
             project.agents.len(),
-            project.backlog_depth
+            project.unassigned_queue_depth
         )
         .map_err(|error| error.to_string())?;
         for agent in &project.agents {
@@ -38,7 +38,7 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
                 output,
                 "  {} | {}{} | queue {} | inbox {} | {}",
                 agent.agent.id,
-                session_label(agent.session.as_ref().map(|session| session.state)),
+                session_label(agent.session.as_ref()),
                 pause,
                 agent.queue_depth,
                 agent.inbox_pending,
@@ -74,16 +74,30 @@ pub fn write(output: &mut impl Write, status: &FleetStatus) -> Result<(), String
     output.flush().map_err(|error| error.to_string())
 }
 
-const fn session_label(state: Option<SessionState>) -> &'static str {
-    match state {
-        None => "no session",
-        Some(SessionState::Starting) => "starting",
-        Some(SessionState::Idle) => "idle",
-        Some(SessionState::Working) => "working",
-        Some(SessionState::WaitingForInput) => "waiting for input",
-        Some(SessionState::Stopped) => "stopped",
-        Some(SessionState::Failed) => "failed",
+fn session_label(session: Option<&SessionSnapshot>) -> String {
+    let Some(session) = session else {
+        return "no session".to_owned();
+    };
+    if session.cleanup_state == factory_core::SessionCleanupState::Failed {
+        return format!(
+            "cleanup failed: {}",
+            display_text(
+                session
+                    .wait_reason
+                    .as_deref()
+                    .unwrap_or("provider cleanup was not confirmed")
+            )
+        );
     }
+    match session.state {
+        SessionState::Starting => "starting",
+        SessionState::Idle => "idle",
+        SessionState::Working => "working",
+        SessionState::WaitingForInput => "waiting for input",
+        SessionState::Stopped => "stopped",
+        SessionState::Failed => "failed",
+    }
+    .to_owned()
 }
 
 fn worktree_label(worktree: Option<&WorktreeStatus>) -> String {
@@ -182,6 +196,7 @@ mod tests {
             runtime_permission_mode: None,
             runtime_control_mode: None,
             state,
+            cleanup_state: factory_core::SessionCleanupState::None,
             state_since_ms: 1,
             worktree: format!("/tmp/{agent_id}"),
             provider_session_id: None,
@@ -293,8 +308,8 @@ mod tests {
                             }),
                         ),
                     ],
-                    backlog_depth: 5,
-                    backlog: Vec::new(),
+                    unassigned_queue_depth: 5,
+                    unassigned_queue: Vec::new(),
                 },
                 ProjectStatus {
                     project: ProjectSnapshot {
@@ -305,8 +320,8 @@ mod tests {
                         updated_at_ms: 1,
                     },
                     agents: Vec::new(),
-                    backlog_depth: 0,
-                    backlog: Vec::new(),
+                    unassigned_queue_depth: 0,
+                    unassigned_queue: Vec::new(),
                 },
             ],
             attention: vec![
@@ -340,11 +355,11 @@ mod tests {
             output,
             concat!(
                 "Dark Factory: auto on | sessions 2/4 | projects 2 | attention 2\n",
-                "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | backlog 5\n",
+                "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | unassigned 5\n",
                 "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
-                "\nEmpty (empty) | agents 0 | backlog 0\n",
+                "\nEmpty (empty) | agents 0 | unassigned 0\n",
                 "\nAttention:\n",
                 "  needs input | factory/reviewer | approve command [2JFORGED\n",
                 "  task blocked | factory task task-7 | dependency missing\n",
@@ -384,6 +399,50 @@ mod tests {
         assert_eq!(
             String::from_utf8(output).unwrap(),
             "Dark Factory: auto off | sessions 0/3 | projects 0 | attention 0\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_failure_is_visible_in_agent_line_and_attention() {
+        let project_id: ProjectId = id("factory");
+        let mut cleanup_agent = agent("author", Some(SessionState::Idle), 0, 0, None);
+        let session = cleanup_agent.session.as_mut().unwrap();
+        session.cleanup_state = factory_core::SessionCleanupState::Failed;
+        session.wait_reason = Some("provider cleanup was not confirmed".to_owned());
+        let status = FleetStatus {
+            generated_at_ms: 1,
+            auto_mode: false,
+            live_session_cap: 1,
+            live_sessions: 1,
+            projects: vec![ProjectStatus {
+                project: ProjectSnapshot {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                },
+                agents: vec![cleanup_agent],
+                unassigned_queue_depth: 0,
+                unassigned_queue: Vec::new(),
+            }],
+            attention: vec![AttentionItem {
+                kind: AttentionKind::SessionFailed,
+                level: Attention::Failed,
+                project_id,
+                agent_id: Some(id("author")),
+                task_id: None,
+                session_id: Some(id("session-author")),
+                since_ms: 1,
+                detail: "provider cleanup was not confirmed".into(),
+            }],
+        };
+        let mut output = Vec::new();
+        write(&mut output, &status).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("author | cleanup failed: provider cleanup was not confirmed"));
+        assert!(
+            output.contains("session failed | factory/author | provider cleanup was not confirmed")
         );
     }
 }
