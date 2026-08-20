@@ -6,7 +6,7 @@ use std::{
 
 use factory_core::{
     EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
-    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    local::{LocalRequest, LocalResponse, RequestCredential, RequestEnvelope, ServerFrame},
 };
 use factoryctl::{Client, ClientError, MAX_FRAME_BYTES};
 
@@ -53,6 +53,58 @@ fn request_writes_one_json_line_and_reads_one_versioned_frame() {
             },
         }
     );
+    server.join().unwrap();
+}
+
+#[test]
+fn authenticated_client_carries_its_credential_on_requests_and_subscriptions() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let credential = RequestCredential::new("operator-secret".into()).unwrap();
+    let expected = credential.clone();
+    let server = thread::spawn(move || {
+        for response in [
+            LocalResponse::Health {
+                runner_path: "/runner".into(),
+                factoryctl_path: "/factoryctl".into(),
+                version: "0.1.0".into(),
+                process_id: 1,
+            },
+            LocalResponse::Subscribed {
+                after_sequence: 3,
+                replay_through: 3,
+            },
+        ] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let envelope: RequestEnvelope = serde_json::from_str(&line).unwrap();
+            assert_eq!(envelope.credential, Some(expected.clone()));
+            serde_json::to_writer(
+                &mut stream,
+                &ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response,
+                },
+            )
+            .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
+    });
+
+    let client = Client::authenticated(&socket, credential);
+    client.request(LocalRequest::Health).unwrap();
+    let mut subscription = client.subscribe(3).unwrap();
+    assert!(matches!(
+        subscription.next().unwrap().unwrap(),
+        ServerFrame::Response {
+            response: LocalResponse::Subscribed { .. },
+            ..
+        }
+    ));
     server.join().unwrap();
 }
 

@@ -14,15 +14,11 @@
 //! $DARK_FACTORY_HOME/projects/<project_id>/PROJECT.md
 //! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/instructions.md
 //! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/memory.md
-//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/codex-home/
-//! $DARK_FACTORY_HOME/projects/<project_id>/agents/<agent_id>/claude-settings.json
-//! $DARK_FACTORY_HOME/projects/<project_id>/worktrees/<agent_id>/
 //! ```
 //!
 //! This module only computes paths. `factoryd::guidance` creates the
-//! Markdown files, `factoryd`'s agent creation provisions the worktree, and
-//! the providers create `codex-home/` (once, on the agent's first spawn) and
-//! `claude-settings.json` (per session spawn) directly under `agent_dir`.
+//! Markdown files. Provider-specific state is prepared beneath the private
+//! attempt runtime, not inside this operator-editable guidance tree.
 //!
 //! `ProjectId` and `AgentId` are already constrained to ASCII letters,
 //! digits, hyphens, and underscores, so they are always safe single path
@@ -110,16 +106,6 @@ pub fn agent_memory_path(home: &Path, project_id: &ProjectId, agent_id: &AgentId
     agent_dir(home, project_id, agent_id).join("memory.md")
 }
 
-/// The agent's own git worktree, sibling to `agents/`:
-/// `<project_dir>/worktrees/<agent_id>` (provisioned by `factoryd` on
-/// `CreateAgent`, removed on `DeleteAgent`).
-#[must_use]
-pub fn agent_worktree_dir(home: &Path, project_id: &ProjectId, agent_id: &AgentId) -> PathBuf {
-    project_dir(home, project_id)
-        .join("worktrees")
-        .join(agent_id.as_str())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,15 +132,6 @@ mod tests {
         assert_eq!(
             agent_memory_path(home, &project(), &agent()),
             Path::new("/home/user/.dark-factory/projects/factory/agents/god/memory.md")
-        );
-    }
-
-    #[test]
-    fn worktree_path_matches_the_documented_sister_folder() {
-        let home = Path::new("/home/user/.dark-factory");
-        assert_eq!(
-            agent_worktree_dir(home, &project(), &agent()),
-            Path::new("/home/user/.dark-factory/projects/factory/worktrees/god")
         );
     }
 

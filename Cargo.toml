@@ -9,7 +9,6 @@ rust-version = "1.88"
 license = "MIT"
 
 [workspace.dependencies]
-base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

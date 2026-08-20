@@ -1,6 +1,6 @@
 use factory_core::{
-    AgentId, EventEnvelope, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
-    RunFailureReason, RunId, RunSnapshot, RunStatus, TaskId, TaskStatus,
+    AgentId, EventEnvelope, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId, Provider,
+    RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot, TaskId, TaskStatus,
 };
 
 fn id<T>(value: &str) -> T
@@ -12,144 +12,180 @@ where
 }
 
 #[test]
-fn all_run_status_values_have_stable_wire_names() {
+fn run_phases_have_stable_wire_names_and_only_running_grants_authority() {
+    assert_eq!(PROTOCOL_VERSION, 3);
     let cases = [
-        (RunStatus::Starting, "starting"),
-        (RunStatus::Running, "running"),
-        (RunStatus::Waiting, "waiting"),
-        (RunStatus::Blocked, "blocked"),
-        (RunStatus::Paused, "paused"),
-        (RunStatus::Succeeded, "succeeded"),
-        (RunStatus::Failed, "failed"),
-        (RunStatus::Stopped, "stopped"),
+        (RunPhase::Admitted, "admitted"),
+        (RunPhase::Running, "running"),
+        (RunPhase::Finalizing, "finalizing"),
+        (RunPhase::Terminal, "terminal"),
     ];
-
-    for (status, expected) in cases {
-        assert_eq!(serde_json::to_value(status).unwrap(), expected);
+    for (phase, expected) in cases {
+        assert_eq!(serde_json::to_value(phase).unwrap(), expected);
+        assert_eq!(phase.grants_attempt_authority(), phase == RunPhase::Running);
     }
 }
 
 #[test]
-fn all_run_failure_reasons_have_stable_wire_names() {
-    assert_eq!(PROTOCOL_VERSION, 2);
+fn legacy_repository_audit_events_remain_decodable() {
+    let value = serde_json::json!({
+        "type": "repository_operation",
+        "data": {
+            "project_id": "project-1",
+            "agent_id": "worker-1",
+            "run_id": "run-1",
+            "operation": "git_push",
+            "phase": "finished",
+            "success": true,
+            "reference": "deadbeef"
+        }
+    });
+    assert!(matches!(
+        serde_json::from_value::<FactoryEvent>(value).unwrap(),
+        FactoryEvent::LegacyRepositoryOperation { .. }
+    ));
+}
 
-    let cases = [
-        (RunFailureReason::Protocol, "protocol"),
-        (RunFailureReason::Provider, "provider"),
-        (RunFailureReason::Permission, "permission"),
-        (RunFailureReason::Limit, "limit"),
-        (RunFailureReason::Process, "process"),
-        (RunFailureReason::Spawn, "spawn"),
-        (RunFailureReason::Incomplete, "incomplete"),
-        (RunFailureReason::Unverifiable, "unverifiable"),
-    ];
+#[test]
+fn run_phase_transition_contract_requires_finalization_before_terminal() {
+    assert!(RunPhase::Admitted.can_transition_to(RunPhase::Running));
+    assert!(RunPhase::Admitted.can_transition_to(RunPhase::Finalizing));
+    assert!(RunPhase::Running.can_transition_to(RunPhase::Finalizing));
+    assert!(RunPhase::Finalizing.can_transition_to(RunPhase::Terminal));
 
-    for (reason, expected) in cases {
-        assert_eq!(serde_json::to_value(reason).unwrap(), expected);
+    for forbidden in [
+        (RunPhase::Admitted, RunPhase::Terminal),
+        (RunPhase::Running, RunPhase::Terminal),
+        (RunPhase::Finalizing, RunPhase::Running),
+        (RunPhase::Terminal, RunPhase::Running),
+    ] {
+        assert!(!forbidden.0.can_transition_to(forbidden.1));
     }
 }
 
 #[test]
-fn observer_health_has_stable_wire_names_and_an_unknown_default() {
+fn immutable_run_outcomes_have_stable_bounded_shapes() {
     let cases = [
-        (ObserverHealth::Unknown, "unknown"),
-        (ObserverHealth::Healthy, "healthy"),
-        (ObserverHealth::Degraded, "degraded"),
+        (
+            RunOutcome::Succeeded,
+            serde_json::json!({"type": "succeeded"}),
+        ),
+        (
+            RunOutcome::Blocked {
+                reason: "wait".into(),
+            },
+            serde_json::json!({"type": "blocked", "data": {"reason": "wait"}}),
+        ),
+        (
+            RunOutcome::Failed {
+                reason: RunFailureReason::Process,
+            },
+            serde_json::json!({"type": "failed", "data": {"reason": "process"}}),
+        ),
+        (
+            RunOutcome::Cancelled {
+                reason: "operator".into(),
+            },
+            serde_json::json!({"type": "cancelled", "data": {"reason": "operator"}}),
+        ),
     ];
-
-    assert_eq!(ObserverHealth::default(), ObserverHealth::Unknown);
-    for (health, expected) in cases {
-        assert_eq!(serde_json::to_value(health).unwrap(), expected);
+    for (outcome, expected) in cases {
+        let value = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(value, expected);
+        assert_eq!(
+            serde_json::from_value::<RunOutcome>(value).unwrap(),
+            outcome
+        );
     }
 }
 
 #[test]
-fn an_event_envelope_round_trips_run_hierarchy_and_activity() {
+fn an_event_envelope_round_trips_the_attempt_phase_and_outcome() {
     let envelope = EventEnvelope {
         protocol_version: PROTOCOL_VERSION,
         sequence: 42,
         occurred_at_ms: 1_723_000_010_000,
         event: FactoryEvent::RunChanged {
-            run: RunSnapshot {
+            run: Box::new(RunSnapshot {
                 id: id::<RunId>("run-7"),
                 project_id: id::<ProjectId>("project-1"),
                 agent_id: id::<AgentId>("worker-2"),
-                parent_run_id: Some(id::<RunId>("run-1")),
-                task_id: Some(id::<TaskId>("task-3")),
-                session_id: None,
-                closed_by: None,
-                status: RunStatus::Waiting,
-                activity: Some("Waiting for review".into()),
+                task_id: id::<TaskId>("task-3"),
+                provider: Provider::Codex,
+                phase: RunPhase::Finalizing,
+                outcome: Some(RunOutcome::Succeeded),
+                runner_instance_id: None,
+                runtime_model: Some("gpt-5.6-luna".into()),
+                runtime_reasoning_effort: Some("medium".into()),
+                runtime_permission_mode: None,
+                runtime_control_mode: None,
+                activity: Some("releasing resources".into()),
                 wait_reason: None,
-                worktree: "/worktrees/task-3".into(),
                 observer_health: ObserverHealth::Healthy,
-                observer_health_since_ms: 1_723_000_008_000,
-                started_at_ms: 1_723_000_000_000,
-                status_since_ms: 1_723_000_009_000,
+                observer_reason: None,
+                admitted_at_ms: 1_723_000_000_000,
+                started_at_ms: Some(1_723_000_001_000),
+                phase_since_ms: 1_723_000_009_000,
                 updated_at_ms: 1_723_000_010_000,
                 ended_at_ms: None,
                 exit_code: None,
                 exit_signal: None,
-                failure_reason: None,
-            },
+            }),
         },
     };
 
-    let json = serde_json::to_string(&envelope).unwrap();
-    let decoded: EventEnvelope = serde_json::from_str(&json).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-
-    assert_eq!(decoded, envelope);
-    assert_eq!(value["protocol_version"], PROTOCOL_VERSION);
-    assert_eq!(value["sequence"], 42);
-    assert_eq!(value["event"]["type"], "run_changed");
-    assert_eq!(value["event"]["data"]["run"]["parent_run_id"], "run-1");
-    assert_eq!(value["event"]["data"]["run"]["project_id"], "project-1");
-    assert_eq!(value["event"]["data"]["run"]["status"], "waiting");
-    assert_eq!(value["event"]["data"]["run"]["observer_health"], "healthy");
+    let value = serde_json::to_value(&envelope).unwrap();
+    let FactoryEvent::RunChanged { run } = &envelope.event else {
+        panic!("expected run event");
+    };
+    assert!(run.has_valid_phase_outcome());
+    assert_eq!(value["event"]["data"]["run"]["phase"], "finalizing");
     assert_eq!(
-        value["event"]["data"]["run"]["observer_health_since_ms"],
-        1_723_000_008_000_i64
+        value["event"]["data"]["run"]["outcome"]["type"],
+        "succeeded"
     );
-    assert!(value["event"]["data"]["run"].get("ended_at_ms").is_none());
-    assert!(value["event"]["data"]["run"].get("exit_code").is_none());
-    assert!(value["event"]["data"]["run"].get("exit_signal").is_none());
-    assert!(
-        value["event"]["data"]["run"]
-            .get("failure_reason")
-            .is_none()
+    assert!(value["event"]["data"]["run"].get("session_id").is_none());
+    assert!(value["event"]["data"]["run"].get("parent_run_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<EventEnvelope>(value).unwrap(),
+        envelope
     );
 }
 
 #[test]
-fn old_run_events_default_missing_observer_health_fields() {
-    let json = r#"{
-        "protocol_version": 1,
-        "sequence": 7,
-        "occurred_at_ms": 40,
-        "event": {
-            "type": "run_changed",
-            "data": {
-                "run": {
-                    "id": "run-old",
-                    "project_id": "project-old",
-                    "agent_id": "agent-old",
-                    "status": "running",
-                    "worktree": "/work/old",
-                    "started_at_ms": 10,
-                    "status_since_ms": 20,
-                    "updated_at_ms": 30
-                }
-            }
-        }
-    }"#;
-
-    let decoded: EventEnvelope = serde_json::from_str(json).unwrap();
-    let FactoryEvent::RunChanged { run } = decoded.event else {
-        panic!("expected a run event");
+fn phase_outcome_contract_rejects_authority_with_an_outcome_or_finalizing_without_one() {
+    let mut run = RunSnapshot {
+        id: id::<RunId>("run-1"),
+        project_id: id::<ProjectId>("project-1"),
+        agent_id: id::<AgentId>("agent-1"),
+        task_id: id::<TaskId>("task-1"),
+        provider: Provider::Shell,
+        phase: RunPhase::Running,
+        outcome: None,
+        runner_instance_id: None,
+        runtime_model: None,
+        runtime_reasoning_effort: None,
+        runtime_permission_mode: None,
+        runtime_control_mode: None,
+        activity: None,
+        wait_reason: None,
+        observer_health: ObserverHealth::Healthy,
+        observer_reason: None,
+        admitted_at_ms: 1,
+        started_at_ms: Some(2),
+        phase_since_ms: 2,
+        updated_at_ms: 2,
+        ended_at_ms: None,
+        exit_code: None,
+        exit_signal: None,
     };
-    assert_eq!(run.observer_health, ObserverHealth::Unknown);
-    assert_eq!(run.observer_health_since_ms, 0);
+    assert!(run.has_valid_phase_outcome());
+    run.outcome = Some(RunOutcome::Succeeded);
+    assert!(!run.has_valid_phase_outcome());
+    run.phase = RunPhase::Finalizing;
+    assert!(run.has_valid_phase_outcome());
+    run.outcome = None;
+    assert!(!run.has_valid_phase_outcome());
 }
 
 #[test]
@@ -162,23 +198,13 @@ fn ids_reject_empty_unbounded_and_unsafe_values() {
         "path/segment".into(),
     ] {
         assert!(ProjectId::try_from(invalid.clone()).is_err());
-
         let json = serde_json::to_string(&invalid).unwrap();
         assert!(serde_json::from_str::<ProjectId>(&json).is_err());
     }
 }
 
 #[test]
-fn only_finished_states_are_terminal() {
-    assert!(!RunStatus::Starting.is_terminal());
-    assert!(!RunStatus::Running.is_terminal());
-    assert!(!RunStatus::Waiting.is_terminal());
-    assert!(!RunStatus::Blocked.is_terminal());
-    assert!(!RunStatus::Paused.is_terminal());
-    assert!(RunStatus::Succeeded.is_terminal());
-    assert!(RunStatus::Failed.is_terminal());
-    assert!(RunStatus::Stopped.is_terminal());
-
+fn task_terminal_statuses_remain_a_separate_projection() {
     assert!(!TaskStatus::Queued.is_terminal());
     assert!(!TaskStatus::Running.is_terminal());
     assert!(!TaskStatus::Blocked.is_terminal());

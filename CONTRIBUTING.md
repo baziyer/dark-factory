@@ -1,8 +1,13 @@
 # Contributing
 
-See [AGENTS.md](AGENTS.md) for the full workflow (worktree per task,
+See [AGENTS.md](AGENTS.md) for the full workflow (one development worktree per change,
 mandatory adversarial PR review, remove-or-refactor over patch) — this
 file is just the shortest path to a useful first change.
+
+Dark Factory is currently frozen for the
+[safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not run
+provider work, install a development build, or use `~/.dark-factory`. Stage 1
+deliberately refuses worker admission.
 
 ## Before you send a change
 
@@ -70,11 +75,10 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
   wire its name into `factory-tui`'s `--theme` flag parsing in `main.rs`.
   The `glyph_tables_are_complete` test in `theme.rs` catches a theme
   missing a glyph the board can actually draw.
-- **A rough edge in the tests**: any test in
-  `crates/factoryd/tests/sessions_e2e.rs` with a comment explaining a
-  workaround (e.g. the settle-window in `wait_for_stable_idle`) is a known
-  rough edge with a documented root cause, not just a flaky test — a
-  cleaner fix is welcome.
+- **A safe-kernel causal test**: use the proof matrix in
+  `docs/development/SAFE_KERNEL_REFACTOR.md`. Process fixtures must register
+  exact resources before use and include an independent post-test verifier;
+  provider/test-process cleanup is not proof.
 
 Every change updates docs in the same PR when it changes behavior — see
 `AGENTS.md`'s "docs are load-bearing" rule.

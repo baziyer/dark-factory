@@ -3,9 +3,9 @@
 //! failures/needs-input above routine chatter per the design brief ("announcements for failures/
 //! completions/spawns/input requests" + "attention-ranked lines float above routine ones").
 
-use factory_core::{EventEnvelope, FactoryEvent, RunStatus, SessionState, TaskStatus};
+use factory_core::{EventEnvelope, FactoryEvent, RunOutcome, RunPhase, TaskStatus};
 
-use factory_core::attention::{Attention, run_attention, session_attention, task_attention};
+use factory_core::attention::{Attention, run_attention, task_attention};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Announcement {
@@ -46,34 +46,23 @@ pub(crate) fn task_status_word(status: TaskStatus) -> &'static str {
     }
 }
 
-fn run_status_word(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Starting => "starting",
-        RunStatus::Running => "running",
-        RunStatus::Waiting => "waiting for input",
-        RunStatus::Blocked => "blocked",
-        RunStatus::Paused => "paused",
-        RunStatus::Succeeded => "succeeded",
-        RunStatus::Failed => "failed",
-        RunStatus::Stopped => "stopped",
-    }
-}
-
-fn session_state_word(state: SessionState) -> &'static str {
-    match state {
-        SessionState::Starting => "starting",
-        SessionState::Idle => "idle",
-        SessionState::Working => "working",
-        SessionState::WaitingForInput => "waiting for input",
-        SessionState::Stopped => "stopped",
-        SessionState::Failed => "failed",
+fn run_status_word(phase: RunPhase, outcome: Option<&RunOutcome>) -> &'static str {
+    match (phase, outcome) {
+        (RunPhase::Admitted, _) => "admitted",
+        (RunPhase::Running, _) => "running",
+        (RunPhase::Finalizing, _) => "finalizing",
+        (RunPhase::Terminal, Some(RunOutcome::Succeeded)) => "succeeded",
+        (RunPhase::Terminal, Some(RunOutcome::Blocked { .. })) => "blocked",
+        (RunPhase::Terminal, Some(RunOutcome::Failed { .. })) => "failed",
+        (RunPhase::Terminal, Some(RunOutcome::Cancelled { .. })) => "cancelled",
+        (RunPhase::Terminal, None) => "terminal",
     }
 }
 
 /// Formats one Dwarf-Fortress-terse announcement line for an event, e.g.
 /// `20:41 bob     task#42 done`, tagged with the [`Attention`] level that governs its ordering.
 /// Returns `None` for events this board doesn't narrate (project-level bookkeeping isn't
-/// agent/task/session activity).
+/// agent/task/run activity).
 #[must_use]
 pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
     let time = clock(event.occurred_at_ms);
@@ -94,17 +83,12 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             let text = format!(
                 "{time} {:<10} run {}",
                 truncate_id(run.agent_id.as_str(), 10),
-                run_status_word(run.status)
+                run_status_word(run.phase, run.outcome.as_ref())
             );
-            (text, run_attention(run.status))
+            (text, run_attention(run))
         }
-        FactoryEvent::SessionChanged { session } => {
-            let text = format!(
-                "{time} {:<10} session {}",
-                truncate_id(session.agent_id.as_str(), 10),
-                session_state_word(session.state)
-            );
-            (text, session_attention(session.state))
+        FactoryEvent::LegacySessionChanged { .. } | FactoryEvent::LegacyRunChanged { .. } => {
+            return None;
         }
         FactoryEvent::AgentChanged { agent } => {
             let text = format!(
@@ -150,33 +134,10 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             ),
             Attention::NeedsInput,
         ),
-        FactoryEvent::RepositoryOperation {
-            agent_id,
-            operation,
-            phase,
-            success,
-            ..
-        } if phase == "finished" => (
-            format!(
-                "{time} {:<10} {} {}",
-                truncate_id(agent_id.as_str(), 10),
-                operation,
-                if *success == Some(true) {
-                    "done"
-                } else {
-                    "failed"
-                }
-            ),
-            if *success == Some(true) {
-                Attention::Routine
-            } else {
-                Attention::Failed
-            },
-        ),
         FactoryEvent::AutoModeChanged { .. }
         | FactoryEvent::PolicyDecision { .. }
         | FactoryEvent::AgentBudgetChanged { .. }
-        | FactoryEvent::RepositoryOperation { .. }
+        | FactoryEvent::LegacyRepositoryOperation { .. }
         | FactoryEvent::RepositoryAuthorityChanged { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,
@@ -187,131 +148,4 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         attention,
         sequence: event.sequence,
     })
-}
-
-/// Ranks announcements for display: highest [`Attention`] first, ties broken by recency (newest
-/// first) — "attention-ranked lines float above routine ones" from the design brief. `height` is
-/// how many lines the caller has room to show.
-#[must_use]
-#[cfg(test)]
-pub fn ranked<'a>(
-    announcements: impl Iterator<Item = &'a Announcement>,
-    height: usize,
-) -> Vec<&'a Announcement> {
-    let mut all: Vec<&Announcement> = announcements.collect();
-    all.sort_by(|a, b| {
-        b.attention
-            .priority()
-            .cmp(&a.attention.priority())
-            .then_with(|| b.at_ms.cmp(&a.at_ms))
-    });
-    all.truncate(height);
-    all
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use factory_core::{AgentId, ProjectId, TaskId, TaskSnapshot};
-
-    fn task_event(status: TaskStatus, at_ms: i64) -> EventEnvelope {
-        EventEnvelope {
-            protocol_version: 1,
-            sequence: at_ms,
-            occurred_at_ms: at_ms,
-            event: FactoryEvent::TaskChanged {
-                task: TaskSnapshot {
-                    id: TaskId::try_from("t1").unwrap(),
-                    project_id: ProjectId::try_from("proj").unwrap(),
-                    parent_task_id: None,
-                    assigned_agent_id: Some(AgentId::try_from("alice").unwrap()),
-                    title: "fix bug".into(),
-                    status,
-                    priority: 0,
-                    created_at_ms: at_ms,
-                    updated_at_ms: at_ms,
-                },
-            },
-        }
-    }
-
-    #[test]
-    fn format_event_tags_task_failed_as_failed_attention() {
-        let announcement = format_event(&task_event(TaskStatus::Failed, 0)).unwrap();
-        assert_eq!(announcement.attention, Attention::Failed);
-        assert!(announcement.text.contains("failed"));
-    }
-
-    #[test]
-    fn format_event_tags_task_succeeded_as_completed() {
-        let announcement = format_event(&task_event(TaskStatus::Succeeded, 0)).unwrap();
-        assert_eq!(announcement.attention, Attention::Completed);
-    }
-
-    #[test]
-    fn format_event_ignores_project_bookkeeping() {
-        let event = EventEnvelope {
-            protocol_version: 1,
-            sequence: 1,
-            occurred_at_ms: 0,
-            event: FactoryEvent::ProjectDeleted {
-                project_id: ProjectId::try_from("proj").unwrap(),
-            },
-        };
-        assert!(format_event(&event).is_none());
-    }
-
-    #[test]
-    fn ranked_puts_needs_input_above_newer_routine_lines() {
-        let old_but_urgent = Announcement {
-            at_ms: 0,
-            text: "old urgent".into(),
-            attention: Attention::NeedsInput,
-            sequence: 0,
-        };
-        let new_but_routine = Announcement {
-            at_ms: 100,
-            text: "new routine".into(),
-            attention: Attention::Routine,
-            sequence: 1,
-        };
-        let items = [new_but_routine.clone(), old_but_urgent.clone()];
-        let result = ranked(items.iter(), 10);
-        assert_eq!(result[0].text, "old urgent");
-        assert_eq!(result[1].text, "new routine");
-    }
-
-    #[test]
-    fn ranked_breaks_ties_by_recency() {
-        let a = Announcement {
-            at_ms: 0,
-            text: "a".into(),
-            attention: Attention::Routine,
-            sequence: 0,
-        };
-        let b = Announcement {
-            at_ms: 100,
-            text: "b".into(),
-            attention: Attention::Routine,
-            sequence: 1,
-        };
-        let items = [a, b];
-        let result = ranked(items.iter(), 10);
-        assert_eq!(result[0].text, "b");
-        assert_eq!(result[1].text, "a");
-    }
-
-    #[test]
-    fn ranked_truncates_to_height() {
-        let items: Vec<Announcement> = (0..5)
-            .map(|i| Announcement {
-                at_ms: i,
-                text: format!("{i}"),
-                attention: Attention::Routine,
-                sequence: i,
-            })
-            .collect();
-        let result = ranked(items.iter(), 2);
-        assert_eq!(result.len(), 2);
-    }
 }

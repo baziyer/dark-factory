@@ -12,12 +12,7 @@ use std::{
     time::Duration,
 };
 
-use factory_core::{
-    ProjectId,
-    local::{
-        LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, ServerFrame,
-    },
-};
+use factory_core::local::{LocalRequest, LocalResponse, MAX_PROJECT_PAGE_ITEMS, ServerFrame};
 use factoryctl::probes::PROBED_PROGRAMS;
 use factoryctl::{Client, install, launchd, probes, update};
 use serde::Serialize;
@@ -84,10 +79,12 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
     for program in PROBED_PROGRAMS {
         checks.push(check_program(program));
     }
-    checks.push(check_claude_json(user_home.as_deref()));
     checks.push(check_codex_seed(user_home.as_deref()));
     if daemon_reachable {
-        checks.extend(check_projects(&Client::new(socket), &home));
+        match Client::authenticated_from_file(socket, home.join("operator.token")) {
+            Ok(client) => checks.extend(check_projects(&client)),
+            Err(error) => checks.push(Check::fail("operator credential", error.to_string())),
+        }
     }
     checks.push(check_update(&home, active_version));
 
@@ -273,7 +270,7 @@ fn check_launchd(user_home: Option<&Path>) -> Check {
         (true, false) => Check::warn(
             "launchd",
             format!(
-                "loaded, but its PATH lacks the directory of {} — sessions won't find it (`factoryctl init` re-renders the job)",
+                "loaded, but its PATH lacks the directory of {} — attempts won't find it (`factoryctl init` re-renders the job)",
                 missing.join(", ")
             ),
         ),
@@ -301,42 +298,15 @@ fn check_program(program: &'static str) -> Check {
             if program == "git" {
                 Check::warn(
                     "git",
-                    "not on PATH; agents get no worktree of their own and run in the project root",
+                    "not on PATH; daemon-owned Changes will remain unavailable",
                 )
             } else {
                 Check::warn(
                     program,
-                    "not on PATH; agents with this provider cannot start",
+                    "not on PATH; attempts using this provider cannot start",
                 )
             }
         }
-    }
-}
-
-fn check_claude_json(user_home: Option<&Path>) -> Check {
-    let Some(user_home) = user_home else {
-        return Check::warn("claude.json", "HOME is not set");
-    };
-    let path = user_home.join(".claude.json");
-    match fs::read(&path) {
-        Ok(bytes) if serde_json::from_slice::<serde_json::Value>(&bytes).is_ok() => Check::ok(
-            "claude.json",
-            format!("{} present; worktree pre-trust applies", path.display()),
-        ),
-        Ok(_) => Check::warn(
-            "claude.json",
-            format!(
-                "{} is not valid JSON; worktree pre-trust will be skipped",
-                path.display()
-            ),
-        ),
-        Err(_) => Check::warn(
-            "claude.json",
-            format!(
-                "{} missing (run `claude` once); until then every new Claude session asks to trust its worktree",
-                path.display()
-            ),
-        ),
     }
 }
 
@@ -375,9 +345,9 @@ fn check_codex_seed(user_home: Option<&Path>) -> Check {
     }
 }
 
-/// Every project's root, and any worktree directory under
-/// `projects/<id>/worktrees/` that no current agent owns.
-fn check_projects(client: &Client, home: &Path) -> Vec<Check> {
+/// Validate the operator-configured source roots. Stage 1 deliberately has no
+/// source-worktree diagnostics because workers cannot own source paths.
+fn check_projects(client: &Client) -> Vec<Check> {
     let projects = match list_projects(client) {
         Ok(projects) => projects,
         Err(error) => {
@@ -400,42 +370,13 @@ fn check_projects(client: &Client, home: &Path) -> Vec<Check> {
             ));
             continue;
         }
-        let agent_ids = match list_agent_ids(client, &project.id) {
-            Ok(ids) => ids,
-            Err(error) => {
-                checks.push(Check::warn(
-                    format!("project:{}", project.id),
-                    format!("could not list agents: {error}"),
-                ));
-                continue;
-            }
-        };
-        let worktrees_dir = factory_core::paths::project_dir(home, &project.id).join("worktrees");
-        let stale: Vec<String> = fs::read_dir(&worktrees_dir)
-            .map(|entries| {
-                entries
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                    .filter_map(|entry| entry.file_name().into_string().ok())
-                    .filter(|name| !agent_ids.iter().any(|id| id == name))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if stale.is_empty() {
-            checks.push(Check::ok(
-                format!("project:{}", project.id),
-                format!("{} agent(s), root {}", agent_ids.len(), root.display()),
-            ));
-        } else {
-            checks.push(Check::warn(
-                format!("project:{}", project.id),
-                format!(
-                    "stale worktree dir(s) with no agent: {} (git -C {} worktree remove <path>, then delete the directory)",
-                    stale.join(", "),
-                    root.display()
-                ),
-            ));
-        }
+        checks.push(Check::ok(
+            format!("project:{}", project.id),
+            format!(
+                "root {} (worker source Changes are disabled until Stage 2)",
+                root.display()
+            ),
+        ));
     }
     checks
 }
@@ -481,36 +422,6 @@ fn list_projects(client: &Client) -> Result<Vec<factory_core::ProjectSnapshot>, 
             return Err("unexpected reply to list projects".into());
         };
         all.extend(projects);
-        match next_after_id {
-            Some(next) => after_id = Some(next),
-            None => return Ok(all),
-        }
-    }
-}
-
-fn list_agent_ids(client: &Client, project_id: &ProjectId) -> Result<Vec<String>, String> {
-    let mut all = Vec::new();
-    let mut after_id = None;
-    loop {
-        let frame = client
-            .request(LocalRequest::ListAgents {
-                project_id: project_id.clone(),
-                after_id: after_id.clone(),
-                limit: MAX_AGENT_PAGE_ITEMS,
-            })
-            .map_err(|error| error.to_string())?;
-        let ServerFrame::Response {
-            response:
-                LocalResponse::Agents {
-                    agents,
-                    next_after_id,
-                },
-            ..
-        } = frame
-        else {
-            return Err("unexpected reply to list agents".into());
-        };
-        all.extend(agents.into_iter().map(|agent| agent.id.to_string()));
         match next_after_id {
             Some(next) => after_id = Some(next),
             None => return Ok(all),

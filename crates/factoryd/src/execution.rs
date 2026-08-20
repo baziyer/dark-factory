@@ -1,215 +1,70 @@
-//! Session spawn, dispatch, and delivery: the daemon-side half of resident
-//! interactive sessions (see `TRACK5-DESIGN.md`, `TRACK5-WIRE.md`).
+//! Durable one-process-per-attempt execution.
 //!
-//! A single background dispatcher task (spawned by [`spawn`]) owns every
-//! agent's delivery: on a wake trigger (task assigned/retried, message
-//! sent, agent resumed, a session's `SessionStart` hook, or the 5 second
-//! safety tick) it spawns a resident session for an agent with no live one
-//! and pending work, or -- for an agent whose session is already `idle` --
-//! composes and PTY-types the next deliverable, waiting for the provider's
-//! own hook to acknowledge receipt before committing the delivery durably
-//! (`compose_delivery`/`commit_delivery`). A session that is `working` or
-//! `waiting_for_input` is instead delivered into via the `Stop`/
-//! `SubagentStop` hook's reply (see [`stop_hook_reply`], called directly
-//! from `local_api.rs`'s `ProviderHook` handler -- that is the seam 5A left
-//! for this track).
-//!
-//! What replaced the old per-run ephemeral-runner supervision loop this
-//! module used to own (deleted by 5A, see `TRACK5-DESIGN.md` §7 and `git
-//! show 364274e:crates/factoryd/src/execution.rs`): a freshly spawned
-//! session's liveness is now just its `tokio::process::Child` handle
-//! (`supervise_child`, far simpler than the old subscribe/replay loop,
-//! because hooks -- not decoded stream-JSON -- are the state source now).
-//! Only *recovered* sessions (no `Child` handle survives a daemon restart)
-//! still need the old subscribe/reconnect pattern; `supervise_recovered`
-//! and its `attach_with_grace`/`endpoint_absent`/`classify_unavailable`
-//! helpers below are ported from that history, trimmed to "watch for
-//! `RunnerEvent::Exited`" since there is no decoder to feed anymore.
+//! SQLite is the authority. This module only turns admitted runs into exact
+//! runner processes and drives their durable finalization; it owns no shadow
+//! session or delivery state.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
-    os::unix::{
-        fs::{DirBuilderExt, FileTypeExt, MetadataExt},
-        process::ExitStatusExt,
-    },
+    os::unix::{fs::DirBuilderExt, fs::MetadataExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use factory_core::{
-    AgentId, AgentRole, EventEnvelope, FactoryEvent, ProjectId, Provider, ProviderHookEvent, RunId,
-    RunnerInstanceId, SessionId, SessionSnapshot, SessionState, TaskDetail,
-    runner::{RunnerEvent, RunnerEventEnvelope, TerminalSize, encode_terminal_bytes},
+    AgentId, AgentRole, ProjectId, Provider, RunFailureReason, RunId, RunPhase, RunnerInstanceId,
+    TaskId, runner::RunnerEvent,
 };
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    sync::{broadcast, mpsc, watch},
+    process::Child,
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
-    time::{Instant, sleep_until, timeout, timeout_at},
+    time::{Instant, sleep, sleep_until, timeout},
 };
 use uuid::Uuid;
 
 use crate::{
     daemon_state::{DaemonState, DaemonStateError},
-    guidance,
     providers::{self, SpawnContext, hooks},
-    runner_client::{RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription},
+    runner_client::{
+        PreparedRunner, RunnerClient, RunnerClientError, RunnerStreamItem, RunnerSubscription,
+    },
     runner_process::{self, LaunchSpec, ProviderEnvironment},
     store::{
-        DeliveryAttempt, DeliveryAttemptState, NewDeliveryAttempt, ProviderDeliveryRecovery,
-        RecoverableSession, SessionRow, StoreError,
+        AdmittedRun, KernelResource, KernelResourceKind, KernelResourceState, NewRunAdmission,
+        PreparedProcessIdentity, RecoverableKernelRun, StoreError,
     },
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum PromptDeliveryAdmission {
-    Ignored,
-    Acknowledged,
-    Denied,
-}
-
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
-/// How long a PTY delivery waits for a matching `UserPromptSubmit` hook.
-/// Expiry leaves the exact authority uncertain; it never authorizes another
-/// provider input while the original bytes or hook may still cross.
-const ACK_TIMEOUT: Duration = Duration::from_secs(20);
-/// Gap between a composed delivery's text and its submitting `\r`, sent as
-/// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
-/// has the why: real Claude Code's paste-vs-keystroke heuristic otherwise
-/// absorbs a `\r` inside the same burst as just another newline).
-const SUBMIT_DELAY: Duration = Duration::from_millis(80);
-/// Safety-net reconciliation sweep; a reconciler, not the source of truth
-/// (TRACK5-WIRE.md) -- event-driven wakes are expected to beat this in the
-/// common case.
-const TICK_INTERVAL: Duration = Duration::from_secs(5);
-const WAKE_CHANNEL_CAPACITY: usize = 512;
+const COMMAND_CAPACITY: usize = 256;
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const CONNECT_GRACE: Duration = Duration::from_secs(5);
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(250);
-const MAX_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// Bounds `supervise_recovered`'s reconnect loop (this track's item 9):
-/// without this, a recovered session whose runner is permanently
-/// unreachable (its process is actually gone, but the runtime
-/// directory/socket did not classify as cleanly `Missing` -- e.g. the
-/// socket file lingers but nothing answers) retried forever at
-/// [`MAX_RECOVERY_RETRY_DELAY`], staying `starting`/whatever state it was
-/// recovered in visible forever, never durably `failed`. 10 attempts is
-/// comfortably past the point [`next_retry_delay`]'s doubling has already
-/// capped the delay at 30s (attempt 8), so this adds only ~1 extra minute
-/// of genuine retrying beyond that plateau before giving up.
-const MAX_RECOVERY_ATTEMPTS: u32 = 10;
-/// Never spawned under a startup-input deadline (terminal-mode launches
-/// carry no startup input to time out on); kept only because
-/// `runner_process::spawn_runner` requires a value.
-const STARTUP_GRACE: Duration = Duration::from_secs(30);
-/// Comfortably under `factory_core::runner::MAX_TERMINAL_INPUT_BYTES`
-/// (64 KiB, pre-base64) so a large task body plus guidance files can never
-/// make a PTY-typed delivery itself fail; long content stays fully readable
-/// via `factoryctl task get`/`agent inbox`, just not fully retyped.
-const MAX_DELIVERY_TEXT_BYTES: usize = 48_000;
-/// Invisible prompt suffix used to bind a provider's prompt hook to the
-/// immutable durable attempt that wrote it. Providers echo the submitted
-/// prompt in `UserPromptSubmit`; if they normalize away the nonce, the
-/// daemon refuses to guess and leaves the attempt uncertain instead.
-pub(crate) const DELIVERY_ATTEMPT_MARKER: &str = "\u{2063}dark-factory-attempt:";
-/// Per-task-body budget inside a composed delivery, leaving room for
-/// guidance sections within [`MAX_DELIVERY_TEXT_BYTES`].
-const MAX_DELIVERY_TASK_BODY_BYTES: usize = 16_384;
-/// Mirrors `store.rs`'s own private `MAX_WAIT_REASON_BYTES` (the
-/// `sessions.wait_reason`/`activity` CHECK bound, migration 0014): a spawn
-/// failure's error text (`spawn_session_for_agent`) is bounded before it
-/// ever reaches `Store::end_session_with_reason`, so an unusually long OS
-/// error message can never itself turn a spawn failure into a second,
-/// confusing store error.
-const MAX_WAIT_REASON_BYTES: usize = 512;
-/// Default for [`Config::session_start_deadline`] (issue #24): how long a
-/// session may sit `starting` before the daemon gives up on its
-/// `SessionStart` hook ever arriving and treats it exactly like a failed
-/// spawn attempt. A real Codex session was observed whose TUI rendered and
-/// sat fully idle, hooks never firing, for several minutes -- root cause
-/// not established, but "starting forever" must not be a reachable steady
-/// state regardless. 120s is generous enough for a cold Codex start with
-/// many MCP servers/plugins syncing. Not an operator flag, env var, or
-/// config file key (AGENTS.md rule 3) -- [`Config::session_start_deadline`]
-/// exists only so tests can shorten it; production always uses this
-/// constant (`main.rs`).
-pub const SESSION_START_DEADLINE: Duration = Duration::from_secs(120);
-/// After this many *consecutive* [`SESSION_START_DEADLINE`] expiries in a
-/// row for the same agent, [`enforce_start_deadline`] pauses the agent
-/// (`Store::pause_agent`) instead of respawning again -- adversarial
-/// review of #24 (finding 4): a hookless provider spawns successfully
-/// every time, so an ordinary spawn failure's backoff never gets anything
-/// to escalate to on its own, and left alone this cycles forever at
-/// [`SESSION_START_DEADLINE`]'s cadence, killing and relaunching a real
-/// provider process every ~2 minutes. 3 is one generous benefit of the
-/// doubt -- a provider that is merely slow to initialize losing the
-/// `SessionStart` race twice running is unlikely -- before treating it as
-/// persistently broken; `factoryctl agent resume` is the documented way
-/// back in and resets the streak (`Handle::resume_backoff`).
-const MAX_CONSECUTIVE_START_DEADLINES: u32 = 3;
-const ORCHESTRATOR_FOOTER: &str = "As the orchestrator, coordinate the project via `factoryctl` \
-(DARK_FACTORY_PROJECT/DARK_FACTORY_AGENT/DARK_FACTORY_SOCKET are already set in this session, so \
---project/--agent are usually optional): `factoryctl task add --title T --body B`, `factoryctl \
-task assign --task <id> --agent <agent>`, `factoryctl agent message --to <agent> --body \"...\"`, \
-`factoryctl session list`. The operator must create and reconfigure agents; do not attempt agent \
-creation or model-policy changes from the orchestrator. Message the operator with a concrete \
-request when a worker is needed. A worker in `waiting_for_input` needs operator attention: \
-message it or surface its request; do not stop, restart, replace, or duplicate it. Before stopping \
-or replacing any worker, inspect `factoryctl agent status --agent <agent>` and preserve or \
-explicitly resolve any dirty worktree.";
+const CONNECT_RETRY: Duration = Duration::from_millis(50);
+const RUNNER_EXIT_GRACE: Duration = Duration::from_secs(5);
+const DEFAULT_FINALIZE_GRACE_MS: u64 = 5_000;
+const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
+const STATE_PAGE: usize = 100;
 
-/// Fixed process and durability bounds for the dispatcher.
 pub struct Config {
-    /// Trusted absolute path to the installed `factory-runner` executable.
     pub runner_program: PathBuf,
-    /// Trusted absolute path to `factoryctl`, embedded in generated hook
-    /// commands and exported as `DARK_FACTORY_FACTORYCTL` (see
-    /// `docs/providers.md`'s "provider A1" resolution and
-    /// `providers::shell::ShellProvider`).
     pub factoryctl_path: PathBuf,
-    /// Root directory sessions' runner runtime directories live under,
-    /// keyed by session id.
     pub runtime_root: PathBuf,
-    /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
-    /// `factory_core::paths` and `guidance`).
     pub guidance_root: PathBuf,
-    /// The daemon's own local control socket path, exported as
-    /// `DARK_FACTORY_SOCKET` so an agent's own `factoryctl` invocations
-    /// (`task done`, `agent message`, ...) can reach the daemon without
-    /// relying on `$DARK_FACTORY_HOME` resolution inside the session.
     pub socket_path: PathBuf,
-    /// Daemon-wide cap on live sessions (`ended_at_ms IS NULL`, across every
-    /// project), enforced by [`dispatch_agent`]: an agent with pending work
-    /// and no live session is left alone -- not spawned, not backed off --
-    /// while [`Store::live_session_count`](crate::store::Store::live_session_count)
-    /// is already at or above this value. The 5 second safety tick retries
-    /// automatically once a session ends and count drops, so this is a
-    /// resource bound, not a hard failure (`--max-active-runs`, README's
-    /// "Local control plane").
     pub max_active_runs: usize,
-    /// How long a session may stay `starting` before [`dispatch_agent`]
-    /// treats it as a failed spawn attempt (issue #24, see
-    /// [`SESSION_START_DEADLINE`]'s doc comment). A struct field rather
-    /// than a bare constant purely so a test can shorten it; every real
-    /// caller (`main.rs`) passes [`SESSION_START_DEADLINE`] -- there is
-    /// deliberately no CLI flag, environment variable, or config file key
-    /// for this (AGENTS.md rule 3).
-    pub session_start_deadline: Duration,
 }
 
-/// One explicit queued task to deliver now into its agent's live, idle
-/// session -- the operator's "deliver now" override of ordinary per-agent
-/// FIFO auto-delivery (TRACK5-WIRE.md D2). `parent_run_id` and `worktree`
-/// are accepted for wire compatibility but unused: a live session's cwd is
-/// fixed at spawn time, not re-set per task.
 pub struct StartTask {
     pub project_id: ProjectId,
-    pub task_id: factory_core::TaskId,
+    pub task_id: TaskId,
     pub agent_id: AgentId,
-    pub parent_run_id: Option<RunId>,
-    pub worktree: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -227,432 +82,159 @@ pub enum Error {
     State(#[from] DaemonStateError),
     #[error("execution manager has stopped")]
     ManagerStopped,
-    #[error("agent has no live session")]
-    NoLiveSession,
-    #[error("agent's live session is not idle")]
-    SessionBusy,
-    #[error("a delivery for this agent is already in flight; retry shortly")]
-    DeliveryInProgress,
-    #[error("the provider did not acknowledge the exact task delivery; the task remains queued")]
-    DeliveryUnacknowledged,
-    #[error("agent has no worktree; create one first")]
-    NoWorktree,
+    #[error("execution request was cancelled")]
+    RequestCancelled,
+    #[error("agent or project is being deleted")]
+    DeleteInProgress,
+    #[error("timed out draining writes before deletion")]
+    DeleteDrainTimeout,
     #[error("system clock is before the Unix epoch")]
     InvalidClock,
+    #[error("generated id is invalid")]
+    InvalidId,
     #[error("provider launch failed: {0}")]
     Provider(#[from] providers::ProviderError),
-    #[error("memory compaction failed: {0}")]
-    MemoryCompaction(#[from] guidance::GuidanceError),
-    #[error("could not write session hook token: {0}")]
-    HookToken(#[from] hooks::HookTokenError),
     #[error("runner launch failed: {0}")]
     Spawn(#[from] runner_process::Error),
     #[error("runner control failed: {0}")]
     Runner(#[from] RunnerClientError),
-    #[error("durable execution metadata is inconsistent")]
-    CorruptExecution,
-    #[error("generated id is invalid")]
-    InvalidId,
-    #[error(
-        "timed out waiting for an in-flight session spawn to finish before deleting this agent"
-    )]
-    DeleteDrainTimeout,
+    #[error("runtime I/O failed at {path}: {source}")]
+    Runtime { path: PathBuf, source: io::Error },
+    #[error("process identity was unavailable for pid {0}")]
+    ProcessIdentityUnavailable(u32),
+    #[error("runner process id was unavailable")]
+    RunnerPidUnavailable,
 }
 
-/// One agent to reconsider for delivery: spawn a session if it has none and
-/// pending work, or attempt PTY-typed delivery if its session is idle.
-struct WakeAgent {
-    project_id: ProjectId,
-    agent_id: AgentId,
+enum Command {
+    Start {
+        input: StartTask,
+        reply: oneshot::Sender<Result<StartedRun, Error>>,
+    },
+    WakeAgent {
+        project_id: ProjectId,
+        agent_id: AgentId,
+    },
+    ReconcileRun {
+        run_id: RunId,
+        grace_ms: u64,
+    },
+    ObserverFinished(RunId),
 }
 
-fn send_wake(wake_tx: &mpsc::Sender<WakeAgent>, project_id: ProjectId, agent_id: AgentId) {
-    let _ = wake_tx.try_send(WakeAgent {
-        project_id,
-        agent_id,
-    });
-}
-
-/// Bounded handle for session spawn, dispatch, and delivery.
 #[derive(Clone)]
 pub struct Handle {
     state: DaemonState,
     config: Arc<Config>,
-    wake_tx: mpsc::Sender<WakeAgent>,
+    commands: mpsc::Sender<Command>,
     shutdown: watch::Sender<bool>,
-    /// Shared with [`run_dispatcher`]'s own [`SpawnBackoff`] (ARCHITECTURE.md
-    /// invariant 9's agent-scoped mechanism): lets
-    /// [`Handle::begin_delete`]/[`Handle::end_delete`]/
-    /// [`Handle::try_begin_agent_write`]/[`Handle::end_agent_write`],
-    /// called from `local_api.rs`'s `DeleteAgent`, `DeleteProject`,
-    /// `GetAgent`/`AgentStatus`, `UpdateAgentProfile`, and `CreateAgent`
-    /// handlers, mark an agent so no writer -- spawn preparation
-    /// (`dispatch_agent`), an idle-session delivery (`deliver_pending`), or
-    /// one of those handlers -- ever begins a new write into its guidance
-    /// directory while it is being deleted, and wait for one already in
-    /// flight to finish -- the same style of seam `local_api.rs` already
-    /// uses for [`stop_hook_reply`] and [`Handle::wake`].
-    backoff: Arc<SpawnBackoff>,
-    /// Project-scoped half of the same invariant (PR #50 review, finding
-    /// 3): guards `CreateAgent`, the one writer under a project that
-    /// `backoff`'s per-agent marks can never already cover, because the
-    /// agent it is about to create does not exist yet for `DeleteProject`
-    /// to have marked. See [`Handle::begin_delete_project`].
+    agent_gate: Arc<DeleteGate<AgentId>>,
     project_gate: Arc<DeleteGate<ProjectId>>,
-    #[cfg(test)]
-    start_task_ack_test: Option<StartTaskAckTest>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct StartTaskAckTest {
-    timeout: Duration,
-    waiter_finished: Option<Arc<tokio::sync::Barrier>>,
-    failure_released: Option<Arc<tokio::sync::Barrier>>,
-    failure_recorded: Option<Arc<tokio::sync::Barrier>>,
-    waiting_released: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl Handle {
-    /// The trusted, already-preflight-checked (`main.rs`'s
-    /// `preflight_sibling_binaries`) path to `factory-runner`. Exposed for
-    /// `LocalRequest::Health` (`local_api.rs`) so `factoryctl health`
-    /// reports exactly what the daemon is actually using, not just its
-    /// own configuration.
     #[must_use]
     pub fn runner_program(&self) -> &Path {
         &self.config.runner_program
     }
 
-    /// The trusted, already-preflight-checked path to `factoryctl`. See
-    /// [`Handle::runner_program`].
     #[must_use]
     pub fn factoryctl_path(&self) -> &Path {
         &self.config.factoryctl_path
     }
 
-    /// The daemon-wide live-session cap (`factoryd --max-active-runs`).
     #[must_use]
     pub fn max_active_runs(&self) -> usize {
         self.config.max_active_runs
     }
 
-    /// Opens a task-episode inside the agent's live, idle session right
-    /// now (bypassing FIFO order -- the operator asked for this exact
-    /// task), then types its instructions and waits for exact provider
-    /// acknowledgement. `Ok` means the task/run admission and acknowledgement
-    /// committed atomically; an unacknowledged external effect stays durably
-    /// `uncertain` and returns an error rather than manufacturing a run.
     pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
-        let StartTask {
+        let (reply, receive) = oneshot::channel();
+        self.commands
+            .send(Command::Start { input, reply })
+            .await
+            .map_err(|_| Error::ManagerStopped)?;
+        receive.await.map_err(|_| Error::RequestCancelled)?
+    }
+
+    pub fn wake(&self, project_id: ProjectId, agent_id: AgentId) {
+        let _ = self.commands.try_send(Command::WakeAgent {
             project_id,
             agent_id,
-            task_id,
-            ..
-        } = input;
-        self.wake(project_id.clone(), agent_id.clone());
-
-        let lookup_project_id = project_id.clone();
-        let lookup_agent_id = agent_id.clone();
-        let session = self
-            .state
-            .with_store(move |store| {
-                store.live_session_for_agent(&lookup_project_id, &lookup_agent_id)
-            })
-            .await?
-            .ok_or(Error::NoLiveSession)?;
-        if session.state != SessionState::Idle || session.stop_requested_at_ms.is_some() {
-            return Err(Error::SessionBusy);
-        }
-        // Single pending-delivery slot (this track's item 1): held for the
-        // rest of this call, so a concurrent `Stop`/`SubagentStop` hook
-        // reply racing this exact agent (`stop_hook_reply`, called
-        // directly from `local_api.rs`, not through this dispatcher) can
-        // never independently compose and deliver the same pending
-        // task/messages while this explicit operator request is already
-        // mid-flight.
-        let _delivery_slot = self.state.lock_delivery_slot(&agent_id).await;
-        let existing_attempt = self
-            .state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let session_id = session.id.clone();
-                move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
-            })
-            .await?;
-        if existing_attempt.is_some() {
-            return Err(Error::DeliveryInProgress);
-        }
-        let (task, messages, marker) = self
-            .state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let task = store.get_task(&project_id, &task_id)?;
-                    if task.snapshot.status != factory_core::TaskStatus::Queued
-                        || task.snapshot.assigned_agent_id.as_ref() != Some(&agent_id)
-                    {
-                        return Err(StoreError::TaskNotQueued);
-                    }
-                    let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
-                    let marker = store.task_delivery_marker(&task_id)?;
-                    Ok((task, messages, marker))
-                }
-            })
-            .await?;
-        let text = compose_text(
-            &self.config.guidance_root,
-            &project_id,
-            &agent_id,
-            Some(&task),
-            &messages,
-            role_hint(&self.state, &project_id, &agent_id).await,
-        );
-        let attempt = ensure_delivery_attempt(
-            &self.state,
-            &project_id,
-            &agent_id,
-            &session.id,
-            Delivery {
-                task_id: Some(task_id.clone()),
-                task_incarnation_id: Some(marker.incarnation_id),
-                task_revision: Some(marker.task_revision),
-                run_id: None,
-                require_queue_head: false,
-                message_ids: messages.iter().map(|message| message.id.clone()).collect(),
-                text,
-            },
-            now_ms()?,
-        )
-        .await?;
-
-        let run_id = attempt.run_id.clone().ok_or(Error::CorruptExecution)?;
-        let target = self
-            .state
-            .with_store({
-                let project_id = project_id.clone();
-                let session_id = session.id.clone();
-                move |store| store.session_control_target(&project_id, &session_id)
-            })
-            .await?;
-        let client = RunnerClient::new(
-            &target.runner_runtime,
-            session_run_id(&session.id)?,
-            target.runner_instance_id,
-        );
-
-        // This is the last durable seam before the first external write.
-        let attempt_id = attempt.id.clone();
-        let claim_now_ms = now_ms()?;
-        let attempt = self
-            .state
-            .commit_and_publish(move |store| {
-                let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
-                Ok((attempt, Vec::new()))
-            })
-            .await?
-            .ok_or(Error::DeliveryInProgress)?;
-        if type_and_await_ack(
-            &self.state,
-            &client,
-            &session.id,
-            &attempt.id,
-            &attempt.text,
-            #[cfg(test)]
-            self.start_task_ack_test
-                .as_ref()
-                .map_or(ACK_TIMEOUT, |test| test.timeout),
-            #[cfg(not(test))]
-            ACK_TIMEOUT,
-        )
-        .await
-        {
-            commit_delivery(
-                &self.state,
-                &project_id,
-                &agent_id,
-                &session.id,
-                &attempt.id,
-                Delivery::from_attempt(&attempt),
-                now_ms()?,
-            )
-            .await?;
-        } else {
-            #[cfg(test)]
-            if let Some(test) = &self.start_task_ack_test {
-                if let (Some(waiter_finished), Some(failure_released)) =
-                    (&test.waiter_finished, &test.failure_released)
-                {
-                    waiter_finished.wait().await;
-                    failure_released.wait().await;
-                }
-            }
-            let attempt_id = attempt.id.clone();
-            let failure_now = now_ms()?;
-            let failure = self
-                .state
-                .commit_and_publish(move |store| {
-                    store.record_delivery_failure(&attempt_id, failure_now)?;
-                    Ok(((), Vec::new()))
-                })
-                .await;
-            if let Err(error) = failure {
-                let exact_acknowledgement = self
-                    .state
-                    .with_store({
-                        let attempt_id = attempt.id.clone();
-                        let session_id = session.id.clone();
-                        let task_id = task_id.clone();
-                        let incarnation_id = attempt
-                            .task_incarnation_id
-                            .clone()
-                            .ok_or(Error::CorruptExecution)?;
-                        let task_revision = attempt.task_revision.ok_or(Error::CorruptExecution)?;
-                        let run_id = run_id.clone();
-                        move |store| {
-                            store.delivery_attempt_acknowledged(
-                                &attempt_id,
-                                &session_id,
-                                &task_id,
-                                &incarnation_id,
-                                task_revision,
-                                &run_id,
-                            )
-                        }
-                    })
-                    .await?;
-                if exact_acknowledgement {
-                    return Ok(StartedRun { run_id });
-                }
-                return Err(error.into());
-            }
-            #[cfg(test)]
-            if let Some(test) = &self.start_task_ack_test {
-                if let (Some(failure_recorded), Some(waiting_released)) =
-                    (&test.failure_recorded, &test.waiting_released)
-                {
-                    failure_recorded.wait().await;
-                    waiting_released.wait().await;
-                }
-            }
-            let reason = "delivery unacknowledged".to_owned();
-            let wait_session_id = session.id.clone();
-            let wait_at_ms = now_ms()?;
-            let acknowledged = self
-                .state
-                .commit_and_publish(move |store| {
-                    let waiting = store.mark_session_waiting_for_delivery(
-                        &wait_session_id,
-                        &attempt.id,
-                        reason,
-                        wait_at_ms,
-                    )?;
-                    Ok((waiting.is_none(), waiting.into_iter().collect()))
-                })
-                .await?;
-            if acknowledged {
-                return Ok(StartedRun { run_id });
-            }
-            return Err(Error::DeliveryUnacknowledged);
-        }
-        Ok(StartedRun { run_id })
+        });
     }
 
-    /// Best-effort: enqueues `agent_id` for the dispatcher's next pass
-    /// (spawn if it has no live session and pending work, or attempt
-    /// delivery if its session is idle). Never blocks and never fails --
-    /// a full wake queue silently defers to the 5 second safety tick.
-    pub fn wake(&self, project_id: ProjectId, agent_id: AgentId) {
-        send_wake(&self.wake_tx, project_id, agent_id);
+    pub fn wake_run(&self, run_id: RunId) {
+        let _ = self.commands.try_send(Command::ReconcileRun {
+            run_id,
+            grace_ms: DEFAULT_FINALIZE_GRACE_MS,
+        });
     }
 
-    /// Waits for all delivery work owned by `agent_id` to finish. Local API
-    /// assignment/deletion handlers hold this barrier while changing task
-    /// ownership, so a delivery that loses the race cannot type the task to
-    /// the old worker after the move has committed.
-    pub async fn lock_delivery_slot(
+    pub async fn cancel_run(
         &self,
-        agent_id: &AgentId,
-    ) -> crate::daemon_state::DeliverySlot {
-        self.state.lock_delivery_slot(agent_id).await
+        project_id: ProjectId,
+        run_id: RunId,
+        grace_ms: u64,
+    ) -> Result<(), Error> {
+        let lookup_run_id = run_id.clone();
+        let run = self
+            .state
+            .with_store(move |store| store.kernel_run(&lookup_run_id))
+            .await?
+            .ok_or(DaemonStateError::Store(StoreError::RunNotFound))?;
+        if run.project_id != project_id {
+            return Err(DaemonStateError::Store(StoreError::RunNotFound).into());
+        }
+        let cancel_run_id = run_id.clone();
+        let at_ms = now_ms()?;
+        self.state
+            .commit_and_publish(move |store| {
+                let (_, events) = store.cancel_admitted_or_running_run(
+                    &cancel_run_id,
+                    "operator cancellation".into(),
+                    at_ms,
+                )?;
+                Ok(((), events))
+            })
+            .await?;
+        self.commands
+            .send(Command::ReconcileRun { run_id, grace_ms })
+            .await
+            .map_err(|_| Error::ManagerStopped)
     }
 
-    /// Serializes assignment mutations for one task across all local API
-    /// request handlers.
     pub async fn lock_assignment_slot(&self) -> tokio::sync::OwnedMutexGuard<()> {
         self.state.lock_assignment_slot().await
     }
 
-    /// Begins deletion of `agent_id` (ARCHITECTURE.md invariant 9's
-    /// agent-scoped mechanism): marks the agent so no writer --
-    /// [`dispatch_agent`]'s spawn preparation, [`deliver_pending`]'s
-    /// delivery composition, or a handler using
-    /// [`Handle::try_begin_agent_write`] -- can begin a new write into its
-    /// guidance directory, then waits up to [`DELETE_DRAIN_TIMEOUT`] for a
-    /// write already in flight to finish, so a caller that gets `Ok` back
-    /// knows nothing can write into the agent's guidance directory before
-    /// [`Handle::end_delete`] is called. On timeout, clears its own mark
-    /// (so the agent is not left permanently undispatchable by a delete
-    /// that never completed) and returns [`Error::DeleteDrainTimeout`] --
-    /// the caller must surface that as its own error, not log and proceed
-    /// (AGENTS.md rule 3).
     pub async fn begin_delete(&self, agent_id: &AgentId) -> Result<(), Error> {
-        self.backoff.begin_delete(agent_id);
+        self.agent_gate.begin_delete(agent_id);
         if self
-            .backoff
+            .agent_gate
             .wait_for_drain(agent_id, DELETE_DRAIN_TIMEOUT)
             .await
         {
             Ok(())
         } else {
-            self.backoff.end_delete(agent_id);
+            self.agent_gate.end_delete(agent_id);
             Err(Error::DeleteDrainTimeout)
         }
     }
 
-    /// Ends a deletion begun by [`Handle::begin_delete`]: clears the mark
-    /// (never the entry itself, and never the in-flight write count -- see
-    /// [`DeleteGate::end_delete`]) so an agent later created with the same
-    /// id dispatches normally. Must be called exactly once after every
-    /// `begin_delete` that returned `Ok`, regardless of whether the delete
-    /// itself went on to succeed (the row may still exist, e.g. a
-    /// `DeleteAgent` refused because a write that finished draining left it
-    /// with a live session).
     pub fn end_delete(&self, agent_id: &AgentId) {
-        self.backoff.end_delete(agent_id);
+        self.agent_gate.end_delete(agent_id);
     }
 
-    /// `true` (and records one write in flight) if `agent_id` is not
-    /// currently being deleted; declines (`false`) if it is. Used by
-    /// handlers that read-or-lazily-create or overwrite an existing
-    /// agent's guidance files outside the dispatcher
-    /// (`GetAgent`/`AgentStatus`, `UpdateAgentProfile`) so they
-    /// participate in the same drain [`Handle::begin_delete`] waits on --
-    /// the same mechanism [`dispatch_agent`] uses for spawn preparation,
-    /// just reached from a request handler instead of the dispatcher.
-    /// Call [`Handle::end_agent_write`] exactly once after, regardless of
-    /// outcome.
     #[must_use]
     pub fn try_begin_agent_write(&self, agent_id: &AgentId) -> bool {
-        self.backoff.try_begin_preparation(agent_id)
+        self.agent_gate.try_begin_write(agent_id)
     }
 
-    /// Ends a write begun by [`Handle::try_begin_agent_write`].
     pub fn end_agent_write(&self, agent_id: &AgentId) {
-        self.backoff.end_preparation(agent_id);
+        self.agent_gate.end_write(agent_id);
     }
 
-    /// Begins deletion of `project_id` (ARCHITECTURE.md invariant 9's
-    /// project-scoped mechanism, PR #50 review finding 3): marks the
-    /// project so [`Handle::try_begin_project_write`] declines a
-    /// `CreateAgent` not yet past its own worktree/guidance-tree writes,
-    /// then waits up to [`DELETE_DRAIN_TIMEOUT`] for a `CreateAgent`
-    /// already in flight to finish. Same contract as
-    /// [`Handle::begin_delete`], one level up: on timeout, clears its own
-    /// mark and returns [`Error::DeleteDrainTimeout`].
     pub async fn begin_delete_project(&self, project_id: &ProjectId) -> Result<(), Error> {
         self.project_gate.begin_delete(project_id);
         if self
@@ -667,75 +249,25 @@ impl Handle {
         }
     }
 
-    /// Ends a deletion begun by [`Handle::begin_delete_project`]. Same
-    /// contract as [`Handle::end_delete`], one level up.
     pub fn end_delete_project(&self, project_id: &ProjectId) {
         self.project_gate.end_delete(project_id);
     }
 
-    /// `true` (and records one write in flight) if `project_id` is not
-    /// currently being deleted; used by `CreateAgent` to gate provisioning
-    /// a new agent's worktree and guidance tree under a project that might
-    /// be mid-`DeleteProject` -- the one writer `DeleteProject`'s own
-    /// per-agent marks can never cover, since the agent being created
-    /// doesn't exist yet for it to have marked. Call
-    /// [`Handle::end_project_write`] exactly once after, regardless of
-    /// outcome.
     #[must_use]
     pub fn try_begin_project_write(&self, project_id: &ProjectId) -> bool {
-        self.project_gate.try_begin_preparation(project_id)
+        self.project_gate.try_begin_write(project_id)
     }
 
-    /// Ends a write begun by [`Handle::try_begin_project_write`].
     pub fn end_project_write(&self, project_id: &ProjectId) {
-        self.project_gate.end_preparation(project_id);
+        self.project_gate.end_write(project_id);
     }
 
-    /// Clears `agent_id`'s spawn backoff and start-deadline streak (issue
-    /// #24 finding 4): called by `ResumeAgent` (`local_api.rs`) right
-    /// alongside `Store::resume_agent`, so an operator resuming an agent
-    /// the dispatcher paused after [`MAX_CONSECUTIVE_START_DEADLINES`]
-    /// gets a clean slate rather than being paused again on its very next
-    /// deadline (which, without this, would still count toward the old
-    /// streak).
-    pub fn resume_backoff(&self, agent_id: &AgentId) {
-        self.backoff.record_success(agent_id);
-    }
-
-    pub async fn reset_delivery_attempt(
-        &self,
-        project_id: &ProjectId,
-        agent_id: &AgentId,
-    ) -> Result<(), Error> {
-        let now = now_ms()?;
-        let project_id = project_id.clone();
-        let agent_id = agent_id.clone();
-        self.state
-            .commit_and_publish(move |store| {
-                store.reset_delivery_attempt(&project_id, &agent_id, now)?;
-                Ok(((), Vec::new()))
-            })
-            .await?;
-        Ok(())
-    }
-
-    pub async fn lock_delivery_admission(
-        &self,
-        agent_id: &AgentId,
-    ) -> crate::daemon_state::DeliverySlot {
-        self.state.lock_delivery_slot(agent_id).await
-    }
-
-    /// Stops the dispatcher. Live sessions are untouched: closing/crashing
-    /// the daemon must not stop agents (`HANDOFF.md`).
     pub async fn shutdown(&self) -> Result<(), Error> {
         let _ = self.shutdown.send(true);
         Ok(())
     }
 }
 
-/// Starts the dispatcher: recovers durable sessions from a prior daemon
-/// instance, then serves wake triggers and the safety tick until shutdown.
 pub fn spawn(
     config: Config,
     state: DaemonState,
@@ -746,2601 +278,1467 @@ pub fn spawn(
     prepare_runtime_root(&config.runtime_root)?;
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::ManagerStopped)?;
     let config = Arc::new(config);
-    let (wake_tx, wake_rx) = mpsc::channel(WAKE_CHANNEL_CAPACITY);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // Shared with `Handle` (see its `backoff` field's doc comment) so
-    // `DeleteAgent`/`DeleteProject` can mark an agent as deleting and wait
-    // for the dispatcher to drain any in-flight spawn preparation for it.
-    let backoff = Arc::new(SpawnBackoff::new());
-    let dispatcher_config = Arc::clone(&config);
-    let dispatcher_state = state.clone();
-    let dispatcher_wake_tx = wake_tx.clone();
-    let dispatcher_backoff = Arc::clone(&backoff);
-    let join = runtime.spawn(run_dispatcher(
-        dispatcher_config,
-        dispatcher_state,
-        dispatcher_wake_tx,
-        wake_rx,
+    let (commands, receiver) = mpsc::channel(COMMAND_CAPACITY);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let agent_gate = Arc::new(DeleteGate::new());
+    let project_gate = Arc::new(DeleteGate::new());
+    let join = runtime.spawn(run_manager(
+        Arc::clone(&config),
+        state.clone(),
+        commands.clone(),
+        receiver,
         shutdown_rx,
-        dispatcher_backoff,
+        Arc::clone(&agent_gate),
     ));
     Ok((
         Handle {
             state,
             config,
-            wake_tx,
-            shutdown: shutdown_tx,
-            backoff,
-            // Not shared with the dispatcher task at all: `CreateAgent`'s
-            // writes it guards run on request-handling tasks, never on
-            // `run_dispatcher`'s (see `Handle::try_begin_project_write`).
-            project_gate: Arc::new(DeleteGate::new()),
-            #[cfg(test)]
-            start_task_ack_test: None,
+            commands,
+            shutdown,
+            agent_gate,
+            project_gate,
         },
         join,
     ))
 }
 
-/// Per-agent exponential backoff for session-spawn attempts (this track's
-/// item 1). Without it, a persistently broken spawn path -- the concrete
-/// repro that motivated it: `--runner` pointed at a missing
-/// `factory-runner` -- retried on every dispatcher wake/tick, unboundedly
-/// often. Doubles from [`SPAWN_BACKOFF_INITIAL`] up to [`SPAWN_BACKOFF_MAX`]
-/// per agent on each consecutive failure; a successful spawn clears the
-/// timer ([`SpawnBackoff::record_success`]). Never pruned, same reasoning
-/// as `DaemonState::delivery_slots`.
-///
-/// Embeds, but is deliberately backed by a *separate* lock from, its own
-/// [`DeleteGate<AgentId>`] (PR #50 review, findings 1 and 2): an earlier
-/// version kept `deleting`/`preparing` in the same map and entry as this
-/// backoff timer, and clearing the timer -- on a successful spawn
-/// (`record_success`) or a timed-out delete's own cleanup (`end_delete`)
-/// -- was one `state.remove` that erased the *other* concern's state too,
-/// silently reopening the exact race this whole mechanism exists to
-/// close. Splitting them so neither operation can touch the other's data
-/// makes that class of bug structurally impossible rather than merely
-/// fixed once.
-/// Timing state is in-memory only: a daemon restart forgets
-/// every agent's delay, `consecutive_failures`, and
-/// `consecutive_start_deadlines` and starts them fresh at
-/// [`SPAWN_BACKOFF_INITIAL`]/zero -- acceptable (a restart is already a
-/// deliberate, infrequent, operator-visible event, not a hot path this
-/// needs to survive) and simpler than persisting transient retry-pacing
-/// state durably alongside the actual session/task ledger.
-struct SpawnBackoff {
-    timing: Mutex<HashMap<AgentId, BackoffTiming>>,
-    /// The delete-gating half of this struct (ARCHITECTURE.md invariant
-    /// 9): [`SpawnBackoff::try_begin_preparation`]/
-    /// [`SpawnBackoff::end_preparation`]/[`SpawnBackoff::begin_delete`]/
-    /// [`SpawnBackoff::end_delete`]/[`SpawnBackoff::wait_for_drain`] all
-    /// delegate here.
-    gate: DeleteGate<AgentId>,
-}
-
-struct BackoffTiming {
-    next_attempt_at: Instant,
-    delay: Duration,
-    consecutive_failures: u32,
-    /// How many of `consecutive_failures` in a row, most recently, were a
-    /// [`SESSION_START_DEADLINE`] expiry specifically (issue #24 finding
-    /// 4) rather than any other kind of spawn failure -- cleared only by
-    /// [`SpawnBackoff::record_success`]'s whole-entry reset (the session
-    /// actually reaching `idle`, or an operator resume,
-    /// [`Handle::resume_backoff`]). An ordinary spawn failure
-    /// ([`SpawnBackoff::record_failure`]) does *not* clear it: `bump`
-    /// only touches `delay`/`consecutive_failures`/`next_attempt_at`, on
-    /// purpose -- a spawn that fails outright (e.g. a broken runner path)
-    /// says nothing about whether the *provider's own hook* is working,
-    /// so it must not excuse a run of deadline expiries. This is "3
-    /// deadline failures since the last success", not "3 in an unbroken
-    /// row with literally nothing else in between".
-    consecutive_start_deadlines: u32,
-}
-
-impl Default for BackoffTiming {
-    fn default() -> Self {
-        Self {
-            next_attempt_at: Instant::now(),
-            delay: Duration::ZERO,
-            consecutive_failures: 0,
-            consecutive_start_deadlines: 0,
-        }
-    }
-}
-
-const SPAWN_BACKOFF_INITIAL: Duration = Duration::from_secs(5);
-const SPAWN_BACKOFF_MAX: Duration = Duration::from_secs(300);
-/// Bounds how long [`Handle::begin_delete`]/[`Handle::begin_delete_project`]
-/// wait for an in-flight write to finish before giving up. The window this
-/// bounds is not just a handful of file writes: for the agent-scoped gate
-/// it is the whole of [`spawn_session_for_agent`] -- several `with_store`
-/// round-trips on the shared store mutex, `hooks::write_hook_token`, the
-/// provider's `spawn_spec`, a `create_session` commit and event publish,
-/// and `runner_process::spawn_runner` -- which PR #50's review measured as
-/// reachable in a few seconds on a loaded machine, exactly the condition
-/// #42 was filed under. So this is a real, sometimes-hit bound, not a
-/// formality: a delete on a busy daemon can genuinely time out and must
-/// retry.
-const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Poll granularity for [`DeleteGate::wait_for_drain`]. Polling (rather
-/// than a `Notify`) is the simplest correct option here: preparation
-/// windows are short, deletes are rare, and this reuses the same
-/// lock-and-check shape as the rest of [`DeleteGate`] instead of adding a
-/// second synchronization primitive.
-const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
-
-impl SpawnBackoff {
-    fn new() -> Self {
-        Self {
-            timing: Mutex::new(HashMap::new()),
-            gate: DeleteGate::new(),
-        }
-    }
-
-    /// `true` if `agent_id` has never failed a spawn, or its last
-    /// recorded failure's delay has fully elapsed.
-    fn ready(&self, agent_id: &AgentId) -> bool {
-        let timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        timing
-            .get(agent_id)
-            .is_none_or(|entry| Instant::now() >= entry.next_attempt_at)
-    }
-
-    /// Doubles (capped) `entry`'s delay, bumps `consecutive_failures`, and
-    /// returns `(new_delay, consecutive_failures)` -- the part
-    /// [`SpawnBackoff::record_failure`] and
-    /// [`SpawnBackoff::record_start_deadline_failure`] share.
-    fn bump(entry: &mut BackoffTiming) -> (Duration, u32) {
-        entry.delay = if entry.delay.is_zero() {
-            SPAWN_BACKOFF_INITIAL
-        } else {
-            entry.delay.saturating_mul(2).min(SPAWN_BACKOFF_MAX)
-        };
-        entry.consecutive_failures += 1;
-        entry.next_attempt_at = Instant::now() + entry.delay;
-        (entry.delay, entry.consecutive_failures)
-    }
-
-    /// Doubles (capped) `agent_id`'s delay and returns `(new_delay,
-    /// consecutive_failures)` so the caller can log both.
-    fn record_failure(&self, agent_id: &AgentId) -> (Duration, u32) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = timing.entry(agent_id.clone()).or_default();
-        Self::bump(entry)
-    }
-
-    /// [`SpawnBackoff::record_failure`], but for a [`SESSION_START_DEADLINE`]
-    /// expiry specifically (issue #24 finding 4): shares the exact same
-    /// exponential delay/`consecutive_failures` curve as any other spawn
-    /// failure (so this still escalates through the documented 5s ->
-    /// 5 minute backoff instead of restarting at 5s every ~2 minutes), and
-    /// additionally tracks the deadline-specific streak
-    /// [`MAX_CONSECUTIVE_START_DEADLINES`] acts on. Returns `(new_delay,
-    /// consecutive_failures, consecutive_start_deadlines)`.
-    fn record_start_deadline_failure(&self, agent_id: &AgentId) -> (Duration, u32, u32) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = timing.entry(agent_id.clone()).or_default();
-        let (delay, consecutive_failures) = Self::bump(entry);
-        entry.consecutive_start_deadlines += 1;
-        (
-            delay,
-            consecutive_failures,
-            entry.consecutive_start_deadlines,
-        )
-    }
-
-    /// Clears the spawn side of `agent_id`'s backoff bookkeeping: delay,
-    /// `consecutive_failures`, and `consecutive_start_deadlines` all reset
-    /// to a clean slate. Two callers, both a deliberate "start over": a
-    /// spawn actually reaching `idle` (`dispatch_agent`'s `Idle` arm --
-    /// issue #24 finding 4's redefinition of "success", since a spawn
-    /// merely returning `Ok` never gave a hookless provider's repeated
-    /// deadline failures anywhere to escalate to), and an operator
-    /// explicitly resuming a paused agent (`Handle::resume_backoff`) --
-    /// the resume *is* the retry decision. Only touches timing, never the
-    /// separate deletion gate introduced by #50.
-    fn record_success(&self, agent_id: &AgentId) {
-        let mut timing = self
-            .timing
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        timing.remove(agent_id);
-    }
-
-    fn try_begin_preparation(&self, agent_id: &AgentId) -> bool {
-        self.gate.try_begin_preparation(agent_id)
-    }
-
-    fn end_preparation(&self, agent_id: &AgentId) {
-        self.gate.end_preparation(agent_id);
-    }
-
-    /// Marks `agent_id` as being deleted (ARCHITECTURE.md invariant 9).
-    /// Deliberately does not touch the backoff timer (nit 8, PR #50
-    /// review): `deleting` alone is what `try_begin_preparation` checks,
-    /// so resetting timing here changes nothing about admission and used
-    /// to just cost a persistently-broken agent its accumulated backoff on
-    /// every refused delete attempt (`AgentHasChildren`,
-    /// `AgentHasLiveSession`, ...).
-    fn begin_delete(&self, agent_id: &AgentId) {
-        self.gate.begin_delete(agent_id);
-    }
-
-    fn end_delete(&self, agent_id: &AgentId) {
-        self.gate.end_delete(agent_id);
-    }
-
-    async fn wait_for_drain(&self, agent_id: &AgentId, budget: Duration) -> bool {
-        self.gate.wait_for_drain(agent_id, budget).await
-    }
-}
-
-/// Per-identity "no new state once deletion begins" gate (ARCHITECTURE.md
-/// invariant 9): a `deleting` mark plus an in-flight `preparing` count.
-/// Generic over the identity type so the exact same mechanism guards an
-/// agent's guidance directory ([`SpawnBackoff`]'s `gate` field, keyed by
-/// `AgentId`) and a project's, including agents an operator might still be
-/// creating under it while the project itself is being deleted
-/// (`Handle`'s `project_gate` field, keyed by `ProjectId`) -- see PR #50's
-/// review, finding 3.
-///
-/// Never pruned (same reasoning as `DaemonState::delivery_slots`):
-/// [`DeleteGate::end_delete`] clears only `deleting`, never removes the
-/// entry and never touches `preparing`. Dropping the entry (or the
-/// in-flight count with it) here is exactly the mistake `SpawnBackoff`
-/// used to make -- see its doc comment.
-struct DeleteGate<Id: Eq + std::hash::Hash + Clone> {
-    state: Mutex<HashMap<Id, GateEntry>>,
-}
-
-#[derive(Default)]
-struct GateEntry {
-    deleting: bool,
-    preparing: u32,
-}
-
-impl<Id: Eq + std::hash::Hash + Clone> DeleteGate<Id> {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Atomically checks that `id` is not currently being deleted and, if
-    /// not, records one write in flight for it; declines (returns
-    /// `false`) if a delete is in progress. Checked and incremented under
-    /// the same lock as [`DeleteGate::begin_delete`] and
-    /// [`DeleteGate::wait_for_drain`], so a fresh write and a delete
-    /// beginning can never race past each other: whichever runs first
-    /// under the lock determines the outcome.
-    fn try_begin_preparation(&self, id: &Id) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = state.entry(id.clone()).or_default();
-        if entry.deleting {
-            return false;
-        }
-        entry.preparing += 1;
-        true
-    }
-
-    /// Ends one write recorded by [`DeleteGate::try_begin_preparation`],
-    /// whether it succeeded or failed -- lets a concurrent
-    /// [`DeleteGate::wait_for_drain`] proceed once every write for `id`
-    /// has ended.
-    fn end_preparation(&self, id: &Id) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(id) {
-            entry.preparing = entry.preparing.saturating_sub(1);
-        }
-    }
-
-    /// Marks `id` as being deleted: from this call on,
-    /// `try_begin_preparation` declines new writes for it. Idempotent.
-    fn begin_delete(&self, id: &Id) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.entry(id.clone()).or_default().deleting = true;
-    }
-
-    /// Clears only the deleting mark begun by `begin_delete` -- never
-    /// removes the entry and never touches `preparing`. `preparing` may
-    /// genuinely still be nonzero here: a drain timeout, or a write
-    /// admitted the instant before `begin_delete` set the mark and not
-    /// yet finished. Dropping it was exactly what let a retried delete
-    /// report "drained" while a write was still running (PR #50 review,
-    /// finding 2). Idempotent.
-    fn end_delete(&self, id: &Id) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = state.get_mut(id) {
-            entry.deleting = false;
-        }
-    }
-
-    /// Polls (bounded by `budget`) until `id` has no write in flight;
-    /// returns `false` on timeout. See [`DELETE_DRAIN_POLL`] for why
-    /// polling rather than a `Notify`.
-    async fn wait_for_drain(&self, id: &Id, budget: Duration) -> bool {
-        let deadline = Instant::now() + budget;
-        loop {
-            let drained = {
-                let state = self
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.get(id).is_none_or(|entry| entry.preparing == 0)
-            };
-            if drained {
-                return true;
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            sleep_until((now + DELETE_DRAIN_POLL).min(deadline)).await;
-        }
-    }
-}
-
-async fn run_dispatcher(
+async fn run_manager(
     config: Arc<Config>,
     state: DaemonState,
-    wake_tx: mpsc::Sender<WakeAgent>,
-    mut wake_rx: mpsc::Receiver<WakeAgent>,
-    mut shutdown_rx: watch::Receiver<bool>,
-    backoff: Arc<SpawnBackoff>,
+    commands: mpsc::Sender<Command>,
+    mut receiver: mpsc::Receiver<Command>,
+    mut shutdown: watch::Receiver<bool>,
+    agent_gate: Arc<DeleteGate<AgentId>>,
 ) -> Result<(), Error> {
-    let recovery_now = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            store.recover_delivery_attempts(recovery_now)?;
-            Ok(((), Vec::new()))
-        })
-        .await?;
-    recover_sessions(&state, &wake_tx, &shutdown_rx).await;
-
-    let mut tick = tokio::time::interval(TICK_INTERVAL);
+    let mut observed = HashSet::new();
+    reconcile_runs(&state, &commands, &mut observed).await?;
+    let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
                 }
             }
-            woken = wake_rx.recv() => {
-                let Some(WakeAgent { project_id, agent_id }) = woken else {
-                    return Ok(());
-                };
-                if let Err(error) =
-                    dispatch_agent(&config, &state, &wake_tx, &backoff, &project_id, &agent_id).await
-                {
-                    tracing::warn!(%error, %project_id, %agent_id, "dispatch failed");
+            command = receiver.recv() => {
+                let Some(command) = command else { return Ok(()); };
+                match command {
+                    Command::Start { input, reply } => {
+                        let result = start_and_observe(
+                            Arc::clone(&config), state.clone(), commands.clone(),
+                            &mut observed, Arc::clone(&agent_gate), input,
+                        ).await;
+                        let _ = reply.send(result);
+                    }
+                    Command::WakeAgent { project_id, agent_id } => {
+                        if let Err(error) = dispatch_agent(
+                            Arc::clone(&config), state.clone(), commands.clone(),
+                            &mut observed, Arc::clone(&agent_gate), project_id, agent_id,
+                        ).await {
+                            tracing::warn!(%error, "attempt dispatch failed");
+                        }
+                    }
+                    Command::ReconcileRun { run_id, grace_ms } => {
+                        reconcile_one(
+                            &state, &commands, &mut observed, run_id, grace_ms,
+                        ).await?;
+                    }
+                    Command::ObserverFinished(run_id) => {
+                        observed.remove(&run_id);
+                    }
                 }
             }
             _ = tick.tick() => {
-                if let Err(error) = reconcile_all(&config, &state, &wake_tx, &backoff).await {
-                    tracing::warn!(%error, "reconcile tick failed");
-                }
+                reconcile_runs(&state, &commands, &mut observed).await?;
+                reconcile_agents(
+                    Arc::clone(&config), state.clone(), commands.clone(),
+                    &mut observed, Arc::clone(&agent_gate),
+                ).await?;
             }
         }
     }
 }
 
-/// The store's generic state-page cap (`store::MAX_STATE_PAGE`, not
-/// exported) is smaller than the wire's advertised `MAX_*_PAGE_ITEMS`; a
-/// full-table reconciler pages through it rather than assuming everything
-/// fits in one call (a `LocalRequest::List*` caller gets the same
-/// treatment via `local_api::session_page_limit`'s comment on the same
-/// mismatch).
-const RECONCILE_PAGE: usize = 100;
+async fn start_and_observe(
+    config: Arc<Config>,
+    state: DaemonState,
+    commands: mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
+    agent_gate: Arc<DeleteGate<AgentId>>,
+    input: StartTask,
+) -> Result<StartedRun, Error> {
+    let agent_id = input.agent_id.clone();
+    if !agent_gate.try_begin_write(&agent_id) {
+        return Err(Error::DeleteInProgress);
+    }
+    let result = start_run(&config, &state, input).await;
+    agent_gate.end_write(&agent_id);
+    result.map(|started| {
+        let StartedProcess { run, child } = started;
+        let run_id = run.run.id.clone();
+        observed.insert(run_id.clone());
+        spawn_observer(state, commands, run, Some(child));
+        StartedRun { run_id }
+    })
+}
 
-/// Re-scans every project's every agent for pending work, so a dropped or
-/// never-sent wake trigger is never fatal -- only ever delayed up to
-/// [`TICK_INTERVAL`].
-async fn reconcile_all(
+struct StartedProcess {
+    run: RecoverableKernelRun,
+    child: Child,
+}
+
+async fn start_run(
     config: &Config,
     state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    backoff: &SpawnBackoff,
-) -> Result<(), Error> {
-    let mut after_project = None;
+    input: StartTask,
+) -> Result<StartedProcess, Error> {
+    let run_id = new_run_id()?;
+    let runner_instance_id = new_runner_instance_id()?;
+    let runtime_dir = config.runtime_root.join(run_id.as_str());
+    let policy_dir = runtime_dir.join("policy");
+    let bearer = random_bearer();
+    let digest = capability_digest(&bearer);
+    let lookup_project = input.project_id.clone();
+    let lookup_agent = input.agent_id.clone();
+    let provider = state
+        .with_store(move |store| {
+            Ok(store
+                .agent_status(&lookup_project, &lookup_agent)?
+                .agent
+                .provider)
+        })
+        .await?;
+    let admission = NewRunAdmission {
+        run_id: run_id.clone(),
+        project_id: input.project_id,
+        task_id: input.task_id,
+        agent_id: input.agent_id,
+        expected_provider: provider,
+        capability_digest: digest,
+        runner_instance_id: runner_instance_id.clone(),
+        runner_runtime: runtime_dir.to_string_lossy().into_owned(),
+        max_active_runs: config.max_active_runs,
+        change_id: None,
+        policy_cwd: Some(policy_dir.to_string_lossy().into_owned()),
+    };
+    let admitted_at_ms = now_ms()?;
+    let admitted = state
+        .commit_and_publish(move |store| {
+            let admitted = store.admit_run(admission, admitted_at_ms)?;
+            let events = admitted.events.clone();
+            Ok((admitted, events))
+        })
+        .await?;
+
+    match launch_admitted(config, state, admitted, bearer).await {
+        Ok(started) => Ok(started),
+        Err((error, child, run)) => {
+            cleanup_unactivated(state, &run, child).await;
+            Err(error)
+        }
+    }
+}
+
+async fn launch_admitted(
+    config: &Config,
+    state: &DaemonState,
+    admitted: AdmittedRun,
+    bearer: String,
+) -> Result<StartedProcess, (Error, Option<Child>, RecoverableKernelRun)> {
+    let recovery = recovery_from_admission(&admitted);
+    let runtime_dir = PathBuf::from(&admitted.target.runner_runtime);
+    if let Err(error) = ensure_private_directory(&runtime_dir) {
+        return Err((error, None, recovery));
+    }
+    let runtime_locator = runtime_locator(&runtime_dir);
+    let runtime_birth = match runtime_birth_fingerprint(&runtime_dir) {
+        Ok(Some(fingerprint)) => fingerprint,
+        Ok(None) => return Err((Error::InvalidRuntimeRoot, None, recovery)),
+        Err(error) => return Err((error, None, recovery)),
+    };
+    let register_runtime_run_id = admitted.run.id.clone();
+    let runtime_registered_at_ms = match now_ms() {
+        Ok(value) => value,
+        Err(error) => return Err((error, None, recovery)),
+    };
+    if let Err(error) = state
+        .commit_and_publish(move |store| {
+            store.register_admitted_runtime(
+                &register_runtime_run_id,
+                &runtime_locator,
+                &runtime_birth,
+                runtime_registered_at_ms,
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await
+    {
+        return Err((error.into(), None, recovery));
+    }
+    if admitted.target.role == AgentRole::Orchestrator {
+        let policy_dir = PathBuf::from(&admitted.target.worktree);
+        if let Err(error) = ensure_private_directory(&policy_dir) {
+            return Err((error, None, recovery));
+        }
+    }
+    let hook_token_path = runtime_dir.join("attempt.token");
+    if let Err(source) = hooks::write_private_file(&hook_token_path, bearer.as_bytes()) {
+        return Err((
+            Error::Runtime {
+                path: hook_token_path,
+                source,
+            },
+            None,
+            recovery,
+        ));
+    }
+    let startup_input = match compose_startup(config, &admitted) {
+        Ok(input) => input,
+        Err(error) => return Err((error, None, recovery)),
+    };
+    let provider = select_provider(admitted.target.provider);
+    let context = SpawnContext {
+        run_id: admitted.run.id.clone(),
+        worktree: PathBuf::from(&admitted.target.worktree),
+        startup_input,
+        model: admitted.target.model.clone(),
+        reasoning_effort: admitted.target.reasoning_effort.clone(),
+        permission_mode: admitted.target.permission_mode.clone(),
+        auto_mode: admitted.target.auto_mode,
+        hook_token_path,
+        factoryctl_path: config.factoryctl_path.clone(),
+        agent_dir: runtime_dir.join("provider"),
+    };
+    let launch = match provider.spawn_spec(&context) {
+        Ok(launch) => launch,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
+    let (provider_environment, attempt_environment) = provider_environment(launch.env);
+    let spec = LaunchSpec {
+        runner_program: config.runner_program.clone(),
+        factoryctl_path: config.factoryctl_path.clone(),
+        provider_program: launch.program,
+        provider_arguments: launch.args.into_iter().map(Into::into).collect(),
+        provider_environment,
+        attempt_environment: base_environment(config, &admitted, attempt_environment),
+        run_id: admitted.run.id.clone(),
+        runner_instance_id: admitted.target.runner_instance_id.clone(),
+        runtime_dir: runtime_dir.clone(),
+        cwd: PathBuf::from(&admitted.target.worktree),
+        startup_input: launch.startup_input,
+    };
+    let child = match runner_process::spawn_runner(spec, CONNECT_GRACE).await {
+        Ok(child) => child,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
+    let runner_pid = match child.id() {
+        Some(pid) => pid,
+        None => return Err((Error::RunnerPidUnavailable, Some(child), recovery)),
+    };
+    let runner_locator = runner_locator(runner_pid, &admitted.target.runner_instance_id);
+    let runner_birth = match process_birth_fingerprint(runner_pid) {
+        Ok(Some(fingerprint)) => fingerprint,
+        Ok(None) => {
+            return Err((
+                Error::ProcessIdentityUnavailable(runner_pid),
+                Some(child),
+                recovery,
+            ));
+        }
+        Err(error) => return Err((error, Some(child), recovery)),
+    };
+    let register_run_id = admitted.run.id.clone();
+    let registered_at_ms = match now_ms() {
+        Ok(value) => value,
+        Err(error) => return Err((error, Some(child), recovery)),
+    };
+    if let Err(error) = state
+        .commit_and_publish(move |store| {
+            store.register_admitted_runner(
+                &register_run_id,
+                &runner_locator,
+                &runner_birth,
+                registered_at_ms,
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await
+    {
+        return Err((error.into(), Some(child), recovery));
+    }
+    let client = RunnerClient::new(
+        &runtime_dir,
+        admitted.run.id.clone(),
+        admitted.target.runner_instance_id.clone(),
+    );
+    let prepared = match prepare_with_grace(&client).await {
+        Ok(prepared) => prepared,
+        Err(error) => return Err((error.into(), Some(child), recovery)),
+    };
+    let identity = match prepared_identity(&admitted, &prepared) {
+        Ok(identity) => identity,
+        Err(error) => return Err((error, Some(child), recovery)),
+    };
+    let activate_run_id = admitted.run.id.clone();
+    let activated_at_ms = match now_ms() {
+        Ok(value) => value,
+        Err(error) => return Err((error, Some(child), recovery)),
+    };
+    let (activated_run, resources) = match state
+        .commit_and_publish(move |store| {
+            let (run, events) =
+                store.activate_prepared_run(&activate_run_id, identity, activated_at_ms)?;
+            let resources = store.kernel_resources(&activate_run_id)?;
+            Ok(((run, resources), events))
+        })
+        .await
+    {
+        Ok(run) => run,
+        Err(error) => return Err((error.into(), Some(child), recovery)),
+    };
+    if let Err(error) = prepared.activate().await {
+        // Running is already durable. The observer resolves whether the gate
+        // accepted activation; returning the admitted run is safer than
+        // manufacturing a second attempt after an ambiguous acknowledgement.
+        tracing::warn!(run_id = %admitted.run.id, %error, "runner activation acknowledgement was lost");
+    }
+    Ok(StartedProcess {
+        run: RecoverableKernelRun {
+            run: activated_run,
+            runner_instance_id: admitted.target.runner_instance_id,
+            runner_runtime: admitted.target.runner_runtime,
+            resources,
+        },
+        child,
+    })
+}
+
+fn recovery_from_admission(admitted: &AdmittedRun) -> RecoverableKernelRun {
+    RecoverableKernelRun {
+        run: admitted.run.clone(),
+        runner_instance_id: admitted.target.runner_instance_id.clone(),
+        runner_runtime: admitted.target.runner_runtime.clone(),
+        resources: Vec::new(),
+    }
+}
+
+async fn prepare_with_grace(client: &RunnerClient) -> Result<PreparedRunner, RunnerClientError> {
+    let deadline = Instant::now() + CONNECT_GRACE;
     loop {
-        let lookup_after_project = after_project.clone();
+        match client.prepare().await {
+            Ok(prepared) => return Ok(prepared),
+            Err(RunnerClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                sleep(CONNECT_RETRY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn prepared_identity(
+    admitted: &AdmittedRun,
+    prepared: &PreparedRunner,
+) -> Result<PreparedProcessIdentity, Error> {
+    let runner_pid = prepared.runner_pid();
+    let provider_pid = prepared.child_pid();
+    let process_group = prepared.process_group_id();
+    let runtime_dir = Path::new(&admitted.target.runner_runtime);
+    let runtime_birth = runtime_birth_fingerprint(runtime_dir)?.ok_or(Error::InvalidRuntimeRoot)?;
+    let runner_birth = process_birth_fingerprint(runner_pid)?
+        .ok_or(Error::ProcessIdentityUnavailable(runner_pid))?;
+    let provider_birth = process_birth_fingerprint(provider_pid)?
+        .ok_or(Error::ProcessIdentityUnavailable(provider_pid))?;
+    Ok(PreparedProcessIdentity {
+        runtime_locator: runtime_locator(runtime_dir),
+        runtime_birth_fingerprint: runtime_birth,
+        runner_locator: runner_locator(runner_pid, &admitted.target.runner_instance_id),
+        runner_birth_fingerprint: runner_birth,
+        provider_locator: serde_json::json!({ "pid": provider_pid }).to_string(),
+        provider_birth_fingerprint: provider_birth.clone(),
+        process_group_locator: serde_json::json!({ "pgid": process_group }).to_string(),
+        process_group_birth_fingerprint: provider_birth,
+    })
+}
+
+fn base_environment(
+    config: &Config,
+    admitted: &AdmittedRun,
+    mut provider_environment: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut environment = vec![
+        (
+            "DARK_FACTORY_AGENT".into(),
+            admitted.target.agent_id.to_string(),
+        ),
+        (
+            "DARK_FACTORY_PROJECT".into(),
+            admitted.target.project_id.to_string(),
+        ),
+        (
+            "DARK_FACTORY_SOCKET".into(),
+            config.socket_path.to_string_lossy().into_owned(),
+        ),
+        (
+            "DARK_FACTORY_ATTEMPT_TOKEN_FILE".into(),
+            PathBuf::from(&admitted.target.runner_runtime)
+                .join("attempt.token")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ];
+    environment.append(&mut provider_environment);
+    environment
+}
+
+fn provider_environment(
+    environment: Vec<(String, String)>,
+) -> (ProviderEnvironment, Vec<(String, String)>) {
+    let mut codex_home = None;
+    let mut rest = Vec::new();
+    for (name, value) in environment {
+        if name == "CODEX_HOME" {
+            codex_home = Some(PathBuf::from(value));
+        } else {
+            rest.push((name, value));
+        }
+    }
+    (
+        codex_home.map_or(
+            ProviderEnvironment::Inherited,
+            ProviderEnvironment::CodexHome,
+        ),
+        rest,
+    )
+}
+
+fn select_provider(kind: Provider) -> Box<dyn providers::Provider + Send> {
+    match kind {
+        Provider::ClaudeCode => Box::new(providers::claude::ClaudeProvider),
+        Provider::Codex => Box::new(providers::codex::CodexProvider::new()),
+        Provider::Shell => Box::new(providers::shell::ShellProvider),
+    }
+}
+
+fn compose_startup(config: &Config, admitted: &AdmittedRun) -> Result<Vec<u8>, Error> {
+    let project_guidance = read_guidance(&factory_core::paths::project_guidance_path(
+        &config.guidance_root,
+        &admitted.target.project_id,
+    ))?;
+    let instructions = read_guidance(&factory_core::paths::agent_instructions_path(
+        &config.guidance_root,
+        &admitted.target.project_id,
+        &admitted.target.agent_id,
+    ))?;
+    let memory = read_guidance(&factory_core::paths::agent_memory_path(
+        &config.guidance_root,
+        &admitted.target.project_id,
+        &admitted.target.agent_id,
+    ))?;
+    let mut prompt = format!(
+        "# Dark Factory attempt {}\n\nProject guidance:\n{}\n\nAgent rules:\n{}\n\nAgent memory:\n{}\n\nTask: {}\n\n{}\n",
+        admitted.run.id,
+        project_guidance,
+        instructions,
+        memory,
+        admitted.target.task_title,
+        admitted.target.task_body,
+    );
+    if !admitted.target.messages.is_empty() {
+        prompt.push_str("\nMessages:\n");
+        for message in &admitted.target.messages {
+            prompt.push_str("- ");
+            prompt.push_str(&message.body);
+            prompt.push('\n');
+        }
+    }
+    if admitted.target.role == AgentRole::Orchestrator {
+        prompt.push_str(
+            "\nYou schedule and prioritize through factoryctl. factoryd owns admission, source, processes, and finalization.\n",
+        );
+    }
+    prompt.push_str(
+        "\nWhen finished run `factoryctl task done --result <summary>`. If genuinely blocked run `factoryctl task blocked --reason <reason>`. Your credential identifies this exact attempt; do not supply task or run IDs.\n",
+    );
+    Ok(prompt.into_bytes())
+}
+
+fn read_guidance(path: &Path) -> Result<String, Error> {
+    fs::read_to_string(path).map_err(|source| Error::Runtime {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+async fn dispatch_agent(
+    config: Arc<Config>,
+    state: DaemonState,
+    commands: mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
+    agent_gate: Arc<DeleteGate<AgentId>>,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) -> Result<(), Error> {
+    let lookup_project = project_id.clone();
+    let lookup_agent = agent_id.clone();
+    let (auto, status) = state
+        .with_store(move |store| {
+            Ok((
+                store.auto_mode()?,
+                store.agent_status(&lookup_project, &lookup_agent)?,
+            ))
+        })
+        .await?;
+    if !auto || status.agent.paused || status.current_run.is_some() {
+        return Ok(());
+    }
+    let Some(task) = status
+        .queue
+        .into_iter()
+        .find(|task| task.status == factory_core::TaskStatus::Queued)
+    else {
+        return Ok(());
+    };
+    let result = start_and_observe(
+        config,
+        state,
+        commands,
+        observed,
+        agent_gate,
+        StartTask {
+            project_id,
+            task_id: task.id,
+            agent_id,
+        },
+    )
+    .await;
+    if let Err(Error::State(DaemonStateError::Store(
+        StoreError::SourceProvisioningUnavailable | StoreError::CapacityReached { .. },
+    ))) = result
+    {
+        return Ok(());
+    }
+    result.map(|_| ())
+}
+
+async fn reconcile_agents(
+    config: Arc<Config>,
+    state: DaemonState,
+    commands: mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
+    agent_gate: Arc<DeleteGate<AgentId>>,
+) -> Result<(), Error> {
+    let mut project_cursor = None;
+    loop {
+        let after = project_cursor.clone();
         let mut projects = state
-            .with_store(move |store| {
-                store.list_projects(lookup_after_project.as_ref(), RECONCILE_PAGE + 1)
-            })
+            .with_store(move |store| store.list_projects(after.as_ref(), STATE_PAGE + 1))
             .await?;
-        let next_after_project = (projects.len() > RECONCILE_PAGE)
-            .then(|| projects.swap_remove(RECONCILE_PAGE))
-            .map(|project| project.id);
+        let next = (projects.len() > STATE_PAGE).then(|| projects.swap_remove(STATE_PAGE).id);
         for project in projects {
-            let project_id = project.id.clone();
-            let mut after_agent = None;
+            let mut agent_cursor = None;
             loop {
-                let lookup_after_agent = after_agent.clone();
+                let project_id = project.id.clone();
+                let after = agent_cursor.clone();
                 let mut agents = state
-                    .with_store({
-                        let project_id = project_id.clone();
-                        move |store| {
-                            store.list_agents(
-                                &project_id,
-                                lookup_after_agent.as_ref(),
-                                RECONCILE_PAGE + 1,
-                            )
-                        }
+                    .with_store(move |store| {
+                        store.list_agents(&project_id, after.as_ref(), STATE_PAGE + 1)
                     })
                     .await?;
-                let next_after_agent = (agents.len() > RECONCILE_PAGE)
-                    .then(|| agents.swap_remove(RECONCILE_PAGE))
-                    .map(|agent| agent.id);
+                let next_agent =
+                    (agents.len() > STATE_PAGE).then(|| agents.swap_remove(STATE_PAGE).id);
                 for agent in agents {
-                    if let Err(error) =
-                        dispatch_agent(config, state, wake_tx, backoff, &project_id, &agent.id)
-                            .await
-                    {
-                        tracing::warn!(%error, %project_id, agent_id = %agent.id, "reconcile dispatch failed");
-                    }
+                    dispatch_agent(
+                        Arc::clone(&config),
+                        state.clone(),
+                        commands.clone(),
+                        observed,
+                        Arc::clone(&agent_gate),
+                        project.id.clone(),
+                        agent.id,
+                    )
+                    .await?;
                 }
-                match next_after_agent {
-                    Some(cursor) => after_agent = Some(cursor),
+                match next_agent {
+                    Some(cursor) => agent_cursor = Some(cursor),
                     None => break,
                 }
             }
         }
-        match next_after_project {
-            Some(cursor) => after_project = Some(cursor),
+        match next {
+            Some(cursor) => project_cursor = Some(cursor),
             None => break,
         }
     }
     Ok(())
 }
 
-async fn dispatch_agent(
-    config: &Config,
+async fn reconcile_runs(
     state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    backoff: &SpawnBackoff,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
+    commands: &mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
 ) -> Result<(), Error> {
-    let hold_project_id = project_id.clone();
-    let hold_agent_id = agent_id.clone();
-    let held = match state
-        .with_store(move |store| store.agent_is_held(&hold_project_id, &hold_agent_id))
-        .await
-    {
-        Ok(held) => held,
-        Err(DaemonStateError::Store(StoreError::AgentNotFound)) => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    if held {
-        return Ok(());
-    }
-
-    let live_project_id = project_id.clone();
-    let live_agent_id = agent_id.clone();
-    let live = state
-        .with_store(move |store| store.live_session_for_agent(&live_project_id, &live_agent_id))
+    let recoverable = state
+        .with_store(|store| store.recoverable_kernel_runs())
         .await?;
-
-    match live {
-        None => {
-            if has_pending_work(state, project_id, agent_id).await? {
-                // Backoff (this track's item 1): a persistently broken
-                // spawn path must not busy-retry on every wake/tick --
-                // `backoff.ready` silently declines attempts still inside
-                // their delay window (no log spam beyond the one already
-                // emitted when the failure that started the delay was
-                // recorded).
-                if backoff.ready(agent_id)
-                    && !at_concurrency_limit(config, state, project_id, agent_id).await?
-                {
-                    // Deletion (this task's mechanism, ARCHITECTURE.md):
-                    // `try_begin_preparation` declines under the same lock
-                    // `Handle::begin_delete` uses, so a `DeleteAgent`/
-                    // `DeleteProject` already marking this agent and a
-                    // fresh preparation can never both proceed -- whichever
-                    // wins the lock first decides. A decline here is
-                    // silent, matching `backoff.ready`'s: the delete
-                    // request draining this agent is what actually reports
-                    // the outcome to its caller.
-                    if backoff.try_begin_preparation(agent_id) {
-                        let spawn_result =
-                            spawn_session_for_agent(config, state, wake_tx, project_id, agent_id)
-                                .await;
-                        backoff.end_preparation(agent_id);
-                        // A successful process spawn is not yet a usable
-                        // session; retain timing until SessionStart moves
-                        // it past `starting`.
-                        match spawn_result {
-                            Ok(_) => {}
-                            Err(error) => {
-                                let (retry_in, attempt) = backoff.record_failure(agent_id);
-                                tracing::warn!(
-                                    %error,
-                                    %project_id,
-                                    %agent_id,
-                                    attempt,
-                                    retry_in_secs = retry_in.as_secs(),
-                                    "session spawn failed; backing off"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(())
+    for run in recoverable {
+        if run.run.phase == RunPhase::Admitted {
+            recover_admitted_run(state, commands, observed, run).await?;
+            continue;
         }
-        Some(session) if session.stop_requested_at_ms.is_some() => {
-            // StopSession acknowledges the runner's request before its
-            // process has actually exited. Keep queued work out of that
-            // dying session; end_session_now will wake the agent after the
-            // durable successor can be spawned (and, for resumable
-            // providers, resume the same provider thread).
-            if session.delivery_recovery_stop_requested_at_ms.is_some() {
-                let client = RunnerClient::new(
-                    &session.runner_runtime,
-                    session_run_id(&session.id)?,
-                    session.runner_instance_id.clone(),
-                );
-                if let Err(error) = client.stop(2_000).await {
-                    tracing::warn!(
-                        %error,
-                        session_id = %session.id,
-                        "durable delivery-recovery stop remains pending"
-                    );
-                }
-            }
-            Ok(())
+        if release_absent_resources(state, &run).await? {
+            continue;
         }
-        Some(session)
-            if session.state == SessionState::WaitingForInput
-                && session.wait_reason.as_deref() == Some("delivery unacknowledged") =>
-        {
-            let due = state
-                .with_store({
-                    let project_id = project_id.clone();
-                    let agent_id = agent_id.clone();
-                    let session_id = session.id.clone();
-                    move |store| {
-                        store.delivery_attempt_due(
-                            &project_id,
-                            &agent_id,
-                            &session_id,
-                            now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
-                        )
-                    }
-                })
-                .await?;
-            if due {
-                deliver_pending(
-                    config,
-                    state,
-                    backoff,
-                    project_id,
-                    agent_id,
-                    &session.snapshot(),
-                )
-                .await?;
-            }
-            Ok(())
-        }
-        Some(session) if session.state == SessionState::Idle => {
-            backoff.record_success(agent_id);
-            deliver_pending(
-                config,
-                state,
-                backoff,
-                project_id,
-                agent_id,
-                &session.snapshot(),
-            )
-            .await
-        }
-        Some(session) if session.state == SessionState::Starting => {
-            enforce_start_deadline(
-                config, state, wake_tx, backoff, project_id, agent_id, &session,
-            )
-            .await
-        }
-        Some(_) => {
-            // `working`/`waiting_for_input` (the only states left --
-            // `live_session_for_agent` only ever returns a still-live row,
-            // so `stopped`/`failed` can't reach here): reachable only via
-            // hook transitions that themselves require `SessionStart` to
-            // have already fired (`record_hook_event`'s state machine), so
-            // this is exactly as much proof of success as the `Idle` arm
-            // above -- a session the dispatcher's own polling never
-            // happened to catch sitting `idle` (busy again by the very
-            // next observation) must not leave a stale streak behind.
-            backoff.record_success(agent_id);
-            Ok(())
+        if observed.insert(run.run.id.clone()) {
+            spawn_observer(state.clone(), commands.clone(), run, None);
         }
     }
-}
-
-/// Issue #24: a session that has been `starting` for longer than
-/// [`Config::session_start_deadline`] is treated exactly like a failed
-/// spawn attempt, so "starting forever" is never a reachable steady state
-/// even though the missing-hook root cause itself is not established. The
-/// deadline is measured from the session's durable `started_at_ms`
-/// (`dispatch_agent`'s ordinary per-agent pass -- wake-triggered or the 5
-/// second safety tick -- calls this for every `starting` session, so this
-/// also catches a session recovered `starting` after a daemon restart, not
-/// just a freshly spawned one).
-async fn enforce_start_deadline(
-    config: &Config,
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    backoff: &SpawnBackoff,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-    session: &SessionRow,
-) -> Result<(), Error> {
-    let now = now_ms()?;
-    // A negative gap (the clock moved backward since the session's
-    // `started_at_ms` was recorded) is treated as "not yet due" rather
-    // than an immediate deadline hit -- clock skew must never be the
-    // reason a freshly spawned session gets killed.
-    let elapsed = u64::try_from(now.saturating_sub(session.started_at_ms)).unwrap_or(0);
-    if Duration::from_millis(elapsed) < config.session_start_deadline {
-        return Ok(());
-    }
-
-    // Adversarial review of #24, finding 6: a `StopSession` already in
-    // flight against this still-`starting` session resolves through the
-    // ordinary stop-completion path (`supervise_child` observing the
-    // runner's real exit, `end_session`/`end_session_now`) with its own
-    // real exit status and no reason text -- never through here, and
-    // never with this deadline's reason attached to what the operator
-    // asked to be a plain `stopped`, not a `failed`. Nothing to back off
-    // or respawn either: nobody asked this agent to be respawned.
-    if session.stop_requested_at_ms.is_some() {
-        return Ok(());
-    }
-
-    let session_id = session.id.clone();
-    // Adversarial review of #24, findings 1 and 2: commit the `failed`
-    // transition *first*, guarded so it only ever applies while the
-    // session is still exactly `starting` (`Store::fail_starting_session`,
-    // `WHERE state = 'starting'` inside its own transaction -- not
-    // `SessionState::is_live()`, which would also accept a session whose
-    // own `SessionStart` hook won the race and already moved it to
-    // `idle`/`working` in between this function's `await` points). Only a
-    // successful, guarded commit goes on to best-effort stop the runner,
-    // record the backoff failure, and wake the dispatcher; a lost guard
-    // (the hook won) makes this entire call a no-op, and -- unlike the
-    // previous stop-then-fail order -- a `supervise_child` racing the
-    // runner's own exit can never beat this commit to `SessionNotLive`
-    // and silently swallow the reason/backoff/wake the operator depends
-    // on to see why the session failed and that a retry is coming.
-    let reason = format!(
-        "SessionStart hook not received within {}s (the provider started but its hooks did not \
-         reach factoryd)",
-        config.session_start_deadline.as_secs()
-    );
-    let fail_session_id = session_id.clone();
-    let outcome = state
-        .commit_and_publish(move |store| {
-            match store.fail_starting_session(&fail_session_id, reason, now)? {
-                Some((_snapshot, events)) => Ok((true, events)),
-                None => Ok((false, Vec::new())),
-            }
-        })
-        .await?;
-    if !outcome {
-        // Lost the guard: the session's own `SessionStart` hook (or some
-        // other transition) already moved it out of `starting` before
-        // this committed. It is exactly as healthy as its own state now
-        // says -- nothing here to stop, back off, or wake for.
-        return Ok(());
-    }
-
-    // Stop the runner (best-effort, reusing the same control path
-    // `local_api.rs`'s `StopSession` handler uses): if the control socket
-    // is already unreachable there is nothing left to stop -- the session
-    // is already durably recorded `failed` above regardless, so this can
-    // never be the reason a stuck session stays visible as `starting`.
-    // Adversarial review of #24, finding 7: a failed stop here can leave
-    // the old provider process alive, holding the worktree, while the
-    // backoff retry below launches a new runner into the same worktree --
-    // the same orphan class issue #26 already covers, just reachable as a
-    // steady-state path now instead of only across a daemon restart; no
-    // reaper for it here, `tracing::error!` (not `warn!`) so it is not
-    // mistaken for the routine, expected case.
-    let target_project_id = project_id.clone();
-    let target_session_id = session_id.clone();
-    match state
-        .with_store(move |store| {
-            store.session_control_target(&target_project_id, &target_session_id)
-        })
-        .await
-    {
-        Ok(target) => {
-            if let Ok(control_run_id) = session_run_id(&session_id) {
-                if let Err(error) = RunnerClient::new(
-                    target.runner_runtime,
-                    control_run_id,
-                    target.runner_instance_id,
-                )
-                .stop(0)
-                .await
-                {
-                    tracing::error!(
-                        %error,
-                        %project_id,
-                        %agent_id,
-                        %session_id,
-                        "could not stop a session past its start deadline; its provider process \
-                         may still be running and holding the worktree"
-                    );
-                }
-            }
-        }
-        Err(error) => {
-            tracing::error!(
-                %error,
-                %project_id,
-                %agent_id,
-                %session_id,
-                "could not resolve a session past its start deadline's control target; its \
-                 provider process may still be running and holding the worktree"
-            );
-        }
-    }
-
-    // Adversarial review of #24, finding 4: this still drives the exact
-    // same exponential delay/`consecutive_failures` an ordinary spawn
-    // failure does (5s doubling to a 5 minute cap, `SpawnBackoff::bump`),
-    // but also tracks how many of this agent's consecutive failures were
-    // a start-deadline expiry specifically, so a hookless provider -- one
-    // whose spawn always succeeds, only its hook never arrives -- has
-    // somewhere to escalate to instead of cycling forever at this
-    // deadline's own ~2 minute cadence.
-    let (retry_in, attempt, consecutive_start_deadlines) =
-        backoff.record_start_deadline_failure(agent_id);
-
-    if consecutive_start_deadlines >= MAX_CONSECUTIVE_START_DEADLINES {
-        // Pause instead of respawning: the session just committed above
-        // stays `failed` with its own reason, which is already enough for
-        // `factory-core::attention::agent_attention` to report this agent
-        // as observed `Failed` and for `factoryctl status`/`agent
-        // status`/the TUI to route the operator to it -- no new state, no
-        // new code path there. `factoryctl agent resume` is the
-        // documented way back in and resets this streak
-        // (`Handle::resume_backoff`). Deliberately no `send_wake`: a
-        // paused agent's own `dispatch_agent` call returns immediately
-        // (its very first check), so there is nothing for a wake to do
-        // until the operator resumes it.
-        let pause_project_id = project_id.clone();
-        let pause_agent_id = agent_id.clone();
-        match state
-            .commit_and_publish(move |store| {
-                let (agent, event) = store.pause_agent(&pause_project_id, &pause_agent_id, now)?;
-                Ok((agent, vec![event]))
-            })
-            .await
-        {
-            Ok(_) => {
-                tracing::warn!(
-                    %project_id,
-                    %agent_id,
-                    %session_id,
-                    consecutive_start_deadlines,
-                    "session start deadline exceeded too many times in a row; pausing the agent \
-                     instead of respawning (factoryctl agent resume to retry)"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %project_id,
-                    %agent_id,
-                    "could not pause an agent after repeated session start deadlines"
-                );
-            }
-        }
-        return Ok(());
-    }
-
-    // Same shape of event/log line an ordinary spawn failure already
-    // emits (`dispatch_agent`'s own `None` branch, above): the next
-    // attempt is backed off, and the dispatcher is woken so it respawns
-    // once that backoff elapses rather than waiting a full extra safety
-    // tick.
-    tracing::warn!(
-        %project_id,
-        %agent_id,
-        %session_id,
-        attempt,
-        consecutive_start_deadlines,
-        retry_in_secs = retry_in.as_secs(),
-        "session start deadline exceeded; recorded failed and backing off"
-    );
-    send_wake(wake_tx, project_id.clone(), agent_id.clone());
     Ok(())
 }
 
-async fn has_pending_work(
+async fn reconcile_one(
     state: &DaemonState,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<bool, Error> {
-    let hold_project_id = project_id.clone();
-    let hold_agent_id = agent_id.clone();
-    if state
-        .with_store(move |store| store.agent_is_held(&hold_project_id, &hold_agent_id))
-        .await?
-    {
-        return Ok(false);
-    }
-    let task_project_id = project_id.clone();
-    let task_agent_id = agent_id.clone();
-    let task = state
-        .with_store(move |store| store.next_deliverable(&task_project_id, &task_agent_id))
-        .await?;
-    if task.is_some() {
-        return Ok(true);
-    }
-    let message_project_id = project_id.clone();
-    let message_agent_id = agent_id.clone();
-    let messages = state
-        .with_store(move |store| {
-            store.undelivered_messages_for_agent(&message_project_id, &message_agent_id)
-        })
-        .await?;
-    Ok(!messages.is_empty())
-}
-
-/// `true` if the daemon is already at `Config::max_active_runs` live
-/// sessions (this track's item 2): the caller must leave `agent_id`
-/// unspawned this pass rather than attempt it. Deliberately does not touch
-/// [`SpawnBackoff`] -- this is not a broken spawn path, just a full resource
-/// pool, and the 5 second safety tick (`reconcile_all`) re-checks every
-/// agent with pending work on its own, so the next session to end frees a
-/// slot within one tick without needing a per-agent wake. Logged at `info`
-/// (not `warn`, matching `dispatch_agent`'s own failure log next to it) so
-/// an operator watching `factoryd`'s log can see *why* an agent with
-/// pending work is not starting, since -- unlike an actual spawn failure --
-/// there is no `starting`/`failed` session row to carry a `wait_reason`
-/// (nothing was ever created).
-async fn at_concurrency_limit(
-    config: &Config,
-    state: &DaemonState,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<bool, Error> {
-    let live_count = state.with_store(|store| store.live_session_count()).await?;
-    if live_count < config.max_active_runs {
-        return Ok(false);
-    }
-    tracing::info!(
-        %project_id,
-        %agent_id,
-        live_count,
-        max_active_runs = config.max_active_runs,
-        "session spawn deferred: max-active-runs reached"
-    );
-    Ok(true)
-}
-
-// --- Session spawn ---------------------------------------------------
-
-fn select_provider(kind: Provider) -> Box<dyn providers::Provider + Send> {
-    match kind {
-        Provider::ClaudeCode => Box::new(providers::claude::ClaudeProvider::new()),
-        Provider::Codex => Box::new(providers::codex::CodexProvider::new()),
-        Provider::Shell => Box::new(providers::shell::ShellProvider),
-    }
-}
-
-async fn spawn_session_for_agent(
-    config: &Config,
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<SessionSnapshot, Error> {
-    let detail_project_id = project_id.clone();
-    let detail_agent_id = agent_id.clone();
-    let agent = state
-        .with_store(move |store| store.get_agent_detail(&detail_project_id, &detail_agent_id))
-        .await?;
-    // This function is reached only for an agent with no live session and is
-    // already protected by the per-agent preparation gate. Repair oversized
-    // memory before constructing any provider launch, so a safe relaunch is
-    // also the self-healing boundary for old installs.
-    let memory_path =
-        factory_core::paths::agent_memory_path(&config.guidance_root, project_id, agent_id);
-    let _ = guidance::compact_memory(&memory_path)?;
-    let auto_mode = state.with_store(|store| store.auto_mode()).await?;
-    let worktree = agent.snapshot.worktree.clone().ok_or(Error::NoWorktree)?;
-    let worktree_path = PathBuf::from(&worktree);
-
-    let provider_impl = select_provider(agent.snapshot.provider);
-    let capabilities = provider_impl.capabilities();
-
-    // The most recent provider-session identity this agent's sessions ever
-    // confirmed, live or historical -- generic across providers by design
-    // (TRACK5-DESIGN.md §1): Claude's is assigned by the daemon itself at
-    // creation time (`Store::create_session`, below), so it is always
-    // already set; Codex's is learned back from its own first
-    // `SessionStart` hook payload and persisted by
-    // `Store::set_provider_session_id` (`local_api.rs`'s `ProviderHook`
-    // handler, TRACK5D item 5). Either way, a fresh spawn just asks "does
-    // this agent have a prior session with one" and resumes it when
-    // `capabilities.resume` allows.
-    let resume_project_id = project_id.clone();
-    let resume_agent_id = agent_id.clone();
-    let resume = if capabilities.resume {
-        state
-            .with_store(move |store| {
-                store.last_provider_session_id(&resume_project_id, &resume_agent_id)
-            })
-            .await?
-    } else {
-        None
-    };
-
-    let session_id = new_session_id()?;
-    let runtime_dir = config.runtime_root.join(session_id.as_str());
-    let hook_token_path = runtime_dir.join("hook.token");
-    let hook_token = hooks::write_hook_token(&hook_token_path)?;
-
-    let agent_dir = factory_core::paths::agent_dir(&config.guidance_root, project_id, agent_id);
-
-    let ctx = SpawnContext {
-        agent_id: agent_id.clone(),
-        project_id: project_id.clone(),
-        session_id: session_id.clone(),
-        worktree: worktree_path.clone(),
-        model: agent.profile.model.clone(),
-        reasoning_effort: agent.profile.reasoning_effort.clone(),
-        permission_mode: agent.profile.permission_mode.clone(),
-        auto_mode,
-        resume: resume.clone(),
-        hook_token_path: hook_token_path.clone(),
-        factoryctl_path: config.factoryctl_path.clone(),
-        agent_dir,
-        socket_path: config.socket_path.clone(),
-    };
-    let launch = provider_impl.spawn_spec(&ctx)?;
-
-    let runner_instance_id = new_runner_instance_id()?;
-    let (codex_home, extra_env) = split_provider_environment(launch.env);
-    let mut session_environment = vec![
-        (
-            "DARK_FACTORY_AGENT".to_owned(),
-            agent_id.as_str().to_owned(),
-        ),
-        (
-            "DARK_FACTORY_PROJECT".to_owned(),
-            project_id.as_str().to_owned(),
-        ),
-        (
-            "DARK_FACTORY_SOCKET".to_owned(),
-            config.socket_path.to_string_lossy().into_owned(),
-        ),
-        (
-            "DARK_FACTORY_SESSION_TOKEN_FILE".to_owned(),
-            hook_token_path.to_string_lossy().into_owned(),
-        ),
-        (
-            "DARK_FACTORY_AGENT_DIR".to_owned(),
-            ctx.agent_dir.to_string_lossy().into_owned(),
-        ),
-    ];
-    session_environment.extend(extra_env);
-    let provider_environment = codex_home
-        .clone()
-        .map_or(ProviderEnvironment::Inherited, |home| {
-            ProviderEnvironment::CodexHome(PathBuf::from(home))
-        });
-
-    let provider_session_id = match agent.snapshot.provider {
-        Provider::ClaudeCode => Some(
-            resume
-                .clone()
-                .unwrap_or_else(|| session_id.as_str().to_owned()),
-        ),
-        Provider::Codex => resume.clone(),
-        Provider::Shell => None,
-    };
-
-    let launch_spec = LaunchSpec {
-        runner_program: config.runner_program.clone(),
-        factoryctl_path: config.factoryctl_path.clone(),
-        provider_program: launch.program,
-        provider_arguments: launch
-            .args
-            .into_iter()
-            .map(std::ffi::OsString::from)
-            .collect(),
-        provider_environment,
-        session_environment,
-        run_id: session_run_id(&session_id)?,
-        runner_instance_id: runner_instance_id.clone(),
-        runtime_dir: runtime_dir.clone(),
-        cwd: worktree_path,
-        startup_input: Vec::new(),
-        terminal: Some(TerminalSize {
-            cols: 200,
-            rows: 50,
-        }),
-    };
-    // Created *before* the process spawn attempt (this track's item 1): a
-    // `starting` session row makes a spawn failure durably visible
-    // (`session list`/the TUI, an announcement + a red X) instead of
-    // silent -- previously the daemon's own log was the only place a
-    // persistently broken spawn path (concretely: `--runner` pointed at a
-    // missing `factory-runner`) ever showed up, and it retried forever
-    // with no visible trace and no runtime-directory cleanup (18 leaked
-    // `runs/<uuid>/` directories in the repro that motivated this).
-    let created_at_ms = now_ms()?;
-    let new_session = crate::store::NewSession {
-        id: session_id.clone(),
-        project_id: project_id.clone(),
-        agent_id: agent_id.clone(),
-        provider: agent.snapshot.provider,
-        runtime_model: launch.runtime.model,
-        runtime_reasoning_effort: launch.runtime.reasoning_effort,
-        runtime_permission_mode: launch.runtime.permission_mode,
-        runtime_control_mode: launch.runtime.control_mode,
-        provider_session_id,
-        worktree,
-        codex_home,
-        hook_token,
-        runner_instance_id: runner_instance_id.clone(),
-        runner_runtime: runtime_dir.to_string_lossy().into_owned(),
-        runner_protocol_version: 1,
-    };
-    let snapshot = state
-        .commit_and_publish(move |store| {
-            let (snapshot, events) = store.create_session(new_session, created_at_ms)?;
-            Ok((snapshot, events))
-        })
-        .await?;
-
-    let child = match runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await {
-        Ok(child) => child,
-        Err(error) => {
-            // Nothing ever ran in this attempt's runtime directory (the
-            // hook token file, and any provider-seeded config written
-            // into it by `spawn_spec` above) -- remove it rather than
-            // leaving one leaked directory behind per failed attempt.
-            let _ = fs::remove_dir_all(&runtime_dir);
-            let reason = truncate_utf8(&error.to_string(), MAX_WAIT_REASON_BYTES);
-            let fail_session_id = session_id.clone();
-            let fail_at_ms = now_ms().unwrap_or(created_at_ms);
-            let _ = state
-                .commit_and_publish(move |store| {
-                    let (snapshot, events) = store.end_session_with_reason(
-                        &fail_session_id,
-                        None,
-                        None,
-                        Some(reason),
-                        fail_at_ms,
-                    )?;
-                    Ok((snapshot, events))
-                })
-                .await;
-            return Err(Error::Spawn(error));
-        }
-    };
-
-    tokio::spawn(supervise_child(
-        state.clone(),
-        wake_tx.clone(),
-        session_id.clone(),
-        agent.snapshot.provider == Provider::Codex,
-        runtime_dir,
-        session_run_id(&session_id)?,
-        runner_instance_id,
-        child,
-    ));
-    Ok(snapshot)
-}
-
-/// Codex 0.147 does not fire its own `SessionStart` hook at TUI/process
-/// startup, even with `source: "startup"` and
-/// `--dangerously-bypass-hook-trust` passed: confirmed live (2 of 2 real
-/// dogfood sessions sat in `starting` indefinitely, unblocked only by an
-/// operator manually posting the session's own `SessionStart` hook by
-/// hand) and empirically (a throwaway `CODEX_HOME` with only a
-/// `SessionStart` hook produced zero invocations while idling at Codex's
-/// own ready-to-type prompt; the identical hook fired exactly once, tagged
-/// `"source":"startup"`, only once a prompt was actually submitted -- see
-/// `docs/providers.md`). Codex defers session/thread creation, and
-/// therefore hook dispatch, to the first turn, not process launch.
-///
-/// That collides with this dispatcher's own invariant: nothing is ever
-/// PTY-typed into a session that is not already `Idle`
-/// (`Handle::start_task`, `dispatch_agent`), and a session only reaches
-/// `Idle` via a `SessionStart` hook (`Store::record_hook_event`). Left
-/// alone, a fresh Codex session deadlocks forever -- Codex waits for a
-/// typed prompt to begin the turn that would fire `SessionStart`; the
-/// daemon waits for `SessionStart` before typing anything.
-///
-/// This synthesizes that exact transition (`Store::synthesize_session_start`,
-/// which -- unlike a real hook -- leaves `last_hook_event` alone, so the
-/// synthesis stays durably distinguishable from a genuine hook POST) once
-/// [`RunnerEvent::TerminalRaw`] reports the provider's own tty left
-/// canonical mode (`wait_for_runner_exit`/`consume_until_exit`, below,
-/// which call this): a kernel-level fact about the child's own terminal
-/// setup, not terminal-output inference (`ARCHITECTURE.md` invariant 5's
-/// Codex carve-out), and specifically *not* "the process merely spawned" --
-/// an earlier version of this fix synthesized immediately on spawn
-/// confirmation, before the pty leaves canonical mode with echo on, which a
-/// real repro showed silently truncates (and can duplicate) the very first
-/// delivery typed into it (`MAX_CANON`, `docs/providers.md`). If Codex's
-/// own real (once-delayed) `SessionStart(source=startup)` arrives later
-/// anyway -- e.g. after the first turn it caused -- it is a harmless no-op:
-/// `record_hook_event`'s `SessionStart` arm only transitions a session that
-/// is still `Starting`, and `local_api.rs`'s `set_provider_session_id` call
-/// is already idempotent once a provider session id is set.
-///
-/// Best-effort like [`Handle::wake`]: a store error here leaves the session
-/// `starting` (recoverable the moment a real hook -- or another wake --
-/// eventually lands) rather than unwinding an already-running provider
-/// process that cannot be un-spawned.
-async fn synthesize_codex_session_start(
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    session_id: &SessionId,
-) {
-    let Ok(hook_at_ms) = now_ms() else {
-        return;
-    };
-    let hook_session_id = session_id.clone();
-    let result = state
-        .commit_and_publish(move |store| {
-            match store.synthesize_session_start(&hook_session_id, hook_at_ms)? {
-                Some((snapshot, event)) => Ok((Some(snapshot), vec![event])),
-                None => Ok((None, Vec::new())),
-            }
-        })
-        .await;
-    if let Ok(Some(snapshot)) = result {
-        send_wake(wake_tx, snapshot.project_id, snapshot.agent_id);
-    }
-}
-
-fn split_provider_environment(
-    launch_env: Vec<(String, String)>,
-) -> (Option<String>, Vec<(String, String)>) {
-    let mut codex_home = None;
-    let mut rest = Vec::new();
-    for (name, value) in launch_env {
-        if name == "CODEX_HOME" {
-            codex_home = Some(value);
-        } else {
-            rest.push((name, value));
-        }
-    }
-    (codex_home, rest)
-}
-
-/// A freshly spawned session's *state* liveness is driven by hooks, not a
-/// decoded stream (unlike the pre-5A model) -- but the underlying
-/// `factory-runner` process's own liveness is not simply "until its `Child`
-/// handle resolves": `factory_runner::run` deliberately does not exit after
-/// an ordinary (non-signalled) termination of the program it supervises
-/// until a client sends it `AcknowledgeExit` for the exact terminal
-/// sequence it durably logged (this is what lets a recovered daemon replay
-/// a session's tail after a crash -- the runner holds the retained spool
-/// open until someone confirms they saw it). A bare `child.wait()` here
-/// would therefore hang forever after every ordinary session end (a
-/// `StopSession`, or the provider process just exiting on its own) unless
-/// the whole daemon itself is shutting down (which signals the runner
-/// directly, taking the `RunnerSignalled` bypass in `factory_runner::run`).
-/// So: subscribe like a recovered session does, wait for the runner's own
-/// `RunnerEvent::Exited`, acknowledge it (which is what actually lets the
-/// runner's process finish), and only then reap the `Child` handle. The
-/// exit code/signal in that event are the underlying PTY child's -- the
-/// wrapper `factory-runner` process's own `Child::wait()` status is not
-/// useful for that (its own exit code is 0/1 for its own success/failure,
-/// unrelated to the program it supervised), so it is only a fallback if
-/// the control socket could not be reached at all.
-#[allow(clippy::too_many_arguments)]
-async fn supervise_child(
-    state: DaemonState,
-    wake_tx: mpsc::Sender<WakeAgent>,
-    session_id: SessionId,
-    synthesize_on_raw_mode: bool,
-    runtime_dir: PathBuf,
+    commands: &mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
     run_id: RunId,
-    runner_instance_id: RunnerInstanceId,
-    mut child: tokio::process::Child,
-) {
-    let event_exit = wait_for_runner_exit(
-        &state,
-        &wake_tx,
-        &session_id,
-        synthesize_on_raw_mode,
-        &runtime_dir,
-        run_id,
-        runner_instance_id,
-    )
-    .await;
-    let wait_status = child.wait().await;
-    let (exit_code, exit_signal) = match event_exit {
-        Some(status) => status,
-        None => match wait_status {
-            Ok(status) => (status.code(), status.signal()),
-            Err(_) => (None, None),
-        },
-    };
-    end_session_now(&state, &wake_tx, &session_id, exit_code, exit_signal).await;
-}
-
-/// Whether `event` is the trigger [`synthesize_codex_session_start`] exists
-/// for -- `synthesize_on_raw_mode` is `true` only for a Codex session still
-/// waiting on it (`supervise_child`'s and `supervise_recovered`'s own
-/// callers gate this on `Provider::Codex`, once, before either loop below
-/// ever starts -- this function does not re-derive it from the event
-/// itself, so it is exactly as testable in isolation as "does synthesis
-/// happen for Codex and never for Claude/shell" asks for).
-fn should_synthesize_session_start(synthesize_on_raw_mode: bool, event: &RunnerEvent) -> bool {
-    synthesize_on_raw_mode && matches!(event, RunnerEvent::TerminalRaw)
-}
-
-/// Logs (at `debug` -- expected, not a fault) any runner event this daemon
-/// build does not recognize (`RunnerEvent::Unknown`'s own doc comment has
-/// the compatibility story: a future variant a newer runner sent that this
-/// build has no name, or no matching shape, for). A no-op for every known
-/// event. Called from both `wait_for_runner_exit` and `consume_until_exit`
-/// right where they already treat "not `Exited`" as ordinary -- observability
-/// only, per adversarial review round 2 finding A: an unrecognized event
-/// must never be silent, even though it is always harmless.
-fn log_unrecognized_runner_event(session_id: &SessionId, envelope: &RunnerEventEnvelope) {
-    if matches!(envelope.event, RunnerEvent::Unknown) {
-        tracing::debug!(
-            session_id = %session_id,
-            sequence = envelope.sequence,
-            "ignoring a runner event this daemon build does not recognize"
-        );
-    }
-}
-
-/// Adversarial review round 2, finding B: `RunnerEvent::TerminalRawTimedOut`
-/// (its own doc comment has the full story) used to vanish in total
-/// silence -- an operator watching a Codex session stuck `starting` had no
-/// breadcrumb at all. Logs a `tracing::warn!`, deliberately the *only*
-/// reaction: no session state or `wait_reason` change, which stays
-/// reserved for `#52`'s own deadline (keyed off `state == starting`) --
-/// changing state here would make this session invisible to that
-/// deadline's own check, silently disabling the actual backstop for
-/// exactly the session it exists to catch. Only meaningful for a Codex
-/// session still waiting on synthesis (`synthesize_on_raw_mode`); a
-/// no-op for Claude/`shell`, which never depend on this signal.
-fn warn_on_raw_mode_timeout(
-    session_id: &SessionId,
-    synthesize_on_raw_mode: bool,
-    envelope: &RunnerEventEnvelope,
-) {
-    if synthesize_on_raw_mode && matches!(envelope.event, RunnerEvent::TerminalRawTimedOut) {
-        tracing::warn!(
-            session_id = %session_id,
-            "Codex session's pty never left canonical mode within the runner's raw-mode \
-             poll window; SessionStart was never synthesized for it and it may still be \
-             starting -- see docs/providers.md's Codex SessionStart section"
-        );
-    }
-}
-
-/// Subscribes to a freshly spawned session's own runner (retrying for up to
-/// [`CONNECT_GRACE`] -- `runner_process::spawn_runner` does not itself wait
-/// for the control socket to exist in terminal mode, so this can genuinely
-/// race the runner's own startup), then watches its event stream until
-/// `RunnerEvent::Exited`, synthesizing Codex's `SessionStart` along the way
-/// the moment `RunnerEvent::TerminalRaw` arrives (`synthesize_on_raw_mode`;
-/// see `synthesize_codex_session_start`'s own doc comment), and returns the
-/// exit's `(exit_code, exit_signal)`. Returns `None` if the control socket
-/// was never reachable or the connection was lost before an exit event
-/// arrived -- best-effort, since the caller still has its own
-/// `Child::wait()` to fall back on rather than hang the dispatcher on one
-/// wedged session forever.
-async fn wait_for_runner_exit(
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    session_id: &SessionId,
-    synthesize_on_raw_mode: bool,
-    runtime_dir: &Path,
-    run_id: RunId,
-    runner_instance_id: RunnerInstanceId,
-) -> Option<(Option<i32>, Option<i32>)> {
-    let client = RunnerClient::new(runtime_dir, run_id, runner_instance_id);
-    let deadline = Instant::now() + CONNECT_GRACE;
-    let mut subscription = loop {
-        match client.subscribe().await {
-            Ok(subscription) => break subscription,
-            Err(error) if unavailable(&error) && Instant::now() < deadline => {
-                sleep_until((Instant::now() + CONNECT_RETRY_DELAY).min(deadline)).await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "could not subscribe to a freshly spawned runner's control socket"
-                );
-                return None;
-            }
-        }
-    };
-    loop {
-        match subscription.next_item().await {
-            Ok(RunnerStreamItem::Event(envelope)) => {
-                if let RunnerEvent::Exited { exit_code, signal } = envelope.event {
-                    if let Err(error) = client.acknowledge_exit(envelope.sequence).await {
-                        tracing::warn!(%error, "failed to acknowledge a runner's terminal event");
-                    }
-                    return Some((exit_code, signal));
-                }
-                log_unrecognized_runner_event(session_id, &envelope);
-                warn_on_raw_mode_timeout(session_id, synthesize_on_raw_mode, &envelope);
-                if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
-                    synthesize_codex_session_start(state, wake_tx, session_id).await;
-                }
-            }
-            Ok(RunnerStreamItem::CaughtUp { .. }) => {}
-            Err(error) => {
-                tracing::warn!(%error, "runner control connection failed before an exit event arrived");
-                return None;
-            }
-        }
-    }
-}
-
-// --- Delivery ----------------------------------------------------------
-
-/// The text (and, when it opens a task-episode, which task) the dispatcher
-/// or a `Stop`/`SubagentStop` hook reply should deliver next for an agent.
-struct Delivery {
-    task_id: Option<factory_core::TaskId>,
-    task_incarnation_id: Option<String>,
-    task_revision: Option<i64>,
-    run_id: Option<RunId>,
-    require_queue_head: bool,
-    message_ids: Vec<factory_core::MessageId>,
-    text: String,
-}
-
-impl Delivery {
-    fn from_attempt(attempt: &DeliveryAttempt) -> Self {
-        Self {
-            task_id: attempt.task_id.clone(),
-            task_incarnation_id: attempt.task_incarnation_id.clone(),
-            task_revision: attempt.task_revision,
-            run_id: attempt.run_id.clone(),
-            require_queue_head: false,
-            message_ids: attempt.message_ids.clone(),
-            text: attempt.text.clone(),
-        }
-    }
-}
-
-async fn compose_delivery(
-    state: &DaemonState,
-    guidance_root: &Path,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<Option<Delivery>, DaemonStateError> {
-    let guidance_root = guidance_root.to_path_buf();
-    let project_id = project_id.clone();
-    let agent_id = agent_id.clone();
-    state
-        .with_store(move |store| {
-            if store.agent_is_held(&project_id, &agent_id)? {
-                return Ok(None);
-            }
-            let task_id = store.next_deliverable(&project_id, &agent_id)?;
-            let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
-            if task_id.is_none() && messages.is_empty() {
-                return Ok(None);
-            }
-            let task = task_id
-                .as_ref()
-                .map(|id| store.get_task(&project_id, id))
-                .transpose()?;
-            let task_marker = task_id
-                .as_ref()
-                .map(|id| store.task_delivery_marker(id))
-                .transpose()?;
-            let (task_incarnation_id, task_revision) = if let Some(marker) = task_marker {
-                (Some(marker.incarnation_id), Some(marker.task_revision))
-            } else {
-                (None, None)
-            };
-            let agent = store.get_agent_detail(&project_id, &agent_id)?;
-            let text = compose_text(
-                &guidance_root,
-                &project_id,
-                &agent_id,
-                task.as_ref(),
-                &messages,
-                agent.snapshot.role,
-            );
-            let require_queue_head = task_id.is_some();
-            Ok(Some(Delivery {
-                task_id,
-                task_incarnation_id,
-                task_revision,
-                run_id: None,
-                require_queue_head,
-                message_ids: messages.iter().map(|message| message.id.clone()).collect(),
-                text,
-            }))
-        })
-        .await
-}
-
-async fn ensure_delivery_attempt(
-    state: &DaemonState,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-    session_id: &SessionId,
-    delivery: Delivery,
-    now_ms: i64,
-) -> Result<DeliveryAttempt, DaemonStateError> {
-    let id = Uuid::new_v4().hyphenated().to_string();
-    let input = NewDeliveryAttempt {
-        id: id.clone(),
-        project_id: project_id.clone(),
-        agent_id: agent_id.clone(),
-        session_id: session_id.clone(),
-        task_id: delivery.task_id,
-        task_incarnation_id: delivery.task_incarnation_id,
-        task_revision: delivery.task_revision,
-        require_queue_head: delivery.require_queue_head,
-        message_ids: delivery.message_ids,
-        text: format!(
-            "{}\n{}{}\u{2063}",
-            delivery.text, DELIVERY_ATTEMPT_MARKER, id
-        ),
-        created_at_ms: now_ms,
-    };
-    state
-        .commit_and_publish(move |store| {
-            let attempt = store.ensure_delivery_attempt(input)?;
-            Ok((attempt, Vec::new()))
-        })
-        .await
-}
-
-/// Commits an already-typed-and-acknowledged [`Delivery`]: opens the task
-/// episode (which also delivers any pending messages alongside it,
-/// `Store::open_run_episode`) or, for a message-only delivery, marks the
-/// messages delivered.
-async fn commit_delivery(
-    state: &DaemonState,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-    session_id: &SessionId,
-    attempt_id: &str,
-    delivery: Delivery,
-    now_ms: i64,
-) -> Result<Option<RunId>, DaemonStateError> {
-    let project_id = project_id.clone();
-    let agent_id = agent_id.clone();
-    let session_id = session_id.clone();
-    let attempt_id = attempt_id.to_owned();
-    state
-        .commit_and_publish(move |store| {
-            let attempt_state = store.delivery_attempt_state(&attempt_id)?;
-            if matches!(attempt_state, Some(DeliveryAttemptState::Acknowledged)) {
-                return Ok((None, Vec::new()));
-            }
-            if !matches!(
-                attempt_state,
-                Some(
-                    DeliveryAttemptState::InFlight
-                        | DeliveryAttemptState::Retryable
-                        | DeliveryAttemptState::Terminal
-                )
-            ) {
-                return Ok((None, Vec::new()));
-            }
-            match (
-                delivery.task_id,
-                delivery.task_incarnation_id,
-                delivery.task_revision,
-                delivery.run_id,
-            ) {
-                (Some(task_id), Some(task_incarnation_id), Some(task_revision), Some(run_id)) => {
-                    match store.open_run_episode_with_delivery_attempt(
-                        &session_id,
-                        &task_id,
-                        Some(&delivery.message_ids),
-                        Some(&attempt_id),
-                        now_ms,
-                    ) {
-                        Ok(opened) => {
-                            let run_id = opened.run.id.clone();
-                            Ok((Some(run_id), opened.events))
-                        }
-                        // The synchronous hook commit can win this later
-                        // acknowledgement commit, and the task can even finish
-                        // before this transaction. The attempt journal is an
-                        // exact receipt written atomically with the authority;
-                        // never infer success from run counts or task state.
-                        Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
-                            if store.delivery_attempt_acknowledged(
-                                &attempt_id,
-                                &session_id,
-                                &task_id,
-                                &task_incarnation_id,
-                                task_revision,
-                                &run_id,
-                            )? =>
-                        {
-                            Ok((None, Vec::new()))
-                        }
-                        Err(StoreError::SessionStopping | StoreError::SessionNotLive) => {
-                            Ok((None, Vec::new()))
-                        }
-                        Err(StoreError::SessionWorkConflict) => Ok((None, Vec::new())),
-                        Err(error) => Err(error),
-                    }
-                }
-                (None, None, None, None) => {
-                    match store.deliver_agent_messages_by_ids_with_delivery_attempt(
-                        &project_id,
-                        &agent_id,
-                        &session_id,
-                        &delivery.message_ids,
-                        Some(&attempt_id),
-                        now_ms,
-                    ) {
-                        Ok(_) => Ok((None, Vec::new())),
-                        // Recovery can cancel the attempt after the exact
-                        // prompt lookup but before this transaction. The
-                        // message delivery rolls back with its lost CAS; turn
-                        // that fence result into the same explicit hook denial
-                        // as the task-backed path.
-                        Err(StoreError::InvalidExecutionMetadata)
-                            if !matches!(
-                                store.delivery_attempt_state(&attempt_id)?,
-                                Some(
-                                    DeliveryAttemptState::InFlight
-                                        | DeliveryAttemptState::Retryable
-                                )
-                            ) =>
-                        {
-                            Ok((None, Vec::new()))
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-                _ => Err(StoreError::InvalidExecutionMetadata),
-            }
-        })
-        .await
-}
-
-/// Best-effort: if a pending task/message delivery exists for `session`'s
-/// agent, commits it (opens the run episode / marks messages delivered)
-/// right now, in-line. Called synchronously from `local_api.rs`'s
-/// `ProviderHook` handler for `UserPromptSubmit`, *before* that hook
-/// request's own reply reaches the client.
-///
-/// Why this needs to exist at all, found manually building this track's
-/// own E2E test (TRACK5E-BRIEF.md item 1): `deliver_pending`'s
-/// `type_and_await_ack` treats "a `UserPromptSubmit` hook for this
-/// session, timestamped after the write" as proof a PTY-typed delivery
-/// landed, then commits it (`commit_delivery`, above) -- but that ack
-/// detection is a *separate* task (a broadcast-event subscriber) racing
-/// the real client's own next steps, which the client takes as soon as
-/// its *own* `factoryctl hook ... UserPromptSubmit` call returns, with no
-/// reason to wait for the daemon's unrelated internal bookkeeping to
-/// finish first. A client that reacts fast enough -- a zero-latency
-/// deterministic test fixture reliably does under any real machine load;
-/// a real Claude Code/Codex turn practically never does, but the daemon
-/// must not depend on that -- can call `factoryctl task done` before
-/// `commit_delivery` ran, which `Store::open_run_for_task` then rejects
-/// (no run open yet) with nothing but a swallowed error on the client
-/// side and a task stuck `running`-that-never-opened forever.
-///
-/// The fix is not "wait longer" (raising `ACK_TIMEOUT` does not help: the
-/// commit that needs to win the race is instant, the problem is *when* it
-/// runs relative to the client, not how long anything waits) -- it is to
-/// make the commit happen as part of handling the exact hook request the
-/// client is itself blocked on, so it is durable before that request's
-/// response can reach the client at all. `deliver_pending`'s own later
-/// `commit_delivery` call becomes a redundant, harmless retry of the same
-/// idempotent commit once its own ack-wait notices (the
-/// `StoreError::AgentUnavailable` tolerance above).
-///
-/// Exact nonce-bearing prompt lookup is the admission authority. An
-/// operator's unrelated prompt has no matching durable attempt and is
-/// ignored; the broad agent filesystem-write gate must not sit in this
-/// path because contention there could otherwise let an exact provider
-/// prompt fail open before recovery commits.
-pub(crate) async fn commit_pending_delivery_on_prompt(
-    state: &DaemonState,
-    session: &SessionSnapshot,
-    payload: &serde_json::Value,
-) -> Result<PromptDeliveryAdmission, DaemonStateError> {
-    let Some(prompt) = payload.get("prompt").and_then(serde_json::Value::as_str) else {
-        return Ok(PromptDeliveryAdmission::Ignored);
-    };
-    let Some(attempt) = state
-        .with_store({
-            let project_id = session.project_id.clone();
-            let agent_id = session.agent_id.clone();
-            let session_id = session.id.clone();
-            let prompt = prompt.to_owned();
-            move |store| {
-                store.delivery_attempt_for_prompt(&project_id, &agent_id, &session_id, &prompt)
-            }
-        })
-        .await?
-    else {
-        return Ok(PromptDeliveryAdmission::Ignored);
-    };
-    admit_delivery_attempt(state, session, attempt).await
-}
-
-async fn admit_delivery_attempt(
-    state: &DaemonState,
-    session: &SessionSnapshot,
-    attempt: DeliveryAttempt,
-) -> Result<PromptDeliveryAdmission, DaemonStateError> {
-    if !matches!(
-        attempt.state,
-        DeliveryAttemptState::InFlight
-            | DeliveryAttemptState::Retryable
-            | DeliveryAttemptState::Terminal
-    ) {
-        return Ok(if attempt.state == DeliveryAttemptState::Acknowledged {
-            PromptDeliveryAdmission::Acknowledged
-        } else {
-            PromptDeliveryAdmission::Denied
-        });
-    }
-    let now =
-        now_ms().map_err(|_| DaemonStateError::Store(StoreError::InvalidExecutionMetadata))?;
-    commit_delivery(
-        state,
-        &session.project_id,
-        &session.agent_id,
-        &session.id,
-        &attempt.id,
-        Delivery::from_attempt(&attempt),
-        now,
-    )
-    .await?;
-    let state_after = state
-        .with_store({
-            let attempt_id = attempt.id.clone();
-            move |store| store.delivery_attempt_state(&attempt_id)
-        })
-        .await?;
-    match state_after {
-        Some(DeliveryAttemptState::Acknowledged) => Ok(PromptDeliveryAdmission::Acknowledged),
-        // Recovery can win after the exact prompt lookup above but before
-        // `commit_delivery` acquires the serialized store. Its own durable
-        // state re-check then no-ops; this second read converts that precise
-        // ordering to an explicit provider block, never a hook failure.
-        _ => Ok(PromptDeliveryAdmission::Denied),
-    }
-}
-
-/// The passive per-agent auto-delivery path: compose, type, wait for
-/// acknowledgement, and only commit the episode/messages once acknowledged
-/// -- unlike [`Handle::start_task`], nothing is committed on failure, so a
-/// retried wake starts clean.
-async fn deliver_pending(
-    config: &Config,
-    state: &DaemonState,
-    backoff: &SpawnBackoff,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-    session: &SessionSnapshot,
+    grace_ms: u64,
 ) -> Result<(), Error> {
-    // Single pending-delivery slot (this track's item 1), claimed *before*
-    // `compose_delivery`'s read: a `Stop`/`SubagentStop` hook for this same
-    // agent can arrive concurrently (on a per-connection task in
-    // `local_api.rs`, entirely independent of this dispatcher loop) and
-    // race straight into `stop_hook_reply`'s own `compose_delivery` call.
-    // Without claiming the slot first, both could read the same pending
-    // task/messages before either commits, and both would then act on it
-    // -- typing it into the PTY here *and* replying `block` with it there.
-    // Skip silently on a lost race: the winner's own commit already
-    // satisfies whatever this wake was for.
-    let Some(_delivery_slot) = state.try_delivery_slot(agent_id) else {
-        return Ok(());
-    };
-    // Deletion (ARCHITECTURE.md invariant 9, PR #50 review finding 5):
-    // `compose_delivery` calls `compose_text`, which lazily recreates this
-    // agent's guidance files (`guidance::read_or_create`) if missing --
-    // gated exactly like spawn preparation, under the same per-agent lock,
-    // so `Handle::begin_delete`'s drain can never miss it. A decline here
-    // is silent, matching the delivery-slot miss above: whatever wake this
-    // was for gets retried once the delete (or whatever else is deleting
-    // this agent) finishes.
-    let existing = state
-        .with_store({
-            let project_id = project_id.clone();
-            let agent_id = agent_id.clone();
-            let session_id = session.id.clone();
-            move |store| store.delivery_attempt_for_session(&project_id, &agent_id, &session_id)
+    let lookup = run_id.clone();
+    let run = state
+        .with_store(move |store| {
+            Ok(store
+                .recoverable_kernel_runs()?
+                .into_iter()
+                .find(|candidate| candidate.run.id == lookup))
         })
         .await?;
-    let attempt = if let Some(attempt) = existing {
-        attempt
-    } else {
-        if !backoff.try_begin_preparation(agent_id) {
-            return Ok(());
-        }
-        let delivery_result =
-            compose_delivery(state, &config.guidance_root, project_id, agent_id).await;
-        backoff.end_preparation(agent_id);
-        let Some(delivery) = delivery_result? else {
-            return Ok(());
-        };
-        ensure_delivery_attempt(
-            state,
-            project_id,
-            agent_id,
-            &session.id,
-            delivery,
-            now_ms()?,
-        )
-        .await?
+    let Some(run) = run else {
+        return Ok(());
     };
-    if !matches!(
-        attempt.state,
-        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
-    ) || attempt
-        .next_attempt_at_ms
-        .is_some_and(|at| at > now_ms().unwrap_or(i64::MAX))
-    {
+    if run.run.phase == RunPhase::Admitted {
+        recover_admitted_run(state, commands, observed, run).await?;
         return Ok(());
     }
-    let target = state
-        .with_store({
-            let project_id = project_id.clone();
-            let session_id = session.id.clone();
-            move |store| store.session_control_target(&project_id, &session_id)
-        })
-        .await?;
-    let client = RunnerClient::new(
-        &target.runner_runtime,
-        session_run_id(&session.id)?,
-        target.runner_instance_id,
-    );
-    // Resolve the immutable runner target first; claim Uncertain only at the
-    // last durable seam before the first external write.
-    let attempt_id = attempt.id.clone();
-    let claim_now_ms = now_ms()?;
-    let claimed = state
-        .commit_and_publish(move |store| {
-            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
-            Ok((attempt, Vec::new()))
-        })
-        .await?;
-    let Some(attempt) = claimed else {
+    if run.run.phase == RunPhase::Finalizing {
+        let client = RunnerClient::new(
+            &run.runner_runtime,
+            run.run.id.clone(),
+            run.runner_instance_id.clone(),
+        );
+        if let Err(error) = client.stop(grace_ms).await {
+            tracing::debug!(run_id = %run.run.id, %error, "exact runner stop deferred to finalizer");
+            kill_registered_processes(&run.resources)?;
+        }
+    }
+    if release_absent_resources(state, &run).await? {
         return Ok(());
+    }
+    if observed.insert(run.run.id.clone()) {
+        spawn_observer(state.clone(), commands.clone(), run, None);
+    }
+    Ok(())
+}
+
+async fn recover_admitted_run(
+    state: &DaemonState,
+    commands: &mpsc::Sender<Command>,
+    observed: &mut HashSet<RunId>,
+    run: RecoverableKernelRun,
+) -> Result<(), Error> {
+    let client = RunnerClient::new(
+        &run.runner_runtime,
+        run.run.id.clone(),
+        run.runner_instance_id.clone(),
+    );
+    let prepared = match prepare_with_grace(&client).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(run_id = %run.run.id, %error, "admitted runner was not recoverable");
+            fail_unrecoverable_admission(state, &run).await?;
+            return Ok(());
+        }
     };
-    if type_and_await_ack(
-        state,
-        &client,
-        &session.id,
-        &attempt.id,
-        &attempt.text,
-        ACK_TIMEOUT,
-    )
-    .await
-    {
-        commit_delivery(
-            state,
-            project_id,
-            agent_id,
-            &session.id,
-            &attempt.id,
-            Delivery::from_attempt(&attempt),
-            now_ms()?,
-        )
+    let identity = match recovered_prepared_identity(&run, &prepared) {
+        Ok(identity) => identity,
+        Err(error) => {
+            drop(prepared);
+            fail_unrecoverable_admission(state, &run).await?;
+            return Err(error);
+        }
+    };
+    let run_id = run.run.id.clone();
+    let activated_at_ms = now_ms()?;
+    let (activated_run, resources) = state
+        .commit_and_publish(move |store| {
+            let (activated, events) =
+                store.activate_prepared_run(&run_id, identity, activated_at_ms)?;
+            let resources = store.kernel_resources(&run_id)?;
+            Ok(((activated, resources), events))
+        })
         .await?;
-    } else {
-        // A resumed Codex TUI can consume the submit CR as recovery from its
-        // "Conversation interrupted" screen while discarding the composer.
-        // Its input state is not observable through the PTY, so a bare-CR
-        // retry is guesswork and replaying the body risks duplicate model
-        // work. Retire that poisoned provider thread instead: stop this
-        // runner, block this exact thread identity from future resume, and
-        // let the still-queued task deliver once into a fresh conversation.
-        let resumed_codex = if session.provider == Provider::Codex {
-            state
-                .with_store({
-                    let project_id = project_id.clone();
-                    let session_id = session.id.clone();
-                    move |store| store.session_resumed_provider_thread(&project_id, &session_id)
-                })
-                .await?
-        } else {
-            false
-        };
-        if resumed_codex {
-            let recovery_project_id = project_id.clone();
-            let recovery_session_id = session.id.clone();
-            let recovery_at_ms = now_ms()?;
-            let recovery = state
-                .commit_and_publish(move |store| {
-                    match store.request_fresh_provider_recovery(
-                        &recovery_project_id,
-                        &recovery_session_id,
-                        &attempt.id,
-                        recovery_at_ms,
-                    )? {
-                        (ProviderDeliveryRecovery::Acknowledged, _) => Ok((false, Vec::new())),
-                        (ProviderDeliveryRecovery::StopRequested, event) => {
-                            Ok((true, event.into_iter().collect()))
-                        }
-                    }
-                })
-                .await?;
-            if !recovery {
-                // The synchronous hook committed while the broadcast ack
-                // waiter was delayed or lagged. Its durable admission wins;
-                // never cancel or stop that accepted turn.
-                return Ok(());
+    if let Err(error) = prepared.activate().await {
+        // Running is already durable. A lost acknowledgement is ambiguous,
+        // so observation of this exact runner, never a second launch, decides.
+        tracing::warn!(run_id = %activated_run.id, %error, "recovered runner activation acknowledgement was lost");
+    }
+    let recovered = RecoverableKernelRun {
+        run: activated_run,
+        runner_instance_id: run.runner_instance_id,
+        runner_runtime: run.runner_runtime,
+        resources,
+    };
+    if observed.insert(recovered.run.id.clone()) {
+        spawn_observer(state.clone(), commands.clone(), recovered, None);
+    }
+    Ok(())
+}
+
+fn recovered_prepared_identity(
+    run: &RecoverableKernelRun,
+    prepared: &PreparedRunner,
+) -> Result<PreparedProcessIdentity, Error> {
+    let runtime = Path::new(&run.runner_runtime);
+    let runtime_birth = runtime_birth_fingerprint(runtime)?.ok_or(Error::InvalidRuntimeRoot)?;
+    let runner_pid = prepared.runner_pid();
+    let provider_pid = prepared.child_pid();
+    let process_group = prepared.process_group_id();
+    let runner_birth = process_birth_fingerprint(runner_pid)?
+        .ok_or(Error::ProcessIdentityUnavailable(runner_pid))?;
+    let provider_birth = process_birth_fingerprint(provider_pid)?
+        .ok_or(Error::ProcessIdentityUnavailable(provider_pid))?;
+    Ok(PreparedProcessIdentity {
+        runtime_locator: runtime_locator(runtime),
+        runtime_birth_fingerprint: runtime_birth,
+        runner_locator: runner_locator(runner_pid, &run.runner_instance_id),
+        runner_birth_fingerprint: runner_birth,
+        provider_locator: serde_json::json!({ "pid": provider_pid }).to_string(),
+        provider_birth_fingerprint: provider_birth.clone(),
+        process_group_locator: serde_json::json!({ "pgid": process_group }).to_string(),
+        process_group_birth_fingerprint: provider_birth,
+    })
+}
+
+async fn fail_unrecoverable_admission(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+) -> Result<(), Error> {
+    let run_id = run.run.id.clone();
+    let failed_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let (_, events) =
+                store.fail_admitted_run(&run_id, RunFailureReason::Spawn, failed_at_ms)?;
+            Ok(((), events))
+        })
+        .await?;
+    kill_registered_processes(&run.resources)?;
+    let refreshed = state
+        .with_store({
+            let run_id = run.run.id.clone();
+            move |store| {
+                let recovered = store
+                    .recoverable_kernel_runs()?
+                    .into_iter()
+                    .find(|candidate| candidate.run.id == run_id)
+                    .ok_or(StoreError::RunNotFound)?;
+                Ok(recovered)
             }
-            if let Err(error) = client.stop(2_000).await {
-                tracing::error!(
-                    %error,
-                    %project_id,
-                    %agent_id,
-                    session_id = %session.id,
-                    "could not stop a Codex session whose resumed input state rejected delivery"
-                );
-                let failed_session_id = session.id.clone();
+        })
+        .await?;
+    // A declared runner has no process identity and never passed Prepare.
+    // The bounded authenticated connection failure above is the authority to
+    // abandon that declaration; active identities still require absence.
+    for resource in refreshed.resources.iter().filter(|resource| {
+        resource.kind == KernelResourceKind::RunnerProcess
+            && resource.state == KernelResourceState::Releasing
+            && resource.birth_fingerprint.is_none()
+    }) {
+        release_resource(state, resource).await?;
+    }
+    let _ = release_absent_resources(state, &refreshed).await?;
+    Ok(())
+}
+
+fn spawn_observer(
+    state: DaemonState,
+    commands: mpsc::Sender<Command>,
+    run: RecoverableKernelRun,
+    child: Option<Child>,
+) {
+    tokio::spawn(async move {
+        let run_id = run.run.id.clone();
+        if let Err(error) = observe_run(&state, &run, child).await {
+            tracing::warn!(%run_id, %error, "attempt finalizer paused");
+        }
+        let _ = commands.send(Command::ObserverFinished(run_id)).await;
+    });
+}
+
+async fn observe_run(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+    mut child: Option<Child>,
+) -> Result<(), Error> {
+    let client = RunnerClient::new(
+        &run.runner_runtime,
+        run.run.id.clone(),
+        run.runner_instance_id.clone(),
+    );
+    if run.run.phase == RunPhase::Finalizing
+        && let Err(error) = client.stop(DEFAULT_FINALIZE_GRACE_MS).await
+    {
+        tracing::debug!(run_id = %run.run.id, %error, "runner stop failed; using registered identities");
+        kill_registered_processes(&run.resources)?;
+    }
+    let mut subscription = match subscribe_with_grace(&client).await {
+        Ok(subscription) => subscription,
+        Err(error) if run.run.phase == RunPhase::Admitted => {
+            cleanup_unactivated(state, run, child).await;
+            return Err(error.into());
+        }
+        Err(error) => {
+            mark_runner_unresolved(state, run, &error.to_string()).await;
+            if run.run.phase == RunPhase::Running {
+                let run_id = run.run.id.clone();
                 let failed_at_ms = now_ms()?;
-                let reason =
-                    "automatic delivery recovery could not stop the Codex runner".to_owned();
                 state
                     .commit_and_publish(move |store| {
-                        let (_, event) =
-                            store.mark_session_waiting(&failed_session_id, reason, failed_at_ms)?;
-                        Ok(((), vec![event]))
+                        let (_, events) = store.fail_running_run(
+                            &run_id,
+                            RunFailureReason::Process,
+                            failed_at_ms,
+                        )?;
+                        Ok(((), events))
                     })
                     .await?;
             }
-            return Ok(());
+            if matches!(run.run.phase, RunPhase::Running | RunPhase::Finalizing) {
+                kill_registered_processes(&run.resources)?;
+            }
+            return Err(error.into());
         }
-        let attempt_id = attempt.id.clone();
-        let failure = state
+    };
+    let observed = consume_until_exit(&mut subscription).await?;
+    let observe_run_id = run.run.id.clone();
+    let observed_at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let (_, events) = store.observe_attempt_exit(
+                &observe_run_id,
+                observed.terminal_sequence,
+                observed.exit_code,
+                observed.exit_signal,
+                observed.failure_reason,
+                observed_at_ms,
+            )?;
+            Ok(((), events))
+        })
+        .await?;
+    client.acknowledge_exit(observed.terminal_sequence).await?;
+    if let Some(child) = child.as_mut() {
+        if timeout(RUNNER_EXIT_GRACE, child.wait()).await.is_err()
+            && let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32))
+        {
+            let _ = kill_process_group(pid, Signal::KILL);
+            let _ = child.wait().await;
+        }
+    } else {
+        wait_for_registered_runner_exit(run).await?;
+    }
+    release_completed_resources(state, run).await
+}
+
+async fn subscribe_with_grace(
+    client: &RunnerClient,
+) -> Result<RunnerSubscription, RunnerClientError> {
+    let deadline = Instant::now() + CONNECT_GRACE;
+    loop {
+        match client.subscribe().await {
+            Ok(subscription) => return Ok(subscription),
+            Err(RunnerClientError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) && Instant::now() < deadline =>
+            {
+                sleep(CONNECT_RETRY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn consume_until_exit(
+    subscription: &mut RunnerSubscription,
+) -> Result<ObservedExit, RunnerClientError> {
+    loop {
+        match subscription.next_item().await? {
+            RunnerStreamItem::CaughtUp { .. } => {}
+            RunnerStreamItem::Event(event) => match event.event {
+                RunnerEvent::Exited { exit_code, signal } => {
+                    return Ok(ObservedExit {
+                        terminal_sequence: event.sequence,
+                        exit_code,
+                        exit_signal: signal,
+                        failure_reason: None,
+                    });
+                }
+                RunnerEvent::SpawnFailed { .. } => {
+                    return Ok(ObservedExit {
+                        terminal_sequence: event.sequence,
+                        exit_code: None,
+                        exit_signal: None,
+                        failure_reason: Some(RunFailureReason::Spawn),
+                    });
+                }
+                RunnerEvent::Started { .. } => {}
+            },
+        }
+    }
+}
+
+struct ObservedExit {
+    terminal_sequence: i64,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    failure_reason: Option<RunFailureReason>,
+}
+
+async fn cleanup_unactivated(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+    mut child: Option<Child>,
+) {
+    if let Some(child) = child.as_mut() {
+        if let Some(pid) = child.id().and_then(|value| Pid::from_raw(value as i32)) {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        let _ = child.wait().await;
+    }
+    let run_id = run.run.id.clone();
+    if let Ok(at_ms) = now_ms() {
+        let _ = state
             .commit_and_publish(move |store| {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-                    .ok_or(StoreError::InvalidExecutionMetadata)?;
-                store.record_delivery_failure(&attempt_id, now)?;
-                Ok(((), Vec::new()))
+                let (_, events) =
+                    store.fail_admitted_run(&run_id, RunFailureReason::Spawn, at_ms)?;
+                Ok(((), events))
             })
             .await;
-        if failure.is_err() {
-            return Ok(());
-        }
-        let reason = "delivery unacknowledged".to_owned();
-        let wait_session_id = session.id.clone();
-        let wait_at_ms = now_ms()?;
-        state
-            .commit_and_publish(move |store| {
-                let (_, event) =
-                    store.mark_session_waiting(&wait_session_id, reason, wait_at_ms)?;
-                Ok(((), vec![event]))
-            })
-            .await?;
     }
+    if let Ok(resources) = state
+        .with_store({
+            let run_id = run.run.id.clone();
+            move |store| store.kernel_resources(&run_id)
+        })
+        .await
+    {
+        for resource in resources.iter().filter(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.birth_fingerprint.is_none()
+                && resource.state != KernelResourceState::Released
+        }) {
+            let _ = release_resource(state, resource).await;
+        }
+    }
+    let _ = release_completed_resources(state, run).await;
+}
+
+async fn release_completed_resources(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+) -> Result<(), Error> {
+    let refreshed = state
+        .with_store({
+            let run_id = run.run.id.clone();
+            move |store| {
+                let recovered = store
+                    .recoverable_kernel_runs()?
+                    .into_iter()
+                    .find(|candidate| candidate.run.id == run_id)
+                    .ok_or(StoreError::RunNotFound)?;
+                Ok(recovered)
+            }
+        })
+        .await?;
+    let _ = release_absent_resources(state, &refreshed).await?;
     Ok(())
 }
 
-/// Types `text` into `session_id`'s PTY, then submits it with a trailing
-/// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for the
-/// exact delivery attempt's `UserPromptSubmit` hook to confirm receipt.
-/// Subscribing to the daemon's event stream *before* writing (not after)
-/// avoids missing a hook that fires between the write and the subscribe
-/// call.
-///
-/// The text and its submitting `\r` are deliberately two separate
-/// `TerminalInput` writes, not one buffer ending in `\r` (found manually
-/// against real Claude Code -- TRACK5C-BRIEF.md step 7's manual check,
-/// not a hypothetical): a multi-line composed delivery arrives at Claude
-/// Code's own input box as a burst; its paste-vs-keystroke heuristic reads
-/// a `\r` inside that same burst as just another inserted newline, not a
-/// submission, leaving the whole delivery sitting typed-but-unsent (the
-/// session durably parks at `waiting_for_input`/`delivery unacknowledged`,
-/// this function's ack wait always losing the race). A short pause after
-/// the text lets that burst visibly end before `\r` arrives on its own,
-/// which is what actually submits it.
-///
-/// Acknowledgement is the exact nonce-bearing `UserPromptSubmit` hook. The
-/// synchronous hook transaction changes the attempt journal and
-/// `session_work` together; this waiter only observes that durable receipt.
-async fn type_and_await_ack(
+async fn release_absent_resources(
     state: &DaemonState,
-    client: &RunnerClient,
-    session_id: &SessionId,
-    attempt_id: &str,
-    text: &str,
-    ack_timeout: Duration,
-) -> bool {
-    let body = encode_terminal_bytes(text.as_bytes());
-    let submit = encode_terminal_bytes(b"\r");
-    let mut events = state.subscribe();
-    if !delivery_attempt_active(state, attempt_id).await {
-        return false;
-    }
-    let Ok(write_started_at_ms) = now_ms() else {
-        return false;
-    };
-    if client.terminal_input(body).await.is_err() {
-        return false;
-    }
-    sleep_until(Instant::now() + SUBMIT_DELAY).await;
-    if client.terminal_input(submit).await.is_err() {
-        return false;
-    }
-    wait_for_ack(
-        state,
-        &mut events,
-        session_id,
-        attempt_id,
-        write_started_at_ms,
-        ack_timeout,
-    )
-    .await
-}
-
-async fn delivery_attempt_active(state: &DaemonState, attempt_id: &str) -> bool {
-    let attempt_id = attempt_id.to_owned();
-    state
-        .with_store(move |store| {
-            Ok(matches!(
-                store.delivery_attempt_state(&attempt_id)?,
-                Some(DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable)
-            ))
-        })
-        .await
-        .unwrap_or(false)
-}
-
-async fn wait_for_ack(
-    state: &DaemonState,
-    events: &mut broadcast::Receiver<EventEnvelope>,
-    session_id: &SessionId,
-    attempt_id: &str,
-    after_ms: i64,
-    ack_timeout: Duration,
-) -> bool {
-    let deadline = Instant::now() + ack_timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return delivery_attempt_acknowledged(state, attempt_id).await;
+    run: &RecoverableKernelRun,
+) -> Result<bool, Error> {
+    for resource in &run.resources {
+        if resource.state == KernelResourceState::Released {
+            continue;
         }
-        match timeout(remaining, events.recv()).await {
-            Ok(Ok(envelope)) => {
-                if let FactoryEvent::SessionChanged { session } = &envelope.event {
-                    if &session.id == session_id
-                        && session.last_hook_event == Some(ProviderHookEvent::UserPromptSubmit)
-                        && session.last_hook_at_ms.is_some_and(|at| at >= after_ms)
-                        && matches!(
-                            state
-                                .with_store({
-                                    let attempt_id = attempt_id.to_owned();
-                                    move |store| store.delivery_attempt_state(&attempt_id)
-                                })
-                                .await,
-                            Ok(Some(DeliveryAttemptState::Acknowledged))
-                        )
-                    {
-                        return true;
-                    }
-                }
+        let absent = match resource.kind {
+            KernelResourceKind::RunnerProcess | KernelResourceKind::ProviderProcess => {
+                process_resource_absent(resource)?
             }
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                if delivery_attempt_acknowledged(state, attempt_id).await {
-                    return true;
-                }
-            }
-            Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
-                return delivery_attempt_acknowledged(state, attempt_id).await;
-            }
+            KernelResourceKind::ProcessGroup => process_group_absent(resource)?,
+            _ => false,
+        };
+        if absent {
+            release_resource(state, resource).await?;
         }
     }
-}
-
-async fn delivery_attempt_acknowledged(state: &DaemonState, attempt_id: &str) -> bool {
-    state
+    let resources = state
         .with_store({
-            let attempt_id = attempt_id.to_owned();
-            move |store| store.delivery_attempt_state(&attempt_id)
-        })
-        .await
-        .is_ok_and(|state| state == Some(DeliveryAttemptState::Acknowledged))
-}
-
-/// Composes the `Stop`/`SubagentStop` hook reply for a session that is
-/// `working`/`waiting_for_input`: delivery here means replying
-/// `{"decision":"block","reason":<text>}` instead of typing into the PTY,
-/// so the provider's own turn loop keeps going instead of settling idle.
-/// Called directly by `local_api.rs`'s `ProviderHook` handler -- the seam
-/// 5A left as `stop_hook_reply` for this track.
-///
-/// `stop_hook_active` guards the loop the Claude/Munder Stop-hook contract
-/// warns about (TRACK5-DESIGN.md §3): when the provider reports it, this
-/// always replies `{}` even if work is pending, leaving it for the next
-/// wake/tick instead of risking a hook that never lets its own CLI settle.
-pub async fn stop_hook_reply(
-    state: &DaemonState,
-    guidance_root: &Path,
-    session: &SessionSnapshot,
-    stop_hook_active: bool,
-) -> Result<serde_json::Value, DaemonStateError> {
-    if stop_hook_active {
-        return Ok(serde_json::json!({}));
-    }
-    // Single pending-delivery slot (this track's item 1), claimed *before*
-    // `compose_delivery`'s read -- see `deliver_pending`'s matching
-    // comment for the exact race this closes (the dispatcher's
-    // tick-driven PTY-typed delivery racing this same hook reply). Losing
-    // the race replies `{}`: safe, since either the winner is this same
-    // agent's dispatcher path (which will actually deliver the pending
-    // work) or another concurrent `Stop`/`SubagentStop` reply for this
-    // same session (which will).
-    let Some(_delivery_slot) = state.try_delivery_slot(&session.agent_id) else {
-        return Ok(serde_json::json!({}));
-    };
-    let Some(delivery) =
-        compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
-    else {
-        return Ok(serde_json::json!({}));
-    };
-    let attempt = ensure_delivery_attempt(
-        state,
-        &session.project_id,
-        &session.agent_id,
-        &session.id,
-        delivery,
-        now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
-    )
-    .await?;
-    if !matches!(
-        attempt.state,
-        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
-    ) {
-        return Ok(serde_json::json!({}));
-    }
-    let attempt_id = attempt.id.clone();
-    let claim_now = now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?;
-    let claimed = state
-        .commit_and_publish(move |store| {
-            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now)?;
-            Ok((attempt, Vec::new()))
+            let run_id = run.run.id.clone();
+            move |store| store.kernel_resources(&run_id)
         })
         .await?;
-    let Some(attempt) = claimed else {
-        return Ok(serde_json::json!({}));
-    };
-    let reason = attempt.text.clone();
-    // The block reply is the external effect, not an acknowledgement. Keep
-    // the exact reservation `uncertain` until the provider echoes its nonce
-    // in `UserPromptSubmit`; that hook atomically admits Running. A daemon
-    // crash after this return can therefore never manufacture a run for a
-    // reply the provider did not receive.
-    Ok(serde_json::json!({"decision": "block", "reason": reason}))
-}
-
-fn compose_text(
-    guidance_root: &Path,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-    task: Option<&TaskDetail>,
-    messages: &[crate::store::AgentMessage],
-    role: AgentRole,
-) -> String {
-    let mut sections = Vec::new();
-    if let Some(task) = task {
-        let id = task.snapshot.id.as_str();
-        let title = &task.snapshot.title;
-        let body = truncate_utf8(&task.body, MAX_DELIVERY_TASK_BODY_BYTES);
-        sections.push(format!(
-            "Task {id}: {title} (task:{id})\nWhen finished, run: factoryctl task done --task {id} \
-             --result \"<summary>\"\nIf blocked, run: factoryctl task blocked --task {id} --reason \
-             \"<why>\"\n\n{body}"
-        ));
-    }
-    if !messages.is_empty() {
-        let mut block = String::from("Messages:");
-        for message in messages {
-            let from = message
-                .sender_agent_id
-                .as_ref()
-                .map(AgentId::as_str)
-                .unwrap_or("operator");
-            block.push_str(&format!("\n- from {from}: {}", message.body));
-        }
-        sections.push(block);
-    }
-    if let Ok(project_guidance) = guidance::read_or_create(
-        &factory_core::paths::project_guidance_path(guidance_root, project_id),
-    ) && !project_guidance.trim().is_empty()
-    {
-        sections.push(format!(
-            "Project guidance (PROJECT.md):\n{project_guidance}"
-        ));
-    }
-    if let Ok(instructions) = guidance::read_or_create(
-        &factory_core::paths::agent_instructions_path(guidance_root, project_id, agent_id),
-    ) && !instructions.trim().is_empty()
-    {
-        sections.push(format!("Standing instructions:\n{instructions}"));
-    }
-    let memory_path = factory_core::paths::agent_memory_path(guidance_root, project_id, agent_id);
-    sections.push(format!(
-        "Curate and merge durable lessons in your memory file instead of appending indefinitely: {}. Keep the active file below {} bytes; concise summaries are authoritative and older exact bytes are preserved in the private archive by the daemon.",
-        memory_path.display(),
-        guidance::MEMORY_COMPACTION_HIGH_WATER_BYTES
-    ));
-    if matches!(role, AgentRole::Orchestrator) {
-        sections.push(ORCHESTRATOR_FOOTER.to_owned());
-    }
-    truncate_utf8(&sections.join("\n\n"), MAX_DELIVERY_TEXT_BYTES)
-}
-
-/// Only used by [`Handle::start_task`], which already loaded `task`/
-/// `messages` via `open_run_episode` but not the agent's role; a second
-/// small read is cheaper than widening `OpenedEpisode`.
-async fn role_hint(state: &DaemonState, project_id: &ProjectId, agent_id: &AgentId) -> AgentRole {
-    let project_id = project_id.clone();
-    let agent_id = agent_id.clone();
-    state
-        .with_store(move |store| store.get_agent_detail(&project_id, &agent_id))
-        .await
-        .map(|agent| agent.snapshot.role)
-        .unwrap_or(AgentRole::Worker)
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}\n...[truncated]", &value[..end])
-}
-
-// --- Stop/cancel/end -----------------------------------------------------
-
-async fn end_session_now(
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    session_id: &SessionId,
-    exit_code: Option<i32>,
-    exit_signal: Option<i32>,
-) {
-    let Ok(now) = now_ms() else { return };
-    let session_id = session_id.clone();
-    let result = state
-        .commit_and_publish(move |store| {
-            let (snapshot, events) = store.end_session(&session_id, exit_code, exit_signal, now)?;
-            Ok((snapshot, events))
+    let processes_released = resources
+        .iter()
+        .filter(|resource| {
+            matches!(
+                resource.kind,
+                KernelResourceKind::RunnerProcess
+                    | KernelResourceKind::ProviderProcess
+                    | KernelResourceKind::ProcessGroup
+            )
         })
-        .await;
-    match result {
-        Ok(snapshot) if snapshot.state == SessionState::Stopped => {
-            // A clean/operator-requested end frees its agent up: if other
-            // work is still queued, re-dispatch now rather than waiting for
-            // the safety tick (design's "session spawned/ended" wake
-            // trigger).
-            send_wake(wake_tx, snapshot.project_id, snapshot.agent_id);
-        }
-        Ok(_) => {
-            // A crash (`Failed`) deliberately does *not* get an immediate
-            // re-wake: if spawning is persistently broken (a missing/
-            // misconfigured provider binary), an immediate retry loop would
-            // busy-spin spawn attempts as fast as they fail. The 5 second
-            // safety tick still retries -- just rate-limited to once per
-            // tick instead of unbounded.
-        }
-        Err(error) => {
-            // A session already ended by another path (an operator
-            // `StopSession` racing this same exit, or a second recovery
-            // attempt) lands here too; not worth escalating.
-            tracing::debug!(%error, "end_session did not apply");
-        }
+        .all(|resource| resource.state == KernelResourceState::Released);
+    let runner_released = resources.iter().any(|resource| {
+        resource.kind == KernelResourceKind::RunnerProcess
+            && resource.state == KernelResourceState::Released
+    });
+    if runner_released && run.run.phase == RunPhase::Running {
+        let run_id = run.run.id.clone();
+        let failed_at_ms = now_ms()?;
+        state
+            .commit_and_publish(move |store| {
+                let (_, events) =
+                    store.fail_running_run(&run_id, RunFailureReason::Process, failed_at_ms)?;
+                Ok(((), events))
+            })
+            .await?;
+        kill_registered_group(&resources)?;
+    } else if runner_released && run.run.phase == RunPhase::Finalizing {
+        kill_registered_group(&resources)?;
     }
-}
-
-// --- Recovery --------------------------------------------------------
-
-/// Reconnects every session still recorded live from a prior daemon
-/// instance. A session's PTY-backed process is long-lived and independent
-/// of the daemon (`HANDOFF.md`: closing/rebuilding the operator surface
-/// must not stop agents) -- this is what proves that survived a restart,
-/// same machinery as `recoverable_sessions()`'s doc comment describes.
-async fn recover_sessions(
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    shutdown_rx: &watch::Receiver<bool>,
-) {
-    let recoverable = match state.with_store(|store| store.recoverable_sessions()).await {
-        Ok(list) => list,
-        Err(error) => {
-            tracing::warn!(%error, "could not load recoverable sessions");
-            return;
+    if processes_released && run.run.phase == RunPhase::Finalizing {
+        for resource in resources.iter().filter(|resource| {
+            resource.kind == KernelResourceKind::RuntimeRoot
+                && resource.state != KernelResourceState::Released
+        }) {
+            release_registered_runtime(state, run, resource).await?;
         }
-    };
-    for recovered in recoverable {
-        let state = state.clone();
-        let wake_tx = wake_tx.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(supervise_recovered(
-            state,
-            wake_tx,
-            recovered,
-            shutdown_rx,
-            MAX_RECOVERY_ATTEMPTS,
-        ));
-    }
-}
-
-/// `max_attempts` is [`MAX_RECOVERY_ATTEMPTS`] in production
-/// (`recover_sessions`, above); a parameter (not the bare constant) purely
-/// so this track's own test can drive the give-up path without waiting
-/// through the real constant's ~10 attempts (each gated by
-/// [`CONNECT_GRACE`], itself not test-configurable -- see that test's own
-/// comment).
-async fn supervise_recovered(
-    state: DaemonState,
-    wake_tx: mpsc::Sender<WakeAgent>,
-    recovered: RecoverableSession,
-    mut shutdown_rx: watch::Receiver<bool>,
-    max_attempts: u32,
-) {
-    let runtime_dir = PathBuf::from(&recovered.runner_runtime);
-    let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
-        return;
-    };
-    let client = RunnerClient::new(
-        &runtime_dir,
-        control_run_id,
-        recovered.runner_instance_id.clone(),
-    );
-    let mut retry_delay = RECOVERY_RETRY_DELAY;
-    let mut attempt: u32 = 0;
-    loop {
-        if shutdown_requested(&shutdown_rx) {
-            return;
-        }
-        let attach = match attach_with_grace(&client, &runtime_dir, CONNECT_GRACE, &mut shutdown_rx)
-            .await
+        let resources = state
+            .with_store({
+                let run_id = run.run.id.clone();
+                move |store| store.kernel_resources(&run_id)
+            })
+            .await?;
+        if !resources
+            .iter()
+            .all(|resource| resource.state == KernelResourceState::Released)
         {
-            Ok(attach) => attach,
-            Err(error) => {
-                // Same reasoning as `Attach::Unreachable`/`ExitOutcome::
-                // Reconnect` below (this track's item 9): a protocol error
-                // or a corrupt-looking runtime directory is not
-                // recoverable by retrying, but leaving the session
-                // dangling forever in whatever state it was recovered in
-                // is exactly the bug this track closes. Durably fail it
-                // (`unverifiable`, like every other "gave up" exit in this
-                // function) instead of just logging and abandoning it.
-                tracing::warn!(%error, session_id = %recovered.session_id, "recovery attach failed");
-                end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                return;
-            }
-        };
-        let subscription = match attach {
-            Attach::Connected(subscription) => subscription,
-            Attach::Shutdown => return,
-            Attach::Missing => {
-                end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                return;
-            }
-            Attach::Unreachable => {
-                attempt += 1;
-                if attempt >= max_attempts {
-                    tracing::warn!(
-                        session_id = %recovered.session_id,
-                        attempt,
-                        "recovered session's runner stayed unreachable; giving up"
-                    );
-                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                    return;
-                }
-                tokio::select! {
-                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
-                    () = sleep_until(Instant::now() + retry_delay) => {}
-                }
-                retry_delay = next_retry_delay(retry_delay);
-                continue;
-            }
-        };
-        let stop_replay_failed = if recovered.delivery_recovery_stop_requested {
-            // Recovery intent was committed before the runner command. A
-            // daemon crash or a transient control failure in that window
-            // must replay this idempotent stop after reconnect, before the
-            // dispatcher may ever consider a successor conversation.
-            if let Err(error) = client.stop(2_000).await {
-                attempt += 1;
-                tracing::warn!(
-                    %error,
-                    session_id = %recovered.session_id,
-                    attempt,
-                    "could not replay durable delivery-recovery stop"
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let consume = consume_until_exit(
-            &state,
-            &wake_tx,
-            &recovered.session_id,
-            recovered.provider == Provider::Codex,
-            &client,
-            subscription,
-            &mut shutdown_rx,
-        );
-        // A stop command can lose a race with the runner's actual exit and
-        // return Conflict even though the subscribed stream already contains
-        // the authoritative terminal event. Give that event priority; only
-        // reconnect/retry when no exit arrives within the retry bound.
-        let outcome = if stop_replay_failed {
-            match timeout(retry_delay, consume).await {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    retry_delay = next_retry_delay(retry_delay);
-                    continue;
-                }
-            }
-        } else {
-            consume.await
-        };
-        match outcome {
-            ExitOutcome::Exited {
-                exit_code,
-                exit_signal,
-            } => {
-                end_session_now(
-                    &state,
-                    &wake_tx,
-                    &recovered.session_id,
-                    exit_code,
-                    exit_signal,
-                )
-                .await;
-                return;
-            }
-            ExitOutcome::Shutdown => return,
-            ExitOutcome::Reconnect => {
-                attempt += 1;
-                if attempt >= max_attempts {
-                    tracing::warn!(
-                        session_id = %recovered.session_id,
-                        attempt,
-                        "recovered session's runner connection kept dropping; giving up"
-                    );
-                    end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                    return;
-                }
-                tokio::select! {
-                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
-                    () = sleep_until(Instant::now() + retry_delay) => {}
-                }
-                retry_delay = next_retry_delay(retry_delay);
-            }
+            return Ok(false);
         }
-    }
-}
-
-enum ExitOutcome {
-    Exited {
-        exit_code: Option<i32>,
-        exit_signal: Option<i32>,
-    },
-    Shutdown,
-    Reconnect,
-}
-
-/// Like `wait_for_runner_exit`, but for a session recovered after a daemon
-/// restart, whose subscription is a fresh "replay-plus-live" stream from
-/// sequence zero every time this reconnects (`RunnerClient::subscribe`'s
-/// own doc comment): a Codex session recovered while still `starting`
-/// therefore sees `RunnerEvent::TerminalRaw` again on replay if the runner
-/// already logged it before the restart -- "the runner re-reports on
-/// subscribe" is exactly this, no separate request needed
-/// (`docs/providers.md`). `synthesize_codex_session_start` is idempotent
-/// (`Store::synthesize_session_start`'s own doc comment) so seeing it again
-/// on every reconnect attempt is harmless.
-async fn consume_until_exit(
-    state: &DaemonState,
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    session_id: &SessionId,
-    synthesize_on_raw_mode: bool,
-    client: &RunnerClient,
-    mut subscription: RunnerSubscription,
-    shutdown: &mut watch::Receiver<bool>,
-) -> ExitOutcome {
-    loop {
-        let item = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return ExitOutcome::Shutdown,
-            item = subscription.next_item() => item,
-        };
-        match item {
-            Ok(RunnerStreamItem::Event(envelope)) => {
-                if let RunnerEvent::Exited { exit_code, signal } = envelope.event {
-                    // As in `wait_for_runner_exit` (`supervise_child`'s
-                    // sibling for a freshly spawned session): the runner
-                    // will not let its own process exit after an ordinary
-                    // termination until this exact acknowledgement arrives.
-                    // A recovered session's runner is otherwise
-                    // indistinguishable from a fresh one here -- without
-                    // this, every session that happens to exit *after* a
-                    // daemon restart (not just before/during one) would
-                    // orphan its runner forever.
-                    if let Err(error) = client.acknowledge_exit(envelope.sequence).await {
-                        tracing::warn!(%error, "failed to acknowledge a recovered runner's terminal event");
-                    }
-                    return ExitOutcome::Exited {
-                        exit_code,
-                        exit_signal: signal,
-                    };
-                }
-                log_unrecognized_runner_event(session_id, &envelope);
-                warn_on_raw_mode_timeout(session_id, synthesize_on_raw_mode, &envelope);
-                if should_synthesize_session_start(synthesize_on_raw_mode, &envelope.event) {
-                    synthesize_codex_session_start(state, wake_tx, session_id).await;
-                }
-            }
-            Ok(RunnerStreamItem::CaughtUp { .. }) => {}
-            Err(_) => return ExitOutcome::Reconnect,
-        }
-    }
-}
-
-enum Attach {
-    Connected(RunnerSubscription),
-    Missing,
-    Unreachable,
-    Shutdown,
-}
-
-/// Ported from the pre-5A execution.rs (`git show
-/// 364274e:crates/factoryd/src/execution.rs`), trimmed of everything about
-/// `Child`/`launch_pending` tracking (a recovered session never has a
-/// `Child` handle -- see this module's top doc comment).
-async fn attach_with_grace(
-    client: &RunnerClient,
-    runtime_dir: &Path,
-    grace: Duration,
-    shutdown: &mut watch::Receiver<bool>,
-) -> Result<Attach, Error> {
-    let deadline = Instant::now() + grace;
-    loop {
-        if shutdown_requested(shutdown) {
-            return Ok(Attach::Shutdown);
-        }
-        let attempted = tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(Attach::Shutdown),
-            result = timeout_at(deadline, client.subscribe()) => result,
-        };
-        match attempted {
-            Ok(Ok(subscription)) => return Ok(Attach::Connected(subscription)),
-            Ok(Err(error)) if unavailable(&error) => {}
-            Ok(Err(error)) => return Err(Error::Runner(error)),
-            Err(_) => return Ok(Attach::Unreachable),
-        }
-        if Instant::now() >= deadline {
-            return classify_unavailable(runtime_dir);
-        }
-        let wake = (Instant::now() + CONNECT_RETRY_DELAY).min(deadline);
-        tokio::select! {
-            _ = wait_for_shutdown(shutdown) => return Ok(Attach::Shutdown),
-            () = sleep_until(wake) => {}
-        }
-    }
-}
-
-fn unavailable(error: &RunnerClientError) -> bool {
-    matches!(
-        error,
-        RunnerClientError::Io(source)
-            if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused)
-    )
-}
-
-fn classify_unavailable(runtime_dir: &Path) -> Result<Attach, Error> {
-    if endpoint_absent(runtime_dir)? {
-        Ok(Attach::Missing)
-    } else {
-        Ok(Attach::Unreachable)
-    }
-}
-
-fn endpoint_absent(runtime_dir: &Path) -> Result<bool, Error> {
-    let runtime = match fs::symlink_metadata(runtime_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(_) => return Err(Error::CorruptExecution),
-    };
-    if runtime.file_type().is_symlink()
-        || !runtime.is_dir()
-        || runtime.uid() != rustix::process::geteuid().as_raw()
-        || runtime.mode() & 0o777 != PRIVATE_DIRECTORY_MODE
-    {
-        return Err(Error::CorruptExecution);
-    }
-    let socket = match fs::symlink_metadata(runtime_dir.join("control.sock")) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
-        Err(_) => return Err(Error::CorruptExecution),
-    };
-    if !socket.file_type().is_socket()
-        || socket.uid() != rustix::process::geteuid().as_raw()
-        || socket.mode() & 0o777 != 0o600
-    {
-        return Err(Error::CorruptExecution);
+        let run_id = run.run.id.clone();
+        let finalized_at_ms = now_ms()?;
+        state
+            .commit_and_publish(move |store| {
+                let (_, events) = store.finalize_run(&run_id, finalized_at_ms)?;
+                Ok(((), events))
+            })
+            .await?;
+        return Ok(true);
     }
     Ok(false)
 }
 
-fn next_retry_delay(current: Duration) -> Duration {
-    current
-        .checked_mul(2)
-        .unwrap_or(MAX_RECOVERY_RETRY_DELAY)
-        .min(MAX_RECOVERY_RETRY_DELAY)
-}
-
-fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {
-    *shutdown.borrow()
-}
-
-async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
+async fn release_registered_runtime(
+    state: &DaemonState,
+    run: &RecoverableKernelRun,
+    resource: &KernelResource,
+) -> Result<(), Error> {
+    let Some(path) = locator_path(&resource.locator) else {
+        mark_resource_unresolved(state, resource, "runtime locator is invalid").await?;
+        return Ok(());
+    };
+    if path != Path::new(&run.runner_runtime) {
+        mark_resource_unresolved(state, resource, "runtime locator does not match its run").await?;
+        return Ok(());
     }
-    let _ = shutdown.wait_for(|requested| *requested).await;
+    let quarantine = path.with_file_name(format!(".finalize-{}", run.run.id.as_str()));
+    match remove_runtime_if_exact(&path, &quarantine, resource.birth_fingerprint.as_deref()) {
+        Ok(RuntimeRemoval::Missing | RuntimeRemoval::Removed) => {
+            release_resource(state, resource).await
+        }
+        Ok(RuntimeRemoval::Unproven) if resource.birth_fingerprint.is_none() => {
+            mark_resource_unresolved(
+                state,
+                resource,
+                "declared runtime exists without a durable birth fingerprint",
+            )
+            .await
+        }
+        Ok(RuntimeRemoval::Unproven) => {
+            mark_resource_unresolved(state, resource, "runtime birth fingerprint changed").await
+        }
+        Err(error) => mark_resource_unresolved(state, resource, &error.to_string()).await,
+    }
 }
 
-// --- Small helpers -----------------------------------------------------
-
-fn session_run_id(session_id: &SessionId) -> Result<RunId, Error> {
-    RunId::try_from(session_id.as_str()).map_err(|_| Error::CorruptExecution)
+#[cfg(target_os = "linux")]
+fn kill_registered_group(resources: &[KernelResource]) -> Result<(), Error> {
+    let Some(group) = resources.iter().find(|resource| {
+        resource.kind == KernelResourceKind::ProcessGroup
+            && resource.state != KernelResourceState::Released
+    }) else {
+        return Ok(());
+    };
+    let Some(pgid) = locator_number(&group.locator, "pgid") else {
+        return Ok(());
+    };
+    // A reused process-group number must never authorize a signal. The group
+    // leader's birth fingerprint is the durable proof that this is still the
+    // group factoryd registered before provider execution began.
+    if process_birth_fingerprint(pgid)?.as_deref() != group.birth_fingerprint.as_deref() {
+        return Ok(());
+    }
+    let Some(pid) = Pid::from_raw(pgid as i32) else {
+        return Ok(());
+    };
+    match kill_process_group(pid, Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(Error::Runtime {
+            path: PathBuf::from(format!("process-group:{pgid}")),
+            source: io::Error::from_raw_os_error(error.raw_os_error()),
+        }),
+    }
 }
 
-fn new_session_id() -> Result<SessionId, Error> {
-    SessionId::try_from(Uuid::new_v4().hyphenated().to_string()).map_err(|_| Error::InvalidId)
+#[cfg(not(target_os = "linux"))]
+fn kill_registered_group(_resources: &[KernelResource]) -> Result<(), Error> {
+    // macOS exposes only second-resolution process start time through the
+    // safe APIs available here. That is sufficient to remain unresolved,
+    // never to authorize a destructive signal across a check/kill race.
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn kill_registered_processes(resources: &[KernelResource]) -> Result<(), Error> {
+    kill_registered_group(resources)?;
+    let Some(runner) = resources.iter().find(|resource| {
+        resource.kind == KernelResourceKind::RunnerProcess
+            && resource.state != KernelResourceState::Released
+    }) else {
+        return Ok(());
+    };
+    let Some(pid_number) = locator_number(&runner.locator, "pid") else {
+        return Ok(());
+    };
+    if process_birth_fingerprint(pid_number)?.as_deref() != runner.birth_fingerprint.as_deref() {
+        return Ok(());
+    }
+    let Some(pid) = Pid::from_raw(pid_number as i32) else {
+        return Ok(());
+    };
+    match kill_process_group(pid, Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(Error::Runtime {
+            path: PathBuf::from(format!("runner-process-group:{pid_number}")),
+            source: io::Error::from_raw_os_error(error.raw_os_error()),
+        }),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kill_registered_processes(_resources: &[KernelResource]) -> Result<(), Error> {
+    // Finalization first uses the authenticated runner socket. If that fails,
+    // weak PID metadata cannot authorize a fallback signal; the durable
+    // resources remain unresolved until absence can be established.
+    Ok(())
+}
+
+async fn release_resource(state: &DaemonState, resource: &KernelResource) -> Result<(), Error> {
+    let id = resource.id.clone();
+    let locator = resource.locator.clone();
+    let fingerprint = resource.birth_fingerprint.clone();
+    let at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            store.mark_resource_released(&id, &locator, fingerprint.as_deref(), at_ms)?;
+            Ok(((), Vec::new()))
+        })
+        .await?;
+    Ok(())
+}
+
+async fn mark_runner_unresolved(state: &DaemonState, run: &RecoverableKernelRun, failure: &str) {
+    let Some(resource) = run
+        .resources
+        .iter()
+        .find(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+    else {
+        return;
+    };
+    let id = resource.id.clone();
+    let failure: String = failure.chars().take(4096).collect();
+    if let Ok(at_ms) = now_ms() {
+        let _ = state
+            .commit_and_publish(move |store| {
+                store.mark_resource_unresolved(&id, &failure, at_ms)?;
+                Ok(((), Vec::new()))
+            })
+            .await;
+    }
+}
+
+async fn mark_resource_unresolved(
+    state: &DaemonState,
+    resource: &KernelResource,
+    failure: &str,
+) -> Result<(), Error> {
+    let id = resource.id.clone();
+    let failure: String = failure.chars().take(4096).collect();
+    let at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            store.mark_resource_unresolved(&id, &failure, at_ms)?;
+            Ok(((), Vec::new()))
+        })
+        .await?;
+    Ok(())
+}
+
+async fn wait_for_registered_runner_exit(run: &RecoverableKernelRun) -> Result<(), Error> {
+    let Some(resource) = run
+        .resources
+        .iter()
+        .find(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+    else {
+        return Ok(());
+    };
+    let deadline = Instant::now() + RUNNER_EXIT_GRACE;
+    loop {
+        if process_resource_absent(resource)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Runner(RunnerClientError::TimedOut {
+                operation: "registered runner exit",
+            }));
+        }
+        sleep(CONNECT_RETRY).await;
+    }
+}
+
+fn process_resource_absent(resource: &KernelResource) -> Result<bool, Error> {
+    let Some(pid) = locator_number(&resource.locator, "pid") else {
+        return Ok(false);
+    };
+    let current = process_birth_fingerprint(pid)?;
+    Ok(match current {
+        None => true,
+        Some(current) => resource
+            .birth_fingerprint
+            .as_deref()
+            .is_some_and(|expected| current != expected),
+    })
+}
+
+fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
+    let Some(pgid) = locator_number(&resource.locator, "pgid") else {
+        return Ok(false);
+    };
+    let Some(pid) = Pid::from_raw(pgid as i32) else {
+        return Ok(true);
+    };
+    match test_kill_process_group(pid) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => {
+            let current = process_birth_fingerprint(pgid)?;
+            Ok(current.is_some() && current.as_deref() != resource.birth_fingerprint.as_deref())
+        }
+        Err(rustix::io::Errno::SRCH) => Ok(true),
+        Err(error) => Err(Error::Runtime {
+            path: PathBuf::from(format!("process-group:{pgid}")),
+            source: io::Error::from_raw_os_error(error.raw_os_error()),
+        }),
+    }
+}
+
+fn locator_number(locator: &str, key: &str) -> Option<u32> {
+    serde_json::from_str::<serde_json::Value>(locator)
+        .ok()?
+        .get(key)?
+        .as_u64()?
+        .try_into()
+        .ok()
+}
+
+fn locator_path(locator: &str) -> Option<PathBuf> {
+    serde_json::from_str::<serde_json::Value>(locator)
+        .ok()?
+        .get("path")?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+fn runtime_locator(path: &Path) -> String {
+    serde_json::json!({ "path": path }).to_string()
+}
+
+fn runner_locator(pid: u32, runner_instance_id: &RunnerInstanceId) -> String {
+    serde_json::json!({
+        "pid": pid,
+        "runner_instance_id": runner_instance_id.as_str(),
+    })
+    .to_string()
+}
+
+fn runtime_birth_fingerprint(path: &Path) -> Result<Option<String>, Error> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::Runtime {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    verify_private_directory_metadata(&metadata)?;
+    Ok(Some(format!(
+        "unix-device:{}:inode:{}",
+        metadata.dev(),
+        metadata.ino()
+    )))
+}
+
+#[cfg(target_os = "linux")]
+fn process_birth_fingerprint(pid: u32) -> Result<Option<String>, Error> {
+    let path = PathBuf::from(format!("/proc/{pid}/stat"));
+    let stat = match fs::read_to_string(&path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Error::Runtime { path, source }),
+    };
+    let Some(after_name) = stat.rsplit_once(") ").map(|(_, fields)| fields) else {
+        return Err(Error::ProcessIdentityUnavailable(pid));
+    };
+    let Some(start_ticks) = after_name.split_whitespace().nth(19) else {
+        return Err(Error::ProcessIdentityUnavailable(pid));
+    };
+    Ok(Some(format!("linux-start-ticks:{start_ticks}")))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_birth_fingerprint(pid: u32) -> Result<Option<String>, Error> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|source| Error::Runtime {
+            path: PathBuf::from("/bin/ps"),
+            source,
+        })?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok((!value.is_empty()).then(|| format!("process-start:{value}")))
+}
+
+fn remove_runtime(path: &Path) -> Result<(), Error> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(Error::Runtime {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeRemoval {
+    Missing,
+    Removed,
+    Unproven,
+}
+
+fn remove_runtime_if_exact(
+    path: &Path,
+    quarantine: &Path,
+    expected_birth_fingerprint: Option<&str>,
+) -> Result<RuntimeRemoval, Error> {
+    if quarantine.parent() != path.parent() || quarantine == path {
+        return Ok(RuntimeRemoval::Unproven);
+    }
+    let parent = path.parent().ok_or(Error::InvalidRuntimeRoot)?;
+    let parent_metadata = fs::symlink_metadata(parent).map_err(|source| Error::Runtime {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    verify_private_directory_metadata(&parent_metadata)?;
+
+    if let Some(quarantined) = runtime_birth_fingerprint(quarantine)? {
+        if runtime_birth_fingerprint(path)?.is_some()
+            || expected_birth_fingerprint != Some(quarantined.as_str())
+        {
+            return Ok(RuntimeRemoval::Unproven);
+        }
+        remove_runtime(quarantine)?;
+        return Ok(if runtime_birth_fingerprint(path)?.is_none() {
+            RuntimeRemoval::Removed
+        } else {
+            RuntimeRemoval::Unproven
+        });
+    }
+
+    let Some(current) = runtime_birth_fingerprint(path)? else {
+        return Ok(RuntimeRemoval::Missing);
+    };
+    if expected_birth_fingerprint != Some(current.as_str()) {
+        return Ok(RuntimeRemoval::Unproven);
+    }
+    match fs::rename(path, quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(RuntimeRemoval::Missing);
+        }
+        Err(source) => {
+            return Err(Error::Runtime {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    if runtime_birth_fingerprint(path)?.is_some()
+        || runtime_birth_fingerprint(quarantine)?.as_deref() != expected_birth_fingerprint
+    {
+        return Ok(RuntimeRemoval::Unproven);
+    }
+    remove_runtime(quarantine)?;
+    Ok(if runtime_birth_fingerprint(path)?.is_none() {
+        RuntimeRemoval::Removed
+    } else {
+        RuntimeRemoval::Unproven
+    })
+}
+
+fn random_bearer() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
+fn capability_digest(bearer: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bearer.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn new_run_id() -> Result<RunId, Error> {
+    RunId::try_from(Uuid::new_v4().hyphenated().to_string()).map_err(|_| Error::InvalidId)
 }
 
 fn new_runner_instance_id() -> Result<RunnerInstanceId, Error> {
@@ -3356,37 +1754,29 @@ fn now_ms() -> Result<i64, Error> {
     i64::try_from(millis).map_err(|_| Error::InvalidClock)
 }
 
-fn prepare_runtime_root(path: &std::path::Path) -> Result<(), Error> {
+fn prepare_runtime_root(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidRuntimeRoot);
     }
     let parent = path.parent().ok_or(Error::InvalidRuntimeRoot)?;
-    match fs::symlink_metadata(parent) {
-        Ok(metadata) => verify_private_directory_metadata(&metadata)?,
+    ensure_private_directory(parent)?;
+    ensure_private_directory(path)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => verify_private_directory_metadata(&metadata),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             fs::DirBuilder::new()
                 .recursive(true)
                 .mode(PRIVATE_DIRECTORY_MODE)
-                .create(parent)
-                .map_err(|_| Error::InvalidRuntimeRoot)?;
-            let metadata = fs::symlink_metadata(parent).map_err(|_| Error::InvalidRuntimeRoot)?;
-            verify_private_directory_metadata(&metadata)?;
-        }
-        Err(_) => return Err(Error::InvalidRuntimeRoot),
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => verify_private_directory_metadata(&metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::DirBuilder::new()
-                .mode(PRIVATE_DIRECTORY_MODE)
                 .create(path)
                 .map_err(|_| Error::InvalidRuntimeRoot)?;
             let metadata = fs::symlink_metadata(path).map_err(|_| Error::InvalidRuntimeRoot)?;
-            verify_private_directory_metadata(&metadata)?;
+            verify_private_directory_metadata(&metadata)
         }
-        Err(_) => return Err(Error::InvalidRuntimeRoot),
+        Err(_) => Err(Error::InvalidRuntimeRoot),
     }
-    Ok(())
 }
 
 fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Error> {
@@ -3395,2751 +1785,206 @@ fn verify_private_directory_metadata(metadata: &fs::Metadata) -> Result<(), Erro
         || metadata.uid() != rustix::process::geteuid().as_raw()
         || metadata.mode() & 0o777 != PRIVATE_DIRECTORY_MODE
     {
-        return Err(Error::InvalidRuntimeRoot);
+        Err(Error::InvalidRuntimeRoot)
+    } else {
+        Ok(())
     }
-    Ok(())
+}
+
+struct DeleteGate<Id: Eq + std::hash::Hash + Clone> {
+    state: Mutex<HashMap<Id, GateEntry>>,
+}
+
+#[derive(Default)]
+struct GateEntry {
+    deleting: bool,
+    writers: u32,
+}
+
+impl<Id: Eq + std::hash::Hash + Clone> DeleteGate<Id> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn try_begin_write(&self, id: &Id) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = state.entry(id.clone()).or_default();
+        if entry.deleting {
+            return false;
+        }
+        entry.writers = entry.writers.saturating_add(1);
+        true
+    }
+
+    fn end_write(&self, id: &Id) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.get_mut(id) {
+            entry.writers = entry.writers.saturating_sub(1);
+        }
+    }
+
+    fn begin_delete(&self, id: &Id) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.entry(id.clone()).or_default().deleting = true;
+    }
+
+    fn end_delete(&self, id: &Id) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = state.get_mut(id) {
+            entry.deleting = false;
+        }
+    }
+
+    async fn wait_for_drain(&self, id: &Id, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            let drained = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(id)
+                .is_none_or(|entry| entry.writers == 0);
+            if drained {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            sleep_until((now + DELETE_DRAIN_POLL).min(deadline)).await;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use factory_core::{MessageId, TaskId};
-
     use super::*;
-    use crate::{
-        session_work::Phase as SessionWorkPhase,
-        store::{NewAgentMessage, NewSession, Store},
-    };
-
-    struct RecoveryStopFixture {
-        _directory: tempfile::TempDir,
-        state: DaemonState,
-        recovered: RecoverableSession,
-        runner: factory_runner::Config,
-        stale_in_flight_attempt: DeliveryAttempt,
-    }
-
-    enum RecoveryFixtureDelivery {
-        Task,
-        Message,
-    }
-
-    fn recovery_stop_fixture() -> RecoveryStopFixture {
-        recovery_stop_fixture_with(RecoveryFixtureDelivery::Task)
-    }
-
-    fn message_recovery_stop_fixture() -> RecoveryStopFixture {
-        recovery_stop_fixture_with(RecoveryFixtureDelivery::Message)
-    }
-
-    fn recovery_stop_fixture_with(delivery: RecoveryFixtureDelivery) -> RecoveryStopFixture {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let thread = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".into(),
-                    root: directory.path().to_string_lossy().into_owned(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Codex,
-                },
-                2,
-            )
-            .unwrap();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let instance_id =
-            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
-        let initial = crate::store::NewSession {
-            id: SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            provider: Provider::Codex,
-            runtime_model: None,
-            runtime_reasoning_effort: None,
-            runtime_permission_mode: None,
-            runtime_control_mode: None,
-            provider_session_id: Some(thread.into()),
-            worktree: directory.path().to_string_lossy().into_owned(),
-            codex_home: None,
-            hook_token: "b".repeat(64),
-            runner_instance_id: RunnerInstanceId::try_from("44444444-4444-4444-8444-444444444444")
-                .unwrap(),
-            runner_runtime: directory.path().join("old").to_string_lossy().into_owned(),
-            runner_protocol_version: 1,
-        };
-        let (initial, _) = store.create_session(initial, 3).unwrap();
-        store.end_session(&initial.id, Some(0), None, 4).unwrap();
-        let runtime_dir = directory.path().join("runner");
-        let (resumed, _) = store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Codex,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: Some(thread.into()),
-                    worktree: directory.path().to_string_lossy().into_owned(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: instance_id.clone(),
-                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
-                    runner_protocol_version: 1,
-                },
-                5,
-            )
-            .unwrap();
-        let (task_id, task_incarnation_id, task_revision, message_ids) = match delivery {
-            RecoveryFixtureDelivery::Task => {
-                let task_id = TaskId::try_from("recovery-task").unwrap();
-                store
-                    .create_task(
-                        crate::store::NewTask {
-                            id: task_id.clone(),
-                            project_id: project_id.clone(),
-                            parent_task_id: None,
-                            title: "Recover".into(),
-                            body: String::new(),
-                            priority: 0,
-                        },
-                        6,
-                    )
-                    .unwrap();
-                store
-                    .assign_task(&project_id, &task_id, Some(&agent_id), 6)
-                    .unwrap();
-                let marker = store.task_delivery_marker(&task_id).unwrap();
-                (
-                    Some(task_id),
-                    Some(marker.incarnation_id),
-                    Some(marker.task_revision),
-                    Vec::new(),
-                )
-            }
-            RecoveryFixtureDelivery::Message => {
-                let message_id = MessageId::try_from("recovery-message").unwrap();
-                store
-                    .send_agent_message(NewAgentMessage {
-                        id: message_id.clone(),
-                        project_id: project_id.clone(),
-                        sender_agent_id: None,
-                        recipient_agent_id: agent_id.clone(),
-                        body: "recover me".into(),
-                        created_at_ms: 6,
-                    })
-                    .unwrap();
-                (None, None, None, vec![message_id])
-            }
-        };
-        store
-            .ensure_delivery_attempt(NewDeliveryAttempt {
-                id: "recovery-attempt".into(),
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                session_id: resumed.id.clone(),
-                task_id,
-                task_incarnation_id,
-                task_revision,
-                require_queue_head: false,
-                message_ids,
-                text: "recover me".into(),
-                created_at_ms: 6,
-            })
-            .unwrap();
-        let stale_in_flight_attempt = store
-            .delivery_attempt_for_prompt(&project_id, &agent_id, &resumed.id, "recover me")
-            .unwrap()
-            .unwrap();
-        store
-            .request_fresh_provider_recovery(&project_id, &resumed.id, "recovery-attempt", 7)
-            .unwrap();
-        let recovered = store.recoverable_sessions().unwrap().remove(0);
-        let runner = factory_runner::Config {
-            run_id: session_run_id(&session_id).unwrap(),
-            runner_instance_id: instance_id,
-            runtime_dir,
-            cwd: directory.path().to_path_buf(),
-            startup_input: None,
-            program: PathBuf::from("/bin/sh"),
-            arguments: vec!["-c".into(), "while :; do sleep 1; done".into()],
-            terminal: None,
-        };
-        RecoveryStopFixture {
-            _directory: directory,
-            state: DaemonState::new(store),
-            recovered,
-            runner,
-            stale_in_flight_attempt,
-        }
-    }
-
-    async fn start_test_runner(config: factory_runner::Config) -> JoinHandle<()> {
-        let socket = config.runtime_dir.join("control.sock");
-        let runner = tokio::spawn(async move { factory_runner::run(config).await.unwrap() });
-        timeout(Duration::from_secs(2), async {
-            while !socket.exists() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        runner
-    }
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     fn private_tempdir() -> tempfile::TempDir {
-        let base = if cfg!(target_os = "macos") {
-            "/private/tmp"
-        } else {
-            "/tmp"
-        };
-        let directory = tempfile::tempdir_in(base).unwrap();
-        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = tempfile::tempdir_in("/tmp").unwrap();
+        fs::set_permissions(
+            directory.path(),
+            fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+        )
+        .unwrap();
         directory
     }
 
-    fn config(directory: &std::path::Path) -> Config {
-        Config {
-            runner_program: directory.join("factory-runner"),
-            factoryctl_path: directory.join("factoryctl"),
-            runtime_root: directory.join("runs"),
-            guidance_root: directory.to_path_buf(),
-            socket_path: directory.join("f.sock"),
-            max_active_runs: 1,
-            session_start_deadline: SESSION_START_DEADLINE,
-        }
-    }
-
-    fn deadline_session(
-        directory: &Path,
-        project_id: &ProjectId,
-        agent_id: &AgentId,
-        session_id: &str,
-        runner_instance_id: &str,
-    ) -> NewSession {
-        NewSession {
-            id: SessionId::try_from(session_id).unwrap(),
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            provider: Provider::Shell,
-            runtime_model: None,
-            runtime_reasoning_effort: None,
-            runtime_permission_mode: None,
-            runtime_control_mode: None,
-            provider_session_id: None,
-            worktree: directory.to_string_lossy().into_owned(),
-            codex_home: None,
-            hook_token: "a".repeat(64),
-            runner_instance_id: RunnerInstanceId::try_from(runner_instance_id).unwrap(),
-            runner_runtime: directory
-                .join("runs")
-                .join(session_id)
-                .to_string_lossy()
-                .into_owned(),
-            runner_protocol_version: 1,
-        }
-    }
-
-    async fn test_delivery_attempt(
-        state: &DaemonState,
-        id: &str,
-        project_id: &ProjectId,
-        agent_id: &AgentId,
-        session_id: &SessionId,
-        delivery: &Delivery,
-        created_at_ms: i64,
-    ) -> DeliveryAttempt {
-        let input = NewDeliveryAttempt {
-            id: id.to_owned(),
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            session_id: session_id.clone(),
-            task_id: delivery.task_id.clone(),
-            task_incarnation_id: delivery.task_incarnation_id.clone(),
-            task_revision: delivery.task_revision,
-            require_queue_head: delivery.require_queue_head,
-            message_ids: delivery.message_ids.clone(),
-            text: delivery.text.clone(),
-            created_at_ms,
-        };
-        state
-            .commit_and_publish(move |store| {
-                let attempt = store.ensure_delivery_attempt(input)?;
-                Ok((attempt, Vec::new()))
-            })
-            .await
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn spawn_rejects_zero_concurrency() {
-        let directory = private_tempdir();
-        let state = DaemonState::new(Store::open_in_memory().unwrap());
-        let mut cfg = config(directory.path());
-        cfg.max_active_runs = 0;
-        assert!(matches!(spawn(cfg, state), Err(Error::InvalidConcurrency)));
-    }
-
-    /// Issue #249: start-deadline escalation is daemon/store behavior, not a
-    /// runner-startup integration test. Drive the exact production transition
-    /// with durable `Starting` rows whose runner program and runtime directory
-    /// deliberately do not exist. The separate `session_start_deadline`
-    /// integration tests retain real runner stop/retry and successful-hook
-    /// lifecycle coverage without making these four state-machine cycles wait
-    /// for four independently scheduled control sockets.
-    #[tokio::test]
-    async fn start_deadline_escalation_pauses_and_resume_resets_the_streak() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("stuck").unwrap();
-        let worktree = directory.path().join("repo");
-        fs::create_dir(&worktree).unwrap();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: worktree.to_string_lossy().into_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-
-        let state = DaemonState::new(store);
-        let mut cfg = config(directory.path());
-        cfg.session_start_deadline = Duration::ZERO;
-        let cfg = Arc::new(cfg);
-        let backoff = Arc::new(SpawnBackoff::new());
-        let (wake_tx, mut wake_rx) = mpsc::channel(8);
-        let (shutdown, _shutdown_rx) = watch::channel(false);
-        let handle = Handle {
-            state: state.clone(),
-            config: Arc::clone(&cfg),
-            wake_tx: wake_tx.clone(),
-            shutdown,
-            backoff: Arc::clone(&backoff),
-            project_gate: Arc::new(DeleteGate::new()),
-            start_task_ack_test: None,
-        };
-        let identities = [
-            (
-                "11111111-1111-4111-8111-111111111111",
-                "22222222-2222-4222-8222-222222222222",
-            ),
-            (
-                "33333333-3333-4333-8333-333333333333",
-                "44444444-4444-4444-8444-444444444444",
-            ),
-            (
-                "55555555-5555-4555-8555-555555555555",
-                "66666666-6666-4666-8666-666666666666",
-            ),
-            (
-                "77777777-7777-4777-8777-777777777777",
-                "88888888-8888-4888-8888-888888888888",
-            ),
-        ];
-
-        assert!(!cfg.runner_program.exists());
-        assert!(!cfg.runtime_root.exists());
-
-        for (index, &(session_id, runner_instance_id)) in identities.iter().enumerate() {
-            let input = deadline_session(
-                directory.path(),
-                &project_id,
-                &agent_id,
-                session_id,
-                runner_instance_id,
-            );
-            state
-                .commit_and_publish(move |store| {
-                    let (session, events) = store.create_session(input, 1_001 + index as i64)?;
-                    Ok((session, events))
-                })
-                .await
-                .unwrap();
-
-            let lookup_project_id = project_id.clone();
-            let lookup_agent_id = agent_id.clone();
-            let starting = state
-                .with_store(move |store| {
-                    store
-                        .live_session_for_agent(&lookup_project_id, &lookup_agent_id)?
-                        .ok_or(StoreError::SessionNotFound)
-                })
-                .await
-                .unwrap();
-            assert_eq!(starting.state, SessionState::Starting);
-
-            enforce_start_deadline(
-                cfg.as_ref(),
-                &state,
-                &wake_tx,
-                backoff.as_ref(),
-                &project_id,
-                &agent_id,
-                &starting,
-            )
-            .await
-            .unwrap();
-
-            let list_project_id = project_id.clone();
-            let failed = state
-                .with_store(move |store| {
-                    store
-                        .list_sessions(&list_project_id, None, 100)?
-                        .into_iter()
-                        .find(|session| session.id.as_str() == session_id)
-                        .ok_or(StoreError::SessionNotFound)
-                })
-                .await
-                .unwrap();
-            assert_eq!(failed.state, SessionState::Failed);
-            assert!(
-                failed
-                    .wait_reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("SessionStart hook not received")),
-                "unexpected deadline failure: {failed:?}"
-            );
-            assert!(
-                !cfg.runtime_root
-                    .join(session_id)
-                    .join("control.sock")
-                    .exists()
-            );
-
-            let held_project_id = project_id.clone();
-            let held_agent_id = agent_id.clone();
-            let held = state
-                .with_store(move |store| store.agent_is_held(&held_project_id, &held_agent_id))
-                .await
-                .unwrap();
-            if index < 2 {
-                assert!(!held, "deadline {} must still be retryable", index + 1);
-                let wake = wake_rx.try_recv().expect("a retry wake");
-                assert_eq!(wake.project_id, project_id);
-                assert_eq!(wake.agent_id, agent_id);
-            } else if index == 2 {
-                assert!(held, "the third consecutive deadline must pause the agent");
-                assert!(matches!(
-                    wake_rx.try_recv(),
-                    Err(mpsc::error::TryRecvError::Empty)
-                ));
-
-                let resume_project_id = project_id.clone();
-                let resume_agent_id = agent_id.clone();
-                state
-                    .commit_and_publish(move |store| {
-                        let (agent, event) =
-                            store.resume_agent(&resume_project_id, &resume_agent_id, 2_000)?;
-                        Ok((agent, vec![event]))
-                    })
-                    .await
-                    .unwrap();
-                // `local_api::ResumeAgent` calls this exact production
-                // boundary alongside the durable store transition above.
-                handle.resume_backoff(&agent_id);
-            } else {
-                assert!(
-                    !held,
-                    "the first deadline after resume must start a fresh streak"
-                );
-                wake_rx.try_recv().expect("a retry wake after resume");
-            }
-        }
-
-        let count_project_id = project_id.clone();
-        assert_eq!(
-            state
-                .with_store(move |store| {
-                    Ok(store.list_sessions(&count_project_id, None, 100)?.len())
-                })
-                .await
-                .unwrap(),
-            4
-        );
-        assert!(!cfg.runner_program.exists());
-        assert!(!cfg.runtime_root.exists());
-    }
-
-    #[tokio::test]
-    async fn delivery_admission_blocks_a_later_stop_until_the_current_delivery_finishes() {
-        let state = DaemonState::new(Store::open_in_memory().unwrap());
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let held = state.lock_delivery_slot(&agent_id).await;
-        let waiting_state = state.clone();
-        let waiting_agent = agent_id.clone();
-        let waiter = tokio::spawn(async move {
-            let _slot = waiting_state.lock_delivery_slot(&waiting_agent).await;
-        });
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), waiter)
-                .await
-                .is_err(),
-            "a stop-side admission must not pass while delivery owns the slot"
-        );
-        drop(held);
-
-        // The timeout consumed the JoinHandle future, so the task itself is
-        // still running and completes as soon as the delivery slot releases.
-        // A second, fresh admission proves the mutex is usable after the
-        // barrier rather than relying on the timed-out handle.
-        let _released = state.lock_delivery_slot(&agent_id).await;
-    }
-
-    /// This track's item 2: `max_active_runs` must actually bound live
-    /// sessions, not just be validated non-zero at startup
-    /// (`spawn_rejects_zero_concurrency`, above). Drives `dispatch_agent`
-    /// directly (no real `factory-runner`/PTY needed -- the real E2E spawn
-    /// path is exercised by `sessions_e2e.rs`) against a daemon already at
-    /// its one-session cap: `waiter` has pending work and no live session,
-    /// but must be left entirely alone -- not just failed-and-backed-off --
-    /// while `occupant`'s session is still live. Asserting on the *session
-    /// count* (not just `live_session_for_agent(waiter)`, which would also
-    /// read `None` after a failed spawn attempt, since a failed session's
-    /// `ended_at_ms` is set) is what actually distinguishes "never
-    /// attempted" from "attempted and failed": `config.runner_program`
-    /// deliberately points at a nonexistent binary, so a real spawn
-    /// attempt here would durably fail loudly, not silently succeed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_agent_defers_spawn_at_the_concurrency_limit() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let occupant_id = AgentId::try_from("occupant").unwrap();
-        let waiter_id = AgentId::try_from("waiter").unwrap();
-        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: worktree.clone(),
-                },
-                1_000,
-            )
-            .unwrap();
-        for agent_id in [&occupant_id, &waiter_id] {
-            store
-                .create_agent(
-                    crate::store::NewAgent {
-                        id: agent_id.clone(),
-                        project_id: project_id.clone(),
-                        parent_agent_id: None,
-                        role: AgentRole::Worker,
-                        provider: Provider::Shell,
-                    },
-                    1_000,
-                )
-                .unwrap();
-        }
-        // `occupant` already holds the daemon's one concurrency slot.
-        store
-            .create_session(
-                crate::store::NewSession {
-                    id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
-                    project_id: project_id.clone(),
-                    agent_id: occupant_id.clone(),
-                    provider: Provider::Shell,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: worktree.clone(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: directory
-                        .path()
-                        .join("runs")
-                        .join("session-1")
-                        .to_string_lossy()
-                        .into_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-        // `waiter` has pending work and no live session of its own.
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: TaskId::try_from("task-1").unwrap(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Do the thing".to_owned(),
-                    body: "Do the thing.".to_owned(),
-                    priority: 0,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .assign_task(
-                &project_id,
-                &TaskId::try_from("task-1").unwrap(),
-                Some(&waiter_id),
-                1_000,
-            )
-            .unwrap();
-
-        let state = DaemonState::new(store);
-        let mut cfg = config(directory.path());
-        cfg.max_active_runs = 1;
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let backoff = SpawnBackoff::new();
-
-        assert!(
-            at_concurrency_limit(&cfg, &state, &project_id, &waiter_id)
-                .await
-                .unwrap(),
-            "one live session must already saturate max_active_runs: 1"
-        );
-
-        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &waiter_id)
-            .await
-            .unwrap();
-
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            sessions.len(),
-            1,
-            "waiter must not get a session row at all -- not attempted, not failed"
-        );
-        assert_eq!(sessions[0].agent_id, occupant_id);
-
-        // Freeing the slot lets the very next dispatch through -- no
-        // artificial backoff delay left over from being deferred.
-        state
-            .commit_and_publish({
-                let session_id = sessions[0].id.clone();
-                move |store| {
-                    let (snapshot, events) =
-                        store.end_session_with_reason(&session_id, None, None, None, 2_000)?;
-                    Ok((snapshot, events))
-                }
-            })
-            .await
-            .unwrap();
-        assert!(
-            !at_concurrency_limit(&cfg, &state, &project_id, &waiter_id)
-                .await
-                .unwrap(),
-            "ending occupant's session must free the slot immediately"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_repairs_oversized_memory_before_spawn_preparation() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: directory.path().to_string_lossy().into_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: TaskId::try_from("task-1").unwrap(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Do the thing".to_owned(),
-                    body: "Do the thing.".to_owned(),
-                    priority: 0,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .assign_task(
-                &project_id,
-                &TaskId::try_from("task-1").unwrap(),
-                Some(&agent_id),
-                1_000,
-            )
-            .unwrap();
-        let state = DaemonState::new(store);
-        let memory_path =
-            factory_core::paths::agent_memory_path(directory.path(), &project_id, &agent_id);
-        guidance::ensure_agent(directory.path(), &project_id, &agent_id).unwrap();
-        fs::write(
-            &memory_path,
-            format!(
-                "old lesson\n{}",
-                "x".repeat(guidance::MAX_GUIDANCE_FILE_BYTES)
-            ),
-        )
-        .unwrap();
-        let cfg = config(directory.path());
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let backoff = SpawnBackoff::new();
-
-        // This fixture deliberately has no worktree, so preparation records a
-        // spawn failure after the memory repair. The assertion isolates the
-        // dispatch boundary and would fail if compaction moved after launch.
-        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
-            .await
-            .unwrap();
-        assert!(
-            (fs::metadata(&memory_path).unwrap().len() as usize)
-                < guidance::MEMORY_COMPACTION_HIGH_WATER_BYTES
-        );
-        assert_eq!(
-            guidance::inspect(&memory_path).health.state,
-            factory_core::local::GuidanceHealthState::Ok
-        );
-    }
-
-    /// Deletion's ordering half of this task's mechanism (ARCHITECTURE.md's
-    /// "once deletion begins, no component may create new state under that
-    /// identity"): once `SpawnBackoff::begin_delete` has marked an agent,
-    /// `dispatch_agent` must not create a session row for it at all -- not
-    /// attempt-then-fail, not attempt-then-succeed -- exactly the same
-    /// "not attempted" assertion `dispatch_agent_defers_spawn_at_the_concurrency_limit`
-    /// makes for the concurrency limit, above. Deterministic: no timing,
-    /// just direct state.
-    ///
-    /// The agent is given a real worktree on disk (unlike that sibling
-    /// test) precisely so this one is *not* vacuous (PR #50 review,
-    /// should-fix 6): without a worktree, `spawn_session_for_agent` bails
-    /// at `Error::NoWorktree` before ever reaching `create_session`, so
-    /// `sessions.is_empty()` would hold whether or not
-    /// `try_begin_preparation`'s gate exists at all. With a worktree,
-    /// `spawn_session_for_agent` gets as far as `create_session` before
-    /// failing at the nonexistent `runner_program` -- verified by mutation:
-    /// hard-coding `try_begin_preparation` to always return `true` makes
-    /// this assertion fail (a session row does get created), and reverting
-    /// that makes it pass again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_agent_declines_to_prepare_for_a_deleting_agent() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: worktree.clone(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .set_agent_worktree(&project_id, &agent_id, worktree.clone(), 1_000)
-            .unwrap();
-        std::fs::create_dir_all(&worktree).unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: TaskId::try_from("task-1").unwrap(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Do the thing".to_owned(),
-                    body: "Do the thing.".to_owned(),
-                    priority: 0,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .assign_task(
-                &project_id,
-                &TaskId::try_from("task-1").unwrap(),
-                Some(&agent_id),
-                1_000,
-            )
-            .unwrap();
-
-        let state = DaemonState::new(store);
-        let cfg = config(directory.path());
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let backoff = SpawnBackoff::new();
-
-        // Simulates `Handle::begin_delete`'s first step: mark the agent
-        // deleting before anything else runs.
-        backoff.begin_delete(&agent_id);
-        assert!(
-            !backoff.try_begin_preparation(&agent_id),
-            "a deleting agent must never begin a new spawn preparation"
-        );
-
-        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
-            .await
-            .unwrap();
-
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        assert!(
-            sessions.is_empty(),
-            "a deleting agent must not get a session row at all -- not attempted, not failed"
-        );
-
-        // Clearing the mark (`Handle::end_delete`'s job) restores normal
-        // dispatch for a future agent with the same id.
-        backoff.end_delete(&agent_id);
-        assert!(
-            backoff.try_begin_preparation(&agent_id),
-            "clearing the mark must restore normal dispatch"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_agent_never_spawns_for_an_exhausted_budget() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("worker").unwrap();
-        let task_id = TaskId::try_from("task-1").unwrap();
-        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
-        std::fs::create_dir_all(&worktree).unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".into(),
-                    root: worktree.clone(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                2,
-            )
-            .unwrap();
-        store
-            .set_agent_worktree(&project_id, &agent_id, worktree, 3)
-            .unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Task".into(),
-                    body: String::new(),
-                    priority: 0,
-                },
-                4,
-            )
-            .unwrap();
-        store
-            .assign_task(&project_id, &task_id, Some(&agent_id), 5)
-            .unwrap();
-        store
-            .set_agent_budget(&project_id, &agent_id, Some(1), 6)
-            .unwrap();
-        assert!(
-            !store
-                .observe_tool_call(&project_id, &agent_id, 7)
-                .unwrap()
-                .1
-        );
-        assert!(
-            store
-                .observe_tool_call(&project_id, &agent_id, 8)
-                .unwrap()
-                .1
-        );
-
-        let state = DaemonState::new(store);
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        dispatch_agent(
-            &config(directory.path()),
-            &state,
-            &wake_tx,
-            &SpawnBackoff::new(),
-            &project_id,
-            &agent_id,
-        )
-        .await
-        .unwrap();
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        assert!(
-            sessions.is_empty(),
-            "budget hold must prevent even a failed spawn attempt"
-        );
-    }
-
-    /// Deletion's waiting half: [`SpawnBackoff::wait_for_drain`] must not
-    /// observe an agent as drained while a preparation `try_begin_preparation`
-    /// already admitted is still in flight, and must unblock as soon as
-    /// [`SpawnBackoff::end_preparation`] ends it. Uses a paused clock
-    /// (`start_paused`) rather than a real sleep-and-hope: `SpawnBackoff`
-    /// times entirely through `tokio::time::Instant`, so advancing the
-    /// virtual clock is what actually drives `wait_for_drain`'s poll loop,
-    /// making the "still waiting" assertion below deterministic rather than
-    /// a timing guess.
-    #[tokio::test(start_paused = true)]
-    async fn wait_for_drain_blocks_until_the_in_flight_preparation_ends() {
-        let backoff = Arc::new(SpawnBackoff::new());
-        let agent_id = AgentId::try_from("curie").unwrap();
-
-        assert!(
-            backoff.try_begin_preparation(&agent_id),
-            "simulates the dispatcher having just begun a spawn preparation"
-        );
-
-        let waiter_backoff = Arc::clone(&backoff);
-        let waiter_agent_id = agent_id.clone();
-        let waiter = tokio::spawn(async move {
-            waiter_backoff.begin_delete(&waiter_agent_id);
-            waiter_backoff
-                .wait_for_drain(&waiter_agent_id, Duration::from_secs(5))
-                .await
-        });
-
-        // Let the waiter run up to its first `sleep_until` and register on
-        // the (paused) clock; it cannot possibly have observed a drain yet
-        // because time has not moved and `end_preparation` has not been
-        // called.
-        tokio::task::yield_now().await;
-        assert!(
-            !waiter.is_finished(),
-            "must still be waiting on the in-flight preparation"
-        );
-
-        backoff.end_preparation(&agent_id);
-        // Advances past one poll tick so `wait_for_drain`'s loop wakes,
-        // re-checks, and observes the drain.
-        tokio::time::advance(DELETE_DRAIN_POLL).await;
-        assert!(
-            waiter.await.unwrap(),
-            "must observe the drain once the preparation ends, well within its budget"
-        );
-    }
-
-    /// PR #50 review, blocking finding 1, reproduced verbatim as a unit
-    /// probe: a spawn that *succeeds* while a delete is draining used to
-    /// have its `record_success` (`state.remove`, back when `SpawnBackoff`
-    /// kept backoff timing and the delete mark in one entry) erase the
-    /// concurrent `deleting` mark, so the drain reported "drained" with no
-    /// mark set at all -- reopening #42's exact race for the *next*
-    /// dispatch. Now that `SpawnBackoff::timing` and `SpawnBackoff::gate`
-    /// are separate locks, `record_success` cannot reach `gate` no matter
-    /// what it does.
-    #[tokio::test]
-    async fn record_success_during_a_drain_does_not_erase_the_deleting_mark() {
-        let backoff = SpawnBackoff::new();
-        let agent_id = AgentId::try_from("curie").unwrap();
-
-        assert!(backoff.try_begin_preparation(&agent_id));
-        backoff.begin_delete(&agent_id);
-        // dispatch_agent's own sequence on a successful spawn
-        // (execution.rs's spawn branch): end the preparation, then record
-        // the backoff success.
-        backoff.end_preparation(&agent_id);
-        backoff.record_success(&agent_id);
-
-        assert!(
-            backoff
-                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
-                .await,
-            "the preparation already ended, so this must drain immediately"
-        );
-        assert!(
-            !backoff.try_begin_preparation(&agent_id),
-            "the deleting mark must survive a concurrent record_success"
-        );
-    }
-
-    /// PR #50 review, blocking finding 2, reproduced verbatim: the retry
-    /// `Handle::begin_delete`'s own error message tells the operator to
-    /// make ("try the delete again") used to bypass the drain entirely,
-    /// because `end_delete`'s timeout-branch call was `state.remove`,
-    /// which discarded the `preparing` count of the write that was *still
-    /// running*. The very next `begin_delete` then saw a fresh, empty
-    /// entry and reported "drained" immediately. `end_delete` now clears
-    /// only `deleting`, so a retry keeps seeing the real in-flight count
-    /// until the write actually ends.
-    #[tokio::test(start_paused = true)]
-    async fn a_timed_out_drain_retry_still_waits_for_the_still_in_flight_preparation() {
-        let backoff = SpawnBackoff::new();
-        let agent_id = AgentId::try_from("curie").unwrap();
-
-        // A preparation that outlives the drain timeout entirely.
-        assert!(backoff.try_begin_preparation(&agent_id));
-
-        backoff.begin_delete(&agent_id);
-        assert!(
-            !backoff
-                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
-                .await,
-            "must time out while the preparation is still in flight"
-        );
-        // `Handle::begin_delete`'s timeout branch, verbatim.
-        backoff.end_delete(&agent_id);
-
-        // The operator retries, exactly as the error message says to.
-        backoff.begin_delete(&agent_id);
-        assert!(
-            !backoff
-                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
-                .await,
-            "the retry must still see the still-in-flight preparation, not report drained"
-        );
-
-        // The preparation finally ends -- a third attempt now genuinely
-        // drains.
-        backoff.end_preparation(&agent_id);
-        backoff.begin_delete(&agent_id);
-        assert!(
-            backoff
-                .wait_for_drain(&agent_id, DELETE_DRAIN_TIMEOUT)
-                .await
-        );
-    }
-
-    /// PR #50 review, blocking finding 3/should-fix 5: `Handle`'s
-    /// project-scoped `DeleteGate<ProjectId>` (`try_begin_project_write`/
-    /// `begin_delete_project`, used by `CreateAgent`/`DeleteProject`) is
-    /// the exact same generic mechanism as the agent-scoped one the tests
-    /// above already prove correct, just instantiated over `ProjectId`
-    /// instead of `AgentId`. This drives it directly rather than only
-    /// trusting that the generic code behaves identically for a different
-    /// key type: a `CreateAgent`-equivalent write declines once the
-    /// project is marked deleting, and a fresh write is accepted again
-    /// once the mark clears.
-    #[tokio::test]
-    async fn project_delete_gate_declines_a_create_agent_style_write_while_deleting() {
-        let gate: DeleteGate<ProjectId> = DeleteGate::new();
-        let project_id = ProjectId::try_from("factory").unwrap();
-
-        assert!(
-            gate.try_begin_preparation(&project_id),
-            "an ordinary CreateAgent-style write is accepted before any delete begins"
-        );
-        gate.end_preparation(&project_id);
-
-        gate.begin_delete(&project_id);
-        assert!(
-            !gate.try_begin_preparation(&project_id),
-            "CreateAgent must decline outright once DeleteProject has marked the project"
-        );
-
-        gate.end_delete(&project_id);
-        assert!(
-            gate.try_begin_preparation(&project_id),
-            "clearing the mark must restore normal CreateAgent behavior"
-        );
-    }
-
-    /// PR #50 re-review, round 3's remaining finding: `CreateAgent` must
-    /// decline when its `parent_agent_id` is currently being deleted, not
-    /// just when the project or the new agent's own id is -- otherwise
-    /// `AgentHasChildren` (the one delete precondition a *different*
-    /// request can flip from false to true) can go stale between
-    /// `DeleteAgent`'s precheck and its actual removals. Deterministic:
-    /// this is the exact `try_begin_preparation`/`begin_delete`/
-    /// `end_delete` sequence `Handle::begin_delete` and `CreateAgent`'s
-    /// new parent-id check both go through, with no timing involved.
     #[test]
-    fn create_agent_declines_a_parent_currently_being_deleted() {
-        let backoff = SpawnBackoff::new();
-        let parent_id = AgentId::try_from("boss").unwrap();
-
-        // Simulates `Handle::begin_delete`'s first step for `DeleteAgent
-        // boss`: the mark is set before its precheck or any file removal
-        // runs.
-        backoff.begin_delete(&parent_id);
-
-        // This is exactly what `CreateAgent`'s new parent-id check calls.
-        assert!(
-            !backoff.try_begin_preparation(&parent_id),
-            "CreateAgent must decline when its intended parent is currently being deleted"
-        );
-
-        // `Handle::end_delete`, called once `DeleteAgent boss` finishes
-        // (refused or not) -- restores normal `CreateAgent` behavior for
-        // the same id.
-        backoff.end_delete(&parent_id);
-        assert!(
-            backoff.try_begin_preparation(&parent_id),
-            "clearing the mark must restore normal CreateAgent behavior for the parent id"
-        );
+    fn bearer_is_lowercase_hex_with_the_store_digest_shape() {
+        let bearer = random_bearer();
+        assert_eq!(bearer.len(), 64);
+        assert!(bearer.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(capability_digest(&bearer).len(), 64);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_agent_never_touches_a_stop_requested_starting_session_past_its_deadline() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("stuck").unwrap();
-        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: worktree.clone(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Shell,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: worktree.clone(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: directory
-                        .path()
-                        .join("runs")
-                        .join("session-1")
-                        .to_string_lossy()
-                        .into_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .request_session_stop(&project_id, &session_id, 1_500)
-            .unwrap();
-
-        let state = DaemonState::new(store);
-        let cfg = config(directory.path());
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let backoff = SpawnBackoff::new();
-        dispatch_agent(&cfg, &state, &wake_tx, &backoff, &project_id, &agent_id)
-            .await
-            .unwrap();
-
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        let session = sessions
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .unwrap();
-        assert_eq!(session.state, SessionState::Starting);
-        assert!(session.ended_at_ms.is_none());
-        assert!(session.wait_reason.is_none());
-        assert!(backoff.ready(&agent_id));
-    }
-
-    /// Q1 fix (`synthesize_codex_session_start`'s own doc comment has the
-    /// live/empirical evidence): Codex 0.147 never fires its own
-    /// `SessionStart` hook at TUI startup, so a fresh Codex session would
-    /// otherwise sit in `starting` forever. This test proves the automatic
-    /// transition wakes delivery and stays distinguishable from a real hook.
     #[tokio::test]
-    async fn synthesize_codex_session_start_moves_a_fresh_codex_session_to_idle_and_wakes_it() {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("worker-1").unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: "/tmp/factory".to_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Codex,
-                },
-                1_000,
-            )
-            .unwrap();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let (snapshot, _) = store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Codex,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: "/tmp/factory/worktree".to_owned(),
-                    codex_home: Some("/tmp/factory/codex-home".to_owned()),
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: "/tmp/factory/runs/session-1".to_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-        assert_eq!(snapshot.state, SessionState::Starting);
-
-        let state = DaemonState::new(store);
-        let (wake_tx, mut wake_rx) = mpsc::channel(8);
-        synthesize_codex_session_start(&state, &wake_tx, &session_id).await;
-
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].state, SessionState::Idle);
-        assert_eq!(sessions[0].last_hook_event, None);
-
-        let woken = wake_rx
-            .try_recv()
-            .expect("synthesis must wake the dispatcher");
-        assert_eq!(woken.project_id, project_id);
-        assert_eq!(woken.agent_id, agent_id);
+    async fn delete_gate_refuses_new_writes_and_drains_the_exact_identity() {
+        let gate = DeleteGate::new();
+        let id = AgentId::try_from("worker").unwrap();
+        assert!(gate.try_begin_write(&id));
+        gate.begin_delete(&id);
+        assert!(!gate.try_begin_write(&id));
+        assert!(!gate.wait_for_drain(&id, Duration::ZERO).await);
+        gate.end_write(&id);
+        assert!(gate.wait_for_drain(&id, Duration::ZERO).await);
     }
 
-    /// Adversarial review finding 1's fix, condition (b): a pure unit test
-    /// of the exact gate `wait_for_runner_exit`/`consume_until_exit` use --
-    /// `synthesize_on_raw_mode` is derived once, at each caller's own spawn
-    /// or recovery site, from `provider == Provider::Codex`; this proves
-    /// the gate itself only ever says yes for that combination.
     #[test]
-    fn should_synthesize_session_start_only_for_codex_and_only_on_terminal_raw() {
-        assert!(should_synthesize_session_start(
-            true,
-            &RunnerEvent::TerminalRaw
-        ));
-        assert!(!should_synthesize_session_start(
-            false,
-            &RunnerEvent::TerminalRaw
-        ));
-        assert!(!should_synthesize_session_start(
-            true,
-            &RunnerEvent::Started { child_pid: 1 }
-        ));
-        assert!(!should_synthesize_session_start(
-            false,
-            &RunnerEvent::Started { child_pid: 1 }
-        ));
+    fn pid_locator_is_typed_json_not_display_text() {
+        let locator = serde_json::json!({ "pid": 42 }).to_string();
+        assert_eq!(locator_number(&locator, "pid"), Some(42));
+        assert_eq!(locator_number("pid 42", "pid"), None);
     }
 
-    /// End-to-end version of the same gate (review finding 9b): three
-    /// sessions -- Codex, Claude, `shell` -- each `starting`, each observes
-    /// the same `RunnerEvent::TerminalRaw` with `synthesize_on_raw_mode`
-    /// derived exactly as `spawn_session_for_agent`/`supervise_recovered` do
-    /// it (`provider == Provider::Codex`). Only the Codex session reaches
-    /// `idle`; Claude and `shell` are left alone for their own real hooks.
-    #[tokio::test]
-    async fn terminal_raw_only_synthesizes_session_start_for_codex_never_for_claude_or_shell() {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: "/tmp/factory".to_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-
-        let providers = [
-            (
-                "codex-agent",
-                Provider::Codex,
-                "11111111-1111-4111-8111-111111111111",
-            ),
-            (
-                "claude-agent",
-                Provider::ClaudeCode,
-                "22222222-2222-4222-8222-222222222222",
-            ),
-            (
-                "shell-agent",
-                Provider::Shell,
-                "33333333-3333-4333-8333-333333333333",
-            ),
-        ];
-        let mut session_ids = Vec::new();
-        for (agent_name, provider, session_uuid) in providers {
-            let agent_id = AgentId::try_from(agent_name).unwrap();
-            store
-                .create_agent(
-                    crate::store::NewAgent {
-                        id: agent_id.clone(),
-                        project_id: project_id.clone(),
-                        parent_agent_id: None,
-                        role: AgentRole::Worker,
-                        provider,
-                    },
-                    1_000,
-                )
-                .unwrap();
-            let session_id = SessionId::try_from(session_uuid).unwrap();
-            store
-                .create_session(
-                    crate::store::NewSession {
-                        id: session_id.clone(),
-                        project_id: project_id.clone(),
-                        agent_id,
-                        provider,
-                        runtime_model: None,
-                        runtime_reasoning_effort: None,
-                        runtime_permission_mode: None,
-                        runtime_control_mode: None,
-                        provider_session_id: None,
-                        worktree: "/tmp/factory/worktree".to_owned(),
-                        codex_home: None,
-                        hook_token: "a".repeat(64),
-                        runner_instance_id: RunnerInstanceId::try_from(session_uuid).unwrap(),
-                        runner_runtime: format!("/tmp/factory/runs/{agent_name}"),
-                        runner_protocol_version: 1,
-                    },
-                    1_000,
-                )
-                .unwrap();
-            session_ids.push((provider, session_id));
-        }
-
-        let state = DaemonState::new(store);
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        for (provider, session_id) in &session_ids {
-            let synthesize_on_raw_mode = *provider == Provider::Codex;
-            if should_synthesize_session_start(synthesize_on_raw_mode, &RunnerEvent::TerminalRaw) {
-                synthesize_codex_session_start(&state, &wake_tx, session_id).await;
-            }
-        }
-
-        let sessions = state
-            .with_store({
-                let project_id = project_id.clone();
-                move |store| store.list_sessions(&project_id, None, 10)
-            })
-            .await
-            .unwrap();
-        for session in sessions {
-            if session.provider == Provider::Codex {
-                assert_eq!(
-                    session.state,
-                    SessionState::Idle,
-                    "the Codex session must be synthesized to idle"
-                );
-            } else {
-                assert_eq!(
-                    session.state,
-                    SessionState::Starting,
-                    "{:?} must never be synthesized -- it waits for its own real hook",
-                    session.provider
-                );
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_task_without_a_live_session_fails_clearly() {
-        let directory = private_tempdir();
-        let state = DaemonState::new(Store::open_in_memory().unwrap());
-        let (handle, join) = spawn(config(directory.path()), state).unwrap();
-        let result = handle
-            .start_task(StartTask {
-                project_id: ProjectId::try_from("factory").unwrap(),
-                task_id: TaskId::try_from("task-1").unwrap(),
-                agent_id: AgentId::try_from("agent-1").unwrap(),
-                parent_run_id: None,
-                worktree: directory.path().to_path_buf(),
-            })
-            .await;
-        assert!(matches!(result, Err(Error::NoLiveSession)));
-        handle.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
-    }
-
-    #[derive(Clone, Copy)]
-    enum StartTaskHookRace {
-        BeforeFailure,
-        BeforeWaiting,
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_task_accepts_the_exact_hook_that_wins_the_timeout_failure_cas() {
-        run_start_task_hook_race(StartTaskHookRace::BeforeFailure).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_task_accepts_the_exact_hook_after_failure_before_waiting() {
-        run_start_task_hook_race(StartTaskHookRace::BeforeWaiting).await;
-    }
-
-    async fn run_start_task_hook_race(race: StartTaskHookRace) {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let task_id = TaskId::try_from("race-task").unwrap();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let runner_instance_id =
-            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
-        let runtime_dir = directory.path().join("runner");
-        let worktree = directory.path().join("repo");
-        fs::create_dir(&worktree).unwrap();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".into(),
-                    root: worktree.to_string_lossy().into_owned(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                2,
-            )
-            .unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Race the late hook".into(),
-                    body: String::new(),
-                    priority: 0,
-                },
-                3,
-            )
-            .unwrap();
-        store
-            .assign_task(&project_id, &task_id, Some(&agent_id), 4)
-            .unwrap();
-        store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Shell,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: worktree.to_string_lossy().into_owned(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: runner_instance_id.clone(),
-                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
-                    runner_protocol_version: 1,
-                },
-                5,
-            )
-            .unwrap();
-        store
-            .record_hook_event(
-                &session_id,
-                ProviderHookEvent::SessionStart,
-                None,
-                false,
-                None,
-                6,
-            )
-            .unwrap();
-
-        let runner = start_test_runner(factory_runner::Config {
-            run_id: session_run_id(&session_id).unwrap(),
-            runner_instance_id: runner_instance_id.clone(),
-            runtime_dir: runtime_dir.clone(),
-            cwd: worktree.clone(),
-            startup_input: None,
-            program: PathBuf::from("/bin/sh"),
-            arguments: vec!["-c".into(), "while :; do sleep 1; done".into()],
-            terminal: None,
-        })
-        .await;
-        let state = DaemonState::new(store);
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let (shutdown, _shutdown_rx) = watch::channel(false);
-        let waiter_finished = Arc::new(tokio::sync::Barrier::new(2));
-        let failure_released = Arc::new(tokio::sync::Barrier::new(2));
-        let failure_recorded = Arc::new(tokio::sync::Barrier::new(2));
-        let waiting_released = Arc::new(tokio::sync::Barrier::new(2));
-        let (waiter_test, failure_test, recorded_test, waiting_test) = match race {
-            StartTaskHookRace::BeforeFailure => (
-                Some(Arc::clone(&waiter_finished)),
-                Some(Arc::clone(&failure_released)),
-                None,
-                None,
-            ),
-            StartTaskHookRace::BeforeWaiting => (
-                None,
-                None,
-                Some(Arc::clone(&failure_recorded)),
-                Some(Arc::clone(&waiting_released)),
-            ),
-        };
-        let handle = Handle {
-            state: state.clone(),
-            config: Arc::new(config(directory.path())),
-            wake_tx,
-            shutdown,
-            backoff: Arc::new(SpawnBackoff::new()),
-            project_gate: Arc::new(DeleteGate::new()),
-            start_task_ack_test: Some(StartTaskAckTest {
-                timeout: Duration::from_millis(1),
-                waiter_finished: waiter_test,
-                failure_released: failure_test,
-                failure_recorded: recorded_test,
-                waiting_released: waiting_test,
-            }),
-        };
-
-        let start = tokio::spawn({
-            let handle = handle.clone();
-            let project_id = project_id.clone();
-            let agent_id = agent_id.clone();
-            let task_id = task_id.clone();
-            let worktree = worktree.clone();
-            async move {
-                handle
-                    .start_task(StartTask {
-                        project_id,
-                        agent_id,
-                        task_id,
-                        parent_run_id: None,
-                        worktree,
-                    })
-                    .await
-            }
-        });
-        let (reached, released) = match race {
-            StartTaskHookRace::BeforeFailure => (&waiter_finished, &failure_released),
-            StartTaskHookRace::BeforeWaiting => (&failure_recorded, &waiting_released),
-        };
-        timeout(Duration::from_secs(2), reached.wait())
-            .await
-            .unwrap();
-        let (session, attempt) = state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let session_id = session_id.clone();
-                move |store| {
-                    Ok((
-                        store.session_snapshot(&project_id, &session_id)?,
-                        store
-                            .delivery_attempt_for_session(&project_id, &agent_id, &session_id)?
-                            .unwrap(),
-                    ))
-                }
-            })
-            .await
-            .unwrap();
-        let payload = serde_json::json!({ "prompt": attempt.text });
-        assert_eq!(
-            commit_pending_delivery_on_prompt(&state, &session, &payload)
-                .await
-                .unwrap(),
-            PromptDeliveryAdmission::Acknowledged
-        );
-        assert_eq!(
-            commit_pending_delivery_on_prompt(&state, &session, &payload)
-                .await
-                .unwrap(),
-            PromptDeliveryAdmission::Acknowledged,
-            "the same exact hook is idempotent"
-        );
-        released.wait().await;
-        let started = timeout(Duration::from_secs(2), start)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        let before_hook_event = state
-            .with_store({
-                let project_id = project_id.clone();
-                let session_id = session_id.clone();
-                move |store| store.session_snapshot(&project_id, &session_id)
-            })
-            .await
-            .unwrap();
-        assert_ne!(
-            before_hook_event.state,
-            SessionState::WaitingForInput,
-            "the timeout path must not overwrite a run admitted before the later hook event"
-        );
-        state
-            .commit_and_publish({
-                let session_id = session_id.clone();
-                move |store| {
-                    let (_, event) = store.record_hook_event(
-                        &session_id,
-                        ProviderHookEvent::UserPromptSubmit,
-                        None,
-                        false,
-                        None,
-                        8,
-                    )?;
-                    Ok(((), vec![event]))
-                }
-            })
-            .await
-            .unwrap();
-        let (task, runs, attempt_state, session) = state
-            .with_store({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                let attempt_id = attempt.id.clone();
-                let session_id = session_id.clone();
-                move |store| {
-                    Ok((
-                        store.get_task(&project_id, &task_id)?,
-                        store.list_runs(&project_id, None, 10)?,
-                        store.delivery_attempt_state(&attempt_id)?,
-                        store.session_snapshot(&project_id, &session_id)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Running);
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].id, started.run_id);
-        assert_eq!(attempt_state, Some(DeliveryAttemptState::Acknowledged));
-        assert_eq!(session.state, SessionState::Working);
-
-        RunnerClient::new(
-            &runtime_dir,
-            session_run_id(&session_id).unwrap(),
-            runner_instance_id,
-        )
-        .stop(1_000)
-        .await
-        .unwrap();
-        runner.abort();
-        let _ = runner.await;
-    }
-
-    #[tokio::test]
-    async fn migrated_terminal_attempt_accepts_only_its_exact_late_hook_once() {
-        let directory = private_tempdir();
-        let database = directory.path().join("terminal-attempt-v28.db");
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let task_id = TaskId::try_from("late-task").unwrap();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let attempt_id = "legacy-terminal-attempt";
-        {
-            let mut store = Store::open(&database).unwrap();
-            store
-                .create_project(
-                    crate::store::NewProject {
-                        id: project_id.clone(),
-                        name: "Factory".into(),
-                        root: directory.path().to_string_lossy().into_owned(),
-                    },
-                    1,
-                )
-                .unwrap();
-            store
-                .create_agent(
-                    crate::store::NewAgent {
-                        id: agent_id.clone(),
-                        project_id: project_id.clone(),
-                        parent_agent_id: None,
-                        role: AgentRole::Worker,
-                        provider: Provider::Shell,
-                    },
-                    2,
-                )
-                .unwrap();
-            store
-                .create_task(
-                    crate::store::NewTask {
-                        id: task_id.clone(),
-                        project_id: project_id.clone(),
-                        parent_task_id: None,
-                        title: "Accept the late hook".into(),
-                        body: String::new(),
-                        priority: 0,
-                    },
-                    3,
-                )
-                .unwrap();
-            store
-                .assign_task(&project_id, &task_id, Some(&agent_id), 4)
-                .unwrap();
-            store
-                .create_session(
-                    NewSession {
-                        id: session_id.clone(),
-                        project_id: project_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider: Provider::Shell,
-                        runtime_model: None,
-                        runtime_reasoning_effort: None,
-                        runtime_permission_mode: None,
-                        runtime_control_mode: None,
-                        provider_session_id: None,
-                        worktree: directory.path().to_string_lossy().into_owned(),
-                        codex_home: None,
-                        hook_token: "a".repeat(64),
-                        runner_instance_id: RunnerInstanceId::try_from(
-                            "22222222-2222-4222-8222-222222222222",
-                        )
-                        .unwrap(),
-                        runner_runtime: directory
-                            .path()
-                            .join("runner")
-                            .to_string_lossy()
-                            .into_owned(),
-                        runner_protocol_version: 1,
-                    },
-                    5,
-                )
-                .unwrap();
-            store
-                .record_hook_event(
-                    &session_id,
-                    ProviderHookEvent::SessionStart,
-                    None,
-                    false,
-                    None,
-                    6,
-                )
-                .unwrap();
-            let marker = store.task_delivery_marker(&task_id).unwrap();
-            store
-                .ensure_delivery_attempt(NewDeliveryAttempt {
-                    id: attempt_id.into(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    session_id: session_id.clone(),
-                    task_id: Some(task_id.clone()),
-                    task_incarnation_id: Some(marker.incarnation_id),
-                    task_revision: Some(marker.task_revision),
-                    require_queue_head: false,
-                    message_ids: Vec::new(),
-                    text: "legacy exact prompt".into(),
-                    created_at_ms: 7,
-                })
-                .unwrap();
-        }
-        {
-            let connection = rusqlite::Connection::open(&database).unwrap();
-            connection
-                .execute_batch(
-                    "UPDATE delivery_attempts SET state = 'terminal' WHERE id = 'legacy-terminal-attempt';
-                     PRAGMA foreign_keys = OFF;
-                     DROP TABLE session_work;
-                     DROP INDEX delivery_attempts_session_work_identity;
-                     DROP INDEX runs_one_open_per_session;
-                     ALTER TABLE delivery_attempts DROP COLUMN run_id;
-                     ALTER TABLE delivery_attempts DROP COLUMN task_revision;
-                     ALTER TABLE tasks DROP COLUMN work_revision;
-                     PRAGMA user_version = 28;
-                     PRAGMA foreign_keys = ON;",
-                )
-                .unwrap();
-        }
-
-        let store = Store::open(&database).unwrap();
-        let work = store.session_work(&session_id).unwrap();
-        assert!(matches!(
-            work.work.unwrap().phase,
-            SessionWorkPhase::Uncertain(_)
-        ));
-        assert_eq!(
-            store.delivery_attempt_state(attempt_id).unwrap(),
-            Some(DeliveryAttemptState::Terminal)
-        );
-        let state = DaemonState::new(store);
-        let session = state
-            .with_store({
-                let project_id = project_id.clone();
-                let session_id = session_id.clone();
-                move |store| store.session_snapshot(&project_id, &session_id)
-            })
-            .await
-            .unwrap();
-        let payload = serde_json::json!({ "prompt": "legacy exact prompt" });
-        for _ in 0..2 {
-            assert_eq!(
-                commit_pending_delivery_on_prompt(&state, &session, &payload)
-                    .await
-                    .unwrap(),
-                PromptDeliveryAdmission::Acknowledged
-            );
-        }
-        let (task, runs, attempt, work) = state
-            .with_store({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                let session_id = session_id.clone();
-                move |store| {
-                    Ok((
-                        store.get_task(&project_id, &task_id)?,
-                        store.list_runs(&project_id, None, 10)?,
-                        store.delivery_attempt_state(attempt_id)?,
-                        store.session_work(&session_id)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Running);
-        assert_eq!(runs.len(), 1, "the repeated exact hook opens one run");
-        assert_eq!(attempt, Some(DeliveryAttemptState::Acknowledged));
-        assert!(matches!(
-            work.work.unwrap().phase,
-            SessionWorkPhase::Running(_)
-        ));
-    }
-
-    /// This track's item 9: a recovered session's runner that never
-    /// becomes reachable again (a stale `control.sock` -- bound once,
-    /// then its listener dropped without unlinking the file, exactly
-    /// what a runner process's own OS-level teardown can leave behind if
-    /// it never gets the chance to run its normal cleanup) must not stay
-    /// dangling in whatever state it was recovered in forever; it must
-    /// durably fail. Drives `supervise_recovered` directly with
-    /// `max_attempts: 1` so this test only waits through one
-    /// `CONNECT_GRACE` window (~5s) instead of production's real
-    /// `MAX_RECOVERY_ATTEMPTS` -- see `supervise_recovered`'s own doc
-    /// comment for why that parameter exists at all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_recovered_session_whose_runner_stays_unreachable_is_durably_failed_not_left_dangling()
-     {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let worktree = directory.path().join("repo").to_string_lossy().into_owned();
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: worktree.clone(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-
-        let runtime_dir = directory.path().join("runs").join("session-1");
+    #[test]
+    fn runtime_removal_refuses_a_replacement_inode() {
+        let parent = private_tempdir();
+        let runtime = parent.path().join("runtime");
         fs::DirBuilder::new()
-            .recursive(true)
             .mode(PRIVATE_DIRECTORY_MODE)
-            .create(&runtime_dir)
+            .create(&runtime)
             .unwrap();
-        let socket_path = runtime_dir.join("control.sock");
-        {
-            let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
-            drop(listener);
-        }
-
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let runner_instance_id =
-            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
-        store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Shell,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: worktree.clone(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: runner_instance_id.clone(),
-                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-
-        let state = DaemonState::new(store);
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let recovered = crate::store::RecoverableSession {
-            session_id: session_id.clone(),
-            provider: Provider::Shell,
-            provider_session_id: None,
-            worktree,
-            runner_instance_id,
-            runner_runtime: runtime_dir.to_string_lossy().into_owned(),
-            runner_protocol_version: 1,
-            observer_health: factory_core::ObserverHealth::Unknown,
-            delivery_recovery_stop_requested: false,
-        };
-
-        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
-
-        let sessions = state
-            .with_store(move |store| store.list_sessions(&project_id, None, 10))
-            .await
-            .unwrap();
-        let session = sessions
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .expect("the recovered session must still exist");
-        assert_eq!(session.state, SessionState::Failed);
-        assert!(!session.state.is_live());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_replays_a_recovery_stop_committed_before_the_runner_command() {
-        let fixture = recovery_stop_fixture();
-        let runner = start_test_runner(fixture.runner).await;
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        supervise_recovered(
-            fixture.state.clone(),
-            wake_tx,
-            fixture.recovered,
-            shutdown_rx,
-            1,
-        )
-        .await;
-        timeout(Duration::from_secs(2), runner)
-            .await
-            .unwrap()
-            .unwrap();
-        let session = fixture
-            .state
-            .with_store(|store| store.recoverable_sessions())
-            .await
-            .unwrap();
-        assert!(
-            session.is_empty(),
-            "replayed stop must reach durable runner exit"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restart_retries_a_recovery_stop_after_the_first_control_call_failed() {
-        let fixture = recovery_stop_fixture();
-        let client = RunnerClient::new(
-            &fixture.recovered.runner_runtime,
-            session_run_id(&fixture.recovered.session_id).unwrap(),
-            fixture.recovered.runner_instance_id.clone(),
-        );
-        assert!(
-            client.stop(2_000).await.is_err(),
-            "the pre-restart control call intentionally runs before the runner socket exists"
-        );
-
-        let runner = start_test_runner(fixture.runner).await;
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        supervise_recovered(
-            fixture.state.clone(),
-            wake_tx,
-            fixture.recovered,
-            shutdown_rx,
-            1,
-        )
-        .await;
-        timeout(Duration::from_secs(2), runner)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            fixture
-                .state
-                .with_store(|store| store.recoverable_sessions())
-                .await
-                .unwrap()
-                .is_empty(),
-            "durable intent must survive the failed call and be replayed after restart"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn terminal_exit_wins_when_the_replayed_stop_is_already_too_late() {
-        let mut fixture = recovery_stop_fixture();
-        fixture.runner.arguments = vec!["-c".into(), "exit 0".into()];
-        let runner = start_test_runner(fixture.runner).await;
-        // Let the provider exit before recovery supervision reconnects. The
-        // runner retains the terminal event until the new daemon acknowledges
-        // it, while a concurrent Stop may legitimately return Conflict.
-        tokio::task::yield_now().await;
-        let (wake_tx, _wake_rx) = mpsc::channel(8);
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        supervise_recovered(
-            fixture.state.clone(),
-            wake_tx,
-            fixture.recovered,
-            shutdown_rx,
-            1,
-        )
-        .await;
-        timeout(Duration::from_secs(2), runner)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            fixture
-                .state
-                .with_store(|store| store.recoverable_sessions())
-                .await
-                .unwrap()
-                .is_empty(),
-            "the retained terminal event must complete recovery despite Stop conflict"
-        );
-    }
-
-    #[tokio::test]
-    async fn late_exact_prompt_hook_is_denied_after_recovery_wins() {
-        let fixture = recovery_stop_fixture();
-        let session = fixture
-            .state
-            .with_store({
-                let session_id = fixture.recovered.session_id.clone();
-                move |store| {
-                    store.session_snapshot(&ProjectId::try_from("factory").unwrap(), &session_id)
-                }
-            })
-            .await
+        let original = runtime_birth_fingerprint(&runtime).unwrap().unwrap();
+        fs::rename(&runtime, parent.path().join("original")).unwrap();
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&runtime)
             .unwrap();
 
         assert_eq!(
-            admit_delivery_attempt(&fixture.state, &session, fixture.stale_in_flight_attempt,)
-                .await
-                .unwrap(),
-            PromptDeliveryAdmission::Denied,
-            "a delayed UserPromptSubmit must be blocked before model/tool execution"
+            remove_runtime_if_exact(
+                &runtime,
+                &parent.path().join(".finalize-test"),
+                Some(&original),
+            )
+            .unwrap(),
+            RuntimeRemoval::Unproven
         );
-        let (task, runs) = fixture
-            .state
-            .with_store(|store| {
-                Ok((
-                    store.get_task(
-                        &ProjectId::try_from("factory").unwrap(),
-                        &TaskId::try_from("recovery-task").unwrap(),
-                    )?,
-                    store.list_runs(&ProjectId::try_from("factory").unwrap(), None, 10)?,
-                ))
-            })
-            .await
-            .unwrap();
-        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Queued);
-        assert!(
-            runs.is_empty(),
-            "the denied old turn must open no duplicate run"
-        );
-    }
-
-    #[tokio::test]
-    async fn late_message_only_prompt_hook_is_denied_without_delivering_the_inbox() {
-        let fixture = message_recovery_stop_fixture();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let session_id = fixture.recovered.session_id.clone();
-        let session = fixture
-            .state
-            .with_store({
-                let project_id = project_id.clone();
-                let session_id = session_id.clone();
-                move |store| store.session_snapshot(&project_id, &session_id)
-            })
-            .await
-            .unwrap();
-
-        assert_eq!(
-            admit_delivery_attempt(&fixture.state, &session, fixture.stale_in_flight_attempt,)
-                .await
-                .unwrap(),
-            PromptDeliveryAdmission::Denied,
-            "the lost message-attempt CAS must become an explicit provider denial"
-        );
-        let (pending, attempt, runs) = fixture
-            .state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                move |store| {
-                    Ok((
-                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
-                        store.delivery_attempt_state("recovery-attempt")?,
-                        store.list_runs(&project_id, None, 10)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            pending.len(),
-            1,
-            "the fresh conversation must retain the message"
-        );
-        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
-        assert!(runs.is_empty(), "a message-only denial must not open a run");
-    }
-
-    /// Issue #85 and PR #90 review: only a run created after candidate
-    /// composition proves the synchronous hook won this attempt. An older
-    /// episode for the same task/session must not hide either error form
-    /// after that task is retried.
-    #[tokio::test]
-    async fn delivery_commit_ignores_only_a_task_already_run_in_the_same_session() {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let race_task_id = TaskId::try_from("race-task").unwrap();
-        let aba_task_id = TaskId::try_from("aba-task").unwrap();
-        let task_id = TaskId::try_from("task-1").unwrap();
-        let occupying_task_id = TaskId::try_from("task-2").unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                crate::store::NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: "/tmp/factory".to_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                crate::store::NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_session(
-                crate::store::NewSession {
-                    id: session_id.clone(),
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    provider: Provider::Shell,
-                    runtime_model: None,
-                    runtime_reasoning_effort: None,
-                    runtime_permission_mode: None,
-                    runtime_control_mode: None,
-                    provider_session_id: None,
-                    worktree: "/tmp/factory".to_owned(),
-                    codex_home: None,
-                    hook_token: "a".repeat(64),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: "/tmp/factory-runner".to_owned(),
-                    runner_protocol_version: 1,
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .record_hook_event(
-                &session_id,
-                ProviderHookEvent::SessionStart,
-                None,
-                false,
-                None,
-                1_001,
-            )
-            .unwrap();
-        for id in [&race_task_id, &aba_task_id, &task_id, &occupying_task_id] {
-            store
-                .create_task(
-                    crate::store::NewTask {
-                        id: id.clone(),
-                        project_id: project_id.clone(),
-                        parent_task_id: None,
-                        title: "Do the thing".to_owned(),
-                        body: "Do the thing.".to_owned(),
-                        priority: 0,
-                    },
-                    1_002,
-                )
-                .unwrap();
-            store
-                .assign_task(&project_id, id, Some(&agent_id), 1_003)
-                .unwrap();
-        }
-
-        // ABA counterexample: retain a delivery marker for the old row,
-        // delete it, then create and run a different task with the same
-        // operator-facing id. Its replacement run must not prove the old
-        // composed text was delivered.
-        let old_marker = store.task_delivery_marker(&aba_task_id).unwrap();
-        let aba_delivery = Delivery {
-            task_id: Some(aba_task_id.clone()),
-            task_incarnation_id: Some(old_marker.incarnation_id.clone()),
-            task_revision: Some(old_marker.task_revision),
-            run_id: None,
-            require_queue_head: false,
-            message_ids: Vec::new(),
-            text: "old task body".to_owned(),
-        };
-        let aba_attempt = store
-            .ensure_delivery_attempt(NewDeliveryAttempt {
-                id: "aba-attempt".to_owned(),
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                task_id: aba_delivery.task_id.clone(),
-                task_incarnation_id: aba_delivery.task_incarnation_id.clone(),
-                task_revision: aba_delivery.task_revision,
-                require_queue_head: false,
-                message_ids: aba_delivery.message_ids.clone(),
-                text: aba_delivery.text.clone(),
-                created_at_ms: 1_005,
-            })
-            .unwrap();
-        store.delete_task(&project_id, &aba_task_id, 1_006).unwrap();
-        store
-            .create_task(
-                crate::store::NewTask {
-                    id: aba_task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Replacement".to_owned(),
-                    body: "Different work.".to_owned(),
-                    priority: 0,
-                },
-                1_007,
-            )
-            .unwrap();
-        store
-            .assign_task(&project_id, &aba_task_id, Some(&agent_id), 1_008)
-            .unwrap();
-        store
-            .open_run_episode(&session_id, &aba_task_id, 1_009)
-            .unwrap();
-        store
-            .complete_task(
-                &project_id,
-                &aba_task_id,
-                "replacement done".to_owned(),
-                1_010,
-            )
-            .unwrap();
-        // Original race: the candidate observes no prior episode, then the
-        // hook opens one and the fast client finishes it before this commit.
-        // The durable attempt is created while the task is still queued.
-        let race_marker = store.task_delivery_marker(&race_task_id).unwrap();
-        let race_delivery = Delivery {
-            task_id: Some(race_task_id.clone()),
-            task_incarnation_id: Some(race_marker.incarnation_id.clone()),
-            task_revision: Some(race_marker.task_revision),
-            run_id: None,
-            require_queue_head: false,
-            message_ids: Vec::new(),
-            text: "already delivered".to_owned(),
-        };
-        let race_attempt = store
-            .ensure_delivery_attempt(NewDeliveryAttempt {
-                id: "race-attempt".to_owned(),
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                task_id: race_delivery.task_id.clone(),
-                task_incarnation_id: race_delivery.task_incarnation_id.clone(),
-                task_revision: race_delivery.task_revision,
-                require_queue_head: false,
-                message_ids: race_delivery.message_ids.clone(),
-                text: race_delivery.text.clone(),
-                created_at_ms: 1_010,
-            })
-            .unwrap();
-        store
-            .open_run_episode_with_delivery_attempt(
-                &session_id,
-                &race_task_id,
-                Some(&[]),
-                Some(&race_attempt.id),
-                1_011,
-            )
-            .unwrap();
-        store
-            .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_012)
-            .unwrap();
-        let event_count = store.events_after(0, 100).unwrap().len();
-        let state = DaemonState::new(store);
-
-        let result = commit_delivery(
-            &state,
-            &project_id,
-            &agent_id,
-            &session_id,
-            &race_attempt.id,
-            Delivery::from_attempt(&race_attempt),
-            1_011,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, None);
-        let mut delayed_events = state.subscribe();
-        assert!(
-            wait_for_ack(
-                &state,
-                &mut delayed_events,
-                &session_id,
-                &race_attempt.id,
-                0,
-                Duration::from_millis(1),
-            )
-            .await,
-            "durable acknowledgement must win even when its broadcast is delayed or lost"
-        );
-        let events = state
-            .with_store(move |store| store.events_after(0, 100))
-            .await
-            .unwrap();
-        assert_eq!(events.len(), event_count, "the retry commits no events");
-
-        let aba = commit_delivery(
-            &state,
-            &project_id,
-            &agent_id,
-            &session_id,
-            &aba_attempt.id,
-            aba_delivery,
-            1_012,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            aba, None,
-            "a cancelled old attempt cannot open replacement work"
-        );
-
-        // Historical episode -> retry -> unrelated cancellation. The run
-        // count did not advance after this candidate was composed.
-        state
-            .commit_and_publish({
-                let session_id = session_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let opened = store.open_run_episode(&session_id, &task_id, 1_007)?;
-                    Ok((opened.run, opened.events))
-                }
-            })
-            .await
-            .unwrap();
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let (task, event) = store.cancel_task(&project_id, &task_id, 1_008)?;
-                    Ok((task, vec![event]))
-                }
-            })
-            .await
-            .unwrap();
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let (task, event) = store.retry_task(&project_id, &task_id, 1_009)?;
-                    Ok((task, vec![event]))
-                }
-            })
-            .await
-            .unwrap();
-        let marker = state
-            .with_store({
-                let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&task_id)
-            })
-            .await
-            .unwrap();
-        let cancelled_delivery = Delivery {
-            task_id: Some(task_id.clone()),
-            task_incarnation_id: Some(marker.incarnation_id.clone()),
-            task_revision: Some(marker.task_revision),
-            run_id: None,
-            require_queue_head: false,
-            message_ids: Vec::new(),
-            text: "cancelled retry".to_owned(),
-        };
-        let cancelled_attempt = test_delivery_attempt(
-            &state,
-            "cancelled-attempt",
-            &project_id,
-            &agent_id,
-            &session_id,
-            &cancelled_delivery,
-            1_009,
-        )
-        .await;
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let (task, event) = store.cancel_task(&project_id, &task_id, 1_010)?;
-                    Ok((task, vec![event]))
-                }
-            })
-            .await
-            .unwrap();
-        let task_not_queued = commit_delivery(
-            &state,
-            &project_id,
-            &agent_id,
-            &session_id,
-            &cancelled_attempt.id,
-            cancelled_delivery,
-            1_011,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            task_not_queued, None,
-            "task cancellation invalidates the attempt"
-        );
-
-        // Historical episode -> retry -> a different current run. The old
-        // task/session match must not hide the resulting AgentUnavailable.
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    let (task, event) = store.retry_task(&project_id, &task_id, 1_012)?;
-                    Ok((task, vec![event]))
-                }
-            })
-            .await
-            .unwrap();
-        let marker = state
-            .with_store({
-                let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&task_id)
-            })
-            .await
-            .unwrap();
-        let unavailable_delivery = Delivery {
-            task_id: Some(task_id.clone()),
-            task_incarnation_id: Some(marker.incarnation_id),
-            task_revision: Some(marker.task_revision),
-            run_id: None,
-            require_queue_head: false,
-            message_ids: Vec::new(),
-            text: "blocked by another run".to_owned(),
-        };
-        let unavailable_attempt = test_delivery_attempt(
-            &state,
-            "unavailable-attempt",
-            &project_id,
-            &agent_id,
-            &session_id,
-            &unavailable_delivery,
-            1_012,
-        )
-        .await;
-        let blocked = state
-            .commit_and_publish({
-                let session_id = session_id.clone();
-                let occupying_task_id = occupying_task_id.clone();
-                move |store| {
-                    let opened = store.open_run_episode(&session_id, &occupying_task_id, 1_013)?;
-                    Ok((opened.run, opened.events))
-                }
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            blocked,
-            DaemonStateError::Store(StoreError::AgentUnavailable)
-        ));
-        let admitted = commit_delivery(
-            &state,
-            &project_id,
-            &agent_id,
-            &session_id,
-            &unavailable_attempt.id,
-            Delivery::from_attempt(&unavailable_attempt),
-            1_014,
-        )
-        .await
-        .unwrap();
-        assert_eq!(admitted, unavailable_attempt.run_id);
+        assert!(runtime.is_dir(), "replacement runtime must not be deleted");
     }
 
     #[test]
-    fn truncate_utf8_stays_on_a_char_boundary() {
-        let text = "hello 🏭 world";
-        let truncated = truncate_utf8(text, 8);
-        assert!(truncated.starts_with("hello"));
-    }
-
-    fn task(id: &str, title: &str, body: &str) -> TaskDetail {
-        TaskDetail {
-            snapshot: factory_core::TaskSnapshot {
-                id: TaskId::try_from(id).unwrap(),
-                project_id: ProjectId::try_from("factory").unwrap(),
-                parent_task_id: None,
-                assigned_agent_id: Some(AgentId::try_from("curie").unwrap()),
-                title: title.to_owned(),
-                status: factory_core::TaskStatus::Running,
-                priority: 0,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-            body: body.to_owned(),
-            result: None,
-            blocked_reason: None,
-        }
-    }
-
-    #[test]
-    fn compose_text_embeds_the_task_colon_id_marker_the_shell_fixture_looks_for() {
-        let directory = private_tempdir();
-        let text = compose_text(
-            directory.path(),
-            &ProjectId::try_from("factory").unwrap(),
-            &AgentId::try_from("curie").unwrap(),
-            Some(&task("task-1", "Build the thing", "Do the work.")),
-            &[],
-            AgentRole::Worker,
-        );
-        assert!(text.starts_with("Task task-1: Build the thing (task:task-1)"));
-        assert!(text.contains("factoryctl task done --task task-1"));
-        assert!(text.contains("factoryctl task blocked --task task-1"));
-        assert!(text.contains("Do the work."));
-        assert!(text.contains("Curate and merge durable lessons"));
-        assert!(text.contains("Keep the active file below 12288 bytes"));
-        assert!(!text.contains("Append durable lessons to your memory file"));
-        assert!(!text.contains("As the orchestrator"));
-    }
-
-    #[test]
-    fn compose_text_appends_the_orchestrator_footer_only_for_orchestrators() {
-        let directory = private_tempdir();
-        let text = compose_text(
-            directory.path(),
-            &ProjectId::try_from("factory").unwrap(),
-            &AgentId::try_from("god").unwrap(),
-            None,
-            &[],
-            AgentRole::Orchestrator,
-        );
-        assert!(text.contains("As the orchestrator"));
-        assert!(!text.contains("factoryctl agent add"));
-        assert!(text.contains("operator must create and reconfigure agents"));
-        assert!(text.contains("waiting_for_input"));
-        assert!(text.contains("do not stop, restart, replace, or duplicate it"));
-        assert!(text.contains("factoryctl agent status"));
-        assert!(text.contains("dirty worktree"));
-    }
-
-    #[test]
-    fn compose_text_never_exceeds_the_delivery_bound() {
-        let directory = private_tempdir();
-        let text = compose_text(
-            directory.path(),
-            &ProjectId::try_from("factory").unwrap(),
-            &AgentId::try_from("curie").unwrap(),
-            Some(&task("task-1", "Big task", &"x".repeat(200_000))),
-            &[],
-            AgentRole::Worker,
-        );
-        assert!(text.len() <= MAX_DELIVERY_TEXT_BYTES + "\n...[truncated]".len());
-        assert!(text.starts_with("Task task-1"));
-    }
-
-    #[test]
-    fn composing_guidance_does_not_rewrite_project_or_standing_instructions() {
-        let directory = private_tempdir();
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let project_path =
-            factory_core::paths::project_guidance_path(directory.path(), &project_id);
-        let instructions_path =
-            factory_core::paths::agent_instructions_path(directory.path(), &project_id, &agent_id);
-        guidance::write(&project_path, "Rules stay byte-identical.\n").unwrap();
-        guidance::write(&instructions_path, "Standing instructions stay put.\n").unwrap();
-        let project_before = std::fs::read(&project_path).unwrap();
-        let instructions_before = std::fs::read(&instructions_path).unwrap();
-
-        let _ = compose_text(
-            directory.path(),
-            &project_id,
-            &agent_id,
-            None,
-            &[],
-            AgentRole::Worker,
-        );
-
-        assert_eq!(std::fs::read(project_path).unwrap(), project_before);
+    fn runtime_removal_accepts_exact_identity_and_absence() {
+        let parent = private_tempdir();
+        let runtime = parent.path().join("runtime");
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&runtime)
+            .unwrap();
+        let identity = runtime_birth_fingerprint(&runtime).unwrap().unwrap();
         assert_eq!(
-            std::fs::read(instructions_path).unwrap(),
-            instructions_before
+            remove_runtime_if_exact(
+                &runtime,
+                &parent.path().join(".finalize-test"),
+                Some(&identity),
+            )
+            .unwrap(),
+            RuntimeRemoval::Removed
         );
+        assert_eq!(
+            remove_runtime_if_exact(
+                &runtime,
+                &parent.path().join(".finalize-test"),
+                Some(&identity),
+            )
+            .unwrap(),
+            RuntimeRemoval::Missing
+        );
+    }
+
+    #[test]
+    fn runtime_removal_recovers_an_exact_post_rename_quarantine() {
+        let parent = private_tempdir();
+        let runtime = parent.path().join("runtime");
+        let quarantine = parent.path().join(".finalize-test");
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&runtime)
+            .unwrap();
+        let identity = runtime_birth_fingerprint(&runtime).unwrap().unwrap();
+        fs::rename(&runtime, &quarantine).unwrap();
+
+        assert_eq!(
+            remove_runtime_if_exact(&runtime, &quarantine, Some(&identity)).unwrap(),
+            RuntimeRemoval::Removed
+        );
+        assert!(!runtime.exists());
+        assert!(!quarantine.exists());
     }
 }

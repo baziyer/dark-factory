@@ -1,34 +1,22 @@
-//! AGENT: one live terminal with its work, inbox, settings, and delegation context alongside.
-//! `pane.rs`'s scrollback methods for why this counts as the design brief's "small custom render
-//! path over `vt100::Screen`'s scrollback" without hand-rolling a cell renderer: `vt100` already
-//! renders the scrolled-back view correctly once `Parser::set_scrollback` is set, so the "custom"
-//! part is entirely the operator-facing scroll-offset plumbing — `PgUp`/`PgDn` here, `pane.rs`'s
-//! `scroll_up`/`scroll_down`/`scroll_offset` there — not a reimplementation of the widget).
+//! AGENT: durable attempt state, queue, inbox, and settings.
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use factory_core::{TaskDetail, TaskStatus};
-use tui_term::widget::PseudoTerminal;
+use factory_core::{RunPhase, TaskDetail, TaskStatus};
 
-use crate::model::{Board, PaneMode};
+use crate::model::{AttentionFocus, Board};
 use crate::mouse::{HitMap, Target};
-use crate::pane::{PaneMap, PaneObservation};
 use crate::ui;
 
-pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, hits: &mut HitMap) {
-    if board.terminal_maximized && board.attention_focus.is_none() {
-        render_terminal(frame, area, board, panes, hits);
-        return;
-    }
+pub fn draw(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
     let area = if let Some(focus) = &board.attention_focus {
-        let card_height = area.height.min(10);
         let panels = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(card_height), Constraint::Min(0)])
+            .constraints([Constraint::Length(area.height.min(9)), Constraint::Min(0)])
             .split(area);
         render_attention_card(frame, panels[0], board, focus, hits);
         panels[1]
@@ -37,169 +25,81 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, h
     };
     let columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
-    render_terminal(frame, columns[0], board, panes, hits);
+    render_attempt(frame, columns[0], board);
     render_context(frame, columns[1], board, hits);
 }
 
-fn render_terminal(
-    frame: &mut Frame,
-    area: Rect,
-    board: &Board,
-    panes: &mut PaneMap,
-    hits: &mut HitMap,
-) {
-    let Some(session_id) = board.focus_target() else {
-        render_placeholder(frame, area, board, "no agent selected");
-        return;
-    };
-    hits.add(area, Target::Pane(session_id.clone()));
-    hits.set_terminal(ui::block("").inner(area), session_id.clone());
-    let Some(pane) = panes.get_mut(&session_id) else {
-        render_placeholder(frame, area, board, "attaching…");
-        return;
-    };
-
-    let observation = pane.observation();
-    match &observation {
-        PaneObservation::Connecting => {
-            render_placeholder(frame, area, board, "attaching…");
-            return;
-        }
-        PaneObservation::AttachRefused(_) => {
-            render_placeholder(
-                frame,
-                area,
-                board,
-                "terminal attach refused — see board status",
-            );
-            return;
-        }
-        PaneObservation::Error(error) => {
-            let block = ui::block(" terminal attach error ");
-            let inner = block.inner(area);
-            frame.render_widget(block, area);
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    error,
-                    Style::default().fg(Color::Red),
-                ))),
-                inner,
-            );
-            return;
-        }
-        PaneObservation::Attached
-        | PaneObservation::LocalPtyExited
-        | PaneObservation::Disconnected => {}
-    }
-
-    let exited = match pane.kind {
-        crate::pane::PaneKind::LocalPty => {
-            matches!(observation, PaneObservation::LocalPtyExited)
-        }
-        crate::pane::PaneKind::Daemon => matches!(observation, PaneObservation::Disconnected),
-    };
-    let marker = if exited { " [exited]" } else { "" };
-    let command = match pane.kind {
-        crate::pane::PaneKind::LocalPty => format!(" — {}", pane.command.join(" ")),
-        crate::pane::PaneKind::Daemon => String::new(),
-    };
-    let scroll_offset = pane.scroll_offset();
-    let mode_hint = if board.pane_mode == PaneMode::Board {
-        "BOARD — Ctrl-] back to pane"
-    } else if scroll_offset > 0 {
-        "TYPING — PgDn/scroll to return to live"
-    } else {
-        "TYPING — Ctrl-] for board control"
-    };
-    let scroll_hint = if scroll_offset > 0 {
-        format!("  [scrolled back {scroll_offset}]")
-    } else {
-        String::new()
-    };
-    let color = if board.pane_mode == PaneMode::Typing {
-        Color::Cyan
-    } else {
-        Color::Yellow
-    };
-    let title = format!(
-        " {}{command}{marker} — [{mode_hint}]{scroll_hint} ",
-        pane.title
-    );
-    let block = ui::block(title).border_style(Style::default().fg(color));
-    let inner = block.inner(area);
-    if inner.width > 0 && inner.height > 0 {
-        let _ = pane.resize(inner.height, inner.width);
-    }
-
-    let parser = pane.lock_parser();
-    let screen = parser.screen();
-    let pseudo = PseudoTerminal::new(screen).block(block);
-    frame.render_widget(pseudo, area);
-
-    // Suppress the hardware cursor while scrolled back — showing the *live* cursor position
-    // among historical content would be actively misleading (see this module's doc comment).
-    if board.pane_mode == PaneMode::Typing && scroll_offset == 0 && !screen.hide_cursor() {
-        let (row, col) = screen.cursor_position();
-        let x = inner.x.saturating_add(col);
-        let y = inner.y.saturating_add(row);
-        if x < inner.x + inner.width && y < inner.y + inner.height {
-            frame.set_cursor_position(Position { x, y });
-        }
-    }
-}
-
-fn render_placeholder(frame: &mut Frame, area: Rect, board: &Board, message: &str) {
-    let inner = ui::bordered(frame, area, ui::block(" terminal "));
-    let text = if board.focused_project.is_none() {
-        "no project focused — press Enter on a BUILDING floor first"
-    } else {
-        message
-    };
-    ui::dim(frame, inner, text);
-}
-
-fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+fn render_attempt(frame: &mut Frame, area: Rect, board: &Board) {
     let Some(agent_id) = board.selected_agent.as_ref() else {
-        ui::dim(frame, area, "no agent selected");
+        let inner = ui::bordered(frame, area, ui::block(" attempt "));
+        ui::dim(frame, inner, "no agent selected");
         return;
     };
     let Some(agent) = board.agents.get(agent_id) else {
         return;
     };
-    let orchestrator = agent.role == factory_core::AgentRole::Orchestrator;
-    let constraints = if orchestrator {
-        vec![
-            Constraint::Percentage(25),
-            Constraint::Percentage(20),
-            Constraint::Percentage(25),
-            Constraint::Percentage(30),
-        ]
+    let mut lines = vec![Line::from(format!("agent: {}", agent.id))];
+    if let Some(run) = board.latest_run_for(agent_id) {
+        lines.extend([
+            Line::from(format!("run: {}", run.id)),
+            Line::from(format!("phase: {:?}", run.phase)),
+            Line::from(format!("task: {}", run.task_id)),
+            Line::from(format!("provider: {:?}", run.provider)),
+            Line::from(format!(
+                "activity: {}",
+                run.activity.as_deref().unwrap_or("—")
+            )),
+            Line::from(format!(
+                "wait: {}",
+                run.wait_reason.as_deref().unwrap_or("—")
+            )),
+            Line::from(format!("observer: {:?}", run.observer_health)),
+            Line::from(format!(
+                "outcome: {}",
+                run.outcome
+                    .as_ref()
+                    .map_or_else(|| "—".to_owned(), |outcome| format!("{outcome:?}"))
+            )),
+        ]);
+        if run.phase == RunPhase::Finalizing {
+            lines.push(Line::from(Span::styled(
+                "mutation authority revoked; resources are finalizing",
+                Style::default().fg(Color::Yellow),
+            )));
+        }
     } else {
-        vec![
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
-            Constraint::Percentage(35),
-        ]
+        lines.push(Line::from("no admitted attempt"));
+    }
+    frame.render_widget(Paragraph::new(lines).block(ui::block(" attempt ")), area);
+}
+
+fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMap) {
+    let Some(agent_id) = board.selected_agent.as_ref() else {
+        return;
+    };
+    let Some(agent) = board.agents.get(agent_id) else {
+        return;
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Percentage(42),
+            Constraint::Percentage(23),
+            Constraint::Percentage(35),
+        ])
         .split(area);
 
-    let active_tasks = board.active_tasks_for_agent(agent_id);
     let task_area = ui::block("").inner(rows[0]);
-    let tasks: Vec<Line> = active_tasks
+    let mut queue: Vec<Line> = board
+        .active_tasks_for_agent(agent_id)
         .iter()
         .enumerate()
         .map(|(row, task)| {
             hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
             Line::from(format!(
-                "{} {:?} p={}  {}",
+                "{} {:?} p={} {}",
                 if board.selected_task.as_ref() == Some(&task.snapshot.id) {
                     ">"
                 } else {
@@ -211,28 +111,24 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
             ))
         })
         .collect();
-    let history = board.task_history_for_agent(agent_id);
-    let mut queue = if tasks.is_empty() {
-        vec![Line::from("nothing assigned")]
-    } else {
-        tasks
-    };
-    if !history.is_empty() {
-        let history_header = queue.len();
-        queue.push(Line::from("history:"));
-        for (offset, task) in history.iter().enumerate() {
-            let row = history_header + 1 + offset;
-            if matches!(
-                task.snapshot.status,
-                TaskStatus::Failed | TaskStatus::Cancelled
-            ) {
-                hits.add_row(task_area, row, Target::Task(task.snapshot.id.clone()));
-            }
-            queue.push(Line::from(format!(
-                "  {:?} p={}  {}",
-                task.snapshot.status, task.snapshot.priority, task.snapshot.title
-            )));
+    if queue.is_empty() {
+        queue.push(Line::from("nothing assigned"));
+    }
+    for task in board.task_history_for_agent(agent_id) {
+        if matches!(
+            task.snapshot.status,
+            TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            hits.add_row(
+                task_area,
+                queue.len(),
+                Target::Task(task.snapshot.id.clone()),
+            );
         }
+        queue.push(Line::from(format!(
+            "  {:?} p={} {}",
+            task.snapshot.status, task.snapshot.priority, task.snapshot.title
+        )));
     }
     frame.render_widget(Paragraph::new(queue).block(ui::block(" queue ")), rows[0]);
 
@@ -255,117 +151,58 @@ fn render_context(frame: &mut Frame, area: Rect, board: &Board, hits: &mut HitMa
         rows[1],
     );
 
-    let (
-        configured_model,
-        configured_reasoning,
-        model_reason,
-        configured_permission,
-        memory_health,
-    ) = board.agent_details.get(agent_id).map_or_else(
-        || {
-            (
-                "loading…".to_owned(),
-                "loading…".to_owned(),
-                "loading…".to_owned(),
-                "loading…".to_owned(),
-                "loading…".to_owned(),
-            )
-        },
+    let settings = board.agent_details.get(agent_id).map_or_else(
+        || vec![Line::from("loading…")],
         |detail| {
-            (
-                detail
-                    .profile
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| "provider default".to_owned()),
-                detail
-                    .profile
-                    .reasoning_effort
-                    .clone()
-                    .unwrap_or_else(|| "provider default".to_owned()),
-                detail.profile.model_selection_reason.clone().map_or_else(
-                    || "unreported".to_owned(),
-                    |reason| factory_core::model_policy::sanitize_for_display(&reason),
-                ),
-                detail
-                    .profile
-                    .permission_mode
-                    .clone()
-                    .unwrap_or_else(|| "provider default".to_owned()),
-                format!(
-                    "{} {}/{}",
+            let run = board.latest_run_for(agent_id);
+            vec![
+                Line::from(format!(
+                    "model: {} → {}",
+                    detail
+                        .profile
+                        .model
+                        .as_deref()
+                        .unwrap_or("provider default"),
+                    run.and_then(|run| run.runtime_model.as_deref())
+                        .unwrap_or("unreported")
+                )),
+                Line::from(format!(
+                    "effort: {} → {}",
+                    detail
+                        .profile
+                        .reasoning_effort
+                        .as_deref()
+                        .unwrap_or("provider default"),
+                    run.and_then(|run| run.runtime_reasoning_effort.as_deref())
+                        .unwrap_or("unreported")
+                )),
+                Line::from(format!(
+                    "access: {} → {}",
+                    detail
+                        .profile
+                        .permission_mode
+                        .as_deref()
+                        .unwrap_or("provider default"),
+                    run.and_then(|run| run.runtime_permission_mode.as_deref())
+                        .unwrap_or("unreported")
+                )),
+                Line::from(format!(
+                    "memory: {} {}/{}",
                     memory_health_state(detail.memory_health.state),
                     detail.memory_health.bytes,
                     detail.memory_health.max_bytes
-                ),
-            )
+                )),
+            ]
         },
     );
-    let session = board.session_for(agent);
-    let running_model = session
-        .and_then(|session| session.runtime_model.as_deref())
-        .unwrap_or("unreported");
-    let running_reasoning = session
-        .and_then(|session| session.runtime_reasoning_effort.as_deref())
-        .unwrap_or("unreported");
-    let running_permission = session
-        .and_then(|session| session.runtime_permission_mode.as_deref())
-        .unwrap_or("unreported");
-    let running_control = session
-        .and_then(|session| session.runtime_control_mode.as_deref())
-        .unwrap_or("unreported");
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "model: {} → {}",
-                ui::truncate(&configured_model, 13),
-                ui::truncate(running_model, 13)
-            )),
-            Line::from(format!(
-                "effort: {} → {}",
-                ui::truncate(&configured_reasoning, 10),
-                ui::truncate(running_reasoning, 10)
-            )),
-            Line::from(format!("audit: {}", ui::truncate(&model_reason, 27))),
-            Line::from(format!(
-                "access: {}/{} {}",
-                ui::truncate(&configured_permission, 8),
-                ui::truncate(running_permission, 8),
-                ui::truncate(running_control, 11)
-            )),
-            Line::from(format!("memory: {}", ui::truncate(&memory_health, 24))),
-        ])
-        .block(ui::block(" settings ")),
+        Paragraph::new(settings).block(ui::block(" settings ")),
         rows[2],
     );
-    if orchestrator {
-        let context_area = ui::block("").inner(rows[3]);
-        for (row, task) in orchestrator_backlog_tasks(board, &agent.project_id)
-            .into_iter()
-            .enumerate()
-        {
-            hits.add_row(
-                context_area,
-                row + 1,
-                Target::Task(task.snapshot.id.clone()),
-            );
-        }
-        let backlog_rows = orchestrator_backlog_tasks(board, &agent.project_id).len();
-        for (offset, task) in orchestrator_history_tasks(board, &agent.project_id)
-            .into_iter()
-            .enumerate()
-        {
-            hits.add_row(
-                context_area,
-                backlog_rows + 2 + offset,
-                Target::Task(task.snapshot.id.clone()),
-            );
-        }
-        frame.render_widget(
-            Paragraph::new(orchestrator_context_lines(board, &agent.project_id).join("\n"))
-                .block(ui::block(" backlog + worker queues ")),
-            rows[3],
-        );
+
+    if agent.role == factory_core::AgentRole::Orchestrator {
+        // The durable queue above already includes orchestrator-owned work. Project backlog remains
+        // visible in BUILDING, avoiding a second orchestration-specific state projection here.
     }
 }
 
@@ -383,7 +220,7 @@ pub(crate) fn render_attention_card(
     frame: &mut Frame,
     area: Rect,
     board: &Board,
-    focus: &crate::model::AttentionFocus,
+    focus: &AttentionFocus,
     hits: &mut HitMap,
 ) {
     let item = &focus.item;
@@ -395,60 +232,38 @@ pub(crate) fn render_attention_card(
     } else {
         " ACTION — NEEDS YOU "
     };
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let project = item.project_id.as_str();
-    let agent = item
-        .agent_id
-        .as_ref()
-        .map_or("—", factory_core::AgentId::as_str);
-    let task = item
-        .task_id
-        .as_ref()
-        .map_or("—", factory_core::TaskId::as_str);
-    let session = item
-        .session_id
-        .as_ref()
-        .map_or("—", factory_core::SessionId::as_str);
-    let run = item
-        .run_id
-        .as_ref()
-        .map_or("—", factory_core::RunId::as_str);
-    let age = factory_core::status::age_text(board.now_ms, item.since_ms);
+    let width = usize::from(area.width.saturating_sub(2));
     let decision = item.decision();
-    let explanation = if focus.resolved {
-        "changed or resolved; refresh NEEDS YOU before acting".to_owned()
-    } else {
-        format!("{} | evidence: {}", decision.cause, decision.evidence)
-    };
     let mut lines = vec![
         Line::from(Span::styled(
-            if focus.resolved {
-                "stale attention".to_owned()
-            } else {
-                item.reason.kind.label().to_owned()
-            },
+            item.reason.kind.label(),
             Style::default().fg(if focus.resolved {
                 Color::DarkGray
             } else {
                 Color::Yellow
             }),
         )),
-        Line::from(ui::truncate(&explanation, inner_width)),
-        Line::from(compact_pair(
-            "project:",
-            project,
-            "agent:",
-            agent,
-            inner_width,
+        Line::from(ui::truncate(&item.reason.summary, width)),
+        Line::from(format!(
+            "project: {}  agent: {}",
+            item.project_id,
+            item.agent_id
+                .as_ref()
+                .map_or("—", factory_core::AgentId::as_str)
         )),
-        Line::from(compact_pair(
-            "task:",
-            task,
-            "session:",
-            session,
-            inner_width,
+        Line::from(format!(
+            "task: {}  run: {}",
+            item.task_id
+                .as_ref()
+                .map_or("—", factory_core::TaskId::as_str),
+            item.run_id
+                .as_ref()
+                .map_or("—", factory_core::RunId::as_str)
         )),
-        Line::from(compact_pair("run:", run, "age:", &age, inner_width)),
+        Line::from(format!(
+            "age: {}",
+            factory_core::status::age_text(board.now_ms, item.since_ms)
+        )),
     ];
     if !focus.resolved {
         for (index, choice) in decision.choices.iter().enumerate() {
@@ -458,205 +273,12 @@ pub(crate) fn render_attention_card(
                 Target::AttentionChoice(item.clone(), index),
             );
             lines.push(Line::from(ui::truncate(
-                &format!(
-                    "{}. {}{} — {}",
-                    index + 1,
-                    choice.label,
-                    if decision.recommended == Some(index) {
-                        " *"
-                    } else {
-                        ""
-                    },
-                    choice.consequence
-                ),
-                inner_width,
+                &format!("{}. {} — {}", index + 1, choice.label, choice.consequence),
+                width,
             )));
         }
-        let typing = if pending {
-            "request pending; wait for response"
-        } else if matches!(
-            item.reason.action,
-            factory_core::status::AttentionAction::AnswerInTerminal
-        ) {
-            "typing off; Ctrl-] to enter answer"
-        } else {
-            "terminal typing is not an action"
-        };
-        let suffix_width = typing.chars().count() + 2;
-        let action_width = inner_width.saturating_sub(suffix_width);
-        let action = ui::truncate(
-            &format!("safe action: {}", item.action_text()),
-            action_width,
-        );
-        lines.push(Line::from(format!("{action}; {typing}")));
-    } else {
-        lines.push(Line::from(ui::truncate(
-            "safe action: refresh NEEDS YOU",
-            inner_width,
-        )));
-        lines.push(Line::from("typing remains off"));
     }
-    // Every field owns one row. Paragraph clipping therefore cannot let a
-    // bounded-but-long reason push source identity or the safe action below
-    // the ten-row full-width card at the tested 80-column board width.
     frame.render_widget(Paragraph::new(lines).block(ui::block(title)), area);
 }
 
-fn compact_pair(
-    left_label: &str,
-    left: &str,
-    right_label: &str,
-    right: &str,
-    width: usize,
-) -> String {
-    let fixed = left_label.chars().count() + right_label.chars().count() + 4;
-    if width <= fixed {
-        return ui::truncate(&format!("{left_label} {left}"), width);
-    }
-    let available = width - fixed;
-    let left_width = available / 2;
-    let right_width = available - left_width;
-    format!(
-        "{left_label} {}  {right_label} {}",
-        ui::truncate_middle(left, left_width),
-        ui::truncate_middle(right, right_width)
-    )
-}
-
-fn orchestrator_backlog_tasks<'a>(
-    board: &'a Board,
-    project_id: &factory_core::ProjectId,
-) -> Vec<&'a TaskDetail> {
-    let mut tasks: Vec<_> = board
-        .tasks
-        .values()
-        .filter(|task| {
-            &task.snapshot.project_id == project_id
-                && task.snapshot.assigned_agent_id.is_none()
-                && matches!(
-                    task.snapshot.status,
-                    factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
-                )
-        })
-        .collect();
-    tasks.sort_by(|a, b| factory_core::active_task_cmp(&a.snapshot, &b.snapshot));
-    tasks
-}
-
-fn orchestrator_history_tasks<'a>(
-    board: &'a Board,
-    project_id: &factory_core::ProjectId,
-) -> Vec<&'a TaskDetail> {
-    let mut tasks: Vec<_> = board
-        .tasks
-        .values()
-        .filter(|task| {
-            &task.snapshot.project_id == project_id
-                && task.snapshot.assigned_agent_id.is_none()
-                && !matches!(
-                    task.snapshot.status,
-                    factory_core::TaskStatus::Queued | factory_core::TaskStatus::Running
-                )
-        })
-        .collect();
-    tasks.sort_by(|a, b| {
-        a.snapshot
-            .updated_at_ms
-            .cmp(&b.snapshot.updated_at_ms)
-            .then_with(|| a.snapshot.id.as_str().cmp(b.snapshot.id.as_str()))
-    });
-    tasks
-}
-
-fn orchestrator_context_lines(board: &Board, project_id: &factory_core::ProjectId) -> Vec<String> {
-    let mut lines = vec!["project backlog:".to_owned()];
-    let tasks = orchestrator_backlog_tasks(board, project_id);
-    for task in tasks {
-        let owner = task
-            .snapshot
-            .assigned_agent_id
-            .as_ref()
-            .map_or("unassigned", factory_core::AgentId::as_str);
-        lines.push(format!(
-            "  {owner}: {:?} p={} {}",
-            task.snapshot.status, task.snapshot.priority, task.snapshot.title
-        ));
-    }
-    let history = orchestrator_history_tasks(board, project_id);
-    if !history.is_empty() {
-        lines.push("history:".to_owned());
-        for task in history {
-            lines.push(format!(
-                "  {:?} p={} {}",
-                task.snapshot.status, task.snapshot.priority, task.snapshot.title
-            ));
-        }
-    }
-    lines.push("worker queues:".to_owned());
-    let mut agents: Vec<_> = board
-        .agents
-        .values()
-        .filter(|agent| &agent.project_id == project_id)
-        .collect();
-    agents.sort_by_key(|agent| (agent.created_at_ms, agent.id.clone()));
-    for agent in agents {
-        let queue = board.active_tasks_for_agent(&agent.id);
-        if !queue.is_empty() {
-            let prefix = agent
-                .parent_agent_id
-                .as_ref()
-                .map_or_else(String::new, |parent| format!("{parent} ═> "));
-            lines.push(format!(
-                "  {prefix}{}: {}",
-                agent.id,
-                queue
-                    .iter()
-                    .map(|task| task.snapshot.title.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ));
-        } else if let Some(parent) = &agent.parent_agent_id {
-            lines.push(format!("  {parent} ═> {}", agent.id));
-        }
-    }
-    lines
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_fixtures::{agent, project, task};
-    use factory_core::{AgentRole, ProjectId, TaskStatus};
-
-    #[test]
-    fn orchestrator_context_lists_unassigned_worker_queues_and_nested_edges() {
-        let mut board = Board::new(false, 0, crate::theme::PLAIN);
-        let mut worker = agent("worker", "proj", AgentRole::Worker, None);
-        worker.parent_agent_id = Some(factory_core::AgentId::try_from("orch").unwrap());
-        let mut child = agent("child", "proj", AgentRole::Worker, None);
-        child.parent_agent_id = Some(factory_core::AgentId::try_from("worker").unwrap());
-        board.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            vec![
-                agent("orch", "proj", AgentRole::Orchestrator, None),
-                worker,
-                child,
-            ],
-            vec![
-                task("free", "proj", TaskStatus::Queued, None, 0),
-                task("owned", "proj", TaskStatus::Running, Some("worker"), 1),
-                task("done", "proj", TaskStatus::Succeeded, Some("child"), 2),
-            ],
-            Vec::new(),
-            Vec::new(),
-        );
-        let text =
-            orchestrator_context_lines(&board, &ProjectId::try_from("proj").unwrap()).join("\n");
-        assert!(text.contains("project backlog:"));
-        assert!(text.contains("free"));
-        assert!(text.contains("worker: owned"));
-        assert!(!text.contains("done"));
-        assert!(text.contains("orch ═> worker"));
-        assert!(text.contains("worker ═> child"));
-    }
-}
+fn _task_owner(_task: &TaskDetail) {}

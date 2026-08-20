@@ -10,14 +10,9 @@ name = "factory-tui"
 path = "src/main.rs"
 
 [dependencies]
-# `crossterm` and `vt100` are deliberately NOT direct dependencies: both ratatui and tui-term
-# re-export the exact crossterm/vt100 versions they were built against (`ratatui::crossterm`,
-# `tui_term::vt100`) specifically so downstream crates avoid a duplicate, version-mismatched
-# copy in the dependency tree. We use those re-exports everywhere instead.
 anyhow = "1.0"
 factory-core = { path = "../factory-core" }
 factoryctl = { path = "../factoryctl" }
-portable-pty = "0.9.0"
 ratatui = { version = "=0.30.0", default-features = false, features = [
     "crossterm",
     "underline-color",
@@ -25,7 +20,6 @@ ratatui = { version = "=0.30.0", default-features = false, features = [
 serde.workspace = true
 serde_json.workspace = true
 shell-words = "1.1"
-tui-term = "=0.3.0"
 uuid.workspace = true
 
 [dev-dependencies]

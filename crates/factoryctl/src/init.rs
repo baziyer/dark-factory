@@ -66,9 +66,9 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             None => println!(
                 "{program}: not on PATH{}",
                 if program == "git" {
-                    " -- agents get no worktree of their own and run in the project root"
+                    " -- daemon-owned Changes will remain unavailable"
                 } else {
-                    " -- agents with this provider cannot start until it is"
+                    " -- attempts using this provider cannot start until it is"
                 }
             ),
         }
@@ -136,27 +136,15 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
 
     // 4. What Dark Factory writes outside $DARK_FACTORY_HOME -- said every
     //    time, whether or not launchd is touched.
-    let claude_json = user_home.join(".claude.json");
     println!(
-        "\nDark Factory writes three things outside {}:\n  \
-         - {} (the launchd job that keeps factoryd running; rewritten by `factoryctl update --install`)\n  \
-         - {}: a `hasTrustDialogAccepted` entry per agent worktree it creates, so a new Claude session\n    \
-           never blocks on the trust prompt (only if that file already exists and parses; nothing else in it changes)\n  \
-         - each project's own git repository: `git worktree add -b agent/<id>` per agent (the worktree goes with the\n    \
-           agent; the branch stays)\n  \
-         Codex sessions get a per-agent CODEX_HOME seeded from {}'s config.toml with its auth.json symlinked, inside {}.",
+        "\nOutside {}, Dark Factory writes only {} (the launchd job that keeps factoryd running; rewritten by `factoryctl update --install`).\n  \
+         Stage 1 does not create source worktrees, mutate project repositories, or edit ~/.claude.json.\n  \
+         Codex attempts seed private per-run configuration from {} inside {}.",
         home.display(),
         plist.display(),
-        claude_json.display(),
         seed_home.display(),
         home.display()
     );
-    if !claude_json.is_file() {
-        println!(
-            "  ({} does not exist yet -- run `claude` once, or the pre-trust step is skipped)",
-            claude_json.display()
-        );
-    }
     if options.no_launchd {
         print_next_steps(&home, NextSteps::StartDaemon);
         return Ok(0);
@@ -236,7 +224,9 @@ pub fn run(options: &Options, socket: &Path) -> Result<i32, String> {
             return Ok(1);
         }
     }
-    let (next_steps, diagnostic) = project_next_steps(has_projects(&Client::new(socket)));
+    let client = Client::authenticated_from_file(socket, home.join("operator.token"))
+        .map_err(|error| error.to_string())?;
+    let (next_steps, diagnostic) = project_next_steps(has_projects(&client));
     if let Some(diagnostic) = diagnostic {
         println!("{diagnostic}");
     }

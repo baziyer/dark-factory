@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
-        MAX_RUNNER_FRAME_BYTES, OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope,
-        RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
+        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
     },
 };
 use factoryd::runner_client::{
@@ -69,39 +69,6 @@ fn encoded(frame: RunnerFrame) -> Vec<u8> {
     bytes
 }
 
-fn terminal_output(offset: u64, bytes: &str) -> RunnerFrame {
-    RunnerFrame::TerminalOutput {
-        protocol_version: RUNNER_PROTOCOL_VERSION,
-        generation: 0,
-        offset,
-        bytes: bytes.to_owned(),
-    }
-}
-
-fn old_v1_terminal_output(offset: u64, bytes: &str) -> Vec<u8> {
-    let frame = serde_json::json!({
-        "type": "terminal_output",
-        "data": {
-            "protocol_version": RUNNER_PROTOCOL_VERSION,
-            "offset": offset,
-            "bytes": bytes,
-        },
-    });
-    let mut encoded = serde_json::to_vec(&frame).unwrap();
-    encoded.push(b'\n');
-    encoded
-}
-
-fn attach_capabilities() -> RunnerFrame {
-    RunnerFrame::TerminalAttachCapabilities {
-        protocol_version: RUNNER_PROTOCOL_VERSION,
-        generation: 4,
-        base_generation: 3,
-        base_offset: 100,
-        end_offset: 200,
-    }
-}
-
 struct FakeRunner {
     _directory: tempfile::TempDir,
     runtime_dir: PathBuf,
@@ -149,18 +116,62 @@ async fn assert_subscribe_request(fake: FakeRunner) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_holds_one_exact_process_identity_until_activation() {
+    let directory = tempfile::tempdir_in("/tmp").unwrap();
+    let runtime_dir = directory.path().join("runtime");
+    std::fs::create_dir(&runtime_dir).unwrap();
+    let listener = UnixListener::bind(runtime_dir.join("control.sock")).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await.unwrap();
+        let prepared: RequestEnvelope = serde_json::from_slice(&line).unwrap();
+        let RunnerRequest::Prepare { command_id } = &prepared.request else {
+            panic!("first request did not prepare the exec gate");
+        };
+        let command_id = command_id.clone();
+        let response = encoded(RunnerFrame::Prepared {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            command_id: command_id.clone(),
+            runner_pid: 1233,
+            child_pid: 1234,
+            process_group_id: 1234,
+        });
+        reader.get_mut().write_all(&response).await.unwrap();
+
+        line.clear();
+        reader.read_until(b'\n', &mut line).await.unwrap();
+        let activated: RequestEnvelope = serde_json::from_slice(&line).unwrap();
+        assert_eq!(activated.run_id, prepared.run_id);
+        assert_eq!(activated.runner_instance_id, prepared.runner_instance_id);
+        assert_eq!(
+            activated.request,
+            RunnerRequest::Activate {
+                command_id: command_id.clone(),
+            }
+        );
+        let response = encoded(RunnerFrame::CommandAck {
+            protocol_version: RUNNER_PROTOCOL_VERSION,
+            command_id,
+        });
+        reader.get_mut().write_all(&response).await.unwrap();
+    });
+
+    let prepared = client(&runtime_dir).prepare().await.unwrap();
+    assert_eq!(prepared.runner_pid(), 1233);
+    assert_eq!(prepared.child_pid(), 1234);
+    assert_eq!(prepared.process_group_id(), 1234);
+    prepared.activate().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn replay_boundary_and_live_terminal_are_delivered_in_exact_order() {
     let fake = fake_runner(vec![vec![
         encoded(hello(2, None)),
         encoded(event(1, RunnerEvent::Started { child_pid: 98 })),
-        encoded(event(
-            2,
-            RunnerEvent::Output {
-                stream: OutputStream::Stdout,
-                text: "structural output".into(),
-                lossy: false,
-            },
-        )),
+        encoded(event(2, RunnerEvent::Started { child_pid: 99 })),
         encoded(caught_up(2)),
         encoded(event(
             3,
@@ -427,7 +438,7 @@ async fn terminal_metadata_must_match_the_observed_terminal_and_end_the_stream()
                 encoded(hello(1, Some(1))),
                 encoded(terminal),
                 encoded(caught_up(1)),
-                encoded(event(2, RunnerEvent::OutputTruncated { limit_bytes: 7 })),
+                encoded(event(2, RunnerEvent::Started { child_pid: 99 })),
             ],
             2,
         )
@@ -479,31 +490,6 @@ async fn live_stream_rejects_duplicates_gaps_and_all_non_event_frames() {
         next_error(vec![encoded(hello(0, None)), encoded(caught_up(0))], 1).await,
         RunnerClientError::UnexpectedEof
     ));
-}
-
-#[tokio::test]
-async fn terminal_stream_rejects_an_arbitrary_forward_generation_jump() {
-    let first = terminal_output(0, &factory_core::runner::encode_terminal_bytes(b"a"));
-    let second = RunnerFrame::TerminalOutput {
-        protocol_version: RUNNER_PROTOCOL_VERSION,
-        generation: 2,
-        offset: 1,
-        bytes: factory_core::runner::encode_terminal_bytes(b"b"),
-    };
-    let fake = fake_runner(vec![vec![encoded(first), encoded(second)]]).await;
-    let mut subscription = client(&fake.runtime_dir)
-        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
-        .await
-        .unwrap();
-    subscription.next_chunk().await.unwrap();
-    assert!(matches!(
-        subscription.next_chunk().await,
-        Err(RunnerClientError::TerminalAttachGenerationJump {
-            expected: 1,
-            found: 2
-        })
-    ));
-    fake.requests.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -635,268 +621,5 @@ async fn cancelling_next_item_preserves_an_already_consumed_partial_frame() {
         RunnerStreamItem::CaughtUp { sequence: 1 }
     );
     drop(subscription);
-    server.await.unwrap();
-}
-
-fn raw_unknown_event(sequence: i64) -> Vec<u8> {
-    let json = serde_json::json!({
-        "type": "event",
-        "data": {
-            "protocol_version": RUNNER_PROTOCOL_VERSION,
-            "event": {
-                "protocol_version": RUNNER_PROTOCOL_VERSION,
-                "sequence": sequence,
-                "occurred_at_ms": 1_000 + sequence,
-                "event": {"type": "some_future_event_a_newer_runner_added"}
-            }
-        }
-    });
-    let mut bytes = serde_json::to_vec(&json).unwrap();
-    bytes.push(b'\n');
-    bytes
-}
-
-/// Adversarial re-review, round 2, finding A: the consumer-side half of the
-/// wire proof `factory-core/tests/runner_protocol.rs`'s
-/// `a_dataless_unrecognized_future_event_type_deserializes_to_unknown_not_a_parse_failure`
-/// covers in isolation. An event this build's `RunnerEvent` enum has no
-/// name for -- standing in for a future variant a newer runner sends to
-/// this (older) daemon -- must not abandon the control stream: it
-/// deserializes to `RunnerEvent::Unknown` and the very next frame, a real
-/// `Exited`, must still be delivered normally. Before the `Unknown`
-/// catch-all existed, the unrecognized frame failed `read_frame` outright
-/// (`RunnerClientError::InvalidJson`) and `next_item` never got far enough
-/// to see the `Exited` event at all -- which is exactly the shape that let
-/// `wait_for_runner_exit`/`consume_until_exit` (`crates/factoryd/src/
-/// execution.rs`) return before `client.acknowledge_exit(...)`, orphaning
-/// the runner (issue #26's shape).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unrecognized_future_event_type_deserializes_to_unknown_and_does_not_break_a_later_exit()
-{
-    let fake = fake_runner(vec![vec![
-        encoded(hello(2, Some(2))),
-        raw_unknown_event(1),
-        encoded(event(
-            2,
-            RunnerEvent::Exited {
-                exit_code: Some(0),
-                signal: None,
-            },
-        )),
-    ]])
-    .await;
-
-    let mut subscription = client(&fake.runtime_dir).subscribe().await.unwrap();
-    let first = subscription.next_item().await.unwrap();
-    assert!(
-        matches!(
-            first,
-            RunnerStreamItem::Event(RunnerEventEnvelope {
-                sequence: 1,
-                event: RunnerEvent::Unknown,
-                ..
-            })
-        ),
-        "expected an Unknown event at sequence 1, got {first:?}"
-    );
-
-    let second = subscription.next_item().await.unwrap();
-    assert!(
-        matches!(
-            second,
-            RunnerStreamItem::Event(RunnerEventEnvelope {
-                sequence: 2,
-                event: RunnerEvent::Exited {
-                    exit_code: Some(0),
-                    signal: None,
-                },
-                ..
-            })
-        ),
-        "the real Exited event immediately after an unrecognized one must \
-         still parse and be reachable -- not abandoning the stream is the \
-         whole point, got {second:?}"
-    );
-
-    drop(subscription);
-    assert_subscribe_request(fake).await;
-}
-
-#[tokio::test]
-async fn new_daemon_accepts_an_old_v1_runners_first_normal_output_as_ready() {
-    let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-output");
-    let fake = fake_runner(vec![vec![old_v1_terminal_output(7, &bytes)]]).await;
-    let mut subscription = client(&fake.runtime_dir)
-        .attach_terminal(7, factory_core::runner::TerminalAttachMode::Legacy)
-        .await
-        .unwrap();
-    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 7, bytes));
-    assert_eq!(
-        fake.requests.await.unwrap(),
-        vec![RequestEnvelope::new(
-            run_id(),
-            instance_id(),
-            RunnerRequest::AttachTerminal {
-                since_offset: 7,
-                mode: factory_core::runner::TerminalAttachMode::Legacy,
-            }
-        )]
-    );
-}
-
-#[tokio::test]
-async fn full_history_falls_back_and_decodes_a_literal_old_v1_output_frame() {
-    let bytes = factory_core::runner::encode_terminal_bytes(b"old-v1-full-history");
-    let fake = fake_runner(vec![
-        vec![encoded(RunnerFrame::Error {
-            protocol_version: RUNNER_PROTOCOL_VERSION,
-            code: RunnerErrorCode::InvalidRequest,
-            message: "unknown terminal capability request".into(),
-        })],
-        vec![old_v1_terminal_output(0, &bytes)],
-    ])
-    .await;
-    let mut subscription = client(&fake.runtime_dir)
-        .attach_terminal(0, factory_core::runner::TerminalAttachMode::FullHistory)
-        .await
-        .unwrap();
-    assert_eq!(subscription.next_chunk().await.unwrap(), (0, 0, bytes));
-    assert_eq!(
-        fake.requests.await.unwrap(),
-        vec![
-            RequestEnvelope::new(
-                run_id(),
-                instance_id(),
-                RunnerRequest::TerminalAttachCapabilities,
-            ),
-            RequestEnvelope::new(
-                run_id(),
-                instance_id(),
-                RunnerRequest::AttachTerminal {
-                    since_offset: 0,
-                    mode: factory_core::runner::TerminalAttachMode::Legacy,
-                },
-            ),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn bounded_attach_refuses_an_old_runner_instead_of_falling_back_to_full_replay() {
-    let fake = fake_runner(vec![vec![encoded(RunnerFrame::Error {
-        protocol_version: RUNNER_PROTOCOL_VERSION,
-        code: RunnerErrorCode::InvalidRequest,
-        message: "unknown terminal capability request".into(),
-    })]])
-    .await;
-    let result = client(&fake.runtime_dir)
-        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
-        .await;
-    assert!(matches!(
-        result,
-        Err(RunnerClientError::BoundedAttachUnsupported)
-    ));
-    assert_eq!(
-        fake.requests.await.unwrap(),
-        vec![RequestEnvelope::new(
-            run_id(),
-            instance_id(),
-            RunnerRequest::TerminalAttachCapabilities,
-        )]
-    );
-}
-
-#[tokio::test]
-async fn bounded_attach_negotiates_exact_generation_and_replay_start() {
-    let fake = fake_runner(vec![
-        vec![encoded(attach_capabilities())],
-        vec![
-            encoded(RunnerFrame::TerminalAttachReady {
-                protocol_version: RUNNER_PROTOCOL_VERSION,
-                generation: 4,
-                base_generation: 3,
-                base_offset: 100,
-                start_generation: 3,
-                start_offset: 150,
-                end_offset: 200,
-                reset_prefix: factory_core::runner::encode_terminal_bytes(b"\x1bc"),
-            }),
-            encoded(RunnerFrame::TerminalOutput {
-                protocol_version: RUNNER_PROTOCOL_VERSION,
-                generation: 3,
-                offset: 150,
-                bytes: String::new(),
-            }),
-        ],
-    ])
-    .await;
-    let mut subscription = client(&fake.runtime_dir)
-        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Tail)
-        .await
-        .unwrap();
-    assert_eq!(subscription.info().unwrap().base_generation, 3);
-    assert_eq!(subscription.info().unwrap().start_offset, 150);
-    assert_eq!(
-        subscription.next_chunk().await.unwrap(),
-        (3, 150, "".into())
-    );
-    assert_eq!(
-        fake.requests.await.unwrap(),
-        vec![
-            RequestEnvelope::new(
-                run_id(),
-                instance_id(),
-                RunnerRequest::TerminalAttachCapabilities,
-            ),
-            RequestEnvelope::new(
-                run_id(),
-                instance_id(),
-                RunnerRequest::AttachTerminal {
-                    since_offset: 0,
-                    mode: factory_core::runner::TerminalAttachMode::Tail,
-                },
-            ),
-        ]
-    );
-}
-
-#[tokio::test]
-async fn silent_old_v1_runner_has_a_bounded_fallback_without_losing_later_output() {
-    let directory = tempfile::tempdir_in("/tmp").unwrap();
-    let runtime_dir = directory.path().join("runtime");
-    std::fs::create_dir(&runtime_dir).unwrap();
-    let listener = UnixListener::bind(runtime_dir.join("control.sock")).unwrap();
-    let server = tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let mut stream = reader.into_inner();
-        stream
-            .write_all(&encoded(terminal_output(
-                0,
-                &factory_core::runner::encode_terminal_bytes(b"later"),
-            )))
-            .await
-            .unwrap();
-    });
-
-    let started = tokio::time::Instant::now();
-    let mut subscription = client(&runtime_dir)
-        .attach_terminal(0, factory_core::runner::TerminalAttachMode::Legacy)
-        .await
-        .unwrap();
-    assert!(
-        started.elapsed() < Duration::from_millis(350),
-        "legacy silent attach stayed blocked"
-    );
-    let (generation, offset, bytes) = subscription.next_chunk().await.unwrap();
-    assert_eq!(generation, 0);
-    assert_eq!(offset, 0);
-    assert_eq!(
-        factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
-        b"later"
-    );
     server.await.unwrap();
 }

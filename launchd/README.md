@@ -1,112 +1,24 @@
-# Local LaunchAgents
+# Local LaunchAgent frozen
 
-`com.dark-factory.factoryd.plist.template` keeps the daemon alive. It loads
-`$DARK_FACTORY_HOME/webhooks.json` automatically if present (or an explicit
-`--webhook-config PATH`) before announcing readiness. This job does not use
-GitHub Actions.
+Do not render, install, reload, or remove the Dark Factory LaunchAgent during
+the safe-kernel refactor. The installed job and `~/.dark-factory` are the
+operator's live system, not development fixtures.
 
-Before loading it, create `$DARK_FACTORY_HOME` and its `logs/` directory
-owned by the current user with mode `0700`; keep the rendered webhook
-config, secrets, and plist at mode `0600`.
+Stage 1 replaces resident sessions with one process per admitted run and adds a
+durable resource finalizer. Stage 2 and Stage 3 are still required before boot,
+so the current source is intentionally unsupported as a launchd service.
 
-## Render and install
+For development, run an isolated source-built daemon only as permitted by
+[`docs/development/WORKFLOW.md`](../docs/development/WORKFLOW.md), using a
+temporary `DARK_FACTORY_HOME` and explicit private socket. During Stage 1,
+limit manual checks to health and non-provider causal fixtures.
 
-launchd jobs do not inherit a login shell's `PATH` -- under `launchd` it is
-just `/usr/bin:/bin:/usr/sbin:/sbin`. `factoryd` has no `--codex`/`--claude`
-flag; it resolves `claude`/`codex` by bare name through the session `PATH`
-it hands each spawned agent, so the `PATH` in `__ENVIRONMENT__` below must
-already include whatever directories `claude` and `codex` actually live in on this machine
-(`~/.local/bin`, `~/.nvm/.../bin`, `/opt/homebrew/bin`, ...) or a
-launchd-managed daemon will never find either provider, even though the
-exact same command works fine from an
-interactive shell. Find them first:
+Do not delete `~/.dark-factory` or preserved worktrees. Pre-kernel stop/list
+instructions no longer apply because the resident-session model is gone. Any
+future service and uninstall procedure must
+operate on exact durable run resources, wait for finalization, preserve unique
+Changes, and verify the target job identity before mutation.
 
-```sh
-dirname "$(command -v claude)"
-dirname "$(command -v codex)"
-```
-
-`factoryctl init` creates this job and `factoryctl update --install`
-rewrites and reloads an existing one, both from this exact template. To
-create one by hand instead, render the three placeholders —
-`__PROGRAM_ARGUMENTS__` (one `<string>` per argument, the first being the
-absolute path to `factoryd`; the daemon finds `factory-runner`/`factoryctl`
-as its own siblings and every path under `$DARK_FACTORY_HOME` by default),
-`__ENVIRONMENT__` (`<key>`/`<string>` pairs; at least `PATH` and
-`DARK_FACTORY_HOME`), and `__DARK_FACTORY_HOME__` — then install the result
-in `~/Library/LaunchAgents`:
-
-```sh
-factoryd="$HOME/.dark-factory/bin/current/factoryd"   # or wherever it lives
-path="$(dirname "$(command -v claude)"):$(dirname "$(command -v codex)"):/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-sed \
-  -e "s#__PROGRAM_ARGUMENTS__#        <string>$factoryd</string>#g" \
-  -e "s#__ENVIRONMENT__#        <key>PATH</key><string>$path</string><key>DARK_FACTORY_HOME</key><string>$HOME/.dark-factory</string>#g" \
-  -e "s#__DARK_FACTORY_HOME__#$HOME/.dark-factory#g" \
-  launchd/com.dark-factory.factoryd.plist.template \
-  > ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
-chmod 0600 ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
-mkdir -p ~/.dark-factory/logs && chmod 0700 ~/.dark-factory ~/.dark-factory/logs
-
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
-launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd
-```
-
-`--max-active-runs` (default 4, enforced by the dispatcher as a hard cap on
-live sessions) is the operator-owned capacity setting. Inspect or change it
-with `factoryctl capacity status` or `factoryctl capacity set N`; values from
-1 through 64 are accepted. The managed operation shows its process and
-subscription impact, reloads only `factoryd`, waits for health, and restores
-the previous plist if reload/health fails. Higher values can increase concurrent
-provider/subscription use; lower values leave saturated work queued. The
-provider-session shell policy denies the mutation; the managed operation also
-refuses manual daemons and an unloaded/missing launchd job. `factoryctl init` and
-`factoryctl update --install` preserve the setting when they rewrite the job.
-Any other `factoryd` flag goes into `ProgramArguments` as further `<string>`
-elements; `factoryctl update --install` carries them and the environment over
-when it rewrites the job (only `--runner`/`--factoryctl` are dropped, since
-they must point at the newly activated binaries, and `PATH` gains the provider
-CLIs' directories if it lacks them). A rewritten job must be `bootout`/`bootstrap`ed, not just
-`kickstart`ed — launchd caches `ProgramArguments`. The template sets
-`AbandonProcessGroup`: without it launchd would kill every runner — every
-session — with the daemon on `bootout`/`kickstart -k`.
-
-Subscription headroom has no background service or log: run `factoryctl
-usage` on demand in a terminal instead.
-
-## Uninstall
-
-Commit or copy any uncommitted agent work first. List the sessions in each
-project. Stop every live session before you stop the daemon:
-
-```sh
-factoryctl session list --project PROJECT_ID
-factoryctl session stop --project PROJECT_ID --session SESSION_ID --grace-ms 5000
-factoryctl session list --project PROJECT_ID
-```
-
-Repeat `session stop` for each entry that has no `ended_at_ms`. A stop closes
-its active task run. Check the final list before you continue. Then unload the
-service and remove its job file:
-
-```sh
-launchctl bootout gui/$(id -u)/com.dark-factory.factoryd
-rm ~/Library/LaunchAgents/com.dark-factory.factoryd.plist
-```
-
-This keeps `~/.dark-factory`, including its database, worktrees, logs, and
-installed versions. It also leaves each `agent/<id>` branch in its project
-repository, Claude trust entries in `~/.claude.json`, and provider login state.
-You can reinstall the service without losing this state.
-
-Deleting `~/.dark-factory` is a separate and irreversible action. It deletes
-the factory history and managed worktrees. This guide does not run that action.
-Archive or inspect the directory first, and only remove it after every session
-has stopped. External agent branches and Claude trust entries still remain.
-
-## Removing a previously installed usage-monitor job
-
-Older checkouts installed a separate `com.dark-factory.usage-monitor` job.
-It no longer exists (`factoryctl usage` replaced it): remove any surviving
-install with `launchctl bootout gui/$(id -u)/com.dark-factory.usage-monitor`
-and delete its plist from `~/Library/LaunchAgents`.
+The normal install, update, rollback, and uninstall guide will return only
+after the complete safe-kernel boot review and a separate operator decision to
+publish and install a release.

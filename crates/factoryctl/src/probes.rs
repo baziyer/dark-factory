@@ -19,7 +19,8 @@ use crate::launchd;
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The provider CLIs a factory can run, and `git`, which worktrees need.
+/// The provider CLIs a factory can run, plus `git` for future daemon-owned
+/// Changes.
 pub const PROBED_PROGRAMS: [&str; 3] = ["claude", "codex", "git"];
 
 /// The first executable regular file named `program` on this process's `PATH`.

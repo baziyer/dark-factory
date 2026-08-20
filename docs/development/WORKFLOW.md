@@ -1,556 +1,153 @@
 # Development workflow
 
+## Freeze and scope
+
+Dark Factory is in a three-stage safe-kernel refactor. Do not start provider
+work, install or release a refactor revision, enable auto mode, modify
+`~/.dark-factory`, load or alter the installed launchd job, or delete preserved
+worktrees. Stage-specific isolated fixtures are allowed only with a temporary
+home, explicit socket, exact resource identities, and an independent reaper.
+
 ## Day to day
 
-1. `./scripts/new-worktree.sh <slug>` — one worktree per task, never work
-   directly on `main`.
-2. Build and iterate: `cargo build --workspace`.
-3. Before opening a PR: `./scripts/local-ci.sh` on macOS, or
-   `./scripts/local-ci.sh --linux-source` on Ubuntu (fmt, clippy at
-   `-D warnings`, the full test suite, `git diff --check`) — this is the
-   authoritative source gate. macOS additionally runs its release-source,
-   publisher, and package fixtures; Linux source preview deliberately does
-   not claim archive support (see "CI and GitHub" below).
+1. Create one branch in one development worktree:
 
-The default macOS `local-ci.sh` path takes a repository-common-directory kernel
-lease before running any release probe, compiler, or test. This serializes
-linked worktrees while leaving independent clones independent. Acquisition
-first creates the lock object as an atomic directory; symlinked, substituted,
-or otherwise unverifiable objects fail closed rather than letting contenders
-lock different inodes. The child obtains the `lockf` descriptor before
-publishing its `.starting` marker, then inherits that descriptor into the owned
-command, so no live starter can race stale-marker recovery and a killed wrapper
-cannot release the gate while an owned descendant remains. A second invocation
-waits and prints one bounded, field-validated owner record (PID, exact head,
-worktree, start time, lock identity, and safe agent/task labels); set
-`DARK_FACTORY_LOCAL_CI_WAIT=0` to fail explicitly instead. The symlink record
-is diagnostic metadata only, must resolve to a regular non-symlink file, and
-is cleaned only after exclusive object recovery. Stale recovery is serialized
-inside the object, so it cannot remove a new owner. A nested child refuses
-through the inherited owner contract.
+   ```sh
+   ./scripts/new-worktree.sh <slug>
+   cd .worktrees/<slug>
+   ```
 
-Direct load-bearing commands must use the same seam, for example:
-`./scripts/with-local-ci-lease.sh cargo +1.88.0 test -p factoryd
---test sessions_e2e -- --test-threads=1`. The wrapper refuses nested use from
-inside an existing owner; direct lifecycle, PTY, and release-probe commands
-must not bypass it. The focused lease checks run as the first step inside the
-authoritative gate. The CI workflow's `always()` step-summary writer is
-reporting-only and runs after that single gate command; it does not invoke,
-bypass, or release the lease. The summary contract is checked by
-`local-ci.sh` while the lease is held. The Ubuntu `--linux-source` preview skips
-this macOS-specific lease harness and its release fixtures; GitHub runs that
-mode in an isolated hosted job.
+2. Make one coherent change. Preserve unrelated dirty work and prefer deletion
+   over compatibility machinery.
+3. Run focused checks through the shared lease when they invoke Cargo or
+   process-sensitive fixtures:
 
-After the macOS lease records its diagnostic owner, the single `local-ci.sh`
-entry boundary removes inherited Dark Factory home, socket, and task/session
-identity overrides before any gate child runs. Tests still set their own
-throwaway homes and sockets, while local-CI test seams, Cargo/Rust toolchain
-inputs, and provider configuration remain available. Callers therefore run the
-authoritative gate directly; they do not need a separate `env -u` recipe.
+   ```sh
+   ./scripts/with-local-ci-lease.sh cargo +1.88.0 test -p factoryd --lib
+   ```
 
-Before either source gate starts a broad Rust compile,
-`scripts/check-build-headroom.sh` reports the exact filesystem bytes available
-to the active Cargo target and that target's exact allocated bytes (the
-platform `df -Pk`/`du -sk` 1024-byte counts converted to bytes). It refuses
-before Cargo when free space is below 12 GiB. That threshold is twice the
-largest clean debug target measured during the #223 incident audit, leaving a
-full second build's margin instead of waiting for rustc to fail opaquely. The
-same read-only preflight runs before Linux's initial workspace build and both
-macOS release builds, and records its bounded result and byte counts in the
-GitHub workflow summary. It never deletes or reclaims anything. Free space on
-the Cargo target filesystem by inspecting only inactive, regenerable Cargo
-targets, then rerun; automatic identity-safe reclamation remains separate work
-in #223.
+4. Run the authoritative gate on the exact head:
 
-4. Push the branch, open a PR (the template carries the review checklist).
-5. **Adversarial review before merge**: a second agent or person reads the
-   diff cold and tries to break it — correctness, missed simplification,
-   security — and posts findings on the PR. The author addresses each one
-   or explains why not. The reviewer re-checks. Only then merge. See
-   `AGENTS.md`'s "Critical rules" for the exact steps.
-6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
+   ```sh
+   ./scripts/local-ci.sh
+   ```
 
-### Agent memory maintenance
+   Ubuntu x86-64 contributors use `./scripts/local-ci.sh --linux-source`.
+5. Push and open a PR describing behavior, deleted authority paths, exact
+   base/head, focused proof, and unverified lanes.
+6. A reviewer other than the author reads `base..head` cold, tries to break
+   correctness/security/simplification, and posts findings plus what resisted
+   attack. The author resolves every finding; the reviewer rechecks and gives
+   an explicit ALLOW before merge.
+7. Required hosted checks must pass on the exact reviewed head. Merge only
+   then. Remove the development worktree after merge through the normal Git
+   worktree command; never remove preserved factory Changes during this work.
 
-`memory.md` is bounded guidance, not the agent's append-only authority log.
-The daemon accepts and exposes mechanical agent status even when memory is
-near the 16 KiB limit, oversized, invalid UTF-8, or unavailable; `agent get`
-and `agent status` return the typed health state and omit unsafe content.
-Before dispatching an agent with no live session, `factoryd` preserves the
-exact old bytes in a private `memory-archive/` rotation and atomically
-projects recent complete UTF-8-safe lines back into `memory.md`. Generated
-provider guidance tells agents to curate durable lessons and keep the active
-file below the 12 KiB compaction high-water mark. `PROJECT.md`, Rules, and
-standing instructions are not rewritten by this maintenance.
+### Shared local-CI lease
 
-### Testing resident sessions
+The macOS gate serializes compiler, release-probe, and process-sensitive work
+across linked worktrees using a repository-common-directory lease. Its owner
+record is diagnostic; the held kernel lock is authoritative. Do not bypass the
+wrapper for a load-bearing Cargo or process fixture. Set
+`DARK_FACTORY_LOCAL_CI_WAIT=0` to refuse instead of waiting.
 
-An E2E harness must not stop `factoryd` immediately after a `StopSession`
-response. That response only confirms that `factory-runner` accepted the stop;
-the runner stays alive until the daemon observes its terminal event and sends
-`AcknowledgeExit`. Killing the daemon between those steps leaves the runner
-waiting for an acknowledgement that can never arrive.
+The gate clears inherited live-factory home, socket, and attempt identity
+variables. Tests set their own isolated values. The build-headroom preflight
+reports and refuses low space but does not reclaim anything; inspect only
+inactive regenerable Cargo targets manually. Stage 3 will add bounded product
+cache reclamation, not change this daemon-independent development lease without
+separate evidence.
 
-Tests that create resident sessions must therefore use both safeguards in
-`crates/factoryd/tests/sessions_e2e.rs`: call `cleanup_session` on the normal
-path, which waits until the session is non-live **and its runner process has
-exited** before stopping the daemon (pausing the agent first so pending fixture
-work cannot spawn a replacement), and retain `Daemon`'s `Drop` cleanup for
-assertion failures. A test may stop the daemon while a session is live only when
-daemon restart/recovery is the behavior under test; it must reconnect, then
-perform the same cleanup handshake before returning. Never replace this with a
-fixed sleep or a bare `daemon.stop()`.
+## Isolated daemon checks
 
-### Developing the daemon without disrupting a running factory
-
-Never point a development build at `~/.dark-factory` or the installed
-`launchd` job — that is the operator's live system, with real agent
-sessions in it. Run a second, throwaway daemon instead:
+Use a second, throwaway home and explicit socket. Never rely on the default:
 
 ```sh
-export DARK_FACTORY_HOME=$(mktemp -d /tmp/df-dev.XXXXXX)
+export DARK_FACTORY_HOME="$(mktemp -d /tmp/df-dev.XXXXXX)"
 chmod 700 "$DARK_FACTORY_HOME"
 target/debug/factoryd --socket "$DARK_FACTORY_HOME/f.sock" &
 target/debug/factoryctl --socket "$DARK_FACTORY_HOME/f.sock" health
 ```
 
-A resident session's provider process is a detached process tree,
-independent of `factoryd` (`ARCHITECTURE.md`'s invariant 4): killing and
-restarting *this* development daemon on the *same* temp
-`$DARK_FACTORY_HOME` reconnects to whatever it left running. Upgrading the
-**live** daemon is `factoryctl update --install` (below), or by hand: build
-the new binaries and `launchctl kickstart -k gui/$(id -u)/com.dark-factory.factoryd`
-— the daemon restarts, runners survive, and `factory-tui`'s reconnect/backoff
-means the board just picks the same sessions back up. **One-time caveat for
-an install that predates the process-group fix** (a job loaded from the old
-template, running a daemon older than 39955d2): the *loaded* job has no
-`AbandonProcessGroup` and its runners share the daemon's process group, so
-the first `kickstart -k`/`bootout`/`update --install` after upgrading takes
-any live session with it — do that first restart while no session is live.
-Every restart after it (new daemon, new job) keeps sessions.
+During Stage 1, stop after anonymous health and store-level causal fixtures.
+Do not add a worker task: production worker admission intentionally refuses
+until Stage 2. Do not point an orchestrator policy fixture at a real provider.
 
-### Ubuntu x86-64 contributor preview
+A lifecycle fixture must register resources before use and verify after its
+test that exact descendants and disposable paths are gone. Crash/restart tests
+must restart the daemon and let its durable finalizer converge. `Drop`, shell
+traps, sleeps, broad process scans, and cleanup owned only by the killed fixture
+are insufficient proof.
 
-The Linux preview is source-only and deliberately narrow. On Ubuntu x86-64,
-use Rust 1.88 or later and run:
+## Stage review discipline
 
-```sh
-cargo +1.88.0 build --workspace
-./scripts/linux-contributor-smoke.sh
-```
+Each safe-kernel stage is a coherent serial PR. Before implementation review,
+record:
 
-The smoke always creates a throwaway `DARK_FACTORY_HOME` and socket. It starts
-the source-built `factoryd`, checks socket mode and health with `factoryctl`,
-launches `factory-tui --version`, and completes a task through the
-deterministic shell provider. Before daemon shutdown, it stops the exact
-resident session through `factoryctl session stop`, waits with a finite bound
-for the session and its exact runner descendants to exit, verifies the socket
-is gone, and only then removes the scratch home. Its interrupted-cleanup
-regression runs the same owned teardown after deliberate failure and proves no
-scratch home remains. The full workspace suite supplies the deeper PTY
-attach/detach, task completion/blocking, process-group cleanup, and
-daemon-restart recovery evidence.
+- the old authority paths deleted;
+- production and test additions/deletions separately;
+- exact causal tests and injected crash boundaries;
+- unsupported later-stage operations that now fail closed;
+- migration preconditions and rollback requirements; and
+- any compatibility code retained, with its sole caller.
 
-This preview does not claim a Linux archive, installer, systemd integration,
-or real-provider support. Claude Code and Codex are explicitly **unverified on
-Linux** and no paid provider prompt is needed. macOS-only launchd fixtures are
-marked ignored on Linux with the concrete reason that launchd is unavailable;
-the shared daemon, queue, store, execution, and shell-provider tests remain
-authoritative on both platforms.
+An independent phase review follows the stage PR review and challenges the
+combined architecture against
+[`SAFE_KERNEL_REFACTOR.md`](SAFE_KERNEL_REFACTOR.md). Passing one stage never
+authorizes booting the factory.
+
+## Migration rules
+
+SQLite migrations are sequential numbered files under
+`crates/factoryd/migrations/`. Never edit a shipped migration. Historical
+fixtures must apply the real ordered chain to version N rather than creating a
+new schema and manually deleting objects.
+
+The Stage 1 cutover migration refuses a schema-29 database containing live
+sessions, active/uncertain delivery, nonterminal runs, or other work whose
+external effect cannot be proven. It preserves legacy worktrees as unlinked
+retained Changes. Before any future schema-30 boot, take an explicit database
+backup and rollback decision; the refactor itself does not boot it.
 
 ## CI and GitHub
 
-`.github/workflows/ci.yml` runs the macOS source gate as one job, `checks`, on
-every pull request and every push to `main`; its Ubuntu preview job invokes
-the shared Rust gate with `--linux-source`, the source smoke, and its bounded
-interrupted-teardown regression. The final `required` job is the single
-required merge context and fails unless both hosted jobs pass. Linux does not
-invoke the macOS release-source, publisher, or package fixtures.
+The pull-request workflow runs the shared source gate on hosted macOS and the
+Linux source-only lane. The aggregate `required` context is the merge gate.
+Review the exact `.github/workflows/` diff before approving an external run: a
+PR evaluates its own workflow and can change `runs-on`. A green workflow never
+replaces CODEOWNERS approval and resolved review threads.
 
-The declarative required-context proposal lives in
-`.github/repository-settings.yml`. `scripts/test-repository-settings.sh`
-checks that the manifest, workflow aggregate, and settings publisher keep the
-same `required` context. It is static and does not contact GitHub or mutate
-repository rules.
+Public state may include a milestone, exact ref/SHA, checks, links, and next
+operator action. Attempt identities, prompts, guidance, raw provider output,
+credentials, messages, source, and review deliberation stay private.
 
-**Going public is one step**: flip the repository, then immediately run
-`scripts/github-repo-settings.sh` — the rulesets, the security features,
-and the fork-approval policy below all 403/422 on a private free-plan
-repository, so until that script has run clean none of this is enforced.
-It applies, idempotently:
+## Release and install
 
-- labels (`known-issue`, `area:*`, `size:*`, `decision`, `security`) and
-  merge settings (squash or rebase only, merged branches deleted);
-- ruleset `main-protect`, with no bypass for anyone: a green `required`
-  aggregate from GitHub Actions (both hosted macOS and Ubuntu) against a head
-  that is up to date with `main`, linear history, no force-push, no deletion;
-- ruleset `main-review`: a pull request with one CODEOWNERS approval and
-  every thread resolved. The repository admin may bypass *this* ruleset,
-  and only through a pull request — GitHub never lets an author approve
-  their own PR and this repository has one maintainer — so the maintainer
-  can merge their own reviewed PR, but never without green `required`, and
-  nobody pushes to `main`;
-- private vulnerability reporting, Dependabot alerts, secret scanning with
-  push protection, and "every workflow run from an outside contributor's
-  fork needs approval".
+Release and install are paused until the safe-kernel boot review. Do not tag,
+publish, update the Homebrew tap, run `factoryctl update --install`, or load a
+refactor binary into the operator job.
 
-Where `checks` runs is a **policy, not a mechanism**: a pull request runs
-the workflow file it carries, so the `runs-on` expression at `.github/workflows/ci.yml`
-only governs a PR that leaves it unmodified — a PR (or a manual run) that
-edits it can route itself elsewhere. Four routes, in increasing order of
-trust:
+After the freeze is lifted, the existing release transaction remains the
+required shape:
 
-- **A pull request whose `runs-on` is unmodified** — same-repository or a
-  fork — runs on an ephemeral hosted macOS runner (`macos-latest`; hosted
-  minutes are free for public repositories). This is the default and the
-  overwhelming majority of runs.
-- **A fork's workflow run additionally needs the maintainer's approval**
-  before it runs at all (`scripts/github-repo-settings.sh` sets that
-  policy, confirmed live: `gh api
-  repos/baziyer/dark-factory/actions/permissions/fork-pr-contributor-approval`
-  returns `all_external_contributors`). Approval, not the runner choice,
-  is the actual gate: self-hosted runners accept any job matching their
-  label regardless of which workflow or branch produced it, so an
-  approved fork run that edited `runs-on` to `dark-factory-mac` *would*
-  execute there. Read `.github/workflows/` in a fork's diff before
-  approving it — that's still the boundary.
-- **A same-repository branch gets no approval gate at all** — GitHub's
-  fork-approval setting only ever covers external contributors — so it
-  can route `checks` straight to `dark-factory-mac` by editing `runs-on`
-  in its own diff, unreviewed, the moment the PR opens or updates; no
-  repo-level setting closes this. But only the maintainer's own GitHub
-  account can push a same-repository branch — every agent's `agent/<id>`
-  branch is pushed under that account (see the worktree note above) — so
-  this policy removes the *default and accidental* path onto the
-  persistent Mac, not a *determined* one from an account that already has
-  push access and can reach the daemon locally anyway. `workflow_dispatch`
-  (`ci.yml:7`) is the same trust level again: any collaborator with write
-  access can manually run `checks` against any ref from the Actions
-  UI/API, and it always evaluates to `dark-factory-mac`
-  (`event_name != 'pull_request'`). The real backstop for a
-  same-repository PR is that a green `checks` run never authorizes a
-  merge by itself — `main-review` still requires one CODEOWNERS approval
-  and every thread resolved, per the ruleset above.
-- **`push` to `main`** (already merged, already reviewed via that same
-  `main-review` ruleset) and **a maintainer's tag push** in `release.yml`
-  are the only routes that don't depend on any account's intent — both
-  require code to already be on a protected ref. These run on the
-  maintainer's persistent Mac, the self-hosted runner `dark-factory-mac`
-  — warm cargo cache, real macOS, no hosted minutes.
+- a semver tag matching the workspace version builds the supported archives;
+- published manifests and archives carry exact SHA-256 identities;
+- install stages a complete version directory, verifies every binary, then
+  atomically repoints `bin/current`;
+- managed daemon reload must prove the expected launchd PID and exact active
+  sibling executables;
+- failure restores the previous pointer/job and verifies old health; and
+- migrations run at daemon start, with backup/rollback handled before an
+  irreversible schema boundary.
 
-**Follow-up, not done yet**: the remaining hardening for a determined
-same-repository or write-access actor is isolating the persistent runner
-itself — a separate macOS user with no access to the operator's home
-directory, credentials, or the `factoryd` socket, or replacing it with an
-ephemeral self-hosted runner — tracked as
-[#54](https://github.com/baziyer/dark-factory/issues/54).
+The old zero-downtime claim based on resident provider processes no longer
+applies. Any future updater must respect durable run resources and finalization
+rather than assuming daemon restart leaves an independent session alive.
 
-Known problems are GitHub issues labelled `known-issue`, see
-`CONTRIBUTING.md`.
+## Exact reporting
 
-### Public work and release visibility
-
-Milestones are the only release-target field. The operator-maintained
-convention for a participating issue or pull request is exactly one of these
-public state labels:
-
-| State label | Meaning |
-| --- | --- |
-| `state:queued` | Accepted work has not started. |
-| `state:in-progress` | Work is actively being executed. |
-| `state:blocked` | Work needs a bounded resolution before it can continue. |
-| `state:review` | A change is awaiting independent review or recheck. |
-| `state:release-ready` | Exact integration or release preconditions are satisfied. |
-
-`area:*`, `size:*`, `security`, and `known-issue` remain orthogonal labels.
-The repository setup script defines the five state labels but does not yet
-validate or reconcile conflicting labels. That enforcement is deferred to
-the GitHub App reconciliation contract in #188 and #208; a human must correct
-conflicting labels in the meantime.
-Use GitHub checks, workflow summaries, and release notes for evidence; do not
-post a comment for every state transition. The first bounded projection is
-specified in [#208](https://github.com/baziyer/dark-factory/issues/208).
-
-Public projections contain only state, release target, exact ref/SHA, checks,
-links, and the next operator action. Queue contents, agent/session identity,
-prompts, guidance, transcripts, raw provider output, credentials, and private
-review deliberation stay inside Dark Factory. A future GitHub App must update
-existing projections by a stable installation/repository/source/revision key
-and reconcile after retries, restarts, duplicate deliveries, edits, reopen,
-timeouts, or permission loss; it must never create transition-comment spam.
-
-### The self-hosted runner
-
-`~/actions-runner-dark-factory-repo` on the maintainer's Mac, registered
-to this repository as `dark-factory-mac` (label `dark-factory-mac`),
-installed as the launchd service
-`actions.runner.baziyer-dark-factory.dark-factory-mac`. It is not in
-version control; to rebuild it on a new machine:
-
-```sh
-V=$(gh api repos/actions/runner/releases/latest --jq .tag_name | sed 's/^v//')
-mkdir -p ~/actions-runner-dark-factory-repo && cd ~/actions-runner-dark-factory-repo
-curl -fsSL -o runner.tar.gz "https://github.com/actions/runner/releases/download/v${V}/actions-runner-osx-arm64-${V}.tar.gz"
-tar xzf runner.tar.gz && rm runner.tar.gz
-./config.sh --unattended --url https://github.com/baziyer/dark-factory \
-  --token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/registration-token --jq .token)" \
-  --name dark-factory-mac --labels dark-factory-mac --work _work
-```
-
-Then write `.env` next to it — a launchd service gets no shell profile, so
-every line is load-bearing (absolute paths; the runner does not expand
-`$HOME`):
-
-```
-PATH=/Users/<you>/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin
-LANG=en_GB.UTF-8
-CARGO_TARGET_DIR=/Users/<you>/actions-runner-dark-factory-repo/_cargo-target
-```
-
-(`RUSTUP_HOME` is deliberately shared with the login user: `local-ci.sh`
-pins `cargo +1.88.0` explicitly and never changes the default toolchain,
-so sharing keeps it warm without repinning anything. `CARGO_TARGET_DIR`
-lives outside `_work` because the checkout step in `ci.yml`/`release.yml`
-runs `git clean -ffdx` each job — see the comment on that step in either
-workflow file for why.) Finally `./svc.sh install && ./svc.sh start`, and
-confirm it is
-`online` with `gh api repos/baziyer/dark-factory/actions/runners`. To
-remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
---token "$(gh api -X POST repos/baziyer/dark-factory/actions/runners/remove-token --jq .token)"`.
-
-## Release and update
-
-GitHub Releases are the source of truth for binaries; nothing else builds
-them.
-
-1. **Build and publish**: pushing a semver tag (`git tag v0.2.6 && git push
-   origin v0.2.6`, on a commit whose `Cargo.toml` workspace version is
-   `0.2.6` — the workflow refuses a mismatch) runs
-   `.github/workflows/release.yml` on the trusted self-hosted arm Mac. One
-   serialized job builds `aarch64-apple-darwin` and then
-   `x86_64-apple-darwin`; there is no release-writing matrix to race shared
-   state. One `scripts/package-release.sh` transaction stages both flat
-   four-binary archives, `SHA256SUMS`, `latest.json`, and a
-   `dark-factory.rb` candidate before exposing `dist/`. It normalizes archive
-   member order, mode, ownership, and timestamps so rebuilding byte-identical
-   binaries produces the same resumable asset set.
-   `scripts/publish-release.sh` binds the remote tag to the workflow commit,
-   creates a draft, uploads only missing assets, and publishes only when the
-   remote asset names and digests exactly match that build. GitHub 5xx and
-   transport failures get four attempts with 2/4/8-second backoff. After any
-   failed write, the publisher reads the release once and accepts an
-   already-committed exact result; deterministic client errors are not
-   retried. A tag with a pre-release suffix (`v0.2.6-rc.1`) is published as
-   a pre-release so `releases/latest` keeps pointing at the newest full
-   release. `latest.json` is `{version, tag, assets: {<target>: {url,
-   sha256}}}` with both macOS targets; the newest one is always at
-   `https://github.com/baziyer/dark-factory/releases/latest/download/latest.json`
-   (a static URL, so no Vercel mirror is needed unless GitHub is
-   unreachable from somewhere that matters).
-   If a workflow defect stops publication, do not move or recreate the tag.
-   After its fix reaches `main`, dispatch the Release workflow from `main`
-   with the existing tag. Recovery resolves and builds that tagged commit,
-   but saves the publisher from the exact reviewed `main` commit that started
-   the run. The publisher revalidates the remote tag before any release write;
-   dispatches from other branches are rejected before the tagged source is
-   checked out.
-2. **Update signal**: `factoryctl update` fetches that manifest (via
-   `curl`; `DARK_FACTORY_UPDATE_URL` overrides the URL for tests/mirrors)
-   and prints concise human-readable lines naming the invoking/bootstrap
-   version, active `bin/current` runtime, latest release, and whether
-   `update --install` has work. Pass `factoryctl update --json` for the
-   machine-readable object (`current`, `active`, `latest`,
-   `update_available`, and the platform `asset`). Availability compares `latest` with `active`
-   when installed, not with a newer Homebrew bootstrap. The manifest result
-   is cached in `$DARK_FACTORY_HOME/update-check.json`;
-   `factory-tui` reads the same cache and refetches at most hourly, in a
-   background thread of the running board — no background service — and
-   shows one `[u update vX]` keyboard/mouse action in its status line.
-   Triggering that action is explicit; there is no automatic update setting.
-   `factoryctl health` also returns the daemon's `version`.
-3. **Install**: `factoryctl update --install` and the TUI action call one
-   shared transaction. It first does every read-only
-   check (a canonical stable `MAJOR.MINOR.PATCH` manifest with bounded safe
-   asset fields and exact lowercase SHA-256 digests; the launchd job, if any,
-   and that it runs with
-   *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
-   moving the operator's job). It captures the exact job/plist state, takes
-   the shared runtime-mutation lock before downloading, and refuses to begin
-   if that job appeared, disappeared, or changed after preflight. It then
-   downloads the platform asset, verifies
-   its SHA-256, unpacks it into `$DARK_FACTORY_HOME/bin/<version>/` (staged,
-   renamed into place only once every binary checked out; a complete
-   version already on disk is reused), atomically repoints
-   `$DARK_FACTORY_HOME/bin/current`, and — if
-   `~/Library/LaunchAgents/com.dark-factory.factoryd.plist` exists —
-   rewrites that job to run `bin/current/factoryd` (keeping its other
-   arguments and environment; `PATH` gains the provider CLIs' directories
-   if it lacks them), `bootout`s and `bootstrap`s it, and waits for
-   `health` to answer **with the new version**. If the reload fails,
-   `bin/current` is rolled back and the error names the recovery command;
-   if the new daemon never answers, exit 1 says where the log is and how to
-   roll back by hand. If the new version is already installed and running,
-   nothing restarts. Without a launchd job it stops after activation and
-   says so; restart the daemon however you run it. The TUI requires the
-   matching managed launchd job so it cannot activate an update and then
-   strand itself against an old independently managed daemon. Its bounded
-   status reports stages from inside the download, SHA verification, unpack,
-   activation, job reload, and exact-version health operations.
-   A complete version directory is reusable only with a private identity file
-   matching the release archive digest and fresh hashes of all four executable
-   bytes; mode-only or same-version substitutions are refused.
-4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
-   an update never needs a separate migration step.
-5. **No lost work**: sessions and runners are independent process trees
-   (`ARCHITECTURE.md`, invariant 4). The daemon restart is on the order of
-   a second and touches no agent process; `factory-tui` reconnects on its
-   own. Under launchd this holds because every runner is its own
-   process-group leader *and* the job sets `AbandonProcessGroup` — without
-   either, `bootout`/`kickstart -k` kills the daemon's whole group, sessions
-   included (verified with a throwaway job; `sessions_e2e`'s
-   `factoryd_process_group_kill_does_not_take_sessions` guards it). Two
-   compatibility rules follow, in both directions: the runner control
-   protocol must stay backward compatible within a major version (a runner
-   spawned by daemon N is supervised by daemon N+1 after an update, and —
-   in the seconds between `activate` and the new daemon answering — daemon
-   N spawns runner N+1), and running sessions' hooks keep working because
-   they invoke `factoryctl` through the `bin/current` symlink, which now
-   resolves to the new version, against whichever daemon is up.
-6. **Rollback**: `ln -sfn <previous-version> $DARK_FACTORY_HOME/bin/current`
-   (or repoint it the same atomic way) and `launchctl kickstart -k
-   gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
-   so a rollback never re-downloads.
-   After a successful TUI install, the viewer validates and execs the exact
-   digest-proven `$DARK_FACTORY_HOME/bin/<version>/factory-tui` returned by
-   that transaction, never a second mutable `bin/current` lookup, retaining
-   its PID and restoring the focused project, selected agent, BUILDING/AGENT
-   view, and maximized-terminal intent from the next durable snapshot. Before
-   exec it closes only local attach panes and restores the host terminal. If exec
-   preparation or exec itself returns an error, the shared rollback plan
-   restores the prior runtime and launchd job, verifies the old daemon's exact
-   version, and leaves the old board running with one actionable error. Runner
-   and provider processes are not children of the viewer and are untouched.
-   The transaction keeps the shared runtime-mutation lock through this exec
-   seam. Normal keyboard/mouse detach is delayed and the update worker is
-   joined. Before activation and at reload/health boundaries it atomically
-   records the prior runtime/job in a private recovery file. On next viewer
-   start, the canonical factory home, socket, plist, operator UID, and launchd
-   job label must match the saved authority before the record can be consumed
-   or any rollback starts. Pre-health phases then roll back and verify the
-   exact old managed daemon; an awaiting-relaunch phase is committed only if
-   the socket responder is the launchd-owned PID using the active sibling
-   executables. Download-only interruption has not mutated the runtime and
-   its staging directory is replaced on the next attempt.
-7. **Homebrew bootstrap substrate**: this repository renders the exact
-   custom-tap formula from the two archive checksums and the update-manifest
-   checksum, then publishes it as `dark-factory.rb`. The versioned manifest
-   is the formula's required top-level source; an architecture-selected
-   resource supplies the binaries. The public tap is
-   [`baziyer/homebrew-tap`](https://github.com/baziyer/homebrew-tap). Its
-   v0.2.0 formula passed tap, install, test, binary-version, and scratch
-   `init`/`doctor` checks. After each release, update the tap from the published
-   formula asset:
-
-   ```sh
-   tap_dir=$(brew --repository baziyer/tap)
-   gh release download "$TAG" --repo baziyer/dark-factory \
-     --pattern dark-factory.rb --dir "$tap_dir/Formula" --clobber
-   ruby -c "$tap_dir/Formula/dark-factory.rb"
-   brew style "$tap_dir/Formula/dark-factory.rb"
-   brew audit --strict --formula baziyer/tap/dark-factory
-   brew install --formula baziyer/tap/dark-factory
-   brew test baziyer/tap/dark-factory
-   ```
-
-   The formula checksums the manifest and selected arm or Intel archive, then
-   installs all four binaries. It deliberately defines no `service` block.
-   Homebrew owns only the bootstrap copy: `factoryctl init` installs the
-   active versioned runtime and launchd job, and `factoryctl update --install`
-   remains the sole active-runtime updater so live-session preservation,
-   atomic switch, health verification, and rollback stay in one
-   implementation. The formula caveats state the same split.
-   Accordingly, `brew uninstall dark-factory` removes only the Homebrew
-   bootstrap commands; it leaves the launchd job, active runtime, database,
-   worktrees, logs, and installed versions under `~/.dark-factory`. Follow
-   [the service uninstall procedure](../../launchd/README.md#uninstall) to
-   stop live sessions and unload the job safely before removing anything
-   else. State deletion remains a separate irreversible choice.
-8. **npm remains deferred** until non-macOS demand is demonstrated. A wrapper
-   would add Node as an installation dependency while reintroducing the same
-   bootstrap-versus-active-runtime update split; it does not simplify the
-   supported macOS product today.
-
-Add `$DARK_FACTORY_HOME/bin/current` to your shell `PATH` to run the
-installed `factoryctl`/`factory-tui`; `launchd/README.md` covers the job
-itself.
-
-### Operator install and doctor
-
-`factoryctl init` is the guided install (README, "Install"): home
-directory (a symlink is refused, as the daemon refuses it), this build's
-binaries as `bin/<version>` + `current` (a different build under the same
-version is refused, never overwritten), a probe of `claude`/`codex`/`git`,
-the disclosure of what is written outside the home and a consent step
-before launchd is touched, a refusal to race a hand-started daemon on the
-same socket, then the launchd job rendered with a `PATH` that can find
-those CLIs (an existing job keeps its arguments and environment and gets
-its `PATH` repaired), loaded, and the daemon awaited *with this version*.
-Once the daemon answers, `init` lists projects through the local API and only
-suggests creating the demo project for an empty fleet; existing fleets get
-`factoryctl status` and `factory-tui` instead.
-`factoryctl doctor [--json]` runs the same diagnostic probes plus the daemon
-(reachable? same version as the binaries?), the launchd job (installed,
-loaded, `PATH` — launchd's default when the job sets none — covers the
-providers?), `~/.claude.json` for worktree pre-trust, every project's root
-and stale worktree directories, and the cached update check (which may fetch
-and refresh `$DARK_FACTORY_HOME/update-check.json`, at most hourly). It does
-not repair or reconfigure the installation; it prints one line per check and
-exits 1 on any failure. `init`, `doctor`, and `update --install` share one set
-of probes (`crates/factoryctl/src/probes.rs`) and one launchd path
-(`launchd::apply`), so they cannot disagree about what a healthy install looks
-like.
-
-The live-session capacity is also launchd-owned durable state. New jobs receive
-the finite default of 4; `factoryctl capacity set N` and the TUI's `C` setting
-surface use the same shared operation, which accepts 1 through 64, requires a
-loaded managed job, serializes concurrent changes, reports restart/subscription
-impact, reloads only `factoryd`, waits for managed-process health, and restores
-the prior plist and job on failure. `init`, `update --install`, re-init, and a
-binary rollback carry the chosen `--max-active-runs` value forward. The
-provider-session shell policy denies agent-originated mutation, and a manual
-daemon cannot satisfy managed health.
-
-## Terminal attach and retained history
-
-`factoryctl attach` and the TUI use the daemon's shared attach operation. A
-normal attach requests a bounded 256 KiB tail, keeping a long-running session
-useful without replaying its entire retained log. The daemon first negotiates
-the runner capability; an old preserved runner is never allowed to turn this
-request into an unbounded legacy replay. Use `--full-history` (or
-`--since-offset 0`) when a complete currently retained replay is intentional;
-that explicit mode can use the old runner's equivalent during a rolling
-upgrade. A resume cursor may include `--generation N`; Ready and gap frames
-carry the owning base generation, replay generation, and exact byte start/end
-bounds so a client can distinguish a retained cursor from compaction lag;
-every output chunk carries its generation when replay crosses a rotation.
-Clients never inspect `terminal.log` directly: the runner snapshots immutable
-file descriptions and uses positional reads. The bounded tail is a reset-
-baseline view, not a promise to reconstruct application mouse, bracketed
-paste, cursor, or alternate-screen state; use full history for that. Its
-suffix begins at a safe UTF-8/ANSI boundary. PTY bytes stay opaque and bounded
-on every wire frame. Ctrl-] closes only the attach stream, Ctrl-C is forwarded
-as ordinary PTY input, and output/socket failure wakes blocked CLI input;
-detaching does not stop the session.
-The TUI parses retained bytes as a real terminal stream, keeps a bounded
-scrollback page, and snapshots the visible state across narrow/wide resize so
-wrapped UTF-8/ANSI output and a live prompt do not disappear at the viewport
-edge.
-
-## Task list for whoever picks this up
-
-- [x] GitHub Actions release workflow (tag → build → attach binaries + manifest)
-- [x] `factoryctl update` (check-only) and `factory-tui` status-line signal
-- [x] `factoryctl update --install` (download, verify, repoint, reload, restart)
-- [x] `factoryctl init` and `factoryctl doctor`
-- [x] Publish and real-install-test the Homebrew tap
-- [ ] Reconsider an npm wrapper after demonstrated non-macOS demand
+Report each command actually run and whether it passed, failed, or was not run.
+Keep local proof, hosted CI, review approval, merge, release, install, and live
+verification distinct. A source build is not provider validation; deterministic
+shell proof is not Claude/Codex proof; a merged intermediate stage is not a
+boot candidate.

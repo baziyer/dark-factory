@@ -1,39 +1,30 @@
 //! Versioned local control and persisted event stream.
 
 use std::{
-    fs,
     future::Future,
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId,
-    SessionId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, RunId,
+    RunPhase,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
-        AgentProfile as LocalAgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
-        LocalRequest, LocalResponse, MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS,
-        MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS,
-        MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
-        MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail, RequestEnvelope,
-        RunTerminal, ServerFrame, normalize_task_title,
-    },
-    runner::{
-        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
-        RunnerEventEnvelope, TerminalAttachMode,
+        AgentProfile as LocalAgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
+        MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS,
+        MAX_TASK_TITLE_BYTES, ProjectDetail as LocalProjectDetail, RequestCredential,
+        RequestEnvelope, ServerFrame, normalize_task_title,
     },
     status,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Take},
-    net::{
-        UnixListener, UnixStream,
-        unix::{OwnedReadHalf, OwnedWriteHalf},
-    },
-    sync::{Semaphore, broadcast, mpsc, watch},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{UnixListener, UnixStream},
+    sync::{Semaphore, broadcast, watch},
     task::JoinSet,
     time::timeout,
 };
@@ -44,40 +35,38 @@ use crate::{
     daemon_state::DaemonStateError,
     execution::{self, StartTask},
     guidance::{self, GuidanceError},
-    repository,
-    runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
-        SessionControlTarget, StoreError, UpdateAgentProfile,
+        AgentMessage, AttemptPrincipal, NewAgent, NewAgentMessage, NewProject, NewTask,
+        RepositoryAuthority, Store, StoreError, UpdateAgentProfile,
     },
 };
 
-const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
-const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
-
-enum RepositoryRequest {
-    Status,
-    Diff {
-        staged: bool,
-    },
-    Commit {
-        message: String,
-    },
-    Push,
-    PrOpen {
-        title: String,
-        body: String,
-    },
-    PrUpdate {
-        number: u64,
-        title: String,
-        body: String,
-    },
+#[derive(Clone)]
+enum Principal {
+    Anonymous,
+    Operator,
+    Attempt(AttemptPrincipal),
 }
 
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+    use factory_core::{Provider, TaskId};
+
+    fn orchestrator_attempt() -> AttemptPrincipal {
+        AttemptPrincipal {
+            run_id: RunId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
+            project_id: ProjectId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
+            task_id: TaskId::try_from("22222222-2222-4222-8222-222222222222").unwrap(),
+            agent_id: AgentId::try_from("god").unwrap(),
+            role: AgentRole::Orchestrator,
+            provider: Provider::Shell,
+            phase: RunPhase::Running,
+            worktree: "/private/runtime/policy".into(),
+            change_id: None,
+            branch: None,
+        }
+    }
 
     #[test]
     fn protocol_version_is_rejected_before_unknown_request_variants_are_parsed() {
@@ -99,44 +88,63 @@ mod protocol_tests {
             }
         ));
     }
-}
 
-struct RepositoryAudit {
-    project_id: ProjectId,
-    agent_id: factory_core::AgentId,
-    session_id: SessionId,
-    operation: String,
-    phase: String,
-    success: Option<bool>,
-    reference: Option<String>,
-}
-
-impl RepositoryRequest {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Status => "git_status",
-            Self::Diff { .. } => "git_diff",
-            Self::Commit { .. } => "git_commit",
-            Self::Push => "git_push",
-            Self::PrOpen { .. } => "pr_open",
-            Self::PrUpdate { .. } => "pr_update",
-        }
+    #[test]
+    fn attempt_cannot_request_source_or_guidance_paths() {
+        let attempt = orchestrator_attempt();
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::GetProject {
+                    project_id: attempt.project_id.clone(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::GetAgent {
+                    project_id: attempt.project_id.clone(),
+                    agent_id: attempt.agent_id.clone(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::AgentStatus {
+                    project_id: attempt.project_id.clone(),
+                    agent_id: attempt.agent_id.clone(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::ListTasks {
+                    project_id: attempt.project_id.clone(),
+                    after_id: None,
+                    agent_id: None,
+                    queue_revision: None,
+                    history: false,
+                    limit: 1,
+                },
+            )
+            .is_ok()
+        );
     }
 }
 
 const EVENT_REPLAY_PAGE: usize = MAX_EVENT_PAGE_ITEMS as usize;
 const MAX_CONNECTIONS: usize = 128;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
-const TERMINAL_FRAME_CHANNEL_CAPACITY: usize = 64;
 /// Mirrors the `tasks.result` CHECK bound (migration 0006).
 const MAX_TASK_RESULT_BYTES: usize = 131_072;
 /// Mirrors the `tasks.blocked_reason` CHECK bound (migration 0014).
 const MAX_BLOCKED_REASON_BYTES: usize = 4096;
-/// Mirrors the `sessions.activity`/`wait_reason` CHECK bound (migration 0014).
-const MAX_HOOK_FIELD_BYTES: usize = 512;
-
-type LimitedReader = Take<BufReader<OwnedReadHalf>>;
-
 #[derive(Debug)]
 enum ApiFailure {
     Invalid(String),
@@ -199,25 +207,17 @@ impl ApiFailure {
                 "task blocked reason is empty or exceeds its bound".into(),
             ),
             Self::Store(StoreError::InvalidHookToken) => (
-                ErrorCode::InvalidRequest,
-                "hook token is not recognized".into(),
+                ErrorCode::Unauthorized,
+                "attempt credential is invalid".into(),
             ),
-            Self::Store(StoreError::AgentNotFound) => (
-                ErrorCode::NotFound,
-                "agent was not found in the project".into(),
-            ),
-            Self::Store(StoreError::ProjectNotFound) => {
-                (ErrorCode::NotFound, "project was not found".into())
-            }
-            Self::Store(StoreError::RepositoryAuthorityMissing) => (
-                ErrorCode::Conflict,
-                "project repository authority is not configured; set it as the operator first"
-                    .into(),
-            ),
-            Self::Store(StoreError::TaskNotFound) => (
-                ErrorCode::NotFound,
-                "task was not found in the project".into(),
-            ),
+            Self::Store(
+                error @ (StoreError::AgentNotFound
+                | StoreError::ProjectNotFound
+                | StoreError::TaskNotFound
+                | StoreError::RunNotFound
+                | StoreError::ChangeNotFound
+                | StoreError::ResourceNotFound),
+            ) => (ErrorCode::NotFound, error.to_string()),
             Self::Store(StoreError::StaleTaskCursor) => (
                 ErrorCode::Conflict,
                 "task page cursor is stale; restart the listing".into(),
@@ -227,61 +227,29 @@ impl ApiFailure {
                 ErrorCode::InvalidRequest,
                 "task cursor and queue revision must be supplied together".into(),
             ),
-            Self::Store(StoreError::RunNotFound) => (
-                ErrorCode::NotFound,
-                "run was not found in the project".into(),
-            ),
-            Self::Store(StoreError::SessionNotFound) => (
-                ErrorCode::NotFound,
-                "session was not found in the project".into(),
-            ),
-            Self::Store(StoreError::TaskNotQueued) => (
-                ErrorCode::Conflict,
-                "task is not queued in the project".into(),
-            ),
-            Self::Store(StoreError::TaskNotRunning) => (
-                ErrorCode::Conflict,
-                "task is not running in the project".into(),
-            ),
-            Self::Store(StoreError::TaskAssignmentMismatch) => (
-                ErrorCode::Conflict,
-                "task is not assigned to the requesting agent".into(),
-            ),
-            Self::Store(StoreError::TaskNotRetryable) => (
-                ErrorCode::Conflict,
-                "task is not retryable in the project".into(),
-            ),
-            Self::Store(StoreError::AgentProviderMismatch) => (
-                ErrorCode::Conflict,
-                "agent provider does not match the requested execution".into(),
-            ),
-            Self::Store(StoreError::AgentUnavailable) => (
-                ErrorCode::Conflict,
-                "agent already has an open run or live session".into(),
-            ),
-            Self::Store(StoreError::SessionAlreadyLive) => (
-                ErrorCode::Conflict,
-                "agent already has a live session".into(),
-            ),
-            Self::Store(StoreError::SessionNotLive) => {
-                (ErrorCode::Conflict, "session is not live".into())
-            }
             Self::Store(
-                error @ (StoreError::TaskNotCancellable
+                error @ (StoreError::RepositoryAuthorityMissing
+                | StoreError::RepositoryAuthorityRequiresIdleProject
+                | StoreError::TaskNotQueued
+                | StoreError::TaskAssignmentMismatch
+                | StoreError::TaskNotRetryable
+                | StoreError::AgentProviderMismatch
+                | StoreError::AgentUnavailable
+                | StoreError::CapacityReached { .. }
+                | StoreError::SourceProvisioningUnavailable
+                | StoreError::RunResourcesUnreleased { .. }
+                | StoreError::ResourceIdentityMismatch
+                | StoreError::InvalidRunState
+                | StoreError::TaskNotCancellable
                 | StoreError::TaskNotEditable
                 | StoreError::TaskHasActiveRun
                 | StoreError::TaskHasSubtasks
                 | StoreError::TaskRunHasDependents
                 | StoreError::AgentHasActiveRun
-                | StoreError::AgentHasLiveSession
                 | StoreError::AgentHasChildren
                 | StoreError::AgentRunHasDependents
                 | StoreError::AgentBudgetExhausted
-                | StoreError::ProjectHasActiveRun
-                | StoreError::RunNotStoppable
-                | StoreError::SessionStopping
-                | StoreError::SessionWorkConflict
-                | StoreError::SessionWorkQuarantined(_)),
+                | StoreError::ProjectHasActiveRun),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -296,38 +264,12 @@ impl ApiFailure {
 impl From<execution::Error> for ApiFailure {
     fn from(error: execution::Error) -> Self {
         match error {
-            execution::Error::NoLiveSession => Self::Conflict(
-                "agent has no live session yet; it will be spawned once it has queued work, or \
-                 try again shortly"
-                    .into(),
-            ),
-            execution::Error::SessionBusy => Self::Conflict(
-                "agent's live session is not idle; the task stays queued and will \
-                                 be delivered once it is"
-                    .into(),
-            ),
-            error @ (execution::Error::DeliveryInProgress
-            | execution::Error::DeliveryUnacknowledged) => Self::Conflict(error.to_string()),
-            execution::Error::NoWorktree => {
-                Self::Invalid("agent has no worktree; create one first".into())
+            execution::Error::DeleteInProgress | execution::Error::DeleteDrainTimeout => {
+                Self::Conflict(error.to_string())
             }
-            execution::Error::DeleteDrainTimeout => Self::Conflict(
-                "an in-flight session spawn did not finish before the delete's drain timeout; \
-                 try the delete again"
-                    .into(),
-            ),
-            execution::Error::State(DaemonStateError::Store(
-                error @ (StoreError::AgentNotFound
-                | StoreError::TaskNotQueued
-                | StoreError::TaskAssignmentMismatch
-                | StoreError::AgentUnavailable
-                | StoreError::SessionNotFound
-                | StoreError::SessionNotLive
-                | StoreError::SessionStopping
-                | StoreError::SessionWorkConflict
-                | StoreError::SessionWorkQuarantined(_)),
-            )) => Self::Store(error),
-            _ => Self::Internal("execution manager could not accept the task".into()),
+            execution::Error::State(DaemonStateError::Store(error)) => Self::Store(error),
+            execution::Error::State(error) => Self::Internal(error.to_string()),
+            error => Self::Internal(error.to_string()),
         }
     }
 }
@@ -337,12 +279,14 @@ pub async fn serve<F>(
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
+    operator_credential: RequestCredential,
     shutdown: F,
 ) -> io::Result<()>
 where
     F: Future<Output = ()>,
 {
     let guidance_root = Arc::new(guidance_root);
+    let operator_credential = Arc::new(operator_credential);
     tokio::pin!(shutdown);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -365,11 +309,20 @@ where
                 let state = state.clone();
                 let execution = execution.clone();
                 let guidance_root = Arc::clone(&guidance_root);
+                let operator_credential = Arc::clone(&operator_credential);
                 let shutdown = stop_rx.clone();
                 handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, state, execution, guidance_root, shutdown).await
+                        handle_connection(
+                            stream,
+                            state,
+                            execution,
+                            guidance_root,
+                            operator_credential,
+                            shutdown,
+                        )
+                        .await
                     {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
@@ -397,6 +350,7 @@ async fn handle_connection(
     state: ApiState,
     execution: execution::Handle,
     guidance_root: Arc<PathBuf>,
+    operator_credential: Arc<RequestCredential>,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let (read, mut write) = stream.into_split();
@@ -424,12 +378,19 @@ async fn handle_connection(
     }
     payload.pop();
 
-    let request = match parse_envelope(&payload) {
-        Ok(request) => request,
+    let envelope = match parse_envelope(&payload) {
+        Ok(envelope) => envelope,
         Err(response) => return write_response(&mut write, *response).await,
     };
+    let principal = match resolve_principal(&state, envelope.credential, &operator_credential).await
+    {
+        Ok(principal) => principal,
+        Err(failure) => return write_response(&mut write, failure.into_response()).await,
+    };
+    let request = envelope.request;
 
     if let LocalRequest::Subscribe { after_sequence } = request {
+        require_operator(&principal).map_err(api_failure_to_io)?;
         if after_sequence < 0 {
             return write_response(
                 &mut write,
@@ -447,37 +408,13 @@ async fn handle_connection(
         };
     }
 
-    if let LocalRequest::AttachTerminal {
-        project_id,
-        session_id,
-        since_offset,
-        mode,
-    } = request
-    {
-        let session_shutdown = shutdown.clone();
-        return tokio::select! {
-            biased;
-            _ = shutdown.changed() => Ok(()),
-            result = terminal_attach_session(
-                limited,
-                write,
-                state.clone(),
-                session_shutdown,
-                project_id,
-                session_id,
-                since_offset,
-                mode,
-            ) => result,
-        };
-    }
-
-    let response = handle_request(&state, &execution, &guidance_root, request)
+    let response = handle_request(&state, &execution, &guidance_root, &principal, request)
         .await
         .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
 }
 
-fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
+fn parse_envelope(payload: &[u8]) -> Result<RequestEnvelope, Box<LocalResponse>> {
     // Read the version discriminator before deserializing the request enum.
     // A newer client may contain a request variant this daemon does not know;
     // that must still produce UnsupportedProtocol, not a misleading invalid
@@ -512,346 +449,146 @@ fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
             message: "request is not valid local protocol JSON".into(),
         })
     })?;
-    Ok(envelope.request)
+    Ok(envelope)
 }
 
-/// Persistent multiplexed connection for one or more `AttachTerminal`
-/// sessions: `ServerFrame::TerminalOutput` for every attached session
-/// (tagged by `session_id`) is interleaved onto the same connection. Only
-/// further `AttachTerminal` requests are accepted on it; anything else gets
-/// an error response. Detaching happens implicitly on client disconnect,
-/// which drops this function's `JoinSet` and aborts every attached
-/// forwarding task.
-#[allow(clippy::too_many_arguments)]
-async fn terminal_attach_session(
-    mut reader: LimitedReader,
-    mut write: OwnedWriteHalf,
-    state: ApiState,
-    mut shutdown: watch::Receiver<bool>,
-    project_id: ProjectId,
-    session_id: SessionId,
-    since_offset: u64,
-    mode: TerminalAttachMode,
-) -> io::Result<()> {
-    let (frame_tx, mut frame_rx) = mpsc::channel::<ServerFrame>(TERMINAL_FRAME_CHANNEL_CAPACITY);
-    let mut attaches = JoinSet::new();
-    spawn_terminal_attach(
-        &mut attaches,
-        state.clone(),
-        frame_tx.clone(),
-        project_id,
-        session_id,
-        since_offset,
-        mode,
-    );
-
-    let mut payload = Vec::new();
-    loop {
-        tokio::select! {
-            _ = shutdown.changed() => return Ok(()),
-            frame = frame_rx.recv() => {
-                let Some(frame) = frame else { return Ok(()); };
-                write_frame(&mut write, &frame).await?;
-            }
-            Some(_) = attaches.join_next(), if !attaches.is_empty() => {}
-            result = read_next_line(&mut reader, &mut payload) => {
-                let Some(line) = result? else { return Ok(()); };
-                match parse_envelope(&line) {
-                    Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset, mode }) => {
-                        spawn_terminal_attach(
-                            &mut attaches,
-                            state.clone(),
-                            frame_tx.clone(),
-                            project_id,
-                            session_id,
-                            since_offset,
-                            mode,
-                        );
-                    }
-                    Ok(_) => {
-                        write_response(
-                            &mut write,
-                            LocalResponse::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: "only AttachTerminal is accepted on an attached \
-                                          terminal connection"
-                                    .into(),
-                            },
-                        )
-                        .await?;
-                    }
-                    Err(response) => write_response(&mut write, *response).await?,
-                }
-            }
-        }
-    }
-}
-
-fn spawn_terminal_attach(
-    attaches: &mut JoinSet<()>,
-    state: ApiState,
-    frame_tx: mpsc::Sender<ServerFrame>,
-    project_id: ProjectId,
-    session_id: SessionId,
-    since_offset: u64,
-    mode: TerminalAttachMode,
-) {
-    attaches.spawn(async move {
-        let lookup_project_id = project_id.clone();
-        let lookup_session_id = session_id.clone();
-        let target = match state
-            .with_store(move |store| {
-                store.session_control_target(&lookup_project_id, &lookup_session_id)
-            })
-            .await
-        {
-            Ok(target) => target,
-            Err(error) => {
-                let response = match error {
-                    DaemonStateError::Store(StoreError::SessionNotFound) => {
-                        LocalResponse::AttachRefused {
-                            refusal: AttachRefusal {
-                                project_id,
-                                session_id,
-                                runner_instance_id: None,
-                                session_state: None,
-                                reason: AttachRefusalReason::SessionNotFound,
-                            },
-                        }
-                    }
-                    error => ApiFailure::from(error).into_response(),
-                };
-                let _ = send_terminal_error(&frame_tx, response).await;
-                return;
-            }
-        };
-        if target.ended_at_ms.is_some() || !target.state.is_live() {
-            let _ = send_terminal_error(
-                &frame_tx,
-                LocalResponse::AttachRefused {
-                    refusal: AttachRefusal {
-                        project_id,
-                        session_id,
-                        runner_instance_id: Some(target.runner_instance_id),
-                        session_state: Some(target.state),
-                        reason: AttachRefusalReason::SessionEnded,
-                    },
-                },
-            )
-            .await;
-            return;
-        }
-        let control_run_id = match session_control_run_id(&session_id) {
-            Ok(run_id) => run_id,
-            Err(failure) => {
-                let _ = send_terminal_error(&frame_tx, failure.into_response()).await;
-                return;
-            }
-        };
-        let client = RunnerClient::new(
-            &target.runner_runtime,
-            control_run_id,
-            target.runner_instance_id.clone(),
-        );
-        let mut subscription = match client.attach_terminal(since_offset, mode).await {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                // A future/rotated client cursor is a request error, not a
-                // loss of the daemon's ability to observe the runner.
-                if attach_error_degrades_observer(&error) {
-                    record_terminal_attach_health(
-                        &state,
-                        &session_id,
-                        Some(bounded_hook_field(&format!(
-                            "terminal attach failed: {error}"
-                        ))),
-                    )
-                    .await;
-                }
-                let reason = attach_refusal_reason(&error);
-                let response = LocalResponse::AttachRefused {
-                    refusal: AttachRefusal {
-                        project_id,
-                        session_id,
-                        runner_instance_id: Some(target.runner_instance_id),
-                        session_state: Some(target.state),
-                        reason,
-                    },
-                };
-                let _ = send_terminal_error(&frame_tx, response).await;
-                return;
-            }
-        };
-        record_terminal_attach_health(&state, &session_id, None).await;
-        if let Some(info) = subscription.info() {
-            if frame_tx
-                .send(ServerFrame::TerminalAttachReady {
-                    protocol_version: PROTOCOL_VERSION,
-                    session_id: session_id.clone(),
-                    generation: info.generation,
-                    base_generation: info.base_generation,
-                    base_offset: info.base_offset,
-                    start_generation: info.start_generation,
-                    start_offset: info.start_offset,
-                    end_offset: info.end_offset,
-                    reset_prefix: info.reset_prefix,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-        } else if frame_tx
-            .send(ServerFrame::TerminalOutput {
-                protocol_version: PROTOCOL_VERSION,
-                session_id: session_id.clone(),
-                generation: 0,
-                offset: since_offset,
-                bytes: String::new(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-        loop {
-            match subscription.next_chunk().await {
-                Ok((generation, offset, bytes)) => {
-                    let frame = ServerFrame::TerminalOutput {
-                        protocol_version: PROTOCOL_VERSION,
-                        session_id: session_id.clone(),
-                        generation,
-                        offset,
-                        bytes,
-                    };
-                    if frame_tx.send(frame).await.is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    record_terminal_attach_health(
-                        &state,
-                        &session_id,
-                        Some(bounded_hook_field(&format!(
-                            "terminal attach failed: {error}"
-                        ))),
-                    )
-                    .await;
-                    if let RunnerClientError::TerminalAttachGap {
-                        generation,
-                        base_generation,
-                        base_offset,
-                        start_generation,
-                        start_offset,
-                        end_offset,
-                        requested_generation,
-                        requested_offset,
-                        reason,
-                    } = error
-                    {
-                        let _ = frame_tx
-                            .send(ServerFrame::TerminalAttachGap {
-                                protocol_version: PROTOCOL_VERSION,
-                                session_id: session_id.clone(),
-                                generation,
-                                base_generation,
-                                base_offset,
-                                start_generation,
-                                start_offset,
-                                end_offset,
-                                requested_generation,
-                                requested_offset,
-                                reason,
-                            })
-                            .await;
-                        return;
-                    }
-                    let reason = attach_refusal_reason(&error);
-                    let response = LocalResponse::AttachRefused {
-                        refusal: AttachRefusal {
-                            project_id: project_id.clone(),
-                            session_id: session_id.clone(),
-                            runner_instance_id: Some(target.runner_instance_id.clone()),
-                            session_state: Some(target.state),
-                            reason,
-                        },
-                    };
-                    let _ = send_terminal_error(&frame_tx, response).await;
-                    return;
-                }
-            }
-        }
-    });
-}
-
-fn attach_error_degrades_observer(error: &RunnerClientError) -> bool {
-    !matches!(
-        error,
-        RunnerClientError::RunnerRejected {
-            code: RunnerErrorCode::InvalidRequest
-        }
-    )
-}
-
-async fn record_terminal_attach_health(
+async fn resolve_principal(
     state: &ApiState,
-    session_id: &SessionId,
-    failure: Option<String>,
-) {
-    let session_id = session_id.clone();
-    let _ = state
-        .commit_and_publish(move |store| {
-            let Some((_, event)) =
-                store.record_terminal_attach_health(&session_id, failure, now_ms()?)?
-            else {
-                return Ok(((), Vec::new()));
-            };
-            Ok(((), vec![event]))
-        })
-        .await;
-}
-
-async fn send_terminal_error(
-    frame_tx: &mpsc::Sender<ServerFrame>,
-    response: LocalResponse,
-) -> Result<(), mpsc::error::SendError<ServerFrame>> {
-    frame_tx
-        .send(ServerFrame::Response {
-            protocol_version: PROTOCOL_VERSION,
-            response,
-        })
-        .await
-}
-
-/// Reads one more newline-delimited frame from an already-open connection,
-/// resetting the per-frame size limit each time so a long-lived connection
-/// is not bounded by the *cumulative* bytes it has ever read.
-async fn read_next_line(
-    reader: &mut LimitedReader,
-    payload: &mut Vec<u8>,
-) -> io::Result<Option<Vec<u8>>> {
-    payload.clear();
-    reader.set_limit((MAX_LOCAL_FRAME_BYTES + 2) as u64);
-    let read = reader.read_until(b'\n', payload).await?;
-    if read == 0 {
-        return Ok(None);
+    credential: Option<RequestCredential>,
+    operator_credential: &RequestCredential,
+) -> Result<Principal, ApiFailure> {
+    let Some(credential) = credential else {
+        return Ok(Principal::Anonymous);
+    };
+    if credential.expose_secret() == operator_credential.expose_secret() {
+        return Ok(Principal::Operator);
     }
-    if payload.last() != Some(&b'\n') || payload.len() - 1 > MAX_LOCAL_FRAME_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "request must be one newline-terminated JSON frame of at most 1 MiB",
+    let bearer = credential.expose_secret().to_owned();
+    let principal = state
+        .with_store(move |store| store.authenticate_attempt(&bearer))
+        .await?
+        .ok_or_else(|| ApiFailure::Unauthorized("invalid request credential".into()))?;
+    if principal.phase != RunPhase::Running {
+        return Err(ApiFailure::Unauthorized(
+            "attempt authority is not active".into(),
         ));
     }
-    payload.pop();
-    Ok(Some(std::mem::take(payload)))
+    Ok(Principal::Attempt(principal))
+}
+
+fn require_operator(principal: &Principal) -> Result<(), ApiFailure> {
+    if matches!(principal, Principal::Operator) {
+        Ok(())
+    } else {
+        Err(ApiFailure::Unauthorized(
+            "operator authority is required".into(),
+        ))
+    }
+}
+
+fn authorize(principal: &Principal, request: &LocalRequest) -> Result<(), ApiFailure> {
+    match principal {
+        Principal::Anonymous if matches!(request, LocalRequest::Health) => Ok(()),
+        Principal::Anonymous => Err(ApiFailure::Unauthorized(
+            "a request credential is required".into(),
+        )),
+        Principal::Operator => match request {
+            LocalRequest::CompleteAttempt { .. }
+            | LocalRequest::BlockAttempt { .. }
+            | LocalRequest::ProviderHook { .. } => Err(ApiFailure::Unauthorized(
+                "this request requires an active attempt credential".into(),
+            )),
+            _ => Ok(()),
+        },
+        Principal::Attempt(attempt) => authorize_attempt(attempt, request),
+    }
+}
+
+fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Result<(), ApiFailure> {
+    let same_project = |project_id: &ProjectId| project_id == &attempt.project_id;
+    let orchestrator = attempt.role == AgentRole::Orchestrator;
+    let allowed = match request {
+        LocalRequest::Health
+        | LocalRequest::CompleteAttempt { .. }
+        | LocalRequest::BlockAttempt { .. } => true,
+        LocalRequest::ProviderHook { .. } => true,
+        LocalRequest::GetTask { project_id, .. }
+        | LocalRequest::ListTasks { project_id, .. }
+        | LocalRequest::ListRuns { project_id, .. } => same_project(project_id),
+        LocalRequest::ListAgentMessages {
+            project_id,
+            agent_id,
+            ..
+        } => same_project(project_id) && (orchestrator || agent_id == &attempt.agent_id),
+        LocalRequest::SendAgentMessage { project_id, .. } => same_project(project_id),
+        LocalRequest::CreateTask { project_id, .. }
+        | LocalRequest::UpdateTask { project_id, .. }
+        | LocalRequest::AssignTask { project_id, .. } => orchestrator && same_project(project_id),
+        LocalRequest::ListAgents { project_id, .. } => orchestrator && same_project(project_id),
+        LocalRequest::SetAutoMode { .. }
+        | LocalRequest::FleetStatus
+        | LocalRequest::CreateProject { .. }
+        | LocalRequest::GetProject { .. }
+        | LocalRequest::ListProjects { .. }
+        | LocalRequest::UpdateProjectGuidance { .. }
+        | LocalRequest::SetProjectRepositoryAuthority { .. }
+        | LocalRequest::CreateAgent { .. }
+        | LocalRequest::GetAgent { .. }
+        | LocalRequest::AgentStatus { .. }
+        | LocalRequest::UpdateAgentProfile { .. }
+        | LocalRequest::SetAgentBudget { .. }
+        | LocalRequest::ResetAgentBudget { .. }
+        | LocalRequest::StartTask { .. }
+        | LocalRequest::RetryTask { .. }
+        | LocalRequest::CancelTask { .. }
+        | LocalRequest::PauseAgent { .. }
+        | LocalRequest::ResumeAgent { .. }
+        | LocalRequest::DeleteTask { .. }
+        | LocalRequest::DeleteAgent { .. }
+        | LocalRequest::DeleteProject { .. }
+        | LocalRequest::CancelRun { .. }
+        | LocalRequest::EventsAfter { .. }
+        | LocalRequest::LatestEventSequence
+        | LocalRequest::Subscribe { .. } => false,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(ApiFailure::Unauthorized(
+            "request is outside the admitted attempt's authority".into(),
+        ))
+    }
+}
+
+fn mutation_attempt(principal: &Principal) -> Option<RunId> {
+    match principal {
+        Principal::Attempt(attempt) => Some(attempt.run_id.clone()),
+        Principal::Anonymous | Principal::Operator => None,
+    }
+}
+
+fn verify_mutation_attempt(store: &Store, run_id: Option<&RunId>) -> crate::store::Result<()> {
+    let Some(run_id) = run_id else {
+        return Ok(());
+    };
+    let running = store
+        .kernel_run(run_id)?
+        .is_some_and(|run| run.phase == RunPhase::Running);
+    if running {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidHookToken)
+    }
 }
 
 async fn handle_request(
     state: &ApiState,
     execution: &execution::Handle,
     guidance_root: &Path,
+    principal: &Principal,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
+    authorize(principal, &request)?;
     match request {
         LocalRequest::Health => Ok(LocalResponse::Health {
             runner_path: execution.runner_program().to_string_lossy().into_owned(),
@@ -905,22 +642,22 @@ async fn handle_request(
             Ok(LocalResponse::AgentBudgetUpdated { budget })
         }
         LocalRequest::FleetStatus => {
-            let live_session_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
-            let (projects, live_sessions, generated_at_ms, auto_mode, event_sequence) = state
+            let active_run_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
+            let (projects, active_runs, generated_at_ms, auto_mode, event_sequence) = state
                 .with_store(move |store| {
                     Ok((
                         store.fleet_status()?,
-                        store.live_session_count()?,
+                        store.recoverable_kernel_runs()?.len(),
                         now_ms()?,
                         store.auto_mode()?,
                         store.latest_event_sequence()?,
                     ))
                 })
                 .await?;
-            let live_sessions = u32::try_from(live_sessions).unwrap_or(u32::MAX);
-            let at_capacity = live_sessions >= live_session_cap;
+            let active_runs = u32::try_from(active_runs).unwrap_or(u32::MAX);
+            let at_capacity = active_runs >= active_run_cap;
             let mut attention = Vec::new();
-            let mut projects: Vec<status::ProjectStatus> = projects
+            let projects: Vec<status::ProjectStatus> = projects
                 .into_iter()
                 .map(|rows| {
                     let crate::store::ProjectStatusRows {
@@ -946,51 +683,18 @@ async fn handle_request(
                     }
                 })
                 .collect();
-            populate_fleet_worktrees(&mut projects).await;
             status::sort_attention(&mut attention);
             Ok(LocalResponse::FleetStatus {
                 status: status::FleetStatus {
                     generated_at_ms,
                     event_sequence,
                     auto_mode,
-                    live_session_cap,
-                    live_sessions,
+                    active_run_cap,
+                    active_runs,
                     projects,
                     attention,
                 },
             })
-        }
-        LocalRequest::GitStatus { token } => {
-            repository_request(state, token, RepositoryRequest::Status).await
-        }
-        LocalRequest::GitDiff { token, staged } => {
-            repository_request(state, token, RepositoryRequest::Diff { staged }).await
-        }
-        LocalRequest::GitCommit { token, message } => {
-            repository_request(state, token, RepositoryRequest::Commit { message }).await
-        }
-        LocalRequest::GitPush { token } => {
-            repository_request(state, token, RepositoryRequest::Push).await
-        }
-        LocalRequest::PrOpen { token, title, body } => {
-            repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
-        }
-        LocalRequest::PrUpdate {
-            token,
-            number,
-            title,
-            body,
-        } => {
-            repository_request(
-                state,
-                token,
-                RepositoryRequest::PrUpdate {
-                    number,
-                    title,
-                    body,
-                },
-            )
-            .await
         }
         LocalRequest::AgentStatus {
             project_id,
@@ -998,7 +702,7 @@ async fn handle_request(
         } => {
             let lookup_project_id = project_id.clone();
             let lookup_agent_id = agent_id.clone();
-            let (mut agent_status, blocked, live_sessions, generated_at_ms, event_sequence) = state
+            let (agent_status, blocked, active_runs, generated_at_ms, event_sequence) = state
                 .with_store(move |store| {
                     let status = store.agent_status(&lookup_project_id, &lookup_agent_id)?;
                     let blocked = store
@@ -1011,13 +715,13 @@ async fn handle_request(
                     Ok((
                         status,
                         blocked,
-                        store.live_session_count()?,
+                        store.recoverable_kernel_runs()?.len(),
                         now_ms()?,
                         store.latest_event_sequence()?,
                     ))
                 })
                 .await?;
-            let at_capacity = live_sessions >= execution.max_active_runs();
+            let at_capacity = active_runs >= execution.max_active_runs();
             let mut attention = status::attention_items(
                 &project_id,
                 std::slice::from_ref(&agent_status),
@@ -1028,18 +732,12 @@ async fn handle_request(
             let detail =
                 agent_detail_with_guidance(state, execution, guidance_root, &project_id, &agent_id)
                     .await?;
-            let worktree = match agent_status.agent.worktree.as_deref() {
-                Some(path) => Some(crate::worktrees::status(Path::new(path)).await),
-                None => None,
-            };
-            agent_status.worktree = worktree.clone();
             Ok(LocalResponse::AgentStatus {
                 status: Box::new(status::AgentStatusDetail {
                     generated_at_ms,
                     event_sequence,
                     status: agent_status,
                     detail,
-                    worktree,
                     attention,
                 }),
             })
@@ -1090,8 +788,10 @@ async fn handle_request(
             }
             let wake_project_id = project_id.clone();
             let wake_agent_id = agent_id.clone();
+            let authority_run_id = mutation_attempt(principal);
             let task = state
                 .commit_and_publish(move |store| {
+                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
                     let (task, event) = store.create_task_with_assignment(
                         NewTask {
                             id,
@@ -1121,12 +821,7 @@ async fn handle_request(
             model,
             reasoning_effort,
             model_selection_reason,
-            worktree,
         } => {
-            let worktree = match worktree {
-                Some(worktree) => Some(validate_agent_worktree(worktree).await?),
-                None => None,
-            };
             let created_project_id = project_id.clone();
             let created_agent_id = id.clone();
             let created_parent_agent_id = parent_agent_id.clone();
@@ -1136,11 +831,8 @@ async fn handle_request(
             // or its intended parent is currently being deleted. Checked
             // and recorded in flight atomically with `DeleteProject`/
             // `DeleteAgent`'s own mark under the same lock, so a delete
-            // already draining can never miss this create's writes
-            // (`provision_agent_worktree`, `ensure_agent_guidance`,
-            // below): the new agent's worktree and guidance directory are
-            // exactly what a `DeleteProject` running concurrently would
-            // otherwise `rm -rf` right out from under this request. The
+            // already draining can never miss this create's guidance-file
+            // writes. The
             // agent-id check also covers the narrower case of reusing an
             // id an in-flight `DeleteAgent` hasn't finished removing files
             // for yet. The parent-id check (PR #50 re-review round 3):
@@ -1190,7 +882,6 @@ async fn handle_request(
                 model,
                 reasoning_effort,
                 model_selection_reason,
-                worktree,
             )
             .await;
             execution.end_agent_write(&created_agent_id);
@@ -1319,8 +1010,7 @@ async fn handle_request(
             remote_url,
             base_branch,
         } => {
-            let authority = repository::validate_authority(remote_url, base_branch)
-                .map_err(repository_failure)?;
+            let authority = validate_repository_authority(remote_url, base_branch)?;
             let response_project_id = project_id.clone();
             state
                 .commit_and_publish(move |store| {
@@ -1336,7 +1026,6 @@ async fn handle_request(
         LocalRequest::SendAgentMessage {
             id,
             project_id,
-            sender_agent_id,
             recipient_agent_id,
             body,
         } => {
@@ -1345,10 +1034,21 @@ async fn handle_request(
                     "agent message must be at most {MAX_AGENT_MESSAGE_BYTES} bytes"
                 )));
             }
+            let sender_agent_id = match principal {
+                Principal::Attempt(attempt) => Some(attempt.agent_id.clone()),
+                Principal::Operator => None,
+                Principal::Anonymous => {
+                    return Err(ApiFailure::Unauthorized(
+                        "agent messages require an authenticated principal".to_owned(),
+                    ));
+                }
+            };
             let wake_project_id = project_id.clone();
             let wake_agent_id = recipient_agent_id.clone();
+            let authority_run_id = mutation_attempt(principal);
             let message = state
                 .commit_and_publish(move |store| {
+                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
                     let message = store.send_agent_message(NewAgentMessage {
                         id,
                         project_id,
@@ -1391,33 +1091,12 @@ async fn handle_request(
             project_id,
             task_id,
             agent_id,
-            parent_run_id,
-            worktree,
         } => {
-            let worktree = match worktree {
-                Some(worktree) => worktree,
-                None => {
-                    let lookup_project_id = project_id.clone();
-                    let lookup_agent_id = agent_id.clone();
-                    let agent = state
-                        .with_store(move |store| {
-                            store.get_agent_detail(&lookup_project_id, &lookup_agent_id)
-                        })
-                        .await?;
-                    agent.snapshot.worktree.ok_or_else(|| {
-                        ApiFailure::Invalid(
-                            "agent has no worktree; pass one explicitly or set one first".into(),
-                        )
-                    })?
-                }
-            };
             let started = execution
                 .start_task(StartTask {
                     project_id,
                     task_id,
                     agent_id,
-                    parent_run_id,
-                    worktree: PathBuf::from(worktree),
                 })
                 .await?;
             Ok(LocalResponse::RunAccepted {
@@ -1518,8 +1197,10 @@ async fn handle_request(
                     )));
                 }
             }
+            let authority_run_id = mutation_attempt(principal);
             let task = state
                 .commit_and_publish(move |store| {
+                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
                     let (task, event) = store.update_task(
                         &project_id,
                         &task_id,
@@ -1557,19 +1238,13 @@ async fn handle_request(
             let response_project_id = project_id.clone();
             let response_agent_id = agent_id.clone();
             // Deletion invariant (ARCHITECTURE.md #9): from this call on,
-            // no gated writer -- the dispatcher's spawn preparation, an
-            // idle session's delivery, or a handler using
-            // `try_begin_agent_write` (`GetAgent`/`AgentStatus`,
+            // no gated writer -- attempt preparation or a handler using
+            // `try_begin_agent_write` (`GetAgent`/`AgentStatus` or
             // `UpdateAgentProfile`) -- can begin a new write for this
             // agent, and this call has waited out any write already in
             // flight, so nothing can still be writing into its guidance
             // directory below.
             execution.begin_delete(&agent_id).await?;
-            // Assignment changes and delivery share the owner-side barrier.
-            // Hold it while the delete transaction unassigns every task so
-            // no in-flight prompt can escape to an agent that is being
-            // removed.
-            let _delivery_slot = execution.lock_delivery_slot(&agent_id).await;
             let result = delete_agent_locked(state, guidance_root, project_id, agent_id).await;
             execution.end_delete(&response_agent_id);
             result?;
@@ -1582,7 +1257,7 @@ async fn handle_request(
             let response_project_id = project_id.clone();
             // Deletion invariant (ARCHITECTURE.md #9): mark the project
             // first, so no `CreateAgent` can start writing a new agent's
-            // worktree/guidance tree under it (PR #50 review finding 3 --
+            // guidance tree under it (PR #50 review finding 3 --
             // the one writer the per-agent marks below can never already
             // cover, since a brand new agent doesn't exist yet for this
             // loop to have marked); then mark and drain every agent the
@@ -1601,20 +1276,10 @@ async fn handle_request(
                     }
                 }
             }
-            let delivery_slots = if begin_error.is_none() {
-                let mut slots = Vec::with_capacity(begun.len());
-                for agent_id in &begun {
-                    slots.push(execution.lock_delivery_slot(agent_id).await);
-                }
-                slots
-            } else {
-                Vec::new()
-            };
             let result = match begin_error {
                 Some(error) => Err(ApiFailure::from(error)),
                 None => delete_project_locked(state, guidance_root, project_id).await,
             };
-            drop(delivery_slots);
             for agent_id in &begun {
                 execution.end_delete(agent_id);
             }
@@ -1630,30 +1295,11 @@ async fn handle_request(
             agent_id,
         } => {
             let _assignment_slot = execution.lock_assignment_slot().await;
-            let lookup_project_id = project_id.clone();
-            let lookup_task_id = task_id.clone();
-            let previous_owner = state
-                .with_store(move |store| {
-                    Ok(store
-                        .get_task(&lookup_project_id, &lookup_task_id)?
-                        .snapshot
-                        .assigned_agent_id)
-                })
-                .await?;
-            // The task-scoped lock orders competing moves. This owner-side
-            // barrier orders the move against delivery itself: when the
-            // move commits, the old worker's delivery slot is definitely
-            // free, and a later delivery observes the new assignment.
-            let _delivery_slot = previous_owner
-                .as_ref()
-                .map(|owner| execution.lock_delivery_slot(owner));
-            let _delivery_slot = match _delivery_slot {
-                Some(future) => Some(future.await),
-                None => None,
-            };
             let wake_project_id = project_id.clone();
+            let authority_run_id = mutation_attempt(principal);
             let task = state
                 .commit_and_publish(move |store| {
+                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
                     let (task, event) =
                         store.assign_task(&project_id, &task_id, agent_id.as_ref(), now_ms()?)?;
                     Ok((task, vec![event]))
@@ -1664,17 +1310,7 @@ async fn handle_request(
             }
             Ok(LocalResponse::TaskAssigned { task })
         }
-        LocalRequest::GetRunTerminal { project_id, run_id } => {
-            let lookup_run_id = run_id.clone();
-            let target = state
-                .with_store(move |store| store.run_control_target(&project_id, &lookup_run_id))
-                .await?;
-            let terminal = tokio::task::spawn_blocking(move || read_run_terminal(&target, run_id))
-                .await
-                .map_err(|_| ApiFailure::Internal("terminal reader stopped".into()))??;
-            Ok(LocalResponse::RunTerminal { terminal })
-        }
-        LocalRequest::StopRun {
+        LocalRequest::CancelRun {
             project_id,
             run_id,
             grace_ms,
@@ -1684,97 +1320,65 @@ async fn handle_request(
                     "runner stop grace must be at most 60000 ms".into(),
                 ));
             }
-            let lookup_project_id = project_id.clone();
-            let lookup_run_id = run_id.clone();
-            let session = state
-                .with_store(move |store| {
-                    store.run_session_snapshot(&lookup_project_id, &lookup_run_id)
-                })
-                .await?;
-            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
-            let stop_project_id = project_id.clone();
-            let stop_run_id = run_id.clone();
-            let _run = state
-                .commit_and_publish(move |store| {
-                    let (run, event) =
-                        store.request_run_stop(&stop_project_id, &stop_run_id, now_ms()?)?;
-                    Ok((run, vec![event]))
-                })
-                .await?;
-            let session_project_id = project_id.clone();
-            let session_id = session.id.clone();
-            state
-                .commit_and_publish(move |store| {
-                    let (session, event) =
-                        store.request_session_stop(&session_project_id, &session_id, now_ms()?)?;
-                    Ok((session, vec![event]))
-                })
-                .await?;
-            let target_project_id = project_id.clone();
-            let target_run_id = run_id.clone();
-            let target = state
-                .with_store(move |store| {
-                    store.run_control_target(&target_project_id, &target_run_id)
-                })
-                .await?;
-            let control_run_id = run_id.clone();
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
-            Ok(LocalResponse::RunStopped { run_id })
-        }
-        LocalRequest::CancelRun { project_id, run_id } => {
             let response_run_id = run_id.clone();
-            state
-                .commit_and_publish(move |store| {
-                    let closed = store.cancel_run(&project_id, &run_id, now_ms()?)?;
-                    Ok(((), closed.events))
-                })
-                .await?;
+            execution.cancel_run(project_id, run_id, grace_ms).await?;
             Ok(LocalResponse::RunCancelled {
                 run_id: response_run_id,
             })
         }
-        LocalRequest::CompleteTask {
-            project_id,
-            task_id,
-            result,
-        } => {
+        LocalRequest::CompleteAttempt { result } => {
             if result.len() > MAX_TASK_RESULT_BYTES {
                 return Err(ApiFailure::Invalid(format!(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
                 )));
             }
-            let task = state
+            let Principal::Attempt(attempt) = principal else {
+                return Err(ApiFailure::Unauthorized(
+                    "attempt outcome requires an active attempt".into(),
+                ));
+            };
+            let run_id = attempt.run_id.clone();
+            let request_run_id = run_id.clone();
+            state
                 .commit_and_publish(move |store| {
-                    let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
-                    Ok((closed.task, closed.events))
+                    let (_, events) = store.request_attempt_outcome(
+                        &request_run_id,
+                        &factory_core::RunOutcome::Succeeded,
+                        Some(&result),
+                        now_ms()?,
+                    )?;
+                    Ok(((), events))
                 })
                 .await?;
-            Ok(LocalResponse::TaskCompleted { task })
+            execution.wake_run(run_id.clone());
+            Ok(LocalResponse::AttemptFinalizing { run_id })
         }
-        LocalRequest::BlockTask {
-            project_id,
-            task_id,
-            reason,
-        } => {
+        LocalRequest::BlockAttempt { reason } => {
             if reason.is_empty() || reason.len() > MAX_BLOCKED_REASON_BYTES {
                 return Err(ApiFailure::Invalid(format!(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
                 )));
             }
-            let task = state
+            let Principal::Attempt(attempt) = principal else {
+                return Err(ApiFailure::Unauthorized(
+                    "attempt outcome requires an active attempt".into(),
+                ));
+            };
+            let run_id = attempt.run_id.clone();
+            let request_run_id = run_id.clone();
+            state
                 .commit_and_publish(move |store| {
-                    let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
-                    Ok((closed.task, closed.events))
+                    let (_, events) = store.request_attempt_outcome(
+                        &request_run_id,
+                        &factory_core::RunOutcome::Blocked { reason },
+                        None,
+                        now_ms()?,
+                    )?;
+                    Ok(((), events))
                 })
                 .await?;
-            Ok(LocalResponse::TaskBlocked { task })
+            execution.wake_run(run_id.clone());
+            Ok(LocalResponse::AttemptFinalizing { run_id })
         }
         LocalRequest::PauseAgent {
             project_id,
@@ -1800,160 +1404,40 @@ async fn handle_request(
                     Ok((agent, vec![event]))
                 })
                 .await?;
-            // Issue #24 finding 4: a resume is itself the operator's retry
-            // decision for an agent the dispatcher may have paused after
-            // repeated session-start-deadline failures, so it gets a clean
-            // backoff/streak slate rather than being immediately eligible
-            // to re-trip the same pause on its very next deadline.
-            execution.resume_backoff(&wake_agent_id);
-            execution
-                .reset_delivery_attempt(&wake_project_id, &wake_agent_id)
-                .await?;
             execution.wake(wake_project_id, wake_agent_id);
             Ok(LocalResponse::AgentResumed { agent })
         }
-        LocalRequest::ListSessions {
-            project_id,
-            after_id,
-            limit,
-        } => {
-            let limit = session_page_limit(limit)?;
-            let mut sessions = state
-                .with_store(move |store| {
-                    store.list_sessions(&project_id, after_id.as_ref(), limit + 1)
-                })
-                .await?;
-            let next_after_id = next_cursor(&mut sessions, limit, |session| session.id.clone());
-            Ok(LocalResponse::Sessions {
-                sessions,
-                next_after_id,
-            })
-        }
-        LocalRequest::StopSession {
-            project_id,
-            session_id,
-            grace_ms,
-        } => {
-            if grace_ms > 60_000 {
-                return Err(ApiFailure::Invalid(
-                    "runner stop grace must be at most 60000 ms".into(),
+        LocalRequest::ProviderHook { payload, .. } => {
+            let Principal::Attempt(attempt) = principal else {
+                return Err(ApiFailure::Unauthorized(
+                    "provider hooks require an active attempt".into(),
                 ));
-            }
-            let lookup_project_id = project_id.clone();
-            let lookup_session_id = session_id.clone();
-            let session = state
-                .with_store(move |store| {
-                    store.session_snapshot(&lookup_project_id, &lookup_session_id)
-                })
-                .await?;
-            let _delivery_admission = execution.lock_delivery_admission(&session.agent_id).await;
-            let target_project_id = project_id.clone();
-            let target_session_id = session_id.clone();
-            let target = state
-                .with_store(move |store| {
-                    store.session_control_target(&target_project_id, &target_session_id)
-                })
-                .await?;
-            let control_run_id = session_control_run_id(&session_id)?;
-            let stop_project_id = project_id.clone();
-            let stop_session_id = session_id.clone();
-            state
-                .commit_and_publish(move |store| {
-                    let (session, event) = store.request_session_stop(
-                        &stop_project_id,
-                        &stop_session_id,
-                        now_ms()?,
-                    )?;
-                    Ok((session, vec![event]))
-                })
-                .await?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .stop(grace_ms)
-            .await
-            .map_err(|error| runner_control_failure(error, "stop"))?;
-            Ok(LocalResponse::SessionStopped { session_id })
-        }
-        LocalRequest::ProviderHook {
-            token,
-            event,
-            payload,
-        } => {
-            if token.is_empty() || token.len() > 4096 {
-                return Err(ApiFailure::Invalid("hook token is invalid".into()));
-            }
-            let lookup_token = token.clone();
-            let session = state
-                .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
-                .await?
-                .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
-            let project_id = session.project_id.clone();
-            let agent_id = session.agent_id.clone();
-            let session_id = session.id.clone();
-            let (activity, inferred, wait_reason, notification_kind) =
-                compute_hook_fields(event, &payload);
-            let policy_decision = (event == ProviderHookEvent::PreToolUse)
-                .then(|| crate::policy::decide(&payload, Path::new(&session.worktree)));
-            let budget_denied = if event == ProviderHookEvent::PreToolUse {
-                let budget_project_id = project_id.clone();
-                let budget_agent_id = agent_id.clone();
-                state
-                    .commit_and_publish(move |store| {
-                        let (_, denied, event) = store.observe_tool_call(
-                            &budget_project_id,
-                            &budget_agent_id,
-                            now_ms()?,
-                        )?;
-                        Ok((denied, vec![event]))
-                    })
-                    .await?
-            } else {
-                false
             };
-            let prompt_admission = if event == ProviderHookEvent::UserPromptSubmit {
-                // Bind and commit the exact durable delivery before
-                // publishing the hook event. The ack waiter then observes
-                // `acknowledged`, never merely an unrelated prompt event.
-                execution::commit_pending_delivery_on_prompt(state, &session.snapshot(), &payload)
-                    .await?
-            } else {
-                execution::PromptDeliveryAdmission::Ignored
-            };
-            let record_session_id = session_id.clone();
-            let updated_session = state
+            let decision = crate::policy::decide(&payload, Path::new(&attempt.worktree));
+            let project_id = attempt.project_id.clone();
+            let agent_id = attempt.agent_id.clone();
+            let authority_run_id = attempt.run_id.clone();
+            let budget_denied = state
                 .commit_and_publish(move |store| {
-                    let (session, event_envelope) = store.record_hook_event_with_notification(
-                        &record_session_id,
-                        event,
-                        activity,
-                        inferred,
-                        wait_reason,
-                        notification_kind,
-                        now_ms()?,
-                    )?;
-                    Ok((session, vec![event_envelope]))
+                    verify_mutation_attempt(store, Some(&authority_run_id))?;
+                    let (_, denied, event) =
+                        store.observe_tool_call(&project_id, &agent_id, now_ms()?)?;
+                    Ok((denied, vec![event]))
                 })
                 .await?;
-            let reply = if prompt_admission == execution::PromptDeliveryAdmission::Denied {
-                // UserPromptSubmit is synchronous and pre-execution in both
-                // supported hook contracts. This exact stale prompt lost the
-                // durable admission fence, so block it before the provider can
-                // begin model or tool work.
-                serde_json::json!({
-                    "decision": "block",
-                    "reason": "Dark Factory rejected this stale delivery"
-                })
-            } else if let Some(decision) = policy_decision {
+            let reply = {
                 let denied_by = decision.denied_by.map(str::to_owned);
                 let policy_event = FactoryEvent::PolicyDecision {
-                    project_id: project_id.clone(),
-                    agent_id: agent_id.clone(),
-                    session_id: session_id.clone(),
+                    project_id: attempt.project_id.clone(),
+                    agent_id: attempt.agent_id.clone(),
+                    run_id: attempt.run_id.clone(),
                     tool_name: decision.tool_name,
-                    decision: if denied_by.is_some() { "deny" } else { "allow" }.to_owned(),
+                    decision: if budget_denied || denied_by.is_some() {
+                        "deny"
+                    } else {
+                        "allow"
+                    }
+                    .to_owned(),
                     rule: denied_by.clone(),
                 };
                 state
@@ -1967,152 +1451,23 @@ async fn handle_request(
                         "hookSpecificOutput": {
                             "hookEventName": "PreToolUse",
                             "permissionDecision": "deny",
-                            "permissionDecisionReason": "Dark Factory budget exhausted; run factoryctl agent budget reset"
+                            "permissionDecisionReason": "Dark Factory budget exhausted"
                         }
                     })
                 } else {
                     denied_by.map_or_else(
-                    || serde_json::json!({}),
-                    |rule| serde_json::json!({
-                        "hookSpecificOutput": {
-                            "hookEventName": "PreToolUse",
-                            "permissionDecision": "deny",
-                            "permissionDecisionReason": format!("Dark Factory policy: {rule}")
-                        }
-                    }),
-                )
-                }
-            } else if matches!(
-                event,
-                ProviderHookEvent::Stop | ProviderHookEvent::SubagentStop
-            ) {
-                let stop_hook_active = payload
-                    .get("stop_hook_active")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false);
-                // Deletion invariant (ARCHITECTURE.md #9, PR #50 re-review
-                // correction): `stop_hook_reply` calls `compose_delivery`,
-                // which can lazily recreate this agent's guidance files
-                // the same way `deliver_pending`'s does -- gated the same
-                // way, at this call site, since `execution` and `agent_id`
-                // are already in scope here. A decline replies `{}`,
-                // matching `stop_hook_active`'s own silent reply just
-                // above: this is a live provider process's own hook call,
-                // not an operator request it can retry, so nothing here
-                // surfaces as an error into it.
-                if execution.try_begin_agent_write(&agent_id) {
-                    let result = execution::stop_hook_reply(
-                        state,
-                        guidance_root,
-                        &updated_session,
-                        stop_hook_active,
-                    )
-                    .await;
-                    execution.end_agent_write(&agent_id);
-                    result?
-                } else {
-                    serde_json::json!({})
-                }
-            } else {
-                serde_json::json!({})
-            };
-            if event == ProviderHookEvent::SessionStart {
-                // Codex reports its own thread id back in this hook's
-                // payload (a Claude-shaped `session_id` field -- its
-                // `--session-id` is instead assigned by the daemon up
-                // front, so `Store::create_session` already set it there;
-                // see `TRACK5-DESIGN.md` §1 and `TRACK5D` item 5).
-                // Unconditional for every provider: `set_provider_session_id`
-                // is a no-op once a session already carries one, which
-                // Claude's and a resumed session's already do.
-                if let Some(provider_session_id) = payload
-                    .get("session_id")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    let identify_session_id = session_id.clone();
-                    let identify_provider_session_id = provider_session_id.to_owned();
-                    state
-                        .commit_and_publish(move |store| {
-                            match store.set_provider_session_id(
-                                &identify_session_id,
-                                &identify_provider_session_id,
-                                now_ms()?,
-                            )? {
-                                Some((_, event)) => Ok(((), vec![event])),
-                                None => Ok(((), Vec::new())),
+                        || serde_json::json!({}),
+                        |rule| serde_json::json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": format!("Dark Factory policy: {rule}")
                             }
-                        })
-                        .await?;
+                        }),
+                    )
                 }
-                // Proof the CLI is up: an agent's very first delivery is
-                // PTY-typed (idle-session path), which needs the session to
-                // be `idle` before typing anything (TRACK5-DESIGN.md §3);
-                // anything queued before the session finished booting is
-                // picked up here rather than waiting for the 5 second
-                // safety tick. For Claude and `shell`, this real hook is
-                // what makes that transition. For Codex, it is usually
-                // already `idle` by the time this real (once-delayed) hook
-                // arrives -- `execution::synthesize_codex_session_start`
-                // made that transition earlier, once
-                // `RunnerEvent::TerminalRaw` reported the provider's own
-                // tty leaving canonical mode (`docs/providers.md`'s Codex
-                // `SessionStart` section) -- so this `wake` is then a
-                // harmless no-op for an agent that is already delivering;
-                // it still matters for the (bounded) window before that
-                // signal arrives, and for every other provider.
-                execution.wake(project_id, agent_id);
-            }
+            };
             Ok(LocalResponse::ProviderHookReply { reply })
-        }
-        LocalRequest::AttachTerminal { .. } => {
-            unreachable!("AttachTerminal is handled per connection")
-        }
-        LocalRequest::TerminalInput {
-            project_id,
-            session_id,
-            bytes,
-        } => {
-            let lookup_project_id = project_id.clone();
-            let lookup_session_id = session_id.clone();
-            let target = state
-                .with_store(move |store| {
-                    store.session_control_target(&lookup_project_id, &lookup_session_id)
-                })
-                .await?;
-            let control_run_id = session_control_run_id(&session_id)?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .terminal_input(bytes)
-            .await
-            .map_err(|error| runner_control_failure(error, "terminal input"))?;
-            Ok(LocalResponse::TerminalInputAccepted { session_id })
-        }
-        LocalRequest::ResizeTerminal {
-            project_id,
-            session_id,
-            cols,
-            rows,
-        } => {
-            let lookup_project_id = project_id.clone();
-            let lookup_session_id = session_id.clone();
-            let target = state
-                .with_store(move |store| {
-                    store.session_control_target(&lookup_project_id, &lookup_session_id)
-                })
-                .await?;
-            let control_run_id = session_control_run_id(&session_id)?;
-            RunnerClient::new(
-                &target.runner_runtime,
-                control_run_id,
-                target.runner_instance_id,
-            )
-            .resize_terminal(cols, rows)
-            .await
-            .map_err(|error| runner_control_failure(error, "resize terminal"))?;
-            Ok(LocalResponse::TerminalResized { session_id })
         }
         LocalRequest::ListRuns {
             project_id,
@@ -2148,322 +1503,6 @@ async fn handle_request(
             Ok(LocalResponse::EventHead { sequence })
         }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
-    }
-}
-
-async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
-    populate_fleet_worktrees_with(
-        projects,
-        MAX_CONCURRENT_WORKTREE_PROBES,
-        FLEET_WORKTREE_DEADLINE,
-        |path| async move { crate::worktrees::status(&path).await },
-    )
-    .await;
-}
-
-async fn populate_fleet_worktrees_with<Probe, ProbeFuture>(
-    projects: &mut [status::ProjectStatus],
-    max_concurrent: usize,
-    deadline: Duration,
-    probe: Probe,
-) where
-    Probe: Fn(PathBuf) -> ProbeFuture + Clone + Send + 'static,
-    ProbeFuture: Future<Output = status::WorktreeStatus> + Send + 'static,
-{
-    let mut pending = Vec::new();
-    for (project_index, project) in projects.iter_mut().enumerate() {
-        for (agent_index, agent) in project.agents.iter_mut().enumerate() {
-            if let Some(path) = agent.agent.worktree.clone() {
-                agent.worktree = Some(status::WorktreeStatus {
-                    path: path.clone(),
-                    branch: None,
-                    changed_files: 0,
-                    dirty: false,
-                    error: Some("fleet git status deadline exceeded".to_owned()),
-                });
-                pending.push((project_index, agent_index, PathBuf::from(path)));
-            }
-        }
-    }
-
-    let mut probes = JoinSet::new();
-    let mut pending = pending.into_iter();
-    let deadline = tokio::time::sleep(deadline);
-    tokio::pin!(deadline);
-    loop {
-        while probes.len() < max_concurrent {
-            let Some((project_index, agent_index, path)) = pending.next() else {
-                break;
-            };
-            let probe = probe.clone();
-            probes.spawn(async move {
-                let worktree = probe(path).await;
-                (project_index, agent_index, worktree)
-            });
-        }
-        if probes.is_empty() {
-            break;
-        }
-        tokio::select! {
-            () = &mut deadline => {
-                probes.abort_all();
-                while probes.join_next().await.is_some() {}
-                break;
-            }
-            result = probes.join_next() => {
-                let Some(result) = result else {
-                    break;
-                };
-                if let Ok((project_index, agent_index, worktree)) = result {
-                    projects[project_index].agents[agent_index].worktree = Some(worktree);
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod worktree_status_tests {
-    use super::*;
-    use factory_core::{AgentRole, AgentSnapshot, ProjectSnapshot, Provider};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct ActiveProbe(Arc<AtomicUsize>);
-
-    impl Drop for ActiveProbe {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn fleet_probe_window_deadline_and_cancellation_are_bounded() {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let mut agents = Vec::new();
-        for index in 0..12 {
-            let id = AgentId::try_from(format!("worker-{index}")).unwrap();
-            agents.push(status::AgentStatus {
-                budget: factory_core::AgentBudget::default(),
-                pause_reasons: Vec::new(),
-                agent: AgentSnapshot {
-                    id,
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Shell,
-                    current_run_id: None,
-                    paused: false,
-                    current_session_id: None,
-                    worktree: Some(format!("/work/{index}")),
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                },
-                worktree: None,
-                session: None,
-                current_run: None,
-                latest_run: None,
-                queue_depth: 0,
-                queue: Vec::new(),
-                inbox_pending: 0,
-                attention: factory_core::attention::Attention::Routine,
-                attention_inferred: true,
-            });
-        }
-        let mut projects = vec![status::ProjectStatus {
-            project: ProjectSnapshot {
-                id: project_id,
-                name: "Factory".into(),
-                root: "/work".into(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            },
-            agents,
-            backlog_depth: 0,
-            backlog: Vec::new(),
-        }];
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        let probe = {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            move |_path: PathBuf| {
-                let active = Arc::clone(&active);
-                let peak = Arc::clone(&peak);
-                async move {
-                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(now, Ordering::SeqCst);
-                    let _active = ActiveProbe(active);
-                    std::future::pending::<status::WorktreeStatus>().await
-                }
-            }
-        };
-        let started = std::time::Instant::now();
-
-        populate_fleet_worktrees_with(&mut projects, 8, Duration::from_millis(30), probe).await;
-
-        assert!(started.elapsed() < Duration::from_millis(200));
-        assert_eq!(peak.load(Ordering::SeqCst), 8);
-        assert_eq!(
-            active.load(Ordering::SeqCst),
-            0,
-            "probes were not cancelled"
-        );
-        assert!(projects[0].agents.iter().all(|agent| {
-            agent.worktree.as_ref().is_some_and(|worktree| {
-                !worktree.dirty
-                    && worktree.error.as_deref() == Some("fleet git status deadline exceeded")
-            })
-        }));
-    }
-}
-
-async fn repository_request(
-    state: &ApiState,
-    token: String,
-    request: RepositoryRequest,
-) -> Result<LocalResponse, ApiFailure> {
-    let session = state
-        .with_store(move |store| store.find_session_by_hook_token(&token))
-        .await?
-        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
-    let project_id = session.project_id.clone();
-    let project = state
-        .with_store(move |store| store.get_project(&project_id))
-        .await?;
-    let authority_project_id = session.project_id.clone();
-    let authority = state
-        .with_store(move |store| store.repository_authority(&authority_project_id))
-        .await?;
-    // Reads use immutable snapshots and must not let a slow diff monopolize the
-    // process-wide mutation boundary. Every operation that can change local or
-    // remote state remains serialized until its final revalidation completes.
-    let _slot = match &request {
-        RepositoryRequest::Status | RepositoryRequest::Diff { .. } => None,
-        _ => Some(state.repository_slot().await),
-    };
-    let operation = request.name().to_owned();
-    let returns_reference = matches!(
-        request,
-        RepositoryRequest::Commit { .. }
-            | RepositoryRequest::Push
-            | RepositoryRequest::PrOpen { .. }
-            | RepositoryRequest::PrUpdate { .. }
-    );
-    record_repository_audit(
-        state,
-        RepositoryAudit {
-            project_id: session.project_id.clone(),
-            agent_id: session.agent_id.clone(),
-            session_id: session.id.clone(),
-            operation: operation.clone(),
-            phase: "requested".into(),
-            success: None,
-            reference: None,
-        },
-    )
-    .await?;
-    let audit_project_id = session.project_id.clone();
-    let audit_agent_id = session.agent_id.clone();
-    let audit_session_id = session.id.clone();
-    let result = match repository::Target::validate(session, project, authority).await {
-        Ok(target) => {
-            let command = match request {
-                RepositoryRequest::Status => target.status().await,
-                RepositoryRequest::Diff { staged } => target.diff(staged).await,
-                RepositoryRequest::Commit { message } => target.commit(&message).await,
-                RepositoryRequest::Push => target.push().await,
-                RepositoryRequest::PrOpen { title, body } => target.pr_open(&title, &body).await,
-                RepositoryRequest::PrUpdate {
-                    number,
-                    title,
-                    body,
-                } => target.pr_update(number, &title, &body).await,
-            };
-            (target, command)
-        }
-        Err(error) => {
-            record_repository_audit(
-                state,
-                RepositoryAudit {
-                    project_id: audit_project_id,
-                    agent_id: audit_agent_id,
-                    session_id: audit_session_id,
-                    operation: operation.clone(),
-                    phase: "finished".into(),
-                    success: Some(false),
-                    reference: None,
-                },
-            )
-            .await?;
-            return Err(repository_failure(error));
-        }
-    };
-    let (target, command) = result;
-    match command {
-        Ok(output) => {
-            let reference = returns_reference.then(|| output.clone());
-            record_repository_audit(
-                state,
-                RepositoryAudit {
-                    project_id: target.project_id.clone(),
-                    agent_id: target.agent_id.clone(),
-                    session_id: target.session_id.clone(),
-                    operation: operation.clone(),
-                    phase: "finished".into(),
-                    success: Some(true),
-                    reference,
-                },
-            )
-            .await?;
-            Ok(LocalResponse::GitOutput { operation, output })
-        }
-        Err(error) => {
-            record_repository_audit(
-                state,
-                RepositoryAudit {
-                    project_id: target.project_id,
-                    agent_id: target.agent_id,
-                    session_id: target.session_id,
-                    operation: operation.clone(),
-                    phase: "finished".into(),
-                    success: Some(false),
-                    reference: None,
-                },
-            )
-            .await?;
-            Err(repository_failure(error))
-        }
-    }
-}
-
-async fn record_repository_audit(
-    state: &ApiState,
-    audit: RepositoryAudit,
-) -> Result<(), ApiFailure> {
-    state
-        .commit_and_publish(move |store| {
-            let event = store.record_repository_operation(NewRepositoryOperation {
-                project_id: audit.project_id,
-                agent_id: audit.agent_id,
-                session_id: audit.session_id,
-                operation: audit.operation,
-                phase: audit.phase,
-                success: audit.success,
-                reference: audit.reference,
-                occurred_at_ms: now_ms()?,
-            })?;
-            Ok(((), vec![event]))
-        })
-        .await?;
-    Ok(())
-}
-
-fn repository_failure(error: repository::Error) -> ApiFailure {
-    match error {
-        repository::Error::Rejected(_) => ApiFailure::Invalid(error.to_string()),
-        repository::Error::Command(_) | repository::Error::Timeout => {
-            ApiFailure::Conflict(error.to_string())
-        }
     }
 }
 
@@ -2507,7 +1546,7 @@ async fn agent_detail_with_guidance(
     // Deletion invariant (ARCHITECTURE.md #9, PR #50 review finding 5):
     // `read_guidance_file` below lazily recreates this agent's guidance
     // files (`guidance::read_or_create`) if they're missing -- gated the
-    // same way spawn preparation is (same per-agent lock), so a
+    // same way attempt preparation is (same per-agent lock), so a
     // concurrent `DeleteAgent`'s drain can never miss this read.
     if !execution.try_begin_agent_write(agent_id) {
         return Err(ApiFailure::Conflict("agent is being deleted".into()));
@@ -2574,7 +1613,6 @@ fn local_agent_detail(
         instructions_path: path_to_string(&paths.instructions),
         instructions_health,
         memory_path: path_to_string(&paths.memory),
-        memory_archive_path: path_to_string(&guidance::memory_archive_path(&paths.memory)),
         memory_health,
         project_guidance_path: path_to_string(&paths.project_guidance),
     }
@@ -2649,7 +1687,6 @@ async fn create_agent_locked(
     model: Option<String>,
     reasoning_effort: Option<String>,
     model_selection_reason: Option<String>,
-    worktree: Option<String>,
 ) -> Result<factory_core::AgentSnapshot, ApiFailure> {
     let created_project_id = new_agent.project_id.clone();
     let created_agent_id = new_agent.id.clone();
@@ -2665,30 +1702,6 @@ async fn create_agent_locked(
             Ok((agent, vec![event]))
         })
         .await?;
-    let resolved_worktree = match worktree {
-        Some(worktree) => Some(worktree),
-        None => Some(
-            provision_agent_worktree(state, guidance_root, &created_project_id, &created_agent_id)
-                .await?,
-        ),
-    };
-    let agent = if let Some(worktree) = resolved_worktree {
-        let worktree_project_id = created_project_id.clone();
-        let worktree_agent_id = created_agent_id.clone();
-        state
-            .commit_and_publish(move |store| {
-                let (agent, event) = store.set_agent_worktree(
-                    &worktree_project_id,
-                    &worktree_agent_id,
-                    worktree,
-                    now_ms()?,
-                )?;
-                Ok((agent, vec![event]))
-            })
-            .await?
-    } else {
-        agent
-    };
     ensure_agent_guidance(guidance_root, &created_project_id, &created_agent_id).await?;
     Ok(agent)
 }
@@ -2707,67 +1720,6 @@ async fn ensure_agent_guidance(
         .map_err(ApiFailure::from)
 }
 
-/// Resolves the worktree a newly created agent should get when `agent add`
-/// did not pass `--worktree` explicitly (D3, `TRACK5-WIRE.md`): a fresh
-/// `git worktree add -b agent/<agent_id>` under
-/// `agent_worktree_dir(guidance_root, project_id, agent_id)` from the
-/// project's `origin/HEAD` (or local `main` without a remote) when the
-/// project root is a git repo,
-/// else the project root itself. A `git worktree add` failure (a real one,
-/// not "branch already exists" -- `worktrees::add` already retries that)
-/// falls back to the project root rather than blocking agent creation
-/// entirely: a working root beats no agent at all.
-async fn provision_agent_worktree(
-    state: &ApiState,
-    guidance_root: &Path,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<String, ApiFailure> {
-    let lookup_project_id = project_id.clone();
-    let project = state
-        .with_store(move |store| store.get_project(&lookup_project_id))
-        .await?;
-    let project_root = PathBuf::from(&project.root);
-    if !crate::worktrees::is_git_repo(&project_root).await {
-        return Ok(project.root);
-    }
-    let worktree_dir = factory_core::paths::agent_worktree_dir(guidance_root, project_id, agent_id);
-    let branch = format!("agent/{}", agent_id.as_str());
-    match crate::worktrees::add(&project_root, &worktree_dir, &branch).await {
-        Ok(()) => Ok(path_to_string(&worktree_dir)),
-        Err(error) => {
-            tracing::warn!(
-                %error, %project_id, %agent_id,
-                "git worktree add failed; using the project root instead"
-            );
-            Ok(project.root)
-        }
-    }
-}
-
-/// Runs the file/database work of `DeleteAgent`, called only after
-/// `execution.begin_delete` has confirmed no spawn preparation can still be
-/// mid-write into this agent's guidance directory (ARCHITECTURE.md's
-/// deletion invariant): checks `store.check_agent_deletable` first, then
-/// removes the git worktree and the guidance directory, *then* deletes the
-/// ledger row (PR #50 re-review's blocking finding).
-///
-/// The precheck exists because a refusal must be completely side-effect
-/// free: `store.delete_agent`'s own preconditions (`AgentHasActiveRun`,
-/// `AgentHasLiveSession`, `AgentHasChildren`, `AgentRunHasDependents`) live
-/// *inside* its transaction, which only runs after the files below are
-/// already gone -- so without this check, the single most ordinary operator
-/// mistake ("delete a busy or parent agent") answered `Conflict` while
-/// silently destroying `instructions.md`/`memory.md`, a data-loss
-/// regression a re-review caught and reproduced through the public API
-/// (`UpdateAgentProfile` writes distinctive instructions, `DeleteAgent` on
-/// a parent answers `AgentHasChildren`, `instructions.md` is gone). The
-/// precheck is sound run here, right after `execution.begin_delete`'s
-/// drain and before any file is touched: the deletion gate already rules
-/// out a *new* session appearing between this read and the removals below,
-/// which is the only way `check_agent_deletable`'s answer could go stale
-/// before `delete_agent`'s own transaction re-confirms it as the
-/// authoritative last word.
 async fn delete_agent_locked(
     state: &ApiState,
     guidance_root: &Path,
@@ -2779,7 +1731,6 @@ async fn delete_agent_locked(
     state
         .with_store(move |store| store.check_agent_deletable(&check_project_id, &check_agent_id))
         .await?;
-    remove_agent_worktree_if_any(state, &project_id, &agent_id).await?;
     remove_agent_guidance(guidance_root, &project_id, &agent_id).await?;
     state
         .commit_and_publish(move |store| {
@@ -2790,13 +1741,10 @@ async fn delete_agent_locked(
     Ok(())
 }
 
-/// Recursively removes one agent's guidance directory, run after
-/// `DeleteAgent`'s transaction has already committed. The ledger row is
-/// gone either way, but a filesystem failure here is now still reported as
-/// the request's own error (AGENTS.md rule 3: no silent fallback) rather
-/// than merely logged -- `execution.begin_delete` having already drained
-/// any in-flight preparation means a failure here is a real problem (a
-/// permission issue, an unexpected file), not the race this task closes.
+/// Recursively removes one agent's guidance directory before the database
+/// deletion commits. A filesystem failure is reported as the request's own
+/// error and leaves the ledger row intact; `execution.begin_delete` has
+/// already drained in-flight preparation.
 async fn remove_agent_guidance(
     guidance_root: &Path,
     project_id: &ProjectId,
@@ -2817,63 +1765,6 @@ async fn remove_agent_guidance(
     }
 }
 
-/// Removes an agent's git worktree before `DeleteAgent`'s transaction
-/// commits (D3, `TRACK5-WIRE.md`): dirty refuses the whole request
-/// (`ApiFailure::Conflict`), matching the design's "unless dirty ->
-/// Conflict" -- the agent row and its worktree must not diverge. A missing
-/// worktree (already removed by hand) or one that equals the project root
-/// (the `provision_agent_worktree` fallback: not a git repo, or `git
-/// worktree add` itself failed at creation time -- nothing separate to
-/// remove either way) is a no-op. Any other git failure is logged and
-/// otherwise ignored: getting the agent row deleted matters more than a
-/// stray leftover directory the operator can clean up by hand.
-async fn remove_agent_worktree_if_any(
-    state: &ApiState,
-    project_id: &ProjectId,
-    agent_id: &AgentId,
-) -> Result<(), ApiFailure> {
-    let lookup_project_id = project_id.clone();
-    let lookup_agent_id = agent_id.clone();
-    let agent = state
-        .with_store(move |store| store.get_agent_detail(&lookup_project_id, &lookup_agent_id))
-        .await?;
-    let Some(worktree) = agent.snapshot.worktree else {
-        return Ok(());
-    };
-    let lookup_project_id = project_id.clone();
-    let project = state
-        .with_store(move |store| store.get_project(&lookup_project_id))
-        .await?;
-    let project_root = PathBuf::from(&project.root);
-    let worktree_path = PathBuf::from(&worktree);
-    if worktree_path == project_root || !worktree_path.exists() {
-        return Ok(());
-    }
-    match crate::worktrees::remove(&project_root, &worktree_path).await {
-        Ok(()) => Ok(()),
-        Err(crate::worktrees::WorktreeError::Dirty) => Err(ApiFailure::Conflict(
-            "agent worktree has modified or untracked files; commit, discard, or remove it \
-             manually with `git worktree remove --force` before deleting the agent"
-                .into(),
-        )),
-        Err(error) => {
-            tracing::warn!(
-                %error, %project_id, %agent_id,
-                "git worktree remove failed; deleting the agent anyway"
-            );
-            Ok(())
-        }
-    }
-}
-
-/// Runs the file/database work of `DeleteProject`, called only after
-/// `execution.begin_delete_project` and every one of the project's agents
-/// has been through `execution.begin_delete` (its caller's loop): checks
-/// `store.check_project_deletable` first (same reasoning as
-/// [`delete_agent_locked`]'s precheck -- `ProjectHasActiveRun` must refuse
-/// before `projects/<p>/`, which holds every one of the project's agents'
-/// worktrees, is removed, not after), then removes the project's whole
-/// guidance directory tree, *then* deletes the ledger row.
 async fn delete_project_locked(
     state: &ApiState,
     guidance_root: &Path,
@@ -2893,10 +1784,8 @@ async fn delete_project_locked(
     Ok(())
 }
 
-/// Recursively removes one project's guidance directory, run after
-/// `DeleteProject`'s transaction has already committed. See
-/// [`remove_agent_guidance`] for why a failure here is now the request's
-/// own error rather than merely logged.
+/// Recursively removes one project's guidance directory before the database
+/// deletion commits. See [`remove_agent_guidance`] for failure semantics.
 async fn remove_project_guidance(
     guidance_root: &Path,
     project_id: &ProjectId,
@@ -2978,278 +1867,6 @@ fn local_agent_message(message: AgentMessage) -> LocalAgentMessage {
         created_at_ms: message.created_at_ms,
         delivered_at_ms: message.delivered_at_ms,
     }
-}
-
-/// Validates an operator-supplied agent worktree override (D3): must be an
-/// absolute, existing directory. Creating the git worktree itself is
-/// execution's job; this only records the path.
-async fn validate_agent_worktree(worktree: String) -> Result<String, ApiFailure> {
-    if !Path::new(&worktree).is_absolute() {
-        return Err(ApiFailure::Invalid(
-            "agent worktree must be an absolute path".into(),
-        ));
-    }
-    tokio::task::spawn_blocking(move || {
-        if !Path::new(&worktree).is_dir() {
-            return Err(ApiFailure::Invalid(
-                "agent worktree must be an existing directory".into(),
-            ));
-        }
-        Ok(worktree)
-    })
-    .await
-    .map_err(|error| ApiFailure::Internal(format!("worktree check worker failed: {error}")))?
-}
-
-fn session_page_limit(limit: Option<usize>) -> Result<usize, ApiFailure> {
-    // `ListSessions.limit` is `Option<usize>` (every other `List*` request
-    // takes a required `u32`, defaulted client-side instead): a caller that
-    // omits it gets this default rather than the wire max.
-    const DEFAULT_SESSION_PAGE: usize = 100;
-    let limit = limit.unwrap_or(DEFAULT_SESSION_PAGE);
-    if !(1..=MAX_SESSION_PAGE_ITEMS as usize).contains(&limit) {
-        return Err(ApiFailure::Invalid(format!(
-            "session page limit must be between 1 and {MAX_SESSION_PAGE_ITEMS}"
-        )));
-    }
-    Ok(limit)
-}
-
-/// Computes the `record_hook_event` inputs for one hook event from its
-/// opaque JSON payload: `tool_name` for `PreToolUse`, `message` for
-/// `Notification`; every other event carries no payload-derived field.
-fn compute_hook_fields(
-    event: ProviderHookEvent,
-    payload: &serde_json::Value,
-) -> (
-    Option<String>,
-    bool,
-    Option<String>,
-    Option<factory_core::ProviderNotificationKind>,
-) {
-    match event {
-        ProviderHookEvent::SessionStart | ProviderHookEvent::Stop => (None, false, None, None),
-        ProviderHookEvent::UserPromptSubmit | ProviderHookEvent::PostToolUse => {
-            (Some("thinking".into()), true, None, None)
-        }
-        ProviderHookEvent::PreToolUse => {
-            let tool_name = payload
-                .get("tool_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool");
-            (
-                Some(bounded_hook_field(&format!("tool: {tool_name}"))),
-                false,
-                None,
-                None,
-            )
-        }
-        ProviderHookEvent::Notification => {
-            let message = payload
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("waiting for input");
-            let notification_kind = match payload
-                .get("notification_type")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("permission_prompt") => {
-                    Some(factory_core::ProviderNotificationKind::PermissionPrompt)
-                }
-                Some("elicitation_dialog") => {
-                    Some(factory_core::ProviderNotificationKind::ElicitationDialog)
-                }
-                Some("elicitation_url_dialog") => {
-                    Some(factory_core::ProviderNotificationKind::ElicitationUrlDialog)
-                }
-                Some("agent_needs_input") => {
-                    Some(factory_core::ProviderNotificationKind::AgentNeedsInput)
-                }
-                Some("idle_prompt") => Some(factory_core::ProviderNotificationKind::IdlePrompt),
-                Some("auth_success") => Some(factory_core::ProviderNotificationKind::AuthSuccess),
-                Some("elicitation_complete") => {
-                    Some(factory_core::ProviderNotificationKind::ElicitationComplete)
-                }
-                Some("elicitation_response") => {
-                    Some(factory_core::ProviderNotificationKind::ElicitationResponse)
-                }
-                Some("agent_completed") => {
-                    Some(factory_core::ProviderNotificationKind::AgentCompleted)
-                }
-                _ => None,
-            };
-            (
-                None,
-                false,
-                Some(bounded_hook_field(message)),
-                notification_kind,
-            )
-        }
-        ProviderHookEvent::PermissionRequest => {
-            // The provider's immediate approval prompt is observe-only: this
-            // daemon records that the session is blocked and never answers
-            // the provider prompt. Both Claude and Codex use this hook.
-            let tool_name = payload
-                .get("tool_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("tool");
-            (
-                None,
-                false,
-                Some(bounded_hook_field(&format!(
-                    "provider approval prompt: {tool_name}"
-                ))),
-                None,
-            )
-        }
-        ProviderHookEvent::SubagentStop | ProviderHookEvent::SessionEnd => {
-            (None, false, None, None)
-        }
-    }
-}
-
-fn bounded_hook_field(value: &str) -> String {
-    if value.len() <= MAX_HOOK_FIELD_BYTES {
-        return value.to_owned();
-    }
-    let mut end = MAX_HOOK_FIELD_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
-}
-
-fn runner_control_failure(error: RunnerClientError, action: &'static str) -> ApiFailure {
-    match error {
-        RunnerClientError::RunnerRejected {
-            code: RunnerErrorCode::Conflict,
-        } => ApiFailure::Conflict(format!("runner rejected the {action} request")),
-        RunnerClientError::RunnerRejected {
-            code: RunnerErrorCode::InvalidRequest,
-        } => ApiFailure::Invalid(format!("runner rejected the {action} request")),
-        RunnerClientError::BoundedAttachUnsupported => ApiFailure::Invalid(
-            "runner does not support bounded terminal attach; use --full-history during the rolling upgrade".into(),
-        ),
-        RunnerClientError::InvalidStopGrace { found } => ApiFailure::Invalid(format!(
-            "runner stop grace must be at most 60000 ms, got {found}"
-        )),
-        _ => ApiFailure::Internal(format!("runner {action} request failed")),
-    }
-}
-
-fn attach_refusal_reason(error: &RunnerClientError) -> AttachRefusalReason {
-    match error {
-        RunnerClientError::WrongIdentity => AttachRefusalReason::RunnerReplaced,
-        RunnerClientError::RunnerRejected { .. } => AttachRefusalReason::RunnerRejected,
-        _ => AttachRefusalReason::RunnerUnavailable,
-    }
-}
-
-fn read_run_terminal(
-    target: &SessionControlTarget,
-    run_id: RunId,
-) -> Result<RunTerminal, ApiFailure> {
-    let spool_path = PathBuf::from(&target.runner_runtime).join("events.ndjson");
-    let file = match fs::File::open(spool_path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Err(ApiFailure::Store(StoreError::RunNotFound));
-        }
-        Err(_) => {
-            return Err(ApiFailure::Internal(
-                "runner terminal spool could not be read".into(),
-            ));
-        }
-    };
-    let mut bytes = Vec::new();
-    file.take(u64::try_from(MAX_RUNNER_SPOOL_BYTES + 1).expect("spool bound fits u64"))
-        .read_to_end(&mut bytes)
-        .map_err(|_| ApiFailure::Internal("runner terminal spool could not be read".into()))?;
-    if bytes.len() > MAX_RUNNER_SPOOL_BYTES {
-        return Err(ApiFailure::Internal(
-            "runner terminal spool exceeded its bound".into(),
-        ));
-    }
-
-    let terminated = bytes.last() == Some(&b'\n');
-    let lines = bytes.split(|byte| *byte == b'\n').collect::<Vec<_>>();
-    let line_count = lines.len();
-    let mut head_sequence = 0;
-    let mut output = String::new();
-    let mut truncated = false;
-    for (index, line) in lines.into_iter().enumerate() {
-        if line.is_empty() {
-            continue;
-        }
-        if line.len() > MAX_RUNNER_FRAME_BYTES {
-            return Err(ApiFailure::Internal(
-                "runner terminal frame exceeded its bound".into(),
-            ));
-        }
-        let event: RunnerEventEnvelope = match serde_json::from_slice(line) {
-            Ok(event) => event,
-            Err(_) if !terminated && index + 1 == line_count => break,
-            // A malformed non-final line means a concurrent writer left a
-            // torn record behind (the spool is append-only, so this cannot
-            // be later "fixed" by more appends); degrade to a truncated
-            // read of whatever was durably complete before it rather than
-            // failing the whole request.
-            Err(_) => {
-                truncated = true;
-                break;
-            }
-        };
-        if event.protocol_version != factory_core::runner::RUNNER_PROTOCOL_VERSION {
-            return Err(ApiFailure::Internal(
-                "runner terminal protocol is unsupported".into(),
-            ));
-        }
-        head_sequence = head_sequence.max(event.sequence);
-        match event.event {
-            RunnerEvent::Output { stream, text, .. } => {
-                let prefix = match stream {
-                    OutputStream::Stdout => "[stdout] ",
-                    OutputStream::Stderr => "[stderr] ",
-                };
-                append_terminal_text(&mut output, prefix, &mut truncated);
-                let text = sanitize_terminal_text(&text);
-                append_terminal_text(&mut output, &text, &mut truncated);
-            }
-            RunnerEvent::OutputTruncated { .. } => truncated = true,
-            RunnerEvent::Started { .. }
-            | RunnerEvent::SpawnFailed { .. }
-            | RunnerEvent::TerminalRaw
-            | RunnerEvent::TerminalRawTimedOut
-            | RunnerEvent::Exited { .. }
-            | RunnerEvent::Unknown => {}
-        }
-    }
-
-    Ok(RunTerminal {
-        run_id,
-        head_sequence,
-        output,
-        truncated,
-    })
-}
-
-fn sanitize_terminal_text(text: &str) -> String {
-    text.chars()
-        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
-        .collect()
-}
-
-fn append_terminal_text(output: &mut String, text: &str, truncated: &mut bool) {
-    output.push_str(text);
-    if output.len() <= MAX_TERMINAL_OUTPUT_BYTES {
-        return;
-    }
-    *truncated = true;
-    let mut first = output.len() - MAX_TERMINAL_OUTPUT_BYTES;
-    while !output.is_char_boundary(first) {
-        first += 1;
-    }
-    output.drain(..first);
 }
 
 async fn stream_events<W>(mut write: W, state: &ApiState, after_sequence: i64) -> io::Result<()>
@@ -3456,14 +2073,62 @@ fn next_cursor<T, Id>(items: &mut Vec<T>, limit: usize, id: impl FnOnce(&T) -> I
     items.last().map(id)
 }
 
-/// The runner protocol still keys control requests by `RunId` (see
-/// `factory_core::runner`); `SessionId` and `RunId` share the same
-/// charset/length validation, so a session's own id doubles as its
-/// runner-facing identity until that protocol grows a session concept of
-/// its own.
-fn session_control_run_id(session_id: &SessionId) -> Result<RunId, ApiFailure> {
-    RunId::try_from(session_id.as_str())
-        .map_err(|_| ApiFailure::Internal("session id is not runner-addressable".into()))
+fn validate_repository_authority(
+    remote_url: String,
+    base_branch: String,
+) -> Result<RepositoryAuthority, ApiFailure> {
+    let valid_branch = !base_branch.is_empty()
+        && !base_branch.starts_with('-')
+        && !base_branch.starts_with('/')
+        && !base_branch.ends_with('/')
+        && !base_branch.contains("..")
+        && !base_branch.contains("@{")
+        && base_branch
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte));
+    if !valid_branch {
+        return Err(ApiFailure::Invalid("invalid base branch".into()));
+    }
+
+    let remote_url = if let Some(tail) = remote_url.strip_prefix("https://github.com/") {
+        let slug = tail.strip_suffix(".git").unwrap_or(tail);
+        let mut parts = slug.split('/');
+        let owner = parts.next().unwrap_or_default();
+        let repository = parts.next().unwrap_or_default();
+        let valid_slug = parts.next().is_none()
+            && !owner.is_empty()
+            && !repository.is_empty()
+            && owner
+                .bytes()
+                .chain(repository.bytes())
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+        if !valid_slug {
+            return Err(ApiFailure::Invalid("invalid GitHub remote".into()));
+        }
+        format!("https://github.com/{owner}/{repository}.git")
+    } else {
+        let path = remote_url
+            .strip_prefix("file://")
+            .map(PathBuf::from)
+            .or_else(|| {
+                Path::new(&remote_url)
+                    .is_absolute()
+                    .then(|| PathBuf::from(&remote_url))
+            })
+            .ok_or_else(|| {
+                ApiFailure::Invalid(
+                    "remote must be GitHub HTTPS or an absolute local test path".into(),
+                )
+            })?;
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|_| ApiFailure::Invalid("local remote does not exist".into()))?;
+        format!("file://{}", canonical.display())
+    };
+
+    Ok(RepositoryAuthority {
+        remote_url,
+        base_branch,
+    })
 }
 
 fn now_ms() -> Result<i64, StoreError> {
@@ -3493,987 +2158,4 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
         | ApiFailure::Internal(message) => message,
         ApiFailure::Store(error) => error.to_string(),
     })
-}
-
-/// Wiring-level tests for hook admission while the broad agent-write gate is
-/// held. Stop hooks still honor that deletion gate. Exact nonce-bearing
-/// `UserPromptSubmit` hooks deliberately bypass it and reach the durable
-/// attempt fence; otherwise gate contention could fail open while recovery
-/// concurrently retires the provider thread.
-#[cfg(test)]
-mod hook_field_tests {
-    use super::*;
-
-    #[test]
-    fn claude_notification_subtype_is_the_only_answerability_authority() {
-        for notification_type in [
-            "permission_prompt",
-            "elicitation_dialog",
-            "elicitation_url_dialog",
-            "agent_needs_input",
-            "idle_prompt",
-            "auth_success",
-            "elicitation_complete",
-            "elicitation_response",
-            "agent_completed",
-        ] {
-            let (_, _, reason, kind) = compute_hook_fields(
-                ProviderHookEvent::Notification,
-                &serde_json::json!({
-                    "notification_type": notification_type,
-                    "message": "Approve delivery?"
-                }),
-            );
-            assert_eq!(reason.as_deref(), Some("Approve delivery?"));
-            assert!(kind.is_some());
-        }
-        let (_, _, reason, kind) = compute_hook_fields(
-            ProviderHookEvent::Notification,
-            &serde_json::json!({"message": "Which branch?"}),
-        );
-        assert_eq!(reason.as_deref(), Some("Which branch?"));
-        assert!(kind.is_none());
-    }
-
-    #[test]
-    fn client_cursor_rejection_does_not_degrade_runner_observation() {
-        assert!(!attach_error_degrades_observer(
-            &RunnerClientError::RunnerRejected {
-                code: RunnerErrorCode::InvalidRequest,
-            }
-        ));
-        assert!(attach_error_degrades_observer(
-            &RunnerClientError::RunnerRejected {
-                code: RunnerErrorCode::Conflict,
-            }
-        ));
-    }
-
-    #[test]
-    fn attach_refusal_classifies_runner_races_without_exposing_error_text() {
-        assert_eq!(
-            attach_refusal_reason(&RunnerClientError::WrongIdentity),
-            AttachRefusalReason::RunnerReplaced
-        );
-        assert_eq!(
-            attach_refusal_reason(&RunnerClientError::RunnerRejected {
-                code: RunnerErrorCode::Conflict,
-            }),
-            AttachRefusalReason::RunnerRejected
-        );
-        assert_eq!(
-            attach_refusal_reason(&RunnerClientError::UnexpectedEof),
-            AttachRefusalReason::RunnerUnavailable
-        );
-    }
-}
-
-/// Wiring-level tests for the two deletion-gate call sites this file adds
-/// around `execution::stop_hook_reply`/`execution::commit_pending_delivery_on_prompt`
-/// (PR #50 review, round 3's nit): every existing `tests/local_api.rs`/
-/// `tests/sessions_e2e.rs` suite still passes even if `try_begin_agent_write`'s
-/// result is discarded at both call sites (the reviewer verified this by
-/// mutation), because neither hook path's *ordinary* behavior depends on
-/// the gate -- only the race this PR closes does, and that race needs a
-/// second, concurrent request to observe. These tests drive
-/// `handle_request` directly (visible here, not from the external
-/// `tests/` crate, since it is module-private) with the agent already
-/// marked deleting, so no real race or timing is needed: the assertion is
-/// "this exact call, with the mark already set, must not touch the store
-/// the way it normally would" -- exactly what the mutation the reviewer
-/// tried would break.
-#[cfg(test)]
-mod deletion_gate_tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use factory_core::{
-        AgentRole, MessageId, Provider, RunnerInstanceId, SessionId, TaskId, TaskStatus,
-    };
-
-    use super::*;
-    use crate::{
-        execution::DELIVERY_ATTEMPT_MARKER,
-        store::{
-            DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject,
-            NewSession, NewTask, Store,
-        },
-    };
-
-    fn private_tempdir() -> tempfile::TempDir {
-        let base = if cfg!(target_os = "macos") {
-            "/private/tmp"
-        } else {
-            "/tmp"
-        };
-        let directory = tempfile::tempdir_in(base).unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        directory
-    }
-    fn config(directory: &Path) -> execution::Config {
-        execution::Config {
-            runner_program: directory.join("factory-runner"),
-            factoryctl_path: directory.join("factoryctl"),
-            runtime_root: directory.join("runs"),
-            guidance_root: directory.to_path_buf(),
-            socket_path: directory.join("f.sock"),
-            max_active_runs: 1,
-            session_start_deadline: execution::SESSION_START_DEADLINE,
-        }
-    }
-
-    const HOOK_TOKEN_LEN: usize = 64;
-
-    #[derive(Clone, Copy)]
-    enum ProviderFixture {
-        Shell,
-        ResumedCodex,
-    }
-
-    /// A project, one agent, one live session (with a fixed, known hook
-    /// token so a test can address it via `LocalRequest::ProviderHook`
-    /// exactly like a real provider process would), and one task assigned
-    /// to that agent -- pending work for `compose_delivery` to find, so a
-    /// gate decline is distinguishable from "nothing to deliver anyway".
-    async fn setup(directory: &Path) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
-        setup_with_provider(directory, ProviderFixture::Shell).await
-    }
-
-    async fn setup_resumed_codex(
-        directory: &Path,
-    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
-        setup_with_provider(directory, ProviderFixture::ResumedCodex).await
-    }
-
-    async fn setup_with_provider(
-        directory: &Path,
-        provider_fixture: ProviderFixture,
-    ) -> (ApiState, execution::Handle, ProjectId, AgentId, TaskId) {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("curie").unwrap();
-        let task_id = TaskId::try_from("task-1").unwrap();
-        let provider = match provider_fixture {
-            ProviderFixture::Shell => Provider::Shell,
-            ProviderFixture::ResumedCodex => Provider::Codex,
-        };
-
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".to_owned(),
-                    root: directory.to_string_lossy().into_owned(),
-                },
-                1_000,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider,
-                },
-                1_000,
-            )
-            .unwrap();
-        if matches!(provider_fixture, ProviderFixture::ResumedCodex) {
-            let thread_id = "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d";
-            let (prior, _) = store
-                .create_session(
-                    NewSession {
-                        id: SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
-                        project_id: project_id.clone(),
-                        agent_id: agent_id.clone(),
-                        provider,
-                        runtime_model: None,
-                        runtime_reasoning_effort: None,
-                        runtime_permission_mode: None,
-                        runtime_control_mode: None,
-                        provider_session_id: Some(thread_id.into()),
-                        worktree: directory.to_string_lossy().into_owned(),
-                        codex_home: None,
-                        hook_token: "b".repeat(HOOK_TOKEN_LEN),
-                        runner_instance_id: RunnerInstanceId::try_from(
-                            "44444444-4444-4444-8444-444444444444",
-                        )
-                        .unwrap(),
-                        runner_runtime: directory.join("old").to_string_lossy().into_owned(),
-                        runner_protocol_version: 1,
-                    },
-                    999,
-                )
-                .unwrap();
-            store.end_session(&prior.id, Some(0), None, 999).unwrap();
-        }
-        store
-            .create_task(
-                NewTask {
-                    id: task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Do the thing".to_owned(),
-                    body: "Do the thing.".to_owned(),
-                    priority: 0,
-                },
-                1_000,
-            )
-            .unwrap();
-        let state = ApiState::new(store);
-        let (execution, join) = execution::spawn(config(directory), state.clone()).unwrap();
-        // These hook tests exercise request-local state transitions, not
-        // runner recovery. Stop the dispatcher while the store has no live
-        // session, then install the synthetic session. Otherwise startup
-        // recovery correctly ends that runner-less row and races token lookup.
-        execution.shutdown().await.unwrap();
-        join.await.unwrap().unwrap();
-        let session_project_id = project_id.clone();
-        let session_agent_id = agent_id.clone();
-        let session_task_id = task_id.clone();
-        let session_worktree = directory.to_string_lossy().into_owned();
-        let session_runtime = directory
-            .join("runs")
-            .join("session-1")
-            .to_string_lossy()
-            .into_owned();
-        state
-            .commit_and_publish(move |store| {
-                let (_, mut session_events) = store.create_session(
-                    NewSession {
-                        id: SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
-                        project_id: session_project_id.clone(),
-                        agent_id: session_agent_id.clone(),
-                        provider,
-                        runtime_model: None,
-                        runtime_reasoning_effort: None,
-                        runtime_permission_mode: None,
-                        runtime_control_mode: None,
-                        provider_session_id: matches!(
-                            provider_fixture,
-                            ProviderFixture::ResumedCodex
-                        )
-                        .then(|| "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".into()),
-                        worktree: session_worktree,
-                        codex_home: None,
-                        hook_token: "a".repeat(HOOK_TOKEN_LEN),
-                        runner_instance_id: RunnerInstanceId::try_from(
-                            "22222222-2222-4222-8222-222222222222",
-                        )
-                        .unwrap(),
-                        runner_runtime: session_runtime,
-                        runner_protocol_version: 1,
-                    },
-                    1_000,
-                )?;
-                let (_, task_event) = store.assign_task(
-                    &session_project_id,
-                    &session_task_id,
-                    Some(&session_agent_id),
-                    1_000,
-                )?;
-                session_events.push(task_event);
-                Ok(((), session_events))
-            })
-            .await
-            .unwrap();
-        (state, execution, project_id, agent_id, task_id)
-    }
-
-    /// An exact provider prompt is already past the filesystem-write
-    /// boundary. Even if that broad agent gate is held, nonce admission must
-    /// reach the store fence instead of replying `{}` while leaving recovery
-    /// free to win afterward. This deterministic ordering makes the hook win;
-    /// the sibling execution test covers recovery winning and blocking it.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exact_prompt_admission_bypasses_the_unrelated_agent_write_gate() {
-        let directory = private_tempdir();
-        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let text = format!("exact prompt\n{DELIVERY_ATTEMPT_MARKER}gate-race\u{2063}");
-        let marker = state
-            .with_store({
-                let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&task_id)
-            })
-            .await
-            .unwrap();
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let task_id = task_id.clone();
-                let text = text.clone();
-                move |store| {
-                    store.ensure_delivery_attempt(NewDeliveryAttempt {
-                        id: "gate-race".into(),
-                        project_id,
-                        agent_id,
-                        session_id,
-                        task_id: Some(task_id),
-                        task_incarnation_id: Some(marker.incarnation_id),
-                        task_revision: Some(marker.task_revision),
-                        require_queue_head: false,
-                        message_ids: Vec::new(),
-                        text,
-                        created_at_ms: 1_001,
-                    })?;
-                    Ok(((), Vec::new()))
-                }
-            })
-            .await
-            .unwrap();
-
-        let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
-        execution.begin_delete(&agent_id).await.unwrap();
-
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::UserPromptSubmit,
-                payload: serde_json::json!({"prompt": text}),
-            },
-        )
-        .await
-        .unwrap();
-        let LocalResponse::ProviderHookReply { reply } = response else {
-            panic!("unexpected response")
-        };
-        assert_eq!(reply, serde_json::json!({}));
-
-        let task = state
-            .with_store({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| store.get_task(&project_id, &task_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            task.snapshot.status,
-            TaskStatus::Running,
-            "the exact hook must win admission instead of failing open"
-        );
-        assert_eq!(
-            state
-                .with_store(|store| store.delivery_attempt_state("gate-race"))
-                .await
-                .unwrap(),
-            Some(DeliveryAttemptState::Acknowledged)
-        );
-
-        execution.end_delete(&agent_id);
-    }
-
-    /// The execution-layer sibling forces the narrower load-before-cancel /
-    /// commit-after-cancel message CAS. This request-level test places a
-    /// durable recovery commit as the barrier before the real provider hook,
-    /// proving the externally observable contract is an explicit block and
-    /// the inbox remains available to the fresh conversation.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn message_only_recovery_win_blocks_the_hook_and_preserves_the_inbox() {
-        let directory = private_tempdir();
-        let (state, execution, project_id, agent_id, task_id) =
-            setup_resumed_codex(directory.path()).await;
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let message_id = MessageId::try_from("recovery-message").unwrap();
-        let text =
-            format!("message only\n{DELIVERY_ATTEMPT_MARKER}message-recovery-attempt\u{2063}");
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let session_id = session_id.clone();
-                let task_id = task_id.clone();
-                let message_id = message_id.clone();
-                let text = text.clone();
-                move |store| {
-                    store.delete_task(&project_id, &task_id, 1_001)?;
-                    store.send_agent_message(NewAgentMessage {
-                        id: message_id.clone(),
-                        project_id: project_id.clone(),
-                        sender_agent_id: None,
-                        recipient_agent_id: agent_id.clone(),
-                        body: "message only".into(),
-                        created_at_ms: 1_002,
-                    })?;
-                    store.ensure_delivery_attempt(NewDeliveryAttempt {
-                        id: "message-recovery-attempt".into(),
-                        project_id: project_id.clone(),
-                        agent_id,
-                        session_id: session_id.clone(),
-                        task_id: None,
-                        task_incarnation_id: None,
-                        task_revision: None,
-                        require_queue_head: false,
-                        message_ids: vec![message_id],
-                        text,
-                        created_at_ms: 1_002,
-                    })?;
-                    let (_, event) = store.request_fresh_provider_recovery(
-                        &project_id,
-                        &session_id,
-                        "message-recovery-attempt",
-                        1_003,
-                    )?;
-                    Ok(((), event.into_iter().collect()))
-                }
-            })
-            .await
-            .unwrap();
-
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::UserPromptSubmit,
-                payload: serde_json::json!({"prompt": text}),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            response,
-            LocalResponse::ProviderHookReply { reply }
-                if reply == serde_json::json!({
-                    "decision": "block",
-                    "reason": "Dark Factory rejected this stale delivery"
-                })
-        ));
-
-        let (pending, attempt, runs) = state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                move |store| {
-                    Ok((
-                        store.undelivered_messages_for_agent(&project_id, &agent_id)?,
-                        store.delivery_attempt_state("message-recovery-attempt")?,
-                        store.list_runs(&project_id, None, 10)?,
-                    ))
-                }
-            })
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(attempt, Some(DeliveryAttemptState::Cancelled));
-        assert!(runs.is_empty());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn delayed_same_text_hook_cannot_commit_a_recreated_task_attempt() {
-        let directory = private_tempdir();
-        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
-        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
-        let visible_text = "same prompt";
-        let old_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-a\u{2063}");
-        let old_attempt_text = old_text.clone();
-        let old_marker = state
-            .with_store({
-                let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&task_id)
-            })
-            .await
-            .unwrap();
-
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let session_id = session_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    store.ensure_delivery_attempt(NewDeliveryAttempt {
-                        id: "attempt-a".to_owned(),
-                        project_id,
-                        agent_id,
-                        session_id,
-                        task_id: Some(task_id),
-                        task_incarnation_id: Some(old_marker.incarnation_id),
-                        task_revision: Some(old_marker.task_revision),
-                        require_queue_head: false,
-                        message_ids: Vec::new(),
-                        text: old_attempt_text,
-                        created_at_ms: 1_001,
-                    })?;
-                    Ok(((), Vec::new()))
-                }
-            })
-            .await
-            .unwrap();
-
-        // Delete/recreate the same operator-facing id. Deletion cancels A;
-        // B has the same visible prompt but a different immutable attempt
-        // nonce and task incarnation.
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    store.delete_task(&project_id, &task_id, 1_002)?;
-                    store.create_task(
-                        NewTask {
-                            id: task_id.clone(),
-                            project_id: project_id.clone(),
-                            parent_task_id: None,
-                            title: "Replacement".to_owned(),
-                            body: visible_text.to_owned(),
-                            priority: 0,
-                        },
-                        1_003,
-                    )?;
-                    store.assign_task(&project_id, &task_id, Some(&agent_id), 1_004)?;
-                    Ok(((), Vec::new()))
-                }
-            })
-            .await
-            .unwrap();
-        let marker = state
-            .with_store({
-                let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&task_id)
-            })
-            .await
-            .unwrap();
-        let new_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-b\u{2063}");
-        state
-            .commit_and_publish({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                let session_id = session_id.clone();
-                let task_id = task_id.clone();
-                move |store| {
-                    store.ensure_delivery_attempt(NewDeliveryAttempt {
-                        id: "attempt-b".to_owned(),
-                        project_id,
-                        agent_id,
-                        session_id,
-                        task_id: Some(task_id),
-                        task_incarnation_id: Some(marker.incarnation_id),
-                        task_revision: Some(marker.task_revision),
-                        require_queue_head: false,
-                        message_ids: Vec::new(),
-                        text: new_text,
-                        created_at_ms: 1_005,
-                    })?;
-                    Ok(((), Vec::new()))
-                }
-            })
-            .await
-            .unwrap();
-
-        let _delivery_slot = state.try_delivery_slot(&agent_id).unwrap();
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::UserPromptSubmit,
-                payload: serde_json::json!({"prompt": old_text}),
-            },
-        )
-        .await;
-        assert!(response.is_ok());
-        let task = state
-            .with_store({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| store.get_task(&project_id, &task_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(task.snapshot.status, TaskStatus::Queued);
-        assert_eq!(
-            state
-                .with_store(|store| store.delivery_attempt_state("attempt-b"))
-                .await
-                .unwrap(),
-            Some(DeliveryAttemptState::InFlight)
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pre_tool_use_denial_is_returned_and_durably_audited() {
-        let directory = private_tempdir();
-        let (state, execution, ..) = setup(directory.path()).await;
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::PreToolUse,
-                payload: serde_json::json!({"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}),
-            },
-        ).await.unwrap();
-        let LocalResponse::ProviderHookReply { reply } = response else {
-            panic!("unexpected response")
-        };
-        assert_eq!(reply["hookSpecificOutput"]["permissionDecision"], "deny");
-        let events = state
-            .with_store(|store| store.events_after(0, 100))
-            .await
-            .unwrap();
-        assert!(events.iter().any(|event| matches!(
-            &event.event,
-            FactoryEvent::PolicyDecision { decision, rule: Some(rule), .. }
-                if decision == "deny" && rule == "destructive_git"
-        )));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn exhausted_budget_denies_hook_and_reset_reopens_it() {
-        let directory = private_tempdir();
-        let (state, execution, project_id, agent_id, _) = setup(directory.path()).await;
-        handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::SetAgentBudget {
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                max_tool_calls: Some(1),
-            },
-        )
-        .await
-        .unwrap();
-        let hook = || LocalRequest::ProviderHook {
-            token: "a".repeat(HOOK_TOKEN_LEN),
-            event: ProviderHookEvent::PreToolUse,
-            payload: serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"README.md"}}),
-        };
-        let first = handle_request(&state, &execution, directory.path(), hook())
-            .await
-            .unwrap();
-        assert!(
-            matches!(first, LocalResponse::ProviderHookReply { ref reply } if *reply == serde_json::json!({}))
-        );
-        let second = handle_request(&state, &execution, directory.path(), hook())
-            .await
-            .unwrap();
-        assert_eq!(
-            match second {
-                LocalResponse::ProviderHookReply { reply } =>
-                    reply["hookSpecificOutput"]["permissionDecision"].clone(),
-                _ => unreachable!(),
-            },
-            "deny"
-        );
-        let status = state
-            .with_store({
-                let project_id = project_id.clone();
-                let agent_id = agent_id.clone();
-                move |store| store.agent_status(&project_id, &agent_id)
-            })
-            .await
-            .unwrap();
-        assert!(status.budget.exhausted && status.agent.paused);
-        let resume = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ResumeAgent {
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-            },
-        )
-        .await;
-        assert!(matches!(
-            resume,
-            Err(ApiFailure::Store(StoreError::AgentBudgetExhausted))
-        ));
-        let stopped = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::Stop,
-                payload: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            stopped,
-            LocalResponse::ProviderHookReply { ref reply }
-                if *reply == serde_json::json!({})
-        ));
-        handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ResetAgentBudget {
-                project_id,
-                agent_id,
-            },
-        )
-        .await
-        .unwrap();
-        let third = handle_request(&state, &execution, directory.path(), hook())
-            .await
-            .unwrap();
-        assert!(
-            matches!(third, LocalResponse::ProviderHookReply { ref reply } if *reply == serde_json::json!({}))
-        );
-    }
-
-    /// `stop_hook_reply`'s gated call site (`Stop`/`SubagentStop`): with
-    /// `curie` marked deleting, a `Stop` hook -- with a task assigned and
-    /// waiting, and the delivery slot free so `stop_hook_reply` could
-    /// otherwise claim it -- must reply `{}` (nothing to deliver, from
-    /// this hook's point of view) rather than block-replying the pending
-    /// task, and must not open its run episode either. Verified by
-    /// mutation the same way as the `UserPromptSubmit` test above.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stop_hook_reply_declines_while_the_agent_is_deleting() {
-        let directory = private_tempdir();
-        let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
-
-        execution.begin_delete(&agent_id).await.unwrap();
-
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
-                event: ProviderHookEvent::Stop,
-                payload: serde_json::json!({}),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(
-                &response,
-                LocalResponse::ProviderHookReply { reply } if *reply == serde_json::json!({})
-            ),
-            "a declined gate must reply {{}} even with pending work, got {response:?}"
-        );
-
-        let task = state
-            .with_store({
-                let project_id = project_id.clone();
-                let task_id = task_id.clone();
-                move |store| store.get_task(&project_id, &task_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            task.snapshot.status,
-            TaskStatus::Queued,
-            "no run episode must open for a deleting agent's Stop hook"
-        );
-
-        execution.end_delete(&agent_id);
-    }
-
-    #[tokio::test]
-    async fn repository_api_binds_live_tokens_and_redacts_audit_content() {
-        use std::process::Command;
-        fn git(cwd: &Path, args: &[&str]) {
-            assert!(
-                Command::new("git")
-                    .current_dir(cwd)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-        }
-        let directory = private_tempdir();
-        let repo = directory.path().join("repo");
-        let remote = directory.path().join("remote.git");
-        let work_a = directory.path().join("a");
-        let work_b = directory.path().join("b");
-        git(
-            directory.path(),
-            &["init", "--bare", remote.to_str().unwrap()],
-        );
-        git(
-            directory.path(),
-            &["init", "-b", "main", repo.to_str().unwrap()],
-        );
-        git(&repo, &["config", "user.name", "Test"]);
-        git(&repo, &["config", "user.email", "test@example.invalid"]);
-        std::fs::write(repo.join("README"), "initial\n").unwrap();
-        git(&repo, &["add", "README"]);
-        git(&repo, &["commit", "-m", "initial"]);
-        git(
-            &repo,
-            &["worktree", "add", "-b", "agent/a", work_a.to_str().unwrap()],
-        );
-        git(
-            &repo,
-            &["worktree", "add", "-b", "agent/b", work_b.to_str().unwrap()],
-        );
-        let project_id = ProjectId::try_from("project").unwrap();
-        let mut store = Store::open_in_memory().unwrap();
-        store
-            .create_project(
-                NewProject {
-                    id: project_id.clone(),
-                    name: "Project".into(),
-                    root: repo.to_string_lossy().into_owned(),
-                },
-                1,
-            )
-            .unwrap();
-        let unconfigured_project_id = ProjectId::try_from("unconfigured-project").unwrap();
-        let unconfigured_root = directory.path().join("unconfigured-repo");
-        std::fs::create_dir(&unconfigured_root).unwrap();
-        store
-            .create_project(
-                NewProject {
-                    id: unconfigured_project_id.clone(),
-                    name: "Unconfigured project".into(),
-                    root: unconfigured_root.to_string_lossy().into_owned(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .set_repository_authority(
-                &project_id,
-                &crate::store::RepositoryAuthority {
-                    remote_url: remote.to_string_lossy().into_owned(),
-                    base_branch: "main".into(),
-                },
-                2,
-            )
-            .unwrap();
-        assert!(
-            store
-                .set_repository_authority(
-                    &project_id,
-                    &crate::store::RepositoryAuthority {
-                        remote_url: "https://github.com/attacker/retarget.git".into(),
-                        base_branch: "attacker".into(),
-                    },
-                    3,
-                )
-                .is_err(),
-            "repository authority must be write-once"
-        );
-        for (name, worktree, token, session) in [
-            ("a", &work_a, "a".repeat(64), "session-a"),
-            ("b", &work_b, "b".repeat(64), "session-b"),
-            ("stale", &work_a, "c".repeat(64), "session-stale"),
-        ] {
-            let agent_id = AgentId::try_from(name).unwrap();
-            store
-                .create_agent(
-                    NewAgent {
-                        id: agent_id.clone(),
-                        project_id: project_id.clone(),
-                        parent_agent_id: None,
-                        role: AgentRole::Worker,
-                        provider: Provider::Shell,
-                    },
-                    3,
-                )
-                .unwrap();
-            store
-                .create_session(
-                    NewSession {
-                        id: SessionId::try_from(session).unwrap(),
-                        project_id: project_id.clone(),
-                        agent_id,
-                        provider: Provider::Shell,
-                        runtime_model: None,
-                        runtime_reasoning_effort: None,
-                        runtime_permission_mode: None,
-                        runtime_control_mode: None,
-                        provider_session_id: None,
-                        worktree: worktree.to_string_lossy().into_owned(),
-                        codex_home: None,
-                        hook_token: token,
-                        runner_instance_id: RunnerInstanceId::try_from(format!("runner-{name}"))
-                            .unwrap(),
-                        runner_runtime: format!("/tmp/runner-{name}"),
-                        runner_protocol_version: 1,
-                    },
-                    4,
-                )
-                .unwrap();
-        }
-        store
-            .end_session(
-                &SessionId::try_from("session-stale").unwrap(),
-                Some(0),
-                None,
-                5,
-            )
-            .unwrap();
-        assert!(
-            matches!(
-                store.set_repository_authority(
-                    &unconfigured_project_id,
-                    &crate::store::RepositoryAuthority {
-                        remote_url: "https://github.com/attacker/poison.git".into(),
-                        base_branch: "main".into(),
-                    },
-                    6,
-                ),
-                Err(crate::store::StoreError::RepositoryAuthorityRequiresIdleProject)
-            ),
-            "a live session in project A must block first-write poisoning of project B"
-        );
-        let state = ApiState::new(store);
-        let secret = "PRIVATE_COMMIT_MESSAGE_SENTINEL";
-        std::fs::write(work_a.join("a.txt"), "PRIVATE_DIFF_SENTINEL\n").unwrap();
-        let response = repository_request(
-            &state,
-            "a".repeat(64),
-            RepositoryRequest::Commit {
-                message: secret.into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            matches!(response, LocalResponse::GitOutput { ref operation, .. } if operation == "git_commit")
-        );
-        assert!(matches!(
-            repository_request(&state, "c".repeat(64), RepositoryRequest::Status).await,
-            Err(ApiFailure::Unauthorized(_))
-        ));
-        std::fs::write(work_b.join("b.txt"), "b\n").unwrap();
-        repository_request(
-            &state,
-            "b".repeat(64),
-            RepositoryRequest::Commit {
-                message: "B commit".into(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(
-            !work_a.join("b.txt").exists(),
-            "agent B token crossed into agent A worktree"
-        );
-        let events = state
-            .with_store(|store| store.events_after(0, 100))
-            .await
-            .unwrap();
-        let json = serde_json::to_string(&events).unwrap();
-        assert!(!json.contains(secret));
-        assert!(!json.contains("PRIVATE_DIFF_SENTINEL"));
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event.event, FactoryEvent::RepositoryOperation { .. }))
-                .count(),
-            4
-        );
-    }
 }

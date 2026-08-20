@@ -1,9 +1,19 @@
 # External integrations
 
+> **Quarantined during the safe-kernel refactor.** Do not enable this listener
+> or feed work into a refactor build. The transport remains documented for
+> compatibility, but external intake cannot become executable work until all
+> three kernel stages and the independent boot review pass.
+
 Dark Factory accepts provider-neutral events on a loopback HTTP listener. An
 external monitor, backlog feeder, or recovery tool can create queued tasks or
 send durable agent messages. These writes use the same store and event ledger
 as `factoryctl`.
+
+Acceptance is not admission. A webhook credential authenticates the sending
+endpoint and request bytes; it grants no attempt, process, source, or mutation
+authority. Any future intake path must remain quarantined until `factoryd`
+admits an exact task incarnation under the normal kernel rules.
 
 Configure one `generic_v1` endpoint in the owner-only
 `$DARK_FACTORY_HOME/webhooks.json` file:

@@ -2,166 +2,150 @@
 
 ## Reporting a vulnerability
 
-Please report privately through GitHub's private vulnerability reporting:
-<https://github.com/baziyer/dark-factory/security/advisories/new>. Do not
-open a public issue for anything that could let a session, a local process,
-or a network peer do more than this document says it can.
+Use [GitHub private vulnerability
+reporting](https://github.com/baziyer/dark-factory/security/advisories/new).
+Do not open a public issue for a capability, credential, process-ownership, or
+network-boundary failure.
 
-This is a one-maintainer project. Expect an acknowledgement within seven
-days and a fix or a documented decision as soon as one is possible; the
-advisory is where that conversation happens.
+Dark Factory is pre-1.0. Only current `main` and the latest release receive
+security fixes.
 
-## Supported versions
+## Current freeze
 
-Pre-1.0: only the current `main` (and the latest tagged release, once
-releases exist) receives fixes.
+The safe-kernel refactor is not a live release. Do not install or start this
+revision, enable auto mode, submit provider work, expose webhook intake, or use
+the operator's `~/.dark-factory`. Stage 1 deliberately cannot admit workers;
+Stages 2 and 3 and an independent boot review remain required.
 
-## What Dark Factory promises
+## Threat model
 
-Dark Factory is a **local, single-operator** runtime. Its security boundary
-is the operating-system user it runs as; it does not try to protect the
-operator from their own agents. Concretely:
+Dark Factory is a local, single-operator application. Provider processes run as
+the operator and use the operator's Claude/Codex subscription. The current
+kernel prevents confused or cooperative providers from acting outside an exact
+attempt; it does **not** isolate a hostile same-user process from readable
+files, credentials, other processes, or the local socket. That claim requires
+a separate OS user, container, or sandbox.
 
-- **No public network listener.** The control plane is a private Unix
-  socket (`0600`, parent directory `0700`, owned by the current user; custom
-  paths are refused otherwise). The only HTTP listener is the optional
-  loopback webhook (`127.0.0.1`, one configured endpoint, secret from an
-  owner-only file); exposing it beyond the machine is deliberately external.
-- **Provider processes run as you, with your subscriptions.** A `claude` or
-  `codex` session is your CLI, authenticated the way your shell's is, in a
-  git worktree the daemon created. Whatever that CLI can do on your machine,
-  a session can ask it to do. Auto mode is on by default: Claude bypasses
-  permissions and Codex bypasses approvals and its sandbox. These processes
-  can read, modify, execute, delete, and transmit anything accessible to
-  the operator's OS user, including credentials. `factoryctl auto off`
-  changes the default for future sessions; an explicit agent profile
-  permission mode wins for that agent.
-- **Remote repository writes use a narrower daemon capability.** Sessions do
-  not inherit token variables or `SSH_AUTH_SOCK`; their environment also
-  resets Git credential helpers, disables Git SSH and prompts, and hides the
-  operator's `gh` configuration. `factoryctl git status|diff|commit|push` and
-  `factoryctl pr open|update` authenticate the live session token and let the
-  daemon operate only on that session's exact worktree and `agent/<id>` ref.
-  Callers cannot provide a path, remote, refspec, force/delete flag, or PR
-  head. Request/result events omit diffs, commit/PR prose, and credentials;
-  merge and release remain external-reviewer/operator actions. This reduces
-  accidentally delegated authority, but is not OS isolation: a process
-  already running as the operator can still search filesystem-readable
-  credentials or evade environment policy. The optional hardened agent
-  runner in #125 is the planned outer security boundary.
-  The operator first pins each project's canonical remote and PR base in the
-  durable store, before any agent session exists; later first-writer or
-  retarget attempts are rejected. Privileged Git pins the linked-worktree
-  gitdir and common-dir path and inode, and runs with empty global/system config and a
-  daemon-created temporary gitdir/index; repository hooks, clean filters,
-  fsmonitor, credential/SSH helpers, external diff drivers, URL rewrites, and
-  non-allowlisted protocols are inert. GitHub credentials travel only through
-  the canonical, non-writable `gh` credential helper's pipe, never a child
-  environment or process argument. Commit publication is a compare-and-
-  swap against the validated HEAD. Output is streamed into a hard bound; a
-  timeout, overflow, or retained descendant pipe kills and reaps the entire
-  command process group.
-- **The hook policy is a tripwire, not a sandbox.** Every ordinary provider
-  tool call reaches an authenticated `PreToolUse` hook. The daemon denies
-  recognizable `factoryctl capacity set`, force-push, pushed-ref deletion,
-  branch-delete, and reset-hard commands. It permits
-  `rm -rf` only when every literal normalized target is inside the agent
-  worktree; changed cwd and compound destructive deletion are denied. It
-  also denies direct structured file-tool access, recognized file commands,
-  and redirections involving
-  named secret paths (`.ssh`, `.aws`, `.gnupg`, `.env`, Codex `auth.json`,
-  credentials, and gcloud config). Bash commands use an intentionally small
-  accepted grammar: simple commands, assignments, `env`/`command`/`builtin`/
-  `exec` and plain `sudo` wrappers, quotes and backslash escapes, separators,
-  pipelines, syntactic redirections, and heredocs. Quoted metacharacters are
-  ordinary arguments, not shell operators. Quoted heredoc bodies are literal;
-  unquoted bodies are accepted only without expansion characters. Variable
-  and command substitution, backticks, process substitution, globs,
-  malformed quoting/redirection, and wrapper options whose operands are
-  ambiguous deny the whole tool call as `unsupported_shell_syntax`. Auto
-  mode remains on by default because ordinary GitHub review/comment commands
-  fit this grammar (including quoted bodies and quoted heredocs); a denied
-  command must be rewritten into the accepted form or run with auto mode off.
-  The hook fails closed if the daemon cannot answer and records each decision
-  as an append-only event. This narrow parser is still not a sandbox:
-  interpreters, generated scripts, MCP tools, provider bugs, or direct
-  syscalls can evade a string-level hook policy; it does not protect the
-  operator from a malicious agent. Worktrees provide collision isolation,
-  not filesystem or credential isolation. A separate OS user remains the
-  planned outer boundary (#125). CI runner isolation is a separate boundary
-  tracked in #54.
-- **Budgets are a tool-call circuit breaker, not monetary accounting.** Each
-  agent defaults to 1,000 authenticated `PreToolUse` calls per reset. The
-  daemon durably counts observations, pauses delivery and denies subsequent
-  calls at exhaustion, and requires an explicit reset (changing the limit
-  alone never reopens an exhausted circuit). The
-  shipped provider hook protocols do not report trustworthy per-agent token,
-  subscription, or currency spend, so those values are unavailable rather
-  than estimated. Calls that bypass hooks also bypass this limit; provider
-  billing controls remain the actual monetary boundary.
-  Ordinary pause and budget exhaustion are separate durable holds, and both
-  spawn and delivery consult exhaustion directly rather than trusting a
-  shared or cached pause projection.
-- **Hooks and repository requests are authenticated; the rest is your user.** A provider's hook
-  invocations identify their session by a per-session random token in a
-  `0600` file (never on argv or in the environment). An agent's own `task
-  done`/`task blocked`/`agent message` calls, and every operator command,
-  are plain local-API requests: whoever can open the socket — any process
-  running as you, including every session — can make them, naming any
-  agent. Repository commands are the exception: they authenticate that same
-  live-session bearer token and infer their target identity from it.
-  Per-session authentication of the remaining calls is planned (roles and a
-  review queue), not present. The daemon spawns runners with a fixed
-  non-secret environment allowlist, not its own ambient environment.
-- **Bounded inputs everywhere.** Guidance files, hook payloads, local-API
-  frames, retained terminal logs, and webhook bodies all have hard size
-  caps; raw provider output never enters public events, webhook responses,
-  or tracing.
-- **The daemon writes only into what it owns** — `$DARK_FACTORY_HOME` —
-  plus three documented, minimal writes elsewhere: a worktree pre-trust
-  entry in `~/.claude.json` (only if it already exists and parses); a
-  filtered copy of your `~/.codex/config.toml` into a per-agent
-  `CODEX_HOME` (with `auth.json` symlinked, never copied); and, in each
-  project's own git repository, `git worktree add -b agent/<id>` per agent
-  (the worktree and its `.git/worktrees/<id>` metadata go when the agent
-  is deleted; the `agent/<id>` branch stays in your repository). A project
-  whose root is not a git repository has its sessions run directly in that
-  root.
+The local API is a private Unix socket with owner-only directory/socket modes.
+The optional webhook listener binds to loopback and uses an owner-only HMAC
+secret. Exposing either boundary beyond the machine is external deployment
+work and is unsupported.
 
-## Out of scope
+## Principals and capabilities
 
-- An agent evading the hook tripwire or doing something harmful with the
-  operator-level access auto mode intentionally grants it.
-- Vulnerabilities in `claude`, `codex`, or the models behind them.
-- Anything requiring the attacker to already run code as your user.
+Every request carries a versioned envelope and is resolved once as one of:
 
-## For contributors
+- **Anonymous**: health only.
+- **Operator**: authenticated by the private operator credential. Operator
+  commands administer durable state but cannot impersonate an attempt for
+  completion, blocking, hooks, or repository writes.
+- **Attempt**: authenticated by a random bearer stored in a private per-run
+  file. The store derives exact project, agent, task, run, role, provider, and
+  Change scope. The bearer works only while that run is `running`.
 
-By default, `.github/workflows/ci.yml`'s `checks` job runs pull request
-code on an ephemeral, GitHub-hosted macOS runner, not the maintainer's
-persistent Mac — but only for a PR that leaves `runs-on` unmodified,
-because a PR's `checks` run uses the workflow file *the PR itself
-carries*. A fork's workflow run additionally needs the maintainer's
-approval before it runs at all, and approval — not the runner choice — is
-the real gate: the maintainer reads `.github/workflows/` in the fork's
-diff before approving it, because an approved fork run that edited
-`runs-on` does execute on the persistent Mac (self-hosted runners accept
-any job matching their label, from any workflow or branch). A
-same-repository branch — including an agent's own generated PR, before
-any review — gets no approval gate at all and can route itself to the
-persistent Mac the same way; only the maintainer's own GitHub account can
-push one, and `workflow_dispatch` is the same trust level again (any
-write-access collaborator can already run `checks` against any ref
-manually). So this boundary keeps the *default and accidental* path onto
-the persistent Mac closed, not a *determined* one from an account that
-already has push and daemon access there — the actual backstop for a
-same-repository PR is that a green `checks` run never authorizes a merge
-by itself (`docs/development/WORKFLOW.md`'s `main-review` ruleset still
-requires CODEOWNERS approval). Isolating the persistent runner itself
-from the operator's own account is the remaining hardening and is not
-done yet: [issue #54](https://github.com/baziyer/dark-factory/issues/54).
-Full enumeration of every route: `docs/development/WORKFLOW.md`, "CI and
-GitHub". A change to any of this is a security change and gets reviewed
-as one. AGENTS.md's adversarial review explicitly includes "security:
-nothing widens what an agent session, a webhook caller, or an untrusted
-PR can reach".
+Missing credentials never imply operator access. Bearers are redacted from
+debug/display output and are not accepted in argv, environment variables,
+events, logs, webhook payloads, or caller-selected identity fields. The first
+transition to `finalizing` revokes attempt mutation authority atomically. Old,
+forged, cross-project, taskless, and terminal credentials fail closed.
+
+The provider environment contains `DARK_FACTORY_ATTEMPT_TOKEN_FILE`, which is
+only the path to the private bearer file, not the bearer itself. When it is
+present, `factoryctl` uses that attempt credential for every local-API request.
+An operator-shaped command invoked by a provider is therefore authorized as the
+attempt and rejected if outside its allowlist; it never falls back to
+`operator.token`.
+
+God/orchestrator credentials grant scheduling policy only. They cannot create
+source paths, launch or finalize processes, change capacity or agents, publish
+repositories, or submit another run's outcome.
+
+## Process and cleanup safety
+
+Before provider execution, `factoryd` durably records the admitted run and its
+resources. `factory-runner` prepares a child blocked before `exec`, reports its
+PID and process group, and waits. Only after the daemon records those exact
+identities and transitions the run to `running` may the child execute.
+
+Success, block, failure, cancellation, and exit converge through
+`finalizing`. A restartable daemon finalizer is the only writer of `terminal`.
+It matches exact resource identities before signalling, deleting, or
+acknowledging them. Reused PIDs, paths, runner identities, and job labels are
+reported as unresolved rather than touched.
+
+Rust `Drop`, shell traps, provider exit handlers, and test harnesses may perform
+fast cleanup but are not trusted for correctness. A run remains visibly
+`finalizing` while any ephemeral resource is active or unresolved.
+
+## Provider and tool boundary
+
+Each admitted run gets one fresh non-interactive provider process and one
+startup input. There are no taskless resident processes, PTY attach/input,
+delivery replay, provider resume, or session outboxes.
+
+Provider hooks are authenticated observations and bounded requests.
+`PreToolUse` applies the durable tool-call budget and a conservative command
+tripwire. The tripwire denies recognized destructive or credential-sensitive
+commands and unsupported shell syntax. It is not a sandbox: interpreters,
+generated programs, MCP tools, provider defects, and direct syscalls can evade
+string inspection.
+
+Auto mode can remove a provider's own approval prompts and therefore increases
+risk within the same-user boundary. It never bypasses daemon authentication,
+attempt scope, run phase, or finalization rules.
+
+Provider output remains opaque and bounded. It never becomes lifecycle
+authority and does not enter public events, webhook responses, or tracing.
+
+## Source and repository boundary
+
+Stage 1 has no production Change allocator, so worker admission fails closed.
+Legacy worktrees are retained without inspection or automatic adoption.
+
+Stage 2 must make `factoryd` the only supported creator and administrator of
+Change worktrees. Providers will receive a leased source view with no Git
+administrative locator. Daemon repository operations will infer the exact
+Change and branch from the running attempt; callers will not provide paths,
+remotes, refspecs, force/delete flags, or PR heads. Review and merge remain
+independent operator actions.
+
+This repository scoping reduces accidental delegation but is still not OS
+isolation from a hostile same-user process.
+
+## Build and storage boundary
+
+The complete boot contract requires Stage 3 to build through a bounded
+project/configuration cache and execute immutable prepared bundles verified by
+digest. Mutable Cargo sibling discovery and one target per worktree are not
+secure or bounded execution paths. Resource reclamation may remove only exact,
+registered, unleased regenerable data; unique retained Changes are never
+automatic cleanup targets.
+
+## Bounded inputs and durable data
+
+Local frames, hook payloads, webhook bodies, guidance, messages, events, logs,
+and generated configuration have hard size limits. SQLite uses durable
+transactions for authority. Guidance and memory files are bounded content, not
+an authority ledger.
+
+Provider credentials, repository credentials, prompts, raw output, message
+bodies, and source content do not belong in public events or diagnostic
+projections.
+
+## Contributor and CI boundary
+
+Tests use a temporary `DARK_FACTORY_HOME`, explicit private socket, disposable
+resource labels, and independent cleanup verification. They never inspect or
+mutate the installed job or operator home and never send paid provider prompts
+unless the task explicitly requires live validation.
+
+A pull request can modify its own workflow, including `runs-on`. Maintainers
+must inspect `.github/workflows/` before approving external CI. A green check
+alone never authorizes merge: protected `main` also requires independent
+CODEOWNERS review and resolved threads. Persistent CI runner isolation remains
+a separate hardening concern.
+
+Every security-sensitive PR receives an adversarial review that explicitly
+tries stale credentials, cross-attempt identity, crash boundaries, resource
+reuse, unauthorized source/repository selection, and accidental expansion of
+the same-user claim.

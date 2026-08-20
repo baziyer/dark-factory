@@ -1,4 +1,4 @@
-//! Per-session hook authentication token, and the small filesystem helpers
+//! Per-attempt hook authentication token and the small filesystem helpers
 //! shared by every provider's generated configuration
 //! (`claude-settings.json`, Codex's seeded `config.toml`).
 //!
@@ -13,6 +13,7 @@
 
 use std::{
     fs, io,
+    io::{Read, Write},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -21,9 +22,7 @@ use uuid::Uuid;
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 const PRIVATE_FILE_MODE: u32 = 0o600;
-/// 32 random bytes, hex-encoded to 64 characters — matches `sessions
-/// .hook_token`'s `CHECK (length(hook_token) = 64 AND hook_token GLOB
-/// '[0-9a-f]*')` constraint.
+/// 32 random bytes, hex-encoded to 64 characters.
 const HOOK_TOKEN_BYTES: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
@@ -35,12 +34,14 @@ pub enum HookTokenError {
     Random(String),
     #[error("cannot write hook token file {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
+    #[error("invalid operator token file {path}: {reason}")]
+    Invalid { path: PathBuf, reason: String },
 }
 
 /// Generates a fresh 32-byte (64 lowercase hex character) hook token and
 /// writes it to `path` at mode `0600`, creating the parent directory (mode
 /// `0700`) if needed. Returns the token so the caller can also persist it as
-/// `sessions.hook_token` for the daemon's own side of the comparison.
+/// the attempt principal for the daemon's side of the comparison.
 ///
 /// # Errors
 ///
@@ -53,6 +54,133 @@ pub fn write_hook_token(path: &Path) -> Result<String, HookTokenError> {
         source,
     })?;
     Ok(token)
+}
+
+/// Reads the existing operator credential or creates it exactly once.
+/// Existing files must be regular files owned by this process's user, mode
+/// `0600`, and contain exactly one 64-character lowercase hexadecimal token.
+/// Symlinks and malformed or broadly-readable files fail closed.
+///
+/// # Errors
+///
+/// Returns [`HookTokenError::Random`] when token generation fails,
+/// [`HookTokenError::Io`] for filesystem errors, or
+/// [`HookTokenError::Invalid`] when an existing file is not private and
+/// canonical.
+pub fn read_or_create_operator_token(path: &Path) -> Result<String, HookTokenError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    ensure_private_dir(parent).map_err(|source| HookTokenError::Io {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+
+    match open_operator_token(path) {
+        Ok(file) => read_operator_token(path, file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let token = random_hex().map_err(|error| HookTokenError::Random(error.to_string()))?;
+            let created = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(nofollow_flag())
+                .open(path);
+            match created {
+                Ok(mut file) => {
+                    file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+                        .and_then(|()| file.write_all(token.as_bytes()))
+                        .and_then(|()| file.sync_all())
+                        .map_err(|source| HookTokenError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                    validate_operator_token_file(path, &file, &token)?;
+                    Ok(token)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let file = open_operator_token(path).map_err(|source| HookTokenError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    })?;
+                    read_operator_token(path, file)
+                }
+                Err(source) => Err(HookTokenError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }),
+            }
+        }
+        Err(source) => Err(HookTokenError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn open_operator_token(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(operator_read_flags())
+        .open(path)
+}
+
+fn read_operator_token(path: &Path, mut file: fs::File) -> Result<String, HookTokenError> {
+    validate_operator_token_metadata(path, &file)?;
+    let mut token = String::new();
+    file.read_to_string(&mut token)
+        .map_err(|source| HookTokenError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_operator_token_file(path, &file, &token)?;
+    Ok(token)
+}
+
+fn validate_operator_token_file(
+    path: &Path,
+    file: &fs::File,
+    token: &str,
+) -> Result<(), HookTokenError> {
+    validate_operator_token_metadata(path, file)?;
+    let valid_token = token.len() == HOOK_TOKEN_BYTES * 2
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    let reason = if !valid_token {
+        Some("content is not 64 lowercase hexadecimal characters")
+    } else {
+        None
+    };
+    reason.map_or(Ok(()), |reason| {
+        Err(HookTokenError::Invalid {
+            path: path.to_path_buf(),
+            reason: reason.to_owned(),
+        })
+    })
+}
+
+fn validate_operator_token_metadata(path: &Path, file: &fs::File) -> Result<(), HookTokenError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata().map_err(|source| HookTokenError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let reason = if !metadata.is_file() {
+        Some("not a regular file")
+    } else if metadata.uid() != rustix::process::geteuid().as_raw() {
+        Some("not owned by the daemon user")
+    } else if metadata.mode() & 0o777 != PRIVATE_FILE_MODE {
+        Some("mode is not 0600")
+    } else {
+        None
+    };
+    reason.map_or(Ok(()), |reason| {
+        Err(HookTokenError::Invalid {
+            path: path.to_path_buf(),
+            reason: reason.to_owned(),
+        })
+    })
 }
 
 fn random_hex() -> Result<String, getrandom::Error> {
@@ -79,20 +207,6 @@ fn random_hex() -> Result<String, getrandom::Error> {
 /// write failure; nothing is ever left partially written at `path` itself,
 /// since the final step is a single rename.
 pub fn write_private_file(path: &Path, contents: &[u8]) -> io::Result<()> {
-    write_file_with_mode(path, contents, PRIVATE_FILE_MODE)
-}
-
-/// Same atomic temp-file-plus-rename write as [`write_private_file`], but
-/// with an explicit file `mode` instead of the fixed `0600` private-file
-/// default. Used by [`crate::providers::claude::pretrust_worktree`] to
-/// rewrite the operator's real `~/.claude.json` in place without silently
-/// tightening its existing permissions -- that file is not a Dark Factory
-/// generated artifact, unlike every other caller of [`write_private_file`].
-///
-/// # Errors
-///
-/// See [`write_private_file`].
-pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     ensure_private_dir(parent)?;
     let temp_path = parent.join(format!(
@@ -107,15 +221,14 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
         let mut file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(mode)
+            .mode(PRIVATE_FILE_MODE)
             .custom_flags(nofollow_flag())
             .open(&temp_path)?;
         // `OpenOptions::mode` is filtered by the process umask when the
         // temporary file is created. Apply the explicit mode to the open
         // file afterward so callers that are preserving an existing file's
-        // permissions do not silently tighten them under a restrictive
-        // daemon umask. Private-file callers still pass `0600` here.
-        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        // permissions are exactly private under any daemon umask.
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
         file.write_all(contents)?;
         file.sync_all()
     })();
@@ -130,7 +243,7 @@ pub fn write_file_with_mode(path: &Path, contents: &[u8], mode: u32) -> io::Resu
 /// (recursively) if missing. Errors if `path` exists but is a symlink or a
 /// non-directory. Shared by [`write_private_file`]'s parent-directory
 /// handling and by providers that need a directory to exist before writing
-/// more than one file into it (e.g. Codex's per-agent `codex-home`).
+/// more than one file into it (e.g. an attempt's Codex home).
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -154,6 +267,10 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
 /// only drop the `NOFOLLOW` protection, never corrupt a write.
 fn nofollow_flag() -> i32 {
     i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).unwrap_or(0)
+}
+
+fn operator_read_flags() -> i32 {
+    i32::try_from((rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits()).unwrap_or(0)
 }
 
 /// Single-quotes `value` for safe inclusion in a POSIX shell command line
@@ -195,24 +312,6 @@ pub fn hook_command(
     )
 }
 
-/// The nine hook events Dark Factory wires into every generated provider
-/// configuration, in the order the daemon's state machine reasons about
-/// them (see `TRACK5-DESIGN.md` sections 2 and 3): boot, delivery
-/// acknowledgement, tool activity (start/finish), idle-wait, turn-complete,
-/// subagent-complete, provider approval, and process shutdown. The immediate
-/// `PermissionRequest` hook is shared by current Claude and Codex configs.
-pub const HOOK_EVENTS: [factory_core::ProviderHookEvent; 9] = [
-    factory_core::ProviderHookEvent::SessionStart,
-    factory_core::ProviderHookEvent::UserPromptSubmit,
-    factory_core::ProviderHookEvent::PreToolUse,
-    factory_core::ProviderHookEvent::PostToolUse,
-    factory_core::ProviderHookEvent::Notification,
-    factory_core::ProviderHookEvent::PermissionRequest,
-    factory_core::ProviderHookEvent::Stop,
-    factory_core::ProviderHookEvent::SubagentStop,
-    factory_core::ProviderHookEvent::SessionEnd,
-];
-
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -250,6 +349,48 @@ mod tests {
     }
 
     #[test]
+    fn operator_token_is_stable_across_restarts() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("operator.token");
+        let first = read_or_create_operator_token(&path).unwrap();
+        let second = read_or_create_operator_token(&path).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(fs::read_to_string(&path).unwrap(), first);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn invalid_existing_operator_token_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("operator.token");
+        fs::write(&path, "not-a-token").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            read_or_create_operator_token(&path),
+            Err(HookTokenError::Invalid { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "not-a-token");
+    }
+
+    #[test]
+    fn broadly_readable_operator_token_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("operator.token");
+        fs::write(&path, "a".repeat(HOOK_TOKEN_BYTES * 2)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(matches!(
+            read_or_create_operator_token(&path),
+            Err(HookTokenError::Invalid { .. })
+        ));
+    }
+
+    #[test]
     fn write_private_file_leaves_no_temp_file_behind() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.json");
@@ -272,15 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn hook_command_quotes_both_paths_and_uses_the_exact_event_name() {
+    fn hook_command_quotes_both_paths_and_uses_the_authority_event_name() {
         let command = hook_command(
             Path::new("/abs/factoryctl"),
-            Path::new("/abs/runs/session-1/hook.token"),
-            factory_core::ProviderHookEvent::SubagentStop,
+            Path::new("/abs/runs/attempt-1/hook.token"),
+            factory_core::ProviderHookEvent::PreToolUse,
         );
         assert_eq!(
             command,
-            "'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' SubagentStop"
+            "'/abs/factoryctl' hook --token-file '/abs/runs/attempt-1/hook.token' PreToolUse"
         );
     }
 }

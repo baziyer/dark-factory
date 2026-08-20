@@ -1,8 +1,11 @@
 # Safe kernel refactor epic
 
-Status: proposed architecture, 20 August 2026
+Status: architecture merged; Stage 1 implemented on a branch pending PR,
+independent review, and merge, 20 August 2026
 
-Baseline: `c19091ea2eb2b20c2de8717cb14799340268c8c7`
+Architecture merge: `f4f17d05315368139e408296ade6e95982cff137`
+
+Audit baseline: `c19091ea2eb2b20c2de8717cb14799340268c8c7`
 
 Factory state: frozen; do not start provider work until the boot gate below is met
 
@@ -22,10 +25,10 @@ The smallest safe model is stricter than the current resident-session design:
 - A queued task has no provider process.
 - Admission creates one exact attempt, one scoped capability, and one lease on
   a factoryd-created change worktree.
-- One provider process and PTY exist for that attempt only.
+- One non-interactive provider process exists for that attempt only.
 - The process ends before the attempt becomes terminal.
-- A new attempt may resume provider conversation metadata, but it starts a new
-  process under new authority.
+- A later attempt may receive bounded retained context, but it starts a fresh
+  provider conversation and process under new authority.
 - A retained change, not a session or attempt, owns the review worktree across
   retries and review.
 - God proposes priority and assignment. Factoryd alone admits work, grants
@@ -82,11 +85,11 @@ admits a new `RunId`; there is no implicit retry or reuse of run authority.
 
 ## Why this reset is necessary
 
-The current source names `session_work` as the work authority, but it owns prompt
-delivery rather than all mutation and finalization. Other paths still grant or
-close work independently:
+The audited baseline named `session_work` as the work authority, but it owned
+prompt delivery rather than all mutation and finalization. Other paths granted
+or closed work independently:
 
-| Concern | Current competing authority |
+| Concern | Competing authority on the audit baseline |
 | --- | --- |
 | Queue and admission | task status, dispatcher session checks, explicit task start |
 | Delivery | `session_work`, delivery attempts, PTY/hook acknowledgement |
@@ -94,7 +97,7 @@ close work independently:
 | Completion | complete/block/cancel endpoints, provider exit, deadlines, recovery |
 | Cleanup | runner acknowledgement, Tokio tasks, Rust `Drop`, `TempDir`, shell traps |
 
-Concrete failures follow from this split:
+Concrete failures followed from that split:
 
 - A taskless live session can invoke tool hooks and repository operations without
   proving an admitted attempt.
@@ -186,7 +189,7 @@ or dependency boundary has changed:
 | Owner | Responsibility after the refactor |
 | --- | --- |
 | `factory-core` | attempt/resource/change domain and bounded wire types |
-| `factory-runner` | minimal provider-blind PTY/process host and blocked-exec handshake |
+| `factory-runner` | minimal provider-blind process host and blocked-exec handshake |
 | `factoryd` | durable admission, capabilities, resources, finalization, worktrees, cache |
 | `factoryctl` | operator and attempt-scoped client requests; no hidden lifecycle logic |
 | `factory-tui` | operator projection through the same API as `factoryctl` |
@@ -228,40 +231,43 @@ Purpose: replace resident sessions, delivery authority, endpoint-specific
 terminalization, and killable cleanup in one internally complete cutover. The
 resource/finalizer seam cannot safely be postponed to a later stage.
 
-- [ ] Reuse `RunId` for attempts and rebuild runs around the pure phase and
+Checked items are present in the working branch. They are not accepted until
+the exact-head local/hosted gates and independent adversarial review pass.
+
+- [x] Reuse `RunId` for attempts and rebuild runs around the pure phase and
   outcome contract above. Add a private retained Change identity; do not add a
   parallel public attempt aggregate.
-- [ ] Add daemon-derived attempt principals and exhaustive, fail-closed request
+- [x] Add daemon-derived attempt principals and exhaustive, fail-closed request
   classification. A missing credential never means operator authority.
-- [ ] Make one transaction the only route from a queued task to an admitted run
+- [x] Make one transaction the only route from a queued task to an admitted run
   and the task's running projection.
-- [ ] Add the resource ledger and restartable finalizer before switching the
+- [x] Add the resource ledger and restartable finalizer before switching the
   process path. Register every process, group, runner, runtime root, temporary
   root, and disposable job used by attempt execution.
-- [ ] Add the blocked-child launch handshake. Declare intent, fork without
+- [x] Add the blocked-child launch handshake. Declare intent, fork without
   provider execution, persist PID/PGID/birth fingerprint and resource state,
   move the run to `running`, then release the child to `exec`.
-- [ ] Replace caller-selected complete/block/cancel operations with the exact
+- [x] Replace caller-selected complete/block/cancel operations with the exact
   outcome contract above. The first durable transition to `finalizing` wins.
-- [ ] Make one finalizer the sole writer of terminal run/task state and resume
+- [x] Make one finalizer the sole writer of terminal run/task state and resume
   it after daemon restart.
-- [ ] Replace resident cross-task sessions with one noninteractive provider
-  process per run. Provider conversation metadata may seed a later run, but no
-  process survives without authority.
-- [ ] Make God scheduling-only and give it no source mutation, process,
+- [x] Replace resident cross-task sessions with one noninteractive provider
+  process per run. Bounded retained context may seed a later run, but no native
+  provider conversation or process is resumed.
+- [x] Make God scheduling-only and give it no source mutation, process,
   capacity, agent administration, or repository authority.
-- [ ] Preserve a legacy per-agent worktree only as a retained Change path until
+- [x] Preserve a legacy per-agent worktree only as a retained Change path until
   Stage 2; never create, delete, or infer ownership for it during migration.
-- [ ] Remove message-only provider turns, generic unaffiliated request replay,
+- [x] Remove message-only provider turns, generic unaffiliated request replay,
   task-start source overrides, session lifecycle APIs, delivery
   acknowledgement/replay, direct episode opening, idle dispatch, direct
   terminalization, and session recovery.
-- [ ] Retain legacy session event decoding only for historical replay; stop
+- [x] Retain legacy session event decoding only for historical replay; stop
   producing live session events.
-- [ ] Make the cutover migration refuse any schema-29 database with a live
+- [x] Make the cutover migration refuse any schema-29 database with a live
   session, non-empty/quarantined session-work row, active delivery, or
   nonterminal run. Never infer whether an uncertain external prompt executed.
-- [ ] Preserve every legacy agent worktree as an unlinked retained Change
+- [x] Preserve every legacy agent worktree as an unlinked retained Change
   record. Do not inspect, move, clean, delete, or automatically adopt it into a
   new task. Require an explicit database backup/rollback decision before the
   first schema-30 boot.
@@ -272,8 +278,9 @@ Stage checkpoint:
   provider process may remain during `finalizing` only as an authority-revoked,
   stop-requested resource being drained or reaped; no provider process survives
   terminal.
-- Every hook, repository mutation, and outcome is refused unless the exact run
-  is `running` and the request is in that principal's allowlist.
+- Every supported hook and outcome is refused unless the exact run is
+  `running` and the request is in that principal's allowlist. Repository
+  execution is absent until Stage 2 can bind it to an exact Change.
 - Spawn failure, provider exit, success, block, and cancellation all converge
   through `finalizing`; restart resumes the same finalizer.
 - No successor run is admitted until the earlier run is terminal.
@@ -558,13 +565,13 @@ to delete superseded authority paths is.
 
 ## Progress record
 
-Update this table only after a PR is merged. Record exact evidence rather than
-"done" or "green" without provenance.
+Fill merge/evidence columns only after a PR is merged. A pending status may
+record branch implementation, but must not imply review, gates, or acceptance.
 
 | Stage | PR(s) | Merged SHA | Net production lines | Local gate | Hosted gate | Adversarial review | Status |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
-| Architecture decision | — | — | — | docs checks only | — | pending | Proposed |
-| 1. Attempt/resource cutover | — | — | — | — | — | — | Not started |
+| Architecture decision | #281 | `f4f17d05315368139e408296ade6e95982cff137` | docs only | docs checks | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/281#pullrequestreview-4987687825) | Merged |
+| 1. Attempt/resource cutover | pending | — | pending exact count | pending | pending | pending | Implemented on branch; not reviewed or merged |
 | 2. Change/source ownership | — | — | — | — | — | — | Not started |
 | 3. Build/bundle/storage | — | — | — | — | — | — | Not started |
 | Boot review | — | — | — | — | — | — | Frozen |

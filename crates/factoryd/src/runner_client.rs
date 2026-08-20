@@ -6,8 +6,7 @@ use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
-        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode,
-        decode_terminal_bytes, terminal_generation_is_contiguous,
+        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
     },
 };
 use thiserror::Error;
@@ -20,7 +19,6 @@ use uuid::Uuid;
 
 const CONTROL_SOCKET_FILE: &str = "control.sock";
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
-const LEGACY_ATTACH_READY_TIMEOUT: Duration = Duration::from_millis(250);
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const MAX_STOP_GRACE_MS: u64 = 60_000;
 
@@ -46,6 +44,51 @@ impl RunnerClient {
             socket: runtime_dir.as_ref().join(CONTROL_SOCKET_FILE),
             run_id,
             runner_instance_id,
+        }
+    }
+
+    /// Opens the authenticated pre-exec leash and returns the exact stable
+    /// process identity. Dropping the returned value before `activate`
+    /// closes the leash, causing the runner to reap the gate without execing
+    /// provider code.
+    pub async fn prepare(&self) -> Result<PreparedRunner, RunnerClientError> {
+        let command_id = format!("prepare-{}", Uuid::new_v4().simple());
+        let mut reader = self
+            .request(RunnerRequest::Prepare {
+                command_id: command_id.clone(),
+            })
+            .await?;
+        let frame = read_control_frame(&mut reader, "runner preparation").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::Prepared {
+                command_id: received,
+                runner_pid,
+                child_pid,
+                process_group_id,
+                ..
+            } if received == command_id
+                && runner_pid > 0
+                && child_pid > 0
+                && process_group_id > 0 =>
+            {
+                Ok(PreparedRunner {
+                    reader,
+                    run_id: self.run_id.clone(),
+                    runner_instance_id: self.runner_instance_id.clone(),
+                    command_id,
+                    runner_pid,
+                    child_pid,
+                    process_group_id,
+                })
+            }
+            RunnerFrame::Prepared {
+                command_id: received,
+                ..
+            } if received != command_id => Err(RunnerClientError::CommandMismatch),
+            RunnerFrame::Prepared { .. } => Err(RunnerClientError::InvalidProcessIdentity),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
         }
     }
 
@@ -152,179 +195,6 @@ impl RunnerClient {
         }
     }
 
-    /// Opens a retained-then-live PTY output stream from a terminal-mode
-    /// run, starting at `since_offset`. Rejected with
-    /// [`RunnerErrorCode::InvalidRequest`] on a run that is not in terminal
-    /// mode.
-    pub async fn attach_terminal(
-        &self,
-        since_offset: u64,
-        mode: TerminalAttachMode,
-    ) -> Result<TerminalSubscription, RunnerClientError> {
-        let requested_mode = mode.clone();
-        let mut legacy_fallback = false;
-        let mode = match mode {
-            TerminalAttachMode::Legacy => TerminalAttachMode::Legacy,
-            requested @ (TerminalAttachMode::Tail | TerminalAttachMode::Offset { .. }) => {
-                if !self.terminal_attach_capabilities().await? {
-                    return Err(RunnerClientError::BoundedAttachUnsupported);
-                }
-                requested
-            }
-            TerminalAttachMode::FullHistory => {
-                if self.terminal_attach_capabilities().await? {
-                    TerminalAttachMode::FullHistory
-                } else {
-                    // This mode is exactly the old since_offset=0 contract.
-                    // Bounded modes never silently become legacy replay.
-                    legacy_fallback = true;
-                    TerminalAttachMode::Legacy
-                }
-            }
-        };
-        let mut reader = self
-            .request(RunnerRequest::AttachTerminal { since_offset, mode })
-            .await?;
-        let (info, pending) = match timeout(LEGACY_ATTACH_READY_TIMEOUT, reader.read_frame()).await
-        {
-            Ok(result) => {
-                let frame = result?;
-                validate_protocol(frame.protocol_version())?;
-                match frame {
-                    RunnerFrame::TerminalOutput {
-                        generation,
-                        offset,
-                        bytes,
-                        ..
-                    } => (None, Some((generation, offset, bytes))),
-                    RunnerFrame::TerminalAttachReady {
-                        generation,
-                        base_generation,
-                        base_offset,
-                        start_generation,
-                        start_offset,
-                        end_offset,
-                        reset_prefix,
-                        ..
-                    } => (
-                        Some(TerminalAttachInfo {
-                            generation,
-                            base_generation,
-                            base_offset,
-                            start_generation,
-                            start_offset,
-                            end_offset,
-                            reset_prefix,
-                        }),
-                        None,
-                    ),
-                    RunnerFrame::TerminalAttachGap {
-                        generation,
-                        base_generation,
-                        base_offset,
-                        start_generation,
-                        start_offset,
-                        end_offset,
-                        requested_generation,
-                        requested_offset,
-                        reason,
-                        ..
-                    } => {
-                        return Err(RunnerClientError::TerminalAttachGap {
-                            generation,
-                            base_generation,
-                            base_offset,
-                            start_generation,
-                            start_offset,
-                            end_offset,
-                            requested_generation,
-                            requested_offset,
-                            reason,
-                        });
-                    }
-                    RunnerFrame::Error { code, .. } => {
-                        return Err(RunnerClientError::RunnerRejected { code });
-                    }
-                    frame => return Err(frame_error(frame)),
-                }
-            }
-            // A timeout is not evidence that an old runner can honor bounded
-            // replay. Capability negotiation above has already decided this.
-            Err(_) if matches!(requested_mode, TerminalAttachMode::Legacy) || legacy_fallback => {
-                (None, None)
-            }
-            Err(_) => return Err(RunnerClientError::BoundedAttachUnsupported),
-        };
-        let next_offset = info
-            .as_ref()
-            .map(|attach| attach.start_offset)
-            .or_else(|| pending.as_ref().map(|(_, offset, _)| *offset));
-        let next_generation = info
-            .as_ref()
-            .map(|attach| attach.start_generation)
-            .or_else(|| pending.as_ref().map(|(generation, ..)| *generation));
-        Ok(TerminalSubscription {
-            reader,
-            next_offset,
-            next_generation,
-            info,
-            pending,
-        })
-    }
-
-    async fn terminal_attach_capabilities(&self) -> Result<bool, RunnerClientError> {
-        let mut reader = self
-            .request(RunnerRequest::TerminalAttachCapabilities)
-            .await?;
-        match timeout(CONTROL_TIMEOUT, reader.read_frame()).await {
-            Ok(Ok(frame)) => {
-                validate_protocol(frame.protocol_version())?;
-                match frame {
-                    RunnerFrame::TerminalAttachCapabilities { .. } => Ok(true),
-                    RunnerFrame::Error {
-                        code: RunnerErrorCode::InvalidRequest | RunnerErrorCode::UnsupportedProtocol,
-                        ..
-                    } => Ok(false),
-                    RunnerFrame::Error { code, .. } => {
-                        Err(RunnerClientError::RunnerRejected { code })
-                    }
-                    frame => Err(frame_error(frame)),
-                }
-            }
-            Ok(Err(error)) => Err(error),
-            Err(_) => Ok(false),
-        }
-    }
-
-    /// Writes operator input to a terminal-mode run's PTY. `bytes` is
-    /// already [`factory_core::runner::encode_terminal_bytes`]-encoded;
-    /// this is a pass-through so the daemon never needs to decode opaque
-    /// terminal bytes.
-    pub async fn terminal_input(&self, bytes: String) -> Result<(), RunnerClientError> {
-        let mut reader = self.request(RunnerRequest::TerminalInput { bytes }).await?;
-        let frame = read_control_frame(&mut reader, "terminal input").await?;
-        validate_protocol(frame.protocol_version())?;
-        match frame {
-            RunnerFrame::CommandAck { .. } => Ok(()),
-            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
-            frame => Err(frame_error(frame)),
-        }
-    }
-
-    /// Resizes a terminal-mode run's PTY.
-    pub async fn resize_terminal(&self, cols: u16, rows: u16) -> Result<(), RunnerClientError> {
-        let mut reader = self
-            .request(RunnerRequest::ResizeTerminal { cols, rows })
-            .await?;
-        let frame = read_control_frame(&mut reader, "resize terminal").await?;
-        validate_protocol(frame.protocol_version())?;
-        match frame {
-            RunnerFrame::CommandAck { .. } => Ok(()),
-            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
-            frame => Err(frame_error(frame)),
-        }
-    }
-
     async fn request(&self, request: RunnerRequest) -> Result<FrameReader, RunnerClientError> {
         let stream = timeout(CONTROL_TIMEOUT, UnixStream::connect(&self.socket))
             .await
@@ -357,6 +227,71 @@ impl RunnerClient {
     }
 }
 
+/// Exact pre-exec process registration held open by one authenticated Unix
+/// connection. It intentionally has no `Clone`: activation is one-shot.
+pub struct PreparedRunner {
+    reader: FrameReader,
+    run_id: RunId,
+    runner_instance_id: RunnerInstanceId,
+    command_id: String,
+    runner_pid: u32,
+    child_pid: u32,
+    process_group_id: u32,
+}
+
+impl PreparedRunner {
+    #[must_use]
+    pub const fn runner_pid(&self) -> u32 {
+        self.runner_pid
+    }
+
+    #[must_use]
+    pub const fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+
+    #[must_use]
+    pub const fn process_group_id(&self) -> u32 {
+        self.process_group_id
+    }
+
+    /// Releases the exact registered exec gate. Provider code cannot run
+    /// before this authenticated second frame is accepted.
+    pub async fn activate(mut self) -> Result<(), RunnerClientError> {
+        let envelope = RequestEnvelope::new(
+            self.run_id,
+            self.runner_instance_id,
+            RunnerRequest::Activate {
+                command_id: self.command_id.clone(),
+            },
+        );
+        let mut payload =
+            serde_json::to_vec(&envelope).map_err(|_| RunnerClientError::InvalidJson)?;
+        if payload.len() > MAX_RUNNER_FRAME_BYTES {
+            return Err(RunnerClientError::FrameTooLarge);
+        }
+        payload.push(b'\n');
+        timeout(CONTROL_TIMEOUT, self.reader.stream.write_all(&payload))
+            .await
+            .map_err(|_| RunnerClientError::TimedOut {
+                operation: "runner activation",
+            })??;
+        timeout(CONTROL_TIMEOUT, self.reader.stream.flush())
+            .await
+            .map_err(|_| RunnerClientError::TimedOut {
+                operation: "runner activation",
+            })??;
+        let frame = read_control_frame(&mut self.reader, "runner activation").await?;
+        validate_protocol(frame.protocol_version())?;
+        match frame {
+            RunnerFrame::CommandAck { command_id, .. } if command_id == self.command_id => Ok(()),
+            RunnerFrame::CommandAck { .. } => Err(RunnerClientError::CommandMismatch),
+            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
+            frame => Err(frame_error(frame)),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RunnerReplayHead {
     pub replay_through: i64,
@@ -382,114 +317,6 @@ impl fmt::Debug for RunnerStreamItem {
                 .field("sequence", sequence)
                 .finish(),
         }
-    }
-}
-
-/// Retained-then-live raw PTY output stream for one terminal-mode run.
-///
-/// `bytes` stays [`factory_core::runner::encode_terminal_bytes`]-encoded end
-/// to end: the daemon proxy forwards it opaquely without decoding.
-pub struct TerminalSubscription {
-    reader: FrameReader,
-    info: Option<TerminalAttachInfo>,
-    pending: Option<(u64, u64, String)>,
-    next_offset: Option<u64>,
-    next_generation: Option<u64>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TerminalAttachInfo {
-    pub generation: u64,
-    pub base_generation: u64,
-    pub base_offset: u64,
-    pub start_generation: u64,
-    pub start_offset: u64,
-    pub end_offset: u64,
-    pub reset_prefix: String,
-}
-
-impl TerminalSubscription {
-    #[must_use]
-    pub fn info(&self) -> Option<TerminalAttachInfo> {
-        self.info.clone()
-    }
-
-    /// Returns the next chunk's generation, byte-stream offset, and base64 bytes.
-    pub async fn next_chunk(&mut self) -> Result<(u64, u64, String), RunnerClientError> {
-        if let Some(chunk) = self.pending.take() {
-            self.validate_chunk(&chunk)?;
-            return Ok(chunk);
-        }
-        let frame = self.reader.read_frame().await?;
-        validate_protocol(frame.protocol_version())?;
-        match frame {
-            RunnerFrame::TerminalOutput {
-                generation,
-                offset,
-                bytes,
-                ..
-            } => {
-                self.validate_chunk(&(generation, offset, bytes.clone()))?;
-                Ok((generation, offset, bytes))
-            }
-            RunnerFrame::TerminalAttachReady { .. } => Err(RunnerClientError::UnexpectedFrame {
-                expected: "terminal output",
-            }),
-            RunnerFrame::TerminalAttachGap {
-                generation,
-                base_generation,
-                base_offset,
-                start_generation,
-                start_offset,
-                end_offset,
-                requested_generation,
-                requested_offset,
-                reason,
-                ..
-            } => Err(RunnerClientError::TerminalAttachGap {
-                generation,
-                base_generation,
-                base_offset,
-                start_generation,
-                start_offset,
-                end_offset,
-                requested_generation,
-                requested_offset,
-                reason,
-            }),
-            RunnerFrame::Error { code, .. } => Err(RunnerClientError::RunnerRejected { code }),
-            frame => Err(frame_error(frame)),
-        }
-    }
-
-    fn validate_chunk(&mut self, chunk: &(u64, u64, String)) -> Result<(), RunnerClientError> {
-        let (generation, offset, encoded) = chunk;
-        let bytes = decode_terminal_bytes(encoded).map_err(|_| RunnerClientError::InvalidJson)?;
-        if let Some(expected) = self.next_offset
-            && *offset != expected
-        {
-            return Err(RunnerClientError::TerminalAttachContinuity {
-                expected,
-                found: *offset,
-            });
-        }
-        if let Some(expected) = self.next_generation {
-            if *generation < expected {
-                return Err(RunnerClientError::TerminalAttachGeneration {
-                    expected,
-                    found: *generation,
-                });
-            }
-            if !terminal_generation_is_contiguous(expected, *generation) {
-                return Err(RunnerClientError::TerminalAttachGenerationJump {
-                    expected: expected.saturating_add(1),
-                    found: *generation,
-                });
-            }
-        }
-        self.next_offset = Some(offset.saturating_add(bytes.len() as u64));
-        self.next_generation = Some(*generation);
-        Ok(())
     }
 }
 
@@ -610,13 +437,8 @@ fn is_terminal(event: &RunnerEvent) -> bool {
 fn runner_event_kind(event: &RunnerEvent) -> &'static str {
     match event {
         RunnerEvent::Started { .. } => "started",
-        RunnerEvent::Output { .. } => "output",
         RunnerEvent::SpawnFailed { .. } => "spawn_failed",
-        RunnerEvent::OutputTruncated { .. } => "output_truncated",
-        RunnerEvent::TerminalRaw => "terminal_raw",
-        RunnerEvent::TerminalRawTimedOut => "terminal_raw_timed_out",
         RunnerEvent::Exited { .. } => "exited",
-        RunnerEvent::Unknown => "unknown",
     }
 }
 
@@ -634,6 +456,9 @@ fn validate_protocol(found: u16) -> Result<(), RunnerClientError> {
 fn frame_error(frame: RunnerFrame) -> RunnerClientError {
     match frame {
         RunnerFrame::Error { code, .. } => RunnerClientError::RunnerRejected { code },
+        RunnerFrame::Prepared { .. } => RunnerClientError::UnexpectedFrame {
+            expected: "runner command acknowledgement",
+        },
         RunnerFrame::Hello { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner event",
         },
@@ -645,17 +470,6 @@ fn frame_error(frame: RunnerFrame) -> RunnerClientError {
         },
         RunnerFrame::CommandAck { .. } => RunnerClientError::UnexpectedFrame {
             expected: "runner event",
-        },
-        RunnerFrame::TerminalOutput { .. } => RunnerClientError::UnexpectedFrame {
-            expected: "runner command acknowledgement",
-        },
-        RunnerFrame::TerminalAttachReady { .. } | RunnerFrame::TerminalAttachGap { .. } => {
-            RunnerClientError::UnexpectedFrame {
-                expected: "runner command acknowledgement",
-            }
-        }
-        RunnerFrame::TerminalAttachCapabilities { .. } => RunnerClientError::UnexpectedFrame {
-            expected: "runner command acknowledgement",
         },
     }
 }
@@ -734,6 +548,8 @@ pub enum RunnerClientError {
     WrongProtocol { found: u16, supported: u16 },
     #[error("runner identity does not match the reserved run")]
     WrongIdentity,
+    #[error("runner returned an invalid zero process identity")]
+    InvalidProcessIdentity,
     #[error("runner replay head {found} is invalid")]
     InvalidReplayHead { found: i64 },
     #[error(
@@ -757,28 +573,6 @@ pub enum RunnerClientError {
     UnexpectedFrame { expected: &'static str },
     #[error("runner rejected the request with {code:?}")]
     RunnerRejected { code: RunnerErrorCode },
-    #[error("runner does not advertise bounded terminal attach")]
-    BoundedAttachUnsupported,
-    #[error("terminal output continuity broke: expected offset {expected}, found {found}")]
-    TerminalAttachContinuity { expected: u64, found: u64 },
-    #[error("terminal output generation regressed: expected at least {expected}, found {found}")]
-    TerminalAttachGeneration { expected: u64, found: u64 },
-    #[error("terminal output skipped a generation: expected at most {expected}, found {found}")]
-    TerminalAttachGenerationJump { expected: u64, found: u64 },
-    #[error(
-        "terminal attach cursor is unavailable ({reason}); retained generation {generation}, offsets {base_offset}..{end_offset}"
-    )]
-    TerminalAttachGap {
-        generation: u64,
-        base_generation: u64,
-        base_offset: u64,
-        start_generation: u64,
-        start_offset: u64,
-        end_offset: u64,
-        requested_generation: Option<u64>,
-        requested_offset: u64,
-        reason: String,
-    },
     #[error("runner terminal sequence {found} must be positive")]
     InvalidTerminalSequence { found: i64 },
     #[error("runner acknowledged a different command")]

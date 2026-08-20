@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use factory_core::local::LocalRequest;
 use factory_core::status::AttentionItem;
-use factory_core::{AgentId, AgentRole, ProjectId, RunId, SessionId, TaskId, TaskStatus};
+use factory_core::{AgentId, AgentRole, ProjectId, RunId, TaskId, TaskStatus};
 
 use super::{Board, StatusLevel};
 use crate::mouse::Target as MouseTarget;
@@ -37,16 +37,6 @@ impl View {
             Self::Agent => "AGENT",
         }
     }
-}
-
-/// Whether AGENT keys control the board or the live terminal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PaneMode {
-    /// Keys control TUI navigation and actions.
-    Board,
-    /// Keys go to the focused pane. Only ever *actually* forwarded when a live pane exists — see
-    /// `Board::has_live_pane`.
-    Typing,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -81,8 +71,6 @@ pub enum Action {
     Detach,
     JumpNeedsAttention,
     ToggleHelp,
-    /// `z`: toggle the maximised terminal.
-    MaximizeTerminal,
     TogglePause,
     EditInstructions,
     EditMemory,
@@ -92,15 +80,12 @@ pub enum Action {
     EditCapacity,
     /// `u`: run the visible verified update once.
     Update,
-    /// `PgUp`/`PgDn`: AGENT terminal scrollback.
-    ScrollUp,
-    ScrollDown,
 }
 
 /// The one keymap: every key the board recognizes in its base navigation mode, independent of
 /// which view is active (`Board::dispatch` supplies the context). Returns `None` for anything not
 /// bound — callers fall through to whatever else might want the key (a live pane, while
-/// `pane_mode` is `Typing`, is handled a level up in `Board::handle_normal_key`).
+/// The active view supplies the context for each action.
 #[must_use]
 pub fn keymap(key: KeyEvent) -> Option<Action> {
     match key.code {
@@ -120,7 +105,6 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Detach),
         KeyCode::Char('g') => Some(Action::JumpNeedsAttention),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
-        KeyCode::Char('z') => Some(Action::MaximizeTerminal),
         KeyCode::Char(' ') => Some(Action::TogglePause),
         KeyCode::Char('I') => Some(Action::EditInstructions),
         KeyCode::Char('M') => Some(Action::EditMemory),
@@ -129,8 +113,6 @@ pub fn keymap(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('a') => Some(Action::EditPermission),
         KeyCode::Char('C') => Some(Action::EditCapacity),
         KeyCode::Char('u') => Some(Action::Update),
-        KeyCode::PageUp => Some(Action::ScrollUp),
-        KeyCode::PageDown => Some(Action::ScrollDown),
         _ => None,
     }
 }
@@ -146,10 +128,6 @@ pub enum PromptKind {
     MessageOrchestrator(AgentId),
     EditTaskTitle(TaskId),
     ReorderTask(TaskId),
-    AttentionAnswer {
-        project_id: ProjectId,
-        session_id: SessionId,
-    },
     EditModel(AgentId),
     EditPermission(AgentId),
     Capacity,
@@ -216,19 +194,6 @@ impl PromptState {
         }
     }
 
-    #[must_use]
-    fn attention_answer(project_id: ProjectId, session_id: SessionId) -> Self {
-        Self {
-            kind: PromptKind::AttentionAnswer {
-                project_id,
-                session_id,
-            },
-            labels: vec!["answer"],
-            values: vec![String::new()],
-            field: 0,
-        }
-    }
-
     fn edit_profile(agent_id: AgentId, permission: bool, current: String) -> Self {
         Self {
             kind: if permission {
@@ -250,7 +215,7 @@ impl PromptState {
     fn capacity(current: String) -> Self {
         Self {
             kind: PromptKind::Capacity,
-            labels: vec!["live-session capacity"],
+            labels: vec!["active-run capacity"],
             values: vec![current],
             field: 0,
         }
@@ -318,10 +283,6 @@ pub enum PendingAction {
         source: Box<AttentionItem>,
         request: LocalRequest,
     },
-    StopSession {
-        project_id: ProjectId,
-        session_id: SessionId,
-    },
     StopRun {
         project_id: ProjectId,
         run_id: RunId,
@@ -354,13 +315,6 @@ pub enum Intent {
     },
     SetCapacity(usize),
     Update,
-    /// Only meaningful while a pane is attached (TERMINALS/FOCUS, `pane_mode` is `Typing`);
-    /// `main.rs` encodes and forwards to whichever pane is currently focused.
-    ForwardKey(KeyEvent),
-    /// FOCUS only: scroll the focused pane's `vt100` scrollback up (`up: true`) or down.
-    ScrollFocus {
-        up: bool,
-    },
     EditFile(String),
 }
 
@@ -434,7 +388,6 @@ impl Board {
                 self.focused_project = Some(task.snapshot.project_id.clone());
                 self.selected_task = Some(task_id);
                 self.attention_focus = None;
-                self.pane_mode = PaneMode::Board;
                 Intent::Redraw
             }
             MouseTarget::Attention(item) => {
@@ -455,18 +408,6 @@ impl Board {
                 };
                 self.select_attention_item(&current);
                 self.choose_attention(index)
-            }
-            MouseTarget::Pane(session_id) => {
-                let Some(agent_id) = self
-                    .agent_for_pane_session(&session_id)
-                    .map(|agent| agent.id.clone())
-                else {
-                    return Intent::None;
-                };
-                self.select_agent(agent_id);
-                self.view = View::Agent;
-                self.pane_mode = PaneMode::Board;
-                Intent::Redraw
             }
         }
     }
@@ -491,31 +432,6 @@ impl Board {
             }
             if let KeyCode::Char(choice @ '1'..='9') = key.code {
                 return self.choose_attention(usize::from(choice as u8 - b'1'));
-            }
-        }
-        if self.view == View::Agent {
-            if key == crate::keys::PREFIX_KEY {
-                if self.pane_mode == PaneMode::Typing {
-                    self.pane_mode = PaneMode::Board;
-                } else if self.has_live_pane() {
-                    self.pane_mode = PaneMode::Typing;
-                } else {
-                    self.set_status("terminal is not attached yet", StatusLevel::Error);
-                }
-                return Intent::Redraw;
-            }
-            if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
-                return Intent::ForwardKey(key);
-            }
-            if self.pane_mode == PaneMode::Board
-                && matches!(key.code, KeyCode::Char('i') | KeyCode::Enter)
-            {
-                if self.has_live_pane() {
-                    self.pane_mode = PaneMode::Typing;
-                } else {
-                    self.set_status("terminal is not attached yet", StatusLevel::Error);
-                }
-                return Intent::Redraw;
             }
         }
         keymap(key).map_or(Intent::None, |action| self.dispatch(action))
@@ -545,10 +461,6 @@ impl Board {
                 self.mode = Mode::Help;
                 Intent::Redraw
             }
-            Action::MaximizeTerminal => {
-                self.terminal_maximized = !self.terminal_maximized;
-                Intent::Redraw
-            }
             Action::TogglePause => self.toggle_pause(),
             Action::EditInstructions => self.edit_guidance(true),
             Action::EditMemory => self.edit_guidance(false),
@@ -565,9 +477,6 @@ impl Board {
                     Intent::None
                 }
             }
-            Action::ScrollUp if self.view == View::Agent => Intent::ScrollFocus { up: true },
-            Action::ScrollDown if self.view == View::Agent => Intent::ScrollFocus { up: false },
-            Action::ScrollUp | Action::ScrollDown => Intent::None,
         }
     }
 
@@ -589,14 +498,11 @@ impl Board {
         self.selected_agent = Some(agent_id);
         self.attention_focus = None;
         self.view = View::Agent;
-        self.pane_mode = PaneMode::Board;
         Intent::Redraw
     }
 
     fn back_to_building(&mut self) -> Intent {
         self.view = View::Building;
-        self.pane_mode = PaneMode::Board;
-        self.terminal_maximized = false;
         Intent::Redraw
     }
 
@@ -706,7 +612,7 @@ impl Board {
 
     fn begin_capacity_edit(&mut self) -> Intent {
         let current = self
-            .live_session_cap
+            .active_run_cap
             .map_or_else(|| "4".to_owned(), |capacity| capacity.to_string());
         self.mode = Mode::Prompt(PromptState::capacity(current));
         Intent::Redraw
@@ -754,7 +660,7 @@ impl Board {
     }
 
     fn begin_message_agent(&mut self) -> Intent {
-        let Some(agent_id) = self.pane_target_agent() else {
+        let Some(agent_id) = self.selected_agent.clone() else {
             self.set_status("no agent selected", StatusLevel::Error);
             return Intent::Redraw;
         };
@@ -821,7 +727,7 @@ impl Board {
     }
 
     fn begin_stop_selected(&mut self) -> Intent {
-        let Some(agent_id) = self.pane_target_agent() else {
+        let Some(agent_id) = self.selected_agent.clone() else {
             self.set_status("no agent selected", StatusLevel::Error);
             return Intent::Redraw;
         };
@@ -829,13 +735,6 @@ impl Board {
             return Intent::Redraw;
         };
         let project_id = agent.project_id.clone();
-        if let Some(session_id) = agent.current_session_id.clone() {
-            self.mode = Mode::Confirm(PendingAction::StopSession {
-                project_id,
-                session_id,
-            });
-            return Intent::Redraw;
-        }
         if let Some(run_id) = agent.current_run_id.clone() {
             self.mode = Mode::Confirm(PendingAction::StopRun { project_id, run_id });
             return Intent::Redraw;
@@ -893,8 +792,6 @@ impl Board {
         // NEEDS YOU is a BUILDING decision inbox. Keep the selected floor and
         // row visible while the right pane shows the bounded decision card.
         self.view = View::Building;
-        self.pane_mode = PaneMode::Board;
-        self.terminal_maximized = false;
         true
     }
 
@@ -956,41 +853,6 @@ impl Board {
                 });
                 Intent::Redraw
             }
-            factory_core::status::AttentionAction::AnswerInTerminal => {
-                let Some(session_id) = source.session_id.clone() else {
-                    self.set_status("provider choice has no exact session", StatusLevel::Error);
-                    return Intent::Redraw;
-                };
-                self.mode = Mode::Prompt(PromptState::attention_answer(
-                    source.project_id.clone(),
-                    session_id,
-                ));
-                Intent::Redraw
-            }
-            factory_core::status::AttentionAction::ApproveProviderPermission
-            | factory_core::status::AttentionAction::RejectProviderPermission => {
-                let Some(session_id) = source.session_id.clone() else {
-                    self.set_status("permission choice has no exact session", StatusLevel::Error);
-                    return Intent::Redraw;
-                };
-                let bytes = if choice.action
-                    == factory_core::status::AttentionAction::ApproveProviderPermission
-                {
-                    b"y\n".as_slice()
-                } else {
-                    b"n\n".as_slice()
-                };
-                let request = LocalRequest::TerminalInput {
-                    project_id: source.project_id.clone(),
-                    session_id,
-                    bytes: factory_core::runner::encode_terminal_bytes(bytes),
-                };
-                self.attention_request(&source, choice.action, request)
-            }
-            factory_core::status::AttentionAction::ReviewProviderPermission => {
-                self.set_status("choose approve or reject", StatusLevel::Info);
-                Intent::Redraw
-            }
             _ => {
                 self.set_status(
                     "this decision has no client-side mutation",
@@ -1004,10 +866,8 @@ impl Board {
     // -- Confirm ----------------------------------------------------------------------------
 
     fn handle_confirm_key(&mut self, key: KeyEvent, action: &PendingAction) -> Intent {
-        let extra_confirm_key = matches!(
-            action,
-            PendingAction::StopSession { .. } | PendingAction::StopRun { .. }
-        ) && key.code == KeyCode::Char('x');
+        let extra_confirm_key =
+            matches!(action, PendingAction::StopRun { .. }) && key.code == KeyCode::Char('x');
         let confirmed =
             matches!(key.code, KeyCode::Enter | KeyCode::Char('y')) || extra_confirm_key;
         self.mode = Mode::Normal;
@@ -1047,19 +907,13 @@ impl Board {
                     request,
                 )
             }
-            PendingAction::StopSession {
-                project_id,
-                session_id,
-            } => Intent::Send(LocalRequest::StopSession {
-                project_id,
-                session_id,
-                grace_ms: 5_000,
-            }),
-            PendingAction::StopRun { project_id, run_id } => Intent::Send(LocalRequest::StopRun {
-                project_id,
-                run_id,
-                grace_ms: 5_000,
-            }),
+            PendingAction::StopRun { project_id, run_id } => {
+                Intent::Send(LocalRequest::CancelRun {
+                    project_id,
+                    run_id,
+                    grace_ms: 5_000,
+                })
+            }
         }
     }
 
@@ -1152,7 +1006,6 @@ impl Board {
                 Intent::Send(LocalRequest::SendAgentMessage {
                     id,
                     project_id,
-                    sender_agent_id: None,
                     recipient_agent_id,
                     body,
                 })
@@ -1192,44 +1045,6 @@ impl Board {
                     body: None,
                     priority: Some(priority),
                 })
-            }
-            PromptKind::AttentionAnswer {
-                project_id,
-                session_id,
-            } => {
-                let answer = prompt
-                    .values
-                    .first()
-                    .map(String::as_str)
-                    .map(str::trim)
-                    .unwrap_or_default();
-                if answer.is_empty() {
-                    self.set_status("answer can't be empty", StatusLevel::Error);
-                    return Intent::Redraw;
-                }
-                let mut bytes = answer.as_bytes().to_vec();
-                bytes.push(b'\n');
-                let request = LocalRequest::TerminalInput {
-                    project_id: project_id.clone(),
-                    session_id: session_id.clone(),
-                    bytes: factory_core::runner::encode_terminal_bytes(&bytes),
-                };
-                if let Some(source) = self
-                    .attention_focus
-                    .as_ref()
-                    .map(|focus| focus.item.clone())
-                    .filter(|source| {
-                        source.project_id == project_id
-                            && source.session_id.as_ref() == Some(&session_id)
-                    })
-                {
-                    return self.attention_request(
-                        &source,
-                        factory_core::status::AttentionAction::AnswerInTerminal,
-                        request,
-                    );
-                }
-                Intent::Send(request)
             }
             PromptKind::EditModel(agent_id) => {
                 let Some(detail) = self.agent_details.get(&agent_id) else {
@@ -1410,17 +1225,10 @@ impl Board {
                     self.set_status("assign a task to an agent first", StatusLevel::Error);
                     return Intent::Redraw;
                 };
-                let worktree = self
-                    .projects
-                    .iter()
-                    .find(|p| p.id == project_id)
-                    .map(|p| p.root.clone());
                 Intent::Send(LocalRequest::StartTask {
                     project_id,
                     task_id,
                     agent_id,
-                    parent_run_id: None,
-                    worktree,
                 })
             }
             "assign" => {
@@ -1492,1428 +1300,4 @@ fn picker_agent_count(board: &Board, picker: &PickerState) -> usize {
     board
         .task_project(task_id)
         .map_or(0, |project_id| board.agent_ids_in(&project_id).len())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_fixtures::{agent, attention, project, session, task};
-    use factory_core::{
-        AgentRole, ObserverHealth, ProviderHookEvent, ProviderNotificationKind, SessionState,
-        TaskStatus, local::LocalResponse, status::AttentionReasonKind,
-    };
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn board() -> Board {
-        let mut board = Board::new(false, 0, crate::theme::FORTRESS);
-        let mut alice = agent("alice", "proj", AgentRole::Worker, None);
-        alice.current_session_id = Some(SessionId::try_from("session").unwrap());
-        board.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            vec![alice, agent("bob", "proj", AgentRole::Worker, None)],
-            Vec::new(),
-            Vec::new(),
-            vec![session("session", "alice", "proj", SessionState::Working)],
-        );
-        board
-    }
-
-    #[test]
-    fn old_numbered_views_are_gone() {
-        for digit in '1'..='4' {
-            assert_eq!(keymap(key(KeyCode::Char(digit))), None);
-        }
-    }
-
-    #[test]
-    fn building_opens_selected_agent_and_escape_returns_home() {
-        let mut board = board();
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::Redraw
-        ));
-        assert_eq!(board.view, View::Agent);
-        assert_eq!(board.pane_mode, PaneMode::Board);
-        board.handle_key(key(KeyCode::Esc));
-        assert_eq!(board.view, View::Building);
-    }
-
-    #[test]
-    fn agent_switching_stays_on_agent_screen() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.handle_key(key(KeyCode::Char(']')));
-        assert_eq!(
-            board.selected_agent.as_ref().map(AgentId::as_str),
-            Some("bob")
-        );
-        assert_eq!(board.view, View::Agent);
-    }
-
-    #[test]
-    fn typing_has_exclusive_input_until_prefix() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.pane_ready = true;
-        board.handle_key(key(KeyCode::Char('i')));
-        assert_eq!(board.pane_mode, PaneMode::Typing);
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('q'))),
-            Intent::ForwardKey(_)
-        ));
-        board.handle_key(crate::keys::PREFIX_KEY);
-        assert_eq!(board.pane_mode, PaneMode::Board);
-    }
-
-    #[test]
-    fn pause_uses_the_shared_local_api_request() {
-        let mut board = board();
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char(' '))),
-            Intent::Send(LocalRequest::PauseAgent { .. })
-        ));
-    }
-
-    #[test]
-    fn capacity_setting_is_an_operator_prompt_and_shared_intent() {
-        let mut board = board();
-        board.live_session_cap = Some(8);
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('C'))),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::SetCapacity(8)
-        ));
-    }
-
-    #[test]
-    fn agent_new_task_uses_atomic_assigned_create() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('n'))),
-            Intent::Redraw
-        ));
-        for character in "build".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        board.handle_key(key(KeyCode::Enter));
-        for character in "body".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        let Intent::Send(request) = board.handle_key(key(KeyCode::Enter)) else {
-            panic!("task prompt did not submit");
-        };
-        assert!(matches!(
-            request,
-            LocalRequest::CreateTask { agent_id, .. }
-                if agent_id == Some(AgentId::try_from("alice").unwrap())
-        ));
-    }
-
-    #[test]
-    fn queue_rows_are_stable_and_mouse_targets_the_same_assigned_queue() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.tasks.insert(
-            TaskId::try_from("later").unwrap(),
-            task("later", "proj", TaskStatus::Queued, Some("alice"), 20),
-        );
-        board.tasks.insert(
-            TaskId::try_from("first").unwrap(),
-            task("first", "proj", TaskStatus::Queued, Some("alice"), 10),
-        );
-        assert_eq!(
-            board
-                .active_tasks_for_agent(&AgentId::try_from("alice").unwrap())
-                .iter()
-                .map(|task| task.snapshot.id.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "later"]
-        );
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("later").unwrap())),
-            Intent::Redraw
-        ));
-        assert_eq!(
-            board.selected_task.as_ref().map(TaskId::as_str),
-            Some("later")
-        );
-    }
-
-    #[test]
-    fn g_skips_free_form_worker_blocks_and_opens_the_first_typed_decision() {
-        let mut board = board();
-        board.attention = vec![
-            attention(
-                AttentionReasonKind::WorkerBlocked,
-                None,
-                Some("old-task"),
-                None,
-                10,
-            ),
-            attention(
-                AttentionReasonKind::ProviderQuestion,
-                Some("alice"),
-                None,
-                Some("session"),
-                20,
-            ),
-        ];
-        let items = board.attention_items();
-        assert_eq!(items[0].reason.kind, AttentionReasonKind::WorkerBlocked);
-        assert_eq!(items[1].reason.kind, AttentionReasonKind::ProviderQuestion);
-        assert_eq!(board.decision_items().len(), 1);
-        board.selected_agent = None;
-        board.terminal_maximized = true;
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(board.selected_task.is_none());
-        assert_eq!(
-            board.selected_agent.as_ref().map(AgentId::as_str),
-            Some("alice")
-        );
-        assert_eq!(
-            board.focused_project.as_ref().map(ProjectId::as_str),
-            Some("proj")
-        );
-        assert_eq!(board.view, View::Building);
-        assert_eq!(board.pane_mode, PaneMode::Board);
-        assert!(!board.terminal_maximized);
-        assert!(board.attention_focus.as_ref().is_some_and(|focus| {
-            !focus.resolved && focus.item.reason.kind == AttentionReasonKind::ProviderQuestion
-        }));
-    }
-
-    #[test]
-    fn building_decision_enter_uses_only_a_safe_typed_recommendation() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::PausedWithWork,
-            Some("alice"),
-            Some("queued"),
-            None,
-            10,
-        );
-        board.attention = vec![item];
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('g'))),
-            Intent::Redraw
-        ));
-        let Intent::SendWithIdentity {
-            request:
-                LocalRequest::ResumeAgent {
-                    project_id,
-                    agent_id,
-                },
-            ..
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("safe recommendation was not a typed local request");
-        };
-        assert_eq!(project_id.as_str(), "proj");
-        assert_eq!(agent_id.as_str(), "alice");
-        assert_eq!(board.view, View::Building);
-    }
-
-    #[test]
-    fn permission_decision_requires_explicit_choice_and_waits_for_authoritative_projection() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderPermission,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::Redraw
-        ));
-        assert!(
-            board
-                .status
-                .as_ref()
-                .is_some_and(|status| { status.text.contains("explicit decision") })
-        );
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('1'))),
-            Intent::SendWithIdentity {
-                request: LocalRequest::TerminalInput { .. },
-                ..
-            }
-        ));
-        board.apply_operation_response(
-            0,
-            LocalRequest::Health,
-            Ok(LocalResponse::TerminalInputAccepted {
-                session_id: SessionId::try_from("session").unwrap(),
-            }),
-        );
-        assert_eq!(board.decision_items().len(), 1);
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('2'))),
-            Intent::Redraw
-        ));
-
-        let mut changed = item;
-        changed.reason.summary = "approve a different command".to_owned();
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 11,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![changed],
-        });
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('2'))),
-            Intent::SendWithIdentity {
-                request: LocalRequest::TerminalInput { .. },
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn budget_reset_has_no_default_and_requires_confirmed_keyboard_or_mouse_choice() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::BudgetExhausted,
-            Some("alice"),
-            None,
-            None,
-            10,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::Redraw
-        ));
-        assert!(matches!(board.mode, Mode::Normal));
-        assert!(
-            board
-                .status
-                .as_ref()
-                .is_some_and(|status| status.text.contains("explicit decision"))
-        );
-
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('1'))),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            board.mode,
-            Mode::Confirm(PendingAction::ResetBudget { .. })
-        ));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('n'))),
-            Intent::Redraw
-        ));
-        assert!(matches!(board.mode, Mode::Normal));
-        assert!(board.pending_attention.is_none());
-
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::AttentionChoice(item, 0)),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            board.mode,
-            Mode::Confirm(PendingAction::ResetBudget { .. })
-        ));
-        let Intent::SendWithIdentity {
-            request:
-                LocalRequest::ResetAgentBudget {
-                    project_id,
-                    agent_id,
-                },
-            ..
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("confirmed budget reset did not use the typed request");
-        };
-        assert_eq!(project_id.as_str(), "proj");
-        assert_eq!(agent_id.as_str(), "alice");
-        assert!(board.pending_attention.is_some());
-    }
-
-    #[test]
-    fn changed_budget_decision_fails_closed_during_confirmation() {
-        let mut board = board();
-        board.attention = vec![attention(
-            AttentionReasonKind::BudgetExhausted,
-            Some("alice"),
-            None,
-            None,
-            10,
-        )];
-        board.handle_key(key(KeyCode::Char('g')));
-        board.handle_key(key(KeyCode::Char('1')));
-        board.attention.clear();
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::Redraw
-        ));
-        assert!(board.pending_attention.is_none());
-        assert!(
-            board
-                .status
-                .as_ref()
-                .is_some_and(|status| status.text.contains("changed before confirmation"))
-        );
-    }
-
-    #[test]
-    fn accepted_provider_question_waits_for_unchanged_authoritative_projection() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('1'))),
-            Intent::Redraw
-        ));
-        for character in "use the stable branch".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        let Intent::SendWithIdentity {
-            operation_id,
-            request,
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("provider question did not produce an identified answer request");
-        };
-
-        board.apply_operation_response(
-            operation_id,
-            request.clone(),
-            Ok(LocalResponse::TerminalInputAccepted {
-                session_id: SessionId::try_from("session").unwrap(),
-            }),
-        );
-        assert_eq!(board.decision_items(), vec![item.clone()]);
-        assert_eq!(board.pending_attention_operation_id, Some(operation_id));
-        assert_eq!(board.pending_attention_request.as_ref(), Some(&request));
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 11,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![item],
-        });
-        assert_eq!(board.decision_items().len(), 1);
-        assert_eq!(board.pending_attention_operation_id, Some(operation_id));
-        assert!(
-            !board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| focus.resolved)
-        );
-    }
-
-    #[test]
-    fn changed_provider_question_summary_replaces_pending_source_without_retiring_card() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        board.handle_key(key(KeyCode::Char('1')));
-        for character in "use the stable branch".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        let Intent::SendWithIdentity {
-            operation_id: old_operation,
-            request: old_request,
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("provider question did not produce an identified answer request");
-        };
-
-        let mut changed = item;
-        changed.reason.summary = "Which worktree should I use?".to_owned();
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 11,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![changed.clone()],
-        });
-        assert!(board.pending_attention_operation_id.is_none());
-        assert_eq!(board.decision_items(), vec![changed]);
-        assert!(
-            board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| !focus.resolved)
-        );
-
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('1'))),
-            Intent::Redraw
-        ));
-        for character in "use the new worktree".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        let Intent::SendWithIdentity {
-            operation_id: new_operation,
-            request: new_request,
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("replacement provider question did not produce an identified request");
-        };
-        assert_ne!(old_operation, new_operation);
-        assert_ne!(old_request, new_request);
-    }
-
-    #[test]
-    fn delayed_success_and_error_cannot_clear_a_replaced_pending_source() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::PausedWithWork,
-            Some("alice"),
-            Some("queued"),
-            None,
-            10,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        let Intent::SendWithIdentity {
-            operation_id: old_operation,
-            request: old_request,
-        } = board.handle_key(key(KeyCode::Char('1')))
-        else {
-            panic!("first decision did not produce an identified request");
-        };
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 11,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        board.attention_focus = None;
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        let Intent::SendWithIdentity {
-            operation_id: new_operation,
-            request: new_request,
-        } = board.handle_key(key(KeyCode::Char('1')))
-        else {
-            panic!("replacement decision did not produce an identified request");
-        };
-        assert_ne!(old_operation, new_operation);
-        assert_eq!(old_request, new_request);
-
-        board.apply_operation_response(
-            old_operation,
-            old_request.clone(),
-            Err("late failure".into()),
-        );
-        assert_eq!(board.pending_attention_operation_id, Some(new_operation));
-        board.apply_operation_response(
-            old_operation,
-            old_request,
-            Ok(LocalResponse::AgentResumed {
-                agent: agent("alice", "proj", AgentRole::Worker, None),
-            }),
-        );
-        assert_eq!(board.pending_attention_operation_id, Some(new_operation));
-        assert_eq!(board.pending_attention_request.as_ref(), Some(&new_request));
-
-        board.apply_operation_response(
-            new_operation,
-            new_request,
-            Ok(LocalResponse::AgentResumed {
-                agent: agent("alice", "proj", AgentRole::Worker, None),
-            }),
-        );
-        assert!(board.pending_attention.is_none());
-        assert!(board.pending_attention_operation_id.is_none());
-        assert!(board.pending_attention_request.is_none());
-    }
-
-    #[test]
-    fn deserialized_attention_reason_is_bounded_and_control_safe_before_rendering() {
-        let mut board = board();
-        let mut item = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        );
-        item.reason.summary = format!("\u{1b}[31m{}\u{202e}", "hostile ".repeat(80));
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 11,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![item],
-        });
-        let rendered = &board.attention[0].reason.summary;
-        assert!(!rendered.contains('\u{1b}'));
-        assert!(!rendered.contains('\u{202e}'));
-        assert!(rendered.chars().count() <= factory_core::status::MAX_ATTENTION_SUMMARY_CHARS);
-        assert!(
-            board.attention[0].decision().cause.chars().count()
-                <= factory_core::status::MAX_ATTENTION_SUMMARY_CHARS
-        );
-    }
-
-    #[test]
-    fn provider_decision_uses_a_typed_local_answer_request_without_terminal_detour() {
-        let mut board = board();
-        board.attention = vec![attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        )];
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Enter)),
-            Intent::Redraw
-        ));
-        assert!(matches!(board.mode, Mode::Prompt(_)));
-        for character in "use the stable branch".chars() {
-            board.handle_key(key(KeyCode::Char(character)));
-        }
-        let Intent::SendWithIdentity {
-            request:
-                LocalRequest::TerminalInput {
-                    project_id,
-                    session_id,
-                    bytes,
-                },
-            ..
-        } = board.handle_key(key(KeyCode::Enter))
-        else {
-            panic!("provider decision did not become a typed local request");
-        };
-        assert_eq!(project_id.as_str(), "proj");
-        assert_eq!(session_id.as_str(), "session");
-        assert_eq!(
-            factory_core::runner::decode_terminal_bytes(&bytes).unwrap(),
-            b"use the stable branch\n"
-        );
-        assert_eq!(board.view, View::Building);
-    }
-
-    #[test]
-    fn manual_pause_decision_emits_resume_request_only_after_explicit_choice() {
-        let mut board = board();
-        board.attention = vec![attention(
-            AttentionReasonKind::PausedWithWork,
-            Some("alice"),
-            Some("queued"),
-            None,
-            10,
-        )];
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(
-            matches!(board.handle_key(key(KeyCode::Char('1'))), Intent::SendWithIdentity { request: LocalRequest::ResumeAgent { project_id, agent_id }, .. } if project_id.as_str() == "proj" && agent_id.as_str() == "alice")
-        );
-        assert_eq!(board.view, View::Building);
-    }
-
-    #[test]
-    fn mouse_choice_uses_the_same_typed_path_as_keyboard_choice() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::PausedWithWork,
-            Some("alice"),
-            Some("queued"),
-            None,
-            10,
-        );
-        board.attention = vec![item.clone()];
-        let Intent::SendWithIdentity {
-            request: LocalRequest::ResumeAgent { agent_id, .. },
-            ..
-        } = board.handle_mouse_target(MouseTarget::AttentionChoice(item, 0))
-        else {
-            panic!("mouse choice did not use the typed resume request");
-        };
-        assert_eq!(agent_id.as_str(), "alice");
-        assert_eq!(board.view, View::Building);
-    }
-
-    #[test]
-    fn machine_recovery_does_not_enter_the_building_decision_inbox() {
-        let mut board = board();
-        board.attention = vec![attention(
-            AttentionReasonKind::DeliveryRecovery,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        )];
-        assert!(board.decision_items().is_empty());
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('g'))),
-            Intent::Redraw
-        ));
-        assert!(board.attention_focus.is_none());
-    }
-
-    #[test]
-    fn ordinary_keyboard_and_mouse_navigation_clear_the_bound_attention_card() {
-        let item = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            10,
-        );
-
-        let mut keyboard = board();
-        keyboard.attention = vec![item.clone()];
-        keyboard.handle_key(key(KeyCode::Char('g')));
-        assert!(keyboard.attention_focus.is_some());
-        keyboard.handle_key(key(KeyCode::Char(']')));
-        assert_eq!(
-            keyboard.selected_agent.as_ref().map(AgentId::as_str),
-            Some("bob")
-        );
-        assert!(keyboard.attention_focus.is_none());
-
-        let mut mouse = board();
-        mouse.attention = vec![item];
-        mouse.handle_key(key(KeyCode::Char('g')));
-        assert!(mouse.attention_focus.is_some());
-        mouse.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("bob").unwrap()));
-        assert_eq!(
-            mouse.selected_agent.as_ref().map(AgentId::as_str),
-            Some("bob")
-        );
-        assert!(mouse.attention_focus.is_none());
-    }
-
-    #[test]
-    fn unattached_terminal_never_enters_typing_or_loses_keys() {
-        let mut board = board();
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.pane_ready = false;
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('i'))),
-            Intent::Redraw
-        ));
-        assert_eq!(board.pane_mode, PaneMode::Board);
-        assert!(
-            board
-                .status
-                .as_ref()
-                .is_some_and(|status| status.text.contains("not attached"))
-        );
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('q'))),
-            Intent::Quit
-        ));
-    }
-
-    #[test]
-    fn mouse_tabs_agents_and_attention_use_keyboard_state_transitions() {
-        let mut keyboard = board();
-        keyboard.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        keyboard.handle_key(key(KeyCode::Down));
-
-        let mut mouse = board();
-        mouse.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        mouse.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("bob").unwrap()));
-        assert_eq!(mouse.selected_agent, keyboard.selected_agent);
-        assert_eq!(mouse.focused_project, keyboard.focused_project);
-        assert_eq!(mouse.selected_task, keyboard.selected_task);
-
-        keyboard.handle_key(key(KeyCode::Right));
-        mouse.handle_mouse_target(MouseTarget::View(View::Agent));
-        assert_eq!(mouse.view, keyboard.view);
-        assert_eq!(mouse.pane_mode, keyboard.pane_mode);
-
-        let item = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            1,
-        );
-        keyboard.attention = vec![item.clone()];
-        mouse.attention = vec![item.clone()];
-        keyboard.selected_agent = None;
-        mouse.selected_agent = None;
-        keyboard.handle_key(key(KeyCode::Char('g')));
-        mouse.handle_mouse_target(MouseTarget::Attention(item));
-        assert_eq!(mouse.selected_agent, keyboard.selected_agent);
-        assert_eq!(mouse.selected_task, keyboard.selected_task);
-        assert_eq!(mouse.focused_project, keyboard.focused_project);
-        assert_eq!(mouse.view, keyboard.view);
-        assert_eq!(mouse.pane_mode, keyboard.pane_mode);
-        assert_eq!(mouse.attention_focus, keyboard.attention_focus);
-    }
-
-    #[test]
-    fn concurrent_resolution_marks_the_card_resolved_and_stale_click_explains_itself() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderPermission,
-            Some("alice"),
-            None,
-            Some("session"),
-            1,
-        );
-        board.attention = vec![item.clone()];
-        board.handle_key(key(KeyCode::Char('g')));
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 1,
-            occurred_at_ms: 2,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::Working),
-            },
-        });
-        assert!(board.attention_items().is_empty());
-        assert!(
-            board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| focus.resolved)
-        );
-        assert!(
-            board
-                .status
-                .as_ref()
-                .is_some_and(|status| status.text.contains("resolved"))
-        );
-
-        board.attention_focus = None;
-        board.handle_mouse_target(MouseTarget::Attention(item));
-        assert_eq!(board.view, View::Building);
-        assert_eq!(board.pane_mode, PaneMode::Board);
-        assert!(
-            board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| focus.resolved)
-        );
-    }
-
-    #[test]
-    fn delayed_fleet_status_cannot_resurrect_attention_after_a_newer_event() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderPermission,
-            Some("alice"),
-            None,
-            Some("session"),
-            1,
-        );
-        board.attention = vec![item.clone()];
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 12,
-            occurred_at_ms: 2,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::Working),
-            },
-        });
-        assert!(board.attention.is_empty());
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 11,
-            occurred_at_ms: 1,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::WaitingForInput),
-            },
-        });
-        assert_eq!(
-            board
-                .sessions
-                .get(&SessionId::try_from("session").unwrap())
-                .map(|session| session.state),
-            Some(SessionState::Working)
-        );
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 3,
-            event_sequence: 11,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![item],
-        });
-        assert!(board.attention.is_empty());
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 4,
-            event_sequence: 13,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        assert!(board.attention.is_empty());
-    }
-
-    #[test]
-    fn fleet_status_then_same_sequence_event_still_folds_state() {
-        let mut board = board();
-        let item = attention(
-            AttentionReasonKind::ProviderPermission,
-            Some("alice"),
-            None,
-            Some("session"),
-            1,
-        );
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 2,
-            event_sequence: 12,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![item],
-        });
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 12,
-            occurred_at_ms: 3,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: {
-                    let mut session =
-                        session("session", "alice", "proj", SessionState::WaitingForInput);
-                    session.last_hook_event =
-                        Some(factory_core::ProviderHookEvent::PermissionRequest);
-                    session.wait_reason = Some("approve command".into());
-                    session
-                },
-            },
-        });
-        assert_eq!(
-            board
-                .sessions
-                .get(&SessionId::try_from("session").unwrap())
-                .map(|session| session.state),
-            Some(SessionState::WaitingForInput)
-        );
-        assert_eq!(board.attention_items().len(), 1);
-    }
-
-    #[test]
-    fn same_sequence_event_then_fleet_status_restores_one_actionable_row() {
-        let mut board = board();
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 12,
-            occurred_at_ms: 2,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: {
-                    let mut session =
-                        session("session", "alice", "proj", SessionState::WaitingForInput);
-                    session.last_hook_event =
-                        Some(factory_core::ProviderHookEvent::PermissionRequest);
-                    session.wait_reason = Some("approve command".into());
-                    session
-                },
-            },
-        });
-        assert_eq!(
-            board.sessions[&SessionId::try_from("session").unwrap()].state,
-            SessionState::WaitingForInput
-        );
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 3,
-            event_sequence: 12,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![attention(
-                AttentionReasonKind::ProviderPermission,
-                Some("alice"),
-                None,
-                Some("session"),
-                1,
-            )],
-        });
-        assert_eq!(board.attention_items().len(), 1);
-        assert_eq!(
-            board.attention_items()[0].reason.kind,
-            AttentionReasonKind::ProviderPermission
-        );
-    }
-
-    #[test]
-    fn same_sequence_status_and_event_preserve_every_structured_session_reason() {
-        let cases = [
-            AttentionReasonKind::ProviderPermission,
-            AttentionReasonKind::ProviderQuestion,
-            AttentionReasonKind::ObserverProblem,
-            AttentionReasonKind::DeliveryRecovery,
-        ];
-
-        for kind in cases {
-            let item = attention(kind, Some("alice"), None, Some("session"), 1);
-            let snapshot = session_for_attention(kind);
-
-            let mut status_first = board();
-            status_first.apply_fleet_status(factory_core::status::FleetStatus {
-                generated_at_ms: 2,
-                event_sequence: 12,
-                auto_mode: true,
-                live_session_cap: 4,
-                live_sessions: 1,
-                projects: Vec::new(),
-                attention: vec![item.clone()],
-            });
-            status_first.apply_event(factory_core::EventEnvelope {
-                protocol_version: 1,
-                sequence: 12,
-                occurred_at_ms: 3,
-                event: factory_core::FactoryEvent::SessionChanged {
-                    session: snapshot.clone(),
-                },
-            });
-            assert_eq!(
-                status_first
-                    .attention_items()
-                    .iter()
-                    .map(|item| item.reason.kind)
-                    .collect::<Vec<_>>(),
-                vec![kind],
-                "status-first lost {kind:?}"
-            );
-
-            let mut event_first = board();
-            event_first.apply_event(factory_core::EventEnvelope {
-                protocol_version: 1,
-                sequence: 12,
-                occurred_at_ms: 2,
-                event: factory_core::FactoryEvent::SessionChanged { session: snapshot },
-            });
-            event_first.apply_fleet_status(factory_core::status::FleetStatus {
-                generated_at_ms: 3,
-                event_sequence: 12,
-                auto_mode: true,
-                live_session_cap: 4,
-                live_sessions: 1,
-                projects: Vec::new(),
-                attention: vec![item],
-            });
-            assert_eq!(
-                event_first
-                    .attention_items()
-                    .iter()
-                    .map(|item| item.reason.kind)
-                    .collect::<Vec<_>>(),
-                vec![kind],
-                "event-first lost {kind:?}"
-            );
-        }
-    }
-
-    fn session_for_attention(kind: AttentionReasonKind) -> factory_core::SessionSnapshot {
-        let mut snapshot = session("session", "alice", "proj", SessionState::WaitingForInput);
-        match kind {
-            AttentionReasonKind::ProviderPermission => {
-                snapshot.last_hook_event = Some(ProviderHookEvent::PermissionRequest);
-                snapshot.wait_reason = Some("approve command".into());
-            }
-            AttentionReasonKind::ProviderQuestion => {
-                snapshot.last_hook_event = Some(ProviderHookEvent::Notification);
-                snapshot.notification_kind = Some(ProviderNotificationKind::ElicitationDialog);
-                snapshot.wait_reason = Some("Which branch should I use?".into());
-            }
-            AttentionReasonKind::ObserverProblem => {
-                snapshot.state = SessionState::Working;
-                snapshot.observer_health = ObserverHealth::Degraded;
-                snapshot.observer_reason = Some("runner disconnected".into());
-            }
-            AttentionReasonKind::DeliveryRecovery => {
-                snapshot.wait_reason = Some("delivery unacknowledged".into());
-            }
-            _ => unreachable!("only session-owned structured reasons belong here"),
-        }
-        snapshot
-    }
-
-    #[test]
-    fn routine_notification_projection_has_no_tui_action_card() {
-        let mut board = board();
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 2,
-            event_sequence: -1,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        assert!(board.attention_items().is_empty());
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(board.attention_focus.is_none());
-    }
-
-    #[test]
-    fn bootstrap_high_water_rejects_an_older_delayed_status_after_replay() {
-        let mut board = board();
-        let stale = attention(
-            AttentionReasonKind::ProviderPermission,
-            Some("alice"),
-            None,
-            Some("session"),
-            1,
-        );
-        board.note_fleet_snapshot_sequence(100);
-        board.apply_replay(vec![factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 100,
-            occurred_at_ms: 2,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::Working),
-            },
-        }]);
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 3,
-            event_sequence: 90,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![stale],
-        });
-        assert!(board.attention_items().is_empty());
-    }
-
-    #[test]
-    fn legacy_unsequenced_status_remains_live_after_an_event() {
-        let mut board = board();
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 1,
-            event_sequence: -1,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        board.apply_event(factory_core::EventEnvelope {
-            protocol_version: 1,
-            sequence: 12,
-            occurred_at_ms: 2,
-            event: factory_core::FactoryEvent::SessionChanged {
-                session: session("session", "alice", "proj", SessionState::Working),
-            },
-        });
-        let fresh = attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            3,
-        );
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 3,
-            event_sequence: -1,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![fresh.clone()],
-        });
-        assert_eq!(board.attention_items(), vec![fresh]);
-    }
-
-    #[test]
-    fn client_local_attach_failure_uses_action_focus_and_clears_on_recovery() {
-        let mut board = board();
-        let session_id = SessionId::try_from("session").unwrap();
-        board.attention = vec![attention(
-            AttentionReasonKind::ProviderQuestion,
-            Some("alice"),
-            None,
-            Some("session"),
-            99,
-        )];
-        board.handle_key(key(KeyCode::Char('g')));
-        assert_eq!(
-            board.attention_focus.as_ref().unwrap().item.reason.action,
-            factory_core::status::AttentionAction::AnswerInTerminal
-        );
-        board.note_local_attach_failure(&session_id, "socket refused\n\u{1b}[2J");
-        assert!(
-            board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| focus.resolved),
-            "the previously focused provider action must become stale immediately"
-        );
-        let items = board.attention_items();
-        assert_eq!(items.len(), 1);
-        let item = &items[0];
-        assert_eq!(item.reason.kind, AttentionReasonKind::ObserverProblem);
-        assert!(
-            item.reason
-                .summary
-                .starts_with("local terminal attach failed: ")
-        );
-        assert!(!item.reason.summary.contains('\n'));
-        assert!(!item.reason.summary.contains('\u{1b}'));
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 1,
-            event_sequence: 1,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        assert_eq!(
-            board.attention_items()[0].reason.kind,
-            AttentionReasonKind::ObserverProblem
-        );
-
-        let mut daemon_observer = attention(
-            AttentionReasonKind::ObserverProblem,
-            Some("alice"),
-            None,
-            Some("session"),
-            2,
-        );
-        daemon_observer.reason.summary = "daemon terminal attach failed".to_owned();
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 2,
-            event_sequence: 2,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: vec![daemon_observer],
-        });
-        let items = board.attention_items();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].reason.summary, "daemon terminal attach failed");
-
-        board.apply_fleet_status(factory_core::status::FleetStatus {
-            generated_at_ms: 3,
-            event_sequence: 3,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: Vec::new(),
-        });
-        assert!(
-            board.attention_items()[0]
-                .reason
-                .summary
-                .starts_with("local terminal attach failed: ")
-        );
-        assert!(board.decision_items().is_empty());
-
-        board.handle_key(key(KeyCode::Char('g')));
-        assert!(
-            board
-                .attention_focus
-                .as_ref()
-                .is_some_and(|focus| focus.resolved)
-        );
-        assert_eq!(board.pane_mode, PaneMode::Board);
-
-        board.clear_local_attach_failure(&session_id);
-        assert!(board.attention_items().is_empty());
-        assert!(board.attention_focus.is_some_and(|focus| focus.resolved));
-    }
-
-    #[test]
-    fn footer_help_and_detach_use_the_keyboard_action_paths() {
-        let mut keyboard = board();
-        let mut mouse = board();
-        assert!(matches!(
-            mouse.handle_mouse_target(MouseTarget::Help),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            keyboard.handle_key(key(KeyCode::Char('?'))),
-            Intent::Redraw
-        ));
-        assert!(matches!(mouse.mode, Mode::Help));
-        assert!(matches!(keyboard.mode, Mode::Help));
-
-        let mut keyboard = board();
-        let mut mouse = board();
-        assert!(matches!(
-            mouse.handle_mouse_target(MouseTarget::Detach),
-            Intent::Quit
-        ));
-        assert!(matches!(
-            keyboard.handle_key(key(KeyCode::Char('q'))),
-            Intent::Quit
-        ));
-        assert!(mouse.quit);
-        assert_eq!(mouse.quit, keyboard.quit);
-    }
-
-    #[test]
-    fn update_keyboard_and_mouse_share_one_exact_once_guard() {
-        let mut keyboard = board();
-        keyboard.update_available = Some("0.2.6".to_owned());
-        assert!(matches!(
-            keyboard.handle_key(key(KeyCode::Char('u'))),
-            Intent::Update
-        ));
-        assert!(matches!(
-            keyboard.handle_key(key(KeyCode::Char('u'))),
-            Intent::None
-        ));
-        assert!(matches!(
-            keyboard.handle_key(key(KeyCode::Char('q'))),
-            Intent::Redraw
-        ));
-        assert!(!keyboard.quit, "detach is delayed until the updater joins");
-
-        let mut mouse = board();
-        mouse.update_available = Some("0.2.6".to_owned());
-        assert!(matches!(
-            mouse.handle_mouse_target(MouseTarget::Update),
-            Intent::Update
-        ));
-        assert!(matches!(
-            mouse.handle_mouse_target(MouseTarget::Update),
-            Intent::None
-        ));
-        assert!(matches!(
-            mouse.handle_mouse_target(MouseTarget::Detach),
-            Intent::Redraw
-        ));
-        assert!(!mouse.quit);
-    }
-
-    #[test]
-    fn task_click_selects_the_exact_visible_task_for_the_existing_task_action() {
-        let mut board = board();
-        board.apply_fleet_snapshot(
-            vec![project("proj", 0)],
-            vec![agent("alice", "proj", AgentRole::Worker, None)],
-            vec![
-                task("first", "proj", TaskStatus::Queued, Some("alice"), 1),
-                task("second", "proj", TaskStatus::Running, Some("alice"), 2),
-            ],
-            Vec::new(),
-            Vec::new(),
-        );
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.attention_focus = Some(crate::model::AttentionFocus {
-            item: attention(
-                AttentionReasonKind::ProviderQuestion,
-                Some("alice"),
-                None,
-                Some("session"),
-                1,
-            ),
-            resolved: false,
-        });
-        board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("first").unwrap()));
-        assert!(board.attention_focus.is_none());
-        board.handle_key(key(KeyCode::Char('t')));
-        assert!(matches!(
-            &board.mode,
-            Mode::TaskMenu(TaskMenuState { task_id, .. }) if task_id.as_str() == "first"
-        ));
-    }
-
-    #[test]
-    fn stale_rows_and_unready_panes_fail_closed() {
-        let mut board = board();
-        let before = board.selected_agent.clone();
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::Agent(AgentId::try_from("deleted").unwrap())),
-            Intent::None
-        ));
-        assert_eq!(board.selected_agent, before);
-
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.tasks.insert(
-            TaskId::try_from("done").unwrap(),
-            task("done", "proj", TaskStatus::Succeeded, Some("alice"), 0),
-        );
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("done").unwrap())),
-            Intent::None
-        ));
-        assert!(board.selected_task.is_none());
-
-        board.tasks.insert(
-            TaskId::try_from("retryable").unwrap(),
-            task("retryable", "proj", TaskStatus::Failed, Some("alice"), 0),
-        );
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::Task(TaskId::try_from("retryable").unwrap())),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            board.handle_key(key(KeyCode::Char('t'))),
-            Intent::Redraw
-        ));
-        assert!(matches!(
-            &board.mode,
-            Mode::TaskMenu(TaskMenuState { items, .. }) if items.contains(&"retry")
-        ));
-        board.mode = Mode::Normal;
-
-        board.view = View::Agent;
-        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
-        board.pane_mode = PaneMode::Typing;
-        board.pane_ready = false;
-        board.handle_mouse_target(MouseTarget::Pane(SessionId::try_from("session").unwrap()));
-        assert_eq!(board.pane_mode, PaneMode::Board);
-
-        board.mode = Mode::Help;
-        assert!(matches!(
-            board.handle_mouse_target(MouseTarget::View(View::Building)),
-            Intent::None
-        ));
-        assert_eq!(board.view, View::Agent);
-    }
 }

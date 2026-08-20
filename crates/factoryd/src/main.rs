@@ -1,9 +1,11 @@
 use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
+use factory_core::local::RequestCredential;
 use factoryd::{
     execution,
     lifecycle::{DaemonInstance, ShutdownSignals},
     local_api::{ApiState, serve},
+    providers::hooks,
     store::Store,
     webhook_http::{WebhookHttpMetrics, WebhookServer, bind_webhooks, load_webhook_config},
 };
@@ -36,6 +38,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let instance = DaemonInstance::claim(&config.database, &config.socket)?;
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
+    let operator_credential = RequestCredential::new(hooks::read_or_create_operator_token(
+        &config.guidance_root.join("operator.token"),
+    )?)?;
     let shutdown = ShutdownSignals::install()?;
     let (listener, socket_cleanup) = instance.bind_socket()?;
     listener.set_nonblocking(true)?;
@@ -68,7 +73,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             guidance_root: config.guidance_root,
             socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
-            session_start_deadline: execution::SESSION_START_DEADLINE,
         },
         state.clone(),
     )?;
@@ -93,6 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         state,
         execution.clone(),
         guidance_root,
+        operator_credential,
         webhooks,
         shutdown,
     );
@@ -132,6 +137,7 @@ async fn serve_control_planes(
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
+    operator_credential: RequestCredential,
     webhooks: Option<WebhookServer>,
     shutdown: ShutdownSignals,
 ) -> io::Result<()> {
@@ -141,6 +147,7 @@ async fn serve_control_planes(
         state,
         execution,
         guidance_root,
+        operator_credential,
         wait_for_stop(stop_rx.clone()),
     );
     let web = serve_optional_webhooks(webhooks, stop_rx);
@@ -334,7 +341,7 @@ fn factory_home() -> Result<PathBuf, Box<dyn Error>> {
 /// track's item 2): `cargo run -p factoryd` only builds `factoryd`
 /// itself, not its sibling binaries (`README.md`'s "get an agent working"
 /// walkthrough), so the previous behavior -- start fine, then fail every
-/// session spawn silently, forever, with no trace outside the daemon's own
+/// attempt spawn silently, forever, with no trace outside the daemon's own
 /// log -- was exactly the operator footgun this track's item 1 also had to
 /// repair defenses around. This is a stricter, cheaper, startup-time
 /// version of the same check `runner_process::spawn_runner` runs on every
