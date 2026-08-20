@@ -9,13 +9,32 @@
 
 use std::{fs, path::PathBuf};
 
-use factory_core::ProjectId;
+use factory_core::{AgentId, ProjectId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     focused_project: Option<ProjectId>,
+}
+
+/// Navigation restored after the updater replaces the TUI process image.
+/// Typing mode is deliberately not retained: the replacement returns keyboard
+/// control to the board on the same screen and selection.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RelaunchState {
+    pub focused_project: Option<ProjectId>,
+    pub selected_agent: Option<AgentId>,
+    pub agent_view: bool,
+    pub terminal_maximized: bool,
+}
+
+pub fn encode_relaunch(state: &RelaunchState) -> Result<String, String> {
+    serde_json::to_string(state).map_err(|error| error.to_string())
+}
+
+pub fn decode_relaunch(value: &str) -> Result<RelaunchState, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid --resume-state: {error}"))
 }
 
 fn path() -> Option<PathBuf> {

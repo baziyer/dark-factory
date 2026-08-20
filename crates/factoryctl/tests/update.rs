@@ -190,7 +190,7 @@ impl Fixture {
         fs::write(
             &program,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\nexit {}\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FAKE_LAUNCHCTL_LOG\"\nif test \"$1\" = print; then echo 'pid = 4242'; fi\nexit {}\n",
                 i32::from(!success)
             ),
         )
@@ -261,6 +261,7 @@ fn serve_managed_health_once(
 ) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     let version = version.to_owned();
+    let home = fs::canonicalize(home).unwrap();
     let runner = home.join("bin/current/factory-runner");
     let factoryctl = home.join("bin/current/factoryctl");
     thread::spawn(move || {
@@ -284,6 +285,65 @@ fn serve_managed_health_once(
         };
         serde_json::to_writer(&mut stream, &frame).unwrap();
         stream.write_all(b"\n").unwrap();
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn serve_unrelated_then_managed_health(
+    socket: &Path,
+    version: &str,
+    home: &Path,
+    process_id: u32,
+) -> thread::JoinHandle<usize> {
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let version = version.to_owned();
+    let home = fs::canonicalize(home).unwrap();
+    let runner = home.join("bin/current/factory-runner");
+    let factoryctl = home.join("bin/current/factoryctl");
+    thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut served = 0;
+        while served < 2 && std::time::Instant::now() < deadline {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accepting health request: {error}"),
+            };
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+                RequestEnvelope::new(LocalRequest::Health)
+            );
+            let managed = served == 1;
+            let frame = ServerFrame::Response {
+                protocol_version: PROTOCOL_VERSION,
+                response: LocalResponse::Health {
+                    runner_path: if managed {
+                        runner.to_string_lossy().into_owned()
+                    } else {
+                        "/tmp/unrelated-runner".to_owned()
+                    },
+                    factoryctl_path: if managed {
+                        factoryctl.to_string_lossy().into_owned()
+                    } else {
+                        "/tmp/unrelated-factoryctl".to_owned()
+                    },
+                    version: version.clone(),
+                    process_id: if managed { process_id } else { 7 },
+                },
+            };
+            serde_json::to_writer(&mut stream, &frame).unwrap();
+            stream.write_all(b"\n").unwrap();
+            served += 1;
+        }
+        served
     })
 }
 
@@ -349,27 +409,26 @@ fn update_is_human_readable_by_default_and_names_both_versions() {
 }
 
 #[test]
-fn human_update_output_sanitizes_manifest_text_but_json_keeps_it_exact() {
+fn hostile_manifest_text_is_rejected_and_human_error_stays_safe() {
     let fixture = Fixture::new();
     let hostile = "999.0.0-rc\u{1b}[2J\nupdate --install: forged";
     let url = fixture.publish_at(hostile, "hostile", None);
     let output = fixture.human_command(&url, &["update"]).output().unwrap();
-    assert!(
-        output.status.success(),
-        "stderr={} stdout={}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
+    assert!(!output.status.success());
     assert!(!output.stdout.contains(&0x1b_u8));
     assert_eq!(
         output.stdout.iter().filter(|&&byte| byte == b'\n').count(),
-        4
+        5
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("latest release: 999.0.0-rc?[2J?update --install: forged\n"));
+    assert!(stdout.contains("latest release: unavailable\n"));
+    assert!(stdout.contains("update error: manifest is not valid:"));
+    assert!(!stdout.contains("update --install: forged\n"));
 
-    let (_, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
-    assert_eq!(report["latest"], hostile);
+    let (code, report, _) = fixture.factoryctl_json(&url, &["update", "--json"]);
+    assert_eq!(code, 1);
+    assert!(report.get("latest").is_none());
+    assert!(report["error"].as_str().unwrap().contains("not valid"));
 }
 
 #[test]
@@ -394,11 +453,9 @@ fn matching_active_release_reports_no_install_work_human_and_json() {
         .human_command(&url, &["update", "--install"])
         .output()
         .unwrap();
-    assert!(output.status.success());
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains(&format!(
-        "update --install: installed {version} (restart the daemon yourself)\n"
-    )));
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("verified release identity"), "{stderr}");
 }
 
 #[test]
@@ -494,7 +551,7 @@ fn update_malformed_existing_capacity_restores_runtime_and_reports_unchanged_job
 }
 
 #[test]
-fn production_update_revalidates_a_candidate_after_a_competing_newer_activation() {
+fn production_update_holds_the_mutation_lock_while_downloading() {
     let fixture = Fixture::new();
     fixture.activate("0.1.0");
     let file_manifest_url = fixture.publish("0.2.0", None);
@@ -546,18 +603,20 @@ fn production_update_revalidates_a_candidate_after_a_competing_newer_activation(
     requested_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("production update reached its archive download");
-    fixture.write_binaries(&fixture.home().join("bin/0.3.0"), "0.3.0");
-    let (lock, snapshot) = factoryctl::runtime::MutationLock::begin(
+    let lock_error = match factoryctl::runtime::MutationLock::begin(
         &fixture.home(),
         &fixture
             .root
             .path()
             .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist"),
-    )
-    .unwrap();
-    assert_eq!(snapshot.active_version.as_deref(), Some("0.1.0"));
-    factoryctl::install::activate(&fixture.home(), "0.3.0").unwrap();
-    drop(lock);
+    ) {
+        Ok(_) => panic!("the update released its mutation lock during download"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        lock_error,
+        "another managed runtime mutation is already in progress"
+    );
     release_tx.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
     server.join().unwrap();
@@ -567,17 +626,20 @@ fn production_update_revalidates_a_candidate_after_a_competing_newer_activation(
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(stdout["installed"], false);
-    assert_eq!(stdout["active"], "0.3.0");
-    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.3.0");
+    assert_eq!(stdout["installed"], "0.2.0");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.2.0");
 }
 
 #[test]
 fn matching_active_runtime_and_daemon_are_a_no_op() {
     let fixture = Fixture::new();
-    let latest = factoryctl::update::CURRENT_VERSION;
-    fixture.activate(latest);
+    let latest = "999.0.0";
     let url = fixture.publish(latest, None);
+    let installed = fixture
+        .command(&url, &["update", "--install", "--json"])
+        .output()
+        .unwrap();
+    assert!(installed.status.success());
     let socket = fixture.home().join("f.sock");
     let server = serve_health_once(&socket, latest);
 
@@ -598,6 +660,91 @@ fn matching_active_runtime_and_daemon_are_a_no_op() {
     assert_eq!(stdout["health"]["version"], latest);
     assert!(String::from_utf8_lossy(&output.stderr).contains("already installed and running"));
     assert_eq!(read_link(&fixture.home().join("bin/current")), latest);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_no_op_rejects_an_unrelated_same_version_responder() {
+    let fixture = Fixture::new();
+    let latest = "999.0.0";
+    let url = fixture.publish(latest, None);
+    let installed = fixture
+        .command(&url, &["update", "--install", "--json"])
+        .output()
+        .unwrap();
+    assert!(installed.status.success());
+    fixture.write_launchd_job();
+    let (tools, log) = fixture.fake_launchctl(true);
+    let socket = fixture.home().join("f.sock");
+    let server = serve_unrelated_then_managed_health(&socket, latest, &fixture.home(), 4242);
+
+    let mut command = fixture.command(&url, &["update", "--install", "--json"]);
+    prepend_path(&mut command, &tools);
+    let output = command
+        .env("FAKE_LAUNCHCTL_LOG", &log)
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert_eq!(
+        server.join().unwrap(),
+        2,
+        "unrelated responder was accepted"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["launchd"], "unchanged");
+    assert_eq!(stdout["health"]["version"], latest);
+}
+
+#[test]
+fn healthy_same_version_daemon_never_bypasses_release_identity() {
+    let fixture = Fixture::new();
+    let latest = "999.0.0";
+    fixture.activate(latest);
+    let url = fixture.publish(latest, None);
+    let socket = fixture.home().join("f.sock");
+    let server = serve_health_once(&socket, latest);
+    let output = fixture
+        .command(&url, &["update", "--install", "--json"])
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("verified release identity"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let fixture = Fixture::new();
+    let url = fixture.publish(latest, None);
+    let installed = fixture
+        .command(&url, &["update", "--install", "--json"])
+        .output()
+        .unwrap();
+    assert!(installed.status.success());
+    let tui = fixture.home().join("bin").join(latest).join("factory-tui");
+    fs::write(&tui, "#!/bin/sh\necho tampered\n").unwrap();
+    fs::set_permissions(&tui, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = fixture.home().join("f.sock");
+    let server = serve_health_once(&socket, latest);
+    let output = fixture
+        .command(&url, &["update", "--install", "--json"])
+        .env("DARK_FACTORY_SOCKET", &socket)
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no longer matches"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -682,7 +829,7 @@ fn launchd_reload_restarts_into_the_new_active_runtime() {
     let url = fixture.publish(latest, None);
     let (tools, log) = fixture.fake_launchctl(true);
     let socket = fixture.home().join("f.sock");
-    let server = serve_health_once(&socket, latest);
+    let server = serve_unrelated_then_managed_health(&socket, latest, &fixture.home(), 4242);
 
     let mut command = fixture.command(&url, &["update", "--install", "--json"]);
     prepend_path(&mut command, &tools);
@@ -691,7 +838,11 @@ fn launchd_reload_restarts_into_the_new_active_runtime() {
         .env("DARK_FACTORY_SOCKET", &socket)
         .output()
         .unwrap();
-    server.join().unwrap();
+    assert_eq!(
+        server.join().unwrap(),
+        2,
+        "unrelated responder was not rejected"
+    );
     let stdout: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(
         output.status.success(),
@@ -746,7 +897,8 @@ fn update_reports_an_unreachable_manifest_as_an_error() {
 #[test]
 fn install_verifies_unpacks_and_activates_then_reports_no_launchd_job() {
     let fixture = Fixture::new();
-    let bad = fixture.publish("999.0.0", Some("00"));
+    let bad_sha = "00".repeat(32);
+    let bad = fixture.publish("999.0.0", Some(&bad_sha));
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args(["update", "--install"])
         .env("DARK_FACTORY_HOME", fixture.home())
