@@ -372,17 +372,23 @@ if [ "$1" = -f ]; then
 fi
 
 [ "$1" = -c ] && [ "$2" = '%d:%i' ] || exit 2
-exec "$DF_TEST_REAL_STAT" -f "$2" "$3"
+exec "$DF_TEST_REAL_STAT" "$DF_TEST_REAL_STAT_STYLE" "$2" "$3"
 EOF
 chmod +x "$stat_shim_directory/stat"
 stat_repository="$temporary/stat fallback repository"
 init_repository "$stat_repository"
 real_stat=$(command -v stat)
+if "$real_stat" -f '%d:%i' "$stat_repository" >/dev/null 2>&1; then
+    real_stat_style=-f
+else
+    real_stat_style=-c
+fi
 if ! (
     cd "$stat_repository"
     env \
         PATH="$stat_shim_directory:$PATH" \
         DF_TEST_REAL_STAT="$real_stat" \
+        DF_TEST_REAL_STAT_STYLE="$real_stat_style" \
         DF_TEST_STAT_STATE="$temporary/stat-state" \
         ./scripts/new-worktree.sh stat-fallback
 ) >"$temporary/stat-fallback.out" 2>&1; then
