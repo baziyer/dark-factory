@@ -22,9 +22,9 @@ use factory_core::{
         DEFAULT_TERMINAL_ATTACH_TAIL_BYTES, MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES,
         MAX_RUNNER_OUTPUT_TEXT_BYTES, MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES,
         MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES,
-        OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
-        RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode, TerminalSize,
-        decode_terminal_bytes, encode_terminal_bytes,
+        OutputStream, RUNNER_ACTIVATION_LOCK_FILE, RUNNER_PROTOCOL_VERSION, RequestEnvelope,
+        RunnerErrorCode, RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        TerminalAttachMode, TerminalSize, decode_terminal_bytes, encode_terminal_bytes,
     },
 };
 use nix::sys::termios::LocalFlags;
@@ -1824,6 +1824,7 @@ async fn supervise(
     stops: mpsc::Receiver<StopCommand>,
     runner_shutdown: watch::Receiver<bool>,
 ) -> Result<SupervisionOutcome, Error> {
+    wait_for_daemon_activation(&config.runtime_dir).await?;
     if *runner_shutdown.borrow() {
         return Ok(SupervisionOutcome::RunnerSignalled);
     }
@@ -1845,6 +1846,42 @@ async fn supervise(
         }
         None => supervise_piped(config, log, stops, runner_shutdown).await,
     }
+}
+
+/// Waits on the daemon-created activation inode before launching any provider
+/// bytes. Absence keeps the standalone/legacy runner contract unchanged; when
+/// present, the kernel lock is the authority and daemon exit releases it.
+async fn wait_for_daemon_activation(runtime_dir: &Path) -> Result<(), Error> {
+    let path = runtime_dir.join(RUNNER_ACTIVATION_LOCK_FILE);
+    let nofollow = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
+        .map_err(|_| Error::InvalidArguments("activation lock flags overflow".into()))?;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nofollow)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(Error::InvalidArguments(
+            "activation lock is not a private owner-only regular file".into(),
+        ));
+    }
+    tokio::task::spawn_blocking(move || -> io::Result<()> {
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive)
+            .map_err(|error| io::Error::from_raw_os_error(error.raw_os_error()))?;
+        std::fs::remove_file(path)
+    })
+    .await
+    .map_err(|error| Error::Task(format!("activation lock waiter failed: {error}")))??;
+    Ok(())
 }
 
 async fn supervise_piped(
@@ -2588,7 +2625,7 @@ mod tests {
     use super::{
         Config, DecodedChunk, Error, MAX_STARTUP_STDIN_BYTES, TERMINAL_LOG_FILE,
         TERMINAL_LOG_ROTATED_FILE, TerminalLog, attach_terminal_connection, decode_available,
-        validate_config,
+        validate_config, wait_for_daemon_activation,
     };
     use factory_core::{
         RunId, RunnerInstanceId,
@@ -2598,7 +2635,7 @@ mod tests {
             decode_terminal_bytes,
         },
     };
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     use std::time::Duration;
     use tokio::{
         fs::File,
@@ -2641,6 +2678,41 @@ mod tests {
         assert!(
             matches!(error, Error::InvalidArguments(message) if message.contains("terminal mode"))
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_lock_blocks_the_provider_boundary_until_release() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join(factory_core::runner::RUNNER_ACTIVATION_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockExclusive).unwrap();
+
+        let runtime_dir = directory.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            wait_for_daemon_activation(&runtime_dir).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the provider boundary crossed a daemon-held activation lock"
+        );
+
+        drop(file);
+        tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

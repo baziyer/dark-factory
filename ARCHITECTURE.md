@@ -229,7 +229,13 @@ catalogue.
    the path of a fresh `0600` bearer file; that endpoint fails closed without
    the exact live credential. The daemon derives project, agent, session,
    message sender, permitted recipient hierarchy, and current work ownership
-   from that bearer. Persisting session stop intent revokes the bearer in the
+   from that bearer. A new session is first committed as a version-zero,
+   unauthenticated reservation while a daemon-held kernel lock prevents its
+   runner from launching the provider; only after `spawn_runner` returns an
+   owned child does the daemon durably activate the principal and release that
+   gate. A pre-runner failure therefore remains unauthenticated even if its
+   ending transaction also fails and a bearer was copied before the private
+   runtime was removed. Persisting session stop intent revokes the bearer in the
    same durable ordering, before runner exit; completion/blocking re-check that
    principal inside their existing work-ownership transactions and repository
    operations revalidate it before admission. Before either socket is published

@@ -1339,12 +1339,35 @@ impl Store {
 
     // --- Sessions -----------------------------------------------------
 
-    /// Reserves a new resident session for an agent. One live session per
-    /// agent is enforced by `sessions_one_live_per_agent`.
+    /// Creates a new resident session whose principal is immediately active.
+    /// One live session per agent is enforced by `sessions_one_live_per_agent`.
+    /// Production runner launch uses [`Self::create_unowned_session`] instead;
+    /// this entry point remains for recovered fixtures and already-owned
+    /// lifecycle construction.
     pub fn create_session(
         &mut self,
         input: NewSession,
         now_ms: i64,
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        self.create_session_with_principal(input, now_ms, true)
+    }
+
+    /// Reserves a session row before the runner is owned, without granting
+    /// its bearer any authority. The caller must hold the runner's activation
+    /// gate until [`Self::activate_session_principal`] commits.
+    pub(crate) fn create_unowned_session(
+        &mut self,
+        input: NewSession,
+        now_ms: i64,
+    ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
+        self.create_session_with_principal(input, now_ms, false)
+    }
+
+    fn create_session_with_principal(
+        &mut self,
+        input: NewSession,
+        now_ms: i64,
+        principal_active: bool,
     ) -> Result<(SessionSnapshot, Vec<EventEnvelope>)> {
         validate_absolute_path(&input.worktree)?;
         if let Some(codex_home) = input.codex_home.as_deref() {
@@ -1416,7 +1439,7 @@ impl Store {
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
                 NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, NULL, ?13,
-                ?13, NULL, NULL, NULL, NULL, ?18, 1
+                ?13, NULL, NULL, NULL, NULL, ?18, ?19
              )",
             params![
                 input.id.as_str(),
@@ -1437,6 +1460,7 @@ impl Store {
                 input.runner_runtime,
                 i64::from(input.runner_protocol_version),
                 resumed_provider_session,
+                i64::from(principal_active),
             ],
         )?;
         transaction.execute(
@@ -1472,6 +1496,63 @@ impl Store {
                 },
             ],
         ))
+    }
+
+    /// Grants a reserved session bearer authority only after the daemon owns
+    /// its runner child. Activation is idempotent, refuses a stopping or ended
+    /// session, and re-checks live-bearer uniqueness in the same transaction.
+    pub(crate) fn activate_session_principal(&mut self, session_id: &SessionId) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (hook_token, principal_version, stop_requested_at_ms, ended_at_ms) = transaction
+            .query_row(
+                "SELECT hook_token, principal_version, stop_requested_at_ms, ended_at_ms
+                 FROM sessions WHERE id = ?1",
+                params![session_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(StoreError::SessionNotFound)?;
+        if ended_at_ms.is_some() {
+            return Err(StoreError::SessionNotLive);
+        }
+        if stop_requested_at_ms.is_some() {
+            return Err(StoreError::SessionStopping);
+        }
+        if principal_version == 1 {
+            return Ok(());
+        }
+        let bearer_already_live: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE id != ?1 AND hook_token = ?2
+                  AND ended_at_ms IS NULL AND principal_version = 1
+             )",
+            params![session_id.as_str(), hook_token],
+            |row| row.get(0),
+        )?;
+        if bearer_already_live {
+            return Err(StoreError::LiveSessionHookTokenCollision);
+        }
+        let changed = transaction.execute(
+            "UPDATE sessions SET principal_version = 1
+             WHERE id = ?1 AND ended_at_ms IS NULL
+               AND stop_requested_at_ms IS NULL AND principal_version = 0",
+            params![session_id.as_str()],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::SessionNotLive);
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Resolves an opaque bearer by scanning every live session with a

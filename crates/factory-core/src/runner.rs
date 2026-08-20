@@ -17,6 +17,10 @@ pub const MAX_RUNNER_ERROR_BYTES: usize = 16 * 1024;
 pub const MAX_RUNNER_SPOOL_BYTES: usize = 16 * 1024 * 1024;
 /// Maximum task bytes transferred from the daemon to a new runner over stdin.
 pub const MAX_STARTUP_STDIN_BYTES: usize = 1024 * 1024;
+/// Private runtime file whose kernel lock keeps a newly owned runner from
+/// launching its provider before the daemon durably activates the session
+/// principal.
+pub const RUNNER_ACTIVATION_LOCK_FILE: &str = "activation.lock";
 /// Maximum raw bytes accepted in one `TerminalInput` request, before base64
 /// encoding. Larger paste operations must be split across requests.
 pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
