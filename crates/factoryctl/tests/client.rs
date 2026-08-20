@@ -140,8 +140,9 @@ fn rejects_an_oversized_server_frame_before_parsing_json() {
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
-        stream.write_all(&vec![b'x'; MAX_FRAME_BYTES + 1]).unwrap();
-        stream.write_all(b"\n").unwrap();
+        let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
+        assert_eq!(oversized.len(), MAX_FRAME_BYTES + 1);
+        stream.write_all(&oversized).unwrap();
     });
 
     let error = Client::new(&socket)
