@@ -6,9 +6,8 @@ use std::{
 };
 
 use factory_core::local::{
-    GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
-    MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
-    ServerFrame,
+    GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
+    MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame,
 };
 use factory_core::runner::TerminalAttachMode;
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
@@ -17,6 +16,7 @@ use uuid::Uuid;
 
 mod attach;
 mod doctor;
+mod events;
 mod init;
 mod outbox;
 mod status;
@@ -172,16 +172,6 @@ const USAGE_HELP: &str = "usage: factoryctl usage
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
 result. No daemon or socket is involved and nothing is persisted; Claude's
 usage is read by running `/usage` inside Claude's own interactive terminal.";
-const EVENTS_HELP: &str = "usage: factoryctl events [--after N] [--limit N] [--follow]
-
-Read durable events from the daemon.
-
-Options:
-  --after N                Read events after this sequence (default 0)
-  --limit N                 Page size (default and max: 100; not with --follow)
-  --follow                   Stream events as they occur
-  -h, --help                  Show this help";
-
 const GIT_HELP: &str = "usage: factoryctl git <status|diff|commit|push> [options]
 
 Run Git through factoryd for the calling session's exact managed worktree and
@@ -743,7 +733,6 @@ const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
 const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
 const SESSION_LIST_LIMIT: u32 = MAX_SESSION_PAGE_ITEMS;
-const EVENT_LIST_LIMIT: u32 = MAX_EVENT_PAGE_ITEMS;
 /// Hard bound on `factoryctl hook`'s stdin payload, matching
 /// `LocalRequest::ProviderHook`'s documented 64 KiB payload limit
 /// (`factory-core/src/local.rs`).
@@ -984,11 +973,7 @@ enum CliCommand {
         token_file: String,
         event: ProviderHookEvent,
     },
-    Events {
-        after_sequence: i64,
-        limit: u32,
-        follow: bool,
-    },
+    Events(events::Command),
 }
 
 fn main() {
@@ -1070,23 +1055,10 @@ fn run() -> Result<i32, String> {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
 
-    if let CliCommand::Events {
-        after_sequence,
-        follow: true,
-        ..
-    } = command
-    {
-        for frame in client
-            .subscribe(after_sequence)
-            .map_err(|error| error.to_string())?
-        {
-            let frame = frame.map_err(|error| error.to_string())?;
-            write_frame(&mut output, &frame)?;
-            if is_error(&frame) {
-                return Ok(2);
-            }
+    if let CliCommand::Events(command) = &command {
+        if let Some(exit_code) = events::run_follow(&client, command, &mut output)? {
+            return Ok(exit_code);
         }
-        return Ok(0);
     }
 
     if let CliCommand::AgentProfileSet {
@@ -1551,12 +1523,7 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             }
             parse_hook(args).map(|command| (socket, command))
         }
-        "events" => {
-            if wants_help(&args) {
-                return Ok((socket, CliCommand::Help(EVENTS_HELP)));
-            }
-            parse_events(args).map(|command| (socket, command))
-        }
+        "events" => events::parse(args).map(|command| (socket, command)),
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
     }
 }
@@ -2270,27 +2237,6 @@ fn parse_run(mut args: Vec<String>) -> Result<CliCommand, String> {
     }
 }
 
-fn parse_events(mut args: Vec<String>) -> Result<CliCommand, String> {
-    let after_sequence = take_option(&mut args, "--after")?
-        .map(|value| parse_number(&value, "--after"))
-        .transpose()?
-        .unwrap_or(0);
-    if after_sequence < 0 {
-        return Err("--after must be zero or greater".into());
-    }
-    let (limit, explicit_limit) = take_limit(&mut args, EVENT_LIST_LIMIT, MAX_EVENT_PAGE_ITEMS)?;
-    let follow = take_flag(&mut args, "--follow")?;
-    if follow && explicit_limit {
-        return Err("--limit cannot be used with --follow".into());
-    }
-    require_empty(&args)?;
-    Ok(CliCommand::Events {
-        after_sequence,
-        limit,
-        follow,
-    })
-}
-
 fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     match command {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
@@ -2669,18 +2615,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             grace_ms,
         }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
-        CliCommand::Events {
-            after_sequence,
-            limit,
-            follow,
-        } => Ok(if follow {
-            LocalRequest::Subscribe { after_sequence }
-        } else {
-            LocalRequest::EventsAfter {
-                sequence: after_sequence,
-                limit,
-            }
-        }),
+        CliCommand::Events(command) => Ok(events::request(command)),
     }
 }
 
@@ -3065,7 +3000,7 @@ mod tests {
         );
         assert_eq!(
             parse_args(args(&["events", "--help"])).unwrap().1,
-            CliCommand::Help(EVENTS_HELP)
+            CliCommand::Help(events::HELP)
         );
         assert_eq!(
             parse_args(args(&["attach", "--help"])).unwrap().1,
@@ -3963,19 +3898,6 @@ mod tests {
     }
 
     #[test]
-    fn events_follow_is_an_explicit_subscription() {
-        let (_, command) = parse_args(args(&["events", "--after", "12", "--follow"])).unwrap();
-        assert_eq!(
-            command,
-            CliCommand::Events {
-                after_sequence: 12,
-                limit: EVENT_LIST_LIMIT,
-                follow: true,
-            }
-        );
-    }
-
-    #[test]
     fn usage_parses_with_no_arguments() {
         let (_, command) = parse_args(args(&["usage"])).unwrap();
         assert_eq!(command, CliCommand::Usage);
@@ -4058,12 +3980,6 @@ mod tests {
             ]))
             .is_err()
         );
-    }
-
-    #[test]
-    fn events_follow_rejects_an_explicit_limit() {
-        let error = parse_args(args(&["events", "--follow", "--limit", "1"])).unwrap_err();
-        assert_eq!(error, "--limit cannot be used with --follow");
     }
 
     #[test]
