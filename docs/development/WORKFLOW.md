@@ -30,34 +30,43 @@ inside the object, so it cannot remove a new owner. A nested child refuses
 through the inherited owner contract.
 
 Direct load-bearing commands must use the same seam, for example:
-`./scripts/with-local-ci-lease.sh cargo +1.88.0 test -p factoryd
---test sessions_e2e -- --test-threads=1`. The wrapper refuses nested use from
-inside an existing owner; direct lifecycle, PTY, and release-probe commands
-must not bypass it. The focused lease checks run as the first step inside the
+`./scripts/run-focused-test.sh cargo +1.88.0 test -p factoryd --test
+sessions_e2e -- --test-threads=1`. The wrapper acquires the macOS repository
+lease, builds an empty private Cargo target with the pinned command, captures
+the two deployable siblings into a private per-invocation directory, and keeps
+that lease until every consumer launch exits. The Ubuntu `--linux-source` mode
+uses the same wrapper without recursive macOS `lockf`; it is the source-preview
+path. Direct lifecycle, PTY, and release-probe commands must use the lease
+seam too. The focused lease checks run as the first step inside the
 authoritative gate. The CI workflow's `always()` step-summary writer is
 reporting-only and runs after that single gate command; it does not invoke,
 bypass, or release the lease. The summary contract is checked by
-`local-ci.sh` while the lease is held. The Ubuntu `--linux-source` preview skips
-this macOS-specific lease harness and its release fixtures; GitHub runs that
-mode in an isolated hosted job.
+`local-ci.sh` while the lease is held.
 
 `./scripts/local-ci.sh --fingerprint` prints the exact ordered phase manifest
 without acquiring the lease or running a command. The
 `test-local-ci-fingerprint.sh` phase compares that manifest with a checked-in
 expected list, so deleting, duplicating, or silently replacing a release,
-source, binary, test, or diff phase fails before the gate can claim equivalent
-coverage. During a real gate each phase reports a wall-clock elapsed duration;
-the output is diagnostic timing only and does not alter ordering or failure
-status.
+source, binary, test, or diff phase fails before the gate can claim that its
+phase ordering is unchanged. This is a characterization of the checked-in
+phase commands, not a generated equivalence proof for Cargo packages, targets,
+harnesses, or test counts; those remain evidenced by the real gate output.
+During a real gate each phase reports a wall-clock elapsed duration; the output
+is diagnostic timing only and does not alter ordering or failure status.
 
 The two factoryd resident-session integration tests use one explicit binary
-seam. Run `./scripts/prepare-test-binaries.sh` through the lease before a
-focused `sessions_e2e` or `session_start_deadline` command. It builds the exact
-locked workspace test profile once with `--no-run`, and the shared test helper
-accepts only executable siblings of the exact `factoryd` test binary in that
-target directory. The tests never invoke Cargo themselves and never resolve a
-binary through `PATH`; the focused command must still use
-`./scripts/with-local-ci-lease.sh`.
+seam. The wrapper's real pinned `cargo +1.88.0 test --locked --workspace
+--all-targets --no-run` starts with an empty private target and must produce
+top-level `factory-runner` and `factoryctl`. It then records regular
+non-symlink identities and SHA-256 digests for private copies and passes only
+their exact paths and expected values through the focused test environment.
+The Rust consumer revalidates those values immediately before every daemon,
+runner, or factoryctl boundary. Repository worktree, git directory, common
+directory, revision, dirty-state, target, and Cargo/Rust configuration are
+checked within the same uninterrupted lease; custom target JSON and path
+configuration are rejected. No mutable trust manifest is placed in a shared
+Cargo target, and the tests never invoke Cargo themselves or resolve a binary
+through `PATH`.
 
 After the macOS lease records its diagnostic owner, the single `local-ci.sh`
 entry boundary removes inherited Dark Factory home, socket, and task/session

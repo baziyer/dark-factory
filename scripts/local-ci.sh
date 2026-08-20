@@ -99,9 +99,11 @@ local_ci_phase build-headroom-tests ./scripts/test-build-headroom.sh
 # seam explicit so a platform mode cannot silently omit a core check.
 local_ci_phase workflow-summary ./scripts/test-github-step-summary.sh
 local_ci_phase phase-fingerprint ./scripts/test-local-ci-fingerprint.sh
-local_ci_phase binary-contract ./scripts/test-prepare-test-binaries.sh
+local_ci_phase focused-contract ./scripts/test-run-focused-test.sh
+if [ "$mode" = macos ]; then
+    local_ci_phase focused-lease ./scripts/test-focused-binary-lease.sh
+fi
 local_ci_phase fmt cargo +1.88.0 fmt --all -- --check
 local_ci_phase clippy cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
-local_ci_phase test-binaries ./scripts/prepare-test-binaries.sh
-local_ci_phase workspace-tests cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1
+local_ci_phase focused-tests ./scripts/run-focused-test.sh "$mode" cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1
 local_ci_phase diff-check git diff --check

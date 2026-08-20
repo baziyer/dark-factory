@@ -15,11 +15,11 @@ expected=$(printf '%s\n' \
     'build-headroom-tests|./scripts/test-build-headroom.sh' \
     'workflow-summary|./scripts/test-github-step-summary.sh' \
     'phase-fingerprint|./scripts/test-local-ci-fingerprint.sh' \
-    'binary-contract|./scripts/test-prepare-test-binaries.sh' \
+    'focused-contract|./scripts/test-run-focused-test.sh' \
+    'focused-lease|./scripts/test-focused-binary-lease.sh' \
     'fmt|cargo +1.88.0 fmt --all -- --check' \
     'clippy|cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings' \
-    'test-binaries|./scripts/prepare-test-binaries.sh' \
-    'workspace-tests|cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1' \
+    'focused-tests|./scripts/run-focused-test.sh macos cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1' \
     'diff-check|git diff --check')
 
 if [ "$actual" != "$expected" ]; then
@@ -36,11 +36,10 @@ linux_expected=$(printf '%s\n' \
     'build-headroom-tests|./scripts/test-build-headroom.sh' \
     'workflow-summary|./scripts/test-github-step-summary.sh' \
     'phase-fingerprint|./scripts/test-local-ci-fingerprint.sh' \
-    'binary-contract|./scripts/test-prepare-test-binaries.sh' \
+    'focused-contract|./scripts/test-run-focused-test.sh' \
     'fmt|cargo +1.88.0 fmt --all -- --check' \
     'clippy|cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings' \
-    'test-binaries|./scripts/prepare-test-binaries.sh' \
-    'workspace-tests|cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1' \
+    'focused-tests|./scripts/run-focused-test.sh --linux-source cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1' \
     'diff-check|git diff --check')
 if [ "$linux_actual" != "$linux_expected" ]; then
     echo 'Linux source phase fingerprint changed:' >&2
