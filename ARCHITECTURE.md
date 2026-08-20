@@ -91,7 +91,7 @@ catalogue.
    exact acknowledged identity is the idempotency receipt; run counts and task
    status are not evidence that a prompt landed. A crash while still
    `delivering` may retry the stored attempt, while `uncertain` is never
-   replayed because submission may already have been accepted. Each typed
+   replayed because submission may already have been accepted.
    A delivery timeout may project `waiting_for_input` only while that exact
    attempt still owns `uncertain`; an acknowledgement that reaches `running`
    first wins the same durable fence and cannot be overwritten by the timeout.
