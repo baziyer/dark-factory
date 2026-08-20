@@ -10,8 +10,8 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, ProviderHookEvent, RunId,
-    SessionId,
+    AgentId, AgentRole, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+    ProviderHookEvent, RunId, SessionId,
     local::{
         AgentDetail as LocalAgentDetail, AgentMessage as LocalAgentMessage,
         AgentProfile as LocalAgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
@@ -1199,6 +1199,9 @@ async fn handle_request(
             }
             execution.end_project_write(&created_project_id);
             let agent = create_result?;
+            if agent.role == AgentRole::Orchestrator {
+                execution.wake_orchestrator(created_project_id).await?;
+            }
             Ok(LocalResponse::AgentCreated { agent })
         }
         LocalRequest::ListAgents {
@@ -1482,12 +1485,14 @@ async fn handle_request(
             project_id,
             task_id,
         } => {
+            let wake_project_id = project_id.clone();
             let task = state
                 .commit_and_publish(move |store| {
                     let (task, event) = store.cancel_task(&project_id, &task_id, now_ms()?)?;
                     Ok((task, vec![event]))
                 })
                 .await?;
+            execution.wake_orchestrator(wake_project_id).await?;
             Ok(LocalResponse::TaskCancelled { task })
         }
         LocalRequest::UpdateTask {
@@ -1730,12 +1735,16 @@ async fn handle_request(
         }
         LocalRequest::CancelRun { project_id, run_id } => {
             let response_run_id = run_id.clone();
-            state
+            let wake_project_id = project_id.clone();
+            let should_wake = state
                 .commit_and_publish(move |store| {
                     let closed = store.cancel_run(&project_id, &run_id, now_ms()?)?;
-                    Ok(((), closed.events))
+                    Ok((closed.orchestrator_wake, closed.events))
                 })
                 .await?;
+            if should_wake {
+                execution.wake_orchestrator(wake_project_id).await?;
+            }
             Ok(LocalResponse::RunCancelled {
                 run_id: response_run_id,
             })
@@ -1750,12 +1759,16 @@ async fn handle_request(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
                 )));
             }
-            let task = state
+            let wake_project_id = project_id.clone();
+            let (task, should_wake) = state
                 .commit_and_publish(move |store| {
                     let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
-                    Ok((closed.task, closed.events))
+                    Ok(((closed.task, closed.orchestrator_wake), closed.events))
                 })
                 .await?;
+            if should_wake {
+                execution.wake_orchestrator(wake_project_id).await?;
+            }
             Ok(LocalResponse::TaskCompleted { task })
         }
         LocalRequest::BlockTask {
@@ -1768,12 +1781,16 @@ async fn handle_request(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
                 )));
             }
-            let task = state
+            let wake_project_id = project_id.clone();
+            let (task, should_wake) = state
                 .commit_and_publish(move |store| {
                     let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
-                    Ok((closed.task, closed.events))
+                    Ok(((closed.task, closed.orchestrator_wake), closed.events))
                 })
                 .await?;
+            if should_wake {
+                execution.wake_orchestrator(wake_project_id).await?;
+            }
             Ok(LocalResponse::TaskBlocked { task })
         }
         LocalRequest::PauseAgent {

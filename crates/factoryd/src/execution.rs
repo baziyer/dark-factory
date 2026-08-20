@@ -114,6 +114,7 @@ const MAX_DELIVERY_TEXT_BYTES: usize = 48_000;
 /// prompt in `UserPromptSubmit`; if they normalize away the nonce, the
 /// daemon refuses to guess and leaves the attempt uncertain instead.
 pub(crate) const DELIVERY_ATTEMPT_MARKER: &str = "\u{2063}dark-factory-attempt:";
+const ORCHESTRATOR_CYCLE_INSTRUCTION: &str = "A bounded orchestration cycle is due. Inspect the durable project state and refill only pre-created work.";
 /// Per-task-body budget inside a composed delivery, leaving room for
 /// guidance sections within [`MAX_DELIVERY_TEXT_BYTES`].
 const MAX_DELIVERY_TASK_BODY_BYTES: usize = 16_384;
@@ -264,12 +265,26 @@ pub enum Error {
 struct WakeAgent {
     project_id: ProjectId,
     agent_id: AgentId,
+    include_orchestrator_cycle: bool,
 }
 
 fn send_wake(wake_tx: &mpsc::Sender<WakeAgent>, project_id: ProjectId, agent_id: AgentId) {
     let _ = wake_tx.try_send(WakeAgent {
         project_id,
         agent_id,
+        include_orchestrator_cycle: false,
+    });
+}
+
+fn send_scheduler_wake(
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    project_id: ProjectId,
+    agent_id: AgentId,
+) {
+    let _ = wake_tx.try_send(WakeAgent {
+        project_id,
+        agent_id,
+        include_orchestrator_cycle: true,
     });
 }
 
@@ -424,6 +439,7 @@ impl Handle {
                 require_queue_head: false,
                 message_ids: messages.iter().map(|message| message.id.clone()).collect(),
                 text,
+                orchestrator_cycle_lease_id: None,
             },
             now_ms()?,
         )
@@ -567,6 +583,24 @@ impl Handle {
     /// a full wake queue silently defers to the 5 second safety tick.
     pub fn wake(&self, project_id: ProjectId, agent_id: AgentId) {
         send_wake(&self.wake_tx, project_id, agent_id);
+    }
+
+    /// Resolves and wakes exactly one current orchestrator. A missing or held
+    /// role leaves the durable scheduler range untouched for a later role or
+    /// session transition.
+    pub(crate) async fn wake_orchestrator(
+        &self,
+        project_id: ProjectId,
+    ) -> Result<(), DaemonStateError> {
+        let lookup_project_id = project_id.clone();
+        let agent_id = self
+            .state
+            .with_store(move |store| store.current_orchestrator(&lookup_project_id))
+            .await?;
+        if let Some(agent_id) = agent_id {
+            send_scheduler_wake(&self.wake_tx, project_id, agent_id);
+        }
+        Ok(())
     }
 
     /// Waits for all delivery work owned by `agent_id` to finish. Local API
@@ -1118,6 +1152,14 @@ async fn run_dispatcher(
         })
         .await?;
     recover_sessions(&state, &wake_tx, &shutdown_rx).await;
+    if let Ok(wakes) = state
+        .with_store(|store| store.pending_orchestrator_wakes())
+        .await
+    {
+        for (project_id, agent_id) in wakes {
+            send_scheduler_wake(&wake_tx, project_id, agent_id);
+        }
+    }
 
     let mut tick = tokio::time::interval(TICK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1129,11 +1171,24 @@ async fn run_dispatcher(
                 }
             }
             woken = wake_rx.recv() => {
-                let Some(WakeAgent { project_id, agent_id }) = woken else {
+                let Some(WakeAgent {
+                    project_id,
+                    agent_id,
+                    include_orchestrator_cycle,
+                }) = woken else {
                     return Ok(());
                 };
                 if let Err(error) =
-                    dispatch_agent(&config, &state, &wake_tx, &backoff, &project_id, &agent_id).await
+                    dispatch_agent_with_scheduler(
+                        &config,
+                        &state,
+                        &wake_tx,
+                        &backoff,
+                        &project_id,
+                        &agent_id,
+                        include_orchestrator_cycle,
+                    )
+                    .await
                 {
                     tracing::warn!(%error, %project_id, %agent_id, "dispatch failed");
                 }
@@ -1225,6 +1280,19 @@ async fn dispatch_agent(
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<(), Error> {
+    dispatch_agent_with_scheduler(config, state, wake_tx, backoff, project_id, agent_id, false)
+        .await
+}
+
+async fn dispatch_agent_with_scheduler(
+    config: &Config,
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    backoff: &SpawnBackoff,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+    include_orchestrator_cycle: bool,
+) -> Result<(), Error> {
     let hold_project_id = project_id.clone();
     let hold_agent_id = agent_id.clone();
     let held = match state
@@ -1247,7 +1315,7 @@ async fn dispatch_agent(
 
     match live {
         None => {
-            if has_pending_work(state, project_id, agent_id).await? {
+            if has_pending_work(state, project_id, agent_id, include_orchestrator_cycle).await? {
                 // Backoff (this track's item 1): a persistently broken
                 // spawn path must not busy-retry on every wake/tick --
                 // `backoff.ready` silently declines attempts still inside
@@ -1587,6 +1655,7 @@ async fn has_pending_work(
     state: &DaemonState,
     project_id: &ProjectId,
     agent_id: &AgentId,
+    include_orchestrator_cycle: bool,
 ) -> Result<bool, Error> {
     let hold_project_id = project_id.clone();
     let hold_agent_id = agent_id.clone();
@@ -1595,6 +1664,20 @@ async fn has_pending_work(
         .await?
     {
         return Ok(false);
+    }
+    if include_orchestrator_cycle {
+        let scheduler_project_id = project_id.clone();
+        let scheduler_agent_id = agent_id.clone();
+        let scheduler_pending = state
+            .with_store(move |store| {
+                Ok(store.current_orchestrator(&scheduler_project_id)?.as_ref()
+                    == Some(&scheduler_agent_id)
+                    && store.orchestrator_cycle_pending(&scheduler_project_id)?)
+            })
+            .await?;
+        if scheduler_pending {
+            return Ok(true);
+        }
     }
     let task_project_id = project_id.clone();
     let task_agent_id = agent_id.clone();
@@ -2124,6 +2207,7 @@ struct Delivery {
     require_queue_head: bool,
     message_ids: Vec<factory_core::MessageId>,
     text: String,
+    orchestrator_cycle_lease_id: Option<String>,
 }
 
 impl Delivery {
@@ -2136,6 +2220,7 @@ impl Delivery {
             require_queue_head: false,
             message_ids: attempt.message_ids.clone(),
             text: attempt.text.clone(),
+            orchestrator_cycle_lease_id: attempt.orchestrator_cycle_lease_id.clone(),
         }
     }
 }
@@ -2149,6 +2234,30 @@ async fn compose_delivery(
     let guidance_root = guidance_root.to_path_buf();
     let project_id = project_id.clone();
     let agent_id = agent_id.clone();
+    let cycle_project_id = project_id.clone();
+    let cycle_agent_id = agent_id.clone();
+    if let Some(lease) = state
+        .commit_and_publish(move |store| {
+            let lease = store.claim_orchestrator_cycle(
+                &cycle_project_id,
+                &cycle_agent_id,
+                now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
+            )?;
+            Ok((lease, Vec::new()))
+        })
+        .await?
+    {
+        return Ok(Some(Delivery {
+            task_id: None,
+            task_incarnation_id: None,
+            task_revision: None,
+            run_id: None,
+            require_queue_head: false,
+            message_ids: Vec::new(),
+            text: ORCHESTRATOR_CYCLE_INSTRUCTION.to_owned(),
+            orchestrator_cycle_lease_id: Some(lease.lease_id),
+        }));
+    }
     state
         .with_store(move |store| {
             if store.agent_is_held(&project_id, &agent_id)? {
@@ -2190,6 +2299,7 @@ async fn compose_delivery(
                 require_queue_head,
                 message_ids: messages.iter().map(|message| message.id.clone()).collect(),
                 text,
+                orchestrator_cycle_lease_id: None,
             }))
         })
         .await
@@ -2204,6 +2314,7 @@ async fn ensure_delivery_attempt(
     now_ms: i64,
 ) -> Result<DeliveryAttempt, DaemonStateError> {
     let id = Uuid::new_v4().hyphenated().to_string();
+    let cycle_lease_id = delivery.orchestrator_cycle_lease_id.clone();
     let input = NewDeliveryAttempt {
         id: id.clone(),
         project_id: project_id.clone(),
@@ -2223,6 +2334,11 @@ async fn ensure_delivery_attempt(
     state
         .commit_and_publish(move |store| {
             let attempt = store.ensure_delivery_attempt(input)?;
+            if let Some(lease_id) = cycle_lease_id
+                && attempt.orchestrator_cycle_lease_id.is_none()
+            {
+                store.bind_orchestrator_cycle_attempt(&lease_id, &attempt.id, now_ms)?;
+            }
             Ok((attempt, Vec::new()))
         })
         .await
@@ -2954,20 +3070,23 @@ async fn end_session_now(
         })
         .await;
     match result {
-        Ok(snapshot) if snapshot.state == SessionState::Stopped => {
-            // A clean/operator-requested end frees its agent up: if other
-            // work is still queued, re-dispatch now rather than waiting for
-            // the safety tick (design's "session spawned/ended" wake
-            // trigger).
-            send_wake(wake_tx, snapshot.project_id, snapshot.agent_id);
-        }
-        Ok(_) => {
-            // A crash (`Failed`) deliberately does *not* get an immediate
-            // re-wake: if spawning is persistently broken (a missing/
-            // misconfigured provider binary), an immediate retry loop would
-            // busy-spin spawn attempts as fast as they fail. The 5 second
-            // safety tick still retries -- just rate-limited to once per
-            // tick instead of unbounded.
+        Ok(snapshot) => {
+            let project_id = snapshot.project_id.clone();
+            if snapshot.state == SessionState::Stopped {
+                // A clean/operator-requested end frees its agent up: if other
+                // work is still queued, re-dispatch now rather than waiting for
+                // the safety tick (design's "session spawned/ended" wake
+                // trigger).
+                send_wake(wake_tx, project_id.clone(), snapshot.agent_id);
+            } else {
+                // A crash (`Failed`) deliberately does *not* get an immediate
+                // re-wake: if spawning is persistently broken (a missing/
+                // misconfigured provider binary), an immediate retry loop would
+                // busy-spin spawn attempts as fast as they fail. The 5 second
+                // safety tick still retries -- just rate-limited to once per
+                // tick instead of unbounded.
+            }
+            wake_current_orchestrator(state, wake_tx, project_id).await;
         }
         Err(error) => {
             // A session already ended by another path (an operator
@@ -2975,6 +3094,20 @@ async fn end_session_now(
             // attempt) lands here too; not worth escalating.
             tracing::debug!(%error, "end_session did not apply");
         }
+    }
+}
+
+async fn wake_current_orchestrator(
+    state: &DaemonState,
+    wake_tx: &mpsc::Sender<WakeAgent>,
+    project_id: ProjectId,
+) {
+    let lookup_project_id = project_id.clone();
+    if let Ok(Some(agent_id)) = state
+        .with_store(move |store| store.current_orchestrator(&lookup_project_id))
+        .await
+    {
+        send_scheduler_wake(wake_tx, project_id, agent_id);
     }
 }
 
@@ -5741,6 +5874,7 @@ mod tests {
             require_queue_head: false,
             message_ids: Vec::new(),
             text: "old task body".to_owned(),
+            orchestrator_cycle_lease_id: None,
         };
         let aba_attempt = store
             .ensure_delivery_attempt(NewDeliveryAttempt {
@@ -5797,6 +5931,7 @@ mod tests {
             require_queue_head: false,
             message_ids: Vec::new(),
             text: "already delivered".to_owned(),
+            orchestrator_cycle_lease_id: None,
         };
         let race_attempt = store
             .ensure_delivery_attempt(NewDeliveryAttempt {
@@ -5925,6 +6060,7 @@ mod tests {
             require_queue_head: false,
             message_ids: Vec::new(),
             text: "cancelled retry".to_owned(),
+            orchestrator_cycle_lease_id: None,
         };
         let cancelled_attempt = test_delivery_attempt(
             &state,
@@ -5991,6 +6127,7 @@ mod tests {
             require_queue_head: false,
             message_ids: Vec::new(),
             text: "blocked by another run".to_owned(),
+            orchestrator_cycle_lease_id: None,
         };
         let unavailable_attempt = test_delivery_attempt(
             &state,
