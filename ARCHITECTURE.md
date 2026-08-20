@@ -165,7 +165,13 @@ catalogue.
    preserving or explicitly resolving dirty work. Fleet attention snapshots carry the
    durable event high-water mark from the same store read, so a delayed
    snapshot cannot overwrite a resolution already observed on the event
-   stream.
+   stream. The TUI also binds an in-flight decision to its exact operation,
+   request, and source: once a durable projection retires that identity, a
+   delayed successful response cannot fold its older payload over newer task
+   state. Completed task decisions are invalidated by durable `TaskChanged`
+   transitions, so a queued task that blocks again within the same millisecond
+   is a new decision without treating summary text or wall-clock precision as
+   identity.
    The agent's `current_session_id` is the exact live-session relation used
    by BUILDING activity: it is derived from sessions whose `ended_at_ms` is
    null, and session create/end transactions publish the matching

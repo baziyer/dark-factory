@@ -1787,6 +1787,13 @@ mod tests {
         );
         assert!(board.pending_attention.is_none());
         assert!(board.decision_items().is_empty());
+        assert_eq!(
+            board
+                .tasks
+                .get(&TaskId::try_from("blocked").unwrap())
+                .map(|task| task.snapshot.status),
+            Some(TaskStatus::Queued)
+        );
         assert!(
             board
                 .attention_focus
@@ -1842,6 +1849,110 @@ mod tests {
         );
         assert!(board.pending_attention.is_none());
         assert!(board.decision_items().is_empty());
+    }
+
+    #[test]
+    fn blocked_task_retry_delayed_success_cannot_regress_a_newer_task_projection() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board
+            .tasks
+            .insert(blocked.snapshot.id.clone(), blocked.clone());
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+
+        let newer = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 12);
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 12,
+            event: factory_core::FactoryEvent::TaskChanged {
+                task: newer.snapshot.clone(),
+            },
+        });
+        assert!(board.pending_attention.is_none());
+        assert_eq!(board.tasks.get(&newer.snapshot.id), Some(&newer));
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert_eq!(board.tasks.get(&newer.snapshot.id), Some(&newer));
+    }
+
+    #[test]
+    fn blocked_task_retry_same_timestamp_reblock_is_a_new_decision() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+        let queued = task("blocked", "proj", TaskStatus::Queued, Some("alice"), 10);
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: queued.clone(),
+            }),
+        );
+        assert!(board.decision_items().is_empty());
+
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 10,
+            event: factory_core::FactoryEvent::TaskChanged {
+                task: queued.snapshot,
+            },
+        });
+        let reblocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 2,
+            occurred_at_ms: 10,
+            event: factory_core::FactoryEvent::TaskChanged {
+                task: reblocked.snapshot,
+            },
+        });
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 10,
+            event_sequence: 2,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: vec![item.clone()],
+        });
+        assert_eq!(board.decision_items(), vec![item]);
     }
 
     #[test]

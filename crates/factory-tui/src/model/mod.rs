@@ -61,6 +61,8 @@ const STATUS_TEXT_MAX_CHARS: usize = 64;
 /// from counting activity twice. This exceeds the connect-time replay batch while remaining
 /// bounded for a long-running board.
 const EVENT_DEDUPE_CAPACITY: usize = 1_024;
+/// How many completed or abandoned decision operations the client remembers.
+const ATTENTION_HISTORY_CAPACITY: usize = 32;
 
 // ---------------------------------------------------------------------------------------------
 // Small enums
@@ -104,6 +106,13 @@ struct ActivityIdentity {
 struct AttachIdentity {
     project_id: ProjectId,
     runner_instance_id: Option<RunnerInstanceId>,
+}
+
+struct StaleAttentionOperation {
+    source: AttentionItem,
+    action: AttentionAction,
+    operation_id: u64,
+    request: LocalRequest,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -178,6 +187,9 @@ pub struct Board {
     pending_attention_action: Option<factory_core::status::AttentionAction>,
     pending_attention_operation_id: Option<u64>,
     pending_attention_request: Option<LocalRequest>,
+    /// Abandoned decision operations whose delayed response must not mutate
+    /// a newer projection. Ordinary task-menu operations are never recorded.
+    stale_attention_operations: Vec<StaleAttentionOperation>,
     next_operation_id: u64,
     /// Recently completed exact sources suppressed until a newer projection
     /// proves a new decision exists.
@@ -238,6 +250,7 @@ impl Board {
             pending_attention_action: None,
             pending_attention_operation_id: None,
             pending_attention_request: None,
+            stale_attention_operations: Vec::new(),
             next_operation_id: 1,
             completed_attention: Vec::new(),
             mode: Mode::Normal,
@@ -1079,6 +1092,11 @@ impl Board {
                     && item.reason.kind == AttentionReasonKind::PausedWithWork
             }),
             FactoryEvent::TaskChanged { task } => {
+                // The event sequence is the durable transition identity. Do
+                // not use millisecond timestamps: queued and re-blocked can
+                // be committed within the same clock tick.
+                self.completed_attention
+                    .retain(|item| item.task_id.as_ref() != Some(&task.id));
                 self.invalidate_attention(|item| item.task_id.as_ref() == Some(&task.id));
             }
             FactoryEvent::RunChanged { run } => {
@@ -1262,6 +1280,15 @@ impl Board {
             LocalResponse::TaskRetried { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
+                if let Some(stale) = self.take_stale_attention_operation(operation_id, request) {
+                    let exact_source = stale.action == AttentionAction::RetryTask
+                        && stale.source.task_id.as_ref() == Some(&id);
+                    return if exact_source {
+                        format!("ignored stale retry response for task#{id}")
+                    } else {
+                        "ignored stale attention response".to_owned()
+                    };
+                }
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 self.complete_attention_request_if(
                     operation_id,
