@@ -229,12 +229,16 @@ catalogue.
    the path of a fresh `0600` bearer file; that endpoint fails closed without
    the exact live credential. The daemon derives project, agent, session,
    message sender, permitted recipient hierarchy, and current work ownership
-   from that bearer. Before either socket is published after this boundary is
-   installed, every preserved version-zero session is stopped and reconciled
-   through its runner, so an old provider environment can never fall back to
-   the operator socket by omitting a credential. All other local operations,
-   including observation and subscriptions, remain operator-only until a later
-   capability tranche can add their projections without widening this seam.
+   from that bearer. Persisting session stop intent revokes the bearer in the
+   same durable ordering, before runner exit; completion/blocking re-check that
+   principal inside their existing work-ownership transactions and repository
+   operations revalidate it before admission. Before either socket is published
+   after this boundary is installed, every preserved version-zero session is
+   stopped and reconciled through its runner, so an old provider environment
+   can never fall back to the operator socket by omitting a credential. All
+   other local operations, including observation and subscriptions, remain
+   operator-only until a later capability tranche can add their projections
+   without widening this seam.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
    message is a durable write before it wakes the orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals

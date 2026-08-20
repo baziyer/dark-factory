@@ -2479,6 +2479,57 @@ fn a_different_live_session_cannot_complete_another_sessions_task() {
 }
 
 #[test]
+fn stopping_session_cannot_complete_or_block_its_open_episode() {
+    for action in ["complete", "block"] {
+        let mut store = fixture();
+        let (session, _) = store
+            .create_session(new_session("stopping", "factory", "curie"), 5)
+            .unwrap();
+        store
+            .open_run_episode(&session.id, &task_id("task-1"), 6)
+            .unwrap();
+        store
+            .request_session_stop(&project_id("factory"), &session.id, 7)
+            .unwrap();
+
+        let result = match action {
+            "complete" => store.complete_task(
+                &project_id("factory"),
+                &task_id("task-1"),
+                &session.id,
+                "must not complete".into(),
+                8,
+            ),
+            "block" => store.block_task(
+                &project_id("factory"),
+                &task_id("task-1"),
+                &session.id,
+                "must not block".into(),
+                8,
+            ),
+            _ => unreachable!(),
+        };
+        assert!(
+            matches!(result, Err(StoreError::SessionNotFound)),
+            "a stopping session was allowed to {action} its exact open episode"
+        );
+        assert_eq!(
+            store
+                .get_task(&project_id("factory"), &task_id("task-1"))
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Running
+        );
+        let session = store
+            .session_snapshot(&project_id("factory"), &session.id)
+            .unwrap();
+        assert!(session.ended_at_ms.is_none());
+        assert!(session.current_run_id.is_some());
+    }
+}
+
+#[test]
 fn complete_task_without_an_open_episode_is_a_conflict() {
     let mut store = fixture();
     assert!(matches!(

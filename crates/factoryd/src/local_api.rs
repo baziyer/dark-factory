@@ -2543,7 +2543,7 @@ async fn repository_request(
     session_id: SessionId,
     request: RepositoryRequest,
 ) -> Result<LocalResponse, ApiFailure> {
-    let session = state
+    let mut session = state
         .with_store(move |store| store.authenticated_session_row(&session_id))
         .await?;
     let project_id = session.project_id.clone();
@@ -2557,10 +2557,16 @@ async fn repository_request(
     // Reads use immutable snapshots and must not let a slow diff monopolize the
     // process-wide mutation boundary. Every operation that can change local or
     // remote state remains serialized until its final revalidation completes.
-    let _slot = match &request {
+    let repository_slot = match &request {
         RepositoryRequest::Status | RepositoryRequest::Diff { .. } => None,
         _ => Some(state.repository_slot().await),
     };
+    if repository_slot.is_some() {
+        let session_id = session.id.clone();
+        session = state
+            .with_store(move |store| store.authenticated_session_row(&session_id))
+            .await?;
+    }
     let operation = request.name().to_owned();
     let returns_reference = matches!(
         request,
@@ -4656,6 +4662,36 @@ mod deletion_gate_tests {
         assert!(
             matches!(response, LocalResponse::GitOutput { ref operation, .. } if operation == "git_commit")
         );
+        let stop_project_id = project_id.clone();
+        state
+            .commit_and_publish(move |store| {
+                let (_, event) = store.request_session_stop(
+                    &stop_project_id,
+                    &SessionId::try_from("session-a").unwrap(),
+                    6,
+                )?;
+                Ok(((), vec![event]))
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            repository_request(
+                &state,
+                SessionId::try_from("session-a").unwrap(),
+                RepositoryRequest::Commit {
+                    message: "must not commit after stop".into(),
+                },
+            )
+            .await,
+            Err(ApiFailure::Store(StoreError::SessionNotFound))
+        ));
+        let stopping = state
+            .with_store(move |store| {
+                store.session_snapshot(&project_id, &SessionId::try_from("session-a").unwrap())
+            })
+            .await
+            .unwrap();
+        assert!(stopping.ended_at_ms.is_none());
         assert!(matches!(
             repository_request(
                 &state,

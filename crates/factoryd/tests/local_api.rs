@@ -360,6 +360,189 @@ async fn session_endpoint_fails_closed_and_derives_message_authority() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_session_credentials_are_revoked_before_runner_exit() {
+    const CREDENTIAL: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let directory = private_tempdir();
+    let socket = directory.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: directory.path().to_string_lossy().into_owned(),
+            },
+            1,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("worker"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+            },
+            2,
+        )
+        .unwrap();
+    store
+        .create_task(
+            NewTask {
+                id: task_id("task"),
+                project_id: project_id("factory"),
+                parent_task_id: None,
+                title: "Task".into(),
+                body: "Task".into(),
+                priority: 0,
+            },
+            3,
+        )
+        .unwrap();
+    let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let worktree = directory.path().to_string_lossy().into_owned();
+    let runner_runtime = directory
+        .path()
+        .join("runner")
+        .to_string_lossy()
+        .into_owned();
+    state
+        .commit_and_publish(move |store| {
+            let (_, mut events) = store.create_session(
+                NewSession {
+                    id: SessionId::try_from("session").unwrap(),
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("worker"),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: worktree.clone(),
+                    codex_home: None,
+                    hook_token: CREDENTIAL.into(),
+                    runner_instance_id: RunnerInstanceId::try_from("runner").unwrap(),
+                    runner_runtime,
+                    runner_protocol_version: 1,
+                },
+                4,
+            )?;
+            let (_, assigned) = store.assign_task(
+                &project_id("factory"),
+                &task_id("task"),
+                Some(&agent_id("worker")),
+                5,
+            )?;
+            events.push(assigned);
+            events.extend(
+                store
+                    .open_run_episode(
+                        &SessionId::try_from("session").unwrap(),
+                        &task_id("task"),
+                        6,
+                    )?
+                    .events,
+            );
+            let (_, stopped) = store.request_session_stop(
+                &project_id("factory"),
+                &SessionId::try_from("session").unwrap(),
+                7,
+            )?;
+            events.push(stopped);
+            Ok(((), events))
+        })
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        Endpoint::Session,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    for (credential, request) in [
+        (
+            CREDENTIAL,
+            LocalRequest::CompleteTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task"),
+                result: "must not complete".into(),
+            },
+        ),
+        (
+            CREDENTIAL,
+            LocalRequest::BlockTask {
+                project_id: project_id("factory"),
+                task_id: task_id("task"),
+                reason: "must not block".into(),
+            },
+        ),
+        (
+            CREDENTIAL,
+            LocalRequest::GitCommit {
+                message: "must not mutate the repository".into(),
+            },
+        ),
+        (
+            CREDENTIAL,
+            LocalRequest::CompleteTask {
+                project_id: project_id("foreign"),
+                task_id: task_id("task"),
+                result: "must not cross projects".into(),
+            },
+        ),
+    ] {
+        let response = authenticated_request(&socket, credential, request).await;
+        assert!(
+            matches!(
+                response,
+                ServerFrame::Response {
+                    response: LocalResponse::Error {
+                        code: ErrorCode::Unauthorized,
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "a stopping session credential retained authority: {response:?}"
+        );
+    }
+
+    let task = state
+        .with_store(|store| store.get_task(&project_id("factory"), &task_id("task")))
+        .await
+        .unwrap();
+    assert_eq!(task.snapshot.status, factory_core::TaskStatus::Running);
+    let session = state
+        .with_store(|store| {
+            store.session_snapshot(
+                &project_id("factory"),
+                &SessionId::try_from("session").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+    assert!(session.ended_at_ms.is_none());
+    assert!(session.current_run_id.is_some());
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn factoryctl_replays_stored_v1_events_through_v3_and_receives_new_live_events() {
     let directory = private_tempdir();
     let database = directory.path().join("factory.db");

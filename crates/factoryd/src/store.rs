@@ -1462,14 +1462,14 @@ impl Store {
     }
 
     /// Resolves an opaque bearer by scanning every live session with a
-    /// constant-time comparison. Version-zero rows predate this boundary and
-    /// are never authenticated.
+    /// constant-time comparison. Version-zero and stopping rows have no
+    /// principal authority and are never authenticated.
     pub fn authenticate_session(
         &self,
         credential: &[u8],
     ) -> Result<Option<AuthenticatedPrincipal>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, hook_token, principal_version
+            "SELECT id, hook_token, principal_version, stop_requested_at_ms
              FROM sessions WHERE ended_at_ms IS NULL ORDER BY id",
         )?;
         let rows = statement
@@ -1478,23 +1478,22 @@ impl Store {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         let mut matched = None;
-        for (id, expected, principal_version) in rows {
+        for (id, expected, principal_version, stop_requested_at_ms) in rows {
             if constant_time_eq(expected.as_bytes(), credential) {
-                matched = (principal_version == 1).then_some(id);
+                matched = (principal_version == 1 && stop_requested_at_ms.is_none()).then_some(id);
             }
         }
         let Some(id) = matched else {
             return Ok(None);
         };
         let session_id: SessionId = parse_id(id, 0)?;
-        let session = load_session(&self.connection, &session_id)?
-            .filter(|session| session.ended_at_ms.is_none())
-            .ok_or(StoreError::SessionNotFound)?;
+        let session = load_authenticated_session(&self.connection, &session_id)?;
         let agent =
             load_agent(&self.connection, &session.agent_id)?.ok_or(StoreError::AgentNotFound)?;
         Ok(Some(AuthenticatedPrincipal {
@@ -3335,6 +3334,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = open_run_for_task(&transaction, project_id, task_id)?;
+        let session = load_authenticated_session(&transaction, session_id)?;
+        if session.project_id != *project_id {
+            return Err(StoreError::SessionNotFound);
+        }
         if run.session_id.as_ref() != Some(session_id) {
             return Err(StoreError::SessionNotFound);
         }
@@ -3370,6 +3373,10 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = open_run_for_task(&transaction, project_id, task_id)?;
+        let session = load_authenticated_session(&transaction, session_id)?;
+        if session.project_id != *project_id {
+            return Err(StoreError::SessionNotFound);
+        }
         if run.session_id.as_ref() != Some(session_id) {
             return Err(StoreError::SessionNotFound);
         }
@@ -4411,20 +4418,7 @@ impl Store {
     }
 
     pub fn authenticated_session_row(&self, session_id: &SessionId) -> Result<SessionRow> {
-        let enabled: bool = self
-            .connection
-            .query_row(
-                "SELECT principal_version = 1 FROM sessions
-             WHERE id = ?1 AND ended_at_ms IS NULL",
-                params![session_id.as_str()],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::SessionNotFound)?;
-        if !enabled {
-            return Err(StoreError::SessionNotFound);
-        }
-        load_session(&self.connection, session_id)?.ok_or(StoreError::SessionNotFound)
+        load_authenticated_session(&self.connection, session_id)
     }
 
     pub fn retry_task(
@@ -6443,6 +6437,27 @@ fn cancel_reserved_session_work_in_transaction(
 
 fn transition_error(_: crate::session_work::TransitionError) -> StoreError {
     StoreError::SessionWorkConflict
+}
+
+fn load_authenticated_session(
+    connection: &Connection,
+    session_id: &SessionId,
+) -> Result<SessionRow> {
+    let enabled: bool = connection
+        .query_row(
+            "SELECT principal_version = 1
+                    AND ended_at_ms IS NULL
+                    AND stop_requested_at_ms IS NULL
+             FROM sessions WHERE id = ?1",
+            params![session_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or(StoreError::SessionNotFound)?;
+    if !enabled {
+        return Err(StoreError::SessionNotFound);
+    }
+    load_session(connection, session_id)?.ok_or(StoreError::SessionNotFound)
 }
 
 fn load_session(connection: &Connection, session_id: &SessionId) -> Result<Option<SessionRow>> {
