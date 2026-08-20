@@ -6,29 +6,82 @@ use factoryd::store::{
     ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
     NewTask, Store, StoreError, UpdateAgentProfile,
 };
-use std::sync::{Arc, Barrier};
+use std::sync::{
+    Arc, Barrier,
+    atomic::{AtomicBool, Ordering},
+};
 
-fn prepare_stores(paths: [std::path::PathBuf; 2]) -> Result<(Store, Store), String> {
+struct TrackedStore {
+    store: Store,
+    dropped: Option<Arc<AtomicBool>>,
+}
+
+impl std::ops::Deref for TrackedStore {
+    type Target = Store;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl std::ops::DerefMut for TrackedStore {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.store
+    }
+}
+
+impl Drop for TrackedStore {
+    fn drop(&mut self) {
+        if let Some(dropped) = &self.dropped {
+            dropped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn prepare_stores(
+    paths: [std::path::PathBuf; 2],
+    first_store_dropped: Option<Arc<AtomicBool>>,
+) -> Result<(TrackedStore, TrackedStore), String> {
     let first = Store::open(&paths[0])
         .map_err(|error| format!("store setup {}: {error}", paths[0].display()))?;
+    let first = TrackedStore {
+        store: first,
+        dropped: first_store_dropped,
+    };
     let second = Store::open(&paths[1])
         .map_err(|error| format!("store setup {}: {error}", paths[1].display()))?;
-    Ok((first, second))
+    Ok((
+        first,
+        TrackedStore {
+            store: second,
+            dropped: None,
+        },
+    ))
 }
 
 #[test]
 fn store_fixture_setup_failure_reports_a_bounded_diagnostic() {
     let directory = tempfile::tempdir().unwrap();
+    let first_database = directory.path().join("factory.db");
     let invalid_database = directory.path().join("directory-database");
     std::fs::create_dir(&invalid_database).unwrap();
+    let first_store_dropped = Arc::new(AtomicBool::new(false));
 
-    let error = match prepare_stores([directory.path().join("factory.db"), invalid_database]) {
+    let error = match prepare_stores(
+        [first_database.clone(), invalid_database.clone()],
+        Some(Arc::clone(&first_store_dropped)),
+    ) {
         Ok(_) => panic!("a directory path must fail store setup"),
         Err(error) => error,
     };
+    assert!(first_database.is_file(), "first store was not opened");
     assert!(
-        error.starts_with("store setup"),
+        error.contains(&format!("store setup {}", invalid_database.display())),
         "unexpected diagnostic: {error}"
+    );
+    assert!(
+        first_store_dropped.load(Ordering::SeqCst),
+        "first store was not dropped after second setup failed"
     );
 }
 
@@ -167,7 +220,7 @@ fn concurrent_mismatched_connector_events_keep_the_first_payload_only() {
         .unwrap();
     drop(setup);
 
-    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()])
+    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()], None)
         .unwrap_or_else(|error| panic!("store setup failed: {error}"));
     let barrier = Arc::new(Barrier::new(2));
     let results = std::thread::scope(|scope| {
@@ -429,7 +482,7 @@ fn concurrent_tool_observations_cannot_cross_the_limit() {
         .unwrap();
     drop(store);
 
-    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()])
+    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()], None)
         .unwrap_or_else(|error| panic!("store setup failed: {error}"));
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let mut joins = Vec::new();
