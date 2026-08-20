@@ -360,39 +360,47 @@ cat >"$stat_shim_directory/stat" <<'EOF'
 set -eu
 
 if [ "$1" = -f ]; then
-    stat_count=0
-    [ ! -f "$DF_TEST_STAT_STATE" ] || read -r stat_count <"$DF_TEST_STAT_STATE"
-    stat_count=$((stat_count + 1))
-    printf '%s\n' "$stat_count" >"$DF_TEST_STAT_STATE"
-    printf 'failed-filesystem-output-%s\n' "$stat_count"
-    exit 1
+    printf '%s\n' 'File: "%d:%i"' 'ID: wrong-filesystem-semantics'
+    exit 0
 fi
 
 [ "$1" = -c ] && [ "$2" = '%d:%i' ] || exit 2
 exec "$DF_TEST_REAL_STAT" "$DF_TEST_REAL_STAT_STYLE" "$2" "$3"
 EOF
 chmod +x "$stat_shim_directory/stat"
-stat_repository="$temporary/stat fallback repository"
+stat_repository="$temporary/stat success repository"
+stat_replacement="$temporary/stat success replacement"
+stat_preserved="$temporary/stat success preserved"
 init_repository "$stat_repository"
+init_repository "$stat_replacement"
+stat_repository_canonical=$(CDPATH='' cd -- "$stat_repository" && pwd -P)
 real_stat=$(command -v stat)
 if "$real_stat" -f '%d:%i' "$stat_repository" >/dev/null 2>&1; then
     real_stat_style=-f
 else
     real_stat_style=-c
 fi
-if ! (
+if (
     cd "$stat_repository"
     env \
-        PATH="$stat_shim_directory:$PATH" \
+        PATH="$stat_shim_directory:$shim_directory:$PATH" \
+        DF_TEST_REAL_GIT="$real_git" \
+        DF_TEST_REPLACE_REPOSITORY=1 \
+        DF_TEST_SWAP_ROOT="$stat_repository_canonical" \
+        DF_TEST_REPLACEMENT_ROOT="$stat_replacement" \
+        DF_TEST_PRESERVED_ROOT="$stat_preserved" \
+        DF_TEST_REPLACE_STATE="$temporary/stat-repository-replaced" \
         DF_TEST_REAL_STAT="$real_stat" \
         DF_TEST_REAL_STAT_STYLE="$real_stat_style" \
-        DF_TEST_STAT_STATE="$temporary/stat-state" \
-        ./scripts/new-worktree.sh stat-fallback
-) >"$temporary/stat-fallback.out" 2>&1; then
-    fail "stat fallback output contaminated path identity"
+        ./scripts/new-worktree.sh stat-success-replaced
+) >"$temporary/stat-success-replaced.out" 2>&1; then
+    fail "successful GNU stat semantics adopted a repository replacement"
 fi
-assert_directory "$stat_repository/.worktrees/stat-fallback"
-assert_registered "$stat_repository" "$stat_repository/.worktrees/stat-fallback"
+assert_output_contains "$temporary/stat-success-replaced.out" "repository identity changed"
+assert_branch_absent "$stat_preserved" stat-success-replaced
+assert_branch_absent "$stat_repository" stat-success-replaced
+assert_path_absent "$stat_preserved/.worktrees/stat-success-replaced"
+assert_path_absent "$stat_repository/.worktrees/stat-success-replaced"
 
 smudge_repository="$temporary/smudge failure repository"
 smudge_target="$smudge_repository/.worktrees/smudge-failure"

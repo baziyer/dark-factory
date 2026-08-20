@@ -48,11 +48,17 @@ canonical_directory() {
 }
 
 path_identity() {
-    if identity_result=$(stat -f '%d:%i' "$1" 2>/dev/null); then
+    for identity_style in -f -c; do
+        identity_result=$(stat "$identity_style" '%d:%i' "$1" 2>/dev/null) || continue
+        case "$identity_result" in
+            '' | *[!0123456789:]* | *:*:*) continue ;;
+            [0123456789]*:[0123456789]*) ;;
+            *) continue ;;
+        esac
         printf '%s\n' "$identity_result"
-    else
-        stat -c '%d:%i' "$1" 2>/dev/null
-    fi
+        return
+    done
+    return 1
 }
 
 same_identity() {
