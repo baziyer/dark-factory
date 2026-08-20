@@ -8,6 +8,30 @@ use factoryd::store::{
 };
 use std::sync::{Arc, Barrier};
 
+fn prepare_stores(paths: [std::path::PathBuf; 2]) -> Result<(Store, Store), String> {
+    let first = Store::open(&paths[0])
+        .map_err(|error| format!("store setup {}: {error}", paths[0].display()))?;
+    let second = Store::open(&paths[1])
+        .map_err(|error| format!("store setup {}: {error}", paths[1].display()))?;
+    Ok((first, second))
+}
+
+#[test]
+fn store_fixture_setup_failure_reports_a_bounded_diagnostic() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_database = directory.path().join("directory-database");
+    std::fs::create_dir(&invalid_database).unwrap();
+
+    let error = match prepare_stores([directory.path().join("factory.db"), invalid_database]) {
+        Ok(_) => panic!("a directory path must fail store setup"),
+        Err(error) => error,
+    };
+    assert!(
+        error.starts_with("store setup"),
+        "unexpected diagnostic: {error}"
+    );
+}
+
 #[test]
 fn connector_event_idempotency_is_atomic_and_survives_restart() {
     let directory = tempfile::tempdir().unwrap();
@@ -143,13 +167,13 @@ fn concurrent_mismatched_connector_events_keep_the_first_payload_only() {
         .unwrap();
     drop(setup);
 
+    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()])
+        .unwrap_or_else(|error| panic!("store setup failed: {error}"));
     let barrier = Arc::new(Barrier::new(2));
     let results = std::thread::scope(|scope| {
-        let handles = [1_u8, 2_u8].map(|variant| {
-            let database = database.clone();
+        let handles = [(1_u8, first_store), (2_u8, second_store)].map(|(variant, mut store)| {
             let barrier = Arc::clone(&barrier);
             scope.spawn(move || {
-                let mut store = Store::open(database).unwrap();
                 barrier.wait();
                 store.apply_connector_event(
                     "monitor",
@@ -405,13 +429,13 @@ fn concurrent_tool_observations_cannot_cross_the_limit() {
         .unwrap();
     drop(store);
 
+    let (first_store, second_store) = prepare_stores([database.clone(), database.clone()])
+        .unwrap_or_else(|error| panic!("store setup failed: {error}"));
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let mut joins = Vec::new();
-    for now in [4, 5] {
-        let database = database.clone();
+    for (now, mut store) in [(4, first_store), (5, second_store)] {
         let barrier = barrier.clone();
         joins.push(std::thread::spawn(move || {
-            let mut store = Store::open(database).unwrap();
             barrier.wait();
             store
                 .observe_tool_call(&project_id("factory"), &agent_id("worker"), now)
