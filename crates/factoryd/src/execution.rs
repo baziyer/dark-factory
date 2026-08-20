@@ -1394,22 +1394,25 @@ async fn dispatch_agent_with_scheduler(
                 .await?;
                 return Ok(());
             }
-            let due = state
+            let (due, cycle_pending) = state
                 .with_store({
                     let project_id = project_id.clone();
                     let agent_id = agent_id.clone();
                     let session_id = session.id.clone();
                     move |store| {
-                        store.delivery_attempt_due(
-                            &project_id,
-                            &agent_id,
-                            &session_id,
-                            now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
-                        )
+                        Ok((
+                            store.delivery_attempt_due(
+                                &project_id,
+                                &agent_id,
+                                &session_id,
+                                now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
+                            )?,
+                            store.orchestrator_cycle_pending(&project_id)?,
+                        ))
                     }
                 })
                 .await?;
-            if due {
+            if due || cycle_pending {
                 deliver_pending(
                     config,
                     state,
@@ -2526,6 +2529,11 @@ async fn admit_delivery_attempt(
     session: &SessionSnapshot,
     attempt: DeliveryAttempt,
 ) -> Result<PromptDeliveryAdmission, DaemonStateError> {
+    if attempt.state == DeliveryAttemptState::Terminal
+        && attempt.orchestrator_cycle_lease_id.is_some()
+    {
+        return Ok(PromptDeliveryAdmission::Denied);
+    }
     if !matches!(
         attempt.state,
         DeliveryAttemptState::InFlight

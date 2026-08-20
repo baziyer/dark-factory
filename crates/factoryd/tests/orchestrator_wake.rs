@@ -28,6 +28,7 @@ const PROJECT: &str = "factory";
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const WAKE_RED_TIMEOUT: Duration = Duration::from_secs(2);
+const RECOVERY_FENCE_TIMEOUT: Duration = Duration::from_secs(130);
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 struct Daemon {
@@ -133,6 +134,24 @@ fn wait_until<T>(description: &str, mut probe: impl FnMut() -> Option<T>) -> T {
         assert!(
             start.elapsed() <= SETUP_TIMEOUT,
             "timed out after {SETUP_TIMEOUT:?} waiting for {description}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn wait_until_with_timeout<T>(
+    description: &str,
+    timeout: Duration,
+    mut probe: impl FnMut() -> Option<T>,
+) -> T {
+    let start = Instant::now();
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        assert!(
+            start.elapsed() <= timeout,
+            "timed out after {timeout:?} waiting for {description}"
         );
         thread::sleep(POLL_INTERVAL);
     }
@@ -414,6 +433,7 @@ def assign_refill():
 
 fd = sys.stdin.fileno()
 old = termios.tcgetattr(fd)
+no_ack_count = 0
 tty.setraw(fd)
 try:
     hook("SessionStart", {{}})
@@ -428,6 +448,15 @@ try:
         text = buffer.decode("utf-8", errors="replace")
         buffer.clear()
         record(text)
+        if mode == "orchestrator-no-ack" and "task:bootstrap-task" not in text:
+            no_ack_count += 1
+            if no_ack_count == 1:
+                time.sleep(40)
+                record("late_ack:" + hook("UserPromptSubmit", {{"prompt": text}}))
+                continue
+            if no_ack_count == 2:
+                time.sleep(50)
+                continue
         hook("UserPromptSubmit", {{"prompt": text}})
         hook("PreToolUse", {{"tool_name": "Bash"}})
         task = re.search(r"task:([A-Za-z0-9_-]+)", text)
@@ -710,6 +739,162 @@ fn terminal_worker_completion_wakes_one_orchestrator_cycle_and_refills_once() {
         response => panic!("expected agents response, got {response:?}"),
     };
     assert_eq!(agent_count, 3, "cycle must not expand authority");
+
+    drop(daemon);
+}
+
+#[test]
+fn two_unacknowledged_cycles_recover_once_until_a_new_event() {
+    let home = private_tempdir();
+    fs::create_dir(home.path().join("projects")).unwrap();
+    fs::set_permissions(
+        home.path().join("projects"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::create_dir(home.path().join("projects/factory")).unwrap();
+    fs::set_permissions(
+        home.path().join("projects/factory"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(home.path().join("projects/factory/PROJECT.md"), []).unwrap();
+    fs::set_permissions(
+        home.path().join("projects/factory/PROJECT.md"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let daemon = Daemon::start(home.path());
+    let client = daemon.client();
+    let root = home.path().join("repo");
+    init_git_repo(&root);
+    create_project(&client, &root);
+
+    let orchestrator_log = home.path().join("orchestrator-prompts.jsonl");
+    let orchestrator_fixture = write_fixture(
+        home.path(),
+        "orchestrator-no-ack",
+        "orchestrator-prompts.jsonl",
+        None,
+    );
+    let worker_fixture = write_fixture(home.path(), "worker-a", "worker-a-prompts.jsonl", None);
+    create_agent(
+        &client,
+        "orchestrator",
+        None,
+        AgentRole::Orchestrator,
+        &orchestrator_fixture,
+    );
+    create_agent(
+        &client,
+        "worker-a",
+        Some("orchestrator"),
+        AgentRole::Worker,
+        &worker_fixture,
+    );
+
+    create_task(
+        &client,
+        "roadmap-root",
+        "roadmap root",
+        "ROADMAP_SECRET_ROOT",
+    );
+    create_task(
+        &client,
+        "bootstrap-task",
+        "orchestrator bootstrap",
+        "bootstrap the bounded cycle",
+    );
+    create_task(
+        &client,
+        "worker-a-task",
+        "worker A terminal tranche",
+        "worker-a-private-body",
+    );
+    create_task(
+        &client,
+        "worker-a-task-2",
+        "worker A second terminal tranche",
+        "worker-a-second-private-body",
+    );
+
+    assign_task(&client, "bootstrap-task", "orchestrator");
+    wait_for_first_prompt(&client, &orchestrator_log, SETUP_TIMEOUT);
+    wait_for_task(&client, "bootstrap-task", TaskStatus::Succeeded);
+    wait_for_agent_state(&client, "orchestrator", SessionState::Idle);
+
+    assign_task(&client, "worker-a-task", "worker-a");
+    wait_for_task(&client, "worker-a-task", TaskStatus::Succeeded);
+    let unique_prompt_count = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|line| !line.starts_with("late_ack:") && !line.contains("task:bootstrap-task"))
+            .fold(Vec::<&String>::new(), |mut prompts, line| {
+                if !prompts.contains(&line) {
+                    prompts.push(line);
+                }
+                prompts
+            })
+            .len()
+    };
+    let _ = wait_until_with_timeout("the first causal cycle", RECOVERY_FENCE_TIMEOUT, || {
+        let lines = log_lines(&orchestrator_log);
+        (unique_prompt_count(&lines) >= 1).then_some(lines)
+    });
+
+    let prompts =
+        wait_until_with_timeout("the one recovery follow-up", RECOVERY_FENCE_TIMEOUT, || {
+            let lines = log_lines(&orchestrator_log);
+            (unique_prompt_count(&lines) >= 2).then_some(lines)
+        });
+    assert_eq!(
+        unique_prompt_count(&prompts),
+        2,
+        "two failed acknowledgements must produce exactly one follow-up"
+    );
+    let lines = wait_until_with_timeout(
+        "a rejected late acknowledgement",
+        RECOVERY_FENCE_TIMEOUT,
+        || {
+            let lines = log_lines(&orchestrator_log);
+            (lines
+                .iter()
+                .filter(|line| line.starts_with("late_ack:"))
+                .count()
+                >= 1)
+                .then_some(lines)
+        },
+    );
+    let late_acks: Vec<_> = lines
+        .iter()
+        .filter(|line| line.starts_with("late_ack:"))
+        .collect();
+    assert!(
+        !late_acks.is_empty(),
+        "the terminal attempt must receive a late hook"
+    );
+    thread::sleep(Duration::from_secs(50));
+    assert_eq!(
+        unique_prompt_count(&log_lines(&orchestrator_log)),
+        2,
+        "a later safety tick must not emit a third cycle without a new event"
+    );
+
+    assign_task(&client, "worker-a-task-2", "worker-a");
+    wait_for_task(&client, "worker-a-task-2", TaskStatus::Succeeded);
+    let lines = wait_until_with_timeout(
+        "a new causal cycle after the next worker event",
+        RECOVERY_FENCE_TIMEOUT,
+        || {
+            let lines = log_lines(&orchestrator_log);
+            (unique_prompt_count(&lines) >= 3).then_some(lines)
+        },
+    );
+    assert_eq!(
+        unique_prompt_count(&lines),
+        3,
+        "one new event must authorize exactly one new cycle"
+    );
 
     drop(daemon);
 }

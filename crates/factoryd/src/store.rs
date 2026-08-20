@@ -3086,8 +3086,16 @@ impl Store {
         let changed = self.connection.execute(
             "UPDATE delivery_attempts
              SET failure_count = failure_count + 1,
-                 state = CASE WHEN failure_count + 1 >= ?1 THEN 'terminal' ELSE 'retryable' END,
-                 next_attempt_at_ms = CASE WHEN failure_count + 1 >= ?1 THEN NULL ELSE ?2 END,
+                 state = CASE
+                     WHEN orchestrator_cycle_lease_id IS NOT NULL
+                          OR failure_count + 1 >= ?1 THEN 'terminal'
+                     ELSE 'retryable'
+                 END,
+                 next_attempt_at_ms = CASE
+                     WHEN orchestrator_cycle_lease_id IS NOT NULL
+                          OR failure_count + 1 >= ?1 THEN NULL
+                     ELSE ?2
+                 END,
                  updated_at_ms = ?2
              WHERE id = ?3 AND state IN ('in_flight', 'retryable')",
             params![
@@ -3336,7 +3344,8 @@ impl Store {
         let mut statement = transaction.prepare(
             "SELECT s.project_id, s.active_lease_id, s.active_agent_id,
                     c.from_sequence, c.through_sequence, c.attempt_id, d.state,
-                    c.created_at_ms
+                    c.created_at_ms, s.pending_from_sequence,
+                    s.pending_through_sequence
              FROM orchestrator_scheduler_state s
              JOIN orchestrator_cycle_ledger c ON c.lease_id = s.active_lease_id
              LEFT JOIN delivery_attempts d ON d.id = c.attempt_id
@@ -3353,6 +3362,8 @@ impl Store {
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3366,6 +3377,8 @@ impl Store {
             attempt_id,
             attempt_state,
             lease_created_at_ms,
+            pending_from_sequence,
+            pending_through_sequence,
         ) in rows
         {
             let inferred_attempt_id = if attempt_id.is_none() {
@@ -3376,7 +3389,7 @@ impl Store {
                              WHERE project_id = ?1 AND agent_id = ?2
                                AND task_id IS NULL AND message_ids_json = '[]'
                                AND orchestrator_cycle_lease_id IS NULL
-                               AND created_at_ms >= ?3
+                               AND created_at_ms > ?3
                                AND state IN ('in_flight', 'retryable', 'terminal')
                              ORDER BY created_at_ms DESC, id DESC LIMIT 1",
                             params![project_id.as_str(), agent_id, lease_created_at_ms],
@@ -3410,17 +3423,32 @@ impl Store {
                     Some("terminal" | "cancelled") | None
                 );
             if should_requeue {
+                // A recovered ledger range is the durable cursor fence for
+                // this active lease: without a newer pending range, repeat
+                // safety ticks must only clear the successor lease.
+                let already_recovered = pending_from_sequence.is_none()
+                    && pending_through_sequence.is_none()
+                    && transaction.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM orchestrator_cycle_ledger
+                            WHERE project_id = ?1 AND state = 'recovered'
+                              AND from_sequence = ?2 AND through_sequence = ?3
+                        )",
+                        params![project_id.as_str(), from_sequence, through_sequence],
+                        |row| row.get::<_, bool>(0),
+                    )?;
                 transaction.execute(
                     "UPDATE orchestrator_scheduler_state
-                     SET pending_from_sequence = CASE
-                             WHEN pending_from_sequence IS NULL THEN ?1
-                             ELSE MIN(pending_from_sequence, ?1) END,
-                         pending_through_sequence = CASE
-                             WHEN pending_through_sequence IS NULL THEN ?2
-                             ELSE MAX(pending_through_sequence, ?2) END,
-                         active_lease_id = NULL, active_agent_id = NULL, updated_at_ms = ?3
-                     WHERE project_id = ?4 AND active_lease_id = ?5",
+                     SET pending_from_sequence = CASE WHEN ?1 THEN NULL
+                             WHEN pending_from_sequence IS NULL THEN ?2
+                             ELSE MIN(pending_from_sequence, ?2) END,
+                         pending_through_sequence = CASE WHEN ?1 THEN NULL
+                             WHEN pending_through_sequence IS NULL THEN ?3
+                             ELSE MAX(pending_through_sequence, ?3) END,
+                         active_lease_id = NULL, active_agent_id = NULL, updated_at_ms = ?4
+                     WHERE project_id = ?5 AND active_lease_id = ?6",
                     params![
+                        already_recovered,
                         from_sequence,
                         through_sequence,
                         now_ms,
@@ -8934,9 +8962,6 @@ mod tests {
         store
             .record_delivery_failure("live-cycle-attempt", 10)
             .unwrap();
-        store
-            .record_delivery_failure("live-cycle-attempt", 5_011)
-            .unwrap();
         assert_eq!(
             store.delivery_attempt_state("live-cycle-attempt").unwrap(),
             Some(DeliveryAttemptState::Terminal)
@@ -9251,7 +9276,7 @@ mod tests {
                 require_queue_head: false,
                 message_ids: Vec::new(),
                 text: "fixed orchestrator instruction".into(),
-                created_at_ms: 4,
+                created_at_ms: 10,
             })
             .unwrap();
         store

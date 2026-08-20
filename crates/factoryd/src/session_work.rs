@@ -294,4 +294,39 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn recover_terminal_only_releases_exact_uncertain_identity() {
+        let lease = lease(
+            "attempt-a",
+            "task-a",
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let empty = SessionWork::empty();
+        let delivering = empty.reserve(lease.clone()).unwrap();
+        let uncertain = delivering.external_effect_possible("attempt-a").unwrap();
+        let running = uncertain.acknowledge("attempt-a").unwrap();
+
+        for (work, state) in [
+            (&empty, "empty"),
+            (&delivering, "delivering"),
+            (&running, "running"),
+        ] {
+            assert!(matches!(
+                work.recover_terminal("attempt-a"),
+                Err(TransitionError::Invalid {
+                    action: Action::RecoverTerminal,
+                    state: actual,
+                }) if actual == state
+            ));
+        }
+        assert_eq!(
+            uncertain.recover_terminal("attempt-b"),
+            Err(TransitionError::IdentityMismatch)
+        );
+        assert_eq!(
+            uncertain.recover_terminal("attempt-a").unwrap().phase,
+            Phase::Empty
+        );
+    }
 }

@@ -1943,21 +1943,30 @@ async fn handle_request(
             } else {
                 execution::PromptDeliveryAdmission::Ignored
             };
-            let record_session_id = session_id.clone();
-            let updated_session = state
-                .commit_and_publish(move |store| {
-                    let (session, event_envelope) = store.record_hook_event_with_notification(
-                        &record_session_id,
-                        event,
-                        activity,
-                        inferred,
-                        wait_reason,
-                        notification_kind,
-                        now_ms()?,
-                    )?;
-                    Ok((session, vec![event_envelope]))
-                })
-                .await?;
+            let preserve_delivery_wait = event == ProviderHookEvent::UserPromptSubmit
+                && session.wait_reason.as_deref() == Some("delivery unacknowledged")
+                && prompt_admission != execution::PromptDeliveryAdmission::Acknowledged;
+            let updated_session = if preserve_delivery_wait {
+                // An unrelated or stale prompt must not erase the durable
+                // recovery state before the dispatcher can reclaim it.
+                session.snapshot()
+            } else {
+                let record_session_id = session_id.clone();
+                state
+                    .commit_and_publish(move |store| {
+                        let (session, event_envelope) = store.record_hook_event_with_notification(
+                            &record_session_id,
+                            event,
+                            activity,
+                            inferred,
+                            wait_reason,
+                            notification_kind,
+                            now_ms()?,
+                        )?;
+                        Ok((session, vec![event_envelope]))
+                    })
+                    .await?
+            };
             let reply = if prompt_admission == execution::PromptDeliveryAdmission::Denied {
                 // UserPromptSubmit is synchronous and pre-execution in both
                 // supported hook contracts. This exact stale prompt lost the
