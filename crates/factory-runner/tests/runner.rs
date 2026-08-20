@@ -1301,3 +1301,112 @@ fn wait_for_process_exit(raw_pid: i32) {
     }
     panic!("descendant process {raw_pid} survived group stop");
 }
+
+struct PipedAgentCleanup {
+    pids: Option<[i32; 2]>,
+}
+
+impl PipedAgentCleanup {
+    fn new(agent_marker: &Path, child_marker: &Path) -> Self {
+        Self {
+            pids: Some([
+                wait_for_pid_file(agent_marker),
+                wait_for_pid_file(child_marker),
+            ]),
+        }
+    }
+
+    fn cleanup(&mut self) {
+        let Some(pids) = self.pids else {
+            return;
+        };
+        let kill_order = [pids[1], pids[0]];
+        for raw_pid in kill_order {
+            let Some(pid) = Pid::from_raw(raw_pid) else {
+                continue;
+            };
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        for raw_pid in kill_order {
+            wait_for_process_exit(raw_pid);
+        }
+        self.pids = None;
+    }
+}
+
+impl Drop for PipedAgentCleanup {
+    fn drop(&mut self) {
+        let Some(pids) = self.pids.take() else {
+            return;
+        };
+        for raw_pid in pids {
+            if let Some(pid) = Pid::from_raw(raw_pid) {
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+    }
+}
+
+fn matching_processes(needles: &[String]) -> Vec<Pid> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|pid| pid.parse::<i32>().ok().and_then(Pid::from_raw))
+        .collect()
+}
+
+fn wait_for_processes_gone(needles: &[String], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if matching_processes(needles).is_empty() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    matching_processes(needles).is_empty()
+}
+
+#[test]
+fn pre_started_harness_drop_does_not_leave_piped_runner_or_fake_agent_descendants() {
+    let marker_directory = tempfile::tempdir().unwrap();
+    let agent_marker = marker_directory.path().join("agent");
+    let child_marker = marker_directory.path().join("direct-child");
+    let runner = RunningRunner::spawn_program(
+        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+        &[
+            "--touch-marker",
+            agent_marker.to_str().unwrap(),
+            "--spawn-child-marker",
+            child_marker.to_str().unwrap(),
+            "--sleep-ms",
+            "60000",
+        ],
+    );
+    let runtime_needle = format!("--runtime-dir {}", runner.runtime.display());
+    let direct_needle = format!("--spawn-child-marker {}", child_marker.display());
+    let nested_needle = format!("--child-marker {}", child_marker.display());
+    let needles = vec![runtime_needle, direct_needle, nested_needle];
+    wait_for_path(&agent_marker);
+    wait_for_path(&child_marker);
+    assert!(!matching_processes(&needles[0..1]).is_empty());
+    assert!(!matching_processes(&needles[1..2]).is_empty());
+    assert!(!matching_processes(&needles[2..3]).is_empty());
+    let mut cleanup = PipedAgentCleanup::new(&agent_marker, &child_marker);
+
+    // Model a harness unwind before the Started event is available to Drop.
+    // The runner must still be stopped, while its agent process group is the
+    // harness's cleanup responsibility.
+    fs::write(runner.spool(), b"").unwrap();
+    drop(runner);
+    cleanup.cleanup();
+    let clean = wait_for_processes_gone(&needles, Duration::from_secs(2));
+    assert!(
+        clean,
+        "pre-Started harness Drop left a piped runner or fake-agent process: {needles:?}"
+    );
+}

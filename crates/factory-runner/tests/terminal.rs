@@ -22,7 +22,7 @@ use factory_core::{
         encode_terminal_bytes,
     },
 };
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 const RUN_ID: &str = "run-terminal-1";
 const INSTANCE_ID: &str = "instance-terminal-1";
@@ -830,4 +830,95 @@ fn terminal_raw_mode_is_never_recorded_for_a_child_that_stays_canonical() {
         },
     ));
     runner.wait_for_process_exit();
+}
+
+struct ExactFixtureCleanup {
+    needles: Vec<String>,
+}
+
+impl ExactFixtureCleanup {
+    fn new(needles: Vec<String>) -> Self {
+        Self { needles }
+    }
+}
+
+impl Drop for ExactFixtureCleanup {
+    fn drop(&mut self) {
+        kill_matching_processes(&self.needles);
+    }
+}
+
+fn matching_processes(needles: &[String]) -> Vec<Pid> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| needles.iter().any(|needle| line.contains(needle)))
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|pid| pid.parse::<i32>().ok().and_then(Pid::from_raw))
+        .collect()
+}
+
+fn wait_for_processes_gone(needles: &[String], timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if matching_processes(needles).is_empty() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    matching_processes(needles).is_empty()
+}
+
+fn kill_matching_processes(needles: &[String]) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let pids = matching_processes(needles);
+        if pids.is_empty() {
+            return;
+        }
+        for pid in pids {
+            let _ = kill_process(pid, Signal::KILL);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn pre_started_harness_drop_does_not_leave_terminal_runner_or_fake_agent_descendants() {
+    let marker_directory = tempfile::tempdir().unwrap();
+    let direct_marker = marker_directory.path().join("direct-child");
+    let runner = RunningTerminalRunner::spawn(
+        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+        &[
+            "--spawn-child-marker",
+            direct_marker.to_str().unwrap(),
+            "--sleep-ms",
+            "60000",
+        ],
+        80,
+        24,
+    );
+    let runtime_needle = format!("--runtime-dir {}", runner.runtime.display());
+    let direct_needle = format!("--spawn-child-marker {}", direct_marker.display());
+    let nested_needle = format!("--child-marker {}", direct_marker.display());
+    let needles = vec![runtime_needle, direct_needle, nested_needle];
+    let _cleanup = ExactFixtureCleanup::new(needles.clone());
+    wait_for_path(&direct_marker);
+    assert!(!matching_processes(&needles[0..1]).is_empty());
+    assert!(!matching_processes(&needles[1..2]).is_empty());
+    assert!(!matching_processes(&needles[2..3]).is_empty());
+
+    // Model a harness unwind before the Started event is available to Drop.
+    // The runner must still be stopped, while its agent process group is the
+    // harness's cleanup responsibility.
+    fs::write(runner.spool(), b"").unwrap();
+    drop(runner);
+    let clean = wait_for_processes_gone(&needles, Duration::from_secs(2));
+    assert!(
+        clean,
+        "pre-Started harness Drop left a terminal runner or fake-agent process: {needles:?}"
+    );
 }
