@@ -523,6 +523,58 @@ impl Board {
         matches
     }
 
+    fn cancel_task_retry(&mut self, project_id: &ProjectId, task_id: &TaskId) {
+        let pending_matches = matches!(
+            self.pending_attention_request.as_ref(),
+            Some(LocalRequest::RetryTask {
+                project_id: pending_project_id,
+                task_id: pending_task_id,
+            }) if pending_project_id == project_id && pending_task_id == task_id
+        );
+        if pending_matches {
+            self.clear_attention_request();
+        }
+        self.retry_operations.retain(|retry_task_id, operation| {
+            retry_task_id != task_id || operation.project_id != *project_id
+        });
+    }
+
+    fn cancel_project_retries(&mut self, project_id: &ProjectId) {
+        let pending_matches = matches!(
+            self.pending_attention_request.as_ref(),
+            Some(LocalRequest::RetryTask {
+                project_id: pending_project_id,
+                ..
+            }) if pending_project_id == project_id
+        );
+        if pending_matches {
+            self.clear_attention_request();
+        }
+        self.retry_operations
+            .retain(|_, operation| operation.project_id != *project_id);
+    }
+
+    fn reconcile_retry_operations_with_tasks(&mut self) {
+        let pending_is_stale = matches!(
+            self.pending_attention_request.as_ref(),
+            Some(LocalRequest::RetryTask {
+                project_id,
+                task_id,
+            }) if self.tasks.get(task_id).is_none_or(|task| {
+                task.snapshot.project_id != *project_id
+            })
+        );
+        if pending_is_stale {
+            self.clear_attention_request();
+        }
+        let tasks = &self.tasks;
+        self.retry_operations.retain(|task_id, operation| {
+            tasks
+                .get(task_id)
+                .is_some_and(|task| task.snapshot.project_id == operation.project_id)
+        });
+    }
+
     /// Surfaces a client-local socket failure through the same action list as
     /// daemon-owned attention. Runner-side attach failures are persisted by
     /// `factoryd`; this covers the only case it cannot record because the TUI
@@ -998,8 +1050,7 @@ impl Board {
             .into_iter()
             .map(|t| (t.snapshot.id.clone(), t))
             .collect();
-        self.retry_operations
-            .retain(|task_id, _| self.tasks.contains_key(task_id));
+        self.reconcile_retry_operations_with_tasks();
         self.runs = runs.into_iter().map(|r| (r.id.clone(), r)).collect();
         self.sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
         self.clear_changed_attach_failures();
@@ -1174,14 +1225,20 @@ impl Board {
                         && (retain_reason != Some(item.reason.kind))
                 });
             }
-            FactoryEvent::TaskDeleted { task_id, .. } => {
-                self.retry_operations.remove(task_id);
-                self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
+            FactoryEvent::TaskDeleted {
+                project_id,
+                task_id,
+            } => {
+                self.cancel_task_retry(project_id, task_id);
+                self.invalidate_attention(|item| {
+                    &item.project_id == project_id && item.task_id.as_ref() == Some(task_id)
+                });
             }
             FactoryEvent::AgentDeleted { agent_id, .. } => {
                 self.invalidate_attention(|item| item.agent_id.as_ref() == Some(agent_id));
             }
             FactoryEvent::ProjectDeleted { project_id } => {
+                self.cancel_project_retries(project_id);
                 self.invalidate_attention(|item| &item.project_id == project_id);
             }
             FactoryEvent::AutoModeChanged { .. }
@@ -1239,8 +1296,17 @@ impl Board {
                 self.sessions.insert(session.id.clone(), session);
                 self.clear_changed_attach_failures();
             }
-            FactoryEvent::TaskDeleted { task_id, .. } => {
-                self.tasks.remove(&task_id);
+            FactoryEvent::TaskDeleted {
+                project_id,
+                task_id,
+            } => {
+                if self
+                    .tasks
+                    .get(&task_id)
+                    .is_some_and(|task| task.snapshot.project_id == project_id)
+                {
+                    self.tasks.remove(&task_id);
+                }
             }
             FactoryEvent::AgentDeleted { agent_id, .. } => {
                 self.agents.remove(&agent_id);
@@ -1250,8 +1316,6 @@ impl Board {
                 self.agents.retain(|_, a| a.project_id != project_id);
                 self.tasks
                     .retain(|_, t| t.snapshot.project_id != project_id);
-                self.retry_operations
-                    .retain(|_, operation| operation.project_id != project_id);
                 self.runs.retain(|_, r| r.project_id != project_id);
                 self.sessions.retain(|_, s| s.project_id != project_id);
                 if self.focused_project.as_ref() == Some(&project_id) {
@@ -1342,7 +1406,17 @@ impl Board {
             LocalResponse::TaskRetried { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
-                if !retry_operation_is_current {
+                let response_matches_request = matches!(
+                    request,
+                    LocalRequest::RetryTask {
+                        project_id,
+                        task_id,
+                    } if task.snapshot.project_id == *project_id && id == *task_id
+                );
+                if !retry_operation_is_current || !response_matches_request {
+                    if retry_operation_is_current {
+                        self.clear_attention_request();
+                    }
                     return format!("ignored stale retry response for task#{id}");
                 }
                 self.tasks.insert(task.snapshot.id.clone(), task);
@@ -1354,9 +1428,23 @@ impl Board {
                 );
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
-            LocalResponse::TaskDeleted { task_id, .. } => {
-                self.tasks.remove(&task_id);
+            LocalResponse::TaskDeleted {
+                project_id,
+                task_id,
+            } => {
+                self.cancel_task_retry(&project_id, &task_id);
+                if self
+                    .tasks
+                    .get(&task_id)
+                    .is_some_and(|task| task.snapshot.project_id == project_id)
+                {
+                    self.tasks.remove(&task_id);
+                }
                 format!("deleted task#{task_id}")
+            }
+            LocalResponse::ProjectDeleted { project_id } => {
+                self.cancel_project_retries(&project_id);
+                format!("deleted project {project_id}")
             }
             LocalResponse::AgentCreated { agent } => {
                 let id = agent.id.clone();

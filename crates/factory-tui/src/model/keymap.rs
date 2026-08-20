@@ -1960,6 +1960,220 @@ mod tests {
     }
 
     #[test]
+    fn task_deleted_response_cancels_retry_before_delayed_success() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board
+            .tasks
+            .insert(blocked.snapshot.id.clone(), blocked.clone());
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+        let task_id = blocked.snapshot.id.clone();
+        let project_id = blocked.snapshot.project_id.clone();
+        let delete_operation_id = board.allocate_operation_id();
+
+        board.apply_operation_response(
+            delete_operation_id,
+            LocalRequest::DeleteTask {
+                project_id: project_id.clone(),
+                task_id: task_id.clone(),
+            },
+            Ok(LocalResponse::TaskDeleted {
+                project_id: project_id.clone(),
+                task_id: task_id.clone(),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(!board.retry_operations.contains_key(&task_id));
+        assert!(!board.tasks.contains_key(&task_id));
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert!(!board.tasks.contains_key(&task_id));
+    }
+
+    #[test]
+    fn project_deleted_response_cancels_every_retry_before_delayed_success() {
+        let mut board = board();
+        let first_id = TaskId::try_from("first").unwrap();
+        let second_id = TaskId::try_from("second").unwrap();
+        board.tasks.insert(
+            first_id.clone(),
+            task("first", "proj", TaskStatus::Blocked, Some("alice"), 10),
+        );
+        board.tasks.insert(
+            second_id.clone(),
+            task("second", "proj", TaskStatus::Failed, Some("alice"), 10),
+        );
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("first"),
+            None,
+            10,
+        );
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id: first_operation_id,
+            request: first_request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+        let Intent::SendWithIdentity {
+            operation_id: second_operation_id,
+            request: second_request,
+        } = board.task_retry_request(ProjectId::try_from("proj").unwrap(), second_id.clone())
+        else {
+            panic!("task menu path did not emit a retry request");
+        };
+        let delete_operation_id = board.allocate_operation_id();
+
+        board.apply_operation_response(
+            delete_operation_id,
+            LocalRequest::DeleteProject {
+                project_id: ProjectId::try_from("proj").unwrap(),
+            },
+            Ok(LocalResponse::ProjectDeleted {
+                project_id: ProjectId::try_from("proj").unwrap(),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.retry_operations.is_empty());
+
+        board.apply_operation_response(
+            first_operation_id,
+            first_request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("first", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        board.apply_operation_response(
+            second_operation_id,
+            second_request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("second", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert_eq!(
+            board.tasks.get(&first_id).map(|task| task.snapshot.status),
+            Some(TaskStatus::Blocked)
+        );
+        assert_eq!(
+            board.tasks.get(&second_id).map(|task| task.snapshot.status),
+            Some(TaskStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn fleet_snapshot_cancels_retry_when_same_task_id_belongs_to_another_project() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board.tasks.insert(blocked.snapshot.id.clone(), blocked);
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+
+        let replacement = task(
+            "blocked",
+            "replacement",
+            TaskStatus::Blocked,
+            Some("alice"),
+            12,
+        );
+        board.apply_fleet_snapshot(
+            vec![project("replacement", 12)],
+            Vec::new(),
+            vec![replacement.clone()],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.retry_operations.is_empty());
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert_eq!(
+            board.tasks.get(&replacement.snapshot.id),
+            Some(&replacement)
+        );
+    }
+
+    #[test]
+    fn retry_response_cannot_merge_a_cross_project_task_payload() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board
+            .tasks
+            .insert(blocked.snapshot.id.clone(), blocked.clone());
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "other", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.retry_operations.is_empty());
+        assert_eq!(board.tasks.get(&blocked.snapshot.id), Some(&blocked));
+    }
+
+    #[test]
     fn task_menu_retry_success_uses_an_exact_current_operation() {
         let mut board = board();
         let task_id = TaskId::try_from("retryable").unwrap();
