@@ -102,7 +102,7 @@ pub trait Provider {
 `spawn_spec` is the entire contract. Given a [`SpawnContext`] — the
 project/agent/session identity, the worktree to run in, an optional model
 and permission mode, an optional prior provider-session identity to
-resume, where this session's hook token file lives, and the trusted path
+resume, where this session's credential file lives, and the trusted path
 to `factoryctl` — it writes whatever provider-specific configuration it
 needs (a settings file, a seeded home directory, ...) and returns an
 [`InteractiveLaunch`]: an executable, its argument vector, environment
@@ -117,7 +117,8 @@ permission/approval-mode strings it accepts.
 The session runner takes the `InteractiveLaunch` and spawns it under a PTY.
 It knows nothing about Claude or Codex specifically; it only knows how to
 run one program with one argv and environment under a terminal, and how to
-receive `factoryctl hook` calls on the daemon's control socket and turn
+receive authenticated `factoryctl hook` calls on the daemon's private session
+socket and turn
 them into `factory_core::ProviderHookEvent` values (see
 `crates/factoryctl/src/main.rs`'s `hook` subcommand and
 `crates/factoryd/src/local_api.rs`'s `ProviderHook` handler).

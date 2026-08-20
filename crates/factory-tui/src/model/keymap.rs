@@ -1152,7 +1152,6 @@ impl Board {
                 Intent::Send(LocalRequest::SendAgentMessage {
                     id,
                     project_id,
-                    sender_agent_id: None,
                     recipient_agent_id,
                     body,
                 })

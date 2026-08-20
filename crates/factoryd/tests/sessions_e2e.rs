@@ -32,6 +32,7 @@ use factory_core::{
 use factoryctl::Client;
 #[cfg(target_os = "macos")]
 use factoryctl::{capacity, launchd, probes};
+use rusqlite::Connection;
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
@@ -51,6 +52,7 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(200);
 /// `tempfile::TempDir` this test owns.
 struct Daemon {
     socket: PathBuf,
+    session_socket: PathBuf,
     child: Child,
 }
 
@@ -114,7 +116,13 @@ impl Daemon {
         }
         let child = command.spawn().expect("spawn factoryd");
         wait_for_socket(&socket, READY_TIMEOUT);
-        Self { socket, child }
+        let session_socket = home.join("runs/agent.sock");
+        wait_for_socket(&session_socket, READY_TIMEOUT);
+        Self {
+            socket,
+            session_socket,
+            child,
+        }
     }
 
     fn client(&self) -> Client {
@@ -978,7 +986,6 @@ fn a_standalone_message_delivers_without_opening_a_run() {
         .request(LocalRequest::SendAgentMessage {
             id: factory_core::MessageId::try_from("msg-1").unwrap(),
             project_id: project_id(),
-            sender_agent_id: None,
             recipient_agent_id: AgentId::try_from("curie").unwrap(),
             body: "Please check the queue.\nKeep this prompt intact.".into(),
         })
@@ -1443,6 +1450,71 @@ fn factoryd_restart_does_not_lose_a_live_session() {
         after.id, session_before.id,
         "delivery after a restart must reuse the recovered session, not spawn a new one"
     );
+
+    cleanup_session(&daemon, "curie");
+    daemon.stop();
+}
+
+#[test]
+fn daemon_replacement_retires_a_preserved_legacy_session_before_publishing_sockets() {
+    let home = private_tempdir();
+    let project = setup_project(home.path());
+    let client = project.daemon.client();
+    create_shell_agent_with_command(
+        &client,
+        "curie",
+        format!("python3 {}", exact_shell_agent_path()),
+    );
+    create_task(&client, "task-1", "First", "establish a resident session");
+    assign_task(&client, "task-1", "curie");
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let legacy = wait_for_stable_idle(&client, "curie");
+    assert_eq!(live_runners_under(home.path()), 1);
+
+    project.daemon.stop();
+    let database = home.path().join("factory.db");
+    let connection = Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE sessions SET principal_version = 0 WHERE id = ?1 AND ended_at_ms IS NULL",
+                [legacy.id.as_str()],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    // Daemon::start returns only after f.sock accepts connections. The
+    // rollout barrier must therefore have stopped and acknowledged the
+    // preserved runner before any credentialless operator request can race
+    // the old provider environment.
+    let daemon = Daemon::start(home.path());
+    assert!(
+        wait_for_no_runners_under(home.path(), READY_TIMEOUT),
+        "legacy runner survived publication of the replacement daemon socket"
+    );
+    let retired = list_sessions(&daemon.client())
+        .into_iter()
+        .find(|session| session.id == legacy.id)
+        .expect("legacy session row survives as terminal history");
+    assert!(!retired.state.is_live());
+
+    create_task(
+        &daemon.client(),
+        "task-2",
+        "Second",
+        "must launch with the authenticated endpoint",
+    );
+    assign_task(&daemon.client(), "task-2", "curie");
+    wait_for_task_status(&daemon.client(), "task-2", TaskStatus::Succeeded);
+    let replacement = poll_until(DELIVERY_TIMEOUT, || {
+        list_sessions(&daemon.client()).into_iter().find(|session| {
+            session.agent_id == AgentId::try_from("curie").unwrap()
+                && session.state == SessionState::Idle
+        })
+    });
+    assert_ne!(replacement.id, legacy.id);
 
     cleanup_session(&daemon, "curie");
     daemon.stop();
@@ -2173,7 +2245,7 @@ fn a_refused_delete_project_leaves_every_file_intact() {
 /// Provider A1), and this spawned process inherits this *test's own*
 /// environment, which has neither set -- without `--socket` it would
 /// silently resolve to `$HOME/.dark-factory/f.sock`, the operator's real
-/// running daemon, never this test's private one.
+/// running daemon, never this test's private session endpoint.
 fn run_hook_cli(socket: &Path, token_path: &Path, event: &str, payload: &str) -> String {
     use std::io::Write;
     let mut child = Command::new(factoryctl_path())
@@ -2231,7 +2303,7 @@ fn permission_request_hook_reports_waiting_for_input_and_is_never_answered() {
         "model":"gpt-5-codex","permission_mode":"on-request","session_id":"s1",
         "tool_name":"shell","tool_input":{},"transcript_path":null,"turn_id":"t1"}"#;
     let reply = run_hook_cli(
-        &daemon.socket,
+        &daemon.session_socket,
         &hook_token_path,
         "PermissionRequest",
         payload,
@@ -2250,7 +2322,7 @@ fn permission_request_hook_reports_waiting_for_input_and_is_never_answered() {
     );
 
     let reply = run_hook_cli(
-        &daemon.socket,
+        &daemon.session_socket,
         &hook_token_path,
         "PreToolUse",
         r#"{"tool_name":"shell"}"#,

@@ -25,7 +25,7 @@ use factory_core::{
 };
 use factoryd::{
     execution,
-    local_api::{ApiState, serve},
+    local_api::{ApiState, Endpoint, serve},
     store::Store,
 };
 use tokio::{
@@ -127,6 +127,7 @@ fn control_readiness_does_not_depend_on_process_table_observation() {
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
     let envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        credential: None,
         request,
     };
     let mut json = serde_json::to_vec(&envelope).unwrap();
@@ -347,7 +348,9 @@ struct Harness {
     execution: execution::Handle,
     execution_join: tokio::task::JoinHandle<Result<(), execution::Error>>,
     server: tokio::task::JoinHandle<std::io::Result<()>>,
+    session_server: tokio::task::JoinHandle<std::io::Result<()>>,
     shutdown_tx: oneshot::Sender<()>,
+    session_shutdown_tx: oneshot::Sender<()>,
     socket: PathBuf,
     home: tempfile::TempDir,
 }
@@ -358,31 +361,47 @@ impl Harness {
         let socket = home.path().join("f.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let state = ApiState::new(Store::open_in_memory().unwrap());
+        let session_socket = home.path().join("runs/agent.sock");
         let config = execution::Config {
             runner_program: factory_runner_path(),
             factoryctl_path: factoryctl_path(),
             runtime_root: home.path().join("runs"),
             guidance_root: home.path().to_path_buf(),
-            socket_path: socket.clone(),
+            socket_path: session_socket.clone(),
             max_active_runs: 4,
             session_start_deadline,
         };
         let (execution, execution_join) = execution::spawn(config, state.clone()).unwrap();
+        let session_listener = UnixListener::bind(&session_socket).unwrap();
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (session_shutdown_tx, session_shutdown_rx) = oneshot::channel();
         let server = tokio::spawn(serve(
             listener,
-            state,
+            Endpoint::Operator,
+            state.clone(),
             execution.clone(),
             home.path().to_path_buf(),
             async move {
                 let _ = shutdown_rx.await;
             },
         ));
+        let session_server = tokio::spawn(serve(
+            session_listener,
+            Endpoint::Session,
+            state,
+            execution.clone(),
+            home.path().to_path_buf(),
+            async move {
+                let _ = session_shutdown_rx.await;
+            },
+        ));
         Self {
             execution,
             execution_join,
             server,
+            session_server,
             shutdown_tx,
+            session_shutdown_tx,
             socket,
             home,
         }
@@ -399,7 +418,9 @@ impl Harness {
 
     async fn stop(self) {
         let _ = self.shutdown_tx.send(());
+        let _ = self.session_shutdown_tx.send(());
         self.server.await.unwrap().unwrap();
+        self.session_server.await.unwrap().unwrap();
         self.execution.shutdown().await.unwrap();
         self.execution_join.await.unwrap().unwrap();
     }

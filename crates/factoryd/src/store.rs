@@ -29,7 +29,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 29;
+const SCHEMA_VERSION: i64 = 30;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -489,6 +489,7 @@ pub struct SessionControlTarget {
 /// resident session after a daemon restart.
 pub struct RecoverableSession {
     pub session_id: SessionId,
+    pub project_id: ProjectId,
     pub provider: Provider,
     pub provider_session_id: Option<String>,
     pub worktree: String,
@@ -497,6 +498,15 @@ pub struct RecoverableSession {
     pub runner_protocol_version: u16,
     pub observer_health: ObserverHealth,
     pub delivery_recovery_stop_requested: bool,
+}
+
+/// Authority derived by the daemon from one fresh live-session credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedPrincipal {
+    pub project_id: ProjectId,
+    pub agent_id: AgentId,
+    pub session_id: SessionId,
+    pub role: AgentRole,
 }
 
 /// Result of opening a task-episode inside a live session.
@@ -1389,11 +1399,11 @@ impl Store {
                 observer_health_since_ms, runner_instance_id, runner_runtime,
                 runner_protocol_version, last_hook_event, notification_kind, last_hook_at_ms,
                 started_at_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal,
-                stop_requested_at_ms, resumed_provider_session
+                stop_requested_at_ms, resumed_provider_session, principal_version
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'starting', ?13,
                 NULL, 0, NULL, ?14, ?13, ?15, ?16, ?17, NULL, NULL, NULL, ?13,
-                ?13, NULL, NULL, NULL, NULL, ?18
+                ?13, NULL, NULL, NULL, NULL, ?18, 1
              )",
             params![
                 input.id.as_str(),
@@ -1451,27 +1461,48 @@ impl Store {
         ))
     }
 
-    /// Authenticates one `factoryctl hook` invocation. Linear scan plus a
-    /// constant-time compare: hook tokens are secrets, so this deliberately
-    /// avoids an indexed `WHERE hook_token = ?` (a b-tree probe on secret
-    /// material leaks timing).
-    pub fn find_session_by_hook_token(&self, token: &str) -> Result<Option<SessionRow>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT id, hook_token FROM sessions WHERE ended_at_ms IS NULL")?;
+    /// Resolves an opaque bearer by scanning every live session with a
+    /// constant-time comparison. Version-zero rows predate this boundary and
+    /// are never authenticated.
+    pub fn authenticate_session(
+        &self,
+        credential: &[u8],
+    ) -> Result<Option<AuthenticatedPrincipal>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, hook_token, principal_version
+             FROM sessions WHERE ended_at_ms IS NULL ORDER BY id",
+        )?;
         let rows = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
-        for (id, hook_token) in rows {
-            if constant_time_eq(hook_token.as_bytes(), token.as_bytes()) {
-                let session_id: SessionId = parse_id(id, 0)?;
-                return load_session(&self.connection, &session_id);
+        let mut matched = None;
+        for (id, expected, principal_version) in rows {
+            if constant_time_eq(expected.as_bytes(), credential) {
+                matched = (principal_version == 1).then_some(id);
             }
         }
-        Ok(None)
+        let Some(id) = matched else {
+            return Ok(None);
+        };
+        let session_id: SessionId = parse_id(id, 0)?;
+        let session = load_session(&self.connection, &session_id)?
+            .filter(|session| session.ended_at_ms.is_none())
+            .ok_or(StoreError::SessionNotFound)?;
+        let agent =
+            load_agent(&self.connection, &session.agent_id)?.ok_or(StoreError::AgentNotFound)?;
+        Ok(Some(AuthenticatedPrincipal {
+            project_id: session.project_id,
+            agent_id: session.agent_id,
+            session_id: session.id,
+            role: agent.snapshot.role,
+        }))
     }
 
     /// Durable provider-independent work owner for one resident session.
@@ -2487,29 +2518,65 @@ impl Store {
     /// Every session the daemon must reconnect to after a restart.
     pub fn recoverable_sessions(&self) -> Result<Vec<RecoverableSession>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, provider, provider_session_id, worktree, runner_instance_id,
+            "SELECT id, project_id, provider, provider_session_id, worktree, runner_instance_id,
                     runner_runtime, runner_protocol_version, observer_health,
                     delivery_recovery_stop_requested_at_ms IS NOT NULL
              FROM sessions
-             WHERE ended_at_ms IS NULL
+             WHERE ended_at_ms IS NULL AND principal_version = 1
              ORDER BY project_id, started_at_ms, id",
         )?;
         let rows = statement.query_map([], |row| {
-            let provider: String = row.get(1)?;
-            let protocol: i64 = row.get(6)?;
-            let observer_health: String = row.get(7)?;
+            let provider: String = row.get(2)?;
+            let protocol: i64 = row.get(7)?;
+            let observer_health: String = row.get(8)?;
             Ok(RecoverableSession {
                 session_id: parse_id(row.get(0)?, 0)?,
-                provider: parse_provider(&provider, 1)?,
-                provider_session_id: row.get(2)?,
-                worktree: row.get(3)?,
-                runner_instance_id: parse_id(row.get(4)?, 4)?,
-                runner_runtime: row.get(5)?,
+                project_id: parse_id(row.get(1)?, 1)?,
+                provider: parse_provider(&provider, 2)?,
+                provider_session_id: row.get(3)?,
+                worktree: row.get(4)?,
+                runner_instance_id: parse_id(row.get(5)?, 5)?,
+                runner_runtime: row.get(6)?,
                 runner_protocol_version: u16::try_from(protocol).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
                 })?,
-                observer_health: parse_observer_health(&observer_health, 7)?,
-                delivery_recovery_stop_requested: row.get(8)?,
+                observer_health: parse_observer_health(&observer_health, 8)?,
+                delivery_recovery_stop_requested: row.get(9)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    /// Sessions resident across the schema upgrade. Their provider
+    /// environment still points at the credentialless operator socket, so
+    /// startup must retire them before publishing either API endpoint.
+    pub fn legacy_live_sessions(&self) -> Result<Vec<RecoverableSession>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, project_id, provider, provider_session_id, worktree, runner_instance_id,
+                    runner_runtime, runner_protocol_version, observer_health,
+                    delivery_recovery_stop_requested_at_ms IS NOT NULL
+             FROM sessions
+             WHERE ended_at_ms IS NULL AND principal_version = 0
+             ORDER BY project_id, started_at_ms, id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let provider: String = row.get(2)?;
+            let protocol: i64 = row.get(7)?;
+            let observer_health: String = row.get(8)?;
+            Ok(RecoverableSession {
+                session_id: parse_id(row.get(0)?, 0)?,
+                project_id: parse_id(row.get(1)?, 1)?,
+                provider: parse_provider(&provider, 2)?,
+                provider_session_id: row.get(3)?,
+                worktree: row.get(4)?,
+                runner_instance_id: parse_id(row.get(5)?, 5)?,
+                runner_runtime: row.get(6)?,
+                runner_protocol_version: u16::try_from(protocol).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+                })?,
+                observer_health: parse_observer_health(&observer_health, 8)?,
+                delivery_recovery_stop_requested: row.get(9)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -3257,6 +3324,7 @@ impl Store {
         &mut self,
         project_id: &ProjectId,
         task_id: &TaskId,
+        session_id: &SessionId,
         result: String,
         now_ms: i64,
     ) -> Result<ClosedEpisode> {
@@ -3267,6 +3335,9 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = open_run_for_task(&transaction, project_id, task_id)?;
+        if run.session_id.as_ref() != Some(session_id) {
+            return Err(StoreError::SessionNotFound);
+        }
         let closed = close_run_in_transaction(
             &transaction,
             &run,
@@ -3288,6 +3359,7 @@ impl Store {
         &mut self,
         project_id: &ProjectId,
         task_id: &TaskId,
+        session_id: &SessionId,
         reason: String,
         now_ms: i64,
     ) -> Result<ClosedEpisode> {
@@ -3298,6 +3370,9 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let run = open_run_for_task(&transaction, project_id, task_id)?;
+        if run.session_id.as_ref() != Some(session_id) {
+            return Err(StoreError::SessionNotFound);
+        }
         let closed = close_run_in_transaction(
             &transaction,
             &run,
@@ -4282,6 +4357,74 @@ impl Store {
             return Err(StoreError::TaskNotFound);
         }
         Ok(task)
+    }
+
+    /// Whether an authenticated session may address `target` directly.
+    /// Workers may report to their daemon-owned parent (or themselves);
+    /// orchestrators may address only themselves and current descendants.
+    pub fn message_recipient_is_in_principal_scope(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        target: &AgentId,
+    ) -> Result<bool> {
+        if principal.role == AgentRole::Orchestrator {
+            return self
+                .connection
+                .query_row(
+                    "WITH RECURSIVE visible(id) AS (
+                         SELECT ?1
+                         UNION ALL
+                         SELECT agents.id FROM agents
+                         JOIN visible ON agents.parent_agent_id = visible.id
+                         WHERE agents.project_id = ?2
+                     )
+                     SELECT EXISTS(SELECT 1 FROM visible WHERE id = ?3)",
+                    params![
+                        principal.agent_id.as_str(),
+                        principal.project_id.as_str(),
+                        target.as_str(),
+                    ],
+                    |row| row.get(0),
+                )
+                .map_err(StoreError::from);
+        }
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1
+                     FROM agents sender
+                     JOIN agents recipient ON recipient.project_id = sender.project_id
+                     WHERE sender.id = ?1
+                       AND sender.project_id = ?2
+                       AND recipient.id = ?3
+                       AND (recipient.id = sender.id
+                            OR recipient.id = sender.parent_agent_id)
+                 )",
+                params![
+                    principal.agent_id.as_str(),
+                    principal.project_id.as_str(),
+                    target.as_str(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::from)
+    }
+
+    pub fn authenticated_session_row(&self, session_id: &SessionId) -> Result<SessionRow> {
+        let enabled: bool = self
+            .connection
+            .query_row(
+                "SELECT principal_version = 1 FROM sessions
+             WHERE id = ?1 AND ended_at_ms IS NULL",
+                params![session_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::SessionNotFound)?;
+        if !enabled {
+            return Err(StoreError::SessionNotFound);
+        }
+        load_session(&self.connection, session_id)?.ok_or(StoreError::SessionNotFound)
     }
 
     pub fn retry_task(
@@ -6941,6 +7084,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         transaction.pragma_update(None, "user_version", 29)?;
         transaction.commit()?;
         verify_no_foreign_key_violations(connection)?;
+        current = 29;
+    }
+    if current == 29 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0030_authenticated_principals.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 30)?;
+        transaction.commit()?;
     }
     Ok(())
 }

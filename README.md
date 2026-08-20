@@ -67,6 +67,14 @@ and sandboxing. Dark Factory still applies its tool deny policy. Run
 future sessions. Read the [security policy](SECURITY.md) before you assign real
 work.
 
+Agent-origin `factoryctl` calls use a daemon-owned authenticated session socket.
+The daemon derives the live session's project, agent, current work, message
+sender, and permitted recipient hierarchy. All other local operations remain
+available only on the credentialless owner-only operator socket. This prevents
+cooperative or buggy sessions from accidentally borrowing another principal,
+but it is not hostile same-user process isolation; see
+[SECURITY.md](SECURITY.md) and issue #125.
+
 `factoryctl agent status` reports each session's configured override separately
 from the exact runtime values it could establish; unavailable provider metadata
 is shown as `unreported`.

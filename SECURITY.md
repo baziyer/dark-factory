@@ -102,17 +102,28 @@ operator from their own agents. Concretely:
   Ordinary pause and budget exhaustion are separate durable holds, and both
   spawn and delivery consult exhaustion directly rather than trusting a
   shared or cached pause projection.
-- **Hooks and repository requests are authenticated; the rest is your user.** A provider's hook
-  invocations identify their session by a per-session random token in a
-  `0600` file (never on argv or in the environment). An agent's own `task
-  done`/`task blocked`/`agent message` calls, and every operator command,
-  are plain local-API requests: whoever can open the socket — any process
-  running as you, including every session — can make them, naming any
-  agent. Repository commands are the exception: they authenticate that same
-  live-session bearer token and infer their target identity from it.
-  Per-session authentication of the remaining calls is planned (roles and a
-  review queue), not present. The daemon spawns runners with a fixed
-  non-secret environment allowlist, not its own ambient environment.
+- **Agent API calls have one authenticated principal.** The documented
+  operator socket remains credentialless and owner-only. A new provider
+  session instead receives the path of a separate private session socket and
+  a fresh 32-byte bearer in an atomic `0600` file under its `0700` runtime
+  directory; the bearer itself is never placed on argv or directly in an
+  environment value. The session endpoint rejects missing, invalid, ended, or
+  legacy credentials. The daemon derives project, agent, session, message
+  sender, permitted message-recipient hierarchy, and exact current task/run
+  ownership; request bodies cannot select those identities. This first tranche
+  permits provider hooks, repository operations, self/parent/approved-
+  descendant messaging, and exact current-session completion/blocking. Every
+  other local request, including observation and subscriptions, remains
+  operator-only. Completion and blocking bind the credential's exact session
+  to the canonical transactional `session_work` transition.
+
+  This boundary protects against cooperative or buggy agents accidentally
+  using another agent's or the operator's authority. It is **not hostile
+  same-OS-user process isolation**: a malicious process already running as the
+  operator may inspect another process, discover filesystem paths, or open the
+  credentialless operator socket. Issue #125 remains the planned hardened outer
+  execution boundary. The daemon still spawns runners with a fixed non-secret
+  environment allowlist, not its own ambient environment.
 - **Bounded inputs everywhere.** Guidance files, hook payloads, local-API
   frames, retained terminal logs, and webhook bodies all have hard size
   caps; raw provider output never enters public events, webhook responses,

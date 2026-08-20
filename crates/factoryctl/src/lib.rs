@@ -12,7 +12,7 @@ use std::{
 
 use factory_core::{
     PROTOCOL_VERSION,
-    local::{LocalRequest, RequestEnvelope, ServerFrame},
+    local::{LocalRequest, RequestEnvelope, ServerFrame, SessionCredential},
 };
 
 pub mod capacity;
@@ -88,9 +88,23 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     socket: PathBuf,
+    credential: Option<SessionCredential>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Client")
+            .field("socket", &self.socket)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 impl Client {
@@ -98,6 +112,15 @@ impl Client {
     pub fn new(socket: impl AsRef<Path>) -> Self {
         Self {
             socket: socket.as_ref().to_owned(),
+            credential: None,
+        }
+    }
+
+    #[must_use]
+    pub fn authenticated(socket: impl AsRef<Path>, credential: SessionCredential) -> Self {
+        Self {
+            socket: socket.as_ref().to_owned(),
+            credential: Some(credential),
         }
     }
 
@@ -162,7 +185,11 @@ impl Client {
     ) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
         stream.set_write_timeout(Some(timeout))?;
-        write_request(&mut stream, &RequestEnvelope::new(request))?;
+        let envelope = match self.credential.clone() {
+            Some(credential) => RequestEnvelope::authenticated(request, credential),
+            None => RequestEnvelope::new(request),
+        };
+        write_request(&mut stream, &envelope)?;
         Ok(stream)
     }
 }
@@ -399,6 +426,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn authenticated_client_debug_never_exposes_the_bearer() {
+        let bearer = "PRIVATE_CLIENT_BEARER_SENTINEL";
+        let client = Client::authenticated(
+            "/tmp/factory-test.sock",
+            SessionCredential::new(bearer.to_owned()),
+        );
+
+        assert!(!format!("{client:?}").contains(bearer));
+    }
 
     #[test]
     fn policy_mutation_rejects_an_old_daemon_instead_of_dropping_fields() {

@@ -5,13 +5,13 @@ use factory_core::{
     RunnerInstanceId, SessionId, TaskId,
     local::{
         ErrorCode, LocalRequest, LocalResponse, MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES,
-        MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame,
+        MAX_TASK_BODY_BYTES, RequestEnvelope, ServerFrame, SessionCredential,
     },
 };
 use factoryctl::Client;
 use factoryd::{
     execution,
-    local_api::{ApiState, serve},
+    local_api::{ApiState, Endpoint, serve},
     store::{NewAgent, NewProject, NewSession, NewTask, Store},
 };
 use rusqlite::Connection;
@@ -36,8 +36,21 @@ fn agent_id(value: &str) -> AgentId {
 async fn write_request(stream: &mut UnixStream, request: LocalRequest) {
     let envelope = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        credential: None,
         request,
     };
+    let mut json = serde_json::to_vec(&envelope).unwrap();
+    json.push(b'\n');
+    stream.write_all(&json).await.unwrap();
+}
+
+async fn write_authenticated_request(
+    stream: &mut UnixStream,
+    credential: &str,
+    request: LocalRequest,
+) {
+    let envelope =
+        RequestEnvelope::authenticated(request, SessionCredential::new(credential.to_owned()));
     let mut json = serde_json::to_vec(&envelope).unwrap();
     json.push(b'\n');
     stream.write_all(&json).await.unwrap();
@@ -53,6 +66,16 @@ async fn read_frame(reader: &mut BufReader<UnixStream>) -> ServerFrame {
 async fn request(socket: &Path, request: LocalRequest) -> ServerFrame {
     let mut stream = UnixStream::connect(socket).await.unwrap();
     write_request(&mut stream, request).await;
+    read_frame(&mut BufReader::new(stream)).await
+}
+
+async fn authenticated_request(
+    socket: &Path,
+    credential: &str,
+    request: LocalRequest,
+) -> ServerFrame {
+    let mut stream = UnixStream::connect(socket).await.unwrap();
+    write_authenticated_request(&mut stream, credential, request).await;
     read_frame(&mut BufReader::new(stream)).await
 }
 
@@ -88,6 +111,7 @@ where
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
+        Endpoint::Operator,
         state,
         execution.clone(),
         directory.path().to_path_buf(),
@@ -105,7 +129,238 @@ where
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_events() {
+async fn session_endpoint_fails_closed_and_derives_message_authority() {
+    const WORKER_CREDENTIAL: &str =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const LEAD_CREDENTIAL: &str =
+        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const ENDED_CREDENTIAL: &str =
+        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    let directory = private_tempdir();
+    let socket = directory.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let mut store = Store::open_in_memory().unwrap();
+    store
+        .create_project(
+            NewProject {
+                id: project_id("factory"),
+                name: "Factory".into(),
+                root: directory.path().to_string_lossy().into_owned(),
+            },
+            1,
+        )
+        .unwrap();
+    for (id, parent_agent_id, role, timestamp) in [
+        ("root", None, AgentRole::Orchestrator, 2),
+        ("worker", Some("root"), AgentRole::Worker, 3),
+        ("lead", Some("root"), AgentRole::Orchestrator, 4),
+        ("descendant", Some("lead"), AgentRole::Worker, 5),
+        ("sibling", Some("root"), AgentRole::Worker, 6),
+    ] {
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id(id),
+                    project_id: project_id("factory"),
+                    parent_agent_id: parent_agent_id.map(agent_id),
+                    role,
+                    provider: Provider::Shell,
+                },
+                timestamp,
+            )
+            .unwrap();
+    }
+    let state = ApiState::new(store);
+    let (execution, execution_join) =
+        execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let worktree = directory.path().to_string_lossy().into_owned();
+    let worker_runtime = directory
+        .path()
+        .join("worker-runner")
+        .to_string_lossy()
+        .into_owned();
+    let lead_runtime = directory
+        .path()
+        .join("lead-runner")
+        .to_string_lossy()
+        .into_owned();
+    state
+        .commit_and_publish(move |store| {
+            let (_, mut events) = store.create_session(
+                NewSession {
+                    id: SessionId::try_from("worker-session").unwrap(),
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("worker"),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: worktree.clone(),
+                    codex_home: None,
+                    hook_token: WORKER_CREDENTIAL.into(),
+                    runner_instance_id: RunnerInstanceId::try_from("worker-runner").unwrap(),
+                    runner_runtime: worker_runtime,
+                    runner_protocol_version: 1,
+                },
+                7,
+            )?;
+            let (_, lead_events) = store.create_session(
+                NewSession {
+                    id: SessionId::try_from("lead-session").unwrap(),
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("lead"),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree,
+                    codex_home: None,
+                    hook_token: LEAD_CREDENTIAL.into(),
+                    runner_instance_id: RunnerInstanceId::try_from("lead-runner").unwrap(),
+                    runner_runtime: lead_runtime,
+                    runner_protocol_version: 1,
+                },
+                8,
+            )?;
+            events.extend(lead_events);
+            Ok(((), events))
+        })
+        .await
+        .unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(serve(
+        listener,
+        Endpoint::Session,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = shutdown_rx.await;
+        },
+    ));
+
+    let message = |id: &str, recipient: &str| LocalRequest::SendAgentMessage {
+        id: factory_core::MessageId::try_from(id).unwrap(),
+        project_id: project_id("factory"),
+        recipient_agent_id: agent_id(recipient),
+        body: "status".into(),
+    };
+    for response in [
+        request(&socket, message("missing", "worker")).await,
+        authenticated_request(&socket, &"b".repeat(64), message("invalid", "worker")).await,
+        authenticated_request(
+            &socket,
+            WORKER_CREDENTIAL,
+            LocalRequest::ListAgents {
+                project_id: project_id("factory"),
+                after_id: None,
+                limit: 1,
+            },
+        )
+        .await,
+        authenticated_request(&socket, WORKER_CREDENTIAL, message("sibling", "sibling")).await,
+        authenticated_request(&socket, LEAD_CREDENTIAL, message("parent", "root")).await,
+    ] {
+        assert!(matches!(
+            response,
+            ServerFrame::Response {
+                response: LocalResponse::Error {
+                    code: ErrorCode::Unauthorized,
+                    ..
+                },
+                ..
+            }
+        ));
+    }
+    for (credential, request, sender) in [
+        (
+            WORKER_CREDENTIAL,
+            message("self", "worker"),
+            agent_id("worker"),
+        ),
+        (
+            WORKER_CREDENTIAL,
+            message("worker-parent", "root"),
+            agent_id("worker"),
+        ),
+        (
+            LEAD_CREDENTIAL,
+            message("descendant", "descendant"),
+            agent_id("lead"),
+        ),
+    ] {
+        assert!(matches!(
+            authenticated_request(&socket, credential, request).await,
+            ServerFrame::Response {
+                response: LocalResponse::AgentMessageSent { message },
+                ..
+            } if message.sender_agent_id == Some(sender)
+        ));
+    }
+
+    let ended_worktree = directory.path().to_string_lossy().into_owned();
+    let ended_runtime = directory
+        .path()
+        .join("ended-runner")
+        .to_string_lossy()
+        .into_owned();
+    state
+        .commit_and_publish(move |store| {
+            let (session, mut events) = store.create_session(
+                NewSession {
+                    id: SessionId::try_from("ended-session").unwrap(),
+                    project_id: project_id("factory"),
+                    agent_id: agent_id("sibling"),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: ended_worktree,
+                    codex_home: None,
+                    hook_token: ENDED_CREDENTIAL.into(),
+                    runner_instance_id: RunnerInstanceId::try_from("ended-runner").unwrap(),
+                    runner_runtime: ended_runtime,
+                    runner_protocol_version: 1,
+                },
+                9,
+            )?;
+            let (_, ended_events) = store.end_session(&session.id, Some(0), None, 10)?;
+            events.extend(ended_events);
+            Ok(((), events))
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        authenticated_request(
+            &socket,
+            ENDED_CREDENTIAL,
+            message("ended-session", "worker"),
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: ErrorCode::Unauthorized,
+                ..
+            },
+            ..
+        }
+    ));
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    execution.shutdown().await.unwrap();
+    execution_join.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn factoryctl_replays_stored_v1_events_through_v3_and_receives_new_live_events() {
     let directory = private_tempdir();
     let database = directory.path().join("factory.db");
     let project_id = project_id("factory");
@@ -133,6 +388,7 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
                  ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+                 ALTER TABLE sessions DROP COLUMN principal_version;
                  ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  DROP TABLE delivery_attempts;
@@ -151,6 +407,7 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
+        Endpoint::Operator,
         state.clone(),
         execution.clone(),
         directory.path().to_path_buf(),
@@ -243,18 +500,32 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
     let directory = tempfile::tempdir_in("/tmp").unwrap();
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket = directory.path().join("f.sock");
+    let session_socket = directory.path().join("agent.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let session_listener = UnixListener::bind(&session_socket).unwrap();
     let state = ApiState::new(Store::open_in_memory().unwrap());
     let (execution, execution_join) =
         execution::spawn(execution_config(directory.path(), &socket), state.clone()).unwrap();
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (session_shutdown_tx, session_shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
+        Endpoint::Operator,
         state.clone(),
         execution.clone(),
         directory.path().to_path_buf(),
         async {
             let _ = shutdown_rx.await;
+        },
+    ));
+    let session_server = tokio::spawn(serve(
+        session_listener,
+        Endpoint::Session,
+        state.clone(),
+        execution.clone(),
+        directory.path().to_path_buf(),
+        async {
+            let _ = session_shutdown_rx.await;
         },
     ));
 
@@ -348,10 +619,10 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
     ));
 
     assert!(matches!(
-        request(
-            &socket,
+        authenticated_request(
+            &session_socket,
+            &token,
             LocalRequest::ProviderHook {
-                token,
                 event: ProviderHookEvent::PreToolUse,
                 payload: serde_json::json!({"tool_name": "Read"}),
             },
@@ -437,19 +708,15 @@ async fn session_hook_local_api_projects_the_real_current_session_relation() {
     ));
 
     let _ = shutdown_tx.send(());
+    let _ = session_shutdown_tx.send(());
     server.await.unwrap().unwrap();
+    session_server.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn repository_requests_require_a_live_session_token_and_accept_no_target_ids() {
     with_server(|socket| async move {
-        let response = request(
-            &socket,
-            LocalRequest::GitPush {
-                token: "not-a-session-token".into(),
-            },
-        )
-        .await;
+        let response = request(&socket, LocalRequest::GitPush).await;
         assert!(matches!(
             response,
             ServerFrame::Response {
@@ -458,7 +725,7 @@ async fn repository_requests_require_a_live_session_token_and_accept_no_target_i
                     ref message,
                 },
                 ..
-            } if message == "session authentication failed"
+            } if message == "operation requires an authenticated agent session"
         ));
     })
     .await;
@@ -778,6 +1045,7 @@ async fn shutdown_closes_idle_connections_before_returning() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
+        Endpoint::Operator,
         state,
         execution.clone(),
         directory.path().to_path_buf(),
@@ -821,6 +1089,7 @@ async fn shutdown_cancels_a_blocked_historical_replay() {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let server = tokio::spawn(serve(
         listener,
+        Endpoint::Operator,
         state,
         execution.clone(),
         directory.path().to_path_buf(),
@@ -997,6 +1266,7 @@ async fn an_unsupported_protocol_cannot_mutate_state() {
         let mut stream = UnixStream::connect(&socket).await.unwrap();
         let envelope = RequestEnvelope {
             protocol_version: PROTOCOL_VERSION + 1,
+            credential: None,
             request: LocalRequest::CreateProject {
                 id: project_id("never-created"),
                 name: "No".into(),
@@ -1245,7 +1515,6 @@ async fn local_agent_messages_round_trip_without_public_events() {
             LocalRequest::SendAgentMessage {
                 id: factory_core::MessageId::try_from("message-1").unwrap(),
                 project_id: project_id("factory"),
-                sender_agent_id: None,
                 recipient_agent_id: agent_id("god"),
                 body: "Please review the queue.".into(),
             },
@@ -1256,7 +1525,7 @@ async fn local_agent_messages_round_trip_without_public_events() {
             ServerFrame::Response {
                 response: LocalResponse::AgentMessageSent { ref message },
                 ..
-            } if message.delivered_at_ms.is_none()
+            } if message.delivered_at_ms.is_none() && message.sender_agent_id.is_none()
         ));
 
         let listed = request(
@@ -2395,8 +2664,9 @@ async fn session_shaped_requests_now_have_real_behavior() {
             } if sessions.is_empty()
         ));
 
-        // Requests naming a run/task-episode/session that doesn't exist yet
-        // surface the real not-found/conflict, not a blanket "unsupported".
+        // Operator-owned run/session controls still surface their real
+        // not-found result. Agent completion and blocking fail before state
+        // lookup because they require an authenticated current session.
         let run_id = factory_core::RunId::try_from("run-1").unwrap();
         let session_id = factory_core::SessionId::try_from("session-1").unwrap();
         assert!(matches!(
@@ -2428,7 +2698,7 @@ async fn session_shaped_requests_now_have_real_behavior() {
             .await,
             ServerFrame::Response {
                 response: LocalResponse::Error {
-                    code: ErrorCode::Conflict,
+                    code: ErrorCode::Unauthorized,
                     ..
                 },
                 ..
@@ -2446,7 +2716,7 @@ async fn session_shaped_requests_now_have_real_behavior() {
             .await,
             ServerFrame::Response {
                 response: LocalResponse::Error {
-                    code: ErrorCode::Conflict,
+                    code: ErrorCode::Unauthorized,
                     ..
                 },
                 ..
@@ -2474,7 +2744,6 @@ async fn session_shaped_requests_now_have_real_behavior() {
             request(
                 &socket,
                 LocalRequest::ProviderHook {
-                    token: "unrecognized-token".into(),
                     event: factory_core::ProviderHookEvent::Stop,
                     payload: serde_json::json!({}),
                 },
@@ -2482,7 +2751,7 @@ async fn session_shaped_requests_now_have_real_behavior() {
             .await,
             ServerFrame::Response {
                 response: LocalResponse::Error {
-                    code: ErrorCode::InvalidRequest,
+                    code: ErrorCode::Unauthorized,
                     ..
                 },
                 ..

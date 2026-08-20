@@ -19,7 +19,7 @@ use factory_core::{
         MAX_EVENT_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS,
         MAX_SESSION_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
         MAX_TERMINAL_OUTPUT_BYTES, ProjectDetail as LocalProjectDetail, RequestEnvelope,
-        RunTerminal, ServerFrame, normalize_task_title,
+        RunTerminal, ServerFrame, SessionCredential, normalize_task_title,
     },
     runner::{
         MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream, RunnerErrorCode, RunnerEvent,
@@ -47,13 +47,19 @@ use crate::{
     repository,
     runner_client::{RunnerClient, RunnerClientError},
     store::{
-        AgentMessage, NewAgent, NewAgentMessage, NewProject, NewRepositoryOperation, NewTask,
-        SessionControlTarget, StoreError, UpdateAgentProfile,
+        AgentMessage, AuthenticatedPrincipal, NewAgent, NewAgentMessage, NewProject,
+        NewRepositoryOperation, NewTask, SessionControlTarget, StoreError, UpdateAgentProfile,
     },
 };
 
 const MAX_CONCURRENT_WORKTREE_PROBES: usize = 8;
 const FLEET_WORKTREE_DEADLINE: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Endpoint {
+    Operator,
+    Session,
+}
 
 enum RepositoryRequest {
     Status,
@@ -334,6 +340,7 @@ impl From<execution::Error> for ApiFailure {
 
 pub async fn serve<F>(
     listener: UnixListener,
+    endpoint: Endpoint,
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
@@ -369,7 +376,7 @@ where
                 handlers.spawn(async move {
                     let _permit = permit;
                     if let Err(error) =
-                        handle_connection(stream, state, execution, guidance_root, shutdown).await
+                        handle_connection(stream, endpoint, state, execution, guidance_root, shutdown).await
                     {
                         tracing::warn!(%error, "local client disconnected with an error");
                     }
@@ -394,6 +401,7 @@ where
 
 async fn handle_connection(
     stream: UnixStream,
+    endpoint: Endpoint,
     state: ApiState,
     execution: execution::Handle,
     guidance_root: Arc<PathBuf>,
@@ -424,10 +432,19 @@ async fn handle_connection(
     }
     payload.pop();
 
-    let request = match parse_envelope(&payload) {
-        Ok(request) => request,
+    let envelope = match parse_envelope(&payload) {
+        Ok(envelope) => envelope,
         Err(response) => return write_response(&mut write, *response).await,
     };
+    let principal =
+        match authenticate_endpoint(&state, endpoint, envelope.credential.as_ref()).await {
+            Ok(principal) => principal,
+            Err(failure) => return write_response(&mut write, failure.into_response()).await,
+        };
+    let request = envelope.request;
+    if let Err(failure) = authorize_request(&state, principal.as_ref(), &request).await {
+        return write_response(&mut write, failure.into_response()).await;
+    }
 
     if let LocalRequest::Subscribe { after_sequence } = request {
         if after_sequence < 0 {
@@ -471,13 +488,19 @@ async fn handle_connection(
         };
     }
 
-    let response = handle_request(&state, &execution, &guidance_root, request)
-        .await
-        .unwrap_or_else(ApiFailure::into_response);
+    let response = handle_request_as(
+        &state,
+        &execution,
+        &guidance_root,
+        principal.as_ref(),
+        request,
+    )
+    .await
+    .unwrap_or_else(ApiFailure::into_response);
     write_response(&mut write, response).await
 }
 
-fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
+fn parse_envelope(payload: &[u8]) -> Result<RequestEnvelope, Box<LocalResponse>> {
     // Read the version discriminator before deserializing the request enum.
     // A newer client may contain a request variant this daemon does not know;
     // that must still produce UnsupportedProtocol, not a misleading invalid
@@ -512,7 +535,7 @@ fn parse_envelope(payload: &[u8]) -> Result<LocalRequest, Box<LocalResponse>> {
             message: "request is not valid local protocol JSON".into(),
         })
     })?;
-    Ok(envelope.request)
+    Ok(envelope)
 }
 
 /// Persistent multiplexed connection for one or more `AttachTerminal`
@@ -556,7 +579,7 @@ async fn terminal_attach_session(
             Some(_) = attaches.join_next(), if !attaches.is_empty() => {}
             result = read_next_line(&mut reader, &mut payload) => {
                 let Some(line) = result? else { return Ok(()); };
-                match parse_envelope(&line) {
+                match parse_envelope(&line).map(|envelope| envelope.request) {
                     Ok(LocalRequest::AttachTerminal { project_id, session_id, since_offset, mode }) => {
                         spawn_terminal_attach(
                             &mut attaches,
@@ -846,10 +869,165 @@ async fn read_next_line(
     Ok(Some(std::mem::take(payload)))
 }
 
-async fn handle_request(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedPolicy {
+    Operator,
+    OperatorOrSession,
+    Session,
+}
+
+/// Exhaustive local-request policy. Adding a wire variant makes this match
+/// fail compilation until the new operation is deliberately classified.
+fn expected_policy(request: &LocalRequest) -> ExpectedPolicy {
+    match request {
+        LocalRequest::SendAgentMessage { .. } => ExpectedPolicy::OperatorOrSession,
+        LocalRequest::ProviderHook { .. }
+        | LocalRequest::GitStatus
+        | LocalRequest::GitDiff { .. }
+        | LocalRequest::GitCommit { .. }
+        | LocalRequest::GitPush
+        | LocalRequest::PrOpen { .. }
+        | LocalRequest::PrUpdate { .. }
+        | LocalRequest::CompleteTask { .. }
+        | LocalRequest::BlockTask { .. } => ExpectedPolicy::Session,
+        LocalRequest::Health
+        | LocalRequest::SetAutoMode { .. }
+        | LocalRequest::FleetStatus
+        | LocalRequest::AgentStatus { .. }
+        | LocalRequest::CreateProject { .. }
+        | LocalRequest::ListProjects { .. }
+        | LocalRequest::GetProject { .. }
+        | LocalRequest::UpdateProjectGuidance { .. }
+        | LocalRequest::SetProjectRepositoryAuthority { .. }
+        | LocalRequest::CreateTask { .. }
+        | LocalRequest::CreateAgent { .. }
+        | LocalRequest::GetAgent { .. }
+        | LocalRequest::UpdateAgentProfile { .. }
+        | LocalRequest::SetAgentBudget { .. }
+        | LocalRequest::ResetAgentBudget { .. }
+        | LocalRequest::ListAgentMessages { .. }
+        | LocalRequest::ListAgents { .. }
+        | LocalRequest::StartTask { .. }
+        | LocalRequest::ListTasks { .. }
+        | LocalRequest::GetTask { .. }
+        | LocalRequest::RetryTask { .. }
+        | LocalRequest::CancelTask { .. }
+        | LocalRequest::UpdateTask { .. }
+        | LocalRequest::DeleteTask { .. }
+        | LocalRequest::DeleteAgent { .. }
+        | LocalRequest::DeleteProject { .. }
+        | LocalRequest::AssignTask { .. }
+        | LocalRequest::GetRunTerminal { .. }
+        | LocalRequest::StopRun { .. }
+        | LocalRequest::CancelRun { .. }
+        | LocalRequest::PauseAgent { .. }
+        | LocalRequest::ResumeAgent { .. }
+        | LocalRequest::ListSessions { .. }
+        | LocalRequest::StopSession { .. }
+        | LocalRequest::AttachTerminal { .. }
+        | LocalRequest::TerminalInput { .. }
+        | LocalRequest::ResizeTerminal { .. }
+        | LocalRequest::ListRuns { .. }
+        | LocalRequest::EventsAfter { .. }
+        | LocalRequest::LatestEventSequence
+        | LocalRequest::Subscribe { .. } => ExpectedPolicy::Operator,
+    }
+}
+
+async fn authenticate_endpoint(
+    state: &ApiState,
+    endpoint: Endpoint,
+    credential: Option<&SessionCredential>,
+) -> Result<Option<AuthenticatedPrincipal>, ApiFailure> {
+    match (endpoint, credential) {
+        (Endpoint::Operator, None) => Ok(None),
+        (Endpoint::Operator, Some(_)) => Err(ApiFailure::Unauthorized(
+            "session credentials are not accepted on the operator endpoint".into(),
+        )),
+        (Endpoint::Session, None) => Err(ApiFailure::Unauthorized(
+            "the session endpoint requires a credential".into(),
+        )),
+        (Endpoint::Session, Some(credential)) => {
+            let credential = credential.as_bytes().to_vec();
+            state
+                .with_store(move |store| store.authenticate_session(&credential))
+                .await?
+                .map(Some)
+                .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))
+        }
+    }
+}
+
+async fn authorize_request(
+    state: &ApiState,
+    principal: Option<&AuthenticatedPrincipal>,
+    request: &LocalRequest,
+) -> Result<(), ApiFailure> {
+    let policy = expected_policy(request);
+    match (principal, policy) {
+        (None, ExpectedPolicy::Session) => {
+            return Err(ApiFailure::Unauthorized(
+                "operation requires an authenticated agent session".into(),
+            ));
+        }
+        (None, _) => return Ok(()),
+        (Some(_), ExpectedPolicy::Operator) => {
+            return Err(ApiFailure::Unauthorized(
+                "operation is operator-only".into(),
+            ));
+        }
+        (Some(_), _) => {}
+    }
+    let principal = principal.expect("session policy has a principal");
+    if let Some(project_id) = request_project(request)
+        && project_id != &principal.project_id
+    {
+        return Err(ApiFailure::Unauthorized(
+            "request is outside the authenticated project".into(),
+        ));
+    }
+    if let LocalRequest::SendAgentMessage {
+        recipient_agent_id, ..
+    } = request
+    {
+        let principal = principal.clone();
+        let recipient_agent_id = recipient_agent_id.clone();
+        let visible = state
+            .with_store(move |store| {
+                store.message_recipient_is_in_principal_scope(&principal, &recipient_agent_id)
+            })
+            .await?;
+        if !visible {
+            return Err(ApiFailure::Unauthorized(
+                "message recipient is outside the authenticated reporting hierarchy".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn principal_session_id(
+    principal: Option<&AuthenticatedPrincipal>,
+) -> Result<SessionId, ApiFailure> {
+    principal
+        .map(|principal| principal.session_id.clone())
+        .ok_or_else(|| ApiFailure::Unauthorized("session authentication is required".into()))
+}
+
+fn request_project(request: &LocalRequest) -> Option<&ProjectId> {
+    match request {
+        LocalRequest::SendAgentMessage { project_id, .. }
+        | LocalRequest::CompleteTask { project_id, .. }
+        | LocalRequest::BlockTask { project_id, .. } => Some(project_id),
+        _ => None,
+    }
+}
+
+async fn handle_request_as(
     state: &ApiState,
     execution: &execution::Handle,
     guidance_root: &Path,
+    principal: Option<&AuthenticatedPrincipal>,
     request: LocalRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     match request {
@@ -960,30 +1138,54 @@ async fn handle_request(
                 },
             })
         }
-        LocalRequest::GitStatus { token } => {
-            repository_request(state, token, RepositoryRequest::Status).await
+        LocalRequest::GitStatus => {
+            repository_request(
+                state,
+                principal_session_id(principal)?,
+                RepositoryRequest::Status,
+            )
+            .await
         }
-        LocalRequest::GitDiff { token, staged } => {
-            repository_request(state, token, RepositoryRequest::Diff { staged }).await
+        LocalRequest::GitDiff { staged } => {
+            repository_request(
+                state,
+                principal_session_id(principal)?,
+                RepositoryRequest::Diff { staged },
+            )
+            .await
         }
-        LocalRequest::GitCommit { token, message } => {
-            repository_request(state, token, RepositoryRequest::Commit { message }).await
+        LocalRequest::GitCommit { message } => {
+            repository_request(
+                state,
+                principal_session_id(principal)?,
+                RepositoryRequest::Commit { message },
+            )
+            .await
         }
-        LocalRequest::GitPush { token } => {
-            repository_request(state, token, RepositoryRequest::Push).await
+        LocalRequest::GitPush => {
+            repository_request(
+                state,
+                principal_session_id(principal)?,
+                RepositoryRequest::Push,
+            )
+            .await
         }
-        LocalRequest::PrOpen { token, title, body } => {
-            repository_request(state, token, RepositoryRequest::PrOpen { title, body }).await
+        LocalRequest::PrOpen { title, body } => {
+            repository_request(
+                state,
+                principal_session_id(principal)?,
+                RepositoryRequest::PrOpen { title, body },
+            )
+            .await
         }
         LocalRequest::PrUpdate {
-            token,
             number,
             title,
             body,
         } => {
             repository_request(
                 state,
-                token,
+                principal_session_id(principal)?,
                 RepositoryRequest::PrUpdate {
                     number,
                     title,
@@ -1336,7 +1538,6 @@ async fn handle_request(
         LocalRequest::SendAgentMessage {
             id,
             project_id,
-            sender_agent_id,
             recipient_agent_id,
             body,
         } => {
@@ -1347,6 +1548,7 @@ async fn handle_request(
             }
             let wake_project_id = project_id.clone();
             let wake_agent_id = recipient_agent_id.clone();
+            let sender_agent_id = principal.map(|principal| principal.agent_id.clone());
             let message = state
                 .commit_and_publish(move |store| {
                     let message = store.send_agent_message(NewAgentMessage {
@@ -1750,9 +1952,16 @@ async fn handle_request(
                     "task result must be at most {MAX_TASK_RESULT_BYTES} bytes"
                 )));
             }
+            let session_id = principal_session_id(principal)?;
             let task = state
                 .commit_and_publish(move |store| {
-                    let closed = store.complete_task(&project_id, &task_id, result, now_ms()?)?;
+                    let closed = store.complete_task(
+                        &project_id,
+                        &task_id,
+                        &session_id,
+                        result,
+                        now_ms()?,
+                    )?;
                     Ok((closed.task, closed.events))
                 })
                 .await?;
@@ -1768,9 +1977,11 @@ async fn handle_request(
                     "block reason must be between 1 and {MAX_BLOCKED_REASON_BYTES} bytes"
                 )));
             }
+            let session_id = principal_session_id(principal)?;
             let task = state
                 .commit_and_publish(move |store| {
-                    let closed = store.block_task(&project_id, &task_id, reason, now_ms()?)?;
+                    let closed =
+                        store.block_task(&project_id, &task_id, &session_id, reason, now_ms()?)?;
                     Ok((closed.task, closed.events))
                 })
                 .await?;
@@ -1877,19 +2088,11 @@ async fn handle_request(
             .map_err(|error| runner_control_failure(error, "stop"))?;
             Ok(LocalResponse::SessionStopped { session_id })
         }
-        LocalRequest::ProviderHook {
-            token,
-            event,
-            payload,
-        } => {
-            if token.is_empty() || token.len() > 4096 {
-                return Err(ApiFailure::Invalid("hook token is invalid".into()));
-            }
-            let lookup_token = token.clone();
+        LocalRequest::ProviderHook { event, payload } => {
+            let session_id = principal_session_id(principal)?;
             let session = state
-                .with_store(move |store| store.find_session_by_hook_token(&lookup_token))
-                .await?
-                .ok_or_else(|| ApiFailure::Invalid("hook token is not recognized".into()))?;
+                .with_store(move |store| store.authenticated_session_row(&session_id))
+                .await?;
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
             let session_id = session.id.clone();
@@ -2151,6 +2354,24 @@ async fn handle_request(
     }
 }
 
+#[cfg(test)]
+async fn handle_request(
+    state: &ApiState,
+    execution: &execution::Handle,
+    guidance_root: &Path,
+    request: LocalRequest,
+) -> Result<LocalResponse, ApiFailure> {
+    let principal = if matches!(expected_policy(&request), ExpectedPolicy::Session) {
+        let credential = "a".repeat(64).into_bytes();
+        state
+            .with_store(move |store| store.authenticate_session(&credential))
+            .await?
+    } else {
+        None
+    };
+    handle_request_as(state, execution, guidance_root, principal.as_ref(), request).await
+}
+
 async fn populate_fleet_worktrees(projects: &mut [status::ProjectStatus]) {
     populate_fleet_worktrees_with(
         projects,
@@ -2319,13 +2540,12 @@ mod worktree_status_tests {
 
 async fn repository_request(
     state: &ApiState,
-    token: String,
+    session_id: SessionId,
     request: RepositoryRequest,
 ) -> Result<LocalResponse, ApiFailure> {
     let session = state
-        .with_store(move |store| store.find_session_by_hook_token(&token))
-        .await?
-        .ok_or_else(|| ApiFailure::Unauthorized("session authentication failed".into()))?;
+        .with_store(move |store| store.authenticated_session_row(&session_id))
+        .await?;
     let project_id = session.project_id.clone();
     let project = state
         .with_store(move |store| store.get_project(&project_id))
@@ -3833,7 +4053,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::UserPromptSubmit,
                 payload: serde_json::json!({"prompt": text}),
             },
@@ -3931,7 +4150,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::UserPromptSubmit,
                 payload: serde_json::json!({"prompt": text}),
             },
@@ -4075,7 +4293,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::UserPromptSubmit,
                 payload: serde_json::json!({"prompt": old_text}),
             },
@@ -4109,7 +4326,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::PreToolUse,
                 payload: serde_json::json!({"tool_name":"Bash","tool_input":{"command":"git reset --hard HEAD~1"}}),
             },
@@ -4146,7 +4362,6 @@ mod deletion_gate_tests {
         .await
         .unwrap();
         let hook = || LocalRequest::ProviderHook {
-            token: "a".repeat(HOOK_TOKEN_LEN),
             event: ProviderHookEvent::PreToolUse,
             payload: serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"README.md"}}),
         };
@@ -4195,7 +4410,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::Stop,
                 payload: serde_json::json!({}),
             },
@@ -4245,7 +4459,6 @@ mod deletion_gate_tests {
             &execution,
             directory.path(),
             LocalRequest::ProviderHook {
-                token: "a".repeat(HOOK_TOKEN_LEN),
                 event: ProviderHookEvent::Stop,
                 payload: serde_json::json!({}),
             },
@@ -4433,7 +4646,7 @@ mod deletion_gate_tests {
         std::fs::write(work_a.join("a.txt"), "PRIVATE_DIFF_SENTINEL\n").unwrap();
         let response = repository_request(
             &state,
-            "a".repeat(64),
+            SessionId::try_from("session-a").unwrap(),
             RepositoryRequest::Commit {
                 message: secret.into(),
             },
@@ -4444,13 +4657,18 @@ mod deletion_gate_tests {
             matches!(response, LocalResponse::GitOutput { ref operation, .. } if operation == "git_commit")
         );
         assert!(matches!(
-            repository_request(&state, "c".repeat(64), RepositoryRequest::Status).await,
-            Err(ApiFailure::Unauthorized(_))
+            repository_request(
+                &state,
+                SessionId::try_from("session-stale").unwrap(),
+                RepositoryRequest::Status,
+            )
+            .await,
+            Err(ApiFailure::Store(StoreError::SessionNotFound))
         ));
         std::fs::write(work_b.join("b.txt"), "b\n").unwrap();
         repository_request(
             &state,
-            "b".repeat(64),
+            SessionId::try_from("session-b").unwrap(),
             RepositoryRequest::Commit {
                 message: "B commit".into(),
             },

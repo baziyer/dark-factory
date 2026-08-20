@@ -2980,6 +2980,58 @@ async fn end_session_now(
 
 // --- Recovery --------------------------------------------------------
 
+/// Fail-closed rollout barrier for sessions created before authenticated
+/// principals existed. It runs before either daemon socket is published,
+/// records stop intent, reconnects to the preserved runner, waits for its
+/// terminal event, and closes the durable session. A successor may be
+/// dispatched only after the ordinary execution manager starts.
+pub async fn retire_legacy_sessions(state: &DaemonState) -> Result<(), Error> {
+    let legacy = state
+        .with_store(|store| store.legacy_live_sessions())
+        .await?;
+    for mut recovered in legacy {
+        let project_id = recovered.project_id.clone();
+        let session_id = recovered.session_id.clone();
+        let requested_at_ms = now_ms()?;
+        let stop = state
+            .commit_and_publish(move |store| {
+                match store.request_session_stop(&project_id, &session_id, requested_at_ms) {
+                    Ok((_, event)) => Ok(((), vec![event])),
+                    Err(crate::store::StoreError::SessionStopping) => Ok(((), Vec::new())),
+                    Err(error) => Err(error),
+                }
+            })
+            .await;
+        if let Err(error) = stop {
+            tracing::warn!(%error, session_id = %recovered.session_id, "could not record legacy-session retirement");
+            return Err(Error::State(error));
+        }
+        recovered.delivery_recovery_stop_requested = true;
+        let (wake_tx, _wake_rx) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        supervise_recovered(
+            state.clone(),
+            wake_tx,
+            recovered,
+            shutdown_rx,
+            MAX_RECOVERY_ATTEMPTS,
+            true,
+        )
+        .await
+        .then_some(())
+        .ok_or(Error::CorruptExecution)?;
+    }
+    if state
+        .with_store(|store| store.legacy_live_sessions())
+        .await?
+        .is_empty()
+    {
+        Ok(())
+    } else {
+        Err(Error::CorruptExecution)
+    }
+}
+
 /// Reconnects every session still recorded live from a prior daemon
 /// instance. A session's PTY-backed process is long-lived and independent
 /// of the daemon (`HANDOFF.md`: closing/rebuilding the operator surface
@@ -3007,6 +3059,7 @@ async fn recover_sessions(
             recovered,
             shutdown_rx,
             MAX_RECOVERY_ATTEMPTS,
+            false,
         ));
     }
 }
@@ -3023,10 +3076,11 @@ async fn supervise_recovered(
     recovered: RecoverableSession,
     mut shutdown_rx: watch::Receiver<bool>,
     max_attempts: u32,
-) {
+    fail_closed: bool,
+) -> bool {
     let runtime_dir = PathBuf::from(&recovered.runner_runtime);
     let Ok(control_run_id) = session_run_id(&recovered.session_id) else {
-        return;
+        return false;
     };
     let client = RunnerClient::new(
         &runtime_dir,
@@ -3037,7 +3091,7 @@ async fn supervise_recovered(
     let mut attempt: u32 = 0;
     loop {
         if shutdown_requested(&shutdown_rx) {
-            return;
+            return false;
         }
         let attach = match attach_with_grace(&client, &runtime_dir, CONNECT_GRACE, &mut shutdown_rx)
             .await
@@ -3053,16 +3107,22 @@ async fn supervise_recovered(
                 // (`unverifiable`, like every other "gave up" exit in this
                 // function) instead of just logging and abandoning it.
                 tracing::warn!(%error, session_id = %recovered.session_id, "recovery attach failed");
+                if fail_closed {
+                    return false;
+                }
                 end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                return;
+                return true;
             }
         };
         let subscription = match attach {
             Attach::Connected(subscription) => subscription,
-            Attach::Shutdown => return,
+            Attach::Shutdown => return false,
             Attach::Missing => {
+                if fail_closed {
+                    return false;
+                }
                 end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                return;
+                return true;
             }
             Attach::Unreachable => {
                 attempt += 1;
@@ -3072,11 +3132,14 @@ async fn supervise_recovered(
                         attempt,
                         "recovered session's runner stayed unreachable; giving up"
                     );
+                    if fail_closed {
+                        return false;
+                    }
                     end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                    return;
+                    return true;
                 }
                 tokio::select! {
-                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                    _ = wait_for_shutdown(&mut shutdown_rx) => return false,
                     () = sleep_until(Instant::now() + retry_delay) => {}
                 }
                 retry_delay = next_retry_delay(retry_delay);
@@ -3140,9 +3203,9 @@ async fn supervise_recovered(
                     exit_signal,
                 )
                 .await;
-                return;
+                return true;
             }
-            ExitOutcome::Shutdown => return,
+            ExitOutcome::Shutdown => return false,
             ExitOutcome::Reconnect => {
                 attempt += 1;
                 if attempt >= max_attempts {
@@ -3151,11 +3214,14 @@ async fn supervise_recovered(
                         attempt,
                         "recovered session's runner connection kept dropping; giving up"
                     );
+                    if fail_closed {
+                        return false;
+                    }
                     end_session_now(&state, &wake_tx, &recovered.session_id, None, None).await;
-                    return;
+                    return true;
                 }
                 tokio::select! {
-                    _ = wait_for_shutdown(&mut shutdown_rx) => return,
+                    _ = wait_for_shutdown(&mut shutdown_rx) => return false,
                     () = sleep_until(Instant::now() + retry_delay) => {}
                 }
                 retry_delay = next_retry_delay(retry_delay);
@@ -3356,7 +3422,7 @@ fn now_ms() -> Result<i64, Error> {
     i64::try_from(millis).map_err(|_| Error::InvalidClock)
 }
 
-fn prepare_runtime_root(path: &std::path::Path) -> Result<(), Error> {
+pub fn prepare_runtime_root(path: &std::path::Path) -> Result<(), Error> {
     if !path.is_absolute() {
         return Err(Error::InvalidRuntimeRoot);
     }
@@ -5277,6 +5343,7 @@ mod tests {
                      ALTER TABLE delivery_attempts DROP COLUMN run_id;
                      ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                      ALTER TABLE tasks DROP COLUMN work_revision;
+                     ALTER TABLE sessions DROP COLUMN principal_version;
                      PRAGMA user_version = 28;
                      PRAGMA foreign_keys = ON;",
                 )
@@ -5423,6 +5490,7 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
         let recovered = crate::store::RecoverableSession {
             session_id: session_id.clone(),
+            project_id: project_id.clone(),
             provider: Provider::Shell,
             provider_session_id: None,
             worktree,
@@ -5433,7 +5501,7 @@ mod tests {
             delivery_recovery_stop_requested: false,
         };
 
-        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1).await;
+        supervise_recovered(state.clone(), wake_tx, recovered, shutdown_rx, 1, false).await;
 
         let sessions = state
             .with_store(move |store| store.list_sessions(&project_id, None, 10))
@@ -5460,6 +5528,7 @@ mod tests {
             fixture.recovered,
             shutdown_rx,
             1,
+            false,
         )
         .await;
         timeout(Duration::from_secs(2), runner)
@@ -5499,6 +5568,7 @@ mod tests {
             fixture.recovered,
             shutdown_rx,
             1,
+            false,
         )
         .await;
         timeout(Duration::from_secs(2), runner)
@@ -5533,6 +5603,7 @@ mod tests {
             fixture.recovered,
             shutdown_rx,
             1,
+            false,
         )
         .await;
         timeout(Duration::from_secs(2), runner)
@@ -5781,6 +5852,7 @@ mod tests {
             .complete_task(
                 &project_id,
                 &aba_task_id,
+                &session_id,
                 "replacement done".to_owned(),
                 1_010,
             )
@@ -5823,7 +5895,13 @@ mod tests {
             )
             .unwrap();
         store
-            .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_012)
+            .complete_task(
+                &project_id,
+                &race_task_id,
+                &session_id,
+                "done".to_owned(),
+                1_012,
+            )
             .unwrap();
         let event_count = store.events_after(0, 100).unwrap().len();
         let state = DaemonState::new(store);

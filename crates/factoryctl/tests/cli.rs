@@ -24,6 +24,12 @@ fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalRe
     stream.write_all(b"\n").unwrap();
 }
 
+fn factoryctl_command() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_factoryctl"));
+    command.env_remove("DARK_FACTORY_SESSION_TOKEN_FILE");
+    command
+}
+
 /// `factoryctl usage` never touches the daemon: it probes `codex` on `PATH`
 /// directly. This exercises the real subprocess/JSON-RPC path against a fake
 /// `codex` script rather than the real provider CLI.
@@ -42,7 +48,7 @@ fn usage_prints_observed_codex_snapshot_from_a_fake_codex_on_path() {
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&codex_home).unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args(["usage"])
         .env("PATH", directory.path())
         .env("HOME", &home)
@@ -62,7 +68,7 @@ fn usage_prints_observed_codex_snapshot_from_a_fake_codex_on_path() {
 #[test]
 fn usage_fails_clearly_when_codex_is_not_on_path() {
     let directory = tempfile::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args(["usage"])
         .env("PATH", directory.path())
         .output()
@@ -104,7 +110,7 @@ fn health_prints_exactly_one_machine_readable_server_frame() {
         stream.write_all(b"\n").unwrap();
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args(["--socket", socket.to_str().unwrap(), "health"])
         .output()
         .unwrap();
@@ -178,7 +184,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
         }
     });
 
-    let human = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let human = factoryctl_command()
         .args(["--socket", socket.to_str().unwrap(), "status"])
         .output()
         .unwrap();
@@ -195,7 +201,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
         )
     );
 
-    let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let json = factoryctl_command()
         .args(["--socket", socket.to_str().unwrap(), "status", "--json"])
         .output()
         .unwrap();
@@ -251,7 +257,7 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
         }
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -353,7 +359,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         );
     });
 
-    let agent = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let agent = factoryctl_command()
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -382,7 +388,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         }
     ));
 
-    let start = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let start = factoryctl_command()
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -433,11 +439,13 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::ProviderHook {
-                token: "session-token-value".into(),
-                event: ProviderHookEvent::Stop,
-                payload: serde_json::json!({"stop_hook_active": false}),
-            })
+            RequestEnvelope::authenticated(
+                LocalRequest::ProviderHook {
+                    event: ProviderHookEvent::Stop,
+                    payload: serde_json::json!({"stop_hook_active": false}),
+                },
+                factory_core::local::SessionCredential::new("session-token-value".into()),
+            )
         );
         write_response(
             &mut stream,
@@ -447,7 +455,7 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
         );
     });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let mut child = factoryctl_command()
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -486,7 +494,7 @@ fn hook_fails_open_and_prints_an_empty_object_when_the_daemon_is_unreachable() {
     std::fs::write(&token_path, "session-token-value").unwrap();
     let unreachable_socket = directory.path().join("no-daemon-here.sock");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let mut child = factoryctl_command()
         .args([
             "--socket",
             unreachable_socket.to_str().unwrap(),
@@ -518,7 +526,7 @@ fn hook_fails_open_when_the_token_file_is_missing() {
     let unreachable_socket = directory.path().join("no-daemon-here.sock");
     let missing_token = directory.path().join("missing.token");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let mut child = factoryctl_command()
         .args([
             "--socket",
             unreachable_socket.to_str().unwrap(),
@@ -545,7 +553,7 @@ fn hook_fails_open_when_the_token_file_is_missing() {
 fn pre_tool_use_fails_closed_when_the_policy_daemon_is_unavailable() {
     let directory = tempfile::tempdir().unwrap();
     let missing_token = directory.path().join("missing.token");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let mut child = factoryctl_command()
         .args([
             "--socket",
             directory.path().join("missing.sock").to_str().unwrap(),
@@ -599,7 +607,7 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
         );
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args(["--socket", socket.to_str().unwrap(), "project", "get"])
         .env("DARK_FACTORY_PROJECT", "factory")
         .output()
@@ -608,11 +616,10 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
     server.join().unwrap();
 }
 
-/// `agent message --from` falls back to `$DARK_FACTORY_AGENT`, matching how
-/// the daemon exports it into a session so an agent's own `factoryctl agent
-/// message` calls are attributed to it without repeating `--from`.
+/// Sender identity is absent from the request body; the daemon derives it
+/// from an authenticated session or records an operator sender.
 #[test]
-fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable() {
+fn agent_message_sender_is_not_present_in_the_request_body() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -624,7 +631,6 @@ fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable(
             .unwrap();
         let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
         let LocalRequest::SendAgentMessage {
-            sender_agent_id,
             recipient_agent_id,
             body,
             ..
@@ -632,10 +638,6 @@ fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable(
         else {
             panic!("expected send-agent-message request");
         };
-        assert_eq!(
-            sender_agent_id,
-            Some(AgentId::try_from("worker-1").unwrap())
-        );
         assert_eq!(recipient_agent_id, AgentId::try_from("god").unwrap());
         assert_eq!(body, "status update");
         write_response(
@@ -649,7 +651,7 @@ fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable(
         );
     });
 
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = factoryctl_command()
         .args([
             "--socket",
             socket.to_str().unwrap(),
@@ -695,10 +697,7 @@ fn help_prints_human_usage_and_exits_zero_without_touching_the_daemon() {
     ] {
         let mut full_args = vec!["--socket", unreachable_socket];
         full_args.extend(arguments.iter().copied());
-        let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-            .args(&full_args)
-            .output()
-            .unwrap();
+        let output = factoryctl_command().args(&full_args).output().unwrap();
         assert!(
             output.status.success(),
             "factoryctl {full_args:?} did not exit 0: {}",

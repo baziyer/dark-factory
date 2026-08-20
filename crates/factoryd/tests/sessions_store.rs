@@ -57,6 +57,7 @@ fn rewind_session_work_migration(database: &std::path::Path) {
              ALTER TABLE delivery_attempts DROP COLUMN run_id;
              ALTER TABLE delivery_attempts DROP COLUMN task_revision;
              ALTER TABLE tasks DROP COLUMN work_revision;
+             ALTER TABLE sessions DROP COLUMN principal_version;
              PRAGMA user_version = 28;
              PRAGMA foreign_keys = ON;",
         )
@@ -249,6 +250,7 @@ fn session_work_cas_fences_every_successor_until_exact_completion() {
         .complete_task(
             &project_id("factory"),
             &task_id("task-1"),
+            &session.id,
             "done".into(),
             13,
         )
@@ -381,7 +383,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 29 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 30 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, provider resume recovery, observer
 /// reason, typed notification cause, and the widened Claude notification
@@ -478,14 +480,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0029.
+    // Opening through the real store runs migrations 0014 through 0030.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -530,7 +532,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0030_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -546,6 +548,7 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
                  ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+                 ALTER TABLE sessions DROP COLUMN principal_version;
                  DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
                  DROP TABLE project_repository_authority;
@@ -564,7 +567,7 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -577,6 +580,72 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
         })
         .unwrap();
     assert_eq!(violations, 0);
+}
+
+#[test]
+fn migration_0030_marks_existing_sessions_legacy_and_new_sessions_authenticated() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("schema-29.db");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for (id, timestamp) in [("curie", 2), ("feynman", 3)] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id(id),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                    },
+                    timestamp,
+                )
+                .unwrap();
+        }
+        store
+            .create_session(new_session("legacy-session", "factory", "curie"), 4)
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE sessions DROP COLUMN principal_version;
+                 PRAGMA user_version = 29;",
+            )
+            .unwrap();
+    }
+
+    let mut store = Store::open(&database).unwrap();
+    let mut fresh = new_session("fresh-session", "factory", "feynman");
+    fresh.hook_token = "b".repeat(64);
+    store.create_session(fresh, 5).unwrap();
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    for (session, expected) in [("legacy-session", 0_i64), ("fresh-session", 1_i64)] {
+        let version: i64 = connection
+            .query_row(
+                "SELECT principal_version FROM sessions WHERE id = ?1",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            version, expected,
+            "unexpected principal version for {session}"
+        );
+    }
 }
 
 #[test]
@@ -663,6 +732,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
+                 ALTER TABLE sessions DROP COLUMN principal_version;
                  PRAGMA user_version = 27;
                  PRAGMA foreign_keys = ON;",
             )
@@ -673,7 +743,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     let message_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
@@ -806,6 +876,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
+                 ALTER TABLE sessions DROP COLUMN principal_version;
                  PRAGMA user_version = 28;
                  PRAGMA foreign_keys = ON;",
             )
@@ -1265,14 +1336,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0029 migrations.
+    // Opening through the real store runs the 0015 through 0030 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -2347,6 +2418,7 @@ fn complete_task_closes_the_episode_succeeded_with_the_result() {
         .complete_task(
             &project_id("factory"),
             &task_id("task-1"),
+            &snapshot.id,
             "all done".into(),
             7,
         )
@@ -2368,10 +2440,55 @@ fn complete_task_closes_the_episode_succeeded_with_the_result() {
 }
 
 #[test]
+fn a_different_live_session_cannot_complete_another_sessions_task() {
+    let mut store = fixture();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id("feynman"),
+                project_id: project_id("factory"),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            5,
+        )
+        .unwrap();
+    let (owner, _) = store
+        .create_session(new_session("owner-session", "factory", "curie"), 6)
+        .unwrap();
+    store
+        .open_run_episode(&owner.id, &task_id("task-1"), 7)
+        .unwrap();
+    let (other, _) = store
+        .create_session(new_session("other-session", "factory", "feynman"), 8)
+        .unwrap();
+
+    assert!(
+        store
+            .complete_task(
+                &project_id("factory"),
+                &task_id("task-1"),
+                &other.id,
+                "spoofed completion".into(),
+                9,
+            )
+            .is_err(),
+        "completion was accepted without binding the calling session"
+    );
+}
+
+#[test]
 fn complete_task_without_an_open_episode_is_a_conflict() {
     let mut store = fixture();
     assert!(matches!(
-        store.complete_task(&project_id("factory"), &task_id("task-1"), "done".into(), 5),
+        store.complete_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            &session_id("missing"),
+            "done".into(),
+            5,
+        ),
         Err(StoreError::TaskNotRunning)
     ));
 }
@@ -2390,6 +2507,7 @@ fn block_task_closes_the_episode_and_retry_requeues_it_after_resolution() {
         .block_task(
             &project_id("factory"),
             &task_id("task-1"),
+            &snapshot.id,
             "needs input".into(),
             7,
         )

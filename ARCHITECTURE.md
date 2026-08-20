@@ -223,8 +223,18 @@ catalogue.
    delayed `SessionStart` is still recorded normally whenever it arrives.
    No other provider gets this treatment; only Codex is known to defer the
    hook this way.
-6. The local control and event API uses a private Unix socket by default. A
-   subscription captures a durable replay head and marks when it has caught up.
+6. The local control plane has two owner-only Unix sockets under `0700`
+   directories. The documented operator socket remains credentialless. New
+   provider sessions receive only a second, daemon-owned session endpoint and
+   the path of a fresh `0600` bearer file; that endpoint fails closed without
+   the exact live credential. The daemon derives project, agent, session,
+   message sender, permitted recipient hierarchy, and current work ownership
+   from that bearer. Before either socket is published after this boundary is
+   installed, every preserved version-zero session is stopped and reconciled
+   through its runner, so an old provider environment can never fall back to
+   the operator socket by omitting a credential. All other local operations,
+   including observation and subscriptions, remain operator-only until a later
+   capability tranche can add their projections without widening this seam.
    Inbound HTTP webhooks are an explicit, authenticated listener; receiving a
    message is a durable write before it wakes the orchestrator.
 7. The board repaints on input or factory events; embedded agent terminals
@@ -252,10 +262,12 @@ catalogue.
    session and reaches the daemon only through the same durable task,
    message, and control interfaces every other client uses (`factoryctl`,
    directly or via its own session's shell access to it). It may coordinate
-   and delegate work, but this local socket currently does not establish a
-   human caller or enforce operator-only agent creation/profile changes; that
-   principal boundary remains #133/#127. Prompt guidance must not be described
-   as authorization, and the orchestrator cannot reach SQLite directly.
+   and delegate work by messaging its approved descendants through its
+   authenticated principal. This first principal tranche otherwise permits
+   only provider hooks, repository operations, and exact current-session task
+   completion/blocking; observation, assignment, reprioritization, and every
+   administrative operation remain operator-only. Prompt guidance is not
+   authorization, and the orchestrator cannot reach SQLite directly.
 9. Remote repository mutation is a daemon boundary. A session may edit and
    inspect its worktree, but its environment disables Git credential helpers,
    SSH transport, interactive credential prompts, and the operator's `gh`
@@ -332,8 +344,9 @@ catalogue.
 
 `factoryd` starts from an empty database. An operator normally creates a
 project and agent, then creates work in the project backlog or directly in an
-agent queue through `factoryctl` or the `factory-tui` board. The local socket
-currently does not prove that the caller is human (see #133/#127). The daemon's
+agent queue through `factoryctl` or the `factory-tui` board. The credentialless
+operator socket is intentionally an OS-user capability; agent environments use
+the separately authenticated session socket. The daemon's
 dispatcher spawns that agent's resident
 session automatically if none is live, or delivers into it if one already is
 idle — there is no separate explicit "start" step in the common case. The
@@ -381,8 +394,8 @@ selected model, reasoning effort, and reason are durable profile fields and
 are projected through `factoryctl` and the TUI. Existing profiles remain
 unchanged; this is a bounded tier policy, not a live pricing engine. Local
 protocol version mismatches are rejected rather than silently dropping policy
-fields. This PR does not implement the human authorization boundary for agent
-creation; that remains #133/#127.
+fields. Agent creation and profile/model changes are classified operator-only
+by the authenticated local-request policy.
 
 The resumed-Codex delivery lifecycle repair is tracked by
 [#170](https://github.com/baziyer/dark-factory/issues/170): live evidence shows

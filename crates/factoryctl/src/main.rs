@@ -8,6 +8,7 @@ use std::{
 use factory_core::local::{
     GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
     MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame,
+    SessionCredential,
 };
 use factory_core::runner::TerminalAttachMode;
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
@@ -69,8 +70,7 @@ Run `factoryctl <command> --help` or `factoryctl <command> <action> --help`
 for action-specific options.
 
 Every `--project` may be omitted if `$DARK_FACTORY_PROJECT` is set (as it is
-inside a session's own environment); `agent message --from` similarly
-defaults to `$DARK_FACTORY_AGENT` when unset.
+inside a session's own environment). Message senders are daemon-derived.
 
 Options:
   --socket PATH                      Use an explicit local socket
@@ -573,8 +573,6 @@ Required:
 
 Options:
   --id ID                    Explicit message ID (default: generated UUID)
-  --from AGENT_ID             Sender agent ID (default: $DARK_FACTORY_AGENT if
-                                set inside a session, else none/system)
   -h, --help                   Show this help";
 const AGENT_INBOX_HELP: &str = "usage: factoryctl agent inbox --project ID --agent ID [options]
 
@@ -910,7 +908,6 @@ enum CliCommand {
     AgentMessage {
         id: Option<String>,
         project_id: String,
-        sender_agent_id: Option<String>,
         recipient_agent_id: String,
         body: String,
     },
@@ -1010,7 +1007,9 @@ fn run() -> Result<i32, String> {
         factory_home.as_deref(),
         home.as_deref(),
     )?;
+    let session_environment = env::var_os(SESSION_TOKEN_FILE_ENV).is_some();
     if matches!(&command, CliCommand::CapacityStatus) {
+        reject_session_operator_command(session_environment)?;
         let status = capacity::status_from_environment()?;
         println!(
             "{}",
@@ -1022,6 +1021,7 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     if let CliCommand::CapacitySet { value } = &command {
+        reject_session_operator_command(session_environment)?;
         let previous = capacity::status_from_environment()?.configured;
         let requested = capacity::validate(*value)?;
         eprintln!(
@@ -1032,15 +1032,21 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     if let CliCommand::Update { install, json } = command {
+        reject_session_operator_command(session_environment)?;
         return update_command::run(&update_command::Options { install, json }, &socket);
     }
     if let CliCommand::Init { yes, no_launchd } = command {
+        reject_session_operator_command(session_environment)?;
         return init::run(&init::Options { yes, no_launchd }, &socket);
     }
     if let CliCommand::Doctor { json } = command {
+        reject_session_operator_command(session_environment)?;
         return doctor::run(&doctor::Options { json }, &socket);
     }
-    let client = Client::new(socket);
+    if let CliCommand::Hook { token_file, event } = command {
+        return Ok(run_hook(&socket, &token_file, event));
+    }
+    let client = session_client(&socket)?;
     if let CliCommand::Attach {
         project_id,
         target,
@@ -1048,9 +1054,6 @@ fn run() -> Result<i32, String> {
     } = command
     {
         return attach::run(&client, &project_id, &target, mode);
-    }
-    if let CliCommand::Hook { token_file, event } = command {
-        return Ok(run_hook(&client, &token_file, event));
     }
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
@@ -1221,43 +1224,37 @@ fn queue_to_outbox(
 /// the outbox". This runs on every hook event, not just `Stop`, so a
 /// queued request is carried at the very next opportunity rather than
 /// waiting specifically for the end of a turn.
-fn run_hook(client: &Client, token_file: &str, event: ProviderHookEvent) -> i32 {
+fn run_hook(socket: &Path, token_file: &str, event: ProviderHookEvent) -> i32 {
+    let Some(credential) = read_session_credential(token_file) else {
+        println!("{}", unavailable_hook_reply(event));
+        return 0;
+    };
+    let client = Client::authenticated(socket, credential);
     if let Ok(agent_dir) = env::var(AGENT_DIR_ENV) {
-        outbox::drain(client, Path::new(&agent_dir));
+        outbox::drain(&client, Path::new(&agent_dir));
     }
-    let reply = hook_reply(client, token_file, event).unwrap_or_else(|| {
-        if event == ProviderHookEvent::PreToolUse {
-            serde_json::json!({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "Dark Factory policy unavailable"
-            }})
-        } else {
-            serde_json::json!({})
-        }
-    });
+    let reply = hook_reply(&client, event).unwrap_or_else(|| unavailable_hook_reply(event));
     println!("{reply}");
     0
 }
 
-fn hook_reply(
-    client: &Client,
-    token_file: &str,
-    event: ProviderHookEvent,
-) -> Option<serde_json::Value> {
-    let token = std::fs::read_to_string(token_file).ok()?;
-    let token = token.trim().to_owned();
-    if token.is_empty() {
-        return None;
+fn unavailable_hook_reply(event: ProviderHookEvent) -> serde_json::Value {
+    if event == ProviderHookEvent::PreToolUse {
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Dark Factory policy unavailable"
+        }})
+    } else {
+        serde_json::json!({})
     }
+}
+
+fn hook_reply(client: &Client, event: ProviderHookEvent) -> Option<serde_json::Value> {
     let payload = read_bounded_stdin_json(HOOK_PAYLOAD_LIMIT_BYTES)?;
     let frame = client
         .request_with_timeout(
-            LocalRequest::ProviderHook {
-                token,
-                event,
-                payload,
-            },
+            LocalRequest::ProviderHook { event, payload },
             HOOK_REQUEST_TIMEOUT,
         )
         .ok()?;
@@ -2139,14 +2136,12 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
         "message" => {
             let id = take_option(&mut args, "--id")?;
             let project_id = required_project(&mut args)?;
-            let sender_agent_id = take_option_or_env(&mut args, "--from", "DARK_FACTORY_AGENT")?;
             let recipient_agent_id = required_option(&mut args, "--to")?;
             let body = required_option(&mut args, "--body")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentMessage {
                 id,
                 project_id,
-                sender_agent_id,
                 recipient_agent_id,
                 body,
             })
@@ -2498,7 +2493,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::AgentMessage {
             id,
             project_id,
-            sender_agent_id,
             recipient_agent_id,
             body,
         } => Ok(LocalRequest::SendAgentMessage {
@@ -2507,9 +2501,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?
                 .unwrap_or(generated_id()?),
             project_id: parse_id(project_id, "project")?,
-            sender_agent_id: sender_agent_id
-                .map(|id| parse_id(id, "sender agent"))
-                .transpose()?,
             recipient_agent_id: parse_id(recipient_agent_id, "recipient agent")?,
             body,
         }),
@@ -2547,31 +2538,16 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             agent_id: parse_id(agent_id, "agent")?,
         }),
-        CliCommand::GitStatus => Ok(LocalRequest::GitStatus {
-            token: session_token()?,
-        }),
-        CliCommand::GitDiff { staged } => Ok(LocalRequest::GitDiff {
-            token: session_token()?,
-            staged,
-        }),
-        CliCommand::GitCommit { message } => Ok(LocalRequest::GitCommit {
-            token: session_token()?,
-            message,
-        }),
-        CliCommand::GitPush => Ok(LocalRequest::GitPush {
-            token: session_token()?,
-        }),
-        CliCommand::PrOpen { title, body } => Ok(LocalRequest::PrOpen {
-            token: session_token()?,
-            title,
-            body,
-        }),
+        CliCommand::GitStatus => Ok(LocalRequest::GitStatus),
+        CliCommand::GitDiff { staged } => Ok(LocalRequest::GitDiff { staged }),
+        CliCommand::GitCommit { message } => Ok(LocalRequest::GitCommit { message }),
+        CliCommand::GitPush => Ok(LocalRequest::GitPush),
+        CliCommand::PrOpen { title, body } => Ok(LocalRequest::PrOpen { title, body }),
         CliCommand::PrUpdate {
             number,
             title,
             body,
         } => Ok(LocalRequest::PrUpdate {
-            token: session_token()?,
             number,
             title,
             body,
@@ -2619,7 +2595,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     }
 }
 
-fn session_token() -> Result<String, String> {
+fn session_credential() -> Result<SessionCredential, String> {
     let path = env::var(SESSION_TOKEN_FILE_ENV).map_err(|_| {
         format!("{SESSION_TOKEN_FILE_ENV} is required; this command only works inside a session")
     })?;
@@ -2629,7 +2605,29 @@ fn session_token() -> Result<String, String> {
     if token.is_empty() {
         return Err("session token file is empty".into());
     }
-    Ok(token)
+    Ok(SessionCredential::new(token))
+}
+
+fn read_session_credential(path: &str) -> Option<SessionCredential> {
+    let token = std::fs::read_to_string(path).ok()?;
+    let token = token.trim().to_owned();
+    (!token.is_empty()).then(|| SessionCredential::new(token))
+}
+
+fn session_client(socket: &Path) -> Result<Client, String> {
+    match env::var(SESSION_TOKEN_FILE_ENV) {
+        Ok(_) => Ok(Client::authenticated(socket, session_credential()?)),
+        Err(env::VarError::NotPresent) => Ok(Client::new(socket)),
+        Err(error) => Err(format!("{SESSION_TOKEN_FILE_ENV} is invalid: {error}")),
+    }
+}
+
+fn reject_session_operator_command(session_environment: bool) -> Result<(), String> {
+    if session_environment {
+        Err("this command is operator-only and cannot run from an agent session".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn generated_id<T>() -> Result<T, String>
@@ -3746,8 +3744,6 @@ mod tests {
             "message",
             "--project",
             "factory",
-            "--from",
-            "god",
             "--to",
             "worker",
             "--body",
@@ -3758,12 +3754,10 @@ mod tests {
         assert!(matches!(
             request,
             LocalRequest::SendAgentMessage {
-                sender_agent_id: Some(sender),
                 recipient_agent_id,
                 body,
                 ..
-            } if sender == "god".try_into().unwrap()
-                && recipient_agent_id == "worker".try_into().unwrap()
+            } if recipient_agent_id == "worker".try_into().unwrap()
                 && body == "Please report your result."
         ));
 

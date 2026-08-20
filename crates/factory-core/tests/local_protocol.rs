@@ -37,6 +37,7 @@ fn runner_instance_id(value: &str) -> RunnerInstanceId {
 fn request_envelope_has_a_stable_tagged_shape() {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        credential: None,
         request: LocalRequest::EventsAfter {
             sequence: 41,
             limit: 100,
@@ -52,6 +53,18 @@ fn request_envelope_has_a_stable_tagged_shape() {
         serde_json::from_value::<RequestEnvelope>(value).unwrap(),
         request
     );
+}
+
+#[test]
+fn credential_bearing_request_debug_never_exposes_the_bearer() {
+    let bearer = "PRIVATE_SESSION_BEARER_SENTINEL";
+    let envelope = RequestEnvelope::authenticated(
+        LocalRequest::GitPush,
+        factory_core::local::SessionCredential::new(bearer.to_owned()),
+    );
+
+    let debug = format!("{envelope:?}");
+    assert!(!debug.contains(bearer), "request debug exposed the bearer");
 }
 
 #[test]
@@ -263,7 +276,6 @@ fn operator_messages_have_a_private_durable_wire_shape() {
     let request = LocalRequest::SendAgentMessage {
         id: factory_core::MessageId::try_from("message-1").unwrap(),
         project_id: project_id("project-1"),
-        sender_agent_id: None,
         recipient_agent_id: agent_id("god"),
         body: message.body.clone(),
     };
@@ -543,7 +555,6 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
 #[test]
 fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
     let request = LocalRequest::ProviderHook {
-        token: "hook-token".into(),
         event: ProviderHookEvent::Stop,
         payload: serde_json::json!({"stop_hook_active": true, "session_id": "provider-session-1"}),
     };
@@ -553,7 +564,6 @@ fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
         serde_json::json!({
             "type": "provider_hook",
             "data": {
-                "token": "hook-token",
                 "event": "stop",
                 "payload": {"stop_hook_active": true, "session_id": "provider-session-1"}
             }

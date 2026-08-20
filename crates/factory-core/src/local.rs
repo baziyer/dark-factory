@@ -1,5 +1,7 @@
 //! Versioned request/response protocol for the local control socket.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::runner::TerminalAttachMode;
@@ -154,10 +156,50 @@ pub struct RunTerminal {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Opaque bearer proving that a local request came from one live daemon
+/// session. Debug deliberately never exposes the secret.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SessionCredential(String);
+
+impl SessionCredential {
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl fmt::Debug for SessionCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SessionCredential([REDACTED])")
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
     pub protocol_version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<SessionCredential>,
     pub request: LocalRequest,
+}
+
+impl fmt::Debug for RequestEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestEnvelope")
+            .field("protocol_version", &self.protocol_version)
+            .field(
+                "credential",
+                &self.credential.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("request", &self.request)
+            .finish()
+    }
 }
 
 impl RequestEnvelope {
@@ -165,6 +207,16 @@ impl RequestEnvelope {
     pub const fn new(request: LocalRequest) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            credential: None,
+            request,
+        }
+    }
+
+    #[must_use]
+    pub const fn authenticated(request: LocalRequest, credential: SessionCredential) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            credential: Some(credential),
             request,
         }
     }
@@ -272,8 +324,6 @@ pub enum LocalRequest {
     SendAgentMessage {
         id: MessageId,
         project_id: ProjectId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sender_agent_id: Option<AgentId>,
         recipient_agent_id: AgentId,
         body: String,
     },
@@ -417,44 +467,34 @@ pub enum LocalRequest {
         grace_ms: u64,
     },
     /// One `factoryctl hook` invocation, forwarded verbatim from a
-    /// provider's hook subprocess. `token` is the contents of the session's
-    /// `hook.token` file; `payload` is the hook's JSON body, opaque here and
+    /// provider's hook subprocess. The session credential is carried only in
+    /// the request envelope; `payload` is the hook's JSON body, opaque here and
     /// at most 64 KiB — the daemon extracts whatever fields (session/thread
     /// id, prompt, message, tool name, `stop_hook_active`, ...) the event
     /// needs.
     ProviderHook {
-        token: String,
         event: ProviderHookEvent,
         payload: serde_json::Value,
     },
     /// Read-only git state for the calling authenticated session's exact
-    /// daemon-managed worktree. `token` is read from the session token file
-    /// by `factoryctl`; callers never select an agent, project, or path.
-    GitStatus {
-        token: String,
-    },
+    /// daemon-managed worktree. Callers never select an agent, project, or path.
+    GitStatus,
     GitDiff {
-        token: String,
         staged: bool,
     },
     /// Stage every change in the session worktree and create one commit.
     GitCommit {
-        token: String,
         message: String,
     },
     /// Push only the session's current `agent/<id>` branch, without force.
-    GitPush {
-        token: String,
-    },
+    GitPush,
     /// Open a PR from the session branch to the repository's default base.
     PrOpen {
-        token: String,
         title: String,
         body: String,
     },
     /// Update only a PR whose head is the calling session's branch.
     PrUpdate {
-        token: String,
         number: u64,
         title: String,
         body: String,

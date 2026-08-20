@@ -2,8 +2,8 @@ use std::{env, error::Error, ffi::OsString, io, path::PathBuf, sync::Arc};
 
 use factoryd::{
     execution,
-    lifecycle::{DaemonInstance, ShutdownSignals},
-    local_api::{ApiState, serve},
+    lifecycle::{DaemonInstance, ShutdownSignals, bind_private_socket},
+    local_api::{ApiState, Endpoint, serve},
     store::Store,
     webhook_http::{WebhookHttpMetrics, WebhookServer, bind_webhooks, load_webhook_config},
 };
@@ -37,9 +37,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let store = Store::open(instance.database_path())?;
     let state = ApiState::new(store);
     let shutdown = ShutdownSignals::install()?;
+    execution::prepare_runtime_root(&config.runtime_root)?;
+    execution::retire_legacy_sessions(&state).await?;
     let (listener, socket_cleanup) = instance.bind_socket()?;
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
+    let session_socket_path = config.runtime_root.join("agent.sock");
+    let (session_listener, session_socket_cleanup) = bind_private_socket(&session_socket_path)?;
+    session_listener.set_nonblocking(true)?;
+    let session_listener = UnixListener::from_std(session_listener)?;
 
     let webhook_metrics = config
         .webhook_config
@@ -66,7 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             factoryctl_path: config.factoryctl,
             runtime_root: config.runtime_root,
             guidance_root: config.guidance_root,
-            socket_path: instance.socket_path().to_path_buf(),
+            socket_path: session_socket_path.clone(),
             max_active_runs: config.max_active_runs,
             session_start_deadline: execution::SESSION_START_DEADLINE,
         },
@@ -75,6 +81,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!(
         database = %instance.database_path().display(),
         socket = %instance.socket_path().display(),
+        session_socket = %session_socket_path.display(),
         webhooks_enabled,
         webhooks_bind = webhooks_bind.map(|bind| bind.to_string()),
         "factory daemon ready"
@@ -90,6 +97,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let control_planes = serve_control_planes(
         listener,
+        session_listener,
         state,
         execution.clone(),
         guidance_root,
@@ -113,6 +121,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Err(error) = socket_cleanup.remove() {
         tracing::warn!(%error, socket = %instance.socket_path().display(), "could not remove socket");
     }
+    if let Err(error) = session_socket_cleanup.remove() {
+        tracing::warn!(%error, socket = %session_socket_path.display(), "could not remove session socket");
+    }
     if let Some(metrics) = webhook_metrics {
         let metrics = metrics.snapshot();
         tracing::info!(
@@ -129,6 +140,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 async fn serve_control_planes(
     listener: UnixListener,
+    session_listener: UnixListener,
     state: ApiState,
     execution: execution::Handle,
     guidance_root: PathBuf,
@@ -136,13 +148,27 @@ async fn serve_control_planes(
     shutdown: ShutdownSignals,
 ) -> io::Result<()> {
     let (stop_tx, stop_rx) = watch::channel(false);
-    let local = serve(
+    let operator = serve(
         listener,
+        Endpoint::Operator,
+        state.clone(),
+        execution.clone(),
+        guidance_root.clone(),
+        wait_for_stop(stop_rx.clone()),
+    );
+    let session = serve(
+        session_listener,
+        Endpoint::Session,
         state,
         execution,
         guidance_root,
         wait_for_stop(stop_rx.clone()),
     );
+    let local = async {
+        let (operator, session) = tokio::join!(operator, session);
+        operator?;
+        session
+    };
     let web = serve_optional_webhooks(webhooks, stop_rx);
     tokio::pin!(local);
     tokio::pin!(web);
