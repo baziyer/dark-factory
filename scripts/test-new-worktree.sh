@@ -250,6 +250,7 @@ if [ "${DF_TEST_REPLACE_TARGET-}" = same-path ] \
     "$DF_TEST_REAL_GIT" "$@"
     mv "$DF_TEST_REPLACE_TARGET_PATH" "$DF_TEST_PRESERVED_TARGET_PATH"
     mkdir "$DF_TEST_REPLACE_TARGET_PATH"
+    cp "$DF_TEST_PRESERVED_TARGET_PATH/.git" "$DF_TEST_REPLACE_TARGET_PATH/.git"
     printf '%s\n' replacement \
         >"$DF_TEST_REPLACE_TARGET_PATH/replacement-survives"
     exit 0
@@ -511,6 +512,7 @@ fi
 assert_output_contains "$temporary/replaced.out" "preserved orphan"
 [ -f "$replacement_target/replacement-survives" ] ||
     fail "same-path replacement was removed"
+[ -f "$replacement_target/.git" ] || fail "same-path replacement lost its copied Git marker"
 assert_directory "$preserved_target"
 assert_branch_present "$replacement_repository" replaced
 assert_registered "$replacement_repository" "$replacement_target"

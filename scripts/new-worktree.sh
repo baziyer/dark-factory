@@ -1,8 +1,7 @@
 #!/bin/sh
 set -eu
 
-LC_ALL=C
-export LC_ALL
+export LC_ALL=C
 
 usage() {
     echo "usage: scripts/new-worktree.sh <slug>" >&2
@@ -26,15 +25,12 @@ safe_value() {
             ;;
     esac
     printf 'hex:'
-    printf '%s' "$value" | od -An -v -tx1 | awk '
-        {
-            for (field = 1; field <= NF; field++) {
-                count++
-                if (count <= 80) printf "%s", $field
-            }
+    printf '%s' "$value" | od -An -v -tx1 | awk '{
+        for (field = 1; field <= NF; field++) {
+            count++
+            if (count <= 80) printf "%s", $field
         }
-        END { if (count > 80) printf "..." }
-    '
+    } END { if (count > 80) printf "..." }'
 }
 
 fail_value() {
@@ -62,11 +58,9 @@ path_identity() {
 }
 
 same_identity() {
-    identity_path=$1
-    expected_identity=$2
-    [ ! -L "$identity_path" ] || return 1
-    actual_identity=$(path_identity "$identity_path") || return 1
-    [ "$actual_identity" = "$expected_identity" ]
+    [ ! -L "$1" ] || return 1
+    actual_identity=$(path_identity "$1") || return 1
+    [ "$actual_identity" = "$2" ]
 }
 
 reject_repository_shaping_environment() {
@@ -80,34 +74,18 @@ reject_repository_shaping_environment() {
         fi
     done
 
-    if [ "${GIT_CONFIG_COUNT+x}" = x ]; then
-        config_shape="${GIT_CONFIG_COUNT-}:${GIT_CONFIG_KEY_0-}:${GIT_CONFIG_VALUE_0-}:\
-${GIT_CONFIG_KEY_1-}:${GIT_CONFIG_VALUE_1-}"
-        [ "$config_shape" = '2:credential.helper::core.sshCommand:/usr/bin/false' ] ||
-            fail "refusing ambient Git config shaping: GIT_CONFIG_COUNT"
-    else
-        for ambient_name in \
-            GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1; do
-            printenv "$ambient_name" >/dev/null 2>&1 &&
-                fail "refusing ambient Git config shaping without GIT_CONFIG_COUNT"
-        done
-    fi
-    for ambient_name in GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2; do
-        printenv "$ambient_name" >/dev/null 2>&1 &&
-            fail "refusing extra ambient Git config shaping"
-    done
+    config_shape="${GIT_CONFIG_COUNT+x}:${GIT_CONFIG_COUNT-}:\
+${GIT_CONFIG_KEY_0-}:${GIT_CONFIG_VALUE_0-}:${GIT_CONFIG_KEY_1-}:\
+${GIT_CONFIG_VALUE_1-}:${GIT_CONFIG_KEY_2-}:${GIT_CONFIG_VALUE_2-}"
+    case "$config_shape" in
+        ':::::::' | 'x:2:credential.helper::core.sshCommand:/usr/bin/false::') ;;
+        *) fail "refusing ambient Git config shaping" ;;
+    esac
 
-    GIT_TERMINAL_PROMPT=0
-    GIT_ASKPASS=/usr/bin/false
-    GIT_SSH_COMMAND=/usr/bin/false
-    GIT_CONFIG_COUNT=2
-    GIT_CONFIG_KEY_0=credential.helper
-    GIT_CONFIG_VALUE_0=
-    GIT_CONFIG_KEY_1=core.sshCommand
-    GIT_CONFIG_VALUE_1=/usr/bin/false
-    export GIT_TERMINAL_PROMPT GIT_ASKPASS GIT_SSH_COMMAND
-    export GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0
-    export GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
+    export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false \
+        GIT_SSH_COMMAND=/usr/bin/false GIT_CONFIG_COUNT=2 \
+        GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0='' \
+        GIT_CONFIG_KEY_1=core.sshCommand GIT_CONFIG_VALUE_1=/usr/bin/false
 }
 
 require_branch_absent() {
@@ -152,14 +130,8 @@ validate_destination_absent() {
 }
 
 created_worktree_matches() {
-    repository_identity_matches || return 1
-    [ -d "$worktrees_directory" ] && [ ! -L "$worktrees_directory" ] || return 1
-    if [ "$parent_initially_present" = true ]; then
-        same_identity "$worktrees_directory" "$initial_parent_identity" || return 1
-    fi
-    [ -d "$target" ] && [ ! -L "$target" ] || return 1
-    created_target=$(canonical_directory "$target") || return 1
-    [ "$created_target" = "$target" ] || return 1
+    same_identity "$worktrees_directory" "$initial_parent_identity" || return 1
+    same_identity "$target" "$reserved_target_identity" || return 1
     [ -f "$target/.git" ] && [ ! -L "$target/.git" ] || return 1
 
     created_top_raw=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || return 1
@@ -186,20 +158,18 @@ created_worktree_matches() {
         repository_identity_matches
 }
 
-report_orphan() {
+fail_orphan() {
     orphan_reason=$1
-    rendered_target=$(safe_value "$target")
-    rendered_branch=$(safe_value "$branch")
-    rendered_base=$(safe_value "$base_ref")
+    trap - HUP INT TERM
     printf '%s; preserved orphan for daemon-owned recovery: target=%s branch=%s base=%s\n' \
-        "$orphan_reason" "$rendered_target" "$rendered_branch" "$rendered_base" >&2
+        "$orphan_reason" "$(safe_value "$target")" "$(safe_value "$branch")" \
+        "$(safe_value "$base_ref")" >&2
+    exit 1
 }
 
 on_mutation_signal() {
     mutation_signal=$1
-    trap - HUP INT TERM
-    report_orphan "interrupted by $mutation_signal after native worktree creation began"
-    exit 1
+    fail_orphan "interrupted by $mutation_signal after worktree creation began"
 }
 
 [ "$#" -eq 1 ] || {
@@ -341,6 +311,32 @@ repository_identity_matches ||
 trap 'on_mutation_signal HUP' HUP
 trap 'on_mutation_signal INT' INT
 trap 'on_mutation_signal TERM' TERM
+
+if [ "$parent_initially_present" = false ]; then
+    mkdir "$worktrees_directory" 2>/dev/null ||
+        fail_orphan "cannot reserve the worktree parent"
+    initial_parent_identity=$(path_identity "$worktrees_directory") ||
+        fail_orphan "cannot identify the reserved worktree parent"
+fi
+mkdir "$target" 2>/dev/null ||
+    fail_orphan "cannot reserve the absent worktree target"
+reserved_target_identity=$(path_identity "$target") ||
+    fail_orphan "cannot identify the reserved worktree target"
+if ! repository_identity_matches ||
+    ! same_identity "$worktrees_directory" "$initial_parent_identity" ||
+    ! same_identity "$target" "$reserved_target_identity"; then
+    fail_orphan "identity changed before native git worktree add"
+fi
+if git --git-dir="$initial_common" show-ref --verify --quiet "$branch_ref" \
+    >/dev/null 2>&1; then
+    fail_orphan "branch appeared after target reservation"
+else
+    ref_status=$?
+fi
+if [ "$ref_status" -ne 1 ] ||
+    ! git --git-dir="$initial_common" cat-file -e "$base_commit^{commit}" 2>/dev/null; then
+    fail_orphan "cannot revalidate the branch and base after target reservation"
+fi
 if git --git-dir="$initial_common" worktree add -b "$branch" "$target" "$base_commit" \
     >/dev/null 2>&1; then
     add_status=0
@@ -348,14 +344,10 @@ else
     add_status=$?
 fi
 if [ "$add_status" -ne 0 ]; then
-    trap - HUP INT TERM
-    report_orphan "native git worktree add failed with status $add_status"
-    exit 1
+    fail_orphan "native git worktree add failed with status $add_status"
 fi
 if ! created_worktree_matches; then
-    trap - HUP INT TERM
-    report_orphan "native git worktree add failed its identity postcondition"
-    exit 1
+    fail_orphan "native git worktree add failed its identity postcondition"
 fi
 
 rendered_target=$(safe_value "$target")

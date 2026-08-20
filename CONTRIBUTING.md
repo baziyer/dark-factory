@@ -15,7 +15,11 @@ cargo build --workspace
 The script resolves the repository's primary checkout and always creates new
 linked worktrees under that checkout's single `.worktrees/` directory. Running
 it from a resident or task-linked worktree therefore does not add another
-nested `.worktrees/` level; existing nested worktrees are left in place.
+nested `.worktrees/` level; existing nested worktrees are left in place. It
+proves the destination absent, reserves its exact directory identity, and then
+uses one native Git add. After reservation, any failure, signal, or identity
+replacement is preserved and reported as an orphan; the script does not roll
+back paths, registrations, or refs.
 
 On macOS, run the complete release-compatible gate:
 
