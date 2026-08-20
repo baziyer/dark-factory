@@ -442,6 +442,21 @@ fn install_fake_codex(home: &Path) -> PathBuf {
     bin
 }
 
+fn fake_codex_submitted_prompts(home: &Path) -> Vec<String> {
+    std::fs::read_dir(home.join("runs"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("fake-codex-prompts.jsonl"))
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|contents| {
+            contents
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("fake Codex prompt log is JSONL"))
+                .collect::<Vec<String>>()
+        })
+        .collect()
+}
+
 /// Starts a daemon on `home`, creates a real git repo project at
 /// `home/repo`, and returns everything a test needs to drive it further.
 struct Project {
@@ -1225,10 +1240,7 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     );
 
     // Delay prompt hooks so the replacement path also proves that a slow
-    // positive acknowledgement cannot duplicate the exact task attempt. The
-    // fixture makes the one fresh replacement miss its first CR while keeping
-    // the composer intact; unlike a resumed launch, it must take the ordinary
-    // bounded retry in the same session rather than churn fresh conversations.
+    // positive acknowledgement cannot duplicate the exact task attempt.
     std::fs::write(fake_bin.join("delay-user-prompt-submit"), b"3").unwrap();
     let stopped = client
         .request(LocalRequest::StopSession {
@@ -1257,18 +1269,7 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     assign_task(&client, "task-2", "curie");
     wait_for_task_status(&client, "task-2", TaskStatus::Succeeded);
 
-    let submitted_prompts: Vec<String> = std::fs::read_dir(home.path().join("runs"))
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("fake-codex-prompts.jsonl"))
-        .filter_map(|path| std::fs::read_to_string(path).ok())
-        .flat_map(|contents| {
-            contents
-                .lines()
-                .map(|line| serde_json::from_str(line).expect("fake Codex prompt log is JSONL"))
-                .collect::<Vec<String>>()
-        })
-        .collect();
+    let submitted_prompts = fake_codex_submitted_prompts(home.path());
     let task2_prompts = submitted_prompts
         .iter()
         .filter(|prompt| prompt.contains("task:task-2"))
@@ -1317,6 +1318,56 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
     assert_eq!(task2_runs.len(), 1, "task-2 must open exactly one run");
     let task2_run = &task2_runs[0];
     assert_eq!(task2_run.session_id.as_ref(), Some(&successor.id));
+
+    cleanup_session(&project.daemon, "curie");
+    project.daemon.stop();
+}
+
+#[test]
+fn late_exact_prompt_ack_never_replays_uncertain_provider_input() {
+    let home = private_tempdir();
+    let fake_bin = install_fake_codex(home.path());
+    // Longer than the production acknowledgement bound: the prompt crosses
+    // the PTY and provider boundary once, while its exact hook is late.
+    std::fs::write(fake_bin.join("delay-user-prompt-submit"), b"22").unwrap();
+    let daemon = Daemon::start_with_provider_path(home.path(), &fake_bin);
+    let project = setup_project_with(daemon, home.path());
+    let client = project.daemon.client();
+    create_codex_agent(&client, "curie");
+
+    create_task(&client, "task-1", "Late acknowledgement", "exactly once");
+    assign_task(&client, "task-1", "curie");
+    wait_for_session_state(&client, "curie", SessionState::WaitingForInput);
+    assert_eq!(
+        get_task(&client, "task-1").snapshot.status,
+        TaskStatus::Queued,
+        "a timeout must remain uncertain, not manufacture a running episode"
+    );
+    assert_eq!(
+        fake_codex_submitted_prompts(home.path())
+            .iter()
+            .filter(|prompt| prompt.contains("task:task-1"))
+            .count(),
+        1,
+        "the provider received one prompt before its exact hook became late"
+    );
+
+    wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    std::thread::sleep(Duration::from_secs(6));
+    let submitted = fake_codex_submitted_prompts(home.path());
+    assert_eq!(
+        submitted
+            .iter()
+            .filter(|prompt| prompt.contains("task:task-1"))
+            .count(),
+        1,
+        "the retry deadline must not emit a second provider submit while authority is uncertain: {submitted:?}"
+    );
+    let runs: Vec<_> = list_runs(&client)
+        .into_iter()
+        .filter(|run| run.task_id.as_ref().map(TaskId::as_str) == Some("task-1"))
+        .collect();
+    assert_eq!(runs.len(), 1, "the late exact hook admits one run");
 
     cleanup_session(&project.daemon, "curie");
     project.daemon.stop();

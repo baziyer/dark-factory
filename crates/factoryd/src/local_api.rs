@@ -279,7 +279,9 @@ impl ApiFailure {
                 | StoreError::AgentBudgetExhausted
                 | StoreError::ProjectHasActiveRun
                 | StoreError::RunNotStoppable
-                | StoreError::SessionStopping),
+                | StoreError::SessionStopping
+                | StoreError::SessionWorkConflict
+                | StoreError::SessionWorkQuarantined(_)),
             ) => (ErrorCode::Conflict, error.to_string()),
             Self::Store(error) if is_constraint_error(&error) => {
                 (ErrorCode::Conflict, error.to_string())
@@ -304,6 +306,8 @@ impl From<execution::Error> for ApiFailure {
                                  be delivered once it is"
                     .into(),
             ),
+            error @ (execution::Error::DeliveryInProgress
+            | execution::Error::DeliveryUnacknowledged) => Self::Conflict(error.to_string()),
             execution::Error::NoWorktree => {
                 Self::Invalid("agent has no worktree; create one first".into())
             }
@@ -319,7 +323,9 @@ impl From<execution::Error> for ApiFailure {
                 | StoreError::AgentUnavailable
                 | StoreError::SessionNotFound
                 | StoreError::SessionNotLive
-                | StoreError::SessionStopping),
+                | StoreError::SessionStopping
+                | StoreError::SessionWorkConflict
+                | StoreError::SessionWorkQuarantined(_)),
             )) => Self::Store(error),
             _ => Self::Internal("execution manager could not accept the task".into()),
         }
@@ -3786,11 +3792,10 @@ mod deletion_gate_tests {
         let (state, execution, project_id, agent_id, task_id) = setup(directory.path()).await;
         let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
         let text = format!("exact prompt\n{DELIVERY_ATTEMPT_MARKER}gate-race\u{2063}");
-        let (incarnation, prior_run_count) = state
+        let marker = state
             .with_store({
-                let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&task_id)
             })
             .await
             .unwrap();
@@ -3807,8 +3812,9 @@ mod deletion_gate_tests {
                         agent_id,
                         session_id,
                         task_id: Some(task_id),
-                        task_incarnation_id: Some(incarnation),
-                        prior_run_count: Some(prior_run_count),
+                        task_incarnation_id: Some(marker.incarnation_id),
+                        task_revision: Some(marker.task_revision),
+                        require_queue_head: false,
                         message_ids: Vec::new(),
                         text,
                         created_at_ms: 1_001,
@@ -3902,7 +3908,8 @@ mod deletion_gate_tests {
                         session_id: session_id.clone(),
                         task_id: None,
                         task_incarnation_id: None,
-                        prior_run_count: None,
+                        task_revision: None,
+                        require_queue_head: false,
                         message_ids: vec![message_id],
                         text,
                         created_at_ms: 1_002,
@@ -3967,11 +3974,10 @@ mod deletion_gate_tests {
         let visible_text = "same prompt";
         let old_text = format!("{visible_text}\n{DELIVERY_ATTEMPT_MARKER}attempt-a\u{2063}");
         let old_attempt_text = old_text.clone();
-        let (old_incarnation, old_run_count) = state
+        let old_marker = state
             .with_store({
-                let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&task_id)
             })
             .await
             .unwrap();
@@ -3989,8 +3995,9 @@ mod deletion_gate_tests {
                         agent_id,
                         session_id,
                         task_id: Some(task_id),
-                        task_incarnation_id: Some(old_incarnation),
-                        prior_run_count: Some(old_run_count),
+                        task_incarnation_id: Some(old_marker.incarnation_id),
+                        task_revision: Some(old_marker.task_revision),
+                        require_queue_head: false,
                         message_ids: Vec::new(),
                         text: old_attempt_text,
                         created_at_ms: 1_001,
@@ -4028,11 +4035,10 @@ mod deletion_gate_tests {
             })
             .await
             .unwrap();
-        let (incarnation, prior_run_count) = state
+        let marker = state
             .with_store({
-                let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&task_id)
             })
             .await
             .unwrap();
@@ -4050,8 +4056,9 @@ mod deletion_gate_tests {
                         agent_id,
                         session_id,
                         task_id: Some(task_id),
-                        task_incarnation_id: Some(incarnation),
-                        prior_run_count: Some(prior_run_count),
+                        task_incarnation_id: Some(marker.incarnation_id),
+                        task_revision: Some(marker.task_revision),
+                        require_queue_head: false,
                         message_ids: Vec::new(),
                         text: new_text,
                         created_at_ms: 1_005,
