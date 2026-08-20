@@ -15,9 +15,13 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use factory_core::local::{LocalRequest, MAX_LOCAL_FRAME_BYTES, RequestEnvelope, ServerFrame};
+use factory_core::runner::encode_terminal_bytes;
+use factory_core::{ProjectId, SessionId};
+use factoryctl::Client;
 
 /// One open `AttachTerminal` connection. Dropping this (or calling [`AttachConnection::shutdown`]
 /// explicitly, which is faster) ends the paired reader's blocking read.
@@ -119,6 +123,45 @@ pub fn read_frames(reader: impl Read, mut on_frame: impl FnMut(ServerFrame) -> b
             Ok(None) | Err(_) => return,
         }
     }
+}
+
+pub(super) fn spawn_input_worker(
+    socket: PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
+    rx: mpsc::Receiver<Vec<u8>>,
+) {
+    std::thread::spawn(move || {
+        let client = Client::new(socket);
+        while let Ok(bytes) = rx.recv() {
+            let request = LocalRequest::TerminalInput {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                bytes: encode_terminal_bytes(&bytes),
+            };
+            let _ = client.request(request);
+        }
+    });
+}
+
+pub(super) fn spawn_resize_worker(
+    socket: PathBuf,
+    project_id: ProjectId,
+    session_id: SessionId,
+    rx: mpsc::Receiver<(u16, u16)>,
+) {
+    std::thread::spawn(move || {
+        let client = Client::new(socket);
+        while let Ok((cols, rows)) = rx.recv() {
+            let request = LocalRequest::ResizeTerminal {
+                project_id: project_id.clone(),
+                session_id: session_id.clone(),
+                cols,
+                rows,
+            };
+            let _ = client.request(request);
+        }
+    });
 }
 
 #[cfg(test)]

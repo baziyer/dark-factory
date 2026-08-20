@@ -20,12 +20,8 @@ use portable_pty::{
 use tui_term::vt100;
 
 use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
-use factory_core::runner::{
-    decode_terminal_bytes, encode_terminal_bytes, terminal_generation_is_contiguous,
-};
+use factory_core::runner::{decode_terminal_bytes, terminal_generation_is_contiguous};
 use factory_core::{ProjectId, RunnerInstanceId, SessionId};
-
-use factoryctl::Client;
 
 use crate::attach::{self, AttachConnection};
 use crate::keys::KeyContext;
@@ -227,13 +223,13 @@ impl Pane {
 
         let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
         let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>();
-        spawn_input_worker(
+        attach::spawn_input_worker(
             socket.clone(),
             project_id.clone(),
             session_id.clone(),
             input_rx,
         );
-        spawn_resize_worker(socket, project_id.clone(), session_id.clone(), resize_rx);
+        attach::spawn_resize_worker(socket, project_id.clone(), session_id.clone(), resize_rx);
 
         Ok(Self {
             title: title.into(),
@@ -740,45 +736,6 @@ fn spawn_attach_reader_thread(
     });
 }
 
-fn spawn_input_worker(
-    socket: PathBuf,
-    project_id: ProjectId,
-    session_id: SessionId,
-    rx: mpsc::Receiver<Vec<u8>>,
-) {
-    std::thread::spawn(move || {
-        let client = Client::new(socket);
-        while let Ok(bytes) = rx.recv() {
-            let request = LocalRequest::TerminalInput {
-                project_id: project_id.clone(),
-                session_id: session_id.clone(),
-                bytes: encode_terminal_bytes(&bytes),
-            };
-            let _ = client.request(request);
-        }
-    });
-}
-
-fn spawn_resize_worker(
-    socket: PathBuf,
-    project_id: ProjectId,
-    session_id: SessionId,
-    rx: mpsc::Receiver<(u16, u16)>,
-) {
-    std::thread::spawn(move || {
-        let client = Client::new(socket);
-        while let Ok((cols, rows)) = rx.recv() {
-            let request = LocalRequest::ResizeTerminal {
-                project_id: project_id.clone(),
-                session_id: session_id.clone(),
-                cols,
-                rows,
-            };
-            let _ = client.request(request);
-        }
-    });
-}
-
 /// The set of panes currently attached, keyed by session id — `main.rs` reconciles this against
 /// `Board::desired_sessions()` every loop iteration; `ui::terminals`/`ui::focus` render whatever's
 /// in it.
@@ -793,6 +750,7 @@ mod tests {
 
     use factory_core::PROTOCOL_VERSION;
     use factory_core::local::{LocalResponse, RequestEnvelope};
+    use factory_core::runner::encode_terminal_bytes;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::widgets::{Block, Borders};
