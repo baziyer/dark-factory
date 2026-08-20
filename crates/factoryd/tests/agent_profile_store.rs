@@ -157,6 +157,7 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
     connection
         .execute_batch(
             "DROP TABLE session_work;
+             DROP INDEX delivery_attempts_session_work_identity;
              DROP INDEX runs_one_open_per_session;
              ALTER TABLE tasks DROP COLUMN work_revision;
              DROP TABLE delivery_attempts;",

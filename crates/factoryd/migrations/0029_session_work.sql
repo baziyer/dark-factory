@@ -10,6 +10,15 @@ ALTER TABLE delivery_attempts ADD COLUMN task_revision INTEGER
     CHECK (task_revision IS NULL OR task_revision >= 0);
 ALTER TABLE delivery_attempts ADD COLUMN run_id TEXT;
 
+-- A scalar attempt id is not enough to prove that the referenced row is owned
+-- by this exact resident session. The composite key lets SQLite enforce
+-- that future non-quarantine authority rows cannot cross project/agent/session
+-- identities, even if a caller supplies otherwise valid foreign ids. Run
+-- identity is validated transactionally because Delivering/Uncertain reserve
+-- the run id before its row exists.
+CREATE UNIQUE INDEX delivery_attempts_session_work_identity
+    ON delivery_attempts(id, session_id, project_id, agent_id);
+
 CREATE TABLE session_work (
     session_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -27,6 +36,8 @@ CREATE TABLE session_work (
     updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
     FOREIGN KEY (session_id, project_id) REFERENCES sessions(id, project_id),
     FOREIGN KEY (session_id, agent_id) REFERENCES sessions(id, agent_id),
+    FOREIGN KEY (attempt_id, session_id, project_id, agent_id)
+        REFERENCES delivery_attempts(id, session_id, project_id, agent_id),
     CHECK (quarantine_reason IS NULL OR state = 'uncertain'),
     CHECK (
         quarantine_reason IS NOT NULL OR

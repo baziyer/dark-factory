@@ -114,6 +114,13 @@ catalogue.
    recompose a newer queue head. The per-agent pending-delivery slot only
    reduces duplicate preparation; correctness comes from the durable
    `session_work` CAS when the dispatcher and hook-reply paths race.
+   Its stored attempt identity is protected by a composite foreign key, while
+   every transition transaction also proves the session, project, agent, task
+   incarnation/revision, and run relationship. The v28 migration adopts only
+   that exact ownership: cross-owner or contradictory legacy rows are
+   quarantined, and ownership retained by an already-ended session is
+   terminalized together with its task, journal, and durable events instead
+   of leaving non-deliverable `running` work behind.
    `factoryd`'s own restart never stops a
    session: `factory-runner` is a detached process tree — spawned as its
    own process-group leader, and the launchd job abandons its group, so a

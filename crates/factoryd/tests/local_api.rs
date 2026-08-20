@@ -127,6 +127,7 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
         connection
             .execute_batch(
                 "DROP TABLE session_work;
+                 DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
                  ALTER TABLE tasks DROP COLUMN work_revision;
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;

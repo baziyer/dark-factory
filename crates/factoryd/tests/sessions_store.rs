@@ -46,6 +46,23 @@ fn new_session(seed: &str, project: &str, agent: &str) -> NewSession {
     }
 }
 
+fn rewind_session_work_migration(database: &std::path::Path) {
+    let connection = rusqlite::Connection::open(database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP TABLE session_work;
+             DROP INDEX delivery_attempts_session_work_identity;
+             DROP INDEX IF EXISTS runs_one_open_per_session;
+             ALTER TABLE delivery_attempts DROP COLUMN run_id;
+             ALTER TABLE delivery_attempts DROP COLUMN task_revision;
+             ALTER TABLE tasks DROP COLUMN work_revision;
+             PRAGMA user_version = 28;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+}
+
 #[test]
 fn runtime_metadata_is_retained_after_a_session_ends() {
     let mut store = fixture();
@@ -523,6 +540,7 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
                  DROP TABLE session_work;
+                 DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
                  ALTER TABLE tasks DROP COLUMN work_revision;
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
@@ -640,6 +658,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
             .execute_batch(
                 "PRAGMA foreign_keys = OFF;
                  DROP TABLE session_work;
+                 DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
@@ -720,7 +739,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                 )
                 .unwrap();
         }
-        for (task, agent) in [("task-a", "curie"), ("task-b", "fermi")] {
+        for (task, owner) in [("task-a", "curie"), ("task-b", "fermi")] {
             store
                 .create_task(
                     NewTask {
@@ -738,7 +757,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                 .assign_task(
                     &project_id("factory"),
                     &task_id(task),
-                    Some(&agent_id(agent)),
+                    Some(&agent_id(owner)),
                     4,
                 )
                 .unwrap();
@@ -751,9 +770,9 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
             .unwrap();
     }
 
-    // v28 had no session-scoped uniqueness. Inject a row that is valid under
-    // its agent/task constraints but contradicts the session owner, then
-    // remove the v29 columns exactly as an upgrade would encounter them.
+    // v28 had no session-scoped uniqueness. Inject a second exact-owner run
+    // and active attempt, then remove the v29 columns exactly as an upgrade
+    // would encounter them.
     {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
@@ -783,6 +802,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                  FROM tasks WHERE id = 'task-b';
                  PRAGMA foreign_keys = OFF;
                  DROP TABLE session_work;
+                 DROP INDEX delivery_attempts_session_work_identity;
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
@@ -799,7 +819,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
         quarantined
             .quarantine_reason
             .as_deref()
-            .is_some_and(|reason| reason.contains("2 open run(s), 1 active delivery attempt(s)"))
+            .is_some_and(|reason| reason.contains("does not belong to the session"))
     );
     let connection = rusqlite::Connection::open(&database).unwrap();
     let open: i64 = connection
@@ -817,6 +837,17 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
         )
         .unwrap();
     assert_eq!((open, failed), (0, 2));
+    for task in ["task-a", "task-b"] {
+        assert_eq!(
+            store
+                .get_task(&project_id("factory"), &task_id(task))
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Failed,
+            "terminalized duplicate run must terminalize its task too"
+        );
+    }
     let unique_index: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_schema
@@ -838,6 +869,322 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
         store.session_work(&session).unwrap().work.unwrap().phase,
         SessionWorkPhase::Empty
     ));
+    assert_eq!(
+        store
+            .delivery_attempt_state("contradictory-attempt")
+            .unwrap(),
+        Some(DeliveryAttemptState::Cancelled)
+    );
+    let agent = store
+        .get_agent_detail(&project_id("factory"), &agent_id("curie"))
+        .unwrap();
+    assert_eq!(agent.snapshot.current_run_id, None);
+    assert_eq!(agent.snapshot.current_session_id, None);
+}
+
+#[test]
+fn migration_0029_quarantines_a_lone_cross_agent_run_and_end_repairs_its_task() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("cross-agent-run-v28.db");
+    let session = session_id("cross-run-session");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for agent in ["curie", "fermi"] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id(agent),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        store
+            .create_task(
+                NewTask {
+                    id: task_id("fermi-task"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Foreign owner".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id("factory"),
+                &task_id("fermi-task"),
+                Some(&agent_id("fermi")),
+                4,
+            )
+            .unwrap();
+        store
+            .create_session(new_session("cross-run-session", "factory", "curie"), 5)
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO runs (
+                    id, project_id, agent_id, session_id, parent_run_id, task_id,
+                    status, activity, wait_reason, worktree, started_at_ms,
+                    status_since_ms, updated_at_ms, ended_at_ms, closed_by,
+                    failure_reason, stop_requested_at_ms
+                 ) VALUES (
+                    'cross-agent-run', 'factory', 'fermi', 'cross-run-session', NULL,
+                    'fermi-task', 'running', NULL, NULL, '/work/factory', 6, 6, 6,
+                    NULL, NULL, NULL, NULL
+                 );
+                 UPDATE tasks SET status = 'running' WHERE id = 'fermi-task';",
+            )
+            .unwrap();
+    }
+    rewind_session_work_migration(&database);
+
+    let mut store = Store::open(&database).unwrap();
+    let work = store.session_work(&session).unwrap();
+    assert!(work.work.is_none());
+    assert!(
+        work.quarantine_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not belong to the session"))
+    );
+    store.end_session(&session, None, None, 7).unwrap();
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task_id("fermi-task"))
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Failed
+    );
+    assert!(matches!(
+        store.session_work(&session).unwrap().work.unwrap().phase,
+        SessionWorkPhase::Empty
+    ));
+}
+
+#[test]
+fn migration_0029_quarantines_a_lone_cross_agent_attempt() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("cross-agent-attempt-v28.db");
+    let session = session_id("cross-attempt-session");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for agent in ["curie", "fermi"] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id(agent),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        store
+            .create_task(
+                NewTask {
+                    id: task_id("fermi-task"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Foreign attempt".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id("factory"),
+                &task_id("fermi-task"),
+                Some(&agent_id("fermi")),
+                4,
+            )
+            .unwrap();
+        store
+            .create_session(new_session("cross-attempt-session", "factory", "curie"), 5)
+            .unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO delivery_attempts (
+                    id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json, text,
+                    failure_count, next_attempt_at_ms, state, created_at_ms,
+                    updated_at_ms, task_revision, run_id
+                 ) SELECT
+                    'cross-agent-attempt', 'factory', 'fermi', 'cross-attempt-session',
+                    'fermi-task', incarnation_id, 0, '[]', 'foreign prompt',
+                    2, NULL, 'terminal', 6, 6, work_revision,
+                    '33333333-3333-4333-8333-333333333333'
+                 FROM tasks WHERE id = 'fermi-task';",
+            )
+            .unwrap();
+    }
+    rewind_session_work_migration(&database);
+
+    let store = Store::open(&database).unwrap();
+    let work = store.session_work(&session).unwrap();
+    assert!(work.work.is_none());
+    assert!(
+        work.quarantine_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("does not belong to the session"))
+    );
+    assert_eq!(
+        store.delivery_attempt_state("cross-agent-attempt").unwrap(),
+        Some(DeliveryAttemptState::Terminal)
+    );
+}
+
+#[test]
+fn migration_0029_resolves_ended_session_ownership_and_emits_terminal_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("ended-owned-work-v28.db");
+    let session = session_id("ended-owned-session");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("curie"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_task(
+                NewTask {
+                    id: task_id("ended-task"),
+                    project_id: project_id("factory"),
+                    parent_task_id: None,
+                    title: "Ended ownership".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(
+                &project_id("factory"),
+                &task_id("ended-task"),
+                Some(&agent_id("curie")),
+                4,
+            )
+            .unwrap();
+        store
+            .create_session(new_session("ended-owned-session", "factory", "curie"), 5)
+            .unwrap();
+        store.end_session(&session, Some(0), None, 6).unwrap();
+    }
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO runs (
+                    id, project_id, agent_id, session_id, parent_run_id, task_id,
+                    status, activity, wait_reason, worktree, started_at_ms,
+                    status_since_ms, updated_at_ms, ended_at_ms, closed_by,
+                    failure_reason, stop_requested_at_ms
+                 ) VALUES (
+                    'ended-open-run', 'factory', 'curie', 'ended-owned-session', NULL,
+                    'ended-task', 'running', NULL, NULL, '/work/factory', 7, 7, 7,
+                    NULL, NULL, NULL, NULL
+                 );
+                 UPDATE tasks SET status = 'running' WHERE id = 'ended-task';
+                 INSERT INTO delivery_attempts (
+                    id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json, text,
+                    failure_count, next_attempt_at_ms, state, created_at_ms,
+                    updated_at_ms, task_revision, run_id
+                 ) VALUES (
+                    'ended-attempt', 'factory', 'curie', 'ended-owned-session', NULL,
+                    NULL, 0, '[]', 'ended prompt', 1, 8, 'retryable', 8, 8,
+                    NULL, NULL
+                 );",
+            )
+            .unwrap();
+    }
+    rewind_session_work_migration(&database);
+
+    let store = Store::open(&database).unwrap();
+    assert_eq!(
+        store
+            .get_task(&project_id("factory"), &task_id("ended-task"))
+            .unwrap()
+            .snapshot
+            .status,
+        TaskStatus::Failed
+    );
+    assert_eq!(
+        store.delivery_attempt_state("ended-attempt").unwrap(),
+        Some(DeliveryAttemptState::Cancelled)
+    );
+    assert!(matches!(
+        store.session_work(&session).unwrap().work.unwrap().phase,
+        SessionWorkPhase::Empty
+    ));
+    let events = store.events_after(0, 1_000).unwrap();
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::TaskChanged { task }
+            if task.id == task_id("ended-task") && task.status == TaskStatus::Failed
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        FactoryEvent::RunChanged { run }
+            if run.id == RunId::try_from("ended-open-run").unwrap()
+                && run.status == factory_core::RunStatus::Failed
+    )));
 }
 
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s

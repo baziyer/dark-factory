@@ -299,6 +299,16 @@ pub struct Handle {
     /// agent it is about to create does not exist yet for `DeleteProject`
     /// to have marked. See [`Handle::begin_delete_project`].
     project_gate: Arc<DeleteGate<ProjectId>>,
+    #[cfg(test)]
+    start_task_ack_test: Option<StartTaskAckTest>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StartTaskAckTest {
+    timeout: Duration,
+    waiter_finished: Arc<tokio::sync::Barrier>,
+    failure_released: Arc<tokio::sync::Barrier>,
 }
 
 impl Handle {
@@ -449,6 +459,12 @@ impl Handle {
             &session.id,
             &attempt.id,
             &attempt.text,
+            #[cfg(test)]
+            self.start_task_ack_test
+                .as_ref()
+                .map_or(ACK_TIMEOUT, |test| test.timeout),
+            #[cfg(not(test))]
+            ACK_TIMEOUT,
         )
         .await
         {
@@ -463,15 +479,50 @@ impl Handle {
             )
             .await?;
         } else {
+            #[cfg(test)]
+            if let Some(test) = &self.start_task_ack_test {
+                test.waiter_finished.wait().await;
+                test.failure_released.wait().await;
+            }
             let attempt_id = attempt.id.clone();
             let failure_now = now_ms()?;
-            let _ = self
+            let failure = self
                 .state
                 .commit_and_publish(move |store| {
                     store.record_delivery_failure(&attempt_id, failure_now)?;
                     Ok(((), Vec::new()))
                 })
                 .await;
+            if let Err(error) = failure {
+                let exact_acknowledgement = self
+                    .state
+                    .with_store({
+                        let attempt_id = attempt.id.clone();
+                        let session_id = session.id.clone();
+                        let task_id = task_id.clone();
+                        let incarnation_id = attempt
+                            .task_incarnation_id
+                            .clone()
+                            .ok_or(Error::CorruptExecution)?;
+                        let task_revision = attempt.task_revision.ok_or(Error::CorruptExecution)?;
+                        let run_id = run_id.clone();
+                        move |store| {
+                            store.delivery_attempt_acknowledged(
+                                &attempt_id,
+                                &session_id,
+                                &task_id,
+                                &incarnation_id,
+                                task_revision,
+                                &run_id,
+                            )
+                        }
+                    })
+                    .await?;
+                if exact_acknowledgement {
+                    return Ok(StartedRun { run_id });
+                }
+                return Err(error.into());
+            }
             let reason = "delivery unacknowledged".to_owned();
             let wait_session_id = session.id.clone();
             let wait_at_ms = now_ms()?;
@@ -702,6 +753,8 @@ pub fn spawn(
             // writes it guards run on request-handling tasks, never on
             // `run_dispatcher`'s (see `Handle::try_begin_project_write`).
             project_gate: Arc::new(DeleteGate::new()),
+            #[cfg(test)]
+            start_task_ack_test: None,
         },
         join,
     ))
@@ -2173,9 +2226,16 @@ async fn commit_delivery(
     state
         .commit_and_publish(move |store| {
             let attempt_state = store.delivery_attempt_state(&attempt_id)?;
+            if matches!(attempt_state, Some(DeliveryAttemptState::Acknowledged)) {
+                return Ok((None, Vec::new()));
+            }
             if !matches!(
                 attempt_state,
-                Some(DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable)
+                Some(
+                    DeliveryAttemptState::InFlight
+                        | DeliveryAttemptState::Retryable
+                        | DeliveryAttemptState::Terminal
+                )
             ) {
                 return Ok((None, Vec::new()));
             }
@@ -2217,6 +2277,7 @@ async fn commit_delivery(
                         Err(StoreError::SessionStopping | StoreError::SessionNotLive) => {
                             Ok((None, Vec::new()))
                         }
+                        Err(StoreError::SessionWorkConflict) => Ok((None, Vec::new())),
                         Err(error) => Err(error),
                     }
                 }
@@ -2325,7 +2386,9 @@ async fn admit_delivery_attempt(
 ) -> Result<PromptDeliveryAdmission, DaemonStateError> {
     if !matches!(
         attempt.state,
-        DeliveryAttemptState::InFlight | DeliveryAttemptState::Retryable
+        DeliveryAttemptState::InFlight
+            | DeliveryAttemptState::Retryable
+            | DeliveryAttemptState::Terminal
     ) {
         return Ok(if attempt.state == DeliveryAttemptState::Acknowledged {
             PromptDeliveryAdmission::Acknowledged
@@ -2458,7 +2521,16 @@ async fn deliver_pending(
     let Some(attempt) = claimed else {
         return Ok(());
     };
-    if type_and_await_ack(state, &client, &session.id, &attempt.id, &attempt.text).await {
+    if type_and_await_ack(
+        state,
+        &client,
+        &session.id,
+        &attempt.id,
+        &attempt.text,
+        ACK_TIMEOUT,
+    )
+    .await
+    {
         commit_delivery(
             state,
             project_id,
@@ -2592,6 +2664,7 @@ async fn type_and_await_ack(
     session_id: &SessionId,
     attempt_id: &str,
     text: &str,
+    ack_timeout: Duration,
 ) -> bool {
     let body = encode_terminal_bytes(text.as_bytes());
     let submit = encode_terminal_bytes(b"\r");
@@ -2615,7 +2688,7 @@ async fn type_and_await_ack(
         session_id,
         attempt_id,
         write_started_at_ms,
-        ACK_TIMEOUT,
+        ack_timeout,
     )
     .await
 }
@@ -3312,7 +3385,10 @@ mod tests {
     use factory_core::{MessageId, TaskId};
 
     use super::*;
-    use crate::store::{NewAgentMessage, NewSession, Store};
+    use crate::{
+        session_work::Phase as SessionWorkPhase,
+        store::{NewAgentMessage, NewSession, Store},
+    };
 
     struct RecoveryStopFixture {
         _directory: tempfile::TempDir,
@@ -3652,6 +3728,7 @@ mod tests {
             shutdown,
             backoff: Arc::clone(&backoff),
             project_gate: Arc::new(DeleteGate::new()),
+            start_task_ack_test: None,
         };
         let identities = [
             (
@@ -4785,6 +4862,386 @@ mod tests {
         assert!(matches!(result, Err(Error::NoLiveSession)));
         handle.shutdown().await.unwrap();
         join.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_task_accepts_the_exact_hook_that_wins_the_timeout_failure_cas() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let task_id = TaskId::try_from("race-task").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let runner_instance_id =
+            RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222").unwrap();
+        let runtime_dir = directory.path().join("runner");
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: worktree.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_task(
+                crate::store::NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Race the late hook".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .assign_task(&project_id, &task_id, Some(&agent_id), 4)
+            .unwrap();
+        store
+            .create_session(
+                crate::store::NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: worktree.to_string_lossy().into_owned(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: runner_instance_id.clone(),
+                    runner_runtime: runtime_dir.to_string_lossy().into_owned(),
+                    runner_protocol_version: 1,
+                },
+                5,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                6,
+            )
+            .unwrap();
+
+        let runner = start_test_runner(factory_runner::Config {
+            run_id: session_run_id(&session_id).unwrap(),
+            runner_instance_id: runner_instance_id.clone(),
+            runtime_dir: runtime_dir.clone(),
+            cwd: worktree.clone(),
+            startup_input: None,
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec!["-c".into(), "while :; do sleep 1; done".into()],
+            terminal: None,
+        })
+        .await;
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let waiter_finished = Arc::new(tokio::sync::Barrier::new(2));
+        let failure_released = Arc::new(tokio::sync::Barrier::new(2));
+        let handle = Handle {
+            state: state.clone(),
+            config: Arc::new(config(directory.path())),
+            wake_tx,
+            shutdown,
+            backoff: Arc::new(SpawnBackoff::new()),
+            project_gate: Arc::new(DeleteGate::new()),
+            start_task_ack_test: Some(StartTaskAckTest {
+                timeout: Duration::from_millis(1),
+                waiter_finished: Arc::clone(&waiter_finished),
+                failure_released: Arc::clone(&failure_released),
+            }),
+        };
+
+        let start = tokio::spawn({
+            let handle = handle.clone();
+            let project_id = project_id.clone();
+            let agent_id = agent_id.clone();
+            let task_id = task_id.clone();
+            let worktree = worktree.clone();
+            async move {
+                handle
+                    .start_task(StartTask {
+                        project_id,
+                        agent_id,
+                        task_id,
+                        parent_run_id: None,
+                        worktree,
+                    })
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(2), waiter_finished.wait())
+            .await
+            .unwrap();
+        let (session, attempt) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let agent_id = agent_id.clone();
+                let session_id = session_id.clone();
+                move |store| {
+                    Ok((
+                        store.session_snapshot(&project_id, &session_id)?,
+                        store
+                            .delivery_attempt_for_session(&project_id, &agent_id, &session_id)?
+                            .unwrap(),
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        let payload = serde_json::json!({ "prompt": attempt.text });
+        assert_eq!(
+            commit_pending_delivery_on_prompt(&state, &session, &payload)
+                .await
+                .unwrap(),
+            PromptDeliveryAdmission::Acknowledged
+        );
+        assert_eq!(
+            commit_pending_delivery_on_prompt(&state, &session, &payload)
+                .await
+                .unwrap(),
+            PromptDeliveryAdmission::Acknowledged,
+            "the same exact hook is idempotent"
+        );
+        failure_released.wait().await;
+        let started = timeout(Duration::from_secs(2), start)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let (task, runs, attempt_state) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                let attempt_id = attempt.id.clone();
+                move |store| {
+                    Ok((
+                        store.get_task(&project_id, &task_id)?,
+                        store.list_runs(&project_id, None, 10)?,
+                        store.delivery_attempt_state(&attempt_id)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Running);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, started.run_id);
+        assert_eq!(attempt_state, Some(DeliveryAttemptState::Acknowledged));
+
+        RunnerClient::new(
+            &runtime_dir,
+            session_run_id(&session_id).unwrap(),
+            runner_instance_id,
+        )
+        .stop(1_000)
+        .await
+        .unwrap();
+        runner.abort();
+        let _ = runner.await;
+    }
+
+    #[tokio::test]
+    async fn migrated_terminal_attempt_accepts_only_its_exact_late_hook_once() {
+        let directory = private_tempdir();
+        let database = directory.path().join("terminal-attempt-v28.db");
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let task_id = TaskId::try_from("late-task").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        let attempt_id = "legacy-terminal-attempt";
+        {
+            let mut store = Store::open(&database).unwrap();
+            store
+                .create_project(
+                    crate::store::NewProject {
+                        id: project_id.clone(),
+                        name: "Factory".into(),
+                        root: directory.path().to_string_lossy().into_owned(),
+                    },
+                    1,
+                )
+                .unwrap();
+            store
+                .create_agent(
+                    crate::store::NewAgent {
+                        id: agent_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Shell,
+                    },
+                    2,
+                )
+                .unwrap();
+            store
+                .create_task(
+                    crate::store::NewTask {
+                        id: task_id.clone(),
+                        project_id: project_id.clone(),
+                        parent_task_id: None,
+                        title: "Accept the late hook".into(),
+                        body: String::new(),
+                        priority: 0,
+                    },
+                    3,
+                )
+                .unwrap();
+            store
+                .assign_task(&project_id, &task_id, Some(&agent_id), 4)
+                .unwrap();
+            store
+                .create_session(
+                    NewSession {
+                        id: session_id.clone(),
+                        project_id: project_id.clone(),
+                        agent_id: agent_id.clone(),
+                        provider: Provider::Shell,
+                        runtime_model: None,
+                        runtime_reasoning_effort: None,
+                        runtime_permission_mode: None,
+                        runtime_control_mode: None,
+                        provider_session_id: None,
+                        worktree: directory.path().to_string_lossy().into_owned(),
+                        codex_home: None,
+                        hook_token: "a".repeat(64),
+                        runner_instance_id: RunnerInstanceId::try_from(
+                            "22222222-2222-4222-8222-222222222222",
+                        )
+                        .unwrap(),
+                        runner_runtime: directory
+                            .path()
+                            .join("runner")
+                            .to_string_lossy()
+                            .into_owned(),
+                        runner_protocol_version: 1,
+                    },
+                    5,
+                )
+                .unwrap();
+            store
+                .record_hook_event(
+                    &session_id,
+                    ProviderHookEvent::SessionStart,
+                    None,
+                    false,
+                    None,
+                    6,
+                )
+                .unwrap();
+            let marker = store.task_delivery_marker(&task_id).unwrap();
+            store
+                .ensure_delivery_attempt(NewDeliveryAttempt {
+                    id: attempt_id.into(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    task_id: Some(task_id.clone()),
+                    task_incarnation_id: Some(marker.incarnation_id),
+                    task_revision: Some(marker.task_revision),
+                    require_queue_head: false,
+                    message_ids: Vec::new(),
+                    text: "legacy exact prompt".into(),
+                    created_at_ms: 7,
+                })
+                .unwrap();
+        }
+        {
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "UPDATE delivery_attempts SET state = 'terminal' WHERE id = 'legacy-terminal-attempt';
+                     PRAGMA foreign_keys = OFF;
+                     DROP TABLE session_work;
+                     DROP INDEX delivery_attempts_session_work_identity;
+                     DROP INDEX runs_one_open_per_session;
+                     ALTER TABLE delivery_attempts DROP COLUMN run_id;
+                     ALTER TABLE delivery_attempts DROP COLUMN task_revision;
+                     ALTER TABLE tasks DROP COLUMN work_revision;
+                     PRAGMA user_version = 28;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&database).unwrap();
+        let work = store.session_work(&session_id).unwrap();
+        assert!(matches!(
+            work.work.unwrap().phase,
+            SessionWorkPhase::Uncertain(_)
+        ));
+        assert_eq!(
+            store.delivery_attempt_state(attempt_id).unwrap(),
+            Some(DeliveryAttemptState::Terminal)
+        );
+        let state = DaemonState::new(store);
+        let session = state
+            .with_store({
+                let project_id = project_id.clone();
+                let session_id = session_id.clone();
+                move |store| store.session_snapshot(&project_id, &session_id)
+            })
+            .await
+            .unwrap();
+        let payload = serde_json::json!({ "prompt": "legacy exact prompt" });
+        for _ in 0..2 {
+            assert_eq!(
+                commit_pending_delivery_on_prompt(&state, &session, &payload)
+                    .await
+                    .unwrap(),
+                PromptDeliveryAdmission::Acknowledged
+            );
+        }
+        let (task, runs, attempt, work) = state
+            .with_store({
+                let project_id = project_id.clone();
+                let task_id = task_id.clone();
+                let session_id = session_id.clone();
+                move |store| {
+                    Ok((
+                        store.get_task(&project_id, &task_id)?,
+                        store.list_runs(&project_id, None, 10)?,
+                        store.delivery_attempt_state(attempt_id)?,
+                        store.session_work(&session_id)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.snapshot.status, factory_core::TaskStatus::Running);
+        assert_eq!(runs.len(), 1, "the repeated exact hook opens one run");
+        assert_eq!(attempt, Some(DeliveryAttemptState::Acknowledged));
+        assert!(matches!(
+            work.work.unwrap().phase,
+            SessionWorkPhase::Running(_)
+        ));
     }
 
     /// This track's item 9: a recovered session's runner that never
