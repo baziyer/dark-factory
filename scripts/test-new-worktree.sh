@@ -27,43 +27,31 @@ init_repository() {
 }
 
 run_script() {
-    fixture_worktree=$1
-    fixture_slug=$2
     (
-        cd "$fixture_worktree"
-        ./scripts/new-worktree.sh "$fixture_slug"
+        cd "$1"
+        ./scripts/new-worktree.sh "$2"
     )
 }
 
 expect_failure() {
-    failure_name=$1
-    failure_worktree=$2
-    failure_slug=$3
-    if run_script "$failure_worktree" "$failure_slug" \
-        >"$temporary/$failure_name.out" 2>&1; then
-        fail "$failure_name unexpectedly succeeded"
+    if run_script "$2" "$3" >"$temporary/$1.out" 2>&1; then
+        fail "$1 unexpectedly succeeded"
     fi
 }
 
 assert_branch_absent() {
-    branch_repository=$1
-    branch_name=$2
-    if git -C "$branch_repository" show-ref --verify --quiet "refs/heads/$branch_name"; then
-        fail "branch unexpectedly exists: $branch_name"
+    if git -C "$1" show-ref --verify --quiet "refs/heads/$2"; then
+        fail "branch unexpectedly exists: $2"
     fi
 }
 
 assert_branch_present() {
-    branch_repository=$1
-    branch_name=$2
-    git -C "$branch_repository" show-ref --verify --quiet \
-        "refs/heads/$branch_name" ||
-        fail "branch is missing: $branch_name"
+    git -C "$1" show-ref --verify --quiet "refs/heads/$2" ||
+        fail "branch is missing: $2"
 }
 
 assert_directory() {
-    directory_path=$1
-    [ -d "$directory_path" ] || fail "directory is missing: $directory_path"
+    [ -d "$1" ] || fail "directory is missing: $1"
 }
 
 assert_path_absent() {
@@ -71,35 +59,24 @@ assert_path_absent() {
 }
 
 assert_unregistered() {
-    registration_repository=$1
-    registration_target=$2
-    if git -C "$registration_repository" worktree list --porcelain |
-        grep -Fqx "worktree $registration_target"; then
-        fail "worktree unexpectedly remains registered: $registration_target"
+    if git -C "$1" worktree list --porcelain | grep -Fqx "worktree $2"; then
+        fail "worktree unexpectedly remains registered: $2"
     fi
 }
 
 assert_registered() {
-    registration_repository=$1
-    registration_target=$2
-    git -C "$registration_repository" worktree list --porcelain |
-        grep -Fqx "worktree $registration_target" ||
-        fail "worktree registration is missing: $registration_target"
+    git -C "$1" worktree list --porcelain | grep -Fqx "worktree $2" ||
+        fail "worktree registration is missing: $2"
 }
 
 assert_output_contains() {
-    output_file=$1
-    expected_text=$2
-    grep -Fq "$expected_text" "$output_file" ||
-        fail "output did not contain: $expected_text"
+    grep -Fq "$2" "$1" || fail "output did not contain: $2"
 }
 
 assert_bounded_output() {
-    output_file=$1
-    maximum_bytes=$2
-    output_bytes=$(wc -c <"$output_file" | tr -d ' ')
-    [ "$output_bytes" -le "$maximum_bytes" ] ||
-        fail "output exceeded $maximum_bytes bytes: $output_bytes"
+    output_bytes=$(wc -c <"$1" | tr -d ' ')
+    [ "$output_bytes" -le "$2" ] ||
+        fail "output exceeded $2 bytes: $output_bytes"
 }
 
 configure_checkout_failure() {
@@ -260,24 +237,12 @@ if [ "${DF_TEST_SIGNAL-}" = before ] && [ "$matches_fetch" = true ]; then
     exit 143
 fi
 
-if [ "${DF_TEST_SWAP_REPOSITORY-}" = 1 ] \
+if [ "${DF_TEST_REPLACE_REPOSITORY-}" = 1 ] \
     && [ "$matches_root" = true ] \
-    && [ "$matches_common_dir" = true ]; then
-    swap_count=0
-    [ ! -f "$DF_TEST_SWAP_STATE" ] || read -r swap_count <"$DF_TEST_SWAP_STATE"
-    swap_count=$((swap_count + 1))
-    printf '%s\n' "$swap_count" >"$DF_TEST_SWAP_STATE"
-    if [ "$swap_count" -eq 2 ]; then
-        printf 'gitdir: %s\n' "$DF_TEST_SWAP_TO_GIT_DIR" \
-            >"$DF_TEST_SWAP_ROOT/.git"
-    fi
-fi
-
-if [ "${DF_TEST_SIGNAL-}" = after ] && [ "$matches_worktree_add" = true ]; then
-    "$DF_TEST_REAL_GIT" "$@"
-    add_status=$?
-    kill -TERM "$PPID"
-    exit "$add_status"
+    && [ ! -e "$DF_TEST_REPLACE_STATE" ]; then
+    : >"$DF_TEST_REPLACE_STATE"
+    mv "$DF_TEST_SWAP_ROOT" "$DF_TEST_PRESERVED_ROOT"
+    mv "$DF_TEST_REPLACEMENT_ROOT" "$DF_TEST_SWAP_ROOT"
 fi
 
 if [ "${DF_TEST_REPLACE_TARGET-}" = same-path ] \
@@ -295,28 +260,60 @@ EOF
 chmod +x "$shim_directory/git"
 real_git=$(command -v git)
 
-changing_git_file=$(sed -n '1p' "$first_link/.git")
-first_link_canonical=$(CDPATH='' cd -- "$first_link" && pwd -P)
+snapshot_repository="$temporary/snapshot repository"
+snapshot_replacement="$temporary/snapshot replacement"
+snapshot_preserved="$temporary/snapshot preserved"
+init_repository "$snapshot_repository"
+init_repository "$snapshot_replacement"
+snapshot_repository_canonical=$(CDPATH='' cd -- "$snapshot_repository" && pwd -P)
 if (
-    cd "$first_link"
+    cd "$snapshot_repository"
     env \
         PATH="$shim_directory:$PATH" \
         DF_TEST_REAL_GIT="$real_git" \
-        DF_TEST_SWAP_REPOSITORY=1 \
-        DF_TEST_SWAP_ROOT="$first_link_canonical" \
-        DF_TEST_SWAP_STATE="$temporary/swap-state" \
-        DF_TEST_SWAP_TO_GIT_DIR="$second_git_dir" \
-        ./scripts/new-worktree.sh identity-changed
-) >"$temporary/identity-changed.out" 2>&1; then
-    fail "repository identity change unexpectedly succeeded"
+        DF_TEST_REPLACE_REPOSITORY=1 \
+        DF_TEST_SWAP_ROOT="$snapshot_repository_canonical" \
+        DF_TEST_REPLACEMENT_ROOT="$snapshot_replacement" \
+        DF_TEST_PRESERVED_ROOT="$snapshot_preserved" \
+        DF_TEST_REPLACE_STATE="$temporary/repository-replaced" \
+        ./scripts/new-worktree.sh snapshot-replaced
+) >"$temporary/snapshot-replaced.out" 2>&1; then
+    fail "pre-query repository replacement unexpectedly succeeded"
 fi
-printf '%s\n' "$changing_git_file" >"$first_link/.git"
-assert_branch_absent "$first_repository" identity-changed
-assert_branch_absent "$second_repository" identity-changed
-[ ! -e "$first_repository/.worktrees/identity-changed" ] ||
-    fail "repository identity change left a worktree"
-[ ! -e "$second_repository/.worktrees/identity-changed" ] ||
-    fail "repository identity change mutated the replacement repository"
+assert_output_contains "$temporary/snapshot-replaced.out" "repository identity changed"
+assert_branch_absent "$snapshot_preserved" snapshot-replaced
+assert_branch_absent "$snapshot_repository" snapshot-replaced
+assert_path_absent "$snapshot_preserved/.worktrees/snapshot-replaced"
+assert_path_absent "$snapshot_repository/.worktrees/snapshot-replaced"
+
+fetch_repository="$temporary/explicit fetch repository"
+fetch_remote="$temporary/explicit fetch remote.git"
+fetch_updater="$temporary/explicit fetch updater"
+init_repository "$fetch_repository"
+git init -q --bare -b main "$fetch_remote"
+git -C "$fetch_repository" remote add origin "$fetch_remote"
+git -C "$fetch_repository" push -q -u origin main
+stale_main=$(git -C "$fetch_repository" rev-parse HEAD)
+git clone -q "$fetch_remote" "$fetch_updater"
+printf '%s\n' fresh >"$fetch_updater/fresh-base"
+git -C "$fetch_updater" add fresh-base
+git -C "$fetch_updater" \
+    -c user.name='Dark Factory tests' \
+    -c user.email='tests@dark.factory' \
+    commit -q -m 'advance remote main'
+fresh_main=$(git -C "$fetch_updater" rev-parse HEAD)
+git -C "$fetch_updater" push -q origin main
+git -C "$fetch_repository" config --unset-all remote.origin.fetch
+for fetch_slug in missing-fetch alternate-fetch; do
+    if [ "$fetch_slug" = alternate-fetch ]; then
+        git -C "$fetch_repository" config --add remote.origin.fetch \
+            '+refs/heads/not-main:refs/remotes/origin/not-main'
+    fi
+    git -C "$fetch_repository" update-ref refs/remotes/origin/main "$stale_main"
+    run_script "$fetch_repository" "$fetch_slug" >/dev/null
+    [ "$(git -C "$fetch_repository/.worktrees/$fetch_slug" rev-parse HEAD)" = "$fresh_main" ] ||
+        fail "$fetch_slug used stale origin/main"
+done
 
 hostile_repository="$temporary/hostile environment repository"
 init_repository "$hostile_repository"
@@ -440,23 +437,52 @@ assert_unregistered \
     "$signal_before_repository" \
     "$signal_before_repository/.worktrees/signal-before"
 
-signal_after_repository="$temporary/signal after repository"
-signal_after_target="$signal_after_repository/.worktrees/signal-after"
-init_repository "$signal_after_repository"
-if (
-    cd "$signal_after_repository"
-    env \
-        PATH="$shim_directory:$PATH" \
-        DF_TEST_REAL_GIT="$real_git" \
-        DF_TEST_SIGNAL=after \
-        ./scripts/new-worktree.sh signal-after
-) >"$temporary/signal-after.out" 2>&1; then
-    fail "post-mutation signal unexpectedly succeeded"
+signal_hook_repository="$temporary/signal hook repository"
+signal_hook_target="$signal_hook_repository/.worktrees/signal-hook"
+signal_hook_ready="$temporary/signal-hook-ready"
+signal_hook_release="$temporary/signal-hook-release"
+init_repository "$signal_hook_repository"
+cat >"$signal_hook_repository/.git/hooks/post-checkout" <<'EOF'
+#!/bin/sh
+set -eu
+: >"$DF_TEST_HOOK_READY"
+while [ ! -e "$DF_TEST_HOOK_RELEASE" ]; do
+    sleep 0.05
+done
+EOF
+chmod +x "$signal_hook_repository/.git/hooks/post-checkout"
+(
+    cd "$signal_hook_repository"
+    exec env \
+        DF_TEST_HOOK_READY="$signal_hook_ready" \
+        DF_TEST_HOOK_RELEASE="$signal_hook_release" \
+        ./scripts/new-worktree.sh signal-hook
+) >"$temporary/signal-hook.out" 2>&1 &
+signal_hook_pid=$!
+signal_wait=0
+while [ ! -e "$signal_hook_ready" ]; do
+    if ! kill -0 "$signal_hook_pid" 2>/dev/null; then
+        wait "$signal_hook_pid" || true
+        fail "native worktree add exited before its hook blocked"
+    fi
+    signal_wait=$((signal_wait + 1))
+    if [ "$signal_wait" -ge 200 ]; then
+        kill -TERM "$signal_hook_pid" 2>/dev/null || true
+        : >"$signal_hook_release"
+        wait "$signal_hook_pid" || true
+        fail "native worktree hook did not block in time"
+    fi
+    sleep 0.05
+done
+kill -TERM "$signal_hook_pid"
+: >"$signal_hook_release"
+if wait "$signal_hook_pid"; then
+    fail "signal during native worktree hook unexpectedly succeeded"
 fi
-assert_output_contains "$temporary/signal-after.out" "preserved orphan"
-assert_branch_present "$signal_after_repository" signal-after
-assert_directory "$signal_after_target"
-assert_registered "$signal_after_repository" "$signal_after_target"
+assert_output_contains "$temporary/signal-hook.out" "preserved orphan"
+assert_branch_present "$signal_hook_repository" signal-hook
+assert_directory "$signal_hook_target"
+assert_registered "$signal_hook_repository" "$signal_hook_target"
 
 replacement_repository="$temporary/replacement repository"
 replacement_target="$replacement_repository/.worktrees/replaced"

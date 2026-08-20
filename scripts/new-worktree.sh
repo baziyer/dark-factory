@@ -17,13 +17,13 @@ fail() {
 safe_value() {
     value=$1
     case "$value" in
-    '' | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:@,+\ -]*) ;;
-    *)
-        if [ "${#value}" -le 160 ]; then
-            printf '%s' "$value"
-            return
-        fi
-        ;;
+        '' | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./:@,+\ -]*) ;;
+        *)
+            if [ "${#value}" -le 160 ]; then
+                printf '%s' "$value"
+                return
+            fi
+            ;;
     esac
     printf 'hex:'
     printf '%s' "$value" | od -An -v -tx1 | awk '
@@ -75,28 +75,21 @@ reject_repository_shaping_environment() {
     done
 
     if [ "${GIT_CONFIG_COUNT+x}" = x ]; then
-        [ "$GIT_CONFIG_COUNT" = 2 ] ||
-            fail "refusing ambient Git config shaping: GIT_CONFIG_COUNT"
-        [ "${GIT_CONFIG_KEY_0+x}" = x ] &&
-            [ "$GIT_CONFIG_KEY_0" = credential.helper ] &&
-            [ "${GIT_CONFIG_VALUE_0+x}" = x ] &&
-            [ -z "$GIT_CONFIG_VALUE_0" ] ||
-            fail "refusing ambient Git config shaping: GIT_CONFIG_COUNT"
-        [ "${GIT_CONFIG_KEY_1+x}" = x ] &&
-            [ "$GIT_CONFIG_KEY_1" = core.sshCommand ] &&
-            [ "${GIT_CONFIG_VALUE_1+x}" = x ] &&
-            [ "$GIT_CONFIG_VALUE_1" = /usr/bin/false ] ||
+        config_shape="${GIT_CONFIG_COUNT-}:${GIT_CONFIG_KEY_0-}:${GIT_CONFIG_VALUE_0-}:\
+${GIT_CONFIG_KEY_1-}:${GIT_CONFIG_VALUE_1-}"
+        [ "$config_shape" = '2:credential.helper::core.sshCommand:/usr/bin/false' ] ||
             fail "refusing ambient Git config shaping: GIT_CONFIG_COUNT"
     else
-        [ "${GIT_CONFIG_KEY_0+x}" != x ] &&
-            [ "${GIT_CONFIG_VALUE_0+x}" != x ] &&
-            [ "${GIT_CONFIG_KEY_1+x}" != x ] &&
-            [ "${GIT_CONFIG_VALUE_1+x}" != x ] ||
-            fail "refusing ambient Git config shaping without GIT_CONFIG_COUNT"
+        for ambient_name in \
+            GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0 GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1; do
+            printenv "$ambient_name" >/dev/null 2>&1 &&
+                fail "refusing ambient Git config shaping without GIT_CONFIG_COUNT"
+        done
     fi
-    [ "${GIT_CONFIG_KEY_2+x}" != x ] &&
-        [ "${GIT_CONFIG_VALUE_2+x}" != x ] ||
-        fail "refusing extra ambient Git config shaping"
+    for ambient_name in GIT_CONFIG_KEY_2 GIT_CONFIG_VALUE_2; do
+        printenv "$ambient_name" >/dev/null 2>&1 &&
+            fail "refusing extra ambient Git config shaping"
+    done
 
     GIT_TERMINAL_PROMPT=0
     GIT_ASKPASS=/usr/bin/false
@@ -111,132 +104,23 @@ reject_repository_shaping_environment() {
     export GIT_CONFIG_KEY_1 GIT_CONFIG_VALUE_1
 }
 
-show_ref_state() {
-    state_common=$1
-    state_ref=$2
-    if git --git-dir="$state_common" show-ref --verify --quiet "$state_ref" \
+require_branch_absent() {
+    if git --git-dir="$initial_common" show-ref --verify --quiet "$branch_ref" \
         >/dev/null 2>&1; then
-        return 0
+        fail_value "$1" "$branch"
     else
-        state_status=$?
+        ref_status=$?
     fi
-    [ "$state_status" -eq 1 ] && return 1
-    return 2
+    [ "$ref_status" -eq 1 ] || fail "$2"
 }
 
-resolve_repository_identity() {
-    resolved_root=$(canonical_directory "$repository_root") ||
+snapshot_repository_identity() {
+    initial_root=$(canonical_directory "$(dirname -- "$0")/..") ||
         fail "cannot resolve the script repository"
-    [ -e "$resolved_root/.git" ] && [ ! -L "$resolved_root/.git" ] ||
+    [ -e "$initial_root/.git" ] && [ ! -L "$initial_root/.git" ] ||
         fail "script repository Git marker is missing or symlinked"
-
-    resolved_bare=$(git -C "$resolved_root" rev-parse --is-bare-repository 2>/dev/null) ||
-        fail "script is not inside a Git worktree"
-    [ "$resolved_bare" = false ] || fail "bare repositories do not have a worktree anchor"
-
-    resolved_top_raw=$(git -C "$resolved_root" rev-parse --show-toplevel 2>/dev/null) ||
-        fail "cannot resolve the script Git worktree"
-    resolved_top=$(canonical_directory "$resolved_top_raw") ||
-        fail "cannot resolve the script Git worktree"
-    [ "$resolved_top" = "$resolved_root" ] ||
-        fail "script repository does not match its registered Git worktree"
-
-    resolved_common_raw=$(
-        git -C "$resolved_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
-    ) || fail "cannot resolve the Git common directory"
-    [ -d "$resolved_common_raw" ] && [ ! -L "$resolved_common_raw" ] ||
-        fail "Git common directory is missing or symlinked"
-    resolved_common=$(canonical_directory "$resolved_common_raw") ||
-        fail "cannot resolve the Git common directory"
-
-    resolved_git_dir_raw=$(
-        git -C "$resolved_root" rev-parse --path-format=absolute --git-dir 2>/dev/null
-    ) || fail "cannot resolve the script worktree registration"
-    [ -d "$resolved_git_dir_raw" ] && [ ! -L "$resolved_git_dir_raw" ] ||
-        fail "script worktree registration is missing or symlinked"
-    resolved_git_dir=$(canonical_directory "$resolved_git_dir_raw") ||
-        fail "cannot resolve the script worktree registration"
-
-    case "$resolved_common" in
-    */.git) resolved_anchor_raw=${resolved_common%/.git} ;;
-    *) fail "Git common directory has no trustworthy primary worktree identity" ;;
-    esac
-    resolved_anchor=$(canonical_directory "$resolved_anchor_raw") ||
-        fail "cannot resolve the primary worktree anchor"
-    [ -d "$resolved_anchor" ] && [ ! -L "$resolved_anchor" ] ||
-        fail "primary worktree anchor is missing or symlinked"
-    [ -d "$resolved_anchor/.git" ] && [ ! -L "$resolved_anchor/.git" ] ||
-        fail "primary worktree Git directory is missing or symlinked"
-    anchor_git_dir=$(canonical_directory "$resolved_anchor/.git") ||
-        fail "cannot resolve the primary worktree Git directory"
-    [ "$anchor_git_dir" = "$resolved_common" ] ||
-        fail "Git common directory does not match the primary worktree"
-
-    anchor_top_raw=$(git -C "$resolved_anchor" rev-parse --show-toplevel 2>/dev/null) ||
-        fail "cannot validate the primary worktree anchor"
-    anchor_top=$(canonical_directory "$anchor_top_raw") ||
-        fail "cannot validate the primary worktree anchor"
-    anchor_common_raw=$(
-        git -C "$resolved_anchor" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
-    ) || fail "cannot validate the primary Git common directory"
-    anchor_common=$(canonical_directory "$anchor_common_raw") ||
-        fail "cannot validate the primary Git common directory"
-    anchor_git_dir_raw=$(
-        git -C "$resolved_anchor" rev-parse --path-format=absolute --git-dir 2>/dev/null
-    ) || fail "cannot validate the primary Git directory"
-    anchor_git_dir=$(canonical_directory "$anchor_git_dir_raw") ||
-        fail "cannot validate the primary Git directory"
-    [ "$anchor_top" = "$resolved_anchor" ] &&
-        [ "$anchor_common" = "$resolved_common" ] &&
-        [ "$anchor_git_dir" = "$resolved_common" ] ||
-        fail "primary worktree identity is ambiguous or mismatched"
-
-    if [ "$resolved_git_dir" = "$resolved_common" ]; then
-        [ "$resolved_root" = "$resolved_anchor" ] ||
-            fail "primary Git directory is attached to a different worktree"
-    else
-        case "$resolved_git_dir" in
-        "$resolved_common"/worktrees/*) ;;
-        *) fail "linked worktree metadata is outside the Git common directory" ;;
-        esac
-        worktree_admin_name=${resolved_git_dir#"$resolved_common"/worktrees/}
-        case "$worktree_admin_name" in
-        '' | */*) fail "linked worktree identity is ambiguous" ;;
-        esac
-        [ -f "$resolved_root/.git" ] && [ ! -L "$resolved_root/.git" ] ||
-            fail "linked worktree Git file is missing or symlinked"
-        [ -f "$resolved_git_dir/gitdir" ] && [ ! -L "$resolved_git_dir/gitdir" ] ||
-            fail "linked worktree registration is missing or symlinked"
-
-        registered_git_file=$(sed -n '1p' "$resolved_git_dir/gitdir")
-        [ "$registered_git_file" = "$resolved_root/.git" ] ||
-            fail "linked worktree registration points to a different worktree"
-        linked_git_dir=$(sed -n 's/^gitdir: //p' "$resolved_root/.git")
-        [ -n "$linked_git_dir" ] || fail "linked worktree Git file is invalid"
-        case "$linked_git_dir" in
-        /*) ;;
-        *) linked_git_dir="$resolved_root/$linked_git_dir" ;;
-        esac
-        linked_git_dir=$(canonical_directory "$linked_git_dir") ||
-            fail "linked worktree Git directory is missing"
-        [ "$linked_git_dir" = "$resolved_git_dir" ] ||
-            fail "linked worktree Git file does not match its registration"
-    fi
-}
-
-save_repository_identity() {
-    initial_root=$resolved_root
-    initial_common=$resolved_common
-    initial_git_dir=$resolved_git_dir
-    initial_anchor=$resolved_anchor
     initial_root_identity=$(path_identity "$initial_root") ||
         fail "cannot identify the script worktree"
-    initial_common_identity=$(path_identity "$initial_common") ||
-        fail "cannot identify the Git common directory"
-    initial_git_dir_identity=$(path_identity "$initial_git_dir") ||
-        fail "cannot identify the script worktree registration"
-    initial_anchor_identity=$(path_identity "$initial_anchor") ||
-        fail "cannot identify the primary worktree"
     initial_root_marker_identity=$(path_identity "$initial_root/.git") ||
         fail "cannot identify the script worktree Git marker"
 }
@@ -247,18 +131,6 @@ repository_identity_matches() {
         same_identity "$initial_git_dir" "$initial_git_dir_identity" &&
         same_identity "$initial_anchor" "$initial_anchor_identity" &&
         same_identity "$initial_root/.git" "$initial_root_marker_identity"
-}
-
-revalidate_repository_identity() {
-    resolve_repository_identity
-    if [ "$resolved_root" = "$initial_root" ] &&
-        [ "$resolved_common" = "$initial_common" ] &&
-        [ "$resolved_git_dir" = "$initial_git_dir" ] &&
-        [ "$resolved_anchor" = "$initial_anchor" ] &&
-        repository_identity_matches; then
-        return
-    fi
-    fail "repository identity changed during worktree creation"
 }
 
 validate_destination_absent() {
@@ -282,9 +154,7 @@ created_worktree_matches() {
     [ -d "$target" ] && [ ! -L "$target" ] || return 1
     created_target=$(canonical_directory "$target") || return 1
     [ "$created_target" = "$target" ] || return 1
-    created_target_identity=$(path_identity "$target") || return 1
     [ -f "$target/.git" ] && [ ! -L "$target/.git" ] || return 1
-    created_marker_identity=$(path_identity "$target/.git") || return 1
 
     created_top_raw=$(git -C "$target" rev-parse --show-toplevel 2>/dev/null) || return 1
     created_top=$(canonical_directory "$created_top_raw") || return 1
@@ -298,20 +168,15 @@ created_worktree_matches() {
     [ -d "$created_git_raw" ] && [ ! -L "$created_git_raw" ] || return 1
     created_git=$(canonical_directory "$created_git_raw") || return 1
     case "$created_git" in
-    "$initial_common"/worktrees/*) ;;
-    *) return 1 ;;
+        "$initial_common"/worktrees/*) ;;
+        *) return 1 ;;
     esac
-    created_git_dir_identity=$(path_identity "$created_git") || return 1
     created_branch=$(git -C "$target" symbolic-ref -q HEAD 2>/dev/null) || return 1
     created_commit=$(git -C "$target" rev-parse --verify HEAD 2>/dev/null) || return 1
     [ "$created_top" = "$target" ] &&
         [ "$created_common" = "$initial_common" ] &&
         [ "$created_branch" = "$branch_ref" ] &&
-        [ "$created_commit" = "$base_commit" ] || return 1
-
-    same_identity "$target" "$created_target_identity" &&
-        same_identity "$target/.git" "$created_marker_identity" &&
-        same_identity "$created_git" "$created_git_dir_identity" &&
+        [ "$created_commit" = "$base_commit" ] &&
         repository_identity_matches
 }
 
@@ -338,20 +203,84 @@ on_mutation_signal() {
 slug=$1
 
 case "$slug" in
--h | --help)
-    usage
-    exit 0
-    ;;
-'' | */* | .*) fail_value "invalid slug" "$slug" ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    '' | */* | .*) fail_value "invalid slug" "$slug" ;;
 esac
 
+snapshot_repository_identity
 reject_repository_shaping_environment
 git check-ref-format --branch "$slug" >/dev/null 2>&1 || fail_value "invalid slug" "$slug"
 
-repository_root=$(canonical_directory "$(dirname -- "$0")/..") ||
-    fail "cannot resolve the script repository"
-resolve_repository_identity
-save_repository_identity
+initial_top=$(canonical_directory "$(
+    git -C "$initial_root" rev-parse --show-toplevel 2>/dev/null
+)") ||
+    fail "cannot resolve the script Git worktree"
+[ "$initial_top" = "$initial_root" ] ||
+    fail "script repository does not match its registered Git worktree"
+
+initial_common_raw=$(
+    git -C "$initial_root" rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+) || fail "cannot resolve the Git common directory"
+[ -d "$initial_common_raw" ] && [ ! -L "$initial_common_raw" ] ||
+    fail "Git common directory is missing or symlinked"
+initial_common=$(canonical_directory "$initial_common_raw") ||
+    fail "cannot resolve the Git common directory"
+
+initial_git_dir_raw=$(
+    git -C "$initial_root" rev-parse --path-format=absolute --git-dir 2>/dev/null
+) || fail "cannot resolve the script worktree registration"
+[ -d "$initial_git_dir_raw" ] && [ ! -L "$initial_git_dir_raw" ] ||
+    fail "script worktree registration is missing or symlinked"
+initial_git_dir=$(canonical_directory "$initial_git_dir_raw") ||
+    fail "cannot resolve the script worktree registration"
+
+case "$initial_common" in
+    */.git) initial_anchor=$(canonical_directory "${initial_common%/.git}") ||
+        fail "cannot resolve the primary worktree anchor" ;;
+    *) fail "Git common directory has no trustworthy primary worktree identity" ;;
+esac
+[ -d "$initial_anchor/.git" ] && [ ! -L "$initial_anchor/.git" ] ||
+    fail "primary worktree Git directory is missing or symlinked"
+[ "$(canonical_directory "$initial_anchor/.git")" = "$initial_common" ] ||
+    fail "cannot resolve the primary worktree Git directory"
+anchor_top=$(canonical_directory "$(
+    git -C "$initial_anchor" rev-parse --show-toplevel 2>/dev/null
+)") ||
+    fail "cannot validate the primary worktree anchor"
+[ "$anchor_top" = "$initial_anchor" ] ||
+    fail "primary worktree identity is ambiguous or mismatched"
+
+if [ "$initial_git_dir" = "$initial_common" ]; then
+    [ "$initial_root" = "$initial_anchor" ] ||
+        fail "primary Git directory is attached to a different worktree"
+else
+    case "$initial_git_dir" in
+        "$initial_common"/worktrees/*) ;;
+        *) fail "linked worktree metadata is outside the Git common directory" ;;
+    esac
+    worktree_admin_name=${initial_git_dir#"$initial_common"/worktrees/}
+    case "$worktree_admin_name" in
+        '' | */*) fail "linked worktree identity is ambiguous" ;;
+    esac
+    [ -f "$initial_root/.git" ] && [ ! -L "$initial_root/.git" ] ||
+        fail "linked worktree Git file is missing or symlinked"
+    [ -f "$initial_git_dir/gitdir" ] && [ ! -L "$initial_git_dir/gitdir" ] ||
+        fail "linked worktree registration is missing or symlinked"
+    [ "$(sed -n '1p' "$initial_git_dir/gitdir")" = "$initial_root/.git" ] ||
+        fail "linked worktree registration points to a different worktree"
+fi
+
+initial_common_identity=$(path_identity "$initial_common") ||
+    fail "cannot identify the Git common directory"
+initial_git_dir_identity=$(path_identity "$initial_git_dir") ||
+    fail "cannot identify the script worktree registration"
+initial_anchor_identity=$(path_identity "$initial_anchor") ||
+    fail "cannot identify the primary worktree"
+repository_identity_matches ||
+    fail "repository identity changed during worktree creation"
 
 worktrees_directory="$initial_anchor/.worktrees"
 target="$worktrees_directory/$slug"
@@ -366,27 +295,27 @@ if [ -d "$worktrees_directory" ]; then
         fail "cannot identify the worktree parent"
 fi
 
-if show_ref_state "$initial_common" "$branch_ref"; then
-    fail_value "branch already exists" "$branch"
-else
-    ref_status=$?
-    [ "$ref_status" -eq 1 ] || fail "cannot determine whether the branch already exists"
-fi
+require_branch_absent \
+    "branch already exists" \
+    "cannot determine whether the branch already exists"
 
 if origin_url=$(git --git-dir="$initial_common" config --get remote.origin.url 2>/dev/null); then
     [ -n "$origin_url" ] || fail "origin remote has an empty URL"
     git --git-dir="$initial_common" fetch --quiet origin main >/dev/null 2>&1 ||
         fail "fetch of origin/main failed"
     base_ref=refs/remotes/origin/main
+    base_commit=$(
+        git --git-dir="$initial_common" rev-parse --verify 'FETCH_HEAD^{commit}' 2>/dev/null
+    ) || fail "fetched origin/main does not resolve to a commit"
 else
     origin_status=$?
     [ "$origin_status" -eq 1 ] || fail "cannot inspect the origin remote"
     base_ref=refs/heads/main
+    base_commit=$(
+        git --git-dir="$initial_common" rev-parse --verify "$base_ref^{commit}" 2>/dev/null
+    ) || fail "main does not resolve to a commit"
 fi
-base_commit=$(git --git-dir="$initial_common" rev-parse --verify "$base_ref^{commit}" 2>/dev/null) ||
-    fail "main does not resolve to a commit"
 
-revalidate_repository_identity
 if [ "$parent_initially_present" = true ]; then
     same_identity "$worktrees_directory" "$initial_parent_identity" ||
         fail "worktree parent identity changed during validation"
@@ -395,16 +324,13 @@ else
         fail "worktree parent appeared during validation"
 fi
 validate_destination_absent
-if show_ref_state "$initial_common" "$branch_ref"; then
-    fail_value "branch appeared during validation" "$branch"
-else
-    ref_status=$?
-    [ "$ref_status" -eq 1 ] || fail "cannot recheck the requested branch"
-fi
-validated_base=$(
-    git --git-dir="$initial_common" rev-parse --verify "$base_ref^{commit}" 2>/dev/null
-) || fail "cannot recheck the base commit"
-[ "$validated_base" = "$base_commit" ] || fail "base commit changed during validation"
+require_branch_absent \
+    "branch appeared during validation" \
+    "cannot recheck the requested branch"
+git --git-dir="$initial_common" cat-file -e "$base_commit^{commit}" 2>/dev/null ||
+    fail "cannot recheck the base commit"
+repository_identity_matches ||
+    fail "repository identity changed during worktree creation"
 
 trap 'on_mutation_signal HUP' HUP
 trap 'on_mutation_signal INT' INT
