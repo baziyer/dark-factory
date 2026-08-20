@@ -2346,6 +2346,71 @@ impl Store {
         ))
     }
 
+    /// Manual delivery timed out after its journal failure was recorded.
+    /// The exact late hook may still acknowledge `Uncertain` work between
+    /// those two transactions, so this projection is conditional on still
+    /// owning that same unacknowledged attempt. `None` means the exact hook
+    /// already won and the caller must report the admitted run instead of a
+    /// timeout.
+    pub fn mark_session_waiting_for_delivery(
+        &mut self,
+        session_id: &SessionId,
+        attempt_id: &str,
+        wait_reason: String,
+        now_ms: i64,
+    ) -> Result<Option<EventEnvelope>> {
+        if wait_reason.is_empty() || wait_reason.len() > MAX_WAIT_REASON_BYTES {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        if !session.state.is_live() {
+            return Err(StoreError::SessionNotLive);
+        }
+        if session.stop_requested_at_ms.is_some() {
+            return Err(StoreError::SessionStopping);
+        }
+        let owner = require_session_work(&transaction, session_id)?;
+        let current = owner.work.as_ref().ok_or(StoreError::CorruptSessionWork)?;
+        match &current.phase {
+            SessionWorkPhase::Running(lease) if lease.attempt_id == attempt_id => {
+                return Ok(None);
+            }
+            SessionWorkPhase::Uncertain(lease) if lease.attempt_id == attempt_id => {}
+            _ => return Err(StoreError::SessionWorkConflict),
+        }
+        let attempt = load_delivery_attempt(&transaction, attempt_id)?
+            .filter(|attempt| attempt.session_id == *session_id)
+            .ok_or(StoreError::InvalidExecutionMetadata)?;
+        if !matches!(
+            attempt.state,
+            DeliveryAttemptState::Retryable | DeliveryAttemptState::Terminal
+        ) {
+            return Err(StoreError::SessionWorkConflict);
+        }
+        transaction.execute(
+            "UPDATE sessions
+             SET state = 'waiting_for_input', state_since_ms = ?1, updated_at_ms = ?1,
+                 wait_reason = ?2, notification_kind = NULL
+             WHERE id = ?3",
+            params![now_ms, wait_reason, session_id.as_str()],
+        )?;
+        let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
+        let event = FactoryEvent::SessionChanged {
+            session: session.snapshot(),
+        };
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok(Some(EventEnvelope {
+            protocol_version: PROTOCOL_VERSION,
+            sequence,
+            occurred_at_ms: now_ms,
+            event,
+        }))
+    }
+
     /// Records whether the daemon can attach to a live session's runner PTY.
     /// Attach failures are shared durable observer state, not a TUI-only note;
     /// the next successful attach clears the exact daemon-owned failure reason.
@@ -8058,6 +8123,24 @@ mod tests {
             !store
                 .delivery_attempt_due(&project_id, &agent_id, &session_id, 7_000)
                 .unwrap()
+        );
+        assert!(
+            store
+                .mark_session_waiting_for_delivery(
+                    &session_id,
+                    "attempt-1",
+                    "delivery unacknowledged".into(),
+                    7_001,
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .session_snapshot(&project_id, &session_id)
+                .unwrap()
+                .state,
+            SessionState::WaitingForInput
         );
 
         // Stop intent is durable and cancels the same attempt before any

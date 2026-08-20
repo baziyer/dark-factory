@@ -307,8 +307,10 @@ pub struct Handle {
 #[derive(Clone)]
 struct StartTaskAckTest {
     timeout: Duration,
-    waiter_finished: Arc<tokio::sync::Barrier>,
-    failure_released: Arc<tokio::sync::Barrier>,
+    waiter_finished: Option<Arc<tokio::sync::Barrier>>,
+    failure_released: Option<Arc<tokio::sync::Barrier>>,
+    failure_recorded: Option<Arc<tokio::sync::Barrier>>,
+    waiting_released: Option<Arc<tokio::sync::Barrier>>,
 }
 
 impl Handle {
@@ -481,8 +483,12 @@ impl Handle {
         } else {
             #[cfg(test)]
             if let Some(test) = &self.start_task_ack_test {
-                test.waiter_finished.wait().await;
-                test.failure_released.wait().await;
+                if let (Some(waiter_finished), Some(failure_released)) =
+                    (&test.waiter_finished, &test.failure_released)
+                {
+                    waiter_finished.wait().await;
+                    failure_released.wait().await;
+                }
             }
             let attempt_id = attempt.id.clone();
             let failure_now = now_ms()?;
@@ -523,17 +529,33 @@ impl Handle {
                 }
                 return Err(error.into());
             }
+            #[cfg(test)]
+            if let Some(test) = &self.start_task_ack_test {
+                if let (Some(failure_recorded), Some(waiting_released)) =
+                    (&test.failure_recorded, &test.waiting_released)
+                {
+                    failure_recorded.wait().await;
+                    waiting_released.wait().await;
+                }
+            }
             let reason = "delivery unacknowledged".to_owned();
             let wait_session_id = session.id.clone();
             let wait_at_ms = now_ms()?;
-            let _ = self
+            let acknowledged = self
                 .state
                 .commit_and_publish(move |store| {
-                    let (_, event) =
-                        store.mark_session_waiting(&wait_session_id, reason, wait_at_ms)?;
-                    Ok(((), vec![event]))
+                    let waiting = store.mark_session_waiting_for_delivery(
+                        &wait_session_id,
+                        &attempt.id,
+                        reason,
+                        wait_at_ms,
+                    )?;
+                    Ok((waiting.is_none(), waiting.into_iter().collect()))
                 })
-                .await;
+                .await?;
+            if acknowledged {
+                return Ok(StartedRun { run_id });
+            }
             return Err(Error::DeliveryUnacknowledged);
         }
         Ok(StartedRun { run_id })
@@ -4864,8 +4886,23 @@ mod tests {
         join.await.unwrap().unwrap();
     }
 
+    #[derive(Clone, Copy)]
+    enum StartTaskHookRace {
+        BeforeFailure,
+        BeforeWaiting,
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_task_accepts_the_exact_hook_that_wins_the_timeout_failure_cas() {
+        run_start_task_hook_race(StartTaskHookRace::BeforeFailure).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_task_accepts_the_exact_hook_after_failure_before_waiting() {
+        run_start_task_hook_race(StartTaskHookRace::BeforeWaiting).await;
+    }
+
+    async fn run_start_task_hook_race(race: StartTaskHookRace) {
         let directory = private_tempdir();
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("curie").unwrap();
@@ -4965,6 +5002,22 @@ mod tests {
         let (shutdown, _shutdown_rx) = watch::channel(false);
         let waiter_finished = Arc::new(tokio::sync::Barrier::new(2));
         let failure_released = Arc::new(tokio::sync::Barrier::new(2));
+        let failure_recorded = Arc::new(tokio::sync::Barrier::new(2));
+        let waiting_released = Arc::new(tokio::sync::Barrier::new(2));
+        let (waiter_test, failure_test, recorded_test, waiting_test) = match race {
+            StartTaskHookRace::BeforeFailure => (
+                Some(Arc::clone(&waiter_finished)),
+                Some(Arc::clone(&failure_released)),
+                None,
+                None,
+            ),
+            StartTaskHookRace::BeforeWaiting => (
+                None,
+                None,
+                Some(Arc::clone(&failure_recorded)),
+                Some(Arc::clone(&waiting_released)),
+            ),
+        };
         let handle = Handle {
             state: state.clone(),
             config: Arc::new(config(directory.path())),
@@ -4974,8 +5027,10 @@ mod tests {
             project_gate: Arc::new(DeleteGate::new()),
             start_task_ack_test: Some(StartTaskAckTest {
                 timeout: Duration::from_millis(1),
-                waiter_finished: Arc::clone(&waiter_finished),
-                failure_released: Arc::clone(&failure_released),
+                waiter_finished: waiter_test,
+                failure_released: failure_test,
+                failure_recorded: recorded_test,
+                waiting_released: waiting_test,
             }),
         };
 
@@ -4997,7 +5052,11 @@ mod tests {
                     .await
             }
         });
-        timeout(Duration::from_secs(2), waiter_finished.wait())
+        let (reached, released) = match race {
+            StartTaskHookRace::BeforeFailure => (&waiter_finished, &failure_released),
+            StartTaskHookRace::BeforeWaiting => (&failure_recorded, &waiting_released),
+        };
+        timeout(Duration::from_secs(2), reached.wait())
             .await
             .unwrap();
         let (session, attempt) = state
@@ -5030,22 +5089,54 @@ mod tests {
             PromptDeliveryAdmission::Acknowledged,
             "the same exact hook is idempotent"
         );
-        failure_released.wait().await;
+        released.wait().await;
         let started = timeout(Duration::from_secs(2), start)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let (task, runs, attempt_state) = state
+        let before_hook_event = state
+            .with_store({
+                let project_id = project_id.clone();
+                let session_id = session_id.clone();
+                move |store| store.session_snapshot(&project_id, &session_id)
+            })
+            .await
+            .unwrap();
+        assert_ne!(
+            before_hook_event.state,
+            SessionState::WaitingForInput,
+            "the timeout path must not overwrite a run admitted before the later hook event"
+        );
+        state
+            .commit_and_publish({
+                let session_id = session_id.clone();
+                move |store| {
+                    let (_, event) = store.record_hook_event(
+                        &session_id,
+                        ProviderHookEvent::UserPromptSubmit,
+                        None,
+                        false,
+                        None,
+                        8,
+                    )?;
+                    Ok(((), vec![event]))
+                }
+            })
+            .await
+            .unwrap();
+        let (task, runs, attempt_state, session) = state
             .with_store({
                 let project_id = project_id.clone();
                 let task_id = task_id.clone();
                 let attempt_id = attempt.id.clone();
+                let session_id = session_id.clone();
                 move |store| {
                     Ok((
                         store.get_task(&project_id, &task_id)?,
                         store.list_runs(&project_id, None, 10)?,
                         store.delivery_attempt_state(&attempt_id)?,
+                        store.session_snapshot(&project_id, &session_id)?,
                     ))
                 }
             })
@@ -5055,6 +5146,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, started.run_id);
         assert_eq!(attempt_state, Some(DeliveryAttemptState::Acknowledged));
+        assert_eq!(session.state, SessionState::Working);
 
         RunnerClient::new(
             &runtime_dir,

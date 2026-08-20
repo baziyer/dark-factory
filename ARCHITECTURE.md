@@ -92,7 +92,10 @@ catalogue.
    status are not evidence that a prompt landed. A crash while still
    `delivering` may retry the stored attempt, while `uncertain` is never
    replayed because submission may already have been accepted. Each typed
-   prompt carries an invisible attempt nonce that the acknowledgement must
+   A delivery timeout may project `waiting_for_input` only while that exact
+   attempt still owns `uncertain`; an acknowledgement that reaches `running`
+   first wins the same durable fence and cannot be overwritten by the timeout.
+   Each typed prompt carries an invisible attempt nonce that the acknowledgement must
    echo, binding the hook to the immutable attempt even when task ids are
    deleted and recreated. A resumed Codex composer
    that does not acknowledge its first delivery is retired: the daemon blocks
