@@ -31,6 +31,11 @@ pub fn write_with_daemon_version(
             }
         },
     );
+    let decisions: Vec<_> = status
+        .attention
+        .iter()
+        .filter(|item| item.level.needs_operator() && item.needs_operator_decision())
+        .collect();
     writeln!(
         output,
         "Dark Factory: {versions} | auto {} | sessions {}/{} | projects {} | attention {}",
@@ -38,7 +43,7 @@ pub fn write_with_daemon_version(
         status.live_sessions,
         status.live_session_cap,
         status.projects.len(),
-        status.attention.len()
+        decisions.len()
     )
     .map_err(|error| error.to_string())?;
 
@@ -68,33 +73,42 @@ pub fn write_with_daemon_version(
         }
     }
 
-    if !status.attention.is_empty() {
+    if !decisions.is_empty() {
         writeln!(output, "\nAttention:").map_err(|error| error.to_string())?;
-        for item in &status.attention {
+        for item in decisions {
             let mut subject = item.project_id.to_string();
             if let Some(agent_id) = &item.agent_id {
                 subject.push('/');
                 subject.push_str(agent_id.as_str());
             }
+            let decision = item.decision();
             writeln!(
                 output,
-                "  {} | {} | task {} | session {} | run {} | age {} | {} | action: {}",
+                "  {} | {} | age {} | cause: {} | evidence: {} | action: {}",
                 item.reason.kind.label(),
                 subject,
-                item.task_id
-                    .as_ref()
-                    .map_or("—", factory_core::TaskId::as_str),
-                item.session_id
-                    .as_ref()
-                    .map_or("—", factory_core::SessionId::as_str),
-                item.run_id
-                    .as_ref()
-                    .map_or("—", factory_core::RunId::as_str),
                 age_text(status.generated_at_ms, item.since_ms),
-                display_text(&item.reason.summary),
+                display_text(&decision.cause),
+                display_text(&decision.evidence),
                 item.action_text(),
             )
             .map_err(|error| error.to_string())?;
+            let decision = item.decision();
+            for (index, choice) in decision.choices.iter().enumerate() {
+                writeln!(
+                    output,
+                    "    {}. {}{} — {}",
+                    index + 1,
+                    choice.label,
+                    if decision.recommended == Some(index) {
+                        " (recommended)"
+                    } else {
+                        ""
+                    },
+                    choice.consequence,
+                )
+                .map_err(|error| error.to_string())?;
+            }
         }
     }
 
@@ -314,11 +328,25 @@ mod tests {
                 AttentionItem {
                     level: Attention::NeedsInput,
                     project_id,
-                    agent_id: None,
-                    task_id: Some(id("task-7")),
+                    agent_id: Some(AgentId::try_from("author").unwrap()),
+                    task_id: None,
                     session_id: None,
                     run_id: None,
                     since_ms: 2,
+                    reason: AttentionReason {
+                        kind: AttentionReasonKind::BudgetExhausted,
+                        summary: "tool-call budget exhausted".into(),
+                        action: AttentionAction::ResetBudget,
+                    },
+                },
+                AttentionItem {
+                    level: Attention::NeedsInput,
+                    project_id: ProjectId::try_from("factory").unwrap(),
+                    agent_id: Some(AgentId::try_from("author").unwrap()),
+                    task_id: Some(id("task-7")),
+                    session_id: None,
+                    run_id: None,
+                    since_ms: 3,
                     reason: AttentionReason {
                         kind: AttentionReasonKind::WorkerBlocked,
                         summary: "dependency missing".into(),
@@ -343,8 +371,11 @@ mod tests {
                 "  reviewer | waiting for input | queue 0 | inbox 0 | clean on review/status\n",
                 "\nEmpty (empty) | agents 0 | backlog 0\n",
                 "\nAttention:\n",
-                "  provider permission | factory/reviewer | task — | session session-reviewer | run — | age 0s | approve command [2JFORGED | action: review the provider prompt before entering terminal typing\n",
-                "  worker blocked | factory | task task-7 | session — | run — | age 0s | dependency missing | action: factoryctl task retry --project factory --task task-7\n",
+                "  provider permission | factory/reviewer | age 0s | cause: approve command [2JFORGED | evidence: project: factory agent: reviewer task: — session: session-reviewer run: — | action: choose Approve or Reject for the exact provider request\n",
+                "    1. Approve — allows the exact provider request to continue\n",
+                "    2. Reject — denies the exact provider request\n",
+                "  budget exhausted | factory/author | age 0s | cause: tool-call budget exhausted | evidence: project: factory agent: author task: — session: — run: — | action: factoryctl agent budget reset --project factory --agent author\n",
+                "    1. Reset budget — resets the durable tool-call budget before more work runs\n",
             )
         );
         assert!(
@@ -356,6 +387,7 @@ mod tests {
         assert!(output.contains("東京🛠️e\u{301}"));
         assert!(!output.contains('\u{202e}'));
         assert!(!output.contains('\u{2066}'));
+        assert!(!output.contains("dependency missing"));
     }
 
     #[test]

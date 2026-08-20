@@ -25,7 +25,8 @@ pub mod state;
 use std::collections::{BTreeMap, HashMap};
 
 use factory_core::local::{
-    AgentDetail, AgentMessage, AttachRefusal, AttachRefusalReason, ErrorCode, LocalResponse,
+    AgentDetail, AgentMessage, AttachRefusal, AttachRefusalReason, ErrorCode, LocalRequest,
+    LocalResponse,
 };
 use factory_core::status::{
     AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, age_text, display_text,
@@ -47,6 +48,14 @@ pub use keymap::{
 pub use state::AgentState;
 
 use crate::theme::Theme;
+
+fn sanitize_attention_item(mut item: AttentionItem) -> AttentionItem {
+    item.reason.summary = display_text(&item.reason.summary);
+    if item.reason.summary.is_empty() {
+        item.reason.summary = "operator attention required".to_owned();
+    }
+    item
+}
 
 /// How many announcement lines the ring buffer keeps. Old lines fall off the front.
 pub const ANNOUNCEMENT_CAPACITY: usize = 500;
@@ -169,6 +178,16 @@ pub struct Board {
     pub selected_task: Option<TaskId>,
     /// Explicit action card selected by `g` or a NEEDS YOU click.
     pub attention_focus: Option<AttentionFocus>,
+    /// Exact decision source awaiting a daemon response. This closes the
+    /// duplicate-action window between a successful request and its event.
+    pending_attention: Option<AttentionItem>,
+    pending_attention_action: Option<factory_core::status::AttentionAction>,
+    pending_attention_operation_id: Option<u64>,
+    pending_attention_request: Option<LocalRequest>,
+    next_operation_id: u64,
+    /// Recently completed exact sources suppressed until a newer projection
+    /// proves a new decision exists.
+    completed_attention: Vec<AttentionItem>,
     pub mode: Mode,
     /// Whether AGENT keys control the board or go exclusively to the terminal.
     pub pane_mode: PaneMode,
@@ -221,6 +240,12 @@ impl Board {
             selected_agent: None,
             selected_task: None,
             attention_focus: None,
+            pending_attention: None,
+            pending_attention_action: None,
+            pending_attention_operation_id: None,
+            pending_attention_request: None,
+            next_operation_id: 1,
+            completed_attention: Vec::new(),
             mode: Mode::Normal,
             pane_mode: PaneMode::Board,
             pane_ready: false,
@@ -240,7 +265,12 @@ impl Board {
             if status.event_sequence >= 0 {
                 self.attention_revision = self.attention_revision.max(status.event_sequence);
             }
-            self.attention = status.attention;
+            self.attention = status
+                .attention
+                .into_iter()
+                .map(sanitize_attention_item)
+                .collect();
+            self.reconcile_pending_attention_projection();
             self.reconcile_attention_focus();
         }
         self.worktrees = status
@@ -380,7 +410,7 @@ impl Board {
     /// `None`, so `main.rs` can call this unconditionally on every loop tick — e.g. whenever
     /// WORKSHOP's selected task changes, or a `TaskChanged` event bumps the selected task's
     /// Folds a background `GetTask` fetch's result back into board state (see
-    /// `net::spawn_task_detail_request`). Kept separate from `apply_response`'s generic
+    /// `net::spawn_task_detail_request`). Kept separate from `apply_operation_response`'s generic
     /// `NetMsg::OperationResult` path because a failed fetch needs `pending_detail` cleared for
     /// the *specific* task it was for, which a generic `LocalResponse::Error` (no request-echo)
     #[must_use]
@@ -455,6 +485,116 @@ impl Board {
         items
     }
 
+    /// The BUILDING NEEDS YOU inbox: only reasons requiring a human authority
+    /// or resolving an ambiguity. Deterministic recovery remains visible to
+    /// diagnostics through [`Board::attention_items`] but never occupies this
+    /// decision list.
+    #[must_use]
+    pub fn decision_items(&self) -> Vec<AttentionItem> {
+        self.attention_items()
+            .into_iter()
+            .filter(AttentionItem::needs_operator_decision)
+            .filter(|item| {
+                !self
+                    .completed_attention
+                    .iter()
+                    .any(|completed| same_attention_source(completed, item))
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub(crate) fn attention_is_pending(&self, item: &AttentionItem) -> bool {
+        self.pending_attention
+            .as_ref()
+            .is_some_and(|pending| same_attention_source(pending, item))
+    }
+
+    pub(crate) fn begin_attention_request(
+        &mut self,
+        item: &AttentionItem,
+        action: factory_core::status::AttentionAction,
+        request: LocalRequest,
+    ) -> u64 {
+        let operation_id = self.allocate_operation_id();
+        self.pending_attention = Some(item.clone());
+        self.pending_attention_action = Some(action);
+        self.pending_attention_operation_id = Some(operation_id);
+        self.pending_attention_request = Some(request);
+        operation_id
+    }
+
+    pub(crate) fn clear_attention_request(&mut self) {
+        self.pending_attention = None;
+        self.pending_attention_action = None;
+        self.pending_attention_operation_id = None;
+        self.pending_attention_request = None;
+    }
+
+    pub(crate) fn allocate_operation_id(&mut self) -> u64 {
+        let operation_id = self.next_operation_id;
+        self.next_operation_id = self.next_operation_id.checked_add(1).unwrap_or(1);
+        operation_id
+    }
+
+    pub(crate) fn attention_request(
+        &mut self,
+        item: &AttentionItem,
+        action: factory_core::status::AttentionAction,
+        request: LocalRequest,
+    ) -> Intent {
+        let operation_id = self.begin_attention_request(item, action, request.clone());
+        Intent::SendWithIdentity {
+            operation_id,
+            request,
+        }
+    }
+
+    pub(crate) fn complete_attention_request(&mut self) {
+        let Some(item) = self.pending_attention.take() else {
+            return;
+        };
+        self.pending_attention_action = None;
+        self.pending_attention_operation_id = None;
+        self.pending_attention_request = None;
+        if item.reason.kind != AttentionReasonKind::ProviderPermission {
+            self.completed_attention.push(item);
+            if self.completed_attention.len() > 32 {
+                self.completed_attention.remove(0);
+            }
+        }
+        self.reconcile_attention_focus();
+    }
+
+    fn complete_attention_request_if(
+        &mut self,
+        operation_id: u64,
+        request: &LocalRequest,
+        action: factory_core::status::AttentionAction,
+        source_matches: impl FnOnce(&AttentionItem) -> bool,
+    ) {
+        let matches = self.pending_attention_operation_id == Some(operation_id)
+            && self.pending_attention_request.as_ref() == Some(request)
+            && self.pending_attention_action == Some(action)
+            && self.pending_attention.as_ref().is_some_and(source_matches);
+        if matches {
+            self.complete_attention_request();
+        }
+    }
+
+    fn reconcile_pending_attention_projection(&mut self) {
+        let Some(pending) = self.pending_attention.as_ref() else {
+            return;
+        };
+        let unchanged = self
+            .attention
+            .iter()
+            .any(|current| same_attention_source(current, pending) && current == pending);
+        if !unchanged {
+            self.clear_attention_request();
+        }
+    }
+
     fn reconcile_attention_focus(&mut self) {
         let Some(source) = self
             .attention_focus
@@ -464,7 +604,7 @@ impl Board {
             return;
         };
         let current = self
-            .attention_items()
+            .decision_items()
             .into_iter()
             .find(|item| same_attention_source(item, &source));
         let focus = self.attention_focus.as_mut().expect("focus checked above");
@@ -481,7 +621,11 @@ impl Board {
     }
 
     fn invalidate_attention(&mut self, mut invalid: impl FnMut(&AttentionItem) -> bool) {
+        let pending_invalid = self.pending_attention.as_ref().is_some_and(&mut invalid);
         self.attention.retain(|item| !invalid(item));
+        if pending_invalid {
+            self.clear_attention_request();
+        }
         self.reconcile_attention_focus();
     }
 
@@ -824,6 +968,13 @@ impl Board {
                 PendingAction::DeleteTask(_) => {
                     "delete this task? y/Enter confirms, anything else cancels".to_owned()
                 }
+                PendingAction::ResetBudget { source, .. } => format!(
+                    "reset {} budget? y/Enter confirms, anything else cancels",
+                    source
+                        .agent_id
+                        .as_ref()
+                        .map_or("agent", factory_core::AgentId::as_str)
+                ),
                 PendingAction::StopSession { .. } | PendingAction::StopRun { .. } => {
                     "stop this agent? x/y/Enter confirms, anything else cancels".to_owned()
                 }
@@ -1102,6 +1253,19 @@ impl Board {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
             FactoryEvent::SessionChanged { session } => {
+                let provider_projection_changed =
+                    self.pending_attention.as_ref().is_some_and(|item| {
+                        item.reason.kind == AttentionReasonKind::ProviderPermission
+                            && item.session_id.as_ref() == Some(&session.id)
+                            && self.sessions.get(&session.id).is_none_or(|previous| {
+                                previous.state != session.state
+                                    || previous.last_hook_event != session.last_hook_event
+                                    || previous.wait_reason != session.wait_reason
+                            })
+                    });
+                if provider_projection_changed {
+                    self.clear_attention_request();
+                }
                 let retain_reason = factory_core::status::session_attention_reason_kind(session);
                 self.invalidate_attention(|item| {
                     item.session_id.as_ref() == Some(&session.id)
@@ -1194,20 +1358,43 @@ impl Board {
         self.clamp_selection();
     }
 
-    pub fn apply_response(&mut self, result: Result<LocalResponse, String>) {
+    pub fn apply_operation_response(
+        &mut self,
+        operation_id: u64,
+        request: LocalRequest,
+        result: Result<LocalResponse, String>,
+    ) {
+        let matches_pending = self.pending_attention_operation_id == Some(operation_id)
+            && self.pending_attention_request.as_ref() == Some(&request);
         match result {
             Ok(LocalResponse::Error { code, message }) => {
-                self.set_status(
-                    format!("{}: {message}", error_code_word(code)),
-                    StatusLevel::Error,
-                );
+                if matches_pending || self.pending_attention.is_none() {
+                    if matches_pending {
+                        self.clear_attention_request();
+                    }
+                    self.set_status(
+                        format!("{}: {message}", error_code_word(code)),
+                        StatusLevel::Error,
+                    );
+                } else {
+                    self.set_status("ignored stale operation failure", StatusLevel::Info);
+                }
             }
             Ok(response) => {
-                let text = self.merge_response(response);
-                self.set_status(text, StatusLevel::Info);
+                let text = self.merge_response(operation_id, &request, response);
+                if matches_pending || self.pending_attention.is_none() {
+                    self.set_status(text, StatusLevel::Info);
+                }
             }
             Err(error) => {
-                self.set_status(format!("request failed: {error}"), StatusLevel::Error);
+                if matches_pending || self.pending_attention.is_none() {
+                    if matches_pending {
+                        self.clear_attention_request();
+                    }
+                    self.set_status(format!("request failed: {error}"), StatusLevel::Error);
+                } else {
+                    self.set_status("ignored stale request failure", StatusLevel::Info);
+                }
             }
         }
         self.clamp_selection();
@@ -1217,7 +1404,12 @@ impl Board {
     /// the `TaskChanged`/`AgentChanged`/etc. event that will also arrive over the subscription;
     /// this just removes the round-trip latency for the client that made the request) and
     /// returns a short human-readable description for the status line.
-    fn merge_response(&mut self, response: LocalResponse) -> String {
+    fn merge_response(
+        &mut self,
+        operation_id: u64,
+        request: &LocalRequest,
+        response: LocalResponse,
+    ) -> String {
         match response {
             LocalResponse::TaskCreated { task } => {
                 let id = task.snapshot.id.clone();
@@ -1225,7 +1417,6 @@ impl Board {
                 format!("created task#{id}")
             }
             LocalResponse::Task { task }
-            | LocalResponse::TaskRetried { task }
             | LocalResponse::TaskCancelled { task }
             | LocalResponse::TaskUpdated { task }
             | LocalResponse::TaskAssigned { task }
@@ -1234,6 +1425,18 @@ impl Board {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
                 self.tasks.insert(task.snapshot.id.clone(), task);
+                format!("task#{id} {}", announcements::task_status_word(status))
+            }
+            LocalResponse::TaskRetried { task } => {
+                let id = task.snapshot.id.clone();
+                let status = task.snapshot.status;
+                self.tasks.insert(task.snapshot.id.clone(), task);
+                self.complete_attention_request_if(
+                    operation_id,
+                    request,
+                    factory_core::status::AttentionAction::RetryTask,
+                    |item| item.task_id.as_ref() == Some(&id),
+                );
                 format!("task#{id} {}", announcements::task_status_word(status))
             }
             LocalResponse::TaskDeleted { task_id, .. } => {
@@ -1256,11 +1459,25 @@ impl Board {
                 self.remove_activity(&agent_id);
                 format!("removed agent {agent_id}")
             }
-            LocalResponse::AgentPaused { agent } | LocalResponse::AgentResumed { agent } => {
+            LocalResponse::AgentPaused { agent } => {
                 let id = agent.id.clone();
                 let paused = agent.paused;
                 self.agents.insert(agent.id.clone(), agent);
                 format!("agent {id} {}", if paused { "paused" } else { "resumed" })
+            }
+            LocalResponse::AgentResumed { agent } => {
+                let id = agent.id.clone();
+                self.agents.insert(agent.id.clone(), agent);
+                self.complete_attention_request_if(
+                    operation_id,
+                    request,
+                    factory_core::status::AttentionAction::ResumeAgent,
+                    |item| item.agent_id.as_ref() == Some(&id),
+                );
+                format!("agent {id} resumed")
+            }
+            LocalResponse::AgentBudgetUpdated { budget } => {
+                format!("agent budget updated at {}", budget.updated_at_ms)
             }
             LocalResponse::AgentMessageSent { message } => {
                 format!("message sent to {}", message.recipient_agent_id)
@@ -1281,6 +1498,9 @@ impl Board {
             LocalResponse::RunCancelled { run_id } => format!("run {run_id} cancelled"),
             LocalResponse::SessionStopped { session_id } => {
                 format!("stop requested for session {session_id}")
+            }
+            LocalResponse::TerminalInputAccepted { session_id } => {
+                format!("answer sent to session {session_id}")
             }
             LocalResponse::Sessions { sessions, .. } => {
                 for session in sessions {
