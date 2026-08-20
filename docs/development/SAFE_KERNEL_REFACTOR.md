@@ -36,13 +36,18 @@ product behavior creates most of the delivery acknowledgement, taskless tool
 authority, resume recovery, and session-versus-run ambiguity now dominating the
 daemon.
 
-`Queued` belongs to a task, not an attempt. The durable attempt state machine is:
+`RunId` is the attempt identity. Do not add a parallel public `AttemptId`,
+aggregate, or table. `Queued` belongs to a task, not a run. The durable run
+phase and outcome are separate:
 
 ```text
-Task:       queued / blocked / complete
+Task:       queued / running / blocked / succeeded / failed / cancelled
                 |
                 v
-Attempt:    admitted -> running -> finalizing -> terminal
+Run:        admitted -> running -> finalizing -> terminal
+                 \----------/          |             |
+                  exact capability      |             +-- durable outcome
+                                        +-- immutable pending outcome
                                       |
                                       v
 Resources: declared -> active -> releasing -> released
@@ -51,8 +56,29 @@ Resources: declared -> active -> releasing -> released
 Change:     owns one retained review worktree across serial attempts
 ```
 
-Outcome, stop intent, operator wait, and cleanup failure are fields or related
-records. They are not competing top-level lifecycle states.
+`running` on the task is a projection written by the admission transaction and
+retained until the finalizer writes the terminal task result. Outcome, stop
+intent, operator wait, and cleanup failure are fields or related records. They
+are not competing top-level lifecycle states.
+
+The transition and projection contract is exhaustive:
+
+| Trigger | Run transition | Pending outcome | Final task status |
+| --- | --- | --- | --- |
+| Provider proposes completion | `running -> finalizing` | `succeeded` | `succeeded` |
+| Provider proposes a block | `running -> finalizing` | `blocked(reason)` | `blocked` |
+| Spawn fails before provider exec | `admitted -> finalizing` | `failed(reason)` | `failed` |
+| Provider/runner exits before an outcome | `running -> finalizing` | `failed(reason)` | `failed` |
+| Operator cancels before terminal | `admitted|running -> finalizing` | `cancelled(reason)` | `cancelled` |
+| Finalizer proves every resource released/transferred | `finalizing -> terminal` | unchanged | exact mapping above |
+
+The first durable transition to `finalizing` wins. An outcome received before
+exit is preserved; exit received first records failure; late outcomes, exits,
+and cancellation requests are idempotent no-ops. Cleanup failure never changes
+the outcome: it leaves the run visibly `finalizing` with an unresolved
+resource. Retry is an explicit, post-terminal operation that increments the
+task work revision, returns that exact task incarnation to `queued`, and later
+admits a new `RunId`; there is no implicit retry or reuse of run authority.
 
 ## Why this reset is necessary
 
@@ -184,112 +210,142 @@ The default is one reviewed PR per stage. A stage may be split once at a
 demonstrably independent seam, but its PRs remain serial and the superseded
 path is deleted in the same stage. Do not run parallel architecture branches.
 
-### Stage 1: one attempt owns every mutation
+### Stage 1: atomic attempt and resource-authority cutover
 
-Purpose: replace session, run, delivery, and endpoint-specific work authority
-with one exact admitted attempt.
+Purpose: replace resident sessions, delivery authority, endpoint-specific
+terminalization, and killable cleanup in one internally complete cutover. The
+resource/finalizer seam cannot safely be postponed to a later stage.
 
-- [ ] Add the pure attempt transition model and a retained change identity.
+- [ ] Reuse `RunId` for attempts and rebuild runs around the pure phase and
+  outcome contract above. Add a private retained Change identity; do not add a
+  parallel public attempt aggregate.
 - [ ] Add daemon-derived attempt principals and exhaustive, fail-closed request
-  classification.
-- [ ] Make admission the only route from a queued task to executable work.
-- [ ] Replace caller-selected complete/block/cancel operations with an
-  attempt-scoped proposed outcome.
-- [ ] Replace resident cross-task sessions with one provider process per
-  attempt; provider resume data may be input to a new launch.
-- [ ] Remove message-only provider turns and generic unaffiliated request
-  replay.
-- [ ] Remove task-start and agent-create source-path overrides from the product
-  protocol.
-- [ ] Make God scheduling-only and give it no writable worktree.
-- [ ] Project old session/run vocabulary only where a temporary protocol
-  compatibility boundary requires it.
-- [ ] Delete delivery acknowledgement/replay, direct episode opening, idle
-  session dispatch, and competing task terminalization paths.
+  classification. A missing credential never means operator authority.
+- [ ] Make one transaction the only route from a queued task to an admitted run
+  and the task's running projection.
+- [ ] Add the resource ledger and restartable finalizer before switching the
+  process path. Register every process, group, runner, runtime root, temporary
+  root, and disposable job used by attempt execution.
+- [ ] Add the blocked-child launch handshake. Declare intent, fork without
+  provider execution, persist PID/PGID/birth fingerprint and resource state,
+  move the run to `running`, then release the child to `exec`.
+- [ ] Replace caller-selected complete/block/cancel operations with the exact
+  outcome contract above. The first durable transition to `finalizing` wins.
+- [ ] Make one finalizer the sole writer of terminal run/task state and resume
+  it after daemon restart.
+- [ ] Replace resident cross-task sessions with one noninteractive provider
+  process per run. Provider conversation metadata may seed a later run, but no
+  process survives without authority.
+- [ ] Make God scheduling-only and give it no source mutation, process,
+  capacity, agent administration, or repository authority.
+- [ ] Preserve a legacy per-agent worktree only as a retained Change path until
+  Stage 2; never create, delete, or infer ownership for it during migration.
+- [ ] Remove message-only provider turns, generic unaffiliated request replay,
+  task-start source overrides, session lifecycle APIs, delivery
+  acknowledgement/replay, direct episode opening, idle dispatch, direct
+  terminalization, and session recovery.
+- [ ] Retain legacy session event decoding only for historical replay; stop
+  producing live session events.
+- [ ] Make the cutover migration refuse any schema-29 database with a live
+  session, non-empty/quarantined session-work row, active delivery, or
+  nonterminal run. Never infer whether an uncertain external prompt executed.
+- [ ] Preserve every legacy agent worktree as an unlinked retained Change
+  record. Do not inspect, move, clean, delete, or automatically adopt it into a
+  new task. Require an explicit database backup/rollback decision before the
+  first schema-30 boot.
 
 Stage checkpoint:
 
-- No provider exists without one admitted attempt.
-- Every provider hook, repository mutation, and outcome is rejected without
-  the exact current attempt capability.
-- Outcome submission reaches `finalizing`, never `terminal`.
-- No successor attempt can be admitted while an earlier attempt for that
-  change is non-terminal.
-
-Do not boot Dark Factory after this intermediate stage.
-
-### Stage 2: durable resources and one finalizer
-
-Purpose: make cleanup survive the death of the provider, runner, daemon, or
-test process that created the resource.
-
-- [ ] Add a durable resource ledger with exact owner, kind, desired state,
-  observed state, locator, birth fingerprint or digest, retries, timestamps,
-  and bounded last failure.
-- [ ] Declare process intent before spawn.
-- [ ] Add a blocked-child launch handshake: the runner forks a child held on a
-  private release pipe; factoryd persists PID, PGID, birth fingerprint, runner,
-  and runtime-root identity, moves the attempt to `running`, and only then
-  permits provider `exec`.
-- [ ] Reconcile declared, active, releasing, and unresolved resources at
-  startup and periodically.
-- [ ] Route success, failure, cancel, timeout, provider exit, runner exit, and
-  daemon restart through the same idempotent finalizer.
-- [ ] Register and reconcile runtime roots, temporary roots, launchd jobs, and
-  build/execution leases through adapters owned by the same ledger.
-- [ ] Guard terminalization in the database on all ephemeral resources being
-  released or explicitly transferred.
-- [ ] Delete runner acknowledgements, Tokio task lifetime, `Drop`, test guards,
-  and shell traps as lifecycle authority. Retain small best-effort cleanup only
-  where it still reduces ordinary leakage.
-
-Stage checkpoint:
-
-- Killing each participating process at every launch/finalization boundary
-  converges after daemon restart.
+- No provider exists without one admitted/running run and exact capability.
+- Every hook, repository mutation, and outcome is refused unless the exact run
+  is `running` and the request is in that principal's allowlist.
+- Spawn failure, provider exit, success, block, and cancellation all converge
+  through `finalizing`; restart resumes the same finalizer.
+- No successor run is admitted until the earlier run is terminal.
 - Reused PID, job, path, or runner identities are refused rather than killed or
   deleted.
-- No attempt becomes terminal with an active or unresolved ephemeral resource.
+- No run becomes terminal with an active or unresolved ephemeral resource.
 
 Do not boot Dark Factory after this intermediate stage.
 
-### Stage 3: daemon-owned source, builds, bundles, and storage
+### Stage 2: daemon-owned changes and provider source views
 
-Purpose: remove recursive worktree creation, per-worktree targets, mutable
-binary launch, and unbounded retained runtime output.
+Purpose: make factoryd the sole supported product path for source-worktree
+administration and prevent accidental recursive worktree creation.
 
-- [ ] Give each retained change one factoryd-created worktree and lease it
-  serially to attempts.
+- [ ] Give each retained Change one factoryd-created worktree and lease it
+  serially to runs. A retry reuses the Change only after the previous run is
+  terminal.
+- [ ] Place managed Changes under a daemon-owned root, not underneath whichever
+  checkout invoked a helper.
+- [ ] Give the provider a writable source view with no `.git` file or other Git
+  administrative locator. Factoryd retains the worktree gitdir privately and
+  performs status/diff/commit/push/PR operations for the exact running Change.
+- [ ] Prove that ordinary `git worktree add` from the provider source view fails
+  while factoryd repository operations continue to work.
 - [ ] Require a Git repository for source mutation; remove fallback mutation in
   the shared project root.
-- [ ] Remove provider guidance and protocol paths that create or select
-  worktrees. Keep any human development helper explicitly outside the product
-  authority model.
-- [ ] Add a bounded project build cache keyed by repository identity,
-  toolchain, target triple, profile, feature/package/target selection,
-  `Cargo.lock`, relevant compiler/linker configuration, allowlisted build
-  environment, and exact source snapshot.
-- [ ] Hold one writer lease through build, open, copy, hash, sync, and atomic
-  bundle publication.
+- [ ] Remove per-agent worktrees, caller-selected paths, `--worktree` protocol
+  fields, and provider guidance that invokes the development worktree helper.
+  Keep any human helper explicitly outside product authority.
+- [ ] Give unique retained Changes an operator-visible soft byte bound and a
+  hard admission count/byte cap. At the cap, refuse new Change admission and
+  request an operator retention/removal decision; never automatically delete
+  unique or dirty work.
+
+Stage checkpoint:
+
+- Factoryd is the only supported product path that creates or administers a
+  Change worktree.
+- A confused provider starting in its source view cannot recursively create a
+  Git worktree through ordinary repository discovery.
+- Active and retained Changes are reported exactly; reaching the hard cap stops
+  admission without deleting unique data.
+
+The same-UID hostile-process caveat still applies: cryptographic or OS-level
+filesystem isolation requires the separate hardened-runner project.
+
+Do not boot Dark Factory after this intermediate stage.
+
+### Stage 3: bounded builds, immutable bundles, and regenerable storage
+
+Purpose: remove per-worktree targets, mutable binary launch, and unbounded
+regenerable runtime output without multiplying the cache by source revision.
+
+- [ ] Add a bounded mutable Cargo cache namespace keyed only by project
+  identity plus toolchain, target triple, profile, feature/package/target
+  selection, and compiler/linker configuration. Exact source revision is not a
+  cache namespace dimension.
+- [ ] Hold one writer lease through source selection, build, open, copy, hash,
+  sync, and atomic bundle publication.
+- [ ] Put exact source snapshot, `Cargo.lock`, allowlisted build environment,
+  cache configuration, executable digest, and required fixture digests in the
+  immutable bundle provenance manifest.
 - [ ] Publish daemon-owned content-addressed executable and required-fixture
   bundles. Verify by digest and execute an already verified file descriptor or
   equivalent immutable handoff.
 - [ ] Hold reader/execution leases so reclamation cannot remove a live bundle.
-- [ ] Bound caches, bundles, runtime roots/logs, and retained worktrees by bytes
+- [ ] Hard-bound regenerable caches, bundles, runtime roots, and logs by bytes
   and count; report active, regenerable, retained, unresolved, and reclaimable
   storage separately.
-- [ ] Reclaim only registered, identity-matched, unleased resources. Dirty
-  review worktrees require explicit retention or operator approval.
-- [ ] Delete runtime Cargo builds, mutable sibling executable discovery, the
-  shell CI lease implementation/tests, and obsolete headroom-only machinery
-  after their Rust replacements are causally proven.
+- [ ] Reclaim only registered, identity-matched, unleased regenerable
+  resources. If protected regenerable resources alone exceed a hard bound,
+  refuse new build admission until leases release.
+- [ ] Prove multiple source revisions reuse the same mutable cache namespace
+  while producing distinct exact-source immutable bundles.
+- [ ] Delete runtime Cargo builds, mutable sibling executable discovery, and
+  obsolete headroom-only logic after replacement proof.
+- [ ] Keep local-CI serialization daemon-independent. Replace its shell lease
+  only if a standalone Rust helper remains usable while factoryd is absent and
+  produces measured net deletion with equal causal coverage.
 
 Stage and boot checkpoint:
 
-- Factoryd is the only product path that creates a change worktree.
 - Executable replacement after bundle preparation cannot change what runs.
-- Quota pressure converges below the configured bound without touching active
-  or retained work.
+- Regenerable quota pressure converges below its configured bound without
+  touching leased resources or unique retained Changes.
+- Multiple revisions do not create multiple Cargo cache namespaces for the same
+  project build configuration.
 - All causal suites below pass on the exact reviewed head.
 - An independent adversarial review explicitly approves re-enabling the
   factory.
@@ -303,14 +359,22 @@ the externally visible effect, not only an internal callback or row.
 | --- | --- |
 | Crash/restart | Crash after admission, resource declaration, fork-before-release, exec release, provider exit, external deletion, and before ledger acknowledgement. Restart must produce at most one provider execution, no prompt replay, exact identity, and idempotent cleanup. |
 | Taskless refusal | With no admitted attempt, no provider process exists. Old/forged capabilities, hooks, repository requests, outcome requests, and queued replays cannot mutate task, budget, repository, or provider state. |
-| Completion ordering | After a provider proposes success, another mutation and successor admission are refused until process drain and resource release complete; only then may attempt/task become terminal. |
+| Outcome/exit race | Exercise outcome-before-exit and exit-before-outcome. The first durable `finalizing` transition wins, late signals are harmless, and task projection matches the immutable outcome. |
+| Completion ordering | After a provider proposes success, another mutation and successor admission are refused until process drain and resource release complete; only then may run/task become terminal. |
+| Failure, cancel, retry | Spawn failure, provider crash, and operator cancellation each finalize to the documented task result. Retry is refused before terminal, then creates a new RunId and work revision while retaining the same Change. Stale credentials remain invalid. |
 | External finalization | Own a process group, runtime root, temporary root, and throwaway launchd job. Kill provider, runner, daemon, and fixture separately. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. |
 | Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs. Tampered bundles fail closed. Restart between prepare and launch preserves the same manifest/digest. Reclamation cannot remove an execution-leased bundle. |
-| Bounded storage | Exceed quota with active, retained, dirty, executing, and regenerable entries. Reclamation reaches the bound using only safe entries and is idempotent. |
+| Cache reuse | Build two exact source revisions with the same project/build configuration. They use one mutable cache namespace and publish different source-bound immutable manifests. |
+| Bounded storage | Exceed the regenerable quota with active, executing, and reclaimable entries. Reclamation reaches the hard bound using only safe entries and is idempotent. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
+| Source-view boundary | The provider source view has no discoverable Git administrative locator; ordinary worktree creation fails. Exact factoryd status/diff/commit operations still target the retained Change. |
 | God policy only | God may propose priority and assignment. Worktree creation, process launch, repository publication, outcome submission, capacity/budget mutation, and operator control fail. Killing God does not change finalization. |
 
-Dangerous process and launchd fixtures must use disposable identities and an
-external cleanup verifier. They are not run during this design phase.
+The design PR runs no process or launchd fixtures. Implementation proof may and
+must start isolated source-built processes once the external cleanup verifier
+for that fixture exists. Every such test uses a temporary `DARK_FACTORY_HOME`,
+an explicit temporary socket, unique disposable job labels, and an independent
+post-test reaper/verifier. It must never address the operator installation,
+socket, home, plist, or job label.
 
 ## GitHub issue and PR disposition
 
@@ -348,6 +412,12 @@ Open implementations are evidence, not an integration chain:
 Closed PRs #277, #278, and #266 remain failure evidence. Do not reopen their
 shell worktree transaction, ambient prepared-binary, or test-only supervisor
 implementations.
+
+For #268, extract shapes and tests rather than cherry-picking its six-commit
+implementation: credential/redaction from `9d5df79`, bearer uniqueness from
+`e1de1c1`, and exact-head fail-closed classification/race tests from
+`00fba4b7`. Do not retain its parallel principal lifecycle, filesystem lock, or
+immediate completion/blocking terminalization.
 
 No issue or PR should be edited or closed from this document change alone.
 Those are deliberate operator actions after review of this plan.
@@ -431,13 +501,28 @@ Each implementation PR records production additions and deletions separately
 from tests and generated migrations. Tests are not deleted to manufacture a
 favorable total; race-specific tests are replaced by the causal matrix above.
 
+The baseline deletion map is reviewable rather than aspirational:
+
+| Superseded production area | Baseline location | Expected gross deletion |
+| --- | --- | ---: |
+| Resident dispatch, delivery, deadlines, session launch/recovery | `execution.rs` delivery/session ranges | 3,000-4,000 |
+| Session, episode, delivery journal, direct terminalization | `store.rs`, `session_work.rs` | 3,000-4,000 |
+| Session protocol/API, generic outbox, resume clients/projections | `local_api.rs`, `factory-core`, providers, CLI/TUI | 2,000-3,000 |
+| Per-agent worktrees and caller path selection | worktrees, paths, API/CLI | 500-1,000 |
+| Mutable sibling launch and obsolete build/headroom paths | runner/build scripts and fixtures | 300-800 |
+
+The daemon-independent local-CI lease is excluded unless its replacement is
+both smaller and equally causal. Stage 1 should delete or replace roughly
+8,000-10,000 lines while adding 3,000-4,000 lines of kernel and proof, for
+about 4,000-6,000 net deletion. Later stages must not erase that reduction.
+
 Target across the epic:
 
 | Measure | Target |
 | --- | ---: |
-| New production kernel code | 4,000-7,000 lines |
-| Deleted production lifecycle/build/worktree code | 15,000-22,000 lines |
-| Net production reduction | at least 8,000 lines |
+| Gross production deletion | 9,000-13,000 lines |
+| New production kernel/cache code | 4,000-7,000 lines |
+| Net production reduction | at least 5,000 lines; stretch 8,000 |
 | New crates or one-implementation framework traits | 0 |
 | Competing terminalization paths at completion | 0 |
 
@@ -452,9 +537,9 @@ Update this table only after a PR is merged. Record exact evidence rather than
 | Stage | PR(s) | Merged SHA | Net production lines | Local gate | Hosted gate | Adversarial review | Status |
 | --- | --- | --- | ---: | --- | --- | --- | --- |
 | Architecture decision | — | — | — | docs checks only | — | pending | Proposed |
-| 1. Attempt authority | — | — | — | — | — | — | Not started |
-| 2. Resource finalizer | — | — | — | — | — | — | Not started |
-| 3. Worktree/build/storage | — | — | — | — | — | — | Not started |
+| 1. Attempt/resource cutover | — | — | — | — | — | — | Not started |
+| 2. Change/source ownership | — | — | — | — | — | — | Not started |
+| 3. Build/bundle/storage | — | — | — | — | — | — | Not started |
 | Boot review | — | — | — | — | — | — | Frozen |
 
 For every implementation PR:
@@ -466,18 +551,22 @@ For every implementation PR:
   reviewed head;
 - distinguish local proof, hosted CI, merge, release, and live verification;
 - obtain independent adversarial review and resolve every finding;
-- do not start Dark Factory, publish a release, install, merge, or delete
-  preserved worktrees as part of implementation proof.
+- never start or modify the operator installation. Isolated source-built
+  daemons and disposable fixtures are permitted only under the causal-test
+  boundary above. Do not publish a release, install, or delete preserved
+  worktrees as part of implementation proof.
 
 ## Boot gate
 
 Dark Factory remains frozen until all three stages are merged and an
 independent review confirms:
 
-- the attempt state machine is the only work and terminalization authority;
+- the run phase/outcome contract is the only work and terminalization authority;
 - no provider can exist or mutate while taskless;
 - factoryd can finalize exact external resources after crashes and restarts;
-- factoryd exclusively owns change worktrees;
+- factoryd is the only supported product path that creates or administers
+  Change worktrees, and provider source views expose no Git administrative
+  locator;
 - builds and executable launches use the bounded cache and immutable bundles;
 - storage reporting and reclamation are identity-safe and bounded;
 - God is policy-only and GitHub intake is still quarantined;
@@ -486,6 +575,6 @@ independent review confirms:
 - additions/deletions and any surviving compatibility machinery have been
   independently challenged.
 
-Re-enabling auto, starting provider sessions, installing, releasing, or
+Re-enabling auto, starting provider work, installing, releasing, or
 changing `~/.dark-factory` is a separate explicit operator decision after this
 gate. Passing the gate does not perform those actions.
