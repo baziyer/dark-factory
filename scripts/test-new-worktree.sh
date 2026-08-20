@@ -4,6 +4,7 @@ set -eu
 repository_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 script_under_test="$repository_root/scripts/new-worktree.sh"
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-new-worktree.XXXXXX")
+temporary=$(CDPATH='' cd -- "$temporary" && pwd -P)
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 
 fail() {
@@ -52,9 +53,68 @@ assert_branch_absent() {
     fi
 }
 
+assert_branch_present() {
+    branch_repository=$1
+    branch_name=$2
+    git -C "$branch_repository" show-ref --verify --quiet \
+        "refs/heads/$branch_name" ||
+        fail "branch is missing: $branch_name"
+}
+
 assert_directory() {
     directory_path=$1
     [ -d "$directory_path" ] || fail "directory is missing: $directory_path"
+}
+
+assert_path_absent() {
+    [ ! -e "$1" ] && [ ! -L "$1" ] || fail "path unexpectedly exists: $1"
+}
+
+assert_unregistered() {
+    registration_repository=$1
+    registration_target=$2
+    if git -C "$registration_repository" worktree list --porcelain |
+        grep -Fqx "worktree $registration_target"; then
+        fail "worktree unexpectedly remains registered: $registration_target"
+    fi
+}
+
+assert_registered() {
+    registration_repository=$1
+    registration_target=$2
+    git -C "$registration_repository" worktree list --porcelain |
+        grep -Fqx "worktree $registration_target" ||
+        fail "worktree registration is missing: $registration_target"
+}
+
+assert_output_contains() {
+    output_file=$1
+    expected_text=$2
+    grep -Fq "$expected_text" "$output_file" ||
+        fail "output did not contain: $expected_text"
+}
+
+assert_bounded_output() {
+    output_file=$1
+    maximum_bytes=$2
+    output_bytes=$(wc -c <"$output_file" | tr -d ' ')
+    [ "$output_bytes" -le "$maximum_bytes" ] ||
+        fail "output exceeded $maximum_bytes bytes: $output_bytes"
+}
+
+configure_checkout_failure() {
+    checkout_repository=$1
+    printf '%s\n' '*.blocked filter=required-failure' \
+        >"$checkout_repository/.gitattributes"
+    printf '%s\n' blocked >"$checkout_repository/failure.blocked"
+    git -C "$checkout_repository" add .gitattributes failure.blocked
+    git -C "$checkout_repository" \
+        -c user.name='Dark Factory tests' \
+        -c user.email='tests@dark.factory' \
+        commit -q -m 'add checkout failure'
+    git -C "$checkout_repository" config filter.required-failure.clean cat
+    git -C "$checkout_repository" config filter.required-failure.smudge false
+    git -C "$checkout_repository" config filter.required-failure.required true
 }
 
 primary="$temporary/primary repository"
@@ -65,11 +125,15 @@ git -C "$primary" worktree add -q -b resident-session "$resident" main
 mkdir -p "$resident/.worktrees"
 git -C "$primary" worktree add -q -b legacy-task "$legacy_task" main
 
-run_script "$primary" from-primary >/dev/null
+run_script "$primary" from-primary >"$temporary/from-primary.out"
+assert_output_contains \
+    "$temporary/from-primary.out" \
+    "$primary/.worktrees/from-primary"
 run_script "$resident" from-resident >/dev/null
 run_script "$legacy_task" from-task >/dev/null
+run_script "$primary/.worktrees/from-task" from-review >/dev/null
 
-for slug in from-primary from-resident from-task; do
+for slug in from-primary from-resident from-task from-review; do
     assert_directory "$primary/.worktrees/$slug"
 done
 [ ! -e "$resident/.worktrees/from-resident" ] ||
@@ -139,6 +203,7 @@ git -C "$separate_worktree" \
     commit -q -m fixture
 expect_failure ambiguous-anchor "$separate_worktree" ambiguous
 assert_branch_absent "$separate_worktree" ambiguous
+assert_path_absent "$separate_worktree/.worktrees/ambiguous"
 
 first_repository="$temporary/first repository"
 second_repository="$temporary/second repository"
@@ -150,6 +215,16 @@ git -C "$first_repository" worktree add -q -b first-link "$first_link" main
 git -C "$second_repository" worktree add -q -b second-link "$second_link" main
 first_git_file=$(sed -n '1p' "$first_link/.git")
 second_git_dir=$(sed -n 's/^gitdir: //p' "$second_link/.git")
+
+copied_link="$temporary/copied linked worktree"
+mkdir -p "$copied_link/scripts"
+cp "$script_under_test" "$copied_link/scripts/new-worktree.sh"
+chmod +x "$copied_link/scripts/new-worktree.sh"
+cp "$first_link/.git" "$copied_link/.git"
+expect_failure copied-pointer "$copied_link" copied-pointer
+assert_branch_absent "$first_repository" copied-pointer
+assert_path_absent "$first_repository/.worktrees/copied-pointer"
+
 printf 'gitdir: %s\n' "$second_git_dir" >"$first_link/.git"
 expect_failure mismatched-repositories "$first_link" mismatched
 printf '%s\n' "$first_git_file" >"$first_link/.git"
@@ -167,6 +242,7 @@ set -eu
 matches_root=false
 matches_common_dir=false
 matches_worktree_add=false
+matches_fetch=false
 previous=
 for argument in "$@"; do
     if [ "$previous" = -C ] && [ "$argument" = "${DF_TEST_SWAP_ROOT-}" ]; then
@@ -175,8 +251,14 @@ for argument in "$@"; do
     [ "$argument" = --git-common-dir ] && matches_common_dir=true
     [ "$previous" = worktree ] && [ "$argument" = add ] \
         && matches_worktree_add=true
+    [ "$argument" = fetch ] && matches_fetch=true
     previous=$argument
 done
+
+if [ "${DF_TEST_SIGNAL-}" = before ] && [ "$matches_fetch" = true ]; then
+    kill -TERM "$PPID"
+    exit 143
+fi
 
 if [ "${DF_TEST_SWAP_REPOSITORY-}" = 1 ] \
     && [ "$matches_root" = true ] \
@@ -191,12 +273,21 @@ if [ "${DF_TEST_SWAP_REPOSITORY-}" = 1 ] \
     fi
 fi
 
-if [ "${DF_TEST_FAIL_ADD-}" = 1 ] && [ "$matches_worktree_add" = true ]; then
-    "$DF_TEST_REAL_GIT" -C "$DF_TEST_FAIL_REPOSITORY" update-ref \
-        "refs/heads/$DF_TEST_FAIL_BRANCH" "$DF_TEST_FAIL_BASE" '' 2>/dev/null || true
-    mkdir -p "$DF_TEST_FAIL_TARGET"
-    printf '%s\n' partial >"$DF_TEST_FAIL_TARGET/partial"
-    exit 72
+if [ "${DF_TEST_SIGNAL-}" = after ] && [ "$matches_worktree_add" = true ]; then
+    "$DF_TEST_REAL_GIT" "$@"
+    add_status=$?
+    kill -TERM "$PPID"
+    exit "$add_status"
+fi
+
+if [ "${DF_TEST_REPLACE_TARGET-}" = same-path ] \
+    && [ "$matches_worktree_add" = true ]; then
+    "$DF_TEST_REAL_GIT" "$@"
+    mv "$DF_TEST_REPLACE_TARGET_PATH" "$DF_TEST_PRESERVED_TARGET_PATH"
+    mkdir "$DF_TEST_REPLACE_TARGET_PATH"
+    printf '%s\n' replacement \
+        >"$DF_TEST_REPLACE_TARGET_PATH/replacement-survives"
+    exit 0
 fi
 
 exec "$DF_TEST_REAL_GIT" "$@"
@@ -227,27 +318,126 @@ assert_branch_absent "$second_repository" identity-changed
 [ ! -e "$second_repository/.worktrees/identity-changed" ] ||
     fail "repository identity change mutated the replacement repository"
 
-failure_repository="$temporary/add failure repository"
-failure_target="$failure_repository/.worktrees/add-failure"
-init_repository "$failure_repository"
-failure_base=$(git -C "$failure_repository" rev-parse main)
+hostile_repository="$temporary/hostile environment repository"
+init_repository "$hostile_repository"
+hostile_number=0
+for hostile_assignment in \
+    "GIT_DIR=$second_git_dir" \
+    "GIT_WORK_TREE=$second_repository" \
+    "GIT_COMMON_DIR=$second_repository/.git" \
+    "GIT_INDEX_FILE=$temporary/hostile-index" \
+    "GIT_CONFIG=$temporary/hostile-config"; do
+    hostile_number=$((hostile_number + 1))
+    hostile_slug="hostile-$hostile_number"
+    if (
+        cd "$hostile_repository"
+        env "$hostile_assignment" ./scripts/new-worktree.sh "$hostile_slug"
+    ) >"$temporary/$hostile_slug.out" 2>&1; then
+        fail "$hostile_assignment unexpectedly succeeded"
+    fi
+    assert_branch_absent "$hostile_repository" "$hostile_slug"
+    assert_path_absent "$hostile_repository/.worktrees/$hostile_slug"
+done
+
 if (
-    cd "$failure_repository"
+    cd "$hostile_repository"
+    env \
+        GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=core.worktree \
+        GIT_CONFIG_VALUE_0="$second_repository" \
+        ./scripts/new-worktree.sh hostile-config-count
+) >"$temporary/hostile-config-count.out" 2>&1; then
+    fail "hostile Git config parameters unexpectedly succeeded"
+fi
+assert_branch_absent "$hostile_repository" hostile-config-count
+assert_path_absent "$hostile_repository/.worktrees/hostile-config-count"
+
+long_slug=$(awk 'BEGIN { for (i = 0; i < 1024; i++) printf "x" }')
+expect_failure bounded-diagnostic "$hostile_repository" "$long_slug"
+assert_bounded_output "$temporary/bounded-diagnostic.out" 512
+
+smudge_repository="$temporary/smudge failure repository"
+smudge_target="$smudge_repository/.worktrees/smudge-failure"
+init_repository "$smudge_repository"
+configure_checkout_failure "$smudge_repository"
+expect_failure smudge-failure "$smudge_repository" smudge-failure
+assert_output_contains "$temporary/smudge-failure.out" "preserved orphan"
+assert_branch_present "$smudge_repository" smudge-failure
+assert_path_absent "$smudge_target"
+assert_unregistered "$smudge_repository" "$smudge_target"
+
+hook_repository="$temporary/hook failure repository"
+hook_target="$hook_repository/.worktrees/hook-failure"
+init_repository "$hook_repository"
+cat >"$hook_repository/.git/hooks/post-checkout" <<'EOF'
+#!/bin/sh
+exit 75
+EOF
+chmod +x "$hook_repository/.git/hooks/post-checkout"
+expect_failure hook-failure "$hook_repository" hook-failure
+assert_output_contains "$temporary/hook-failure.out" "preserved orphan"
+assert_branch_present "$hook_repository" hook-failure
+assert_directory "$hook_target"
+assert_registered "$hook_repository" "$hook_target"
+
+signal_before_repository="$temporary/signal before repository"
+init_repository "$signal_before_repository"
+git -C "$signal_before_repository" remote add origin "$signal_before_repository"
+if (
+    cd "$signal_before_repository"
     env \
         PATH="$shim_directory:$PATH" \
         DF_TEST_REAL_GIT="$real_git" \
-        DF_TEST_FAIL_ADD=1 \
-        DF_TEST_FAIL_REPOSITORY="$failure_repository" \
-        DF_TEST_FAIL_BRANCH=add-failure \
-        DF_TEST_FAIL_BASE="$failure_base" \
-        DF_TEST_FAIL_TARGET="$failure_target" \
-        ./scripts/new-worktree.sh add-failure
-) >"$temporary/add-failure.out" 2>&1; then
-    fail "partial worktree-add failure unexpectedly succeeded"
+        DF_TEST_SIGNAL=before \
+        ./scripts/new-worktree.sh signal-before
+) >"$temporary/signal-before.out" 2>&1; then
+    fail "pre-mutation signal unexpectedly succeeded"
 fi
-assert_branch_absent "$failure_repository" add-failure
-[ ! -e "$failure_target" ] || fail "failed worktree add left a path"
-[ ! -e "$failure_repository/.worktrees" ] ||
-    fail "failed worktree add left an empty parent"
+assert_branch_absent "$signal_before_repository" signal-before
+assert_path_absent "$signal_before_repository/.worktrees/signal-before"
+assert_unregistered \
+    "$signal_before_repository" \
+    "$signal_before_repository/.worktrees/signal-before"
+
+signal_after_repository="$temporary/signal after repository"
+signal_after_target="$signal_after_repository/.worktrees/signal-after"
+init_repository "$signal_after_repository"
+if (
+    cd "$signal_after_repository"
+    env \
+        PATH="$shim_directory:$PATH" \
+        DF_TEST_REAL_GIT="$real_git" \
+        DF_TEST_SIGNAL=after \
+        ./scripts/new-worktree.sh signal-after
+) >"$temporary/signal-after.out" 2>&1; then
+    fail "post-mutation signal unexpectedly succeeded"
+fi
+assert_output_contains "$temporary/signal-after.out" "preserved orphan"
+assert_branch_present "$signal_after_repository" signal-after
+assert_directory "$signal_after_target"
+assert_registered "$signal_after_repository" "$signal_after_target"
+
+replacement_repository="$temporary/replacement repository"
+replacement_target="$replacement_repository/.worktrees/replaced"
+preserved_target="$replacement_repository/.worktrees/replaced-created"
+init_repository "$replacement_repository"
+if (
+    cd "$replacement_repository"
+    env \
+        PATH="$shim_directory:$PATH" \
+        DF_TEST_REAL_GIT="$real_git" \
+        DF_TEST_REPLACE_TARGET=same-path \
+        DF_TEST_REPLACE_TARGET_PATH="$replacement_target" \
+        DF_TEST_PRESERVED_TARGET_PATH="$preserved_target" \
+        ./scripts/new-worktree.sh replaced
+) >"$temporary/replaced.out" 2>&1; then
+    fail "same-path replacement unexpectedly succeeded"
+fi
+assert_output_contains "$temporary/replaced.out" "preserved orphan"
+[ -f "$replacement_target/replacement-survives" ] ||
+    fail "same-path replacement was removed"
+assert_directory "$preserved_target"
+assert_branch_present "$replacement_repository" replaced
+assert_registered "$replacement_repository" "$replacement_target"
 
 echo "new-worktree tests passed"
