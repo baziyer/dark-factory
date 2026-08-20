@@ -81,9 +81,10 @@ Read-only context unless a task explicitly asks you to edit them:
 10. **Issue bodies are the backlog contract.** Each GitHub issue body must be
     self-contained: required scope, decisions, evidence, status, and acceptance
     criteria belong in the body. Issue comments are ignored by intake and must
-    not be required to understand or execute the work. Editing a body creates a
-    new source revision that follows the configured quarantine and readiness
-    policy. PR review comments remain required by rule 2.
+    not be required to understand or execute the work. Every external body
+    revision is immutable and independently identified. Editing a body creates
+    a new quarantined revision; accepting or readying one revision never amends
+    accepted or running work. PR review comments remain required by rule 2.
 11. **Never touch the operator's live install from a task.** `~/.dark-factory`,
     the installed `launchd` job, and the running daemon behind them are the
     owner's real system. Use a temporary `$DARK_FACTORY_HOME` and `--socket`
