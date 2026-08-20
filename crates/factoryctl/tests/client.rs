@@ -1,5 +1,5 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixListener,
     thread,
 };
@@ -140,14 +140,23 @@ fn rejects_an_oversized_server_frame_before_parsing_json() {
         BufReader::new(stream.try_clone().unwrap())
             .read_line(&mut line)
             .unwrap();
-        let oversized = vec![b'x'; MAX_FRAME_BYTES + 1];
-        assert_eq!(oversized.len(), MAX_FRAME_BYTES + 1);
-        stream.write_all(&oversized).unwrap();
+        let oversized = vec![b'x'; MAX_FRAME_BYTES * 2];
+        assert_eq!(oversized.len(), MAX_FRAME_BYTES * 2);
+        stream.write_all(&oversized)
     });
 
     let error = Client::new(&socket)
         .request(LocalRequest::Health)
         .unwrap_err();
-    assert!(matches!(error, ClientError::FrameTooLarge { .. }));
-    server.join().unwrap();
+    assert!(matches!(
+        error,
+        ClientError::FrameTooLarge {
+            max: MAX_FRAME_BYTES
+        }
+    ));
+    match server.join().expect("oversized frame server panicked") {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
+        Err(error) => panic!("oversized frame server write failed unexpectedly: {error}"),
+    }
 }
