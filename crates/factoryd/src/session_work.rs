@@ -60,6 +60,7 @@ pub enum Action {
     ExternalEffectPossible,
     Acknowledge,
     CancelReservation,
+    RecoverTerminal,
     Complete,
     EndSession,
 }
@@ -121,6 +122,14 @@ impl SessionWork {
             Phase::Delivering(lease) if lease.attempt_id == attempt_id => self.next(Phase::Empty),
             Phase::Delivering(_) => Err(TransitionError::IdentityMismatch),
             _ => self.invalid(Action::CancelReservation),
+        }
+    }
+
+    pub fn recover_terminal(&self, attempt_id: &str) -> Result<Self, TransitionError> {
+        match &self.phase {
+            Phase::Uncertain(lease) if lease.attempt_id == attempt_id => self.next(Phase::Empty),
+            Phase::Uncertain(_) => Err(TransitionError::IdentityMismatch),
+            _ => self.invalid(Action::RecoverTerminal),
         }
     }
 

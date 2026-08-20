@@ -3434,6 +3434,110 @@ impl Store {
         Ok(())
     }
 
+    /// Reclaims a terminal orchestrator cycle while its provider session is
+    /// still resident. A failed acknowledgement leaves the exact attempt in
+    /// `uncertain` session work, so this fence is the only live path allowed
+    /// to release that reservation: the same transaction cancels the stale
+    /// delivery audit row, requeues its scheduler range, and empties the
+    /// session work before the dispatcher composes the successor cycle.
+    pub(crate) fn recover_live_orchestrator_cycle(
+        &mut self,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let Some(_session) = load_session(&transaction, session_id)?.filter(|session| {
+            session.project_id == *project_id
+                && session.agent_id == *agent_id
+                && session.state == SessionState::WaitingForInput
+                && session.wait_reason.as_deref() == Some("delivery unacknowledged")
+                && session.stop_requested_at_ms.is_none()
+        }) else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let owner = require_session_work(&transaction, session_id)?;
+        let Some(current) = owner.work.as_ref() else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let Some(lease) = (match &current.phase {
+            SessionWorkPhase::Uncertain(lease) => Some(lease),
+            _ => None,
+        }) else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let Some(attempt) = load_delivery_attempt(&transaction, &lease.attempt_id)? else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let Some(cycle_lease_id) = attempt.orchestrator_cycle_lease_id.as_deref() else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        if attempt.project_id != *project_id
+            || attempt.agent_id != *agent_id
+            || attempt.session_id != *session_id
+            || attempt.state != DeliveryAttemptState::Terminal
+            || attempt.task_id.is_some()
+            || !attempt.message_ids.is_empty()
+        {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let active_lease_id: Option<String> = transaction
+            .query_row(
+                "SELECT active_lease_id FROM orchestrator_scheduler_state
+                 WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if active_lease_id.as_deref() != Some(cycle_lease_id) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let ledger_attempt_id: Option<String> = transaction
+            .query_row(
+                "SELECT attempt_id FROM orchestrator_cycle_ledger
+                 WHERE lease_id = ?1 AND state = 'leased'",
+                params![cycle_lease_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if ledger_attempt_id.as_deref() != Some(attempt.id.as_str()) {
+            transaction.commit()?;
+            return Ok(false);
+        }
+
+        Self::recover_orchestrator_cycles_in_transaction(&transaction, now_ms)?;
+        let recovered = current
+            .recover_terminal(&attempt.id)
+            .map_err(transition_error)?;
+        persist_session_work(
+            &transaction,
+            session_id,
+            current.revision,
+            &recovered,
+            now_ms,
+        )?;
+        transaction.execute(
+            "UPDATE delivery_attempts
+             SET state = 'cancelled', next_attempt_at_ms = NULL, updated_at_ms = ?1
+             WHERE id = ?2 AND state = 'terminal'",
+            params![now_ms, attempt.id.as_str()],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
     pub fn delivery_attempt_state(&self, attempt_id: &str) -> Result<Option<DeliveryAttemptState>> {
         self.connection
             .query_row(
@@ -8721,6 +8825,219 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease_state, "recovered");
+    }
+
+    #[test]
+    fn live_waiting_terminal_cycle_requeues_on_later_causal_event_without_restart() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("orchestrator").unwrap();
+        let session_id = SessionId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Orchestrator,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "44444444-4444-4444-8444-444444444444",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".into(),
+                    runner_protocol_version: 1,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                4,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO orchestrator_scheduler_state (
+                    project_id, pending_from_sequence, pending_through_sequence,
+                    active_lease_id, active_agent_id, updated_at_ms
+                 ) VALUES (?1, 10, 20, NULL, NULL, 5)",
+                params![project_id.as_str()],
+            )
+            .unwrap();
+        let lease = store
+            .claim_orchestrator_cycle(&project_id, &agent_id, 6)
+            .unwrap()
+            .unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "live-cycle-attempt".into(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: None,
+                task_incarnation_id: None,
+                task_revision: None,
+                require_queue_head: false,
+                message_ids: Vec::new(),
+                text: "fixed orchestrator instruction".into(),
+                created_at_ms: 7,
+            })
+            .unwrap();
+        store
+            .bind_orchestrator_cycle_attempt(&lease.lease_id, "live-cycle-attempt", 8)
+            .unwrap();
+        store
+            .begin_delivery_attempt("live-cycle-attempt", 9)
+            .unwrap()
+            .unwrap();
+        store
+            .record_delivery_failure("live-cycle-attempt", 10)
+            .unwrap();
+        store
+            .record_delivery_failure("live-cycle-attempt", 5_011)
+            .unwrap();
+        assert_eq!(
+            store.delivery_attempt_state("live-cycle-attempt").unwrap(),
+            Some(DeliveryAttemptState::Terminal)
+        );
+        store
+            .mark_session_waiting_for_delivery(
+                &session_id,
+                "live-cycle-attempt",
+                "delivery unacknowledged".into(),
+                5_012,
+            )
+            .unwrap();
+
+        let (_, causal_event) = store
+            .create_task(
+                NewTask {
+                    id: TaskId::try_from("later-worker-event").unwrap(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "later event".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                14,
+            )
+            .unwrap();
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            note_orchestrator_terminal_events(
+                &transaction,
+                &project_id,
+                std::slice::from_ref(&causal_event),
+                15,
+            )
+            .unwrap()
+        );
+        assert!(
+            note_orchestrator_terminal_events(
+                &transaction,
+                &project_id,
+                std::slice::from_ref(&causal_event),
+                16,
+            )
+            .unwrap()
+        );
+        transaction.commit().unwrap();
+
+        assert!(
+            store
+                .recover_live_orchestrator_cycle(&project_id, &agent_id, &session_id, 17)
+                .unwrap()
+        );
+        assert_eq!(
+            store.delivery_attempt_state("live-cycle-attempt").unwrap(),
+            Some(DeliveryAttemptState::Cancelled)
+        );
+        assert!(matches!(
+            store.session_work(&session_id).unwrap().work.unwrap().phase,
+            SessionWorkPhase::Empty
+        ));
+        assert!(
+            store
+                .deliver_agent_messages_by_ids_with_delivery_attempt(
+                    &project_id,
+                    &agent_id,
+                    &session_id,
+                    &[],
+                    Some("live-cycle-attempt"),
+                    17,
+                )
+                .is_err(),
+            "a reordered late acknowledgement must not resurrect the cancelled lease"
+        );
+
+        let state: (Option<i64>, Option<i64>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT pending_from_sequence, pending_through_sequence, active_lease_id
+                 FROM orchestrator_scheduler_state WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (Some(causal_event.sequence), Some(20), None),
+            "the later event must coalesce with the original scheduler range"
+        );
+        assert_eq!(
+            store
+                .claim_orchestrator_cycle(&project_id, &agent_id, 18)
+                .unwrap()
+                .is_some(),
+            true,
+            "a later causal event must recover the stale live lease exactly once"
+        );
+        assert_eq!(
+            store
+                .delivery_attempt_due(&project_id, &agent_id, &session_id, 18)
+                .unwrap(),
+            false,
+            "the terminal attempt must not be replayed as a concurrent cycle"
+        );
     }
 
     #[test]

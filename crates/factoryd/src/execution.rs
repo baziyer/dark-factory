@@ -1366,6 +1366,34 @@ async fn dispatch_agent_with_scheduler(
             if session.state == SessionState::WaitingForInput
                 && session.wait_reason.as_deref() == Some("delivery unacknowledged") =>
         {
+            let recovered = state
+                .commit_and_publish({
+                    let project_id = project_id.clone();
+                    let agent_id = agent_id.clone();
+                    let session_id = session.id.clone();
+                    move |store| {
+                        let recovered = store.recover_live_orchestrator_cycle(
+                            &project_id,
+                            &agent_id,
+                            &session_id,
+                            now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?,
+                        )?;
+                        Ok((recovered, Vec::new()))
+                    }
+                })
+                .await?;
+            if recovered {
+                deliver_pending(
+                    config,
+                    state,
+                    backoff,
+                    project_id,
+                    agent_id,
+                    &session.snapshot(),
+                )
+                .await?;
+                return Ok(());
+            }
             let due = state
                 .with_store({
                     let project_id = project_id.clone();
