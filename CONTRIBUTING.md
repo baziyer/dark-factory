@@ -8,9 +8,14 @@ file is just the shortest path to a useful first change.
 
 ```sh
 ./scripts/new-worktree.sh <slug>
-cd .worktrees/<slug>
+# cd to the absolute path printed by the script
 cargo build --workspace
 ```
+
+The script resolves the repository's primary checkout and always creates new
+linked worktrees under that checkout's single `.worktrees/` directory. Running
+it from a resident or task-linked worktree therefore does not add another
+nested `.worktrees/` level; existing nested worktrees are left in place.
 
 On macOS, run the complete release-compatible gate:
 

@@ -50,6 +50,7 @@ esac
 
 # The authoritative source gate is shared by macOS and Linux. Keep this
 # seam explicit so a platform mode cannot silently omit a core check.
+./scripts/test-new-worktree.sh
 ./scripts/test-github-step-summary.sh
 cargo +1.88.0 fmt --all -- --check
 cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings

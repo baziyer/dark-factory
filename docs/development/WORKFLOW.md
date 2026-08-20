@@ -3,7 +3,11 @@
 ## Day to day
 
 1. `./scripts/new-worktree.sh <slug>` — one worktree per task, never work
-   directly on `main`.
+   directly on `main`. The script prints the new absolute path. It derives the
+   primary checkout from Git's validated common-directory identity and places
+   every new linked worktree under that checkout's one `.worktrees/` directory,
+   even when invoked from a resident or task-linked worktree. Existing nested
+   worktrees are not moved.
 2. Build and iterate: `cargo build --workspace`.
 3. Before opening a PR: `./scripts/local-ci.sh` on macOS, or
    `./scripts/local-ci.sh --linux-source` on Ubuntu (fmt, clippy at
@@ -68,7 +72,8 @@ in #223.
    security — and posts findings on the PR. The author addresses each one
    or explains why not. The reviewer re-checks. Only then merge. See
    `AGENTS.md`'s "Critical rules" for the exact steps.
-6. Remove the worktree once merged (`git worktree remove .worktrees/<slug>`).
+6. Remove the worktree once merged (`git worktree remove <absolute-path>`, using
+   the path printed when it was created).
 
 ### Agent memory maintenance
 
