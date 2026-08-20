@@ -1,6 +1,7 @@
 use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixListener,
+    sync::mpsc,
     thread,
 };
 
@@ -131,32 +132,48 @@ fn subscribe_exposes_each_frame_without_polling() {
 
 #[test]
 fn rejects_an_oversized_server_frame_before_parsing_json() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("factory.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let oversized = vec![b'x'; MAX_FRAME_BYTES * 2];
-        assert_eq!(oversized.len(), MAX_FRAME_BYTES * 2);
-        stream.write_all(&oversized)
-    });
+    for _ in 0..8 {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("factory.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (boundary_tx, boundary_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream.write_all(&vec![b'x'; MAX_FRAME_BYTES])?;
+            stream.write_all(b"x")?;
+            boundary_rx
+                .recv()
+                .expect("client never observed FrameTooLarge");
+            match stream.write_all(b"x") {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                Err(error) => Err(error),
+            }
+        });
 
-    let error = Client::new(&socket)
-        .request(LocalRequest::Health)
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ClientError::FrameTooLarge {
-            max: MAX_FRAME_BYTES
+        let error = Client::new(&socket)
+            .request(LocalRequest::Health)
+            .unwrap_err();
+        let expected = matches!(
+            &error,
+            ClientError::FrameTooLarge {
+                max: MAX_FRAME_BYTES
+            }
+        );
+        if expected {
+            boundary_tx
+                .send(())
+                .expect("server stopped before post-boundary probe");
         }
-    ));
-    match server.join().expect("oversized frame server panicked") {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {}
-        Err(error) => panic!("oversized frame server write failed unexpectedly: {error}"),
+        drop(boundary_tx);
+        assert!(expected, "expected FrameTooLarge, got {error:?}");
+        match server.join().expect("oversized frame server panicked") {
+            Ok(()) => {}
+            Err(error) => panic!("oversized frame server write failed unexpectedly: {error}"),
+        }
     }
 }
