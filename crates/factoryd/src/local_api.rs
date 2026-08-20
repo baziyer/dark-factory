@@ -2093,6 +2093,13 @@ async fn handle_request_as(
             let session = state
                 .with_store(move |store| store.authenticated_session_row(&session_id))
                 .await?;
+            #[cfg(test)]
+            if let Ok((reached, resume)) =
+                AUTHENTICATED_PROVIDER_HOOK_TEST_BARRIER.try_with(Clone::clone)
+            {
+                reached.notify_one();
+                resume.notified().await;
+            }
             let project_id = session.project_id.clone();
             let agent_id = session.agent_id.clone();
             let session_id = session.id.clone();
@@ -2352,6 +2359,12 @@ async fn handle_request_as(
         }
         LocalRequest::Subscribe { .. } => unreachable!("subscriptions are handled per connection"),
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static AUTHENTICATED_PROVIDER_HOOK_TEST_BARRIER:
+        (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
 }
 
 #[cfg(test)]
@@ -4095,10 +4108,13 @@ mod deletion_gate_tests {
     }
 
     /// The execution-layer sibling forces the narrower load-before-cancel /
-    /// commit-after-cancel message CAS. This request-level test places a
-    /// durable recovery commit as the barrier before the real provider hook,
-    /// proving the externally observable contract is an explicit block and
-    /// the inbox remains available to the fresh conversation.
+    /// commit-after-cancel message CAS. This request-level test authenticates
+    /// the real provider hook while its session is live, pauses after the
+    /// handler's own liveness re-check, then lets the durable recovery commit
+    /// win before prompt admission. The externally observable contract stays
+    /// an explicit block and the inbox remains available to the fresh
+    /// conversation without giving a newly arriving stopped-session request
+    /// any authority.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn message_only_recovery_win_blocks_the_hook_and_preserves_the_inbox() {
         let directory = private_tempdir();
@@ -4139,6 +4155,47 @@ mod deletion_gate_tests {
                         text,
                         created_at_ms: 1_002,
                     })?;
+                    Ok(((), Vec::new()))
+                }
+            })
+            .await
+            .unwrap();
+
+        let hook_reached = Arc::new(tokio::sync::Notify::new());
+        let resume_hook = Arc::new(tokio::sync::Notify::new());
+        let hook_state = state.clone();
+        let hook_execution = execution.clone();
+        let guidance_root = directory.path().to_path_buf();
+        let hook = tokio::spawn(AUTHENTICATED_PROVIDER_HOOK_TEST_BARRIER.scope(
+            (Arc::clone(&hook_reached), Arc::clone(&resume_hook)),
+            async move {
+                let credential = SessionCredential::new("a".repeat(HOOK_TOKEN_LEN));
+                let principal =
+                    authenticate_endpoint(&hook_state, Endpoint::Session, Some(&credential))
+                        .await?;
+                let request = LocalRequest::ProviderHook {
+                    event: ProviderHookEvent::UserPromptSubmit,
+                    payload: serde_json::json!({"prompt": text}),
+                };
+                authorize_request(&hook_state, principal.as_ref(), &request).await?;
+                handle_request_as(
+                    &hook_state,
+                    &hook_execution,
+                    &guidance_root,
+                    principal.as_ref(),
+                    request,
+                )
+                .await
+            },
+        ));
+        timeout(Duration::from_secs(2), hook_reached.notified())
+            .await
+            .unwrap();
+        state
+            .commit_and_publish({
+                let project_id = project_id.clone();
+                let session_id = session_id.clone();
+                move |store| {
                     let (_, event) = store.request_fresh_provider_recovery(
                         &project_id,
                         &session_id,
@@ -4150,18 +4207,13 @@ mod deletion_gate_tests {
             })
             .await
             .unwrap();
+        resume_hook.notify_one();
 
-        let response = handle_request(
-            &state,
-            &execution,
-            directory.path(),
-            LocalRequest::ProviderHook {
-                event: ProviderHookEvent::UserPromptSubmit,
-                payload: serde_json::json!({"prompt": text}),
-            },
-        )
-        .await
-        .unwrap();
+        let response = timeout(Duration::from_secs(2), hook)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert!(matches!(
             response,
             LocalResponse::ProviderHookReply { reply }
