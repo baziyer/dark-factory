@@ -373,7 +373,21 @@ impl Pane {
             }
         }
         if let Ok(mut parser) = self.parser.lock() {
+            // vt100 truncates rows from the bottom when the live grid shrinks. Re-feed one
+            // bounded, formatted snapshot of the visible screen after changing the viewport so
+            // a prompt at the lower edge survives narrow/wide TUI resizing. The daemon attach
+            // observation remains authoritative and unchanged by this local render operation.
+            let scrollback = parser.screen().scrollback();
+            if scrollback > 0 {
+                // vt100's visible-row iterator cannot snapshot an offset beyond the viewport.
+                parser.set_scrollback(0);
+            }
+            let formatted = parser.screen().contents_formatted();
             parser.set_size(rows, cols);
+            parser.process(&formatted);
+            if scrollback > 0 {
+                parser.set_scrollback(scrollback.min(usize::from(rows)));
+            }
         }
         self.mark_dirty();
         Ok(())
@@ -474,7 +488,14 @@ impl Pane {
     /// always safe.
     pub fn scroll_up(&self, lines: usize) {
         if let Ok(mut parser) = self.parser.lock() {
-            let target = parser.screen().scrollback() + lines;
+            // Bound one movement to one viewport: vt100 cannot render an offset beyond the
+            // visible row count, and PgUp may deliberately request `usize::MAX`.
+            let max_page = usize::from(parser.screen().size().0);
+            let target = parser
+                .screen()
+                .scrollback()
+                .saturating_add(lines)
+                .min(max_page);
             parser.set_scrollback(target);
         }
         self.mark_dirty();
@@ -766,6 +787,175 @@ pub type PaneMap = std::collections::HashMap<SessionId, Pane>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread::JoinHandle;
+
+    use factory_core::PROTOCOL_VERSION;
+    use factory_core::local::{LocalResponse, RequestEnvelope};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::{Block, Borders};
+    use tui_term::widget::PseudoTerminal;
+
+    struct AttachFixture {
+        socket: PathBuf,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+        handlers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl AttachFixture {
+        fn start(output: Vec<u8>) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("factory.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let handlers = Arc::new(Mutex::new(Vec::new()));
+            let thread_handlers = Arc::clone(&handlers);
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let stop = Arc::clone(&thread_stop);
+                            let output = output.clone();
+                            let handler = std::thread::spawn(move || {
+                                serve_attach_connection(stream, output, stop);
+                            });
+                            thread_handlers.lock().unwrap().push(handler);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                socket,
+                stop,
+                thread: Some(thread),
+                handlers,
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Drop for AttachFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&self.socket);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            for handler in self.handlers.lock().unwrap().drain(..) {
+                handler.join().unwrap();
+            }
+        }
+    }
+
+    fn serve_attach_connection(mut stream: UnixStream, output: Vec<u8>, stop: Arc<AtomicBool>) {
+        let mut request = String::new();
+        if BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap_or(0)
+            == 0
+        {
+            return;
+        }
+        let envelope: RequestEnvelope = serde_json::from_str(&request).unwrap();
+        match envelope.request {
+            LocalRequest::AttachTerminal { session_id, .. } => {
+                send_frame(
+                    &mut stream,
+                    ServerFrame::TerminalAttachReady {
+                        protocol_version: PROTOCOL_VERSION,
+                        session_id: session_id.clone(),
+                        generation: 0,
+                        base_generation: 0,
+                        base_offset: 0,
+                        start_generation: 0,
+                        start_offset: 0,
+                        end_offset: output.len() as u64,
+                        reset_prefix: encode_terminal_bytes(
+                            b"\x1bc\x1b[?1049l\x1b[?2004l\x1b[0m\x1b[2J\x1b[H",
+                        ),
+                    },
+                );
+                for (offset, chunk) in output.chunks(7).scan(0_u64, |offset, chunk| {
+                    let start = *offset;
+                    *offset += chunk.len() as u64;
+                    Some((start, chunk))
+                }) {
+                    send_frame(
+                        &mut stream,
+                        ServerFrame::TerminalOutput {
+                            protocol_version: PROTOCOL_VERSION,
+                            session_id: session_id.clone(),
+                            generation: 0,
+                            offset,
+                            bytes: encode_terminal_bytes(chunk),
+                        },
+                    );
+                }
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+                let mut discard = [0_u8; 1];
+                while !stop.load(Ordering::Acquire) {
+                    match stream.read(&mut discard) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            LocalRequest::ResizeTerminal { session_id, .. } => send_frame(
+                &mut stream,
+                ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::TerminalResized { session_id },
+                },
+            ),
+            _ => {}
+        }
+    }
+
+    fn send_frame(stream: &mut UnixStream, frame: ServerFrame) {
+        if serde_json::to_writer(&mut *stream, &frame).is_ok() {
+            let _ = stream.write_all(b"\n");
+            let _ = stream.flush();
+        }
+    }
+
+    fn render_pane(pane: &mut Pane, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                pane.resize(inner.height, inner.width).unwrap();
+                let parser = pane.lock_parser();
+                frame.render_widget(PseudoTerminal::new(parser.screen()).block(block), area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn every_nonempty_input_returns_scrollback_to_the_live_tail() {
@@ -780,6 +970,70 @@ mod tests {
         pane.write_input(b"x");
 
         assert_eq!(pane.scroll_offset(), 0);
+        pane.kill();
+    }
+
+    #[test]
+    fn real_long_attach_renders_utf8_ansi_scrollback_and_live_prompt_after_resize() {
+        let mut output = Vec::new();
+        for line in 0..1_500 {
+            output.extend_from_slice(
+                format!("history-{line:04} café \x1b[32mansi-{line:04}\x1b[0m\r\n").as_bytes(),
+            );
+        }
+        output.extend_from_slice(b"\x1b[1;34mLIVE-PROMPT\x1b[0m $ ");
+
+        let fixture = AttachFixture::start(output);
+        let mut pane = Pane::attach(
+            fixture.socket.clone(),
+            ProjectId::try_from("project-1").unwrap(),
+            SessionId::try_from("session-1").unwrap(),
+            None,
+            "attached",
+            8,
+            48,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while (!pane.observation().is_attached()
+            || !pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(pane.observation(), PaneObservation::Attached);
+        assert!(
+            pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")),
+            "real attach replay never reached the live prompt"
+        );
+
+        let wide = render_pane(&mut pane, 48, 8);
+        assert!(
+            wide.contains("LIVE-PROMPT"),
+            "wide render lost the live prompt: {wide:?}"
+        );
+        assert_eq!(wide.matches("LIVE-PROMPT").count(), 1);
+
+        pane.scroll_up(usize::MAX);
+        let narrow = render_pane(&mut pane, 18, 8);
+        assert!(
+            narrow.contains("history-1494"),
+            "narrow scrolled render lost the retained historical lines: {narrow:?}"
+        );
+        assert!(
+            narrow.contains("café") || narrow.contains("caf"),
+            "narrow scrolled render lost the UTF-8 text: {narrow:?}"
+        );
+
+        pane.scroll_reset();
+        let restored = render_pane(&mut pane, 72, 8);
+        assert!(
+            restored.contains("LIVE-PROMPT"),
+            "wide live render lost the prompt after scroll/resize: {restored:?}"
+        );
+        assert_eq!(restored.matches("LIVE-PROMPT").count(), 1);
+        assert_eq!(pane.observation(), PaneObservation::Attached);
         pane.kill();
     }
 }
