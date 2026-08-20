@@ -10,7 +10,7 @@
 //! `Observation`, item-tracking state, `Outcome`, `FailureReason`, the
 //! non-interactive `prepare()`, and their fixtures/tests
 //! (`crates/factoryd/tests/codex.rs`) are gone (~540 LOC, see
-//! `TRACK5-DESIGN.md` §7). `validate_thread_id` is the one piece that
+//! `TRACK5-DESIGN.md` §7). Canonical UUID validation is the one piece that
 //! survived unchanged: both the old decoder and the new [`CodexProvider`]
 //! need to confirm a Codex thread identity is a canonical UUID.
 
@@ -20,20 +20,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use uuid::Uuid;
-
 use crate::providers::{
     Capabilities, InteractiveLaunch, Provider, ProviderError, RuntimeMetadata, SpawnContext, hooks,
 };
-
-fn validate_thread_id(value: &str) -> Result<(), ()> {
-    let parsed = Uuid::parse_str(value).map_err(|_| ())?;
-    if parsed.hyphenated().to_string() == value {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
 
 pub const PERMISSION_MODES: [&str; 2] = ["on-request", "never"];
 
@@ -273,8 +262,10 @@ impl Provider for CodexProvider {
             args.push(format!("approval_policy=\"{approval_policy}\""));
         }
         if let Some(thread_id) = &ctx.resume {
-            validate_thread_id(thread_id).map_err(|_| ProviderError::ResumeIdNotUuid {
-                value: thread_id.clone(),
+            super::validate_canonical_uuid(thread_id).map_err(|_| {
+                ProviderError::ResumeIdNotUuid {
+                    value: thread_id.clone(),
+                }
             })?;
             args.push("resume".to_owned());
             args.push(thread_id.clone());

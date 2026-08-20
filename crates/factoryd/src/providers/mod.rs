@@ -25,6 +25,28 @@ use std::path::PathBuf;
 
 use factory_core::{AgentId, ProjectId, SessionId};
 
+fn validate_canonical_uuid(value: &str) -> Result<(), ()> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| ())?;
+    if parsed.hyphenated().to_string() == value {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_canonical_uuid;
+
+    #[test]
+    fn canonical_uuid_accepts_only_lowercase_hyphenated_form() {
+        assert!(validate_canonical_uuid("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d").is_ok());
+        assert!(validate_canonical_uuid("9b1deb4d3b7d4bad9bdd2b0d7b3dcb6d").is_err());
+        assert!(validate_canonical_uuid("9B1DEB4D-3B7D-4BAD-9BDD-2B0D7B3DCB6D").is_err());
+        assert!(validate_canonical_uuid("not-a-uuid").is_err());
+    }
+}
+
 /// Returns the capability declaration for a provider kind without requiring
 /// callers to know which concrete provider implements it. Profile updates use
 /// this same declaration as launch, so an unsupported permission mode fails

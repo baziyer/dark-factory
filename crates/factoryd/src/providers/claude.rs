@@ -10,9 +10,9 @@
 //! `Observation`, `ToolState`/`InitState`/`ResultState`, `Outcome`,
 //! `FailureReason`, the non-interactive `prepare()`, and their fixtures/tests
 //! (`crates/factoryd/tests/claude.rs`) are gone (~750 LOC, see
-//! `TRACK5-DESIGN.md` §7). `validate_uuid` is the one piece that survived
-//! unchanged: both the old decoder and the new [`ClaudeProvider`] need to
-//! confirm a Claude session identity is a canonical UUID.
+//! `TRACK5-DESIGN.md` §7). Canonical UUID validation is the one piece that
+//! survived unchanged: both the old decoder and the new [`ClaudeProvider`]
+//! need to confirm a Claude session identity is a canonical UUID.
 
 use std::{
     os::unix::fs::PermissionsExt,
@@ -25,15 +25,6 @@ use serde_json::Value;
 use crate::providers::{
     Capabilities, InteractiveLaunch, Provider, ProviderError, RuntimeMetadata, SpawnContext, hooks,
 };
-
-fn validate_uuid(value: &str) -> Result<(), ()> {
-    let parsed = uuid::Uuid::parse_str(value).map_err(|_| ())?;
-    if parsed.hyphenated().to_string() == value {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
 
 pub const PERMISSION_MODES: [&str; 3] = ["default", "acceptEdits", "plan"];
 
@@ -103,8 +94,10 @@ impl Provider for ClaudeProvider {
         ];
         match &ctx.resume {
             Some(provider_session_id) => {
-                validate_uuid(provider_session_id).map_err(|_| ProviderError::ResumeIdNotUuid {
-                    value: provider_session_id.clone(),
+                super::validate_canonical_uuid(provider_session_id).map_err(|_| {
+                    ProviderError::ResumeIdNotUuid {
+                        value: provider_session_id.clone(),
+                    }
                 })?;
                 args.push("--resume".to_owned());
                 args.push(provider_session_id.clone());
@@ -117,8 +110,10 @@ impl Provider for ClaudeProvider {
                 // `SessionId`s are UUIDs by construction; this is validated
                 // defensively rather than assumed.
                 let session_id = ctx.session_id.as_str();
-                validate_uuid(session_id).map_err(|_| ProviderError::SessionIdNotUuid {
-                    session_id: session_id.to_owned(),
+                super::validate_canonical_uuid(session_id).map_err(|_| {
+                    ProviderError::SessionIdNotUuid {
+                        session_id: session_id.to_owned(),
+                    }
                 })?;
                 args.push("--session-id".to_owned());
                 args.push(session_id.to_owned());
