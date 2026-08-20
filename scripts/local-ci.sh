@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
 
+script_dir=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 mode=${1:-macos}
 test "$#" -le 1 || {
     echo "usage: scripts/local-ci.sh [macos|--linux-source]" >&2
@@ -8,11 +9,24 @@ test "$#" -le 1 || {
 }
 case "$mode" in
     macos)
-        script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
         if [ "${DARK_FACTORY_LOCAL_CI_LEASE_HELD-}" != 1 ]; then
             exec "$script_dir/with-local-ci-lease.sh" "$script_dir/local-ci.sh"
         fi
+        ;;
+    --linux-source) ;;
+    *)
+        echo "unknown local-ci mode: $mode" >&2
+        exit 2
+        ;;
+esac
 
+# Keep lease diagnostics attributable to the invoking live task, then make
+# every gate child independent of that task's runtime and identity overrides.
+# shellcheck source=scripts/local-ci-environment.sh
+. "$script_dir/local-ci-environment.sh"
+
+case "$mode" in
+    macos)
         ./scripts/test-local-ci-lease.sh
         ./scripts/test-local-ci-lease-mutations.sh
         ./scripts/check-toolchain-pins.sh
@@ -26,14 +40,11 @@ case "$mode" in
     --linux-source)
         ./scripts/check-toolchain-pins.sh
         ;;
-    *)
-        echo "unknown local-ci mode: $mode" >&2
-        exit 2
-        ;;
 esac
 
 # Measure after the macOS repository lease is held, so another linked worktree
 # cannot begin a broad gate between this read-only preflight and our compile.
+./scripts/test-local-ci-environment.sh
 ./scripts/check-build-headroom.sh
 ./scripts/test-build-headroom.sh
 

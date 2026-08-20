@@ -3376,7 +3376,7 @@ mod tests {
     use factory_core::{MessageId, TaskId};
 
     use super::*;
-    use crate::store::{NewAgentMessage, Store};
+    use crate::store::{NewAgentMessage, NewSession, Store};
 
     struct RecoveryStopFixture {
         _directory: tempfile::TempDir,
@@ -3588,6 +3588,36 @@ mod tests {
         }
     }
 
+    fn deadline_session(
+        directory: &Path,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        session_id: &str,
+        runner_instance_id: &str,
+    ) -> NewSession {
+        NewSession {
+            id: SessionId::try_from(session_id).unwrap(),
+            project_id: project_id.clone(),
+            agent_id: agent_id.clone(),
+            provider: Provider::Shell,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            provider_session_id: None,
+            worktree: directory.to_string_lossy().into_owned(),
+            codex_home: None,
+            hook_token: "a".repeat(64),
+            runner_instance_id: RunnerInstanceId::try_from(runner_instance_id).unwrap(),
+            runner_runtime: directory
+                .join("runs")
+                .join(session_id)
+                .to_string_lossy()
+                .into_owned(),
+            runner_protocol_version: 1,
+        }
+    }
+
     async fn test_delivery_attempt(
         state: &DaemonState,
         id: &str,
@@ -3625,6 +3655,202 @@ mod tests {
         let mut cfg = config(directory.path());
         cfg.max_active_runs = 0;
         assert!(matches!(spawn(cfg, state), Err(Error::InvalidConcurrency)));
+    }
+
+    /// Issue #249: start-deadline escalation is daemon/store behavior, not a
+    /// runner-startup integration test. Drive the exact production transition
+    /// with durable `Starting` rows whose runner program and runtime directory
+    /// deliberately do not exist. The separate `session_start_deadline`
+    /// integration tests retain real runner stop/retry and successful-hook
+    /// lifecycle coverage without making these four state-machine cycles wait
+    /// for four independently scheduled control sockets.
+    #[tokio::test]
+    async fn start_deadline_escalation_pauses_and_resume_resets_the_streak() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("stuck").unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".to_owned(),
+                    root: worktree.to_string_lossy().into_owned(),
+                },
+                1_000,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                1_000,
+            )
+            .unwrap();
+
+        let state = DaemonState::new(store);
+        let mut cfg = config(directory.path());
+        cfg.session_start_deadline = Duration::ZERO;
+        let cfg = Arc::new(cfg);
+        let backoff = Arc::new(SpawnBackoff::new());
+        let (wake_tx, mut wake_rx) = mpsc::channel(8);
+        let (shutdown, _shutdown_rx) = watch::channel(false);
+        let handle = Handle {
+            state: state.clone(),
+            config: Arc::clone(&cfg),
+            wake_tx: wake_tx.clone(),
+            shutdown,
+            backoff: Arc::clone(&backoff),
+            project_gate: Arc::new(DeleteGate::new()),
+        };
+        let identities = [
+            (
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ),
+            (
+                "33333333-3333-4333-8333-333333333333",
+                "44444444-4444-4444-8444-444444444444",
+            ),
+            (
+                "55555555-5555-4555-8555-555555555555",
+                "66666666-6666-4666-8666-666666666666",
+            ),
+            (
+                "77777777-7777-4777-8777-777777777777",
+                "88888888-8888-4888-8888-888888888888",
+            ),
+        ];
+
+        assert!(!cfg.runner_program.exists());
+        assert!(!cfg.runtime_root.exists());
+
+        for (index, &(session_id, runner_instance_id)) in identities.iter().enumerate() {
+            let input = deadline_session(
+                directory.path(),
+                &project_id,
+                &agent_id,
+                session_id,
+                runner_instance_id,
+            );
+            state
+                .commit_and_publish(move |store| {
+                    let (session, events) = store.create_session(input, 1_001 + index as i64)?;
+                    Ok((session, events))
+                })
+                .await
+                .unwrap();
+
+            let lookup_project_id = project_id.clone();
+            let lookup_agent_id = agent_id.clone();
+            let starting = state
+                .with_store(move |store| {
+                    store
+                        .live_session_for_agent(&lookup_project_id, &lookup_agent_id)?
+                        .ok_or(StoreError::SessionNotFound)
+                })
+                .await
+                .unwrap();
+            assert_eq!(starting.state, SessionState::Starting);
+
+            enforce_start_deadline(
+                cfg.as_ref(),
+                &state,
+                &wake_tx,
+                backoff.as_ref(),
+                &project_id,
+                &agent_id,
+                &starting,
+            )
+            .await
+            .unwrap();
+
+            let list_project_id = project_id.clone();
+            let failed = state
+                .with_store(move |store| {
+                    store
+                        .list_sessions(&list_project_id, None, 100)?
+                        .into_iter()
+                        .find(|session| session.id.as_str() == session_id)
+                        .ok_or(StoreError::SessionNotFound)
+                })
+                .await
+                .unwrap();
+            assert_eq!(failed.state, SessionState::Failed);
+            assert!(
+                failed
+                    .wait_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("SessionStart hook not received")),
+                "unexpected deadline failure: {failed:?}"
+            );
+            assert!(
+                !cfg.runtime_root
+                    .join(session_id)
+                    .join("control.sock")
+                    .exists()
+            );
+
+            let held_project_id = project_id.clone();
+            let held_agent_id = agent_id.clone();
+            let held = state
+                .with_store(move |store| store.agent_is_held(&held_project_id, &held_agent_id))
+                .await
+                .unwrap();
+            if index < 2 {
+                assert!(!held, "deadline {} must still be retryable", index + 1);
+                let wake = wake_rx.try_recv().expect("a retry wake");
+                assert_eq!(wake.project_id, project_id);
+                assert_eq!(wake.agent_id, agent_id);
+            } else if index == 2 {
+                assert!(held, "the third consecutive deadline must pause the agent");
+                assert!(matches!(
+                    wake_rx.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+
+                let resume_project_id = project_id.clone();
+                let resume_agent_id = agent_id.clone();
+                state
+                    .commit_and_publish(move |store| {
+                        let (agent, event) =
+                            store.resume_agent(&resume_project_id, &resume_agent_id, 2_000)?;
+                        Ok((agent, vec![event]))
+                    })
+                    .await
+                    .unwrap();
+                // `local_api::ResumeAgent` calls this exact production
+                // boundary alongside the durable store transition above.
+                handle.resume_backoff(&agent_id);
+            } else {
+                assert!(
+                    !held,
+                    "the first deadline after resume must start a fresh streak"
+                );
+                wake_rx.try_recv().expect("a retry wake after resume");
+            }
+        }
+
+        let count_project_id = project_id.clone();
+        assert_eq!(
+            state
+                .with_store(move |store| {
+                    Ok(store.list_sessions(&count_project_id, None, 100)?.len())
+                })
+                .await
+                .unwrap(),
+            4
+        );
+        assert!(!cfg.runner_program.exists());
+        assert!(!cfg.runtime_root.exists());
     }
 
     #[tokio::test]

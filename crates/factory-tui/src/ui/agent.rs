@@ -25,12 +25,12 @@ pub fn draw(frame: &mut Frame, area: Rect, board: &Board, panes: &mut PaneMap, h
         return;
     }
     let area = if let Some(focus) = &board.attention_focus {
-        let card_height = area.height.min(9);
+        let card_height = area.height.min(10);
         let panels = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(card_height), Constraint::Min(0)])
             .split(area);
-        render_attention_card(frame, panels[0], board, focus);
+        render_attention_card(frame, panels[0], board, focus, hits);
         panels[1]
     } else {
         area
@@ -379,15 +379,19 @@ fn memory_health_state(state: factory_core::local::GuidanceHealthState) -> &'sta
     }
 }
 
-fn render_attention_card(
+pub(crate) fn render_attention_card(
     frame: &mut Frame,
     area: Rect,
     board: &Board,
     focus: &crate::model::AttentionFocus,
+    hits: &mut HitMap,
 ) {
     let item = &focus.item;
+    let pending = board.attention_is_pending(item);
     let title = if focus.resolved {
         " ACTION — STALE "
+    } else if pending {
+        " ACTION — PENDING "
     } else {
         " ACTION — NEEDS YOU "
     };
@@ -410,6 +414,12 @@ fn render_attention_card(
         .as_ref()
         .map_or("—", factory_core::RunId::as_str);
     let age = factory_core::status::age_text(board.now_ms, item.since_ms);
+    let decision = item.decision();
+    let explanation = if focus.resolved {
+        "changed or resolved; refresh NEEDS YOU before acting".to_owned()
+    } else {
+        format!("{} | evidence: {}", decision.cause, decision.evidence)
+    };
     let mut lines = vec![
         Line::from(Span::styled(
             if focus.resolved {
@@ -423,14 +433,7 @@ fn render_attention_card(
                 Color::Yellow
             }),
         )),
-        Line::from(ui::truncate(
-            if focus.resolved {
-                "changed or resolved; refresh NEEDS YOU before acting"
-            } else {
-                &item.reason.summary
-            },
-            inner_width,
-        )),
+        Line::from(ui::truncate(&explanation, inner_width)),
         Line::from(compact_pair(
             "project:",
             project,
@@ -448,22 +451,44 @@ fn render_attention_card(
         Line::from(compact_pair("run:", run, "age:", &age, inner_width)),
     ];
     if !focus.resolved {
-        lines.push(Line::from(ui::truncate(
-            &format!("safe action: {}", item.action_text()),
-            inner_width,
-        )));
-        if matches!(
-            item.reason.action,
-            factory_core::status::AttentionAction::AnswerInTerminal
-                | factory_core::status::AttentionAction::ReviewProviderPermission
-        ) {
+        for (index, choice) in decision.choices.iter().enumerate() {
+            hits.add_row(
+                ui::block("").inner(area),
+                5 + index,
+                Target::AttentionChoice(item.clone(), index),
+            );
             lines.push(Line::from(ui::truncate(
-                "typing off; Ctrl-] to enter",
+                &format!(
+                    "{}. {}{} — {}",
+                    index + 1,
+                    choice.label,
+                    if decision.recommended == Some(index) {
+                        " *"
+                    } else {
+                        ""
+                    },
+                    choice.consequence
+                ),
                 inner_width,
             )));
-        } else {
-            lines.push(Line::from("terminal typing is not an action"));
         }
+        let typing = if pending {
+            "request pending; wait for response"
+        } else if matches!(
+            item.reason.action,
+            factory_core::status::AttentionAction::AnswerInTerminal
+        ) {
+            "typing off; Ctrl-] to enter answer"
+        } else {
+            "terminal typing is not an action"
+        };
+        let suffix_width = typing.chars().count() + 2;
+        let action_width = inner_width.saturating_sub(suffix_width);
+        let action = ui::truncate(
+            &format!("safe action: {}", item.action_text()),
+            action_width,
+        );
+        lines.push(Line::from(format!("{action}; {typing}")));
     } else {
         lines.push(Line::from(ui::truncate(
             "safe action: refresh NEEDS YOU",
@@ -473,7 +498,7 @@ fn render_attention_card(
     }
     // Every field owns one row. Paragraph clipping therefore cannot let a
     // bounded-but-long reason push source identity or the safe action below
-    // the nine-row full-width card at the tested 80-column board width.
+    // the ten-row full-width card at the tested 80-column board width.
     frame.render_widget(Paragraph::new(lines).block(ui::block(title)), area);
 }
 

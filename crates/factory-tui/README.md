@@ -18,9 +18,10 @@ project unless `--project` selects one.
 ## Screens
 
 BUILDING shows the full factory. Each project is a building. Each agent has a
-floor. The NEEDS YOU list includes agents and tasks. It lists attention items
-globally, most urgent and then oldest first. Each row names the actionable
-reason instead of collapsing every condition into a generic input request.
+floor. NEEDS YOU is the decision subset of fleet attention, globally sorted
+most urgent and then oldest first. Free-form worker blocks and deterministic
+recovery remain diagnostics until the daemon can prove a typed human choice;
+they do not become operator decisions merely because work stopped.
 
 BUILDING separates durable lifecycle from current activity. Each row names the
 most recent bounded hook/tool activity and its age; it says `no recent activity`
@@ -42,11 +43,12 @@ active work, durable messages, and settings. Settings distinguish the
 configured model/reasoning tier and durable selection reason from the
 historical runtime-resolved session values. The orchestrator also shows the
 project backlog and worker queues; messages remain the inbox and review
-attention remains separate. `g` or a NEEDS YOU click opens the
-same reason card here, with task/session/age and a safe action, while terminal
-typing remains off until explicitly entered. If the reason resolves
-concurrently, the stale row disappears and an already-open card says it
-changed before action.
+attention remains separate. `g` or a NEEDS YOU click keeps BUILDING visible
+and opens the shared decision card in its right pane, with bounded cause,
+exact source identities, typed choices, and consequences. Provider permission
+and budget reset have no default; budget reset also requires confirmation.
+If the reason resolves concurrently, the stale row disappears and an
+already-open card says it changed before action.
 
 ## Mouse
 
@@ -88,6 +90,7 @@ controls below remain available.
 | `z` | Maximize or restore the terminal. |
 | `PgUp` / `PgDn` | Scroll the terminal. |
 | `Ctrl-]` | Stop sending keys to the terminal and control the board. |
+| `u` | Install and relaunch when the footer shows an available update. |
 | `x` | Stop the selected agent after confirmation. |
 | `?` | Show all keys. |
 | `q` | Detach from the factory. |
@@ -95,7 +98,13 @@ controls below remain available.
 Board actions use daemon requests. `C` uses the same shared launchd capacity
 operation as `factoryctl capacity set`; it restarts only `factoryd` and keeps
 runner sessions alive. See the [main README](../../README.md) for setup and
-first use.
+first use. The `u` action is manual and uses the same verified install and
+rollback transaction as `factoryctl update --install`; after daemon health is
+confirmed it execs the exact digest-verified version-directory `factory-tui`,
+preserving this viewer PID and its current project/screen intent without
+restarting provider sessions.
+Detach is delayed until the joined update worker reaches a safe handoff; a
+private phase record makes an abnormal viewer exit recoverable on next start.
 
 Mouse clicks select the same agents, tasks, attention rows, and queue rows as
 keyboard navigation. Press `Enter` or `i` to focus typing in an attached

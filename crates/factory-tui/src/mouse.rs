@@ -18,9 +18,11 @@ pub enum Target {
     View(View),
     Help,
     Detach,
+    Update,
     Agent(AgentId),
     Task(TaskId),
     Attention(AttentionItem),
+    AttentionChoice(AttentionItem, usize),
     Pane(SessionId),
 }
 

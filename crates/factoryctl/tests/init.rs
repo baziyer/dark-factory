@@ -446,7 +446,7 @@ fn doctor_report(active_version: &str, daemon_version: &str) -> serde_json::Valu
             "assets": {
                 factoryctl::update::platform_key(): {
                     "url": "https://example.invalid/release.tar.gz",
-                    "sha256": "00"
+                    "sha256": "00".repeat(32)
                 }
             }
         }

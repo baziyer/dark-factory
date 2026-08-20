@@ -206,6 +206,7 @@ pub(super) fn styled_list<'a>(items: Vec<ListItem<'a>>, block: Block<'static>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PendingAction;
     use crate::mouse::{Route, Target, route};
     use crate::test_fixtures::{agent, attention, project, session, task};
     use factory_core::{
@@ -274,8 +275,8 @@ mod tests {
             Vec::new(),
         );
         let attention = attention(
-            AttentionReasonKind::WorkerBlocked,
-            None,
+            AttentionReasonKind::BudgetExhausted,
+            Some("alice"),
             Some("blocked"),
             None,
             0,
@@ -337,7 +338,37 @@ mod tests {
         assert!(text.contains("session: session-1"));
         assert!(text.contains("age: 1m"));
         assert!(text.contains("safe action:"));
-        assert!(text.contains("typing off; Ctrl-] to enter"));
+        assert!(text.contains("terminal typing is not an action"));
+    }
+
+    #[test]
+    fn budget_confirmation_only_advertises_the_keys_that_confirm_it() {
+        let mut board = Board::new(false, 0, crate::theme::PLAIN);
+        let source = attention(
+            AttentionReasonKind::BudgetExhausted,
+            Some("alice"),
+            None,
+            None,
+            0,
+        );
+        board.mode = Mode::Confirm(PendingAction::ResetBudget {
+            source: Box::new(source),
+            request: factory_core::local::LocalRequest::ResetAgentBudget {
+                project_id: ProjectId::try_from("proj").unwrap(),
+                agent_id: AgentId::try_from("alice").unwrap(),
+            },
+        });
+
+        let (_, terminal) = render_frame(&board, 80, 12);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("y / Enter to confirm"));
+        assert!(!text.contains("x again"));
     }
 
     #[test]
@@ -363,7 +394,7 @@ mod tests {
             )],
         );
         let mut item = attention(
-            AttentionReasonKind::WorkerBlocked,
+            AttentionReasonKind::BudgetExhausted,
             Some(&agent_id),
             Some(&task_id),
             Some(&session_id),
@@ -393,7 +424,7 @@ mod tests {
         let session_fragment = truncate_middle(&session_id, 31);
         let run_fragment = truncate_middle(&run_id, 33);
         for visible in [
-            "worker blocked",
+            "budget exhausted",
             "project:",
             &project_fragment,
             "agent:",
@@ -405,7 +436,7 @@ mod tests {
             "run:",
             &run_fragment,
             "age:",
-            "safe action: factoryctl task retry",
+            "safe action: factoryctl agent budget reset",
             "terminal typing is not an action",
         ] {
             assert!(text.contains(visible), "missing {visible:?}: {text}");

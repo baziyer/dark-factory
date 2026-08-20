@@ -13,6 +13,7 @@ use crate::model::{
 };
 use crate::mouse::{HitMap, Target};
 use crate::ui::{self, centered_rect, render_tabs};
+use factoryctl::managed_update::UpdateProgress;
 
 fn connection_badge(board: &Board) -> Span<'static> {
     match board.connection {
@@ -44,14 +45,35 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         if typing { TYPING_ESCAPE } else { "" }
     );
     let controls_width = u16::try_from(controls.len()).unwrap_or(u16::MAX);
+    let update_label = board.update_progress.map_or_else(
+        || {
+            board
+                .update_available
+                .as_ref()
+                .map(|version| format!("[u update v{version}]"))
+        },
+        |progress| Some(progress_label(progress)),
+    );
     let tabs_width = TABS_WIDTH.min(area.width);
     let remaining = area.width.saturating_sub(tabs_width);
     let controls_width = controls_width.min(remaining);
-    let status_width = remaining.saturating_sub(controls_width);
+    let update_width = update_label
+        .as_ref()
+        .map_or(0, |label| u16::try_from(label.len()).unwrap_or(u16::MAX))
+        .min(remaining.saturating_sub(controls_width));
+    let status_width = remaining
+        .saturating_sub(controls_width)
+        .saturating_sub(update_width);
     let tabs_area = Rect::new(area.x, area.y, tabs_width, 1);
     let status_area = Rect::new(area.x.saturating_add(tabs_width), area.y, status_width, 1);
-    let controls_area = Rect::new(
+    let update_area = Rect::new(
         status_area.x.saturating_add(status_width),
+        area.y,
+        update_width,
+        1,
+    );
+    let controls_area = Rect::new(
+        update_area.x.saturating_add(update_width),
         area.y,
         controls_width,
         1,
@@ -98,13 +120,20 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
             ));
         }
     }
-    if let Some(version) = &board.update_available {
-        spans.push(Span::styled(
-            format!("  update v{version} available: factoryctl update --install"),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
     frame.render_widget(Paragraph::new(Line::from(spans)), status_area);
+    if let Some(label) = update_label {
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(if board.update_progress.is_some() {
+                Color::Cyan
+            } else {
+                Color::Yellow
+            })),
+            update_area,
+        );
+        if board.update_progress.is_none() {
+            hits.add(update_area, Target::Update);
+        }
+    }
     frame.render_widget(
         Paragraph::new(controls.clone()).style(Style::default().fg(Color::Cyan)),
         controls_area,
@@ -139,6 +168,19 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
     }
 }
 
+fn progress_label(progress: UpdateProgress) -> String {
+    match progress {
+        UpdateProgress::Checking => "update: checking".to_owned(),
+        UpdateProgress::Downloading => "update: downloading".to_owned(),
+        UpdateProgress::Verifying => "update: verifying".to_owned(),
+        UpdateProgress::Unpacking => "update: unpacking".to_owned(),
+        UpdateProgress::Activating => "update: activating".to_owned(),
+        UpdateProgress::Reloading => "update: reloading".to_owned(),
+        UpdateProgress::CheckingHealth => "update: health check".to_owned(),
+        UpdateProgress::RollingBack => "update: rolling back".to_owned(),
+    }
+}
+
 pub fn render_overlay(frame: &mut Frame, area: Rect, board: &Board) {
     match &board.mode {
         Mode::Confirm(action) => render_confirm(frame, area, action),
@@ -151,17 +193,33 @@ pub fn render_overlay(frame: &mut Frame, area: Rect, board: &Board) {
 }
 
 fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
-    let (title, prompt_line) = match action {
-        PendingAction::DeleteTask(task_id) => {
-            ("delete task?".to_owned(), format!("delete task#{task_id}?"))
-        }
+    let (title, prompt_line, confirm_line) = match action {
+        PendingAction::DeleteTask(task_id) => (
+            "delete task?".to_owned(),
+            format!("delete task#{task_id}?"),
+            "y / Enter to confirm — any other key cancels",
+        ),
+        PendingAction::ResetBudget { source, .. } => (
+            "reset budget?".to_owned(),
+            format!(
+                "reset the durable budget for {}?",
+                source
+                    .agent_id
+                    .as_ref()
+                    .map_or("this agent", factory_core::AgentId::as_str)
+            ),
+            "y / Enter to confirm — any other key cancels",
+        ),
         PendingAction::StopSession { session_id, .. } => (
             "stop agent?".to_owned(),
             format!("stop session {session_id}?"),
+            "y / Enter / x again to confirm — any other key cancels",
         ),
-        PendingAction::StopRun { run_id, .. } => {
-            ("stop agent?".to_owned(), format!("stop run {run_id}?"))
-        }
+        PendingAction::StopRun { run_id, .. } => (
+            "stop agent?".to_owned(),
+            format!("stop run {run_id}?"),
+            "y / Enter / x again to confirm — any other key cancels",
+        ),
     };
     let rect = centered_rect(area, 56, 5);
     frame.render_widget(Clear, rect);
@@ -173,7 +231,7 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
     let text = vec![
         Line::from(prompt_line),
         Line::from(""),
-        Line::from("y / Enter / x again to confirm — any other key cancels"),
+        Line::from(confirm_line),
     ];
     frame.render_widget(Paragraph::new(text), inner);
 }
@@ -185,6 +243,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
         PromptKind::ReorderTask(task_id) => format!("reorder — task#{task_id}"),
+        PromptKind::AttentionAnswer { session_id, .. } => {
+            format!("decision answer — session#{session_id}")
+        }
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
         PromptKind::Capacity => "live-session capacity".to_owned(),
@@ -315,11 +376,12 @@ const HELP_TEXT: &[&str] = &[
     "o          message the orchestrator (picks by Tab if more than one)",
     "p          focus a project (remembered for next time)",
     "x          stop the selected agent — 2-press confirm",
-    "g          jump to the next agent in NEEDS YOU",
+    "g          jump to the next decision in NEEDS YOU",
     "i/Enter    AGENT: type into the live terminal",
     "Ctrl-]     return terminal input to BOARD mode",
     "z          maximise/restore terminal     PgUp/PgDn scroll",
     "mouse      click tabs/rows/pane; wheel scrolls terminal history",
+    "u          install the shown update and relaunch this viewer",
     "Space      pause/resume agent            t manage active task",
     "I / M      edit instructions.md / memory.md in $EDITOR",
     "q          detach (quits the client only — never stops the factory)",
@@ -345,4 +407,61 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
     let lines: Vec<Line> = HELP_TEXT.iter().map(|line| Line::from(*line)).collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn update_mouse_target_is_exactly_where_the_label_is_drawn() {
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        board.update_available = Some("0.2.6".to_owned());
+        let mut hits = HitMap::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let start = text
+            .find("[u update v0.2.6]")
+            .expect("visible update label");
+        let start = u16::try_from(start).unwrap();
+        assert_eq!(hits.target_at(start, 0), Some(Target::Update));
+        assert_eq!(hits.target_at(start + 16, 0), Some(Target::Update));
+        assert_ne!(
+            hits.target_at(start.saturating_sub(1), 0),
+            Some(Target::Update)
+        );
+    }
+
+    #[test]
+    fn progress_replaces_the_action_and_cannot_be_clicked() {
+        let mut board = Board::new(false, 0, theme::PLAIN);
+        board.update_available = Some("0.2.6".to_owned());
+        board.update_progress = Some(UpdateProgress::Verifying);
+        let mut hits = HitMap::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
+            .unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("update: verifying"));
+        assert!((0..100).all(|column| hits.target_at(column, 0) != Some(Target::Update)));
+    }
 }

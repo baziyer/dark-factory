@@ -27,7 +27,15 @@ catalogue.
    atomically with a valid UTF-8 recent-line projection. `PROJECT.md`, Rules,
    and standing instructions are never rewritten by memory compaction.
 3. `factory-tui` and `factoryctl` are clients. Stopping, rebuilding, or losing
-   either one cannot change the lifetime of an agent.
+   either one cannot change the lifetime of an agent. A manual TUI update uses
+   the same verified active-runtime transaction as `factoryctl`, then execs
+   only the digest-verified immutable version-directory viewer after exact
+   daemon health succeeds; the mutation lock spans that seam and a private
+   phase record bound to the canonical home/socket/plist/UID/job identity
+   makes a crashed handoff recoverable only by its original authority. Managed
+   health proves the launchd PID and active sibling executables, not just a
+   version string. Local attach panes are closed, but runner and provider
+   process identities are unchanged.
 4. A **session**, not a run, is the unit `factory-runner` supervises: one
    resident, interactive provider process per agent (Claude Code, Codex, or
    the minimal `shell` provider), spawned under a PTY and living across many
@@ -119,11 +127,20 @@ catalogue.
    reasons separate provider questions/permissions from worker blocks,
    delivery or observation failures, exhausted budgets, and lifecycle
    inference; every client receives the same bounded control-safe summary,
-   source IDs, age, and safe action. Attention is not permission to stop or
-   replace a worker; recovery begins by preserving or explicitly resolving
-   dirty work. Fleet attention snapshots carry the durable event high-water
-   mark from the same store read, so a delayed snapshot cannot overwrite a
-   resolution already observed on the event stream.
+   source IDs, age, and safe action. NEEDS YOU is a decision inbox: only
+   reasons with a valid typed operator decision enter it. Unproven lifecycle
+   inference has no valid typed operator action and remains a control-plane
+   concern alongside delivery, observer, capacity, and other deterministic
+   recovery. Selecting a row keeps BUILDING visible and shows
+   the same bounded cause, exact evidence, typed choices, optional safe
+   recommendation, and consequences in both `factoryctl status` and the TUI.
+   Permission and budget choices have no default and require explicit selection;
+   budget reset also requires a second stale-safe confirmation.
+   Attention is not permission to stop or replace a worker; recovery begins by
+   preserving or explicitly resolving dirty work. Fleet attention snapshots carry the
+   durable event high-water mark from the same store read, so a delayed
+   snapshot cannot overwrite a resolution already observed on the event
+   stream.
    The agent's `current_session_id` is the exact live-session relation used
    by BUILDING activity: it is derived from sessions whose `ended_at_ms` is
    null, and session create/end transactions publish the matching

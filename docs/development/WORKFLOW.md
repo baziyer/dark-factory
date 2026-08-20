@@ -41,6 +41,13 @@ bypass, or release the lease. The summary contract is checked by
 this macOS-specific lease harness and its release fixtures; GitHub runs that
 mode in an isolated hosted job.
 
+After the macOS lease records its diagnostic owner, the single `local-ci.sh`
+entry boundary removes inherited Dark Factory home, socket, and task/session
+identity overrides before any gate child runs. Tests still set their own
+throwaway homes and sockets, while local-CI test seams, Cargo/Rust toolchain
+inputs, and provider configuration remain available. Callers therefore run the
+authoritative gate directly; they do not need a separate `env -u` recipe.
+
 Before either source gate starts a broad Rust compile,
 `scripts/check-build-headroom.sh` reports the exact filesystem bytes available
 to the active Cargo target and that target's exact allocated bytes (the
@@ -316,9 +323,9 @@ remove it: `./svc.sh stop && ./svc.sh uninstall && ./config.sh remove
 GitHub Releases are the source of truth for binaries; nothing else builds
 them.
 
-1. **Build and publish**: pushing a semver tag (`git tag v0.2.5 && git push
-   origin v0.2.5`, on a commit whose `Cargo.toml` workspace version is
-   `0.2.5` — the workflow refuses a mismatch) runs
+1. **Build and publish**: pushing a semver tag (`git tag v0.2.6 && git push
+   origin v0.2.6`, on a commit whose `Cargo.toml` workspace version is
+   `0.2.6` — the workflow refuses a mismatch) runs
    `.github/workflows/release.yml` on the trusted self-hosted arm Mac. One
    serialized job builds `aarch64-apple-darwin` and then
    `x86_64-apple-darwin`; there is no release-writing matrix to race shared
@@ -333,7 +340,7 @@ them.
    transport failures get four attempts with 2/4/8-second backoff. After any
    failed write, the publisher reads the release once and accepts an
    already-committed exact result; deterministic client errors are not
-   retried. A tag with a pre-release suffix (`v0.2.5-rc.1`) is published as
+   retried. A tag with a pre-release suffix (`v0.2.6-rc.1`) is published as
    a pre-release so `releases/latest` keeps pointing at the newest full
    release. `latest.json` is `{version, tag, assets: {<target>: {url,
    sha256}}}` with both macOS targets; the newest one is always at
@@ -358,12 +365,19 @@ them.
    is cached in `$DARK_FACTORY_HOME/update-check.json`;
    `factory-tui` reads the same cache and refetches at most hourly, in a
    background thread of the running board — no background service — and
-   shows `update vX available: factoryctl update --install` in its status
-   line. `factoryctl health` also returns the daemon's `version`.
-3. **Install**: `factoryctl update --install` first does every read-only
-   check (the manifest; the launchd job, if any, and that it runs with
+   shows one `[u update vX]` keyboard/mouse action in its status line.
+   Triggering that action is explicit; there is no automatic update setting.
+   `factoryctl health` also returns the daemon's `version`.
+3. **Install**: `factoryctl update --install` and the TUI action call one
+   shared transaction. It first does every read-only
+   check (a canonical stable `MAJOR.MINOR.PATCH` manifest with bounded safe
+   asset fields and exact lowercase SHA-256 digests; the launchd job, if any,
+   and that it runs with
    *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
-   moving the operator's job), then downloads the platform asset, verifies
+   moving the operator's job). It captures the exact job/plist state, takes
+   the shared runtime-mutation lock before downloading, and refuses to begin
+   if that job appeared, disappeared, or changed after preflight. It then
+   downloads the platform asset, verifies
    its SHA-256, unpacks it into `$DARK_FACTORY_HOME/bin/<version>/` (staged,
    renamed into place only once every binary checked out; a complete
    version already on disk is reused), atomically repoints
@@ -377,7 +391,14 @@ them.
    if the new daemon never answers, exit 1 says where the log is and how to
    roll back by hand. If the new version is already installed and running,
    nothing restarts. Without a launchd job it stops after activation and
-   says so; restart the daemon however you run it.
+   says so; restart the daemon however you run it. The TUI requires the
+   matching managed launchd job so it cannot activate an update and then
+   strand itself against an old independently managed daemon. Its bounded
+   status reports stages from inside the download, SHA verification, unpack,
+   activation, job reload, and exact-version health operations.
+   A complete version directory is reusable only with a private identity file
+   matching the release archive digest and fresh hashes of all four executable
+   bytes; mode-only or same-version substitutions are refused.
 4. **Migrations** run at daemon start (`crates/factoryd/migrations/`), so
    an update never needs a separate migration step.
 5. **No lost work**: sessions and runners are independent process trees
@@ -399,6 +420,27 @@ them.
    (or repoint it the same atomic way) and `launchctl kickstart -k
    gui/$(id -u)/com.dark-factory.factoryd`. Nothing is deleted on install,
    so a rollback never re-downloads.
+   After a successful TUI install, the viewer validates and execs the exact
+   digest-proven `$DARK_FACTORY_HOME/bin/<version>/factory-tui` returned by
+   that transaction, never a second mutable `bin/current` lookup, retaining
+   its PID and restoring the focused project, selected agent, BUILDING/AGENT
+   view, and maximized-terminal intent from the next durable snapshot. Before
+   exec it closes only local attach panes and restores the host terminal. If exec
+   preparation or exec itself returns an error, the shared rollback plan
+   restores the prior runtime and launchd job, verifies the old daemon's exact
+   version, and leaves the old board running with one actionable error. Runner
+   and provider processes are not children of the viewer and are untouched.
+   The transaction keeps the shared runtime-mutation lock through this exec
+   seam. Normal keyboard/mouse detach is delayed and the update worker is
+   joined. Before activation and at reload/health boundaries it atomically
+   records the prior runtime/job in a private recovery file. On next viewer
+   start, the canonical factory home, socket, plist, operator UID, and launchd
+   job label must match the saved authority before the record can be consumed
+   or any rollback starts. Pre-health phases then roll back and verify the
+   exact old managed daemon; an awaiting-relaunch phase is committed only if
+   the socket responder is the launchd-owned PID using the active sibling
+   executables. Download-only interruption has not mutated the runtime and
+   its staging directory is replaced on the next attempt.
 7. **Homebrew bootstrap substrate**: this repository renders the exact
    custom-tap formula from the two archive checksums and the update-manifest
    checksum, then publishes it as `dark-factory.rb`. The versioned manifest

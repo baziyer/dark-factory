@@ -19,18 +19,41 @@
 //! binaries checked out; any failure removes the staging directory.
 
 use std::{
-    fs, io,
-    os::unix::fs::{PermissionsExt, symlink},
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
     process::Command,
 };
 
 pub use crate::update::RELEASE_BINARIES as BINARIES;
 use crate::update::{self, Manifest};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+/// Observable boundaries of the archive install. Emitted immediately before
+/// the named work starts, so a caller never labels checksum or unpack time as
+/// download time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReleaseInstallStage {
+    Downloading,
+    Verifying,
+    Unpacking,
+}
 
 /// Downloads larger than this are refused before verification even starts.
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+const RELEASE_IDENTITY_FILE: &str = ".release-identity.json";
+const MAX_RELEASE_IDENTITY_BYTES: u64 = 16 * 1024;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseIdentity {
+    version: String,
+    archive_sha256: String,
+    binaries: BTreeMap<String, String>,
+}
 
 /// `<home>/bin`.
 #[must_use]
@@ -66,6 +89,18 @@ pub fn install_release(
     manifest: &Manifest,
     log: &mut dyn FnMut(&str),
 ) -> Result<PathBuf, String> {
+    install_release_with_progress(home, manifest, log, &mut |_| {})
+}
+
+/// [`install_release`] with typed, truthful progress boundaries for operator
+/// clients. The original wrapper remains for callers that only need logs.
+pub fn install_release_with_progress(
+    home: &Path,
+    manifest: &Manifest,
+    log: &mut dyn FnMut(&str),
+    progress: &mut dyn FnMut(ReleaseInstallStage),
+) -> Result<PathBuf, String> {
+    update::validate_manifest(manifest)?;
     let key = update::platform_key();
     let asset = manifest
         .assets
@@ -79,11 +114,20 @@ pub fn install_release(
                 destination.display()
             )
         })?;
+        verify_release_identity(&destination, &manifest.version, &asset.sha256).map_err(
+            |error| {
+                format!(
+                    "{error}; remove {} to download it again",
+                    destination.display()
+                )
+            },
+        )?;
         log(&format!("{} already present", destination.display()));
         return Ok(destination);
     }
     stage(home, &manifest.version, |staging| {
         let archive = staging.join("release.tar.gz");
+        progress(ReleaseInstallStage::Downloading);
         log(&format!("downloading {}", asset.url));
         update::curl_to_file(&asset.url, &archive, MAX_ARCHIVE_BYTES)?;
         let size = fs::metadata(&archive)
@@ -95,6 +139,7 @@ pub fn install_release(
                 asset.url
             ));
         }
+        progress(ReleaseInstallStage::Verifying);
         let digest = sha256_file(&archive)?;
         if !digest.eq_ignore_ascii_case(asset.sha256.trim()) {
             return Err(format!(
@@ -103,6 +148,7 @@ pub fn install_release(
             ));
         }
         log(&format!("verified sha256 {digest}"));
+        progress(ReleaseInstallStage::Unpacking);
         let status = Command::new("tar")
             .arg("-xzf")
             .arg(&archive)
@@ -113,9 +159,100 @@ pub fn install_release(
         if !status.success() {
             return Err(format!("unpacking {} failed ({status})", archive.display()));
         }
+        verify_binaries(staging)?;
+        write_release_identity(staging, &manifest.version, &digest)?;
         fs::remove_file(&archive).map_err(|error| error.to_string())
     })
     .inspect(|installed| log(&format!("installed {}", installed.display())))
+}
+
+/// Requires an installed release to be the exact archive identity previously
+/// verified for this version, and requires every still-executable binary to
+/// retain the digest captured immediately after unpacking.
+pub fn verify_release_identity(
+    directory: &Path,
+    version: &str,
+    archive_sha256: &str,
+) -> Result<(), String> {
+    let directory_metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("could not inspect {}: {error}", directory.display()))?;
+    if !directory_metadata.file_type().is_dir() {
+        return Err(format!("{} is not a direct directory", directory.display()));
+    }
+    verify_binaries(directory)?;
+    let path = directory.join(RELEASE_IDENTITY_FILE);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "{} has no verified release identity: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.file_type().is_file()
+        || metadata.permissions().mode() & 0o777 != 0o600
+        || metadata.len() > MAX_RELEASE_IDENTITY_BYTES
+    {
+        return Err(format!(
+            "{} is not a private bounded regular identity file",
+            path.display()
+        ));
+    }
+    let identity: ReleaseIdentity = serde_json::from_slice(
+        &fs::read(&path).map_err(|error| format!("reading {}: {error}", path.display()))?,
+    )
+    .map_err(|error| format!("{} is invalid: {error}", path.display()))?;
+    if identity.version != version || identity.archive_sha256 != archive_sha256 {
+        return Err(format!(
+            "{} does not match release {version} archive {archive_sha256}",
+            path.display()
+        ));
+    }
+    if identity.binaries.len() != BINARIES.len() {
+        return Err(format!(
+            "{} has an incomplete binary identity",
+            path.display()
+        ));
+    }
+    for name in BINARIES {
+        let expected = identity
+            .binaries
+            .get(name)
+            .ok_or_else(|| format!("{} omits {name}", path.display()))?;
+        let actual = sha256_file(&directory.join(name))?;
+        if &actual != expected {
+            return Err(format!(
+                "{} no longer matches its verified release identity",
+                directory.join(name).display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn write_release_identity(
+    directory: &Path,
+    version: &str,
+    archive_sha256: &str,
+) -> Result<(), String> {
+    let binaries = BINARIES
+        .into_iter()
+        .map(|name| sha256_file(&directory.join(name)).map(|digest| (name.to_owned(), digest)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let bytes = serde_json::to_vec(&ReleaseIdentity {
+        version: version.to_owned(),
+        archive_sha256: archive_sha256.to_owned(),
+        binaries,
+    })
+    .map_err(|error| error.to_string())?;
+    let path = directory.join(RELEASE_IDENTITY_FILE);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|error| format!("creating {}: {error}", path.display()))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("writing {}: {error}", path.display()))
 }
 
 /// Copies the four binaries from `source` (typically the directory the
@@ -353,7 +490,8 @@ mod tests {
         };
         let lines = std::cell::RefCell::new(Vec::new());
         let mut log = |line: &str| lines.borrow_mut().push(line.to_owned());
-        let error = install_release(home.path(), &manifest("00"), &mut log).unwrap_err();
+        let error =
+            install_release(home.path(), &manifest(&"00".repeat(32)), &mut log).unwrap_err();
         assert!(error.contains("checksum mismatch"), "{error}");
         assert!(!version_dir(home.path(), "0.3.0").exists());
         assert!(
@@ -370,7 +508,20 @@ mod tests {
         assert!(install_release(home.path(), &unreachable, &mut log).is_err());
         assert!(!bin_dir(home.path()).join(".staging-0.3.0").exists());
 
-        let installed = install_release(home.path(), &manifest(&sha), &mut log).unwrap();
+        let stages = std::cell::RefCell::new(Vec::new());
+        let installed =
+            install_release_with_progress(home.path(), &manifest(&sha), &mut log, &mut |stage| {
+                stages.borrow_mut().push(stage)
+            })
+            .unwrap();
+        assert_eq!(
+            *stages.borrow(),
+            [
+                ReleaseInstallStage::Downloading,
+                ReleaseInstallStage::Verifying,
+                ReleaseInstallStage::Unpacking,
+            ]
+        );
         assert_eq!(installed, version_dir(home.path(), "0.3.0"));
         verify_binaries(&installed).unwrap();
         assert!(!installed.join("release.tar.gz").exists());
@@ -385,6 +536,19 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("already present"))
         );
+        let error =
+            install_release(home.path(), &manifest(&"00".repeat(32)), &mut log).unwrap_err();
+        assert!(error.contains("does not match release"), "{error}");
+        // Keeping all four files executable is insufficient: modified bytes
+        // must not be reused under the release's verified identity.
+        fs::write(installed.join("factory-tui"), b"#!/bin/sh\necho tampered\n").unwrap();
+        fs::set_permissions(
+            installed.join("factory-tui"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let error = install_release(home.path(), &manifest(&sha), &mut log).unwrap_err();
+        assert!(error.contains("no longer matches"), "{error}");
         // A tampered version directory is refused, not "reused".
         fs::remove_file(installed.join("factory-tui")).unwrap();
         assert!(

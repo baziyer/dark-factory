@@ -124,10 +124,17 @@ The TUI has two screens:
 
 Select an agent and press `Enter` to open AGENT. Press `i` or `Enter` to type
 in its terminal. Press `Ctrl-]` to return control to the board. Press `g` to
-jump to the next item in NEEDS YOU and open its explicit action card before
-typing. The card distinguishes provider questions and permissions from worker
-blocks, delivery/recovery failures, observer problems, exhausted budgets, and
-inferred lifecycle state. Press `?` for all keys. Press `q` to detach.
+jump to the next item in NEEDS YOU and open its decision card in the BUILDING
+right pane; selection never detours into an agent terminal. The card contains
+the bounded cause, exact project/agent/task/session/run evidence, safe typed
+choices, an optional safe default, and each consequence. Press `Enter` when a
+safe default is shown, or `1`–`9` for a displayed choice. Provider questions
+use a bounded answer prompt; provider permissions require an explicit typed
+Approve or Reject choice. Budget reset has no default and requires a second
+confirmation. Free-form worker-block reasons remain diagnostics until the
+daemon can prove a typed human decision; delivery, observer, capacity, and
+unproven deterministic recovery stay with the control plane. Press `?` for all keys.
+Press `q` to detach.
 Detaching does not stop any agent.
 
 Mouse navigation uses the same selections as the keyboard: click the footer's
@@ -147,7 +154,9 @@ factoryctl agent status --project my-project --agent worker-1
 ```
 
 `factoryctl status` is a concise fleet summary for people, including each
-bounded attention reason, its task/session/age, and a safe next action.
+bounded decision reason, its task/session/age, typed choices, and a safe next
+action. It uses the same decision projection as the TUI; deterministic
+recovery diagnostics are not presented as NEEDS YOU.
 `factoryctl agent status` exposes the same structured attention projection for
 one agent. Terminal attach failures are durable observer problems in that same
 projection and disappear after a successful reattach without erasing an
@@ -187,9 +196,34 @@ Homebrew updates the bootstrap. `factoryctl update --install` updates the active
 runtime and restarts the daemon; running agent sessions continue. Do not use
 `brew services` for Dark Factory.
 
+When the board shows `[u update vX.Y.Z]`, press `u` or click that exact action
+to run the same verified install transaction without leaving the TUI. The
+board reports download, verification, unpack, activation, reload, and health
+progress, then replaces only its own process image with the active
+release's digest-verified version-directory `factory-tui` (never a later
+`bin/current` lookup). Its PID and current project/screen selection are
+retained; daemon-supervised runners and provider sessions are not restarted.
+This is a manual action: Dark Factory does not auto-update. If relaunch
+preparation or exec fails, the active runtime and managed launchd job are
+rolled back and the old TUI remains available with the error. An older viewer
+still offers the action when the matching runtime was already installed from
+`factoryctl`.
+Detach is delayed while this transaction owns the runtime. A private durable
+phase record lets the next viewer roll back a crash-interrupted mutation, or
+commit a handoff only when the exact new managed daemon is already healthy.
+That record is bound to the canonical factory home, socket, launchd plist,
+operator UID, and job label; a viewer aimed at another daemon cannot consume
+or act on it. Managed health requires the socket responder to be launchd's
+exact job PID using the active runtime's sibling executables, not merely a
+daemon that reports the expected version.
+
 `factoryctl update` reports the invoking bootstrap, active runtime, latest
 release, and install availability in human-readable lines. Use
 `factoryctl update --json` for the machine-readable report.
+Fetched and cached manifests accept only canonical stable `MAJOR.MINOR.PATCH`
+versions, bounded safe asset fields, and exact lowercase SHA-256 digests.
+Reusing an installed release requires both its archive identity and every
+binary digest to match; executable-looking modified files are refused.
 
 `brew uninstall dark-factory` removes only the bootstrap. The active runtime,
 launchd job, and state remain. See the [service and uninstall

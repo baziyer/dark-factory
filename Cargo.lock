@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "factory-core"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "base64",
  "serde",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "factory-runner"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "factory-core",
  "factoryd",
@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "factory-tui"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "factory-core",
@@ -446,7 +446,7 @@ dependencies = [
 
 [[package]]
 name = "factoryctl"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "factory-core",
  "nix 0.28.0",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "factoryd"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "axum",
  "factory-core",
