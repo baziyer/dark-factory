@@ -1826,7 +1826,11 @@ async fn handle_request(
             execution
                 .reset_delivery_attempt(&wake_project_id, &wake_agent_id)
                 .await?;
-            execution.wake(wake_project_id, wake_agent_id);
+            if agent.role == AgentRole::Orchestrator {
+                execution.wake_orchestrator(wake_project_id).await?;
+            } else {
+                execution.wake(wake_project_id, wake_agent_id);
+            }
             Ok(LocalResponse::AgentResumed { agent })
         }
         LocalRequest::ListSessions {

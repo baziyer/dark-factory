@@ -54,6 +54,10 @@ fn rewind_session_work_migration(database: &std::path::Path) {
              DROP TABLE session_work;
              DROP INDEX delivery_attempts_session_work_identity;
              DROP INDEX IF EXISTS runs_one_open_per_session;
+             DROP INDEX orchestrator_cycle_ledger_project_state;
+             DROP TABLE orchestrator_cycle_ledger;
+             DROP TABLE orchestrator_scheduler_state;
+             ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
              ALTER TABLE delivery_attempts DROP COLUMN run_id;
              ALTER TABLE delivery_attempts DROP COLUMN task_revision;
              ALTER TABLE tasks DROP COLUMN work_revision;
@@ -381,7 +385,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 29 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 30 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, provider resume recovery, observer
 /// reason, typed notification cause, and the widened Claude notification
@@ -478,14 +482,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0029.
+    // Opening through the real store runs migrations 0014 through 0030.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -542,6 +546,10 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
                  DROP TABLE session_work;
                  DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
+                 DROP INDEX orchestrator_cycle_ledger_project_state;
+                 DROP TABLE orchestrator_cycle_ledger;
+                 DROP TABLE orchestrator_scheduler_state;
+                 ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
                  ALTER TABLE tasks DROP COLUMN work_revision;
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
@@ -564,7 +572,7 @@ fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -660,6 +668,10 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
                  DROP TABLE session_work;
                  DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
+                 DROP INDEX orchestrator_cycle_ledger_project_state;
+                 DROP TABLE orchestrator_cycle_ledger;
+                 DROP TABLE orchestrator_scheduler_state;
+                 ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
@@ -673,7 +685,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     let message_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
@@ -803,6 +815,10 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                  PRAGMA foreign_keys = OFF;
                  DROP TABLE session_work;
                  DROP INDEX delivery_attempts_session_work_identity;
+                 DROP INDEX orchestrator_cycle_ledger_project_state;
+                 DROP TABLE orchestrator_cycle_ledger;
+                 DROP TABLE orchestrator_scheduler_state;
+                 ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
@@ -1265,14 +1281,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0029 migrations.
+    // Opening through the real store runs the 0015 through 0030 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 29);
+    assert_eq!(version, 30);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"

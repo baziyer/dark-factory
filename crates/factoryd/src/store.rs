@@ -2059,6 +2059,7 @@ impl Store {
         }
 
         end_session_work_in_transaction(&transaction, session_id, now_ms)?;
+        Self::recover_orchestrator_cycles_in_transaction(&transaction, now_ms)?;
 
         let session = load_session(&transaction, session_id)?.ok_or(StoreError::SessionNotFound)?;
         let snapshot = session.snapshot();
@@ -3323,6 +3324,15 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::recover_orchestrator_cycles_in_transaction(&transaction, now_ms)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn recover_orchestrator_cycles_in_transaction(
+        transaction: &Transaction<'_>,
+        now_ms: i64,
+    ) -> Result<()> {
         let mut statement = transaction.prepare(
             "SELECT s.project_id, s.active_lease_id, s.active_agent_id,
                     c.from_sequence, c.through_sequence, c.attempt_id, d.state
@@ -3421,7 +3431,6 @@ impl Store {
                 )?;
             }
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -6543,7 +6552,7 @@ fn validate_session_work_identity(
             "SELECT id, project_id, agent_id, session_id, task_id,
                     task_incarnation_id, message_ids_json,
                     text, failure_count, next_attempt_at_ms, state,
-                    task_revision, run_id, orchestrator_cycle_lease_id
+                    task_revision, run_id, NULL AS orchestrator_cycle_lease_id
              FROM delivery_attempts WHERE id = ?1",
             params![lease.attempt_id.as_str()],
             delivery_attempt_from_row,
@@ -7323,6 +7332,13 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         current = 29;
     }
     if current == 29 {
+        // Integration contract for the unmerged #133 branch: this branch is
+        // the sole owner of migration 0030 while it is based on main. If
+        // #133 lands first, this block must be rebased after its principal
+        // migration and the scheduler migration must become 0031; if this
+        // branch lands first, #133 must make the same serialized renumbering.
+        // Keeping that sequencing explicit prevents either migration from
+        // being silently skipped at the shared user_version 30 boundary.
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
             "../migrations/0030_orchestrator_scheduler.sql"
@@ -8553,5 +8569,288 @@ mod tests {
             store.session_work(&session_id).unwrap().work.unwrap().phase,
             SessionWorkPhase::Empty
         ));
+    }
+
+    #[test]
+    fn migration_0030_replays_from_a_true_v29_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("v29.db");
+        drop(Store::open(&database).unwrap());
+        {
+            let connection = Connection::open(&database).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     DROP INDEX orchestrator_cycle_ledger_project_state;
+                     DROP TABLE orchestrator_cycle_ledger;
+                     DROP TABLE orchestrator_scheduler_state;
+                     ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
+                     PRAGMA user_version = 29;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+        }
+
+        let store = Store::open(&database).unwrap();
+        let version: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            store
+                .connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'orchestrator_scheduler_state'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn orchestrator_cycle_lease_is_requeued_atomically_when_session_ends() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("orchestrator").unwrap();
+        let session_id = SessionId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Orchestrator,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "22222222-2222-4222-8222-222222222222",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner".into(),
+                    runner_protocol_version: 1,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO orchestrator_scheduler_state (
+                    project_id, pending_from_sequence, pending_through_sequence,
+                    active_lease_id, active_agent_id, updated_at_ms
+                 ) VALUES (?1, 10, 20, NULL, NULL, 4)",
+                params![project_id.as_str()],
+            )
+            .unwrap();
+        let lease = store
+            .claim_orchestrator_cycle(&project_id, &agent_id, 5)
+            .unwrap()
+            .unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "cycle-attempt".into(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: session_id.clone(),
+                task_id: None,
+                task_incarnation_id: None,
+                task_revision: None,
+                require_queue_head: false,
+                message_ids: Vec::new(),
+                text: "fixed orchestrator instruction".into(),
+                created_at_ms: 6,
+            })
+            .unwrap();
+        store
+            .bind_orchestrator_cycle_attempt(&lease.lease_id, "cycle-attempt", 7)
+            .unwrap();
+
+        store.end_session(&session_id, Some(0), None, 8).unwrap();
+
+        let state: (Option<i64>, Option<i64>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT pending_from_sequence, pending_through_sequence, active_lease_id
+                 FROM orchestrator_scheduler_state WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, (Some(10), Some(20), None));
+        assert_eq!(
+            store.delivery_attempt_state("cycle-attempt").unwrap(),
+            Some(DeliveryAttemptState::Cancelled)
+        );
+        let lease_state: String = store
+            .connection
+            .query_row(
+                "SELECT state FROM orchestrator_cycle_ledger WHERE lease_id = ?1",
+                params![lease.lease_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_state, "recovered");
+    }
+
+    #[test]
+    fn orchestrator_terminal_event_ranges_coalesce_duplicate_and_gapped_events() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let (_, event) = store
+            .create_task(
+                NewTask {
+                    id: TaskId::try_from("terminal-task").unwrap(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "terminal".into(),
+                    body: "body".into(),
+                    priority: 0,
+                },
+                2,
+            )
+            .unwrap();
+        let mut later = event.clone();
+        later.sequence += 7;
+        let transaction = store
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            note_orchestrator_terminal_events(
+                &transaction,
+                &project_id,
+                std::slice::from_ref(&event),
+                3,
+            )
+            .unwrap()
+        );
+        assert!(
+            note_orchestrator_terminal_events(&transaction, &project_id, &[event, later], 4,)
+                .unwrap()
+        );
+        transaction.commit().unwrap();
+        let range: (i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT pending_from_sequence, pending_through_sequence
+                 FROM orchestrator_scheduler_state WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(range, (2, 9));
+    }
+
+    #[test]
+    fn pending_orchestrator_cycle_survives_restart_and_paused_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("scheduler.db");
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let old_agent = AgentId::try_from("old-orchestrator").unwrap();
+        let current_agent = AgentId::try_from("current-orchestrator").unwrap();
+        {
+            let mut store = Store::open(&database).unwrap();
+            store
+                .create_project(
+                    NewProject {
+                        id: project_id.clone(),
+                        name: "Factory".into(),
+                        root: "/tmp/factory".into(),
+                    },
+                    1,
+                )
+                .unwrap();
+            for (agent_id, now) in [(&old_agent, 2), (&current_agent, 3)] {
+                store
+                    .create_agent(
+                        NewAgent {
+                            id: agent_id.clone(),
+                            project_id: project_id.clone(),
+                            parent_agent_id: None,
+                            role: AgentRole::Orchestrator,
+                            provider: Provider::Shell,
+                        },
+                        now,
+                    )
+                    .unwrap();
+            }
+            store
+                .connection
+                .execute(
+                    "INSERT INTO orchestrator_scheduler_state (
+                        project_id, pending_from_sequence, pending_through_sequence,
+                        active_lease_id, active_agent_id, updated_at_ms
+                     ) VALUES (?1, 40, 44, NULL, NULL, 4)",
+                    params![project_id.as_str()],
+                )
+                .unwrap();
+            store.pause_agent(&project_id, &current_agent, 5).unwrap();
+            assert!(
+                store
+                    .claim_orchestrator_cycle(&project_id, &current_agent, 6)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+
+        let mut store = Store::open(&database).unwrap();
+        assert_eq!(
+            store.pending_orchestrator_wakes().unwrap(),
+            vec![(project_id.clone(), current_agent.clone())]
+        );
+        store.resume_agent(&project_id, &current_agent, 7).unwrap();
+        assert!(
+            store
+                .claim_orchestrator_cycle(&project_id, &old_agent, 8)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_orchestrator_cycle(&project_id, &current_agent, 9)
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -129,6 +129,10 @@ async fn factoryctl_replays_stored_v1_events_through_v2_and_receives_new_live_ev
                 "DROP TABLE session_work;
                  DROP INDEX delivery_attempts_session_work_identity;
                  DROP INDEX runs_one_open_per_session;
+                 DROP INDEX orchestrator_cycle_ledger_project_state;
+                 DROP TABLE orchestrator_cycle_ledger;
+                 DROP TABLE orchestrator_scheduler_state;
+                 ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
                  ALTER TABLE tasks DROP COLUMN work_revision;
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;

@@ -265,26 +265,12 @@ pub enum Error {
 struct WakeAgent {
     project_id: ProjectId,
     agent_id: AgentId,
-    include_orchestrator_cycle: bool,
 }
 
 fn send_wake(wake_tx: &mpsc::Sender<WakeAgent>, project_id: ProjectId, agent_id: AgentId) {
     let _ = wake_tx.try_send(WakeAgent {
         project_id,
         agent_id,
-        include_orchestrator_cycle: false,
-    });
-}
-
-fn send_scheduler_wake(
-    wake_tx: &mpsc::Sender<WakeAgent>,
-    project_id: ProjectId,
-    agent_id: AgentId,
-) {
-    let _ = wake_tx.try_send(WakeAgent {
-        project_id,
-        agent_id,
-        include_orchestrator_cycle: true,
     });
 }
 
@@ -598,7 +584,7 @@ impl Handle {
             .with_store(move |store| store.current_orchestrator(&lookup_project_id))
             .await?;
         if let Some(agent_id) = agent_id {
-            send_scheduler_wake(&self.wake_tx, project_id, agent_id);
+            send_wake(&self.wake_tx, project_id, agent_id);
         }
         Ok(())
     }
@@ -1157,7 +1143,7 @@ async fn run_dispatcher(
         .await
     {
         for (project_id, agent_id) in wakes {
-            send_scheduler_wake(&wake_tx, project_id, agent_id);
+            send_wake(&wake_tx, project_id, agent_id);
         }
     }
 
@@ -1171,11 +1157,7 @@ async fn run_dispatcher(
                 }
             }
             woken = wake_rx.recv() => {
-                let Some(WakeAgent {
-                    project_id,
-                    agent_id,
-                    include_orchestrator_cycle,
-                }) = woken else {
+                let Some(WakeAgent { project_id, agent_id }) = woken else {
                     return Ok(());
                 };
                 if let Err(error) =
@@ -1186,7 +1168,6 @@ async fn run_dispatcher(
                         &backoff,
                         &project_id,
                         &agent_id,
-                        include_orchestrator_cycle,
                     )
                     .await
                 {
@@ -1280,8 +1261,7 @@ async fn dispatch_agent(
     project_id: &ProjectId,
     agent_id: &AgentId,
 ) -> Result<(), Error> {
-    dispatch_agent_with_scheduler(config, state, wake_tx, backoff, project_id, agent_id, false)
-        .await
+    dispatch_agent_with_scheduler(config, state, wake_tx, backoff, project_id, agent_id).await
 }
 
 async fn dispatch_agent_with_scheduler(
@@ -1291,7 +1271,6 @@ async fn dispatch_agent_with_scheduler(
     backoff: &SpawnBackoff,
     project_id: &ProjectId,
     agent_id: &AgentId,
-    include_orchestrator_cycle: bool,
 ) -> Result<(), Error> {
     let hold_project_id = project_id.clone();
     let hold_agent_id = agent_id.clone();
@@ -1315,7 +1294,7 @@ async fn dispatch_agent_with_scheduler(
 
     match live {
         None => {
-            if has_pending_work(state, project_id, agent_id, include_orchestrator_cycle).await? {
+            if has_pending_work(state, project_id, agent_id).await? {
                 // Backoff (this track's item 1): a persistently broken
                 // spawn path must not busy-retry on every wake/tick --
                 // `backoff.ready` silently declines attempts still inside
@@ -1655,7 +1634,6 @@ async fn has_pending_work(
     state: &DaemonState,
     project_id: &ProjectId,
     agent_id: &AgentId,
-    include_orchestrator_cycle: bool,
 ) -> Result<bool, Error> {
     let hold_project_id = project_id.clone();
     let hold_agent_id = agent_id.clone();
@@ -1665,19 +1643,17 @@ async fn has_pending_work(
     {
         return Ok(false);
     }
-    if include_orchestrator_cycle {
-        let scheduler_project_id = project_id.clone();
-        let scheduler_agent_id = agent_id.clone();
-        let scheduler_pending = state
-            .with_store(move |store| {
-                Ok(store.current_orchestrator(&scheduler_project_id)?.as_ref()
-                    == Some(&scheduler_agent_id)
-                    && store.orchestrator_cycle_pending(&scheduler_project_id)?)
-            })
-            .await?;
-        if scheduler_pending {
-            return Ok(true);
-        }
+    let scheduler_project_id = project_id.clone();
+    let scheduler_agent_id = agent_id.clone();
+    let scheduler_pending = state
+        .with_store(move |store| {
+            Ok(store.current_orchestrator(&scheduler_project_id)?.as_ref()
+                == Some(&scheduler_agent_id)
+                && store.orchestrator_cycle_pending(&scheduler_project_id)?)
+        })
+        .await?;
+    if scheduler_pending {
+        return Ok(true);
     }
     let task_project_id = project_id.clone();
     let task_agent_id = agent_id.clone();
@@ -3107,7 +3083,7 @@ async fn wake_current_orchestrator(
         .with_store(move |store| store.current_orchestrator(&lookup_project_id))
         .await
     {
-        send_scheduler_wake(wake_tx, project_id, agent_id);
+        send_wake(wake_tx, project_id, agent_id);
     }
 }
 
@@ -5407,6 +5383,10 @@ mod tests {
                      DROP TABLE session_work;
                      DROP INDEX delivery_attempts_session_work_identity;
                      DROP INDEX runs_one_open_per_session;
+                     DROP INDEX orchestrator_cycle_ledger_project_state;
+                     DROP TABLE orchestrator_cycle_ledger;
+                     DROP TABLE orchestrator_scheduler_state;
+                     ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
                      ALTER TABLE delivery_attempts DROP COLUMN run_id;
                      ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                      ALTER TABLE tasks DROP COLUMN work_revision;
