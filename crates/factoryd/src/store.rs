@@ -9028,19 +9028,17 @@ mod tests {
             (Some(causal_event.sequence), Some(20), None),
             "the later event must coalesce with the original scheduler range"
         );
-        assert_eq!(
+        assert!(
             store
                 .claim_orchestrator_cycle(&project_id, &agent_id, 18)
                 .unwrap()
                 .is_some(),
-            true,
             "a later causal event must recover the stale live lease exactly once"
         );
-        assert_eq!(
-            store
+        assert!(
+            !store
                 .delivery_attempt_due(&project_id, &agent_id, &session_id, 18)
                 .unwrap(),
-            false,
             "the terminal attempt must not be replayed as a concurrent cycle"
         );
     }
