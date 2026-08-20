@@ -3335,7 +3335,8 @@ impl Store {
     ) -> Result<()> {
         let mut statement = transaction.prepare(
             "SELECT s.project_id, s.active_lease_id, s.active_agent_id,
-                    c.from_sequence, c.through_sequence, c.attempt_id, d.state
+                    c.from_sequence, c.through_sequence, c.attempt_id, d.state,
+                    c.created_at_ms
              FROM orchestrator_scheduler_state s
              JOIN orchestrator_cycle_ledger c ON c.lease_id = s.active_lease_id
              LEFT JOIN delivery_attempts d ON d.id = c.attempt_id
@@ -3351,6 +3352,7 @@ impl Store {
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3363,6 +3365,7 @@ impl Store {
             through_sequence,
             attempt_id,
             attempt_state,
+            lease_created_at_ms,
         ) in rows
         {
             let inferred_attempt_id = if attempt_id.is_none() {
@@ -3372,9 +3375,11 @@ impl Store {
                             "SELECT id FROM delivery_attempts
                              WHERE project_id = ?1 AND agent_id = ?2
                                AND task_id IS NULL AND message_ids_json = '[]'
+                               AND orchestrator_cycle_lease_id IS NULL
+                               AND created_at_ms >= ?3
                                AND state IN ('in_flight', 'retryable', 'terminal')
                              ORDER BY created_at_ms DESC, id DESC LIMIT 1",
-                            params![project_id.as_str(), agent_id],
+                            params![project_id.as_str(), agent_id, lease_created_at_ms],
                             |row| row.get::<_, String>(0),
                         )
                         .optional()?
@@ -9167,6 +9172,224 @@ mod tests {
             store
                 .claim_orchestrator_cycle(&project_id, &current_agent, 9)
                 .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn restart_recovery_does_not_infer_an_old_terminal_attempt_into_a_new_lease() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("orchestrator").unwrap();
+        let old_session_id = SessionId::try_from("55555555-5555-4555-8555-555555555555").unwrap();
+        let current_session_id =
+            SessionId::try_from("66666666-6666-4666-8666-666666666666").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Orchestrator,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: old_session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "77777777-7777-4777-8777-777777777777",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner-old".into(),
+                    runner_protocol_version: 1,
+                },
+                3,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &old_session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                4,
+            )
+            .unwrap();
+        store
+            .ensure_delivery_attempt(NewDeliveryAttempt {
+                id: "old-terminal-cycle-attempt".into(),
+                project_id: project_id.clone(),
+                agent_id: agent_id.clone(),
+                session_id: old_session_id.clone(),
+                task_id: None,
+                task_incarnation_id: None,
+                task_revision: None,
+                require_queue_head: false,
+                message_ids: Vec::new(),
+                text: "fixed orchestrator instruction".into(),
+                created_at_ms: 4,
+            })
+            .unwrap();
+        store
+            .end_session(&old_session_id, Some(0), None, 5)
+            .unwrap();
+        store
+            .create_session(
+                NewSession {
+                    id: current_session_id.clone(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    provider: Provider::Shell,
+                    runtime_model: None,
+                    runtime_reasoning_effort: None,
+                    runtime_permission_mode: None,
+                    runtime_control_mode: None,
+                    provider_session_id: None,
+                    worktree: "/tmp/factory".into(),
+                    codex_home: None,
+                    hook_token: "a".repeat(64),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "88888888-8888-4888-8888-888888888888",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner-current".into(),
+                    runner_protocol_version: 1,
+                },
+                8,
+            )
+            .unwrap();
+        store
+            .record_hook_event(
+                &current_session_id,
+                ProviderHookEvent::SessionStart,
+                None,
+                false,
+                None,
+                9,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE delivery_attempts
+                 SET state = 'terminal', failure_count = 2, next_attempt_at_ms = NULL
+                 WHERE id = 'old-terminal-cycle-attempt'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .deliver_agent_messages_by_ids_with_delivery_attempt(
+                    &project_id,
+                    &agent_id,
+                    &old_session_id,
+                    &[],
+                    Some("old-terminal-cycle-attempt"),
+                    9,
+                )
+                .is_err(),
+            "a reordered acknowledgement from the replaced session must be rejected"
+        );
+        store
+            .connection
+            .execute(
+                "INSERT INTO orchestrator_scheduler_state (
+                    project_id, pending_from_sequence, pending_through_sequence,
+                    active_lease_id, active_agent_id, updated_at_ms
+                 ) VALUES (?1, 10, 20, NULL, NULL, 9)",
+                params![project_id.as_str()],
+            )
+            .unwrap();
+        let lease = store
+            .claim_orchestrator_cycle(&project_id, &agent_id, 10)
+            .unwrap()
+            .unwrap();
+
+        store.recover_delivery_attempts(11).unwrap();
+        store.recover_delivery_attempts(12).unwrap();
+
+        let scheduler: (Option<i64>, Option<i64>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT pending_from_sequence, pending_through_sequence, active_lease_id
+                 FROM orchestrator_scheduler_state WHERE project_id = ?1",
+                params![project_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            scheduler,
+            (Some(10), Some(20), None),
+            "restart recovery must requeue an unowned lease, not bind an older attempt"
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT orchestrator_cycle_lease_id FROM delivery_attempts
+                     WHERE id = 'old-terminal-cycle-attempt'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT state FROM orchestrator_cycle_ledger WHERE lease_id = ?1",
+                    params![lease.lease_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "recovered"
+        );
+        assert!(
+            store
+                .claim_orchestrator_cycle(&project_id, &agent_id, 12)
+                .unwrap()
+                .is_some(),
+            "the replacement session must receive one current cycle"
+        );
+        assert!(
+            store
+                .claim_orchestrator_cycle(&project_id, &agent_id, 13)
+                .unwrap()
+                .is_none(),
+            "recovery must never create concurrent cycle leases"
+        );
+        assert!(
+            store
+                .session_work(&current_session_id)
+                .unwrap()
+                .work
                 .is_some()
         );
     }
