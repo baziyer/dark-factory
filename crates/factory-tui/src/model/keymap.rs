@@ -1451,10 +1451,7 @@ impl Board {
                 project_id,
                 task_id,
             }),
-            "retry" => Intent::Send(LocalRequest::RetryTask {
-                project_id,
-                task_id,
-            }),
+            "retry" => self.task_retry_request(project_id, task_id),
             "delete" => {
                 self.mode = Mode::Confirm(PendingAction::DeleteTask(task_id));
                 Intent::Redraw
@@ -1895,6 +1892,105 @@ mod tests {
             }),
         );
         assert_eq!(board.tasks.get(&newer.snapshot.id), Some(&newer));
+    }
+
+    #[test]
+    fn blocked_task_retry_cannot_regress_after_thirty_three_retired_operations() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let blocked = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 10);
+        board
+            .tasks
+            .insert(blocked.snapshot.id.clone(), blocked.clone());
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+
+        let newer = task("blocked", "proj", TaskStatus::Blocked, Some("alice"), 12);
+        board.apply_event(factory_core::EventEnvelope {
+            protocol_version: 1,
+            sequence: 1,
+            occurred_at_ms: 12,
+            event: factory_core::FactoryEvent::TaskChanged {
+                task: newer.snapshot.clone(),
+            },
+        });
+        assert!(board.pending_attention.is_none());
+
+        for index in 0..33 {
+            let filler_id = format!("filler-{index}");
+            let filler = attention(
+                AttentionReasonKind::WorkerBlocked,
+                Some("alice"),
+                Some(&filler_id),
+                None,
+                20 + i64::from(index),
+            );
+            board.begin_attention_request(
+                &filler,
+                factory_core::status::AttentionAction::RetryTask,
+                LocalRequest::RetryTask {
+                    project_id: ProjectId::try_from("proj").unwrap(),
+                    task_id: TaskId::try_from(filler_id).unwrap(),
+                },
+            );
+            board.clear_attention_request();
+        }
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert_eq!(board.tasks.get(&newer.snapshot.id), Some(&newer));
+    }
+
+    #[test]
+    fn task_menu_retry_success_uses_an_exact_current_operation() {
+        let mut board = board();
+        let task_id = TaskId::try_from("retryable").unwrap();
+        board.tasks.insert(
+            task_id.clone(),
+            task("retryable", "proj", TaskStatus::Failed, Some("alice"), 10),
+        );
+        board.selected_agent = Some(AgentId::try_from("alice").unwrap());
+        board.selected_task = Some(task_id.clone());
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('t'))),
+            Intent::Redraw
+        ));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Enter))
+        else {
+            panic!("task-menu retry did not register an exact operation");
+        };
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("retryable", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert_eq!(
+            board.tasks.get(&task_id).map(|task| task.snapshot.status),
+            Some(TaskStatus::Queued)
+        );
     }
 
     #[test]

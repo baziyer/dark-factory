@@ -1,7 +1,7 @@
 use factory_core::local::LocalRequest;
 use factory_core::status::{AttentionAction, AttentionItem, AttentionReasonKind, display_text};
 
-use super::{ATTENTION_HISTORY_CAPACITY, Board, Intent, StaleAttentionOperation, StatusLevel};
+use super::{Board, COMPLETED_ATTENTION_CAPACITY, Intent, StatusLevel};
 
 pub(super) fn sanitize_attention_item(mut item: AttentionItem) -> AttentionItem {
     item.reason.summary = display_text(&item.reason.summary);
@@ -71,6 +71,7 @@ impl Board {
             self.clear_attention_request();
         }
         let operation_id = self.allocate_operation_id();
+        self.track_retry_operation(operation_id, &request);
         self.pending_attention = Some(item.clone());
         self.pending_attention_action = Some(action);
         self.pending_attention_operation_id = Some(operation_id);
@@ -79,38 +80,13 @@ impl Board {
     }
 
     pub(crate) fn clear_attention_request(&mut self) {
-        let source = self.pending_attention.take();
-        let action = self.pending_attention_action.take();
         let operation_id = self.pending_attention_operation_id.take();
         let request = self.pending_attention_request.take();
-        if let (Some(source), Some(action), Some(operation_id), Some(request)) =
-            (source, action, operation_id, request)
-        {
-            self.stale_attention_operations
-                .push(StaleAttentionOperation {
-                    source,
-                    action,
-                    operation_id,
-                    request,
-                });
-            if self.stale_attention_operations.len() > ATTENTION_HISTORY_CAPACITY {
-                self.stale_attention_operations.remove(0);
-            }
+        if let (Some(operation_id), Some(request)) = (operation_id, request) {
+            self.take_retry_operation(operation_id, &request);
         }
-    }
-
-    pub(super) fn take_stale_attention_operation(
-        &mut self,
-        operation_id: u64,
-        request: &LocalRequest,
-    ) -> Option<StaleAttentionOperation> {
-        let index = self
-            .stale_attention_operations
-            .iter()
-            .position(|operation| {
-                operation.operation_id == operation_id && operation.request == *request
-            })?;
-        Some(self.stale_attention_operations.remove(index))
+        self.pending_attention = None;
+        self.pending_attention_action = None;
     }
 
     pub(crate) fn attention_request(
@@ -130,12 +106,15 @@ impl Board {
         let Some(item) = self.pending_attention.take() else {
             return;
         };
+        let operation_id = self.pending_attention_operation_id.take();
+        let request = self.pending_attention_request.take();
+        if let (Some(operation_id), Some(request)) = (operation_id, request) {
+            self.take_retry_operation(operation_id, &request);
+        }
         self.pending_attention_action = None;
-        self.pending_attention_operation_id = None;
-        self.pending_attention_request = None;
         if item.reason.kind != AttentionReasonKind::ProviderPermission {
             self.completed_attention.push(item);
-            if self.completed_attention.len() > ATTENTION_HISTORY_CAPACITY {
+            if self.completed_attention.len() > COMPLETED_ATTENTION_CAPACITY {
                 self.completed_attention.remove(0);
             }
         }

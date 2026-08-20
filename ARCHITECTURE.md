@@ -166,9 +166,11 @@ catalogue.
    durable event high-water mark from the same store read, so a delayed
    snapshot cannot overwrite a resolution already observed on the event
    stream. The TUI also binds an in-flight decision to its exact operation,
-   request, and source: once a durable projection retires that identity, a
-   delayed successful response cannot fold its older payload over newer task
-   state. Completed task decisions are invalidated by durable `TaskChanged`
+   request, and source. At most one exact retry operation per task may merge a
+   response payload; retiring the decision or admitting a durable task event
+   removes that permission, so a delayed success cannot become valid through
+   bounded-history eviction and fold older state over a newer projection.
+   Completed task decisions are invalidated by durable `TaskChanged`
    transitions, so a queued task that blocks again within the same millisecond
    is a new decision without treating summary text or wall-clock precision as
    identity.

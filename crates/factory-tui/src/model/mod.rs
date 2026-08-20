@@ -61,8 +61,8 @@ const STATUS_TEXT_MAX_CHARS: usize = 64;
 /// from counting activity twice. This exceeds the connect-time replay batch while remaining
 /// bounded for a long-running board.
 const EVENT_DEDUPE_CAPACITY: usize = 1_024;
-/// How many completed or abandoned decision operations the client remembers.
-const ATTENTION_HISTORY_CAPACITY: usize = 32;
+/// How many completed decision sources the client remembers.
+const COMPLETED_ATTENTION_CAPACITY: usize = 32;
 
 // ---------------------------------------------------------------------------------------------
 // Small enums
@@ -108,11 +108,9 @@ struct AttachIdentity {
     runner_instance_id: Option<RunnerInstanceId>,
 }
 
-struct StaleAttentionOperation {
-    source: AttentionItem,
-    action: AttentionAction,
+struct RetryOperation {
+    project_id: ProjectId,
     operation_id: u64,
-    request: LocalRequest,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -187,9 +185,9 @@ pub struct Board {
     pending_attention_action: Option<factory_core::status::AttentionAction>,
     pending_attention_operation_id: Option<u64>,
     pending_attention_request: Option<LocalRequest>,
-    /// Abandoned decision operations whose delayed response must not mutate
-    /// a newer projection. Ordinary task-menu operations are never recorded.
-    stale_attention_operations: Vec<StaleAttentionOperation>,
+    /// The one response currently allowed to merge a retry payload for each
+    /// task. Bounded by loaded tasks, and invalidated by a durable task event.
+    retry_operations: BTreeMap<TaskId, RetryOperation>,
     next_operation_id: u64,
     /// Recently completed exact sources suppressed until a newer projection
     /// proves a new decision exists.
@@ -250,7 +248,7 @@ impl Board {
             pending_attention_action: None,
             pending_attention_operation_id: None,
             pending_attention_request: None,
-            stale_attention_operations: Vec::new(),
+            retry_operations: BTreeMap::new(),
             next_operation_id: 1,
             completed_attention: Vec::new(),
             mode: Mode::Normal,
@@ -472,6 +470,57 @@ impl Board {
         let operation_id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.checked_add(1).unwrap_or(1);
         operation_id
+    }
+
+    pub(crate) fn task_retry_request(&mut self, project_id: ProjectId, task_id: TaskId) -> Intent {
+        let request = LocalRequest::RetryTask {
+            project_id,
+            task_id,
+        };
+        let operation_id = self.allocate_operation_id();
+        self.track_retry_operation(operation_id, &request);
+        Intent::SendWithIdentity {
+            operation_id,
+            request,
+        }
+    }
+
+    pub(crate) fn track_retry_operation(&mut self, operation_id: u64, request: &LocalRequest) {
+        let LocalRequest::RetryTask {
+            project_id,
+            task_id,
+        } = request
+        else {
+            return;
+        };
+        self.retry_operations.insert(
+            task_id.clone(),
+            RetryOperation {
+                project_id: project_id.clone(),
+                operation_id,
+            },
+        );
+    }
+
+    pub(crate) fn take_retry_operation(
+        &mut self,
+        operation_id: u64,
+        request: &LocalRequest,
+    ) -> bool {
+        let LocalRequest::RetryTask {
+            project_id,
+            task_id,
+        } = request
+        else {
+            return false;
+        };
+        let matches = self.retry_operations.get(task_id).is_some_and(|operation| {
+            operation.operation_id == operation_id && operation.project_id == *project_id
+        });
+        if matches {
+            self.retry_operations.remove(task_id);
+        }
+        matches
     }
 
     /// Surfaces a client-local socket failure through the same action list as
@@ -949,6 +998,8 @@ impl Board {
             .into_iter()
             .map(|t| (t.snapshot.id.clone(), t))
             .collect();
+        self.retry_operations
+            .retain(|task_id, _| self.tasks.contains_key(task_id));
         self.runs = runs.into_iter().map(|r| (r.id.clone(), r)).collect();
         self.sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
         self.clear_changed_attach_failures();
@@ -1097,6 +1148,7 @@ impl Board {
                 // be committed within the same clock tick.
                 self.completed_attention
                     .retain(|item| item.task_id.as_ref() != Some(&task.id));
+                self.retry_operations.remove(&task.id);
                 self.invalidate_attention(|item| item.task_id.as_ref() == Some(&task.id));
             }
             FactoryEvent::RunChanged { run } => {
@@ -1123,6 +1175,7 @@ impl Board {
                 });
             }
             FactoryEvent::TaskDeleted { task_id, .. } => {
+                self.retry_operations.remove(task_id);
                 self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
             }
             FactoryEvent::AgentDeleted { agent_id, .. } => {
@@ -1197,6 +1250,8 @@ impl Board {
                 self.agents.retain(|_, a| a.project_id != project_id);
                 self.tasks
                     .retain(|_, t| t.snapshot.project_id != project_id);
+                self.retry_operations
+                    .retain(|_, operation| operation.project_id != project_id);
                 self.runs.retain(|_, r| r.project_id != project_id);
                 self.sessions.retain(|_, s| s.project_id != project_id);
                 if self.focused_project.as_ref() == Some(&project_id) {
@@ -1216,6 +1271,7 @@ impl Board {
     ) {
         let matches_pending = self.pending_attention_operation_id == Some(operation_id)
             && self.pending_attention_request.as_ref() == Some(&request);
+        let retry_operation_is_current = self.take_retry_operation(operation_id, &request);
         match result {
             Ok(LocalResponse::Error { code, message }) => {
                 if matches_pending || self.pending_attention.is_none() {
@@ -1231,7 +1287,12 @@ impl Board {
                 }
             }
             Ok(response) => {
-                let text = self.merge_response(operation_id, &request, response);
+                let text = self.merge_response(
+                    operation_id,
+                    &request,
+                    retry_operation_is_current,
+                    response,
+                );
                 if matches_pending || self.pending_attention.is_none() {
                     self.set_status(text, StatusLevel::Info);
                 }
@@ -1258,6 +1319,7 @@ impl Board {
         &mut self,
         operation_id: u64,
         request: &LocalRequest,
+        retry_operation_is_current: bool,
         response: LocalResponse,
     ) -> String {
         match response {
@@ -1280,14 +1342,8 @@ impl Board {
             LocalResponse::TaskRetried { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
-                if let Some(stale) = self.take_stale_attention_operation(operation_id, request) {
-                    let exact_source = stale.action == AttentionAction::RetryTask
-                        && stale.source.task_id.as_ref() == Some(&id);
-                    return if exact_source {
-                        format!("ignored stale retry response for task#{id}")
-                    } else {
-                        "ignored stale attention response".to_owned()
-                    };
+                if !retry_operation_is_current {
+                    return format!("ignored stale retry response for task#{id}");
                 }
                 self.tasks.insert(task.snapshot.id.clone(), task);
                 self.complete_attention_request_if(
