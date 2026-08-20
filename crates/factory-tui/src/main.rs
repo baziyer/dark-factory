@@ -1321,6 +1321,7 @@ mod main_tests {
             let ready = ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                generation: 0,
                 offset: 0,
                 bytes: String::new(),
             };
@@ -1418,6 +1419,7 @@ mod main_tests {
             let ready = ServerFrame::TerminalOutput {
                 protocol_version: PROTOCOL_VERSION,
                 session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                generation: 0,
                 offset: 0,
                 bytes: factory_core::runner::encode_terminal_bytes(b"\x1b[?1000h"),
             };
@@ -1607,6 +1609,7 @@ mod main_tests {
                     ServerFrame::TerminalOutput {
                         protocol_version: PROTOCOL_VERSION,
                         session_id: factory_core::SessionId::try_from("session-1").unwrap(),
+                        generation: 0,
                         offset: 0,
                         bytes: String::new(),
                     }

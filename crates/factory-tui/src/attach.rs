@@ -131,6 +131,7 @@ mod tests {
         let frame = ServerFrame::TerminalOutput {
             protocol_version: factory_core::PROTOCOL_VERSION,
             session_id: SessionId::try_from(session_id).unwrap(),
+            generation: 0,
             offset,
             bytes: encode_terminal_bytes(bytes),
         };
@@ -264,6 +265,7 @@ mod tests {
             project_id: ProjectId::try_from("proj").unwrap(),
             session_id: SessionId::try_from("sess-1").unwrap(),
             since_offset: 0,
+            mode: factory_core::runner::TerminalAttachMode::Tail,
         };
         write_request(&mut buf, &request).unwrap();
         assert_eq!(buf.last(), Some(&b'\n'));

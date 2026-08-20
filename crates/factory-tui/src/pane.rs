@@ -20,7 +20,9 @@ use portable_pty::{
 use tui_term::vt100;
 
 use factory_core::local::{AttachRefusal, LocalRequest, ServerFrame};
-use factory_core::runner::{decode_terminal_bytes, encode_terminal_bytes};
+use factory_core::runner::{
+    decode_terminal_bytes, encode_terminal_bytes, terminal_generation_is_contiguous,
+};
 use factory_core::{ProjectId, RunnerInstanceId, SessionId};
 
 use factoryctl::Client;
@@ -202,6 +204,7 @@ impl Pane {
                 project_id: project_id.clone(),
                 session_id: session_id.clone(),
                 since_offset: 0,
+                mode: factory_core::runner::TerminalAttachMode::Tail,
             },
         )?;
 
@@ -370,7 +373,21 @@ impl Pane {
             }
         }
         if let Ok(mut parser) = self.parser.lock() {
+            // vt100 truncates rows from the bottom when the live grid shrinks. Re-feed one
+            // bounded, formatted snapshot of the visible screen after changing the viewport so
+            // a prompt at the lower edge survives narrow/wide TUI resizing. The daemon attach
+            // observation remains authoritative and unchanged by this local render operation.
+            let scrollback = parser.screen().scrollback();
+            if scrollback > 0 {
+                // vt100's visible-row iterator cannot snapshot an offset beyond the viewport.
+                parser.set_scrollback(0);
+            }
+            let formatted = parser.screen().contents_formatted();
             parser.set_size(rows, cols);
+            parser.process(&formatted);
+            if scrollback > 0 {
+                parser.set_scrollback(scrollback.min(usize::from(rows)));
+            }
         }
         self.mark_dirty();
         Ok(())
@@ -471,7 +488,14 @@ impl Pane {
     /// always safe.
     pub fn scroll_up(&self, lines: usize) {
         if let Ok(mut parser) = self.parser.lock() {
-            let target = parser.screen().scrollback() + lines;
+            // Bound one movement to one viewport: vt100 cannot render an offset beyond the
+            // visible row count, and PgUp may deliberately request `usize::MAX`.
+            let max_page = usize::from(parser.screen().size().0);
+            let target = parser
+                .screen()
+                .scrollback()
+                .saturating_add(lines)
+                .min(max_page);
             parser.set_scrollback(target);
         }
         self.mark_dirty();
@@ -565,10 +589,36 @@ fn spawn_attach_reader_thread(
     observation: Arc<(Mutex<AttachState>, Condvar)>,
 ) {
     std::thread::spawn(move || {
+        let mut next_offset = None;
+        let mut next_generation = None;
         attach::read_frames(reader, |frame| {
             match frame {
-                ServerFrame::TerminalOutput { bytes, .. } => match decode_terminal_bytes(&bytes) {
+                ServerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                } => match decode_terminal_bytes(&bytes) {
                     Ok(decoded) => {
+                        let generation_jump = next_generation.is_some_and(|expected| {
+                            !terminal_generation_is_contiguous(expected, generation)
+                        });
+                        if next_offset.is_some_and(|expected| expected != offset)
+                            || next_generation.is_some_and(|expected| generation < expected)
+                            || generation_jump
+                        {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                state.observation = PaneObservation::Error(format!(
+                                    "terminal output continuity broke at offset {offset}"
+                                ));
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            return false;
+                        }
+                        next_offset = Some(offset.saturating_add(decoded.len() as u64));
+                        next_generation = Some(generation);
                         let (state, signal) = &*observation;
                         if let Ok(mut state) = state.lock() {
                             if matches!(state.observation, PaneObservation::Connecting) {
@@ -592,6 +642,64 @@ fn spawn_attach_reader_thread(
                         }
                     }
                 },
+                ServerFrame::TerminalAttachReady {
+                    reset_prefix,
+                    start_generation,
+                    start_offset,
+                    ..
+                } => {
+                    next_offset = Some(start_offset);
+                    next_generation = Some(start_generation);
+                    match decode_terminal_bytes(&reset_prefix) {
+                        Ok(decoded) => {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                if matches!(state.observation, PaneObservation::Connecting) {
+                                    state.observation = PaneObservation::Attached;
+                                }
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            if let Ok(mut parser) = parser.lock() {
+                                parser.process(&decoded);
+                                dirty.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            let (state, signal) = &*observation;
+                            if let Ok(mut state) = state.lock() {
+                                state.observation = PaneObservation::Error(format!(
+                                    "invalid terminal state: {error}"
+                                ));
+                                state.finished = true;
+                                signal.notify_all();
+                            }
+                            return false;
+                        }
+                    }
+                }
+                ServerFrame::TerminalAttachGap {
+                    generation,
+                    base_generation,
+                    base_offset,
+                    start_generation,
+                    start_offset,
+                    end_offset,
+                    requested_generation,
+                    requested_offset,
+                    reason,
+                    ..
+                } => {
+                    let (state, signal) = &*observation;
+                    if let Ok(mut state) = state.lock() {
+                        state.observation = PaneObservation::Error(format!(
+                            "attach cursor unavailable: {reason}; retained generation {base_generation} offsets {base_offset}..{end_offset}, requested generation {requested_generation:?} offset {requested_offset}, generation {generation}, replay generation {start_generation} at {start_offset}"
+                        ));
+                        state.finished = true;
+                        signal.notify_all();
+                    }
+                    return false;
+                }
                 ServerFrame::Response { response, .. } => match response {
                     factory_core::local::LocalResponse::AttachRefused { refusal } => {
                         let (state, signal) = &*observation;
@@ -679,6 +787,202 @@ pub type PaneMap = std::collections::HashMap<SessionId, Pane>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::thread::JoinHandle;
+
+    use factory_core::PROTOCOL_VERSION;
+    use factory_core::local::{LocalResponse, RequestEnvelope};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::widgets::{Block, Borders};
+    use tui_term::widget::PseudoTerminal;
+
+    type AttachHandler = JoinHandle<Result<(), String>>;
+
+    struct AttachFixture {
+        socket: PathBuf,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+        handlers: Arc<Mutex<Vec<AttachHandler>>>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl AttachFixture {
+        fn start(output: Vec<u8>) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("factory.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = Arc::clone(&stop);
+            let handlers = Arc::new(Mutex::new(Vec::new()));
+            let thread_handlers = Arc::clone(&handlers);
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let stop = Arc::clone(&thread_stop);
+                            let output = output.clone();
+                            let handler = std::thread::spawn(move || {
+                                // The listening socket is nonblocking only so fixture teardown can
+                                // wake it. Accepted streams must exercise ordinary blocking local
+                                // API writes, including the full replay payload.
+                                stream.set_nonblocking(false).map_err(|error| {
+                                    format!("failed to make accepted stream blocking: {error}")
+                                })?;
+                                serve_attach_connection(stream, output, stop)
+                            });
+                            thread_handlers.lock().unwrap().push(handler);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                socket,
+                stop,
+                thread: Some(thread),
+                handlers,
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Drop for AttachFixture {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _ = UnixStream::connect(&self.socket);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+            for handler in self.handlers.lock().unwrap().drain(..) {
+                handler
+                    .join()
+                    .expect("attach fixture handler panicked")
+                    .expect("attach fixture handler failed");
+            }
+        }
+    }
+
+    fn serve_attach_connection(
+        mut stream: UnixStream,
+        output: Vec<u8>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), String> {
+        let mut request = String::new();
+        let request_stream = stream
+            .try_clone()
+            .map_err(|error| format!("failed to clone accepted stream: {error}"))?;
+        if BufReader::new(request_stream)
+            .read_line(&mut request)
+            .map_err(|error| format!("failed to read local request: {error}"))?
+            == 0
+        {
+            return Ok(());
+        }
+        let envelope: RequestEnvelope = serde_json::from_str(&request)
+            .map_err(|error| format!("failed to parse local request: {error}"))?;
+        match envelope.request {
+            LocalRequest::AttachTerminal { session_id, .. } => {
+                send_frame(
+                    &mut stream,
+                    ServerFrame::TerminalAttachReady {
+                        protocol_version: PROTOCOL_VERSION,
+                        session_id: session_id.clone(),
+                        generation: 0,
+                        base_generation: 0,
+                        base_offset: 0,
+                        start_generation: 0,
+                        start_offset: 0,
+                        end_offset: output.len() as u64,
+                        reset_prefix: encode_terminal_bytes(
+                            b"\x1bc\x1b[?1049l\x1b[?2004l\x1b[0m\x1b[2J\x1b[H",
+                        ),
+                    },
+                )?;
+                for (offset, chunk) in output.chunks(7).scan(0_u64, |offset, chunk| {
+                    let start = *offset;
+                    *offset += chunk.len() as u64;
+                    Some((start, chunk))
+                }) {
+                    send_frame(
+                        &mut stream,
+                        ServerFrame::TerminalOutput {
+                            protocol_version: PROTOCOL_VERSION,
+                            session_id: session_id.clone(),
+                            generation: 0,
+                            offset,
+                            bytes: encode_terminal_bytes(chunk),
+                        },
+                    )?;
+                }
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(25)))
+                    .map_err(|error| format!("failed to bound attach fixture read: {error}"))?;
+                let mut discard = [0_u8; 1];
+                while !stop.load(Ordering::Acquire) {
+                    match stream.read(&mut discard) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => {
+                            return Err(format!("attach fixture read failed: {error}"));
+                        }
+                    }
+                }
+            }
+            LocalRequest::ResizeTerminal { session_id, .. } => send_frame(
+                &mut stream,
+                ServerFrame::Response {
+                    protocol_version: PROTOCOL_VERSION,
+                    response: LocalResponse::TerminalResized { session_id },
+                },
+            )?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn send_frame(stream: &mut UnixStream, frame: ServerFrame) -> Result<(), String> {
+        let mut payload = serde_json::to_vec(&frame)
+            .map_err(|error| format!("failed to encode server frame: {error}"))?;
+        payload.push(b'\n');
+        stream
+            .write_all(&payload)
+            .and_then(|()| stream.flush())
+            .map_err(|error| format!("failed to send server frame: {error}"))
+    }
+
+    fn render_pane(pane: &mut Pane, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let block = Block::default().borders(Borders::ALL);
+                let inner = block.inner(area);
+                pane.resize(inner.height, inner.width).unwrap();
+                let parser = pane.lock_parser();
+                frame.render_widget(PseudoTerminal::new(parser.screen()).block(block), area);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn every_nonempty_input_returns_scrollback_to_the_live_tail() {
@@ -693,6 +997,72 @@ mod tests {
         pane.write_input(b"x");
 
         assert_eq!(pane.scroll_offset(), 0);
+        pane.kill();
+    }
+
+    #[test]
+    fn real_long_attach_renders_utf8_ansi_scrollback_and_live_prompt_after_resize() {
+        let mut output = Vec::new();
+        for line in 0..1_500 {
+            output.extend_from_slice(
+                format!("history-{line:04} café \x1b[32mansi-{line:04}\x1b[0m\r\n").as_bytes(),
+            );
+        }
+        output.extend_from_slice(b"\x1b[1;34mLIVE-PROMPT\x1b[0m $ ");
+
+        let fixture = AttachFixture::start(output);
+        let mut pane = Pane::attach(
+            fixture.socket.clone(),
+            ProjectId::try_from("project-1").unwrap(),
+            SessionId::try_from("session-1").unwrap(),
+            None,
+            "attached",
+            8,
+            48,
+        )
+        .unwrap();
+
+        // Observing the parsed live prompt is the peer-consumption barrier: resize does not begin
+        // merely because the fixture finished writing the replay.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while (!pane.observation().is_attached()
+            || !pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(pane.observation(), PaneObservation::Attached);
+        assert!(
+            pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")),
+            "real attach replay never reached the live prompt"
+        );
+
+        let wide = render_pane(&mut pane, 48, 8);
+        assert!(
+            wide.contains("LIVE-PROMPT"),
+            "wide render lost the live prompt: {wide:?}"
+        );
+        assert_eq!(wide.matches("LIVE-PROMPT").count(), 1);
+
+        pane.scroll_up(usize::MAX);
+        let narrow = render_pane(&mut pane, 18, 8);
+        assert!(
+            narrow.contains("history-1494"),
+            "narrow scrolled render lost the retained historical lines: {narrow:?}"
+        );
+        assert!(
+            narrow.contains("café") || narrow.contains("caf"),
+            "narrow scrolled render lost the UTF-8 text: {narrow:?}"
+        );
+
+        pane.scroll_reset();
+        let restored = render_pane(&mut pane, 72, 8);
+        assert!(
+            restored.contains("LIVE-PROMPT"),
+            "wide live render lost the prompt after scroll/resize: {restored:?}"
+        );
+        assert_eq!(restored.matches("LIVE-PROMPT").count(), 1);
+        assert_eq!(pane.observation(), PaneObservation::Attached);
         pane.kill();
     }
 }

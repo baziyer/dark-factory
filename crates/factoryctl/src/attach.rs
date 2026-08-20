@@ -5,20 +5,26 @@
 
 use std::{
     io::{Read, Write},
+    os::{fd::AsFd, unix::net::UnixStream},
+    sync::mpsc::{self, RecvTimeoutError, Sender},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
+    time::Duration,
 };
 
 use factory_core::{
     AgentId, ProjectId, SessionId,
     local::{AttachRefusal, AttachRefusalReason, LocalRequest, LocalResponse, ServerFrame},
-    runner::{decode_terminal_bytes, encode_terminal_bytes},
+    runner::{
+        TerminalAttachMode, decode_terminal_bytes, encode_terminal_bytes,
+        terminal_generation_is_contiguous,
+    },
 };
 use factoryctl::Client;
+use nix::sys::select::{FdSet, select};
 use rustix::termios::{self, OptionalActions, Termios};
 
 /// Byte the operator types to detach: Ctrl-] (ASCII GS, 0x1D), the classic
@@ -50,7 +56,7 @@ pub fn run(
     client: &Client,
     project_id: &str,
     target: &AttachTarget,
-    since_offset: u64,
+    mode: TerminalAttachMode,
 ) -> Result<i32, String> {
     let project_id = ProjectId::try_from(project_id.to_owned())
         .map_err(|error| format!("invalid project ID: {error}"))?;
@@ -60,56 +66,55 @@ pub fn run(
         AttachTarget::Agent(agent_id) => resolve_agent_session(client, &project_id, agent_id)?,
     };
 
-    let mut frames = client
+    let frames = client
         .attach_terminal(LocalRequest::AttachTerminal {
             project_id: project_id.clone(),
             session_id: session_id.clone(),
-            since_offset,
+            since_offset: 0,
+            mode,
         })
         .map_err(|error| error.to_string())?;
-
-    let first_frame = frames
-        .next()
-        .ok_or_else(|| "daemon closed the attach connection before readiness".to_owned())?;
-    match &first_frame {
-        Ok(ServerFrame::TerminalOutput { .. }) => {}
-        Ok(ServerFrame::Response {
-            response: LocalResponse::AttachRefused { refusal },
-            ..
-        }) => return Err(format_attach_refusal(refusal)),
-        Ok(ServerFrame::Response {
-            response: LocalResponse::Error { message, .. },
-            ..
-        }) => return Err(message.clone()),
-        Ok(_) => return Err("daemon sent an unexpected attach readiness frame".into()),
-        Err(error) => return Err(error.to_string()),
-    }
+    let cancellation = frames.cancellation();
 
     let raw_mode = RawMode::enable().map_err(|error| error.to_string())?;
 
-    let failed = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let failure: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let output_thread = spawn_output_thread(
-        Some(first_frame),
-        frames,
-        Arc::clone(&failed),
-        Arc::clone(&failure),
-    );
+    let output_thread = spawn_output_thread(frames, Arc::clone(&done), Arc::clone(&failure));
 
     send_resize(client, &project_id, &session_id);
     spawn_resize_watcher(client.clone(), project_id.clone(), session_id.clone());
 
-    let stdin_rx = spawn_stdin_reader();
-    let exit_code = forward_with_guard(
-        raw_mode,
-        client,
-        &project_id,
-        &session_id,
-        &failed,
-        &stdin_rx,
-    );
+    let (input_tx, input_rx) = mpsc::channel();
+    let (input_cancel_read, mut input_cancel_write) = UnixStream::pair()
+        .map_err(|error| format!("could not create attach cancellation: {error}"))?;
+    let input_thread = spawn_stdin_reader(input_tx, Arc::clone(&done), input_cancel_read);
+    let exit_code = loop {
+        if done.load(Ordering::SeqCst) {
+            break if failure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+            {
+                2
+            } else {
+                0
+            };
+        }
+        match input_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(StdinEvent::Bytes(bytes)) => send_input(client, &project_id, &session_id, &bytes),
+            Ok(StdinEvent::Detach) => break 0,
+            Ok(StdinEvent::Eof) | Err(RecvTimeoutError::Disconnected) => break 0,
+            Err(RecvTimeoutError::Timeout) => continue,
+        }
+    };
 
+    cancellation.cancel();
+    done.store(true, Ordering::SeqCst);
+    let _ = input_cancel_write.write_all(&[1]);
     let _ = output_thread.join();
+    let _ = input_thread.join();
+    drop(raw_mode);
     if let Some(message) = failure
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -120,32 +125,52 @@ pub fn run(
     Ok(exit_code)
 }
 
-fn spawn_output_thread<I>(
-    first_frame: Option<Result<ServerFrame, factoryctl::ClientError>>,
-    frames: I,
+fn spawn_output_thread(
+    frames: factoryctl::TerminalFrames,
     done: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
-) -> thread::JoinHandle<()>
-where
-    I: Iterator<Item = Result<ServerFrame, factoryctl::ClientError>> + Send + 'static,
-{
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut stdout = std::io::stdout();
-        for frame in first_frame.into_iter().chain(frames) {
+        let mut next_offset = None;
+        let mut next_generation = None;
+        for frame in frames {
             match frame {
-                Ok(ServerFrame::TerminalOutput { bytes, .. }) => {
-                    match decode_terminal_bytes(&bytes) {
-                        Ok(raw) => {
-                            if stdout.write_all(&raw).is_err() || stdout.flush().is_err() {
-                                break;
-                            }
+                Ok(ServerFrame::TerminalOutput {
+                    generation,
+                    offset,
+                    bytes,
+                    ..
+                }) => match decode_terminal_bytes(&bytes) {
+                    Ok(raw) => {
+                        let generation_jump = next_generation.is_some_and(|expected| {
+                            !terminal_generation_is_contiguous(expected, generation)
+                        });
+                        if next_offset.is_some_and(|expected| expected != offset)
+                            || next_generation.is_some_and(|expected| generation < expected)
+                            || generation_jump
+                        {
+                            set_failure(
+                                &failure,
+                                format!("terminal output continuity broke at offset {offset}"),
+                            );
+                            break;
                         }
-                        Err(_) => {
-                            set_failure(&failure, "daemon sent unreadable terminal output".into());
+                        next_offset = Some(offset.saturating_add(raw.len() as u64));
+                        next_generation = Some(generation);
+                        if write_terminal_bytes(&mut stdout, &raw).is_err() {
+                            set_failure(
+                                &failure,
+                                "terminal output stream could not be written".into(),
+                            );
                             break;
                         }
                     }
-                }
+                    Err(_) => {
+                        set_failure(&failure, "daemon sent unreadable terminal output".into());
+                        break;
+                    }
+                },
                 Ok(ServerFrame::Response {
                     response: LocalResponse::AttachRefused { refusal },
                     ..
@@ -160,6 +185,46 @@ where
                     set_failure(&failure, message);
                     break;
                 }
+                Ok(ServerFrame::TerminalAttachReady {
+                    reset_prefix,
+                    start_generation,
+                    start_offset,
+                    ..
+                }) => {
+                    next_offset = Some(start_offset);
+                    next_generation = Some(start_generation);
+                    match decode_terminal_bytes(&reset_prefix) {
+                        Ok(raw) => {
+                            if write_terminal_bytes(&mut stdout, &raw).is_err() {
+                                set_failure(&failure, "terminal state could not be written".into());
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            set_failure(&failure, "daemon sent unreadable terminal state".into());
+                            break;
+                        }
+                    }
+                }
+                Ok(ServerFrame::TerminalAttachGap {
+                    generation,
+                    base_generation,
+                    base_offset,
+                    start_generation,
+                    start_offset,
+                    end_offset,
+                    requested_offset,
+                    reason,
+                    ..
+                }) => {
+                    set_failure(
+                        &failure,
+                        format!(
+                            "attach cursor unavailable: {reason}; retry from generation {base_generation} offsets {base_offset}..{end_offset} (requested {requested_offset}, generation {generation}, replay generation {start_generation} at {start_offset})"
+                        ),
+                    );
+                    break;
+                }
                 Ok(_) => {}
                 Err(error) => {
                     set_failure(&failure, error.to_string());
@@ -171,20 +236,77 @@ where
     })
 }
 
-/// Runs the forwarding loop while owning the terminal-mode guard. Keeping this production seam
-/// generic lets the refusal-frame regression prove that the same wake path drops its guard
-/// without requiring a provider prompt or a real TTY in the test process.
-fn forward_with_guard<G>(
-    guard: G,
-    client: &Client,
-    project_id: &ProjectId,
-    session_id: &SessionId,
-    failed: &AtomicBool,
-    input: &Receiver<Vec<u8>>,
-) -> i32 {
-    let exit_code = forward_stdin(client, project_id, session_id, failed, input);
-    drop(guard);
-    exit_code
+enum StdinEvent {
+    Bytes(Vec<u8>),
+    Detach,
+    Eof,
+}
+
+fn spawn_stdin_reader(
+    sender: Sender<StdinEvent>,
+    done: Arc<AtomicBool>,
+    cancel: UnixStream,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
+        loop {
+            if done.load(Ordering::SeqCst) {
+                return;
+            }
+            match wait_for_input_or_cancel(&stdin, &cancel) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(_) => {
+                    let _ = sender.send(StdinEvent::Eof);
+                    return;
+                }
+            }
+            let read = match classify_stdin_read(stdin.read(&mut buffer)) {
+                Ok(read) => read,
+                Err(event) => {
+                    let _ = sender.send(event);
+                    return;
+                }
+            };
+            let chunk = &buffer[..read];
+            if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
+                if detach_at > 0 {
+                    let _ = sender.send(StdinEvent::Bytes(chunk[..detach_at].to_vec()));
+                }
+                let _ = sender.send(StdinEvent::Detach);
+                return;
+            }
+            if sender.send(StdinEvent::Bytes(chunk.to_vec())).is_err() {
+                return;
+            }
+        }
+    })
+}
+
+fn classify_stdin_read(read: std::io::Result<usize>) -> Result<usize, StdinEvent> {
+    match read {
+        Ok(0) | Err(_) => Err(StdinEvent::Eof),
+        Ok(read) => Ok(read),
+    }
+}
+
+/// Waits for either operator input or the lifecycle cancellation signal.
+/// `select` is used instead of a tty read timeout: macOS does not reliably
+/// poll terminal devices, while an explicit cancellation fd makes the input
+/// join deterministic on every Unix target supported by factoryctl.
+fn wait_for_input_or_cancel(input: &impl AsFd, cancel: &impl AsFd) -> std::io::Result<bool> {
+    let input_fd = input.as_fd();
+    let cancel_fd = cancel.as_fd();
+    let mut readfds = FdSet::new();
+    readfds.insert(input_fd);
+    readfds.insert(cancel_fd);
+    select(None, Some(&mut readfds), None, None, None)?;
+    Ok(readfds.contains(cancel_fd))
+}
+
+fn set_failure(failure: &Mutex<Option<String>>, message: String) {
+    *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
 }
 
 fn format_attach_refusal(refusal: &AttachRefusal) -> String {
@@ -201,56 +323,38 @@ fn format_attach_refusal(refusal: &AttachRefusal) -> String {
     )
 }
 
-fn set_failure(failure: &Mutex<Option<String>>, message: String) {
-    *failure.lock().unwrap_or_else(|error| error.into_inner()) = Some(message);
+fn write_terminal_bytes(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
+    writer
+        .write_all(bytes)
+        .map_err(|error| format!("terminal output stream could not be written: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("terminal output stream could not be flushed: {error}"))
 }
 
-/// Reads stdin on its own blocking descriptor so the forwarding loop can also observe a late
-/// attach refusal. The reader may remain blocked until the process exits, but the controlling
-/// loop is wakeable and drops [`RawMode`] as soon as the output side reports failure.
-fn spawn_stdin_reader() -> Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
-        loop {
-            let read = match stdin.read(&mut buffer) {
-                Ok(0) | Err(_) => return,
-                Ok(read) => read,
-            };
-            if tx.send(buffer[..read].to_vec()).is_err() {
-                return;
-            }
-        }
-    });
-    rx
-}
-
-/// Reads stdin and forwards it as `TerminalInput` until EOF, `Ctrl-]`, or the
-/// output side reports failure. Returns the process exit code.
-fn forward_stdin(
-    client: &Client,
-    project_id: &ProjectId,
-    session_id: &SessionId,
+#[cfg(test)]
+fn forward_stdin_from(
+    reader: &mut impl Read,
     failed: &AtomicBool,
-    input: &Receiver<Vec<u8>>,
+    mut send: impl FnMut(&[u8]),
 ) -> i32 {
+    let mut buffer = [0_u8; STDIN_CHUNK_BYTES];
     loop {
         if failed.load(Ordering::SeqCst) {
             return 2;
         }
-        let chunk = match input.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(chunk) => chunk,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => return 0,
+        let read = match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => return 0,
+            Ok(read) => read,
         };
+        let chunk = &buffer[..read];
         if let Some(detach_at) = chunk.iter().position(|byte| *byte == DETACH_BYTE) {
             if detach_at > 0 {
-                send_input(client, project_id, session_id, &chunk[..detach_at]);
+                send(&chunk[..detach_at]);
             }
             return 0;
         }
-        send_input(client, project_id, session_id, &chunk);
+        send(chunk);
     }
 }
 
@@ -367,63 +471,78 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::time::{Duration, Instant};
+    use super::{forward_stdin_from, write_terminal_bytes};
+    use std::sync::atomic::AtomicBool;
+    use std::{
+        io::{Cursor, Write},
+        os::unix::net::UnixStream,
+        thread,
+        time::Duration,
+    };
 
-    #[test]
-    fn late_refusal_frame_wakes_forwarding_and_drops_terminal_guard() {
-        struct RestoreProbe(Arc<AtomicBool>);
+    struct FailingWriter;
 
-        impl Drop for RestoreProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
+    impl Write for FailingWriter {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
         }
 
-        let failed = Arc::new(AtomicBool::new(false));
-        let failure = Arc::new(Mutex::new(None));
-        let refusal = AttachRefusal {
-            project_id: ProjectId::try_from("project-1").unwrap(),
-            session_id: SessionId::try_from("session-1").unwrap(),
-            runner_instance_id: None,
-            session_state: None,
-            reason: AttachRefusalReason::RunnerRejected,
-        };
-        let output_thread = spawn_output_thread(
-            None,
-            std::iter::once(Ok(ServerFrame::Response {
-                protocol_version: factory_core::PROTOCOL_VERSION,
-                response: LocalResponse::AttachRefused { refusal },
-            })),
-            Arc::clone(&failed),
-            Arc::clone(&failure),
-        );
-        let (_input_tx, input_rx) = mpsc::channel();
-        let client = Client::new("/tmp/factoryctl-attach-test.sock");
-        let project_id = ProjectId::try_from("project-1").unwrap();
-        let session_id = SessionId::try_from("session-1").unwrap();
-        let restored = Arc::new(AtomicBool::new(false));
-        let started = Instant::now();
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
-        let exit_code = forward_with_guard(
-            RestoreProbe(Arc::clone(&restored)),
-            &client,
-            &project_id,
-            &session_id,
-            &failed,
-            &input_rx,
-        );
-        output_thread.join().unwrap();
+    #[test]
+    fn ctrl_right_bracket_detaches_without_forwarding_following_bytes() {
+        let mut input = Cursor::new(b"before\x1dafter".to_vec());
+        let failed = AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        let exit = forward_stdin_from(&mut input, &failed, |bytes| {
+            forwarded.extend_from_slice(bytes);
+        });
 
-        assert_eq!(exit_code, 2);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(restored.load(Ordering::SeqCst));
-        assert!(
-            failure
-                .lock()
-                .unwrap()
-                .as_deref()
-                .is_some_and(|message| message.contains("runner rejected terminal attach"))
-        );
+        assert_eq!(exit, 0);
+        assert_eq!(forwarded, b"before");
+    }
+
+    #[test]
+    fn ctrl_c_is_forwarded_as_ordinary_pty_input() {
+        let mut input = Cursor::new(b"before\x03after".to_vec());
+        let failed = AtomicBool::new(false);
+        let mut forwarded = Vec::new();
+        let exit = forward_stdin_from(&mut input, &failed, |bytes| {
+            forwarded.extend_from_slice(bytes);
+        });
+
+        assert_eq!(exit, 0);
+        assert_eq!(forwarded, b"before\x03after");
+    }
+
+    #[test]
+    fn output_write_failure_is_a_lifecycle_error() {
+        let mut writer = FailingWriter;
+        let error = write_terminal_bytes(&mut writer, b"output").unwrap_err();
+        assert!(error.contains("could not be written"));
+    }
+
+    #[test]
+    fn cancellation_wakes_a_blocked_input_wait() {
+        let (input, _input_writer) = UnixStream::pair().unwrap();
+        let (cancel, mut cancel_writer) = UnixStream::pair().unwrap();
+        let handle = thread::spawn(move || super::wait_for_input_or_cancel(&input, &cancel));
+        thread::sleep(Duration::from_millis(25));
+        cancel_writer.write_all(&[1]).unwrap();
+        assert!(handle.join().unwrap().unwrap());
+    }
+
+    #[test]
+    fn stdin_eof_is_a_terminal_input_event() {
+        assert!(matches!(
+            super::classify_stdin_read(Ok(0)),
+            Err(super::StdinEvent::Eof)
+        ));
     }
 }

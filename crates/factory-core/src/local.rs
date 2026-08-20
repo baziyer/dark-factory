@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::runner::TerminalAttachMode;
 use crate::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, RunnerInstanceId, SessionId,
@@ -463,9 +464,10 @@ pub enum LocalRequest {
     /// after the first `AttachTerminal`, only more `AttachTerminal` requests
     /// are accepted on it (a client may attach several sessions on one
     /// connection). A successful attach produces at least one
-    /// `ServerFrame::TerminalOutput` (possibly with zero bytes), then output
+    /// `ServerFrame::TerminalAttachReady` and retained output for explicit
+    /// modes, or the legacy empty `TerminalOutput` boundary, then output
     /// frames for every attached session are multiplexed onto it, tagged by
-    /// `session_id`.
+    /// `session_id`. Invalidated cursors produce `TerminalAttachGap`.
     /// Detaching happens implicitly on disconnect. `TerminalInput` and
     /// `ResizeTerminal` are independent, ordinary one-shot requests (like
     /// `StopRun`); they do not need to run on an attached connection.
@@ -473,6 +475,8 @@ pub enum LocalRequest {
         project_id: ProjectId,
         session_id: SessionId,
         since_offset: u64,
+        #[serde(default, skip_serializing_if = "TerminalAttachMode::is_legacy")]
+        mode: TerminalAttachMode,
     },
     /// Writes operator input to a session's PTY. An ordinary one-shot
     /// request: it does not require a prior or concurrent `AttachTerminal`,
@@ -761,8 +765,37 @@ pub enum ServerFrame {
     TerminalOutput {
         protocol_version: u16,
         session_id: SessionId,
+        generation: u64,
         offset: u64,
         bytes: String,
+    },
+    /// Negotiated retained-log bounds for an explicit terminal attach.
+    TerminalAttachReady {
+        protocol_version: u16,
+        session_id: SessionId,
+        generation: u64,
+        base_generation: u64,
+        base_offset: u64,
+        start_generation: u64,
+        start_offset: u64,
+        end_offset: u64,
+        #[serde(default)]
+        reset_prefix: String,
+    },
+    /// Actionable recovery metadata when a requested cursor is no longer
+    /// available or is ahead of the runner's live head.
+    TerminalAttachGap {
+        protocol_version: u16,
+        session_id: SessionId,
+        generation: u64,
+        base_generation: u64,
+        base_offset: u64,
+        start_generation: u64,
+        start_offset: u64,
+        end_offset: u64,
+        requested_generation: Option<u64>,
+        requested_offset: u64,
+        reason: String,
     },
 }
 
@@ -777,6 +810,12 @@ impl ServerFrame {
                 protocol_version, ..
             }
             | Self::TerminalOutput {
+                protocol_version, ..
+            }
+            | Self::TerminalAttachReady {
+                protocol_version, ..
+            }
+            | Self::TerminalAttachGap {
                 protocol_version, ..
             } => *protocol_version,
         }
