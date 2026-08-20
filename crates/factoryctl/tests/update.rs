@@ -551,7 +551,7 @@ fn update_malformed_existing_capacity_restores_runtime_and_reports_unchanged_job
 }
 
 #[test]
-fn production_update_revalidates_a_candidate_after_a_competing_newer_activation() {
+fn production_update_holds_the_mutation_lock_while_downloading() {
     let fixture = Fixture::new();
     fixture.activate("0.1.0");
     let file_manifest_url = fixture.publish("0.2.0", None);
@@ -603,18 +603,20 @@ fn production_update_revalidates_a_candidate_after_a_competing_newer_activation(
     requested_rx
         .recv_timeout(Duration::from_secs(10))
         .expect("production update reached its archive download");
-    fixture.write_binaries(&fixture.home().join("bin/0.3.0"), "0.3.0");
-    let (lock, snapshot) = factoryctl::runtime::MutationLock::begin(
+    let lock_error = match factoryctl::runtime::MutationLock::begin(
         &fixture.home(),
         &fixture
             .root
             .path()
             .join("user-home/Library/LaunchAgents/com.dark-factory.factoryd.plist"),
-    )
-    .unwrap();
-    assert_eq!(snapshot.active_version.as_deref(), Some("0.1.0"));
-    factoryctl::install::activate(&fixture.home(), "0.3.0").unwrap();
-    drop(lock);
+    ) {
+        Ok(_) => panic!("the update released its mutation lock during download"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        lock_error,
+        "another managed runtime mutation is already in progress"
+    );
     release_tx.send(()).unwrap();
     let output = child.wait_with_output().unwrap();
     server.join().unwrap();
@@ -624,9 +626,8 @@ fn production_update_revalidates_a_candidate_after_a_competing_newer_activation(
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(stdout["installed"], false);
-    assert_eq!(stdout["active"], "0.3.0");
-    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.3.0");
+    assert_eq!(stdout["installed"], "0.2.0");
+    assert_eq!(read_link(&fixture.home().join("bin/current")), "0.2.0");
 }
 
 #[test]

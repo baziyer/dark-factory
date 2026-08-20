@@ -367,7 +367,10 @@ them.
    asset fields and exact lowercase SHA-256 digests; the launchd job, if any,
    and that it runs with
    *this* `$DARK_FACTORY_HOME` — a scratch home is refused rather than
-   moving the operator's job), then downloads the platform asset, verifies
+   moving the operator's job). It captures the exact job/plist state, takes
+   the shared runtime-mutation lock before downloading, and refuses to begin
+   if that job appeared, disappeared, or changed after preflight. It then
+   downloads the platform asset, verifies
    its SHA-256, unpacks it into `$DARK_FACTORY_HOME/bin/<version>/` (staged,
    renamed into place only once every binary checked out; a complete
    version already on disk is reused), atomically repoints

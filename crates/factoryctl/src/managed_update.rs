@@ -144,7 +144,7 @@ impl std::fmt::Display for InstallError {
             Self::Message(message) => formatter.write_str(message),
             Self::Stale { active } => write!(
                 formatter,
-                "active runtime changed to {active} while update was downloading; refusing stale update"
+                "active runtime {active} is newer than the selected release; refusing downgrade"
             ),
             Self::Health {
                 error, rollback, ..
@@ -290,17 +290,249 @@ fn require_recovery_authority(
     Ok(())
 }
 
-fn managed_job_under_lock(
-    _lock: &runtime::MutationLock,
-    plist: &Path,
-    home: &Path,
-    user_home: &Path,
-) -> Result<Option<launchd::ExistingJob>, String> {
-    let existing = launchd::read_existing(plist)?;
-    if let Some(existing) = &existing {
-        launchd::check_home(existing, home, user_home)?;
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExpectedManagedJob {
+    Absent,
+    Present {
+        job: launchd::ExistingJob,
+        plist: String,
+    },
+}
+
+impl ExpectedManagedJob {
+    fn capture(plist: &Path, home: &Path, user_home: &Path) -> Result<Self, String> {
+        let Some(job) = launchd::read_existing(plist)? else {
+            return Ok(Self::Absent);
+        };
+        launchd::check_home(&job, home, user_home)?;
+        let plist = fs::read_to_string(plist)
+            .map_err(|error| format!("reading managed launchd job identity: {error}"))?;
+        Ok(Self::Present { job, plist })
     }
-    Ok(existing)
+
+    fn require_unchanged(
+        &self,
+        _lock: &runtime::MutationLock,
+        plist: &Path,
+        home: &Path,
+        user_home: &Path,
+    ) -> Result<Option<launchd::ExistingJob>, String> {
+        let current = Self::capture(plist, home, user_home)?;
+        if &current != self {
+            return Err(
+                "managed launchd job changed after update preflight; refusing stale update"
+                    .to_owned(),
+            );
+        }
+        match current {
+            Self::Absent => Ok(None),
+            Self::Present { job, .. } => Ok(Some(job)),
+        }
+    }
+
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+struct InstallPreflight {
+    authority: RecoveryAuthority,
+    target: launchd::LaunchdTarget,
+    expected_job: ExpectedManagedJob,
+}
+
+fn install_after_preflight(
+    preflight: InstallPreflight,
+    manifest: &Manifest,
+    archive_sha256: String,
+    retain_for_reexec: bool,
+    progress: &mut dyn FnMut(UpdateProgress),
+    log: &mut dyn FnMut(&str),
+) -> Result<InstalledUpdate, InstallError> {
+    let InstallPreflight {
+        authority,
+        target,
+        expected_job,
+    } = preflight;
+    let canonical_home = authority.home.clone();
+    let canonical_socket = authority.socket.clone();
+    let user_home = authority.user_home.clone();
+    let home = canonical_home.as_path();
+    let socket = canonical_socket.as_path();
+    let plist = authority.plist.clone();
+    let (runtime_lock, snapshot) = runtime::MutationLock::begin(home, &plist)?;
+    let existing = expected_job.require_unchanged(&runtime_lock, &plist, home, &user_home)?;
+    let previous_version = snapshot.active_version.clone();
+
+    if snapshot.active_version.as_deref() == Some(manifest.version.as_str()) {
+        let installed = install::version_dir(home, &manifest.version);
+        let health = if existing.is_some() {
+            probes::wait_for_managed_daemon_for(
+                &target,
+                socket,
+                Duration::from_secs(2),
+                Some(&manifest.version),
+                home,
+            )
+        } else {
+            probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version))
+        };
+        if health.is_ok() {
+            install::verify_release_identity(&installed, &manifest.version, &archive_sha256)?;
+            log(&format!(
+                "{} is already installed and running",
+                manifest.version
+            ));
+            return Ok(InstalledUpdate {
+                version: manifest.version.clone(),
+                installed,
+                daemon: ManagedDaemon::Unchanged,
+                health_version: Some(manifest.version.clone()),
+                archive_sha256,
+                runtime_lock: Some(runtime_lock),
+                rollback: None,
+            });
+        }
+    }
+
+    if let Some(active) = snapshot.active_version.as_deref()
+        && active != manifest.version
+        && !update::is_newer(&manifest.version, active)
+    {
+        return Err(InstallError::Stale {
+            active: active.to_owned(),
+        });
+    }
+
+    let installed = install::install_release_with_progress(home, manifest, log, &mut |stage| {
+        progress(match stage {
+            ReleaseInstallStage::Downloading => UpdateProgress::Downloading,
+            ReleaseInstallStage::Verifying => UpdateProgress::Verifying,
+            ReleaseInstallStage::Unpacking => UpdateProgress::Unpacking,
+        });
+    })?;
+
+    let mut pending = PendingUpdate {
+        version: manifest.version.clone(),
+        archive_sha256: archive_sha256.clone(),
+        phase: PendingPhase::for_progress(UpdateProgress::Activating).unwrap(),
+        snapshot: snapshot.clone(),
+        authority,
+    };
+    write_pending(home, &pending)?;
+    progress(UpdateProgress::Activating);
+    install::activate(home, &manifest.version)?;
+    log(&format!("bin/current -> {}", manifest.version));
+
+    let Some(existing) = existing else {
+        log("no launchd job installed; restart the daemon yourself to run the new version");
+        remove_pending(home)?;
+        return Ok(InstalledUpdate {
+            version: manifest.version.clone(),
+            installed,
+            daemon: ManagedDaemon::NotInstalled,
+            health_version: None,
+            archive_sha256,
+            runtime_lock: Some(runtime_lock),
+            rollback: None,
+        });
+    };
+
+    pending.phase = PendingPhase::for_progress(UpdateProgress::Reloading).unwrap();
+    write_pending(home, &pending)?;
+    progress(UpdateProgress::Reloading);
+    if let Err(error) = launchd::apply_with_rollback_for(
+        launchd::ApplyRequest {
+            target: &target,
+            home,
+            plist: &plist,
+            existing: Some(&existing),
+            provider_directories: &probes::provider_directories(),
+            extra_environment: &std::collections::BTreeMap::new(),
+            capacity: None,
+        },
+        || snapshot.restore_runtime(home),
+    ) {
+        return Err(InstallError::Message(runtime::rollback_report(
+            &error,
+            previous_version.as_deref(),
+            |previous| {
+                probes::wait_for_managed_daemon_for(
+                    &target,
+                    socket,
+                    HEALTH_WAIT,
+                    Some(previous),
+                    home,
+                )
+                .map(|_| ())
+            },
+        )));
+    }
+    log(&format!("rewrote and reloaded {}", plist.display()));
+    pending.phase = PendingPhase::for_progress(UpdateProgress::CheckingHealth).unwrap();
+    write_pending(home, &pending)?;
+    progress(UpdateProgress::CheckingHealth);
+    match probes::wait_for_managed_daemon_for(
+        &target,
+        socket,
+        HEALTH_WAIT,
+        Some(&manifest.version),
+        home,
+    ) {
+        Ok(version) => {
+            if retain_for_reexec {
+                pending.phase = PendingPhase::AwaitingRelaunch;
+                write_pending(home, &pending)?;
+            } else {
+                remove_pending(home)?;
+            }
+            Ok(InstalledUpdate {
+                version: manifest.version.clone(),
+                installed,
+                daemon: ManagedDaemon::Reloaded,
+                health_version: Some(version),
+                archive_sha256,
+                runtime_lock: Some(runtime_lock),
+                rollback: retain_for_reexec.then_some(RollbackPlan {
+                    home: home.to_owned(),
+                    plist,
+                    socket: socket.to_owned(),
+                    target,
+                    installed_version: manifest.version.clone(),
+                    snapshot,
+                }),
+            })
+        }
+        Err(error) => {
+            let rollback = runtime::rollback_after_health_failure_for(
+                &target,
+                home,
+                &plist,
+                &snapshot,
+                &manifest.version,
+                |previous| {
+                    probes::wait_for_managed_daemon_for(
+                        &target,
+                        socket,
+                        HEALTH_WAIT,
+                        Some(previous),
+                        home,
+                    )
+                    .map(|_| ())
+                },
+            );
+            if rollback.is_ok() {
+                remove_pending(home)?;
+            }
+            Err(InstallError::Health {
+                version: manifest.version.clone(),
+                installed,
+                error,
+                previous_version,
+                rollback,
+            })
+        }
+    }
 }
 
 fn pending_path(home: &Path) -> PathBuf {
@@ -515,209 +747,26 @@ pub fn install(
         .ok_or_else(|| InstallError::Message("HOME is not set".to_owned()))?;
     let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
     let authority = recovery_authority(home, socket, &user_home, &target)?;
-    let canonical_home = authority.home.clone();
-    let canonical_socket = authority.socket.clone();
-    let user_home = authority.user_home.clone();
-    let home = canonical_home.as_path();
-    let socket = canonical_socket.as_path();
-    let plist = authority.plist.clone();
-    let existing = launchd::read_existing(&plist)?;
-    if let Some(existing) = &existing {
-        launchd::check_home(existing, home, &user_home)?;
-    } else if require_managed_daemon {
+    let expected_job =
+        ExpectedManagedJob::capture(&authority.plist, &authority.home, &authority.user_home)?;
+    if expected_job.is_absent() && require_managed_daemon {
         return Err(InstallError::Message(
             "one-button update requires the managed launchd job; use `factoryctl update --install` for a manually managed daemon"
                 .to_owned(),
         ));
     }
-
-    if install::active_version(home)?.as_deref() == Some(manifest.version.as_str()) {
-        let (runtime_lock, current) = runtime::MutationLock::begin(home, &plist)?;
-        let locked_existing = managed_job_under_lock(&runtime_lock, &plist, home, &user_home)?;
-        if locked_existing.is_none() && require_managed_daemon {
-            return Err(InstallError::Message(
-                "managed launchd job disappeared before the already-active runtime was verified"
-                    .to_owned(),
-            ));
-        }
-        if current.active_version.as_deref() == Some(manifest.version.as_str()) {
-            let installed = install::version_dir(home, &manifest.version);
-            let health = if locked_existing.is_some() {
-                probes::wait_for_managed_daemon_for(
-                    &target,
-                    socket,
-                    Duration::from_secs(2),
-                    Some(&manifest.version),
-                    home,
-                )
-            } else {
-                probes::wait_for_daemon(socket, Duration::from_secs(2), Some(&manifest.version))
-            };
-            if health.is_ok() {
-                install::verify_release_identity(&installed, &manifest.version, &archive_sha256)?;
-                log(&format!(
-                    "{} is already installed and running",
-                    manifest.version
-                ));
-                return Ok(InstalledUpdate {
-                    version: manifest.version.clone(),
-                    installed,
-                    daemon: ManagedDaemon::Unchanged,
-                    health_version: Some(manifest.version.clone()),
-                    archive_sha256,
-                    runtime_lock: Some(runtime_lock),
-                    rollback: None,
-                });
-            }
-        }
-    }
-
-    let installed = install::install_release_with_progress(home, manifest, log, &mut |stage| {
-        progress(match stage {
-            ReleaseInstallStage::Downloading => UpdateProgress::Downloading,
-            ReleaseInstallStage::Verifying => UpdateProgress::Verifying,
-            ReleaseInstallStage::Unpacking => UpdateProgress::Unpacking,
-        });
-    })?;
-
-    let (runtime_lock, snapshot) = runtime::MutationLock::begin(home, &plist)?;
-    let previous_version = snapshot.active_version.clone();
-    let existing = managed_job_under_lock(&runtime_lock, &plist, home, &user_home)?;
-    if existing.is_none() && require_managed_daemon {
-        return Err(InstallError::Message(
-            "managed launchd job disappeared while the update was downloading".to_owned(),
-        ));
-    }
-    if let Some(active) = snapshot.active_version.as_deref()
-        && active != manifest.version
-        && !update::is_newer(&manifest.version, active)
-    {
-        return Err(InstallError::Stale {
-            active: active.to_owned(),
-        });
-    }
-
-    let mut pending = PendingUpdate {
-        version: manifest.version.clone(),
-        archive_sha256: archive_sha256.clone(),
-        phase: PendingPhase::for_progress(UpdateProgress::Activating).unwrap(),
-        snapshot: snapshot.clone(),
-        authority,
-    };
-    write_pending(home, &pending)?;
-    progress(UpdateProgress::Activating);
-    install::activate(home, &manifest.version)?;
-    log(&format!("bin/current -> {}", manifest.version));
-
-    let Some(existing) = existing else {
-        log("no launchd job installed; restart the daemon yourself to run the new version");
-        remove_pending(home)?;
-        return Ok(InstalledUpdate {
-            version: manifest.version.clone(),
-            installed,
-            daemon: ManagedDaemon::NotInstalled,
-            health_version: None,
-            archive_sha256,
-            runtime_lock: Some(runtime_lock),
-            rollback: None,
-        });
-    };
-
-    pending.phase = PendingPhase::for_progress(UpdateProgress::Reloading).unwrap();
-    write_pending(home, &pending)?;
-    progress(UpdateProgress::Reloading);
-    if let Err(error) = launchd::apply_with_rollback_for(
-        launchd::ApplyRequest {
-            target: &target,
-            home,
-            plist: &plist,
-            existing: Some(&existing),
-            provider_directories: &probes::provider_directories(),
-            extra_environment: &std::collections::BTreeMap::new(),
-            capacity: None,
+    install_after_preflight(
+        InstallPreflight {
+            authority,
+            target,
+            expected_job,
         },
-        || snapshot.restore_runtime(home),
-    ) {
-        return Err(InstallError::Message(runtime::rollback_report(
-            &error,
-            previous_version.as_deref(),
-            |previous| {
-                probes::wait_for_managed_daemon_for(
-                    &target,
-                    socket,
-                    HEALTH_WAIT,
-                    Some(previous),
-                    home,
-                )
-                .map(|_| ())
-            },
-        )));
-    }
-    log(&format!("rewrote and reloaded {}", plist.display()));
-    pending.phase = PendingPhase::for_progress(UpdateProgress::CheckingHealth).unwrap();
-    write_pending(home, &pending)?;
-    progress(UpdateProgress::CheckingHealth);
-    match probes::wait_for_managed_daemon_for(
-        &target,
-        socket,
-        HEALTH_WAIT,
-        Some(&manifest.version),
-        home,
-    ) {
-        Ok(version) => {
-            if retain_for_reexec {
-                pending.phase = PendingPhase::AwaitingRelaunch;
-                write_pending(home, &pending)?;
-            } else {
-                remove_pending(home)?;
-            }
-            Ok(InstalledUpdate {
-                version: manifest.version.clone(),
-                installed,
-                daemon: ManagedDaemon::Reloaded,
-                health_version: Some(version),
-                archive_sha256,
-                runtime_lock: Some(runtime_lock),
-                rollback: retain_for_reexec.then_some(RollbackPlan {
-                    home: home.to_owned(),
-                    plist,
-                    socket: socket.to_owned(),
-                    target,
-                    installed_version: manifest.version.clone(),
-                    snapshot,
-                }),
-            })
-        }
-        Err(error) => {
-            let rollback = runtime::rollback_after_health_failure_for(
-                &target,
-                home,
-                &plist,
-                &snapshot,
-                &manifest.version,
-                |previous| {
-                    probes::wait_for_managed_daemon_for(
-                        &target,
-                        socket,
-                        HEALTH_WAIT,
-                        Some(previous),
-                        home,
-                    )
-                    .map(|_| ())
-                },
-            );
-            if rollback.is_ok() {
-                remove_pending(home)?;
-            }
-            Err(InstallError::Health {
-                version: manifest.version.clone(),
-                installed,
-                error,
-                previous_version,
-                rollback,
-            })
-        }
-    }
+        manifest,
+        archive_sha256,
+        retain_for_reexec,
+        progress,
+        log,
+    )
 }
 
 #[cfg(test)]
@@ -907,35 +956,138 @@ mod tests {
         }
     }
 
+    fn fake_manifest(version: &str) -> Manifest {
+        Manifest {
+            version: version.to_owned(),
+            assets: [(
+                update::platform_key().to_owned(),
+                update::Asset {
+                    url: "file:///must-not-be-downloaded".to_owned(),
+                    sha256: "00".repeat(32),
+                },
+            )]
+            .into(),
+        }
+    }
+
+    fn install_fake_runtime(home: &Path, version: &str) {
+        let source = home.join("source");
+        fs::create_dir_all(&source).unwrap();
+        for name in install::BINARIES {
+            let path = source.join(name);
+            fs::write(&path, format!("#!/bin/sh\necho {name}\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        install::install_from_dir(home, &source, version).unwrap();
+        install::activate(home, version).unwrap();
+    }
+
+    fn managed_plist(home: &Path) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
+            home.display(),
+            home.display()
+        )
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
-    fn already_active_health_rereads_job_presence_under_the_mutation_lock() {
+    fn install_refuses_a_managed_job_appearing_after_preflight_before_any_mutation() {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("factory-home");
         let user_home = root.path().join("user-home");
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&user_home).unwrap();
+        install_fake_runtime(&home, "0.2.5");
         let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+        let authority =
+            recovery_authority(&home, &home.join("f.sock"), &user_home, &target).unwrap();
         let plist = launchd::plist_path_for(&user_home, &target);
-        assert!(launchd::read_existing(&plist).unwrap().is_none());
+        let expected = ExpectedManagedJob::capture(&plist, &home, &user_home).unwrap();
+        assert!(expected.is_absent());
 
         fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        fs::write(
-            &plist,
-            format!(
-                "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
-                home.display(),
-                home.display()
-            ),
+        let appeared = managed_plist(&home);
+        fs::write(&plist, &appeared).unwrap();
+        let mut progress = Vec::new();
+        let error = install_after_preflight(
+            InstallPreflight {
+                authority,
+                target,
+                expected_job: expected,
+            },
+            &fake_manifest("0.2.6"),
+            "00".repeat(32),
+            false,
+            &mut |stage| progress.push(stage),
+            &mut |_| {},
         )
-        .unwrap();
-        let (lock, _) = runtime::MutationLock::begin(&home, &plist).unwrap();
+        .unwrap_err();
+
         assert!(
-            managed_job_under_lock(&lock, &plist, &home, &user_home)
-                .unwrap()
-                .is_some(),
-            "the post-preflight job must select managed PID/path health"
+            error
+                .to_string()
+                .contains("managed launchd job changed after update preflight"),
+            "{error}"
         );
+        assert!(progress.is_empty(), "the archive must not be downloaded");
+        assert_eq!(
+            install::active_version(&home).unwrap().as_deref(),
+            Some("0.2.5")
+        );
+        assert!(!install::version_dir(&home, "0.2.6").exists());
+        assert!(!pending_path(&home).exists());
+        assert_eq!(fs::read_to_string(&plist).unwrap(), appeared);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn install_refuses_a_managed_job_disappearing_after_preflight_before_any_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("factory-home");
+        let user_home = root.path().join("user-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&user_home).unwrap();
+        install_fake_runtime(&home, "0.2.5");
+        let target = launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw());
+        let plist = launchd::plist_path_for(&user_home, &target);
+        fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        fs::write(&plist, managed_plist(&home)).unwrap();
+        let authority =
+            recovery_authority(&home, &home.join("f.sock"), &user_home, &target).unwrap();
+        let expected = ExpectedManagedJob::capture(&plist, &home, &user_home).unwrap();
+        assert!(!expected.is_absent());
+
+        fs::remove_file(&plist).unwrap();
+        let mut progress = Vec::new();
+        let error = install_after_preflight(
+            InstallPreflight {
+                authority,
+                target,
+                expected_job: expected,
+            },
+            &fake_manifest("0.2.6"),
+            "00".repeat(32),
+            false,
+            &mut |stage| progress.push(stage),
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("managed launchd job changed after update preflight"),
+            "{error}"
+        );
+        assert!(progress.is_empty(), "the archive must not be downloaded");
+        assert_eq!(
+            install::active_version(&home).unwrap().as_deref(),
+            Some("0.2.5")
+        );
+        assert!(!install::version_dir(&home, "0.2.6").exists());
+        assert!(!pending_path(&home).exists());
+        assert!(!plist.exists());
     }
 
     #[test]
