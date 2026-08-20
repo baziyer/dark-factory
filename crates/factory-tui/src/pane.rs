@@ -798,11 +798,13 @@ mod tests {
     use ratatui::widgets::{Block, Borders};
     use tui_term::widget::PseudoTerminal;
 
+    type AttachHandler = JoinHandle<Result<(), String>>;
+
     struct AttachFixture {
         socket: PathBuf,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
-        handlers: Arc<Mutex<Vec<JoinHandle<()>>>>,
+        handlers: Arc<Mutex<Vec<AttachHandler>>>,
         _directory: tempfile::TempDir,
     }
 
@@ -823,7 +825,13 @@ mod tests {
                             let stop = Arc::clone(&thread_stop);
                             let output = output.clone();
                             let handler = std::thread::spawn(move || {
-                                serve_attach_connection(stream, output, stop);
+                                // The listening socket is nonblocking only so fixture teardown can
+                                // wake it. Accepted streams must exercise ordinary blocking local
+                                // API writes, including the full replay payload.
+                                stream.set_nonblocking(false).map_err(|error| {
+                                    format!("failed to make accepted stream blocking: {error}")
+                                })?;
+                                serve_attach_connection(stream, output, stop)
                             });
                             thread_handlers.lock().unwrap().push(handler);
                         }
@@ -852,21 +860,32 @@ mod tests {
                 thread.join().unwrap();
             }
             for handler in self.handlers.lock().unwrap().drain(..) {
-                handler.join().unwrap();
+                handler
+                    .join()
+                    .expect("attach fixture handler panicked")
+                    .expect("attach fixture handler failed");
             }
         }
     }
 
-    fn serve_attach_connection(mut stream: UnixStream, output: Vec<u8>, stop: Arc<AtomicBool>) {
+    fn serve_attach_connection(
+        mut stream: UnixStream,
+        output: Vec<u8>,
+        stop: Arc<AtomicBool>,
+    ) -> Result<(), String> {
         let mut request = String::new();
-        if BufReader::new(stream.try_clone().unwrap())
+        let request_stream = stream
+            .try_clone()
+            .map_err(|error| format!("failed to clone accepted stream: {error}"))?;
+        if BufReader::new(request_stream)
             .read_line(&mut request)
-            .unwrap_or(0)
+            .map_err(|error| format!("failed to read local request: {error}"))?
             == 0
         {
-            return;
+            return Ok(());
         }
-        let envelope: RequestEnvelope = serde_json::from_str(&request).unwrap();
+        let envelope: RequestEnvelope = serde_json::from_str(&request)
+            .map_err(|error| format!("failed to parse local request: {error}"))?;
         match envelope.request {
             LocalRequest::AttachTerminal { session_id, .. } => {
                 send_frame(
@@ -884,7 +903,7 @@ mod tests {
                             b"\x1bc\x1b[?1049l\x1b[?2004l\x1b[0m\x1b[2J\x1b[H",
                         ),
                     },
-                );
+                )?;
                 for (offset, chunk) in output.chunks(7).scan(0_u64, |offset, chunk| {
                     let start = *offset;
                     *offset += chunk.len() as u64;
@@ -899,9 +918,11 @@ mod tests {
                             offset,
                             bytes: encode_terminal_bytes(chunk),
                         },
-                    );
+                    )?;
                 }
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(25)));
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(25)))
+                    .map_err(|error| format!("failed to bound attach fixture read: {error}"))?;
                 let mut discard = [0_u8; 1];
                 while !stop.load(Ordering::Acquire) {
                     match stream.read(&mut discard) {
@@ -912,7 +933,9 @@ mod tests {
                                 error.kind(),
                                 std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                             ) => {}
-                        Err(_) => break,
+                        Err(error) => {
+                            return Err(format!("attach fixture read failed: {error}"));
+                        }
                     }
                 }
             }
@@ -922,16 +945,20 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     response: LocalResponse::TerminalResized { session_id },
                 },
-            ),
+            )?,
             _ => {}
         }
+        Ok(())
     }
 
-    fn send_frame(stream: &mut UnixStream, frame: ServerFrame) {
-        if serde_json::to_writer(&mut *stream, &frame).is_ok() {
-            let _ = stream.write_all(b"\n");
-            let _ = stream.flush();
-        }
+    fn send_frame(stream: &mut UnixStream, frame: ServerFrame) -> Result<(), String> {
+        let mut payload = serde_json::to_vec(&frame)
+            .map_err(|error| format!("failed to encode server frame: {error}"))?;
+        payload.push(b'\n');
+        stream
+            .write_all(&payload)
+            .and_then(|()| stream.flush())
+            .map_err(|error| format!("failed to send server frame: {error}"))
     }
 
     fn render_pane(pane: &mut Pane, width: u16, height: u16) -> String {
@@ -995,6 +1022,8 @@ mod tests {
         )
         .unwrap();
 
+        // Observing the parsed live prompt is the peer-consumption barrier: resize does not begin
+        // merely because the fixture finished writing the replay.
         let deadline = Instant::now() + Duration::from_secs(15);
         while (!pane.observation().is_attached()
             || !pane.with_screen(|screen| screen.contents().contains("LIVE-PROMPT")))
