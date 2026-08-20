@@ -16,7 +16,7 @@ use factory_core::{
         RunnerEventEnvelope, RunnerFrame, RunnerRequest,
     },
 };
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process_group};
 
 const RUN_ID: &str = "run-1";
 const INSTANCE_ID: &str = "instance-1";
@@ -1303,72 +1303,68 @@ fn wait_for_process_exit(raw_pid: i32) {
 }
 
 struct PipedAgentCleanup {
-    pids: Option<[i32; 2]>,
+    command: String,
+    process_group: Option<Pid>,
 }
 
 impl PipedAgentCleanup {
-    fn new(agent_marker: &Path, child_marker: &Path) -> Self {
+    fn new(command: String) -> Self {
         Self {
-            pids: Some([
-                wait_for_pid_file(agent_marker),
-                wait_for_pid_file(child_marker),
-            ]),
+            command,
+            process_group: None,
         }
     }
 
-    fn cleanup(&mut self) {
-        let Some(pids) = self.pids else {
-            return;
-        };
-        let kill_order = [pids[1], pids[0]];
-        for raw_pid in kill_order {
-            let Some(pid) = Pid::from_raw(raw_pid) else {
-                continue;
-            };
-            let _ = kill_process(pid, Signal::KILL);
-        }
-        for raw_pid in kill_order {
-            wait_for_process_exit(raw_pid);
-        }
-        self.pids = None;
+    fn capture(&mut self) -> Pid {
+        let process_group = wait_for_exact_process_group(&self.command, Duration::from_secs(2))
+            .expect("fake agent process group did not appear before setup waits");
+        self.process_group = Some(process_group);
+        process_group
     }
 }
 
 impl Drop for PipedAgentCleanup {
     fn drop(&mut self) {
-        let Some(pids) = self.pids.take() else {
-            return;
-        };
-        for raw_pid in pids {
-            if let Some(pid) = Pid::from_raw(raw_pid) {
-                let _ = kill_process(pid, Signal::KILL);
-            }
+        let process_group = self
+            .process_group
+            .take()
+            .or_else(|| wait_for_exact_process_group(&self.command, Duration::from_secs(1)))
+            .expect("fake agent process group identity was never captured");
+        let _ = kill_process_group(process_group, Signal::KILL);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && test_kill_process_group(process_group).is_ok() {
+            thread::sleep(Duration::from_millis(20));
         }
+        assert!(test_kill_process_group(process_group).is_err());
     }
 }
 
-fn matching_processes(needles: &[String]) -> Vec<Pid> {
+fn wait_for_exact_process_group(command: &str, timeout: Duration) -> Option<Pid> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(process_group) = exact_process_group(command) {
+            return Some(process_group);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    exact_process_group(command)
+}
+
+fn exact_process_group(command: &str) -> Option<Pid> {
     let output = Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-axo", "pid=,pgid=,command="])
         .output()
         .unwrap();
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter(|line| needles.iter().any(|needle| line.contains(needle)))
-        .filter_map(|line| line.split_whitespace().next())
-        .filter_map(|pid| pid.parse::<i32>().ok().and_then(Pid::from_raw))
-        .collect()
-}
-
-fn wait_for_processes_gone(needles: &[String], timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if matching_processes(needles).is_empty() {
-            return true;
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    matching_processes(needles).is_empty()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<i32>().ok().and_then(Pid::from_raw)?;
+            let process_group = fields.next()?.parse::<i32>().ok().and_then(Pid::from_raw)?;
+            (pid == process_group && fields.eq(command.split_whitespace()))
+                .then_some((pid, process_group))
+        })
+        .map(|(_, process_group)| process_group)
 }
 
 #[test]
@@ -1376,37 +1372,39 @@ fn pre_started_harness_drop_does_not_leave_piped_runner_or_fake_agent_descendant
     let marker_directory = tempfile::tempdir().unwrap();
     let agent_marker = marker_directory.path().join("agent");
     let child_marker = marker_directory.path().join("direct-child");
-    let runner = RunningRunner::spawn_program(
-        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
-        &[
-            "--touch-marker",
-            agent_marker.to_str().unwrap(),
-            "--spawn-child-marker",
-            child_marker.to_str().unwrap(),
-            "--sleep-ms",
-            "60000",
-        ],
-    );
-    let runtime_needle = format!("--runtime-dir {}", runner.runtime.display());
-    let direct_needle = format!("--spawn-child-marker {}", child_marker.display());
-    let nested_needle = format!("--child-marker {}", child_marker.display());
-    let needles = vec![runtime_needle, direct_needle, nested_needle];
-    wait_for_path(&agent_marker);
-    wait_for_path(&child_marker);
-    assert!(!matching_processes(&needles[0..1]).is_empty());
-    assert!(!matching_processes(&needles[1..2]).is_empty());
-    assert!(!matching_processes(&needles[2..3]).is_empty());
-    let mut cleanup = PipedAgentCleanup::new(&agent_marker, &child_marker);
+    let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let runner = RunningRunner::spawn_program(
+            Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+            &[
+                "--touch-marker",
+                agent_marker.to_str().unwrap(),
+                "--spawn-child-marker",
+                child_marker.to_str().unwrap(),
+                "--sleep-ms",
+                "60000",
+            ],
+        );
+        let command = format!(
+            "{} --touch-marker {} --spawn-child-marker {} --sleep-ms 60000",
+            env!("CARGO_BIN_EXE_fake-agent"),
+            agent_marker.display(),
+            child_marker.display(),
+        );
+        let mut cleanup = PipedAgentCleanup::new(command);
+        cleanup.capture();
+        wait_for_path(&agent_marker);
+        wait_for_path(&child_marker);
 
-    // Model a harness unwind before the Started event is available to Drop.
-    // The runner must still be stopped, while its agent process group is the
-    // harness's cleanup responsibility.
-    fs::write(runner.spool(), b"").unwrap();
-    drop(runner);
-    cleanup.cleanup();
-    let clean = wait_for_processes_gone(&needles, Duration::from_secs(2));
-    assert!(
-        clean,
-        "pre-Started harness Drop left a piped runner or fake-agent process: {needles:?}"
-    );
+        // Cross the explicit pre-Started setup barrier only after the exact
+        // process group and both fixture descendants are known to exist.
+        fs::write(runner.spool(), b"").unwrap();
+        assert!(fs::read_to_string(runner.spool()).unwrap().is_empty());
+        panic!("deterministic pre-Started setup failure");
+    }));
+    let payload = setup.expect_err("pre-Started setup did not unwind");
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    assert_eq!(message, Some("deterministic pre-Started setup failure"));
 }
