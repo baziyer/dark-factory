@@ -22,7 +22,7 @@ GitHub views remain the current source of truth:
 
 | Target | Open actions |
 | --- | --- |
-| [v0.2.5 — seamless dogfood update](https://github.com/baziyer/dark-factory/milestone/3) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.2.5%20%E2%80%94%20seamless%20dogfood%20update%22) |
+| [v0.2.6 — seamless dogfood update](https://github.com/baziyer/dark-factory/milestone/3) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.2.6%20%E2%80%94%20seamless%20dogfood%20update%22) |
 | [v0.3.0 — autonomous dogfood](https://github.com/baziyer/dark-factory/milestone/1) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.3.0%20%E2%80%94%20autonomous%20dogfood%22) |
 | [v0.3.1 — Linux contributor preview](https://github.com/baziyer/dark-factory/milestone/5) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.3.1%20%E2%80%94%20Linux%20contributor%20preview%22) |
 | [v0.4.0 — GitHub-connected factory](https://github.com/baziyer/dark-factory/milestone/2) | [milestone issues](https://github.com/baziyer/dark-factory/issues?q=is%3Aissue%20is%3Aopen%20milestone%3A%22v0.4.0%20%E2%80%94%20GitHub-connected%20factory%22) |
