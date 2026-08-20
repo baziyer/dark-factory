@@ -6,13 +6,12 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use factory_core::{
     PROTOCOL_VERSION,
-    local::{LocalRequest, RequestEnvelope, ServerFrame},
+    local::{LocalRequest, RequestCredential, RequestEnvelope, ServerFrame},
 };
 
 pub mod capacity;
@@ -91,6 +90,7 @@ impl From<serde_json::Error> for ClientError {
 #[derive(Clone, Debug)]
 pub struct Client {
     socket: PathBuf,
+    credential: Option<RequestCredential>,
 }
 
 impl Client {
@@ -98,11 +98,42 @@ impl Client {
     pub fn new(socket: impl AsRef<Path>) -> Self {
         Self {
             socket: socket.as_ref().to_owned(),
+            credential: None,
         }
+    }
+
+    /// Creates a client whose ordinary requests and subscriptions carry the
+    /// supplied bearer. The bearer is redacted by its `Debug` implementation.
+    #[must_use]
+    pub fn authenticated(socket: impl AsRef<Path>, credential: RequestCredential) -> Self {
+        Self {
+            socket: socket.as_ref().to_owned(),
+            credential: Some(credential),
+        }
+    }
+
+    pub fn authenticated_from_file(
+        socket: impl AsRef<Path>,
+        credential_file: impl AsRef<Path>,
+    ) -> Result<Self, ClientError> {
+        let value = std::fs::read_to_string(credential_file)?;
+        let credential = RequestCredential::new(value.trim().to_owned())
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        Ok(Self::authenticated(socket, credential))
     }
 
     pub fn request(&self, request: LocalRequest) -> Result<ServerFrame, ClientError> {
         self.request_with_timeout(request, REQUEST_TIMEOUT)
+    }
+
+    /// Sends one request with an opaque bearer. The caller chooses only the
+    /// credential value; factoryd resolves its principal and owned attempt.
+    pub fn request_authenticated(
+        &self,
+        request: LocalRequest,
+        credential: RequestCredential,
+    ) -> Result<ServerFrame, ClientError> {
+        self.request_with_timeout_authenticated(request, credential, REQUEST_TIMEOUT)
     }
 
     /// Like [`Self::request`] but with an explicit read/write timeout
@@ -114,7 +145,27 @@ impl Client {
         request: LocalRequest,
         timeout: Duration,
     ) -> Result<ServerFrame, ClientError> {
-        let stream = self.connect_with_timeout(request, timeout)?;
+        self.request_envelope_with_timeout(self.envelope(request), timeout)
+    }
+
+    pub fn request_with_timeout_authenticated(
+        &self,
+        request: LocalRequest,
+        credential: RequestCredential,
+        timeout: Duration,
+    ) -> Result<ServerFrame, ClientError> {
+        self.request_envelope_with_timeout(
+            RequestEnvelope::authenticated(request, credential),
+            timeout,
+        )
+    }
+
+    fn request_envelope_with_timeout(
+        &self,
+        envelope: RequestEnvelope,
+        timeout: Duration,
+    ) -> Result<ServerFrame, ClientError> {
+        let stream = self.connect_envelope_with_timeout(envelope, timeout)?;
         stream.set_read_timeout(Some(timeout))?;
         let mut reader = BufReader::new(stream);
         let frame = read_frame(&mut reader)?.ok_or(ClientError::UnexpectedEof)?;
@@ -134,23 +185,6 @@ impl Client {
         })
     }
 
-    /// Opens a persistent connection for an `AttachTerminal` request and
-    /// returns every frame the daemon sends on it (retained-then-live
-    /// `ServerFrame::TerminalOutput` for the attached run, or an error
-    /// response). The connection stays open, unbounded by any read timeout,
-    /// until the returned iterator is dropped or the daemon closes it.
-    pub fn attach_terminal(&self, request: LocalRequest) -> Result<TerminalFrames, ClientError> {
-        let stream = self.connect(request)?;
-        let cancellation = TerminalFramesCancellation {
-            stream: Arc::new(Mutex::new(stream.try_clone()?)),
-        };
-        Ok(TerminalFrames {
-            reader: BufReader::new(stream),
-            finished: false,
-            cancellation,
-        })
-    }
-
     fn connect(&self, request: LocalRequest) -> Result<UnixStream, ClientError> {
         self.connect_with_timeout(request, REQUEST_TIMEOUT)
     }
@@ -160,9 +194,24 @@ impl Client {
         request: LocalRequest,
         timeout: Duration,
     ) -> Result<UnixStream, ClientError> {
+        self.connect_envelope_with_timeout(self.envelope(request), timeout)
+    }
+
+    fn envelope(&self, request: LocalRequest) -> RequestEnvelope {
+        match &self.credential {
+            Some(credential) => RequestEnvelope::authenticated(request, credential.clone()),
+            None => RequestEnvelope::new(request),
+        }
+    }
+
+    fn connect_envelope_with_timeout(
+        &self,
+        envelope: RequestEnvelope,
+        timeout: Duration,
+    ) -> Result<UnixStream, ClientError> {
         let mut stream = UnixStream::connect(&self.socket)?;
         stream.set_write_timeout(Some(timeout))?;
-        write_request(&mut stream, &RequestEnvelope::new(request))?;
+        write_request(&mut stream, &envelope)?;
         Ok(stream)
     }
 }
@@ -198,63 +247,6 @@ impl Iterator for Subscription {
                 Some(Err(ClientError::Disconnected {
                     after_sequence: self.after_sequence,
                 }))
-            }
-            Err(error) => {
-                self.finished = true;
-                Some(Err(error))
-            }
-        }
-    }
-}
-
-/// Frames from one `AttachTerminal` connection. See [`Client::attach_terminal`].
-pub struct TerminalFrames {
-    reader: BufReader<UnixStream>,
-    finished: bool,
-    cancellation: TerminalFramesCancellation,
-}
-
-/// A cancellation handle for a persistent terminal stream. Shutting down the
-/// cloned socket wakes a blocked reader immediately; dropping an iterator is
-/// therefore never required to wait for another output frame.
-#[derive(Clone)]
-pub struct TerminalFramesCancellation {
-    stream: Arc<Mutex<UnixStream>>,
-}
-
-impl TerminalFrames {
-    #[must_use]
-    pub fn cancellation(&self) -> TerminalFramesCancellation {
-        self.cancellation.clone()
-    }
-}
-
-impl TerminalFramesCancellation {
-    pub fn cancel(&self) {
-        if let Ok(stream) = self.stream.lock() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-    }
-}
-
-impl Iterator for TerminalFrames {
-    type Item = Result<ServerFrame, ClientError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.finished {
-            return None;
-        }
-        match read_frame(&mut self.reader) {
-            Ok(Some(frame)) => match validate_frame(&frame) {
-                Ok(()) => Some(Ok(frame)),
-                Err(error) => {
-                    self.finished = true;
-                    Some(Err(error))
-                }
-            },
-            Ok(None) => {
-                self.finished = true;
-                None
             }
             Err(error) => {
                 self.finished = true;
@@ -336,9 +328,6 @@ fn validate_frame(frame: &ServerFrame) -> Result<(), ClientError> {
 mod protocol_tests {
     use super::*;
     use factory_core::{FactoryEvent, ProjectId, ProjectSnapshot};
-    use std::os::unix::net::UnixStream;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     #[test]
     fn v1_durable_event_is_accepted_inside_a_v2_replay_frame() {
@@ -360,28 +349,6 @@ mod protocol_tests {
             },
         };
         assert!(validate_frame(&frame).is_ok());
-    }
-
-    #[test]
-    fn terminal_attach_cancellation_wakes_a_blocked_reader() {
-        let (_server, client) = UnixStream::pair().unwrap();
-        let cancellation = TerminalFramesCancellation {
-            stream: Arc::new(Mutex::new(client.try_clone().unwrap())),
-        };
-        let frames = TerminalFrames {
-            reader: BufReader::new(client),
-            finished: false,
-            cancellation: cancellation.clone(),
-        };
-        let handle = thread::spawn(move || {
-            let mut frames = frames;
-            frames.next()
-        });
-        thread::sleep(Duration::from_millis(25));
-        let started = Instant::now();
-        cancellation.cancel();
-        assert!(handle.join().unwrap().is_none());
-        assert!(started.elapsed() < Duration::from_millis(250));
     }
 }
 

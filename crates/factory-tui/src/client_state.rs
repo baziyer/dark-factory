@@ -19,14 +19,12 @@ struct State {
 }
 
 /// Navigation restored after the updater replaces the TUI process image.
-/// Typing mode is deliberately not retained: the replacement returns keyboard
-/// control to the board on the same screen and selection.
+/// Navigation restored after an in-place updater relaunch.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RelaunchState {
     pub focused_project: Option<ProjectId>,
     pub selected_agent: Option<AgentId>,
     pub agent_view: bool,
-    pub terminal_maximized: bool,
 }
 
 pub fn encode_relaunch(state: &RelaunchState) -> Result<String, String> {

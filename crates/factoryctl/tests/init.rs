@@ -16,7 +16,7 @@ use std::{
 
 use factory_core::{
     PROTOCOL_VERSION,
-    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    local::{LocalRequest, LocalResponse, RequestCredential, RequestEnvelope, ServerFrame},
 };
 
 const SIBLINGS: [&str; 3] = ["factoryd", "factory-runner", "factory-tui"];
@@ -198,7 +198,7 @@ fn init_creates_the_home_installs_this_build_and_activates_it() {
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains("differs from this build"), "{stderr}");
     // The disclosure is printed even when launchd is skipped.
-    assert!(stdout.contains("outside"), "{stdout}");
+    assert!(stdout.contains("Outside"), "{stdout}");
 }
 
 #[cfg(target_os = "macos")]
@@ -388,7 +388,6 @@ fn doctor_reports_each_check_and_fails_without_a_daemon() {
     assert_eq!(status("daemon"), "fail");
     assert_eq!(status("launchd"), "warn");
     assert_eq!(status("git"), "ok");
-    assert_eq!(status("claude.json"), "warn");
     // Only meaningful where codex is installed (the check is `ok`, n/a, otherwise).
     let codex_installed = std::env::var_os("PATH")
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("codex").is_file()));
@@ -456,6 +455,12 @@ fn doctor_report(active_version: &str, daemon_version: &str) -> serde_json::Valu
         serde_json::to_vec(&cache).unwrap(),
     )
     .unwrap();
+    let operator_credential = RequestCredential::new("operator-secret".into()).unwrap();
+    fs::write(
+        home.join("operator.token"),
+        operator_credential.expose_secret(),
+    )
+    .unwrap();
 
     let socket = home.join("f.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -484,6 +489,7 @@ fn doctor_report(active_version: &str, daemon_version: &str) -> serde_json::Valu
                 assert_eq!(request, RequestEnvelope::new(LocalRequest::Health));
             } else {
                 assert!(matches!(request.request, LocalRequest::ListProjects { .. }));
+                assert_eq!(request.credential, Some(operator_credential.clone()));
             }
             serde_json::to_writer(
                 &mut stream,

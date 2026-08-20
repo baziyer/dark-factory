@@ -11,9 +11,8 @@ use std::{
 use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
-        MAX_RUNNER_FRAME_BYTES, MAX_RUNNER_OUTPUT_TEXT_BYTES, MAX_RUNNER_SPOOL_BYTES, OutputStream,
-        RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
-        RunnerEventEnvelope, RunnerFrame, RunnerRequest,
+        MAX_RUNNER_FRAME_BYTES, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode,
+        RunnerEvent, RunnerEventEnvelope, RunnerFrame, RunnerRequest,
     },
 };
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
@@ -50,6 +49,12 @@ impl RunningRunner {
     }
 
     fn spawn_program(program: &Path, agent_args: &[&str]) -> Self {
+        let runner = Self::spawn_program_unactivated(program, agent_args);
+        runner.prepare_and_activate();
+        runner
+    }
+
+    fn spawn_program_unactivated(program: &Path, agent_args: &[&str]) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let runtime = directory.path().join("run");
         let mut child = runner_command(&runtime, directory.path(), program, agent_args, None)
@@ -104,6 +109,7 @@ impl RunningRunner {
             .expect("startup input producer remained blocked")
             .unwrap();
         runner.wait_until_ready();
+        runner.prepare_and_activate();
         runner
     }
 
@@ -131,6 +137,52 @@ impl RunningRunner {
             thread::sleep(Duration::from_millis(10));
         }
         panic!("runner did not create its control socket");
+    }
+
+    fn prepare(&self) -> (UnixStream, u32, u32) {
+        let command_id = "prepare-test";
+        let mut stream = connect(&self.socket());
+        write_request(
+            &mut stream,
+            INSTANCE_ID,
+            RunnerRequest::Prepare {
+                command_id: command_id.into(),
+            },
+        );
+        match read_frame(&mut BufReader::new(stream.try_clone().unwrap())) {
+            RunnerFrame::Prepared {
+                command_id: received,
+                runner_pid,
+                child_pid,
+                process_group_id,
+                ..
+            } => {
+                assert_eq!(received, command_id);
+                assert_eq!(runner_pid, self.child.as_ref().unwrap().id());
+                (stream, child_pid, process_group_id)
+            }
+            frame => panic!("expected prepared frame, got {frame:?}"),
+        }
+    }
+
+    fn prepare_and_activate(&self) -> (u32, u32) {
+        let command_id = "prepare-test";
+        let (mut stream, child_pid, process_group_id) = self.prepare();
+        write_request(
+            &mut stream,
+            INSTANCE_ID,
+            RunnerRequest::Activate {
+                command_id: command_id.into(),
+            },
+        );
+        match read_frame(&mut BufReader::new(stream)) {
+            RunnerFrame::CommandAck {
+                command_id: received,
+                ..
+            } => assert_eq!(received, command_id),
+            frame => panic!("expected activation acknowledgement, got {frame:?}"),
+        }
+        (child_pid, process_group_id)
     }
 
     fn wait_for_terminal_spool(&self) {
@@ -215,7 +267,6 @@ impl Drop for RunningRunner {
                         started_pid = i32::try_from(child_pid).ok().and_then(Pid::from_raw);
                     }
                     RunnerEvent::SpawnFailed { .. } | RunnerEvent::Exited { .. } => return None,
-                    _ => {}
                 }
             }
             started_pid
@@ -365,20 +416,6 @@ fn assert_command_ack(frame: RunnerFrame, command_id: &str) {
     );
 }
 
-fn stdout_text(frames: &[RunnerFrame]) -> String {
-    event_frames(frames)
-        .into_iter()
-        .filter_map(|(_, event)| match event {
-            RunnerEvent::Output {
-                stream: OutputStream::Stdout,
-                text,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
-}
-
 fn assert_startup_input_rejected(declared_bytes: usize, input: &[u8]) {
     let directory = tempfile::tempdir().unwrap();
     let runtime = directory.path().join("run");
@@ -423,7 +460,6 @@ fn wrapped_agent_stdin_is_closed_by_default() {
     runner.wait_for_terminal_spool();
 
     let frames = subscribe_through_terminal(&runner, 0);
-    assert_eq!(stdout_text(&frames), "");
     assert!(matches!(
         event_frames(&frames).last().unwrap().1,
         RunnerEvent::Exited {
@@ -441,13 +477,55 @@ fn wrapped_agent_stdin_is_closed_by_default() {
 }
 
 #[test]
-fn framed_startup_input_is_exact_and_preserves_replay_and_ack() {
+fn dropped_preparation_leash_never_execs_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("provider-ran");
+    let mut runner = RunningRunner::spawn_program_unactivated(
+        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+        &["--touch-marker", marker.to_str().unwrap()],
+    );
+
+    let (leash, child_pid, process_group_id) = runner.prepare();
+    assert_eq!(child_pid, process_group_id);
+    thread::sleep(Duration::from_millis(100));
+    assert!(!marker.exists(), "provider ran before activation");
+
+    drop(leash);
+    runner.wait_for_successful_exit();
+    assert!(!marker.exists(), "provider ran after its leash was dropped");
+}
+
+#[test]
+fn activation_execs_provider_with_the_prepared_pid() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("provider.pid");
+    let runner = RunningRunner::spawn_program_unactivated(
+        Path::new(env!("CARGO_BIN_EXE_fake-agent")),
+        &["--touch-marker", marker.to_str().unwrap()],
+    );
+
+    let (child_pid, process_group_id) = runner.prepare_and_activate();
+    assert_eq!(child_pid, process_group_id);
+    wait_for_path(&marker);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), child_pid.to_string());
+
+    runner.wait_for_terminal_spool();
+    let frames = subscribe_through_terminal(&runner, 0);
+    let terminal = terminal_sequence(&frames);
+    assert_command_ack(
+        acknowledge(&runner, terminal, "stable-pid-persisted"),
+        "stable-pid-persisted",
+    );
+    runner.wait_for_clean_exit();
+}
+
+#[test]
+fn framed_startup_input_preserves_lifecycle_replay_and_ack() {
     let input = b"first line\n{\"kind\":\"turn\",\"message\":\"hello factory\"}\nlast line\n";
     let runner = RunningRunner::spawn_with_startup_input(&["--stdin-to-stdout"], input);
     runner.wait_for_terminal_spool();
 
     let frames = subscribe_through_terminal(&runner, 0);
-    assert_eq!(stdout_text(&frames).as_bytes(), input);
     let events = event_frames(&frames);
     assert!(matches!(
         events.first().unwrap().1,
@@ -587,7 +665,7 @@ fn invalid_cli_is_rejected_before_reading_declared_stdin() {
 }
 
 #[test]
-fn output_before_connect_replays_contiguously_and_requires_exact_terminal_ack() {
+fn lifecycle_before_connect_replays_contiguously_and_requires_exact_terminal_ack() {
     let mut runner = RunningRunner::spawn(&[
         "--stdout",
         "compiled\n",
@@ -621,16 +699,6 @@ fn output_before_connect_replays_contiguously_and_requires_exact_terminal_ack() 
         (1..=i64::try_from(events.len()).unwrap()).collect::<Vec<_>>()
     );
     assert!(matches!(events[0].1, RunnerEvent::Started { .. }));
-    assert!(events.iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Output { stream: OutputStream::Stdout, text, lossy: false }
-            if text.contains("compiled")
-    )));
-    assert!(events.iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Output { stream: OutputStream::Stderr, text, lossy: false }
-            if text.contains("warning")
-    )));
     assert!(matches!(
         events.last().unwrap().1,
         RunnerEvent::Exited {
@@ -640,11 +708,11 @@ fn output_before_connect_replays_contiguously_and_requires_exact_terminal_ack() 
     ));
     let terminal = terminal_sequence(&frames);
 
-    let replay = subscribe_through_terminal(&runner, 2);
+    let replay = subscribe_through_terminal(&runner, 1);
     assert!(
         event_frames(&replay)
             .iter()
-            .all(|(sequence, _)| *sequence > 2)
+            .all(|(sequence, _)| *sequence > 1)
     );
     assert!(matches!(
         acknowledge(&runner, terminal - 1, "wrong-boundary"),
@@ -742,15 +810,24 @@ fn control_plane_rejects_wrong_identity_protocol_cursors_and_oversize_requests()
 }
 
 #[test]
-fn spawn_failure_is_a_replayable_terminal_event() {
+fn provider_exec_failure_is_a_replayable_terminal_event() {
     let mut runner =
         RunningRunner::spawn_program(Path::new("/definitely-not-present/dark-factory-agent"), &[]);
     runner.wait_for_terminal_spool();
     runner.assert_still_running();
     let frames = subscribe_through_terminal(&runner, 0);
     let events = event_frames(&frames);
-    assert_eq!(events.len(), 1);
-    assert!(matches!(events[0].1, RunnerEvent::SpawnFailed { .. }));
+    assert!(matches!(
+        events.first().unwrap().1,
+        RunnerEvent::Started { .. }
+    ));
+    assert!(matches!(
+        events.last().unwrap().1,
+        RunnerEvent::Exited {
+            exit_code: Some(125),
+            signal: None,
+        }
+    ));
     let terminal = terminal_sequence(&frames);
     assert_command_ack(
         acknowledge(&runner, terminal, "spawn-failure-persisted"),
@@ -760,7 +837,7 @@ fn spawn_failure_is_a_replayable_terminal_event() {
 }
 
 #[test]
-fn replay_boundary_delivers_later_output_and_exit_without_polling() {
+fn replay_boundary_delivers_later_exit_without_polling() {
     let release_directory = tempfile::tempdir().unwrap();
     let release = release_directory.path().join("release");
     let runner = RunningRunner::spawn(&[
@@ -771,7 +848,7 @@ fn replay_boundary_delivers_later_output_and_exit_without_polling() {
         "--stderr",
         "after\n",
     ]);
-    wait_for_spool_text(&runner.spool(), "before");
+    wait_for_spool_text(&runner.spool(), "started");
     let mut stream = connect(&runner.socket());
     write_request(
         &mut stream,
@@ -816,10 +893,6 @@ fn replay_boundary_delivers_later_output_and_exit_without_polling() {
             .iter()
             .all(|(sequence, _)| *sequence <= replay_through)
     );
-    assert!(event_frames(&frames).iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Output { text, .. } if text.contains("before")
-    )));
 
     let mut caught_up_stream = connect(&runner.socket());
     write_request(
@@ -864,23 +937,21 @@ fn replay_boundary_delivers_later_output_and_exit_without_polling() {
             .collect::<Vec<_>>(),
         (1..=i64::try_from(events.len()).unwrap()).collect::<Vec<_>>()
     );
-    assert!(events.iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Output { stream: OutputStream::Stderr, text, .. } if text.contains("after")
-    )));
     let caught_up_index = frames
         .iter()
         .position(|frame| matches!(frame, RunnerFrame::CaughtUp { .. }))
         .unwrap();
-    let after_index = frames
+    let terminal_index = frames
         .iter()
-        .position(|frame| matches!(
-            frame,
-            RunnerFrame::Event { event, .. }
-                if matches!(&event.event, RunnerEvent::Output { text, .. } if text.contains("after"))
-        ))
+        .position(|frame| {
+            matches!(
+                frame,
+                RunnerFrame::Event { event, .. }
+                    if matches!(&event.event, RunnerEvent::Exited { .. })
+            )
+        })
         .unwrap();
-    assert!(caught_up_index < after_index);
+    assert!(caught_up_index < terminal_index);
     assert!(
         frames[caught_up_index + 1..]
             .iter()
@@ -1078,83 +1149,27 @@ fn stop_escalates_only_after_the_requested_grace_period() {
 }
 
 #[test]
-fn output_is_utf8_safe_and_the_spool_has_one_explicit_hard_limit() {
+fn large_output_is_drained_without_entering_the_lifecycle_spool() {
     let release_directory = tempfile::tempdir().unwrap();
     let release = release_directory.path().join("release-output");
     let runner = RunningRunner::spawn(&[
-        "--split-utf8",
-        "--invalid-stderr",
         "--wait-before-stdout-bytes-file",
         release.to_str().unwrap(),
         "--stdout-bytes",
-        &(MAX_RUNNER_SPOOL_BYTES + 1024 * 1024).to_string(),
+        &(17 * 1024 * 1024).to_string(),
     ]);
-    let mut non_reader_stream = connect(&runner.socket());
-    write_request(
-        &mut non_reader_stream,
-        INSTANCE_ID,
-        RunnerRequest::Subscribe { after_sequence: 0 },
-    );
-    let mut non_reader = BufReader::new(non_reader_stream);
-    let lagged_after = loop {
-        if let RunnerFrame::CaughtUp { sequence, .. } = read_frame(&mut non_reader) {
-            break sequence;
-        }
-    };
     fs::write(&release, b"go").unwrap();
     runner.wait_for_terminal_spool();
     let frames = subscribe_through_terminal(&runner, 0);
     let events = event_frames(&frames);
     assert_eq!(
-        events
-            .iter()
-            .map(|(sequence, _)| *sequence)
-            .collect::<Vec<_>>(),
-        (1..=i64::try_from(events.len()).unwrap()).collect::<Vec<_>>()
+        events.len(),
+        2,
+        "only Started and Exited belong in the lifecycle spool"
     );
-    assert!(events.iter().all(|(_, event)| match event {
-        RunnerEvent::Output { text, .. } => text.len() <= MAX_RUNNER_OUTPUT_TEXT_BYTES,
-        _ => true,
-    }));
-    let stdout = events
-        .iter()
-        .filter_map(|(_, event)| match event {
-            RunnerEvent::Output {
-                stream: OutputStream::Stdout,
-                text,
-                lossy: false,
-            } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<String>();
-    assert!(stdout.contains('🦀'));
-    assert!(events.iter().any(|(_, event)| matches!(
-        event,
-        RunnerEvent::Output {
-            stream: OutputStream::Stderr,
-            lossy: true,
-            ..
-        }
-    )));
-    let truncations = events
-        .iter()
-        .filter_map(|(_, event)| match event {
-            RunnerEvent::OutputTruncated { limit_bytes } => Some(*limit_bytes),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        truncations,
-        vec![u64::try_from(MAX_RUNNER_SPOOL_BYTES).unwrap()]
-    );
-    assert!(matches!(
-        events.last().unwrap().1,
-        RunnerEvent::Exited { .. }
-    ));
-    assert!(
-        fs::metadata(runner.spool()).unwrap().len()
-            <= u64::try_from(MAX_RUNNER_SPOOL_BYTES).unwrap()
-    );
+    assert!(matches!(events[0].1, RunnerEvent::Started { .. }));
+    assert!(matches!(events[1].1, RunnerEvent::Exited { .. }));
+    assert!(fs::metadata(runner.spool()).unwrap().len() < 4096);
     assert_eq!(
         fs::metadata(&runner.runtime).unwrap().permissions().mode() & 0o777,
         0o700
@@ -1168,28 +1183,11 @@ fn output_is_utf8_safe_and_the_spool_has_one_explicit_hard_limit() {
         0o600
     );
     let terminal = terminal_sequence(&frames);
-    assert_eq!(terminal, events.last().unwrap().0);
-    let mut lagged_sequences = Vec::new();
-    loop {
-        if let RunnerFrame::Event { event, .. } = read_frame(&mut non_reader) {
-            lagged_sequences.push(event.sequence);
-            if matches!(
-                event.event,
-                RunnerEvent::SpawnFailed { .. } | RunnerEvent::Exited { .. }
-            ) {
-                break;
-            }
-        }
-    }
-    assert_eq!(
-        lagged_sequences,
-        ((lagged_after + 1)..=terminal).collect::<Vec<_>>()
-    );
+    assert_eq!(terminal, events[1].0);
     assert_command_ack(
-        acknowledge(&runner, terminal, "bounded-output-persisted"),
-        "bounded-output-persisted",
+        acknowledge(&runner, terminal, "large-output-drained"),
+        "large-output-drained",
     );
-    drop(non_reader);
     runner.wait_for_clean_exit();
 }
 

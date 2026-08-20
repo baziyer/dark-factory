@@ -1,20 +1,18 @@
 //! The operator board's view-model: pure data + pure key-handling, no I/O.
 //!
-//! Everything in this module (and its submodules) is deliberately free of sockets, threads, and
-//! PTYs so it can be unit tested directly. `net.rs` feeds it fleet snapshots/events; `main.rs`'s
-//! event loop feeds it `crossterm` key/paste events and applies the [`keymap::Intent`]s it
-//! returns (sending requests, attaching/detaching terminal panes, quitting).
+//! Everything in this module is deliberately free of sockets and threads. `net.rs` feeds it
+//! snapshots/events; `main.rs` applies its request and navigation intents.
 //!
 //! ## Multi-project scope (Track 6c)
 //!
 //! Unlike the pre-Track-6c board (which loaded one project at a time), `Board` holds **every**
-//! project's agents/tasks/runs/sessions at once. BUILDING is fleet-wide; AGENT follows the
+//! project's agents/tasks/runs at once. BUILDING is fleet-wide; AGENT follows the
 //! selected agent while `focused_project` supplies scope for project actions.
 //!
 //! ## Deriving agent state
 //!
 //! [`Board::agent_state`] is the one function everything else in this crate goes through instead
-//! of inspecting [`SessionState`]/[`RunStatus`] itself. Operator attention is not derived here:
+//! of inspecting attempt fields itself. Operator attention is not derived here:
 //! it is the shared CLI-first [`factory_core::status::AttentionItem`] projection received in
 //! fleet status.
 
@@ -23,31 +21,24 @@ mod attention;
 mod keymap;
 pub mod state;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use factory_core::local::{
-    AgentDetail, AgentMessage, AttachRefusal, AttachRefusalReason, ErrorCode, LocalRequest,
-    LocalResponse,
-};
-use factory_core::status::{
-    AttentionAction, AttentionItem, AttentionReason, AttentionReasonKind, age_text, display_text,
-};
+use factory_core::local::{AgentDetail, AgentMessage, ErrorCode, LocalRequest, LocalResponse};
+use factory_core::status::{AttentionItem, AttentionReasonKind, age_text, display_text};
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, ProjectId, ProjectSnapshot,
-    Provider, RunId, RunSnapshot, RunnerInstanceId, SessionId, SessionSnapshot, SessionState,
-    TaskDetail, TaskId,
+    Provider, RunId, RunSnapshot, TaskDetail, TaskId,
 };
 use factoryctl::managed_update::UpdateProgress;
 use factoryctl::update::UpdateCheck;
 
 pub use announcements::Announcement;
 pub(crate) use attention::same_attention_source;
-pub use factory_core::attention::Rated;
 pub use keymap::{
-    Intent, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
-    TaskMenuState, View,
+    Intent, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState, TaskMenuState,
+    View,
 };
-pub use state::AgentState;
+pub use state::{AgentState, Rated};
 
 use crate::theme::Theme;
 
@@ -100,18 +91,11 @@ struct ActivityIdentity {
     created_at_ms: Option<i64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AttachIdentity {
-    project_id: ProjectId,
-    runner_instance_id: Option<RunnerInstanceId>,
-}
-
 // ---------------------------------------------------------------------------------------------
 // Board
 // ---------------------------------------------------------------------------------------------
 
 pub struct Board {
-    pub dev_local_pty: bool,
     pub now_ms: i64,
     pub theme: Theme,
 
@@ -127,8 +111,8 @@ pub struct Board {
     pub update_check: Option<UpdateCheck>,
     pub update_progress: Option<UpdateProgress>,
     /// `factoryd --max-active-runs`, learned from `FleetStatus` after bootstrap; the status line
-    /// shows live sessions against it.
-    pub live_session_cap: Option<u32>,
+    /// shows active attempts against it.
+    pub active_run_cap: Option<u32>,
     /// Every project on the daemon, in whatever order the last snapshot/event delivered them —
     /// use [`Board::projects_sorted`] for creation order.
     pub projects: Vec<ProjectSnapshot>,
@@ -136,17 +120,12 @@ pub struct Board {
     pub focused_project: Option<ProjectId>,
 
     pub agents: BTreeMap<AgentId, AgentSnapshot>,
-    /// Git summaries received through the CLI-first fleet-status request.
-    pub worktrees: BTreeMap<AgentId, factory_core::status::WorktreeStatus>,
     pub tasks: BTreeMap<TaskId, TaskDetail>,
     pub runs: BTreeMap<RunId, RunSnapshot>,
-    pub sessions: BTreeMap<SessionId, SessionSnapshot>,
     pub agent_details: BTreeMap<AgentId, AgentDetail>,
     pub messages: BTreeMap<AgentId, Vec<AgentMessage>>,
     /// Authoritative CLI-first attention projection from `FleetStatus`.
     pub attention: Vec<AttentionItem>,
-    /// Client-only attach failures that the unreachable daemon cannot own.
-    local_attention: BTreeMap<SessionId, AttentionItem>,
 
     pub announcements: state::RingBuffer<Announcement>,
     pub activity: BTreeMap<AgentId, state::ActivitySeries>,
@@ -156,14 +135,8 @@ pub struct Board {
     attention_revision: i64,
     /// Highest live event sequence folded into the state maps. A FleetStatus
     /// at the same sequence may have arrived first; it must not block the
-    /// corresponding live event from updating task/session state.
+    /// corresponding live event from updating task/run state.
     event_revision: i64,
-    /// Bounded retry deadlines for client-side terminal attach failures.
-    attach_retry_after: BTreeMap<SessionId, i64>,
-    /// Identity of the durable session generation that owns each local failure.
-    attach_failure_identities: BTreeMap<SessionId, AttachIdentity>,
-    /// Non-retryable refusals remain fenced while the same durable identity is selected.
-    attach_retry_blocked: BTreeMap<SessionId, AttachIdentity>,
 
     pub view: View,
     /// The one agent selection shared by BUILDING and AGENT.
@@ -183,13 +156,6 @@ pub struct Board {
     /// proves a new decision exists.
     completed_attention: Vec<AttentionItem>,
     pub mode: Mode,
-    /// Whether AGENT keys control the board or go exclusively to the terminal.
-    pub pane_mode: PaneMode,
-    /// Set by the pane reconciler only after the selected terminal is actually attached.
-    pub pane_ready: bool,
-    /// AGENT's terminal consumes the full content area while true.
-    pub terminal_maximized: bool,
-
     pub status: Option<StatusMessage>,
 
     pub caught_up: bool,
@@ -198,9 +164,8 @@ pub struct Board {
 
 impl Board {
     #[must_use]
-    pub fn new(dev_local_pty: bool, now_ms: i64, theme: Theme) -> Self {
+    pub fn new(now_ms: i64, theme: Theme) -> Self {
         Self {
-            dev_local_pty,
             now_ms,
             theme,
             connection: Connection::Connecting,
@@ -209,27 +174,21 @@ impl Board {
             update_available: None,
             update_check: None,
             update_progress: None,
-            live_session_cap: None,
+            active_run_cap: None,
             projects: Vec::new(),
             focused_project: None,
             agents: BTreeMap::new(),
-            worktrees: BTreeMap::new(),
             tasks: BTreeMap::new(),
             runs: BTreeMap::new(),
-            sessions: BTreeMap::new(),
             agent_details: BTreeMap::new(),
             messages: BTreeMap::new(),
             attention: Vec::new(),
-            local_attention: BTreeMap::new(),
             announcements: state::RingBuffer::new(ANNOUNCEMENT_CAPACITY),
             activity: BTreeMap::new(),
             activity_identities: BTreeMap::new(),
             seen_event_sequences: state::RingBuffer::new(EVENT_DEDUPE_CAPACITY),
             attention_revision: 0,
             event_revision: -1,
-            attach_retry_after: BTreeMap::new(),
-            attach_failure_identities: BTreeMap::new(),
-            attach_retry_blocked: BTreeMap::new(),
             view: View::Building,
             selected_agent: None,
             selected_task: None,
@@ -241,9 +200,6 @@ impl Board {
             next_operation_id: 1,
             completed_attention: Vec::new(),
             mode: Mode::Normal,
-            pane_mode: PaneMode::Board,
-            pane_ready: false,
-            terminal_maximized: false,
             status: None,
             caught_up: false,
             quit: false,
@@ -251,7 +207,7 @@ impl Board {
     }
 
     pub fn apply_fleet_status(&mut self, status: factory_core::status::FleetStatus) {
-        self.live_session_cap = Some(status.live_session_cap);
+        self.active_run_cap = Some(status.active_run_cap);
         if status.event_sequence < 0
             || (status.event_sequence >= self.attention_revision
                 && status.event_sequence >= self.event_revision)
@@ -267,12 +223,6 @@ impl Board {
             self.reconcile_pending_attention_projection();
             self.reconcile_attention_focus();
         }
-        self.worktrees = status
-            .projects
-            .into_iter()
-            .flat_map(|project| project.agents)
-            .filter_map(|agent| agent.worktree.map(|worktree| (agent.agent.id, worktree)))
-            .collect();
     }
 
     /// Records the durable head paired with the authoritative bootstrap.
@@ -421,331 +371,25 @@ impl Board {
 
     // -- derived views: state/attention ------------------------------------------------------
 
-    /// The session a hook has reported for this agent, if any — regardless of whether it's still
-    /// live, since a `Stopped`/`Failed` session is still meaningful, real, observed state (see
-    /// `Board::agent_state`'s doc comment).
-    #[must_use]
-    pub fn session_for(&self, agent: &AgentSnapshot) -> Option<&SessionSnapshot> {
-        agent
-            .current_session_id
-            .as_ref()
-            .and_then(|id| self.sessions.get(id))
-    }
-
-    /// The agent's most recent run attempt by start time, or `None` if it has never run.
+    /// The agent's most recent run attempt by admission time, or `None` if it has never run.
     #[must_use]
     pub fn latest_run_for(&self, agent_id: &AgentId) -> Option<&RunSnapshot> {
         self.runs
             .values()
             .filter(|run| &run.agent_id == agent_id)
-            .max_by_key(|run| (run.started_at_ms, run.id.clone()))
+            .max_by_key(|run| (run.admitted_at_ms, run.id.clone()))
     }
 
-    /// The single mapping point from durable daemon state to the board's five-way
-    /// [`AgentState`]. Session state wins whenever a session exists (hooks supersede inference,
-    /// per the design brief); otherwise falls back to the pre-sessions run-status mapping, and
-    /// `inferred` on the result is set so callers can show the `~` prefix the brief asks for.
+    /// The single mapping point from durable attempt state to the board's five-way state.
     #[must_use]
     pub fn agent_state(&self, agent: &AgentSnapshot) -> Rated<AgentState> {
-        if let Some(session) = self.session_for(agent) {
-            return Rated::observed(state::agent_state_from_session(session.state));
-        }
-        Rated::inferred(state::agent_state_from_run(
-            self.latest_run_for(&agent.id).map(|run| run.status),
-        ))
+        Rated::observed(state::agent_state_from_run(self.latest_run_for(&agent.id)))
     }
 
     pub(crate) fn allocate_operation_id(&mut self) -> u64 {
         let operation_id = self.next_operation_id;
         self.next_operation_id = self.next_operation_id.checked_add(1).unwrap_or(1);
         operation_id
-    }
-
-    /// Surfaces a client-local socket failure through the same action list as
-    /// daemon-owned attention. Runner-side attach failures are persisted by
-    /// `factoryd`; this covers the only case it cannot record because the TUI
-    /// could not reach it at all.
-    pub fn note_local_attach_failure(&mut self, session_id: &SessionId, error: &str) {
-        let identity = self.session_attach_identity(session_id);
-        self.note_attach_failure(session_id, error, true, identity);
-    }
-
-    /// Folds the daemon's typed refusal into the board without changing task or session state.
-    /// Ended/missing sessions are not retried: refreshing the durable fleet is their recovery.
-    /// Runner replacement/unavailability may recover in place, so those retain the bounded retry.
-    pub fn note_attach_refusal(&mut self, refusal: &AttachRefusal) -> bool {
-        let Some(identity) = self.session_attach_identity(&refusal.session_id) else {
-            return false;
-        };
-        if identity.project_id != refusal.project_id
-            || identity.runner_instance_id != refusal.runner_instance_id
-        {
-            return false;
-        }
-        let message = match refusal.reason {
-            AttachRefusalReason::SessionNotFound => {
-                "terminal unavailable: session no longer exists; state refreshed"
-            }
-            AttachRefusalReason::SessionEnded => {
-                "terminal unavailable: session ended; task state unchanged"
-            }
-            AttachRefusalReason::RunnerRejected => {
-                "terminal unavailable: runner rejected attach; state refreshed"
-            }
-            AttachRefusalReason::RunnerReplaced => {
-                "terminal unavailable: runner replaced; retrying after refresh"
-            }
-            AttachRefusalReason::RunnerUnavailable => {
-                "terminal unavailable: runner unavailable; retrying after refresh"
-            }
-        };
-        self.note_attach_failure(
-            &refusal.session_id,
-            message,
-            refusal.reason.retryable(),
-            Some(identity),
-        );
-        self.note_error(message);
-        true
-    }
-
-    fn note_attach_failure(
-        &mut self,
-        session_id: &SessionId,
-        error: &str,
-        retry: bool,
-        identity: Option<AttachIdentity>,
-    ) {
-        let Some(session) = self.sessions.get(session_id) else {
-            return;
-        };
-        if let Some(identity) = identity {
-            self.attach_failure_identities
-                .insert(session_id.clone(), identity.clone());
-            if retry {
-                self.attach_retry_blocked.remove(session_id);
-            } else {
-                self.attach_retry_blocked
-                    .insert(session_id.clone(), identity);
-            }
-        }
-        if retry {
-            self.attach_retry_after
-                .entry(session_id.clone())
-                .or_insert(self.now_ms.saturating_add(1_000));
-        } else {
-            self.attach_retry_after.remove(session_id);
-        }
-        if self.local_attention.contains_key(session_id) {
-            return;
-        }
-        self.local_attention.insert(
-            session_id.clone(),
-            AttentionItem {
-                level: factory_core::attention::Attention::Failed,
-                project_id: session.project_id.clone(),
-                agent_id: Some(session.agent_id.clone()),
-                task_id: None,
-                session_id: Some(session_id.clone()),
-                run_id: session.current_run_id.clone(),
-                since_ms: self.now_ms,
-                reason: AttentionReason {
-                    kind: AttentionReasonKind::ObserverProblem,
-                    summary: display_text(&format!("local terminal attach failed: {error}")),
-                    action: AttentionAction::InspectObserver,
-                },
-            },
-        );
-        self.reconcile_attention_focus();
-    }
-
-    fn session_attach_identity(&self, session_id: &SessionId) -> Option<AttachIdentity> {
-        self.sessions.get(session_id).map(|session| AttachIdentity {
-            project_id: session.project_id.clone(),
-            runner_instance_id: session.runner_instance_id.clone(),
-        })
-    }
-
-    fn clear_changed_attach_failures(&mut self) {
-        let stale: Vec<SessionId> = self
-            .attach_failure_identities
-            .iter()
-            .filter(|(session_id, identity)| {
-                self.session_attach_identity(session_id).as_ref() != Some(*identity)
-            })
-            .map(|(session_id, _)| session_id.clone())
-            .collect();
-        for session_id in stale {
-            self.clear_local_attach_failure(&session_id);
-        }
-    }
-
-    fn clear_unlinked_attach_failures(&mut self) {
-        let stale: Vec<SessionId> = self
-            .attach_failure_identities
-            .keys()
-            .filter(|session_id| {
-                !self
-                    .agents
-                    .values()
-                    .any(|agent| agent.current_session_id.as_ref() == Some(*session_id))
-            })
-            .cloned()
-            .collect();
-        for session_id in stale {
-            self.clear_local_attach_failure(&session_id);
-        }
-    }
-
-    pub fn clear_local_attach_failure(&mut self, session_id: &SessionId) {
-        self.attach_retry_after.remove(session_id);
-        self.attach_retry_blocked.remove(session_id);
-        self.attach_failure_identities.remove(session_id);
-        self.local_attention.remove(session_id);
-        self.reconcile_attention_focus();
-    }
-
-    /// Removes a local attach failure only when the durable session link or its runner generation
-    /// no longer matches the failure owner. Detaching a pane because AGENT is no longer desired
-    /// must not reopen an identity-matching nonretryable refusal fence.
-    pub fn clear_local_attach_failure_if_identity_changed(
-        &mut self,
-        session_id: &SessionId,
-    ) -> bool {
-        let failure_identity = self.attach_failure_identities.get(session_id).cloned();
-        let durable_identity = self.session_attach_identity(session_id);
-        let still_linked = self
-            .agents
-            .values()
-            .any(|agent| agent.current_session_id.as_ref() == Some(session_id));
-        if failure_identity != durable_identity || !still_linked {
-            self.clear_local_attach_failure(session_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn clear_undesired_attach_failures(&mut self, desired: &[SessionId]) -> bool {
-        let previous = (
-            self.local_attention.len(),
-            self.attach_retry_after.len(),
-            self.attach_retry_blocked.len(),
-        );
-        let linked: Vec<SessionId> = self
-            .agents
-            .values()
-            .filter_map(|agent| agent.current_session_id.clone())
-            .collect();
-        let keep =
-            |session_id: &SessionId| desired.contains(session_id) || linked.contains(session_id);
-        self.local_attention
-            .retain(|session_id, _| keep(session_id));
-        self.attach_retry_after
-            .retain(|session_id, _| keep(session_id));
-        self.attach_retry_blocked
-            .retain(|session_id, _| keep(session_id));
-        let changed = previous
-            != (
-                self.local_attention.len(),
-                self.attach_retry_after.len(),
-                self.attach_retry_blocked.len(),
-            );
-        if changed {
-            self.reconcile_attention_focus();
-        }
-        changed
-    }
-
-    /// Returns true for a first attempt or once a failed attach's bounded
-    /// retry deadline has elapsed. Taking an elapsed deadline lets the next
-    /// failure establish a fresh delay instead of spinning every frame.
-    pub fn take_attach_retry(&mut self, session_id: &SessionId) -> bool {
-        if self.attach_retry_blocked.contains_key(session_id) {
-            return false;
-        }
-        match self.attach_retry_after.get(session_id).copied() {
-            Some(deadline) if self.now_ms < deadline => false,
-            Some(_) => {
-                self.attach_retry_after.remove(session_id);
-                true
-            }
-            None => true,
-        }
-    }
-
-    // -- derived views: terminal attach targets ----------------------------------------------
-
-    /// The session id `main.rs` should attach a pane to for `agent`, if any. Real usage: only an
-    /// agent with a live session produces one. `--dev-local-pty` (offline testing only — see
-    /// `README.md`): every agent gets a deterministic synthetic id (`dev-<agent_id>`, never
-    /// inserted into `self.sessions`) so the pane mechanics can be exercised without a daemon
-    /// that implements sessions yet; `main.rs`'s reconciliation tells real from synthetic by
-    /// checking `self.sessions.contains_key(..)` and spawns a local shell instead of a daemon
-    /// attach for the latter (see `agent_for_pane_session`, its inverse).
-    fn session_id_for_pane(&self, agent: &AgentSnapshot) -> Option<SessionId> {
-        if let Some(session_id) = &agent.current_session_id {
-            if self
-                .sessions
-                .get(session_id)
-                .is_some_and(|session| session.state.is_live())
-            {
-                return Some(session_id.clone());
-            }
-        }
-        if self.dev_local_pty {
-            return SessionId::try_from(format!("dev-{}", agent.id)).ok();
-        }
-        None
-    }
-
-    /// The inverse of `session_id_for_pane`: which agent a (possibly synthetic) pane session id
-    /// belongs to. Used by `main.rs`'s pane reconciliation to build titles/targets without ever
-    /// needing to parse the synthetic id's shape itself.
-    #[must_use]
-    pub fn agent_for_pane_session(&self, session_id: &SessionId) -> Option<&AgentSnapshot> {
-        self.agents
-            .values()
-            .find(|agent| self.session_id_for_pane(agent).as_ref() == Some(session_id))
-    }
-
-    /// Up to [`MAX_TERMINAL_PANES`] targets in the focused project, in fortress order — the panes
-    /// The selected agent's target — what FOCUS attaches when entered directly (e.g. via `G`),
-    /// not necessarily one of `terminal_targets`.
-    #[must_use]
-    pub fn focus_target(&self) -> Option<SessionId> {
-        let agent = self
-            .selected_agent
-            .as_ref()
-            .and_then(|id| self.agents.get(id))?;
-        self.session_id_for_pane(agent)
-    }
-
-    /// The agent targeted by the focused pane, falling back to the selection outside TERMINALS.
-    #[must_use]
-    pub fn pane_target_agent(&self) -> Option<AgentId> {
-        self.selected_agent.clone()
-    }
-
-    /// Whether the current view has a live pane keys could actually be forwarded to right now.
-    /// `PaneMode::Typing` only ever forwards when this is true — an empty TERMINALS/FOCUS screen
-    /// (no live session at all) always leaves every key acting on the board, never silently
-    /// eating it as input for a pane that isn't there.
-    #[must_use]
-    pub(crate) fn has_live_pane(&self) -> bool {
-        self.view == View::Agent && self.pane_ready
-    }
-
-    /// Which sessions should currently be attached, given `self.view`. FORTRESS/WORKSHOP attach
-    /// nothing — "detach without stopping the worker" applies just as much to *leaving* TERMINALS
-    /// or FOCUS as it does to quitting the whole client.
-    #[must_use]
-    pub fn desired_sessions(&self) -> Vec<SessionId> {
-        if self.view == View::Agent {
-            self.focus_target().into_iter().collect()
-        } else {
-            Vec::new()
-        }
     }
 
     // -- status/help text -----------------------------------------------------------------
@@ -758,9 +402,7 @@ impl Board {
         });
     }
 
-    /// A public status-line setter for `main.rs`, which has no other way to surface things like
-    /// "couldn't attach the terminal pane" (a PTY/socket-level failure `Board` itself never
-    /// sees).
+    /// Surfaces a background or protocol error in the bounded footer.
     pub fn note_error(&mut self, text: impl Into<String>) {
         self.set_status(text, StatusLevel::Error);
     }
@@ -807,7 +449,7 @@ impl Board {
                         .as_ref()
                         .map_or("agent", factory_core::AgentId::as_str)
                 ),
-                PendingAction::StopSession { .. } | PendingAction::StopRun { .. } => {
+                PendingAction::StopRun { .. } => {
                     "stop this agent? x/y/Enter confirms, anything else cancels".to_owned()
                 }
             },
@@ -822,19 +464,7 @@ impl Board {
     }
 
     fn normal_help_text(&self) -> String {
-        if self.view == View::Agent {
-            if self.pane_mode == PaneMode::Typing && self.has_live_pane() {
-                let target = self
-                    .pane_target_agent()
-                    .map_or_else(|| "pane".to_owned(), |id| id.to_string());
-                return format!("TYPING \u{2192} {target}");
-            }
-            return "BOARD".to_owned();
-        }
-        if self.view == View::Building {
-            return "BOARD".to_owned();
-        }
-        String::new()
+        "BOARD".to_owned()
     }
 
     // -- ticking --------------------------------------------------------------------------
@@ -884,24 +514,16 @@ impl Board {
     }
 
     /// Current activity is deliberately separate from durable lifecycle state.
-    /// A recent named hook is useful; an old hook is explicitly stale, and no
-    /// sample is explicitly reported rather than rendered as evidence of inactivity.
     #[must_use]
     pub fn activity_label(&self, agent: &AgentSnapshot) -> String {
-        let Some(session_id) = agent.current_session_id.as_ref() else {
+        let Some(run) = self.latest_run_for(&agent.id) else {
             return "no recent activity".to_owned();
         };
-        let Some(session) = self.sessions.get(session_id) else {
-            return "no recent activity".to_owned();
-        };
-        let Some(at_ms) = session.last_hook_at_ms else {
-            return "no recent activity".to_owned();
-        };
-        let age = age_text(self.now_ms, at_ms);
-        if self.now_ms.saturating_sub(at_ms) > 60_000 {
+        let age = age_text(self.now_ms, run.updated_at_ms);
+        if self.now_ms.saturating_sub(run.updated_at_ms) > 60_000 {
             return format!("stale activity {age} ago");
         }
-        let activity = session
+        let activity = run
             .activity
             .as_deref()
             .map(display_text)
@@ -909,16 +531,16 @@ impl Board {
         format!("{activity} {age} ago")
     }
 
-    /// Sessions that have not ended, fleet-wide — what the daemon's live-session cap counts.
+    /// Attempts that still occupy active-run capacity.
     #[must_use]
-    pub fn live_session_count(&self) -> usize {
-        self.sessions
+    pub fn active_run_count(&self) -> usize {
+        self.runs
             .values()
-            .filter(|session| session.ended_at_ms.is_none())
+            .filter(|run| run.phase != factory_core::RunPhase::Terminal)
             .count()
     }
 
-    /// Replaces the entire fleet snapshot (every project's projects/agents/tasks/runs/sessions).
+    /// Replaces the complete fleet snapshot.
     /// If no project is focused yet, focuses the oldest one (by creation order) — so WORKSHOP has
     /// something to show without requiring the operator to zoom in first, unless `--project`
     /// already chose one (`focus_project`, called by `main.rs` before this on startup).
@@ -928,7 +550,6 @@ impl Board {
         agents: Vec<AgentSnapshot>,
         tasks: Vec<TaskDetail>,
         runs: Vec<RunSnapshot>,
-        sessions: Vec<SessionSnapshot>,
     ) {
         self.projects = projects;
         self.agents = agents.into_iter().map(|a| (a.id.clone(), a)).collect();
@@ -937,23 +558,19 @@ impl Board {
             .map(|t| (t.snapshot.id.clone(), t))
             .collect();
         self.runs = runs.into_iter().map(|r| (r.id.clone(), r)).collect();
-        self.sessions = sessions.into_iter().map(|s| (s.id.clone(), s)).collect();
-        self.clear_changed_attach_failures();
-        self.clear_unlinked_attach_failures();
         self.prune_activity_to_current_agents();
         self.ensure_default_focus();
     }
 
     /// Applies a complete snapshot only when its consistency point is not older than a live
     /// event already folded into the board. The sequence check must happen before replacing any
-    /// maps; otherwise a delayed refusal refresh can regress a newer current-session link.
+    /// maps; otherwise a delayed refresh can regress a newer run projection.
     pub fn apply_fleet_snapshot_at(
         &mut self,
         projects: Vec<ProjectSnapshot>,
         agents: Vec<AgentSnapshot>,
         tasks: Vec<TaskDetail>,
         runs: Vec<RunSnapshot>,
-        sessions: Vec<SessionSnapshot>,
         event_sequence: i64,
     ) -> bool {
         if (event_sequence >= 0 && event_sequence < self.attention_revision)
@@ -961,7 +578,7 @@ impl Board {
         {
             return false;
         }
-        self.apply_fleet_snapshot(projects, agents, tasks, runs, sessions);
+        self.apply_fleet_snapshot(projects, agents, tasks, runs);
         self.note_fleet_snapshot_sequence(event_sequence);
         true
     }
@@ -979,25 +596,6 @@ impl Board {
                 self.focused_project = Some(first.id.clone());
             }
         }
-    }
-
-    /// Whether `event` is worth a new announcement line. Every event type narrates
-    /// unconditionally except `SessionChanged`: the daemon emits one for *every* hook
-    /// (`SessionStart`/`UserPromptSubmit`/`PreToolUse`/`PostToolUse`/...), and most of those
-    /// don't change `state` at all — only `activity`/`last_hook_event`, which the detail pane
-    /// already shows. Without this, a session working through one task announces "working"
-    /// dozens of times (65 in a few minutes during the first dogfood run) and drowns the handful
-    /// of real transitions. Compares against the state this board already has recorded for the
-    /// session (`None`, i.e. never seen before, always announces) rather than tracking a separate
-    /// "last announced" snapshot — `self.sessions` already *is* that snapshot as of the moment
-    /// just before this event folds into it.
-    fn should_announce(&self, event: &EventEnvelope) -> bool {
-        let FactoryEvent::SessionChanged { session } = &event.event else {
-            return true;
-        };
-        self.sessions
-            .get(&session.id)
-            .is_none_or(|previous| previous.state != session.state)
     }
 
     /// Pushes `event`'s announcement (if `worth_announcing` and it produces one via
@@ -1030,31 +628,19 @@ impl Board {
     /// the same root cause — a fresh client had never been fed any of the recent history that made
     /// up the sparkline in the first place).
     ///
-    /// Deliberately doesn't fold `event.event` into `agents`/`tasks`/`runs`/`sessions`:
+    /// Deliberately doesn't fold `event.event` into `agents`/`tasks`/`runs`:
     /// `apply_fleet_snapshot` already has the current, authoritative state for those, and replaying
     /// stale historical snapshots on top of it would regress them. `maybe_announce`'s
     /// sequence-based dedupe covers the case where the live stream (started right after this
     /// backfill, or after a later reconnect) overlaps it.
     pub fn apply_replay(&mut self, mut events: Vec<EventEnvelope>) {
         events.sort_by_key(|event| event.sequence);
-        // A local, replay-only view of "what did we last see this session at" — distinct from
-        // `should_announce`'s use of `self.sessions` (the board's *current* state), which isn't
-        // the right reference point for judging whether an old event in this batch was a real
-        // transition at the time.
-        let mut last_session_state: HashMap<SessionId, SessionState> = HashMap::new();
         for event in events {
             if !self.admit_event_sequence(event.sequence, false) {
                 continue;
             }
             self.apply_event_activity(&event.event, event.occurred_at_ms);
-            let worth_announcing = match &event.event {
-                FactoryEvent::SessionChanged { session } => {
-                    last_session_state.insert(session.id.clone(), session.state)
-                        != Some(session.state)
-                }
-                _ => true,
-            };
-            self.maybe_announce(&event, worth_announcing);
+            self.maybe_announce(&event, true);
         }
     }
 
@@ -1064,8 +650,7 @@ impl Board {
         }
         self.apply_event_activity(&event.event, event.occurred_at_ms);
 
-        let worth_announcing = self.should_announce(&event);
-        self.maybe_announce(&event, worth_announcing);
+        self.maybe_announce(&event, true);
 
         match &event.event {
             FactoryEvent::AgentBudgetChanged { agent_id, .. } => {
@@ -1084,26 +669,7 @@ impl Board {
             FactoryEvent::RunChanged { run } => {
                 self.invalidate_attention(|item| item.run_id.as_ref() == Some(&run.id));
             }
-            FactoryEvent::SessionChanged { session } => {
-                let provider_projection_changed =
-                    self.pending_attention.as_ref().is_some_and(|item| {
-                        item.reason.kind == AttentionReasonKind::ProviderPermission
-                            && item.session_id.as_ref() == Some(&session.id)
-                            && self.sessions.get(&session.id).is_none_or(|previous| {
-                                previous.state != session.state
-                                    || previous.last_hook_event != session.last_hook_event
-                                    || previous.wait_reason != session.wait_reason
-                            })
-                    });
-                if provider_projection_changed {
-                    self.clear_attention_request();
-                }
-                let retain_reason = factory_core::status::session_attention_reason_kind(session);
-                self.invalidate_attention(|item| {
-                    item.session_id.as_ref() == Some(&session.id)
-                        && (retain_reason != Some(item.reason.kind))
-                });
-            }
+            FactoryEvent::LegacyRunChanged { .. } | FactoryEvent::LegacySessionChanged { .. } => {}
             FactoryEvent::TaskDeleted { task_id, .. } => {
                 self.invalidate_attention(|item| item.task_id.as_ref() == Some(task_id));
             }
@@ -1115,7 +681,7 @@ impl Board {
             }
             FactoryEvent::AutoModeChanged { .. }
             | FactoryEvent::PolicyDecision { .. }
-            | FactoryEvent::RepositoryOperation { .. }
+            | FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::RepositoryAuthorityChanged { .. }
             | FactoryEvent::ProjectChanged { .. } => {}
         }
@@ -1129,8 +695,10 @@ impl Board {
                     agent.paused = paused;
                 }
             }
-            FactoryEvent::RepositoryOperation { .. }
-            | FactoryEvent::RepositoryAuthorityChanged { .. } => {}
+            FactoryEvent::LegacyRepositoryOperation { .. }
+            | FactoryEvent::RepositoryAuthorityChanged { .. }
+            | FactoryEvent::LegacyRunChanged { .. }
+            | FactoryEvent::LegacySessionChanged { .. } => {}
             FactoryEvent::ProjectChanged { project } => {
                 if let Some(existing) = self.projects.iter_mut().find(|p| p.id == project.id) {
                     *existing = project;
@@ -1157,16 +725,9 @@ impl Board {
                     },
                 );
             }
-            FactoryEvent::AgentChanged { agent } => {
-                self.replace_agent(agent);
-                self.clear_unlinked_attach_failures();
-            }
+            FactoryEvent::AgentChanged { agent } => self.replace_agent(agent),
             FactoryEvent::RunChanged { run } => {
-                self.runs.insert(run.id.clone(), run);
-            }
-            FactoryEvent::SessionChanged { session } => {
-                self.sessions.insert(session.id.clone(), session);
-                self.clear_changed_attach_failures();
+                self.runs.insert(run.id.clone(), *run);
             }
             FactoryEvent::TaskDeleted { task_id, .. } => {
                 self.tasks.remove(&task_id);
@@ -1180,7 +741,6 @@ impl Board {
                 self.tasks
                     .retain(|_, t| t.snapshot.project_id != project_id);
                 self.runs.retain(|_, r| r.project_id != project_id);
-                self.sessions.retain(|_, s| s.project_id != project_id);
                 if self.focused_project.as_ref() == Some(&project_id) {
                     self.focused_project = None;
                     self.ensure_default_focus();
@@ -1251,9 +811,7 @@ impl Board {
             LocalResponse::Task { task }
             | LocalResponse::TaskCancelled { task }
             | LocalResponse::TaskUpdated { task }
-            | LocalResponse::TaskAssigned { task }
-            | LocalResponse::TaskCompleted { task }
-            | LocalResponse::TaskBlocked { task } => {
+            | LocalResponse::TaskAssigned { task } => {
                 let id = task.snapshot.id.clone();
                 let status = task.snapshot.status;
                 self.tasks.insert(task.snapshot.id.clone(), task);
@@ -1326,20 +884,8 @@ impl Board {
                 }
             }
             LocalResponse::RunAccepted { run_id } => format!("started run {run_id}"),
-            LocalResponse::RunStopped { run_id } => format!("stop requested for run {run_id}"),
             LocalResponse::RunCancelled { run_id } => format!("run {run_id} cancelled"),
-            LocalResponse::SessionStopped { session_id } => {
-                format!("stop requested for session {session_id}")
-            }
-            LocalResponse::TerminalInputAccepted { session_id } => {
-                format!("answer sent to session {session_id}")
-            }
-            LocalResponse::Sessions { sessions, .. } => {
-                for session in sessions {
-                    self.sessions.insert(session.id.clone(), session);
-                }
-                "sessions refreshed".to_owned()
-            }
+            LocalResponse::AttemptFinalizing { run_id } => format!("run {run_id} finalizing"),
             _ => "ok".to_owned(),
         }
     }
@@ -1441,10 +987,9 @@ impl Board {
                     created_at_ms: Some(agent.created_at_ms),
                 },
             )),
-            FactoryEvent::SessionChanged { session } => Some((
-                session.agent_id.clone(),
-                self.activity_identity(&session.agent_id, &session.project_id),
-            )),
+            FactoryEvent::LegacySessionChanged { .. } | FactoryEvent::LegacyRunChanged { .. } => {
+                None
+            }
             FactoryEvent::PolicyDecision {
                 project_id,
                 agent_id,
@@ -1454,16 +999,12 @@ impl Board {
                 project_id,
                 agent_id,
                 ..
-            }
-            | FactoryEvent::RepositoryOperation {
-                project_id,
-                agent_id,
-                ..
             } => Some((
                 agent_id.clone(),
                 self.activity_identity(agent_id, project_id),
             )),
             FactoryEvent::AgentDeleted { .. }
+            | FactoryEvent::LegacyRepositoryOperation { .. }
             | FactoryEvent::RepositoryAuthorityChanged { .. }
             | FactoryEvent::AutoModeChanged { .. }
             | FactoryEvent::TaskDeleted { .. }
@@ -1577,6 +1118,3 @@ pub const fn provider_letter(provider: Provider) -> char {
         Provider::Shell => 'S',
     }
 }
-
-#[cfg(test)]
-mod tests;

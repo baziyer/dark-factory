@@ -1,11 +1,10 @@
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, FactoryEvent, ObserverHealth, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
+    AgentId, AgentRole, AgentSnapshot, FactoryEvent, PROTOCOL_VERSION, ProjectId, ProjectSnapshot,
+    Provider, ProviderHookEvent, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
-        AgentDetail, AgentMessage, AgentProfile, AttachRefusal, AttachRefusalReason, ErrorCode,
-        LocalRequest, LocalResponse, MAX_LOCAL_FRAME_BYTES, MAX_TASK_BODY_BYTES, RequestEnvelope,
-        RunTerminal, ServerFrame,
+        AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
+        MAX_LOCAL_FRAME_BYTES, MAX_REQUEST_CREDENTIAL_BYTES, MAX_TASK_BODY_BYTES,
+        RequestCredential, RequestEnvelope, ServerFrame,
     },
 };
 
@@ -25,18 +24,11 @@ fn run_id(value: &str) -> RunId {
     RunId::try_from(value).unwrap()
 }
 
-fn session_id(value: &str) -> SessionId {
-    SessionId::try_from(value).unwrap()
-}
-
-fn runner_instance_id(value: &str) -> RunnerInstanceId {
-    RunnerInstanceId::try_from(value).unwrap()
-}
-
 #[test]
 fn request_envelope_has_a_stable_tagged_shape() {
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
+        credential: None,
         request: LocalRequest::EventsAfter {
             sequence: 41,
             limit: 100,
@@ -52,6 +44,35 @@ fn request_envelope_has_a_stable_tagged_shape() {
         serde_json::from_value::<RequestEnvelope>(value).unwrap(),
         request
     );
+}
+
+#[test]
+fn request_credentials_are_outer_opaque_bearers_and_debug_is_redacted() {
+    let credential = RequestCredential::new("attempt-secret".into()).unwrap();
+    let request = RequestEnvelope::authenticated(
+        LocalRequest::CompleteAttempt {
+            result: "done".into(),
+        },
+        credential.clone(),
+    );
+    let value = serde_json::to_value(&request).unwrap();
+
+    assert_eq!(value["credential"], "attempt-secret");
+    assert_eq!(value["request"]["type"], "complete_attempt");
+    assert_eq!(
+        value["request"]["data"],
+        serde_json::json!({"result": "done"})
+    );
+    assert!(!format!("{request:?}").contains("attempt-secret"));
+    assert_eq!(credential.expose_secret(), "attempt-secret");
+    assert_eq!(
+        serde_json::from_value::<RequestEnvelope>(value).unwrap(),
+        request
+    );
+
+    assert!(RequestCredential::new(String::new()).is_err());
+    assert!(RequestCredential::new("x".repeat(MAX_REQUEST_CREDENTIAL_BYTES + 1)).is_err());
+    assert!(serde_json::from_value::<RequestCredential>(serde_json::json!("")).is_err());
 }
 
 #[test]
@@ -73,57 +94,36 @@ fn live_detail_requests_and_event_head_have_stable_shapes() {
 }
 
 #[test]
-fn run_terminal_and_stop_requests_have_additive_local_shapes() {
-    let terminal_request = LocalRequest::GetRunTerminal {
-        project_id: project_id("project-1"),
-        run_id: run_id("run-1"),
-    };
-    let stop_request = LocalRequest::StopRun {
+fn cancel_request_and_finalizing_response_have_stable_shapes() {
+    let stop_request = LocalRequest::CancelRun {
         project_id: project_id("project-1"),
         run_id: run_id("run-1"),
         grace_ms: 2_000,
     };
-    let terminal_response = LocalResponse::RunTerminal {
-        terminal: RunTerminal {
-            run_id: run_id("run-1"),
-            head_sequence: 4,
-            output: "[stdout] ready".into(),
-            truncated: false,
-        },
+    let finalizing_response = LocalResponse::AttemptFinalizing {
+        run_id: run_id("run-1"),
     };
-    let stopped_response = LocalResponse::RunStopped {
+    let stopped_response = LocalResponse::RunCancelled {
         run_id: run_id("run-1"),
     };
 
     assert_eq!(
-        serde_json::to_value(terminal_request).unwrap(),
-        serde_json::json!({
-            "type": "get_run_terminal",
-            "data": {"project_id": "project-1", "run_id": "run-1"}
-        })
-    );
-    assert_eq!(
         serde_json::to_value(stop_request).unwrap(),
         serde_json::json!({
-            "type": "stop_run",
+            "type": "cancel_run",
             "data": {"project_id": "project-1", "run_id": "run-1", "grace_ms": 2000}
         })
     );
     assert_eq!(
-        serde_json::to_value(terminal_response).unwrap(),
+        serde_json::to_value(finalizing_response).unwrap(),
         serde_json::json!({
-            "type": "run_terminal",
-            "data": {"terminal": {
-                "run_id": "run-1",
-                "head_sequence": 4,
-                "output": "[stdout] ready",
-                "truncated": false
-            }}
+            "type": "attempt_finalizing",
+            "data": {"run_id": "run-1"}
         })
     );
     assert_eq!(
         serde_json::to_value(stopped_response).unwrap(),
-        serde_json::json!({"type": "run_stopped", "data": {"run_id": "run-1"}})
+        serde_json::json!({"type": "run_cancelled", "data": {"run_id": "run-1"}})
     );
 }
 
@@ -182,14 +182,11 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         model: None,
         reasoning_effort: None,
         model_selection_reason: None,
-        worktree: None,
     };
     let start = LocalRequest::StartTask {
         project_id: project_id("project-1"),
         task_id: task_id("task-1"),
         agent_id: agent_id("agent-1"),
-        parent_run_id: Some(run_id("run-parent")),
-        worktree: Some("/work/dark-factory-agent-1".into()),
     };
     let created = LocalResponse::AgentCreated {
         agent: AgentSnapshot {
@@ -200,8 +197,6 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
             provider: Provider::Codex,
             current_run_id: None,
             paused: false,
-            current_session_id: None,
-            worktree: None,
             created_at_ms: 10,
             updated_at_ms: 10,
         },
@@ -218,7 +213,8 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
     let start = serde_json::to_value(start).unwrap();
     assert_eq!(start["type"], "start_task");
     assert_eq!(start["data"]["task_id"], "task-1");
-    assert_eq!(start["data"]["worktree"], "/work/dark-factory-agent-1");
+    assert!(start["data"].get("worktree").is_none());
+    assert!(start["data"].get("parent_run_id").is_none());
     assert!(start["data"].get("body").is_none());
     assert!(start["data"].get("provider_session_id").is_none());
 
@@ -243,7 +239,6 @@ fn agent_creation_can_carry_an_optional_model_without_exposing_an_id_field_contr
         model: Some("gpt-5-codex".into()),
         reasoning_effort: None,
         model_selection_reason: None,
-        worktree: None,
     };
     let value = serde_json::to_value(request).unwrap();
     assert_eq!(value["data"]["model"], "gpt-5-codex");
@@ -263,7 +258,6 @@ fn operator_messages_have_a_private_durable_wire_shape() {
     let request = LocalRequest::SendAgentMessage {
         id: factory_core::MessageId::try_from("message-1").unwrap(),
         project_id: project_id("project-1"),
-        sender_agent_id: None,
         recipient_agent_id: agent_id("god"),
         body: message.body.clone(),
     };
@@ -289,8 +283,6 @@ fn agent_profile_is_available_only_through_private_local_detail() {
         provider: Provider::Codex,
         current_run_id: None,
         paused: false,
-        current_session_id: None,
-        worktree: None,
         created_at_ms: 1,
         updated_at_ms: 2,
     };
@@ -310,8 +302,6 @@ fn agent_profile_is_available_only_through_private_local_detail() {
                 "/home/user/.dark-factory/projects/factory/agents/god/instructions.md".into(),
             instructions_health: Default::default(),
             memory_path: "/home/user/.dark-factory/projects/factory/agents/god/memory.md".into(),
-            memory_archive_path:
-                "/home/user/.dark-factory/projects/factory/agents/god/memory-archive".into(),
             memory_health: Default::default(),
             project_guidance_path: "/home/user/.dark-factory/projects/factory/PROJECT.md".into(),
         },
@@ -543,9 +533,8 @@ fn the_largest_valid_task_page_fits_one_local_frame() {
 #[test]
 fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
     let request = LocalRequest::ProviderHook {
-        token: "hook-token".into(),
-        event: ProviderHookEvent::Stop,
-        payload: serde_json::json!({"stop_hook_active": true, "session_id": "provider-session-1"}),
+        event: ProviderHookEvent::PreToolUse,
+        payload: serde_json::json!({"tool_name": "Read"}),
     };
     let value = serde_json::to_value(&request).unwrap();
     assert_eq!(
@@ -553,9 +542,8 @@ fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
         serde_json::json!({
             "type": "provider_hook",
             "data": {
-                "token": "hook-token",
-                "event": "stop",
-                "payload": {"stop_hook_active": true, "session_id": "provider-session-1"}
+                "event": "pre_tool_use",
+                "payload": {"tool_name": "Read"}
             }
         })
     );
@@ -582,255 +570,16 @@ fn provider_hook_carries_an_opaque_payload_and_its_reply_is_printed_verbatim() {
 }
 
 #[test]
-fn session_snapshot_omits_unset_optionals_and_session_changed_carries_it() {
-    let session = SessionSnapshot {
-        id: session_id("session-1"),
-        project_id: project_id("project-1"),
-        agent_id: agent_id("agent-1"),
-        provider: Provider::ClaudeCode,
-        runtime_model: None,
-        runtime_reasoning_effort: None,
-        runtime_permission_mode: None,
-        runtime_control_mode: None,
-        state: SessionState::Idle,
-        state_since_ms: 10,
-        worktree: "/work/agent-1".into(),
-        provider_session_id: None,
-        runner_instance_id: Some(runner_instance_id("runner-1")),
-        current_run_id: None,
-        activity: None,
-        activity_inferred: false,
-        last_hook_event: None,
-        notification_kind: None,
-        last_hook_at_ms: None,
-        wait_reason: None,
-        observer_reason: None,
-        observer_health: ObserverHealth::Unknown,
-        observer_health_since_ms: 0,
-        started_at_ms: 5,
-        updated_at_ms: 10,
-        ended_at_ms: None,
-        exit_code: None,
-        exit_signal: None,
-    };
-    let value = serde_json::to_value(&session).unwrap();
-    assert_eq!(
-        value,
-        serde_json::json!({
-            "id": "session-1",
-            "project_id": "project-1",
-            "agent_id": "agent-1",
-            "provider": "claude_code",
-            "state": "idle",
-            "state_since_ms": 10,
-            "worktree": "/work/agent-1",
-            "runner_instance_id": "runner-1",
-            "activity_inferred": false,
-            "observer_health": "unknown",
-            "observer_health_since_ms": 0,
-            "started_at_ms": 5,
-            "updated_at_ms": 10
-        })
-    );
-    assert_eq!(
-        serde_json::from_value::<SessionSnapshot>(value).unwrap(),
-        session
-    );
-
-    let event = FactoryEvent::SessionChanged {
-        session: session.clone(),
-    };
-    let value = serde_json::to_value(&event).unwrap();
-    assert_eq!(value["type"], "session_changed");
-    assert_eq!(value["data"]["session"]["state"], "idle");
-    assert_eq!(
-        serde_json::from_value::<FactoryEvent>(value).unwrap(),
-        event
-    );
-}
-
-#[test]
-fn an_old_session_snapshot_without_runtime_metadata_is_still_readable() {
-    let old_wire = serde_json::json!({
-        "id": "session-1",
-        "project_id": "project-1",
-        "agent_id": "agent-1",
-        "provider": "codex",
-        "state": "stopped",
-        "state_since_ms": 10,
-        "worktree": "/work/agent-1",
-        "activity_inferred": false,
-        "observer_health": "unknown",
-        "observer_health_since_ms": 0,
-        "started_at_ms": 5,
-        "updated_at_ms": 10
+fn obsolete_provider_hook_events_are_rejected_by_the_wire_type() {
+    let value = serde_json::json!({
+        "type": "provider_hook",
+        "data": {"event": "stop", "payload": {}}
     });
-    let session: SessionSnapshot = serde_json::from_value(old_wire).unwrap();
-    assert_eq!(session.runtime_model, None);
-    assert_eq!(session.runtime_reasoning_effort, None);
-    assert_eq!(session.runtime_permission_mode, None);
-    assert_eq!(session.runtime_control_mode, None);
+    assert!(serde_json::from_value::<LocalRequest>(value).is_err());
 }
 
 #[test]
-fn session_snapshot_carries_its_bounded_optionals_when_set() {
-    let session = SessionSnapshot {
-        id: session_id("session-1"),
-        project_id: project_id("project-1"),
-        agent_id: agent_id("agent-1"),
-        provider: Provider::Codex,
-        runtime_model: None,
-        runtime_reasoning_effort: None,
-        runtime_permission_mode: None,
-        runtime_control_mode: None,
-        state: SessionState::WaitingForInput,
-        state_since_ms: 20,
-        worktree: "/work/agent-1".into(),
-        provider_session_id: Some("thread-1".into()),
-        runner_instance_id: Some(runner_instance_id("runner-1")),
-        current_run_id: Some(run_id("run-1")),
-        activity: Some("tool: Read".into()),
-        activity_inferred: true,
-        last_hook_event: Some(ProviderHookEvent::Notification),
-        notification_kind: None,
-        last_hook_at_ms: Some(19),
-        wait_reason: Some("permission prompt".into()),
-        observer_reason: None,
-        observer_health: ObserverHealth::Healthy,
-        observer_health_since_ms: 15,
-        started_at_ms: 5,
-        updated_at_ms: 20,
-        ended_at_ms: None,
-        exit_code: None,
-        exit_signal: None,
-    };
-    let value = serde_json::to_value(&session).unwrap();
-    assert_eq!(value["provider_session_id"], "thread-1");
-    assert_eq!(value["current_run_id"], "run-1");
-    assert_eq!(value["activity"], "tool: Read");
-    assert_eq!(value["activity_inferred"], true);
-    assert_eq!(value["last_hook_event"], "notification");
-    assert_eq!(value["wait_reason"], "permission prompt");
-    assert_eq!(
-        serde_json::from_value::<SessionSnapshot>(value).unwrap(),
-        session
-    );
-}
-
-#[test]
-fn terminal_requests_and_frames_are_keyed_by_session_id() {
-    let attach = LocalRequest::AttachTerminal {
-        project_id: project_id("project-1"),
-        session_id: session_id("session-1"),
-        since_offset: 4,
-        mode: factory_core::runner::TerminalAttachMode::Legacy,
-    };
-    assert_eq!(
-        serde_json::to_value(attach).unwrap(),
-        serde_json::json!({
-            "type": "attach_terminal",
-            "data": {"project_id": "project-1", "session_id": "session-1", "since_offset": 4}
-        })
-    );
-
-    let bounded = LocalRequest::AttachTerminal {
-        project_id: project_id("project-1"),
-        session_id: session_id("session-1"),
-        since_offset: 0,
-        mode: factory_core::runner::TerminalAttachMode::Tail,
-    };
-    assert_eq!(
-        serde_json::to_value(bounded).unwrap(),
-        serde_json::json!({
-            "type": "attach_terminal",
-            "data": {
-                "project_id": "project-1",
-                "session_id": "session-1",
-                "since_offset": 0,
-                "mode": {"kind": "tail"}
-            }
-        })
-    );
-
-    let input = LocalRequest::TerminalInput {
-        project_id: project_id("project-1"),
-        session_id: session_id("session-1"),
-        bytes: "aGk=".into(),
-    };
-    assert_eq!(
-        serde_json::to_value(input).unwrap(),
-        serde_json::json!({
-            "type": "terminal_input",
-            "data": {"project_id": "project-1", "session_id": "session-1", "bytes": "aGk="}
-        })
-    );
-
-    let accepted = LocalResponse::TerminalInputAccepted {
-        session_id: session_id("session-1"),
-    };
-    assert_eq!(
-        serde_json::to_value(accepted).unwrap(),
-        serde_json::json!({"type": "terminal_input_accepted", "data": {"session_id": "session-1"}})
-    );
-
-    let frame = ServerFrame::TerminalOutput {
-        protocol_version: PROTOCOL_VERSION,
-        session_id: session_id("session-1"),
-        generation: 0,
-        offset: 4,
-        bytes: "aGk=".into(),
-    };
-    let value = serde_json::to_value(&frame).unwrap();
-    assert_eq!(value["type"], "terminal_output");
-    assert_eq!(value["data"]["session_id"], "session-1");
-    assert_eq!(serde_json::from_value::<ServerFrame>(value).unwrap(), frame);
-
-    let ready = ServerFrame::TerminalOutput {
-        protocol_version: PROTOCOL_VERSION,
-        session_id: session_id("session-1"),
-        generation: 0,
-        offset: 4,
-        bytes: String::new(),
-    };
-    assert_eq!(
-        serde_json::to_value(&ready).unwrap(),
-        serde_json::json!({
-            "type": "terminal_output",
-            "data": {
-                "protocol_version": PROTOCOL_VERSION,
-                "session_id": "session-1",
-                "generation": 0,
-                "offset": 4,
-                "bytes": ""
-            }
-        })
-    );
-}
-
-#[test]
-fn attach_refusal_is_a_bounded_typed_frame_with_session_and_runner_identity() {
-    let response = LocalResponse::AttachRefused {
-        refusal: AttachRefusal {
-            project_id: project_id("project-1"),
-            session_id: session_id("session-1"),
-            runner_instance_id: Some(RunnerInstanceId::try_from("runner-1").unwrap()),
-            session_state: Some(SessionState::Idle),
-            reason: AttachRefusalReason::RunnerReplaced,
-        },
-    };
-    let value = serde_json::to_value(&response).unwrap();
-    assert_eq!(value["type"], "attach_refused");
-    assert_eq!(value["data"]["refusal"]["reason"], "runner_replaced");
-    assert_eq!(value["data"]["refusal"]["session_id"], "session-1");
-    assert_eq!(value["data"]["refusal"]["runner_instance_id"], "runner-1");
-    assert_eq!(
-        serde_json::from_value::<LocalResponse>(value).unwrap(),
-        response
-    );
-}
-
-#[test]
-fn session_lifecycle_requests_have_small_versioned_local_shapes() {
+fn attempt_outcomes_cannot_select_project_task_or_run() {
     assert_eq!(
         serde_json::to_value(LocalRequest::PauseAgent {
             project_id: project_id("project-1"),
@@ -843,32 +592,21 @@ fn session_lifecycle_requests_have_small_versioned_local_shapes() {
         })
     );
     assert_eq!(
-        serde_json::to_value(LocalRequest::CompleteTask {
-            project_id: project_id("project-1"),
-            task_id: task_id("task-1"),
+        serde_json::to_value(LocalRequest::CompleteAttempt {
             result: "done".into(),
         })
         .unwrap(),
         serde_json::json!({
-            "type": "complete_task",
-            "data": {"project_id": "project-1", "task_id": "task-1", "result": "done"}
+            "type": "complete_attempt",
+            "data": {"result": "done"}
         })
     );
     assert_eq!(
-        serde_json::to_value(LocalRequest::ListSessions {
-            project_id: project_id("project-1"),
-            after_id: None,
-            limit: None,
+        serde_json::to_value(LocalRequest::BlockAttempt {
+            reason: "dependency".into(),
         })
         .unwrap(),
-        serde_json::json!({"type": "list_sessions", "data": {"project_id": "project-1"}})
-    );
-    assert_eq!(
-        serde_json::to_value(LocalResponse::SessionStopped {
-            session_id: session_id("session-1"),
-        })
-        .unwrap(),
-        serde_json::json!({"type": "session_stopped", "data": {"session_id": "session-1"}})
+        serde_json::json!({"type": "block_attempt", "data": {"reason": "dependency"}})
     );
 }
 
@@ -919,8 +657,8 @@ fn status_requests_have_stable_shapes() {
         auto_mode: true,
         generated_at_ms: 7,
         event_sequence: 9,
-        live_session_cap: 4,
-        live_sessions: 1,
+        active_run_cap: 4,
+        active_runs: 1,
         projects: Vec::new(),
         attention: Vec::new(),
     };
@@ -929,80 +667,13 @@ fn status_requests_have_stable_shapes() {
     })
     .unwrap();
     assert_eq!(value["type"], "fleet_status");
-    assert_eq!(value["data"]["status"]["live_session_cap"], 4);
+    assert_eq!(value["data"]["status"]["active_run_cap"], 4);
     assert_eq!(value["data"]["status"]["auto_mode"], true);
-    assert_eq!(value["data"]["status"]["live_sessions"], 1);
+    assert_eq!(value["data"]["status"]["active_runs"], 1);
     assert_eq!(value["data"]["status"]["event_sequence"], 9);
     assert_eq!(value["data"]["status"]["projects"], serde_json::json!([]));
     assert_eq!(
         serde_json::from_value::<LocalResponse>(value).unwrap(),
         LocalResponse::FleetStatus { status }
     );
-}
-
-#[test]
-fn protocol_v1_attention_rows_decode_in_both_old_and_new_shapes() {
-    use factory_core::status::{AttentionAction, AttentionKind, AttentionReasonKind};
-    use serde::Deserialize;
-
-    let old_daemon = serde_json::json!({
-        "type": "fleet_status",
-        "data": {"status": {
-            "generated_at_ms": 7,
-            "auto_mode": true,
-            "live_session_cap": 4,
-            "live_sessions": 1,
-            "projects": [],
-            "attention": [{
-                "kind": "needs_input",
-                "level": "needs_input",
-                "project_id": "project-1",
-                "agent_id": "agent-1",
-                "session_id": "session-1",
-                "since_ms": 6,
-                "detail": "legacy provider wait"
-            }]
-        }}
-    });
-    let LocalResponse::FleetStatus { status } =
-        serde_json::from_value::<LocalResponse>(old_daemon).unwrap()
-    else {
-        panic!("expected fleet status")
-    };
-    assert_eq!(status.event_sequence, -1);
-    assert_eq!(status.attention.len(), 1);
-    assert_eq!(
-        status.attention[0].reason.kind,
-        AttentionReasonKind::Inferred
-    );
-    assert_eq!(
-        status.attention[0].reason.action,
-        AttentionAction::InspectInferredState
-    );
-
-    #[derive(Deserialize)]
-    struct OldAttentionItem {
-        kind: AttentionKind,
-        detail: String,
-    }
-    #[derive(Deserialize)]
-    struct OldFleetStatus {
-        attention: Vec<OldAttentionItem>,
-    }
-    let new_daemon = serde_json::to_value(LocalResponse::FleetStatus {
-        status: factory_core::status::FleetStatus {
-            generated_at_ms: 8,
-            event_sequence: 12,
-            auto_mode: true,
-            live_session_cap: 4,
-            live_sessions: 1,
-            projects: Vec::new(),
-            attention: status.attention,
-        },
-    })
-    .unwrap();
-    let old = OldFleetStatus::deserialize(&new_daemon["data"]["status"]).unwrap();
-    assert_eq!(old.attention.len(), 1);
-    assert_eq!(old.attention[0].kind, AttentionKind::NeedsInput);
-    assert_eq!(old.attention[0].detail, "legacy provider wait");
 }

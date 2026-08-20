@@ -1,40 +1,20 @@
-//! The one attention urgency taxonomy: what counts as urgent, ranked.
-//! `factoryd` uses it to build the structured status projection and
-//! `factory-tui` consumes those projected levels for NEEDS YOU routing; the
-//! board does not independently rebuild operator attention from raw states.
-//!
-//! Session state wins over run-status inference when a session exists
-//! (hooks supersede inference); [`Rated`] carries which one a value came
-//! from.
+//! Shared operator-attention taxonomy derived from durable task/run state.
 
 use serde::{Deserialize, Serialize};
 
-use crate::{RunSnapshot, RunStatus, SessionSnapshot, SessionState, TaskStatus};
+use crate::{RunOutcome, RunPhase, RunSnapshot, TaskStatus};
 
-/// How urgently something wants the operator's attention, ranked low to high. `Ord`/`PartialOrd`
-/// follow declaration order, so `a.max(b)` and sorting by this enum directly implement "float
-/// above routine" without a separate `priority()` lookup table to keep in sync — declaration
-/// order *is* the ranking, which is also why every variant is documented with its rank in mind.
+/// How urgently something wants the operator's attention, ranked low to high.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Attention {
-    /// Nothing to see: idle, working normally, queued, or otherwise unremarkable.
     Routine,
-    /// A positive terminal outcome (task succeeded, run succeeded) — worth a line in the log, but
-    /// never worth interrupting an operator's scan for something that's actually stuck.
     Completed,
-    /// A negative terminal outcome (task/run/session failed).
     Failed,
-    /// Blocked on a human: a session waiting for input, or a task/run blocked/waiting. Ranked
-    /// above `Failed` because a `Failed` agent stays failed until retried (nothing new to decide
-    /// right now), whereas `NeedsInput` is actively blocking forward progress on live work.
     NeedsInput,
 }
 
 impl Attention {
-    /// Explicit numeric rank, for call sites that want a number rather than to lean on `Ord`
-    /// (e.g. formatting, or a future cross-process wire form). Kept in lock-step with the enum's
-    /// declaration order by the `priority_matches_declaration_order` test below.
     #[must_use]
     pub const fn priority(self) -> u8 {
         match self {
@@ -45,46 +25,28 @@ impl Attention {
         }
     }
 
-    /// Whether this level is one an operator should be actively routed toward (`g`/`G`'s filter,
-    /// WORKSHOP's `!` toggle). Deliberately excludes `Completed`: a success needs to be seen once
-    /// in the log, not hunted down.
     #[must_use]
     pub const fn needs_operator(self) -> bool {
         matches!(self, Self::Failed | Self::NeedsInput)
     }
 }
 
-/// Maps a session's durable state onto [`Attention`]. `Starting`/`Idle`/`Working`/`Stopped` are
-/// all `Routine` here: `Stopped` is a normal, expected end of a session's life (distinct from
-/// `Failed`, which is not), and doesn't need to be chased down the way a stuck or failed agent
-/// does.
+/// A run is authoritative for its own attention. There is no resident-session
+/// state to override or infer it from.
 #[must_use]
-pub const fn session_attention(state: SessionState) -> Attention {
-    match state {
-        SessionState::WaitingForInput => Attention::NeedsInput,
-        SessionState::Failed => Attention::Failed,
-        SessionState::Starting
-        | SessionState::Idle
-        | SessionState::Working
-        | SessionState::Stopped => Attention::Routine,
-    }
-}
-
-/// Maps a run's status onto [`Attention]` — the fallback used when an agent has no session yet
-/// (see [`agent_attention`]).
-#[must_use]
-pub const fn run_attention(status: RunStatus) -> Attention {
-    match status {
-        RunStatus::Failed => Attention::Failed,
-        RunStatus::Waiting | RunStatus::Blocked => Attention::NeedsInput,
-        RunStatus::Succeeded => Attention::Completed,
-        RunStatus::Starting | RunStatus::Running | RunStatus::Paused | RunStatus::Stopped => {
-            Attention::Routine
+pub fn run_attention(run: &RunSnapshot) -> Attention {
+    match (&run.phase, &run.outcome) {
+        (RunPhase::Terminal, Some(RunOutcome::Succeeded)) => Attention::Completed,
+        (RunPhase::Terminal, Some(RunOutcome::Blocked { .. })) => Attention::NeedsInput,
+        (RunPhase::Terminal, Some(RunOutcome::Failed { .. })) => Attention::Failed,
+        (RunPhase::Terminal, Some(RunOutcome::Cancelled { .. })) => Attention::Routine,
+        (RunPhase::Finalizing, _) if run.observer_health == crate::ObserverHealth::Degraded => {
+            Attention::Failed
         }
+        _ => Attention::Routine,
     }
 }
 
-/// Maps a task's status onto [`Attention`], for the WORKSHOP task list and announcements.
 #[must_use]
 pub const fn task_attention(status: TaskStatus) -> Attention {
     match status {
@@ -95,64 +57,71 @@ pub const fn task_attention(status: TaskStatus) -> Attention {
     }
 }
 
-/// The precedence rule used while `factoryd` builds status responses: a live
-/// session's hook-driven state wins (observed); with no live session, a most recent
-/// session that ended in failure still counts as failed (observed) until a
-/// new session starts; otherwise the most recent run's status is the best
-/// guess (inferred), `Routine` when the agent has never run.
-/// `latest_session` is the agent's newest session, live or ended.
-#[must_use]
-pub fn agent_attention(
-    latest_session: Option<&SessionSnapshot>,
-    latest_run: Option<&RunSnapshot>,
-) -> Rated<Attention> {
-    match latest_session {
-        Some(session) if session.ended_at_ms.is_none() => {
-            Rated::observed(session_attention(session.state))
-        }
-        Some(session) if session.state == SessionState::Failed => {
-            Rated::observed(Attention::Failed)
-        }
-        _ => {
-            Rated::inferred(latest_run.map_or(Attention::Routine, |run| run_attention(run.status)))
-        }
-    }
-}
-
-/// An attention level together with whether it was read straight from a hook-reported session
-/// (`inferred = false`) or guessed from run/task lifecycle state because no session exists yet
-/// (`inferred = true`). The design brief: "mark inferred activity with a `~` prefix in the detail
-/// pane" — `inferred` is exactly that bit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Rated<T> {
-    pub value: T,
-    pub inferred: bool,
-}
-
-impl<T> Rated<T> {
-    #[must_use]
-    pub const fn observed(value: T) -> Self {
-        Self {
-            value,
-            inferred: false,
-        }
-    }
-
-    #[must_use]
-    pub const fn inferred(value: T) -> Self {
-        Self {
-            value,
-            inferred: true,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{AgentId, ObserverHealth, ProjectId, Provider, RunFailureReason, RunId, TaskId};
+
+    fn run(phase: RunPhase, outcome: Option<RunOutcome>) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::try_from("run-1").unwrap(),
+            project_id: ProjectId::try_from("project-1").unwrap(),
+            agent_id: AgentId::try_from("agent-1").unwrap(),
+            task_id: TaskId::try_from("task-1").unwrap(),
+            provider: Provider::Shell,
+            phase,
+            outcome,
+            runner_instance_id: None,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            activity: None,
+            wait_reason: None,
+            observer_health: ObserverHealth::Healthy,
+            observer_reason: None,
+            admitted_at_ms: 1,
+            started_at_ms: Some(2),
+            phase_since_ms: 3,
+            updated_at_ms: 3,
+            ended_at_ms: None,
+            exit_code: None,
+            exit_signal: None,
+        }
+    }
 
     #[test]
-    fn priority_matches_declaration_order() {
+    fn only_terminal_outcomes_drive_completed_blocked_or_failed_attention() {
+        assert_eq!(
+            run_attention(&run(RunPhase::Terminal, Some(RunOutcome::Succeeded))),
+            Attention::Completed
+        );
+        assert_eq!(
+            run_attention(&run(
+                RunPhase::Terminal,
+                Some(RunOutcome::Blocked {
+                    reason: "wait".into()
+                })
+            )),
+            Attention::NeedsInput
+        );
+        assert_eq!(
+            run_attention(&run(
+                RunPhase::Terminal,
+                Some(RunOutcome::Failed {
+                    reason: RunFailureReason::Process
+                })
+            )),
+            Attention::Failed
+        );
+        assert_eq!(
+            run_attention(&run(RunPhase::Running, Some(RunOutcome::Succeeded))),
+            Attention::Routine
+        );
+    }
+
+    #[test]
+    fn priority_and_operator_routing_share_one_order() {
         let ranked = [
             Attention::Routine,
             Attention::Completed,
@@ -160,76 +129,12 @@ mod tests {
             Attention::NeedsInput,
         ];
         for window in ranked.windows(2) {
-            assert!(
-                window[0] < window[1],
-                "{:?} should rank below {:?}",
-                window[0],
-                window[1]
-            );
-            assert!(
-                window[0].priority() < window[1].priority(),
-                "priority() should agree with Ord"
-            );
+            assert!(window[0] < window[1]);
+            assert!(window[0].priority() < window[1].priority());
         }
-    }
-
-    #[test]
-    fn needs_operator_excludes_completed_and_routine() {
         assert!(!Attention::Routine.needs_operator());
         assert!(!Attention::Completed.needs_operator());
         assert!(Attention::Failed.needs_operator());
         assert!(Attention::NeedsInput.needs_operator());
-    }
-
-    #[test]
-    fn session_state_maps_only_waiting_and_failed_above_routine() {
-        assert_eq!(
-            session_attention(SessionState::WaitingForInput),
-            Attention::NeedsInput
-        );
-        assert_eq!(session_attention(SessionState::Failed), Attention::Failed);
-        for routine in [
-            SessionState::Starting,
-            SessionState::Idle,
-            SessionState::Working,
-            SessionState::Stopped,
-        ] {
-            assert_eq!(
-                session_attention(routine),
-                Attention::Routine,
-                "{routine:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn run_status_mapping_matches_brief() {
-        assert_eq!(run_attention(RunStatus::Failed), Attention::Failed);
-        assert_eq!(run_attention(RunStatus::Waiting), Attention::NeedsInput);
-        assert_eq!(run_attention(RunStatus::Blocked), Attention::NeedsInput);
-        assert_eq!(run_attention(RunStatus::Succeeded), Attention::Completed);
-        assert_eq!(run_attention(RunStatus::Starting), Attention::Routine);
-        assert_eq!(run_attention(RunStatus::Running), Attention::Routine);
-        assert_eq!(run_attention(RunStatus::Paused), Attention::Routine);
-        assert_eq!(run_attention(RunStatus::Stopped), Attention::Routine);
-    }
-
-    #[test]
-    fn task_status_mapping_treats_blocked_as_needs_input() {
-        assert_eq!(task_attention(TaskStatus::Blocked), Attention::NeedsInput);
-        assert_eq!(task_attention(TaskStatus::Failed), Attention::Failed);
-        assert_eq!(task_attention(TaskStatus::Succeeded), Attention::Completed);
-        assert_eq!(task_attention(TaskStatus::Queued), Attention::Routine);
-        assert_eq!(task_attention(TaskStatus::Running), Attention::Routine);
-        assert_eq!(task_attention(TaskStatus::Cancelled), Attention::Routine);
-    }
-
-    #[test]
-    fn rated_tracks_inferred_bit() {
-        let observed = Rated::observed(Attention::Failed);
-        let inferred = Rated::inferred(Attention::Failed);
-        assert!(!observed.inferred);
-        assert!(inferred.inferred);
-        assert_eq!(observed.value, inferred.value);
     }
 }

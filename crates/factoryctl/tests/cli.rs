@@ -8,7 +8,7 @@ use std::{
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
     ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskId,
-    local::{LocalRequest, LocalResponse, RequestEnvelope, ServerFrame},
+    local::{LocalRequest, LocalResponse, RequestCredential, RequestEnvelope, ServerFrame},
     status::FleetStatus,
 };
 
@@ -22,6 +22,12 @@ fn write_response(stream: &mut std::os::unix::net::UnixStream, response: LocalRe
     )
     .unwrap();
     stream.write_all(b"\n").unwrap();
+}
+
+fn write_operator_credential(home: &std::path::Path) -> RequestCredential {
+    let credential = RequestCredential::new("operator-secret".into()).unwrap();
+    std::fs::write(home.join("operator.token"), credential.expose_secret()).unwrap();
+    credential
 }
 
 /// `factoryctl usage` never touches the daemon: it probes `codex` on `PATH`
@@ -130,12 +136,13 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    write_operator_credential(directory.path());
     let status = FleetStatus {
         generated_at_ms: 123,
         event_sequence: 0,
         auto_mode: true,
-        live_session_cap: 4,
-        live_sessions: 0,
+        active_run_cap: 4,
+        active_runs: 0,
         projects: Vec::new(),
         attention: Vec::new(),
     };
@@ -180,6 +187,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
 
     let human = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args(["--socket", socket.to_str().unwrap(), "status"])
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
     assert!(human.status.success(), "{human:?}");
@@ -191,12 +199,13 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
             env!("CARGO_PKG_VERSION"),
             " | active runtime v",
             env!("CARGO_PKG_VERSION"),
-            " | auto on | sessions 0/4 | projects 0 | attention 0\n"
+            " | auto on | attempts 0/4 | projects 0 | attention 0\n"
         )
     );
 
     let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args(["--socket", socket.to_str().unwrap(), "status", "--json"])
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
     assert!(json.status.success(), "{json:?}");
@@ -210,6 +219,7 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let credential = write_operator_credential(directory.path());
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -218,7 +228,10 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::Subscribe { after_sequence: 7 })
+            RequestEnvelope::authenticated(
+                LocalRequest::Subscribe { after_sequence: 7 },
+                credential,
+            )
         );
         for frame in [
             ServerFrame::Response {
@@ -260,6 +273,7 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
             "7",
             "--follow",
         ])
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
 
@@ -281,6 +295,8 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let credential = write_operator_credential(directory.path());
+    let expected_credential = credential.clone();
     let server = thread::spawn(move || {
         let (mut agent_stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -288,6 +304,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             .read_line(&mut line)
             .unwrap();
         let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
+        assert_eq!(request.credential, Some(expected_credential.clone()));
         let LocalRequest::CreateAgent {
             id,
             project_id,
@@ -297,7 +314,6 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             model,
             reasoning_effort,
             model_selection_reason,
-            worktree,
         } = request.request
         else {
             panic!("expected create-agent request");
@@ -310,7 +326,6 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         assert_eq!(model, None);
         assert_eq!(reasoning_effort, None);
         assert_eq!(model_selection_reason, None);
-        assert_eq!(worktree, None);
         write_response(
             &mut agent_stream,
             LocalResponse::AgentCreated {
@@ -322,8 +337,6 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
                     provider: Provider::Codex,
                     current_run_id: None,
                     paused: false,
-                    current_session_id: None,
-                    worktree: None,
                     created_at_ms: 1,
                     updated_at_ms: 1,
                 },
@@ -337,13 +350,14 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::StartTask {
-                project_id: ProjectId::try_from("project-1").unwrap(),
-                task_id: TaskId::try_from("task-1").unwrap(),
-                agent_id: AgentId::try_from("agent-1").unwrap(),
-                parent_run_id: None,
-                worktree: Some("/work/agent-1".into()),
-            })
+            RequestEnvelope::authenticated(
+                LocalRequest::StartTask {
+                    project_id: ProjectId::try_from("project-1").unwrap(),
+                    task_id: TaskId::try_from("task-1").unwrap(),
+                    agent_id: AgentId::try_from("agent-1").unwrap(),
+                },
+                expected_credential,
+            )
         );
         write_response(
             &mut start_stream,
@@ -366,6 +380,7 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             "--provider",
             "codex",
         ])
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
     assert!(agent.status.success());
@@ -394,9 +409,8 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
             "task-1",
             "--agent",
             "agent-1",
-            "--worktree",
-            "/work/agent-1",
         ])
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
     assert!(start.status.success());
@@ -433,11 +447,13 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::ProviderHook {
-                token: "session-token-value".into(),
-                event: ProviderHookEvent::Stop,
-                payload: serde_json::json!({"stop_hook_active": false}),
-            })
+            RequestEnvelope::authenticated(
+                LocalRequest::ProviderHook {
+                    event: ProviderHookEvent::PreToolUse,
+                    payload: serde_json::json!({"tool_name": "Read"}),
+                },
+                RequestCredential::new("session-token-value".into()).unwrap()
+            )
         );
         write_response(
             &mut stream,
@@ -454,7 +470,7 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
             "hook",
             "--token-file",
             token_path.to_str().unwrap(),
-            "Stop",
+            "PreToolUse",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -464,7 +480,7 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
         .stdin
         .take()
         .unwrap()
-        .write_all(br#"{"stop_hook_active": false}"#)
+        .write_all(br#"{"tool_name":"Read"}"#)
         .unwrap();
     let output = child.wait_with_output().unwrap();
 
@@ -477,68 +493,83 @@ fn hook_forwards_the_stdin_payload_and_prints_the_daemon_reply_verbatim() {
     server.join().unwrap();
 }
 
-/// A hook invocation must never wedge the operator's live provider session:
-/// an unreachable daemon socket still exits 0 and prints `{}`.
 #[test]
-fn hook_fails_open_and_prints_an_empty_object_when_the_daemon_is_unreachable() {
+fn task_outcome_uses_only_the_attempt_credential_and_result() {
     let directory = tempfile::tempdir().unwrap();
-    let token_path = directory.path().join("hook.token");
-    std::fs::write(&token_path, "session-token-value").unwrap();
-    let unreachable_socket = directory.path().join("no-daemon-here.sock");
+    let socket = directory.path().join("factory.sock");
+    let token_path = directory.path().join("attempt.token");
+    let credential = RequestCredential::new("attempt-secret".into()).unwrap();
+    std::fs::write(&token_path, credential.expose_secret()).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::authenticated(
+                LocalRequest::CompleteAttempt {
+                    result: "finished".into(),
+                },
+                credential,
+            )
+        );
+        write_response(
+            &mut stream,
+            LocalResponse::AttemptFinalizing {
+                run_id: RunId::try_from("run-1").unwrap(),
+            },
+        );
+    });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args([
             "--socket",
-            unreachable_socket.to_str().unwrap(),
-            "hook",
-            "--token-file",
-            token_path.to_str().unwrap(),
-            "SessionStart",
+            socket.to_str().unwrap(),
+            "task",
+            "done",
+            "--result",
+            "finished",
         ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
+        .env("DARK_FACTORY_ATTEMPT_TOKEN_FILE", token_path)
+        .output()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"{}").unwrap();
-    let output = child.wait_with_output().unwrap();
-
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({})
-    );
+    assert!(output.status.success(), "{output:?}");
+    server.join().unwrap();
 }
 
-/// Same fail-open contract when the token file itself cannot be read (a
-/// provider misconfiguration, not a daemon problem) — still exits 0 and
-/// prints `{}`, without ever attempting to contact the daemon.
 #[test]
-fn hook_fails_open_when_the_token_file_is_missing() {
+fn attempt_environment_cannot_accidentally_select_operator_authority() {
     let directory = tempfile::tempdir().unwrap();
-    let unreachable_socket = directory.path().join("no-daemon-here.sock");
-    let missing_token = directory.path().join("missing.token");
+    let socket = directory.path().join("factory.sock");
+    let token_path = directory.path().join("attempt.token");
+    let credential = RequestCredential::new("attempt-secret".into()).unwrap();
+    std::fs::write(&token_path, credential.expose_secret()).unwrap();
+    std::fs::write(directory.path().join("operator.token"), "operator-secret").unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
+            RequestEnvelope::authenticated(LocalRequest::SetAutoMode { enabled: true }, credential)
+        );
+        write_response(&mut stream, LocalResponse::AutoModeSet { enabled: true });
+    });
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-        .args([
-            "--socket",
-            unreachable_socket.to_str().unwrap(),
-            "hook",
-            "--token-file",
-            missing_token.to_str().unwrap(),
-            "Notification",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
+    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "auto", "on"])
+        .env("DARK_FACTORY_HOME", directory.path())
+        .env("DARK_FACTORY_ATTEMPT_TOKEN_FILE", token_path)
+        .output()
         .unwrap();
-    child.stdin.take().unwrap().write_all(b"{}").unwrap();
-    let output = child.wait_with_output().unwrap();
-
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!({})
-    );
+    assert!(output.status.success(), "{output:?}");
+    server.join().unwrap();
 }
 
 #[test]
@@ -573,6 +604,7 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    let credential = write_operator_credential(directory.path());
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut line = String::new();
@@ -581,9 +613,12 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::new(LocalRequest::GetProject {
-                project_id: ProjectId::try_from("factory").unwrap(),
-            })
+            RequestEnvelope::authenticated(
+                LocalRequest::GetProject {
+                    project_id: ProjectId::try_from("factory").unwrap(),
+                },
+                credential,
+            )
         );
         // The request having reached the daemon with the env-resolved
         // project ID, matched above, is what this test is checking; the
@@ -602,67 +637,7 @@ fn project_flag_falls_back_to_the_dark_factory_project_environment_variable() {
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
         .args(["--socket", socket.to_str().unwrap(), "project", "get"])
         .env("DARK_FACTORY_PROJECT", "factory")
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "{output:?}");
-    server.join().unwrap();
-}
-
-/// `agent message --from` falls back to `$DARK_FACTORY_AGENT`, matching how
-/// the daemon exports it into a session so an agent's own `factoryctl agent
-/// message` calls are attributed to it without repeating `--from`.
-#[test]
-fn agent_message_from_falls_back_to_the_dark_factory_agent_environment_variable() {
-    let directory = tempfile::tempdir().unwrap();
-    let socket = directory.path().join("factory.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let request = serde_json::from_str::<RequestEnvelope>(&line).unwrap();
-        let LocalRequest::SendAgentMessage {
-            sender_agent_id,
-            recipient_agent_id,
-            body,
-            ..
-        } = request.request
-        else {
-            panic!("expected send-agent-message request");
-        };
-        assert_eq!(
-            sender_agent_id,
-            Some(AgentId::try_from("worker-1").unwrap())
-        );
-        assert_eq!(recipient_agent_id, AgentId::try_from("god").unwrap());
-        assert_eq!(body, "status update");
-        write_response(
-            &mut stream,
-            LocalResponse::Health {
-                runner_path: "/opt/factory-runner".to_owned(),
-                factoryctl_path: "/opt/factoryctl".to_owned(),
-                version: "0.1.0".to_owned(),
-                process_id: 0,
-            },
-        );
-    });
-
-    let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-        .args([
-            "--socket",
-            socket.to_str().unwrap(),
-            "agent",
-            "message",
-            "--project",
-            "factory",
-            "--to",
-            "god",
-            "--body",
-            "status update",
-        ])
-        .env("DARK_FACTORY_AGENT", "worker-1")
+        .env("DARK_FACTORY_HOME", directory.path())
         .output()
         .unwrap();
     assert!(output.status.success(), "{output:?}");

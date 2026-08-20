@@ -1,5 +1,5 @@
 use factory_core::local::LocalRequest;
-use factory_core::status::{AttentionAction, AttentionItem, AttentionReasonKind, display_text};
+use factory_core::status::{AttentionAction, AttentionItem, display_text};
 
 use super::{Board, Intent, StatusLevel};
 
@@ -17,18 +17,6 @@ impl Board {
         let mut items: Vec<_> = self
             .attention
             .iter()
-            .filter(|item| {
-                item.session_id.as_ref().is_none_or(|session_id| {
-                    !self.local_attention.contains_key(session_id)
-                        || item.reason.kind == AttentionReasonKind::ObserverProblem
-                })
-            })
-            .chain(self.local_attention.values().filter(|local| {
-                !self.attention.iter().any(|item| {
-                    item.session_id == local.session_id
-                        && item.reason.kind == AttentionReasonKind::ObserverProblem
-                })
-            }))
             .filter(|item| item.level.needs_operator())
             .cloned()
             .collect();
@@ -102,11 +90,9 @@ impl Board {
         self.pending_attention_action = None;
         self.pending_attention_operation_id = None;
         self.pending_attention_request = None;
-        if item.reason.kind != AttentionReasonKind::ProviderPermission {
-            self.completed_attention.push(item);
-            if self.completed_attention.len() > 32 {
-                self.completed_attention.remove(0);
-            }
+        self.completed_attention.push(item);
+        if self.completed_attention.len() > 32 {
+            self.completed_attention.remove(0);
         }
         self.reconcile_attention_focus();
     }
@@ -180,7 +166,6 @@ pub(crate) fn same_attention_source(a: &AttentionItem, b: &AttentionItem) -> boo
         && a.project_id == b.project_id
         && a.agent_id == b.agent_id
         && a.task_id == b.task_id
-        && a.session_id == b.session_id
         && a.run_id == b.run_id
         && a.since_ms == b.since_ms
 }

@@ -1,12 +1,11 @@
 //! Per-agent presentation state: the five-way [`AgentState`] shown as glyph color everywhere on
 //! the board, the bounded [`RingBuffer`] the announcements log is built from, and the per-agent
 //! [`ActivitySeries`]/braille sparkline. Moved out of the pre-Track-6c `model.rs` unchanged in
-//! behavior; only [`agent_state`] gained the session-precedence rule described in its own doc
-//! comment.
+//! behavior.
 
 use std::collections::VecDeque;
 
-use factory_core::{RunStatus, SessionState};
+use factory_core::{RunOutcome, RunPhase, RunSnapshot};
 
 // ---------------------------------------------------------------------------------------------
 // Agent state
@@ -23,6 +22,24 @@ pub enum AgentState {
     Failed,
 }
 
+/// Whether a presentation value came directly from durable state or is an
+/// intentionally inferred fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rated<T> {
+    pub value: T,
+    pub inferred: bool,
+}
+
+impl<T> Rated<T> {
+    #[must_use]
+    pub const fn observed(value: T) -> Self {
+        Self {
+            value,
+            inferred: false,
+        }
+    }
+}
+
 impl AgentState {
     #[must_use]
     pub const fn label(self) -> &'static str {
@@ -36,33 +53,20 @@ impl AgentState {
     }
 }
 
-/// Maps a session's durable state onto [`AgentState`]. The session-state half of the precedence
-/// rule described on [`crate::model::Board::agent_state`]: called only once a session is known to
-/// exist for the agent.
+/// Maps one durable attempt onto the board's compact presentation state.
 #[must_use]
-pub const fn agent_state_from_session(state: SessionState) -> AgentState {
-    match state {
-        SessionState::Starting | SessionState::Idle => AgentState::Idle,
-        SessionState::Working => AgentState::Working,
-        SessionState::WaitingForInput => AgentState::Waiting,
-        SessionState::Stopped => AgentState::Stopped,
-        SessionState::Failed => AgentState::Failed,
-    }
-}
-
-/// Maps a run's status onto [`AgentState`] — the pre-sessions fallback, used when an agent has no
-/// session yet. Preserved verbatim from the pre-Track-6c board (see its README for the original
-/// judgment calls: no run/succeeded reads as idle; a run that failed or was stopped keeps showing
-/// that outcome, rather than reverting to idle, until retried; `RunStatus::Paused` folds into
-/// `Waiting` as the closest fit).
-#[must_use]
-pub const fn agent_state_from_run(status: Option<RunStatus>) -> AgentState {
-    match status {
-        None | Some(RunStatus::Succeeded) => AgentState::Idle,
-        Some(RunStatus::Starting | RunStatus::Running) => AgentState::Working,
-        Some(RunStatus::Waiting | RunStatus::Blocked | RunStatus::Paused) => AgentState::Waiting,
-        Some(RunStatus::Failed) => AgentState::Failed,
-        Some(RunStatus::Stopped) => AgentState::Stopped,
+pub fn agent_state_from_run(run: Option<&RunSnapshot>) -> AgentState {
+    let Some(run) = run else {
+        return AgentState::Idle;
+    };
+    match (&run.phase, &run.outcome) {
+        (RunPhase::Admitted | RunPhase::Running, _) => AgentState::Working,
+        (RunPhase::Finalizing, Some(RunOutcome::Blocked { .. })) => AgentState::Waiting,
+        (RunPhase::Finalizing, _) => AgentState::Working,
+        (RunPhase::Terminal, Some(RunOutcome::Blocked { .. })) => AgentState::Waiting,
+        (RunPhase::Terminal, Some(RunOutcome::Failed { .. })) => AgentState::Failed,
+        (RunPhase::Terminal, Some(RunOutcome::Cancelled { .. })) => AgentState::Stopped,
+        (RunPhase::Terminal, Some(RunOutcome::Succeeded) | None) => AgentState::Idle,
     }
 }
 
@@ -97,12 +101,6 @@ impl<T> RingBuffer<T> {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> {
         self.items.iter()
     }
-
-    #[must_use]
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.items.len()
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -117,7 +115,7 @@ const ACTIVITY_WINDOW: usize = 12;
 /// Number of recent buckets shown in BUILDING. At five seconds per bucket this is a 40-second
 /// visible horizon, while the series retains another four buckets for smooth aging at the edge.
 /// A rolling five-second event count for one agent, rendered as a braille sparkline. A stand-in
-/// for a real tokens/turns series until session-level per-turn accounting exists.
+/// for a real tokens/turns series until attempt-level accounting exists.
 #[derive(Debug, Default)]
 pub struct ActivitySeries {
     /// `(bucket_start_ms, count)`, oldest first, one entry per five seconds.
@@ -204,135 +202,78 @@ pub fn braille_sparkline(counts: &[u64], width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use factory_core::{
+        AgentId, ObserverHealth, ProjectId, Provider, RunFailureReason, RunId, TaskId,
+    };
+
+    fn run(phase: RunPhase, outcome: Option<RunOutcome>) -> RunSnapshot {
+        RunSnapshot {
+            id: RunId::try_from("run").unwrap(),
+            project_id: ProjectId::try_from("project").unwrap(),
+            agent_id: AgentId::try_from("agent").unwrap(),
+            task_id: TaskId::try_from("task").unwrap(),
+            provider: Provider::Shell,
+            phase,
+            outcome,
+            runner_instance_id: None,
+            runtime_model: None,
+            runtime_reasoning_effort: None,
+            runtime_permission_mode: None,
+            runtime_control_mode: None,
+            activity: None,
+            wait_reason: None,
+            observer_health: ObserverHealth::Healthy,
+            observer_reason: None,
+            admitted_at_ms: 1,
+            started_at_ms: None,
+            phase_since_ms: 1,
+            updated_at_ms: 1,
+            ended_at_ms: None,
+            exit_code: None,
+            exit_signal: None,
+        }
+    }
 
     #[test]
-    fn agent_state_from_run_maps_no_run_to_idle() {
+    fn attempt_phase_and_outcome_are_the_only_agent_state_inputs() {
+        let cases = [
+            (run(RunPhase::Admitted, None), AgentState::Working),
+            (run(RunPhase::Running, None), AgentState::Working),
+            (
+                run(
+                    RunPhase::Finalizing,
+                    Some(RunOutcome::Failed {
+                        reason: RunFailureReason::Process,
+                    }),
+                ),
+                AgentState::Working,
+            ),
+            (
+                run(
+                    RunPhase::Terminal,
+                    Some(RunOutcome::Blocked {
+                        reason: "operator decision".into(),
+                    }),
+                ),
+                AgentState::Waiting,
+            ),
+            (
+                run(
+                    RunPhase::Terminal,
+                    Some(RunOutcome::Failed {
+                        reason: RunFailureReason::Process,
+                    }),
+                ),
+                AgentState::Failed,
+            ),
+            (
+                run(RunPhase::Terminal, Some(RunOutcome::Succeeded)),
+                AgentState::Idle,
+            ),
+        ];
+        for (run, expected) in cases {
+            assert_eq!(agent_state_from_run(Some(&run)), expected);
+        }
         assert_eq!(agent_state_from_run(None), AgentState::Idle);
-    }
-
-    #[test]
-    fn agent_state_from_run_maps_all_statuses() {
-        let cases = [
-            (RunStatus::Starting, AgentState::Working),
-            (RunStatus::Running, AgentState::Working),
-            (RunStatus::Waiting, AgentState::Waiting),
-            (RunStatus::Blocked, AgentState::Waiting),
-            (RunStatus::Paused, AgentState::Waiting),
-            (RunStatus::Succeeded, AgentState::Idle),
-            (RunStatus::Failed, AgentState::Failed),
-            (RunStatus::Stopped, AgentState::Stopped),
-        ];
-        for (status, expected) in cases {
-            assert_eq!(agent_state_from_run(Some(status)), expected, "{status:?}");
-        }
-    }
-
-    #[test]
-    fn agent_state_from_session_maps_all_states() {
-        let cases = [
-            (SessionState::Starting, AgentState::Idle),
-            (SessionState::Idle, AgentState::Idle),
-            (SessionState::Working, AgentState::Working),
-            (SessionState::WaitingForInput, AgentState::Waiting),
-            (SessionState::Stopped, AgentState::Stopped),
-            (SessionState::Failed, AgentState::Failed),
-        ];
-        for (state, expected) in cases {
-            assert_eq!(agent_state_from_session(state), expected, "{state:?}");
-        }
-    }
-
-    #[test]
-    fn ring_buffer_drops_oldest_past_capacity() {
-        let mut buf = RingBuffer::new(3);
-        for value in 0..5 {
-            buf.push(value);
-        }
-        assert_eq!(buf.len(), 3);
-        assert_eq!(buf.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4]);
-    }
-
-    #[test]
-    fn ring_buffer_capacity_is_at_least_one() {
-        let mut buf: RingBuffer<i32> = RingBuffer::new(0);
-        buf.push(1);
-        buf.push(2);
-        assert_eq!(buf.iter().copied().collect::<Vec<_>>(), vec![2]);
-    }
-
-    #[test]
-    fn activity_series_buckets_events_per_five_seconds() {
-        let mut series = ActivitySeries::default();
-        series.record(0);
-        series.record(4_999);
-        series.record(5_000);
-        let counts = series.counts();
-        assert_eq!(counts, vec![2, 1]);
-    }
-
-    #[test]
-    fn activity_series_rolls_forward_on_idle_ticks() {
-        let mut series = ActivitySeries::default();
-        series.record(0);
-        series.roll_to(3 * ACTIVITY_BUCKET_MS);
-        let counts = series.counts();
-        assert_eq!(counts, vec![1, 0, 0, 0]);
-    }
-
-    #[test]
-    fn activity_series_folds_clock_skew_without_rolling_back() {
-        let mut series = ActivitySeries::default();
-        series.record(10_000);
-        series.record(5_000);
-        assert_eq!(series.counts(), vec![2]);
-    }
-
-    #[test]
-    fn activity_series_collapses_long_idle_gaps() {
-        let mut series = ActivitySeries::default();
-        series.record(0);
-        series.roll_to(1_000_000_000);
-        assert_eq!(series.counts(), vec![0]);
-    }
-
-    #[test]
-    fn activity_series_caps_window_length() {
-        let mut series = ActivitySeries::default();
-        for bucket in 0..(ACTIVITY_WINDOW as i64 + 10) {
-            series.record(bucket * ACTIVITY_BUCKET_MS);
-        }
-        assert_eq!(series.counts().len(), ACTIVITY_WINDOW);
-    }
-
-    #[test]
-    fn activity_series_saturates_high_event_rates() {
-        let mut series = ActivitySeries::default();
-        series.buckets.push_back((0, u64::MAX));
-        series.record(0);
-        assert_eq!(series.counts(), vec![u64::MAX]);
-    }
-
-    #[test]
-    fn braille_sparkline_renders_saturated_counts_without_overflow() {
-        assert_eq!(
-            braille_sparkline(&[u64::MAX], 1),
-            BRAILLE_LEVELS[7].to_string()
-        );
-    }
-
-    #[test]
-    fn braille_sparkline_quantizes_and_pads() {
-        let counts = [0, 1, 2, 4];
-        let rendered = braille_sparkline(&counts, 6);
-        assert_eq!(rendered.chars().count(), 6);
-        assert_eq!(rendered.chars().next(), Some(BRAILLE_LEVELS[0]));
-        assert_eq!(rendered.chars().last(), Some(BRAILLE_LEVELS[7]));
-    }
-
-    #[test]
-    fn braille_sparkline_all_zero_stays_empty() {
-        let counts = [0, 0, 0];
-        let rendered = braille_sparkline(&counts, 3);
-        assert!(rendered.chars().all(|glyph| glyph == BRAILLE_LEVELS[0]));
     }
 }

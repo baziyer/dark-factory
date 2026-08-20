@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,7 +108,6 @@ id_type!(AgentId);
 id_type!(MessageId);
 id_type!(RunId);
 id_type!(RunnerInstanceId);
-id_type!(SessionId);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,22 +132,42 @@ pub enum AgentRole {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    Starting,
+pub enum RunPhase {
+    Admitted,
     Running,
-    Waiting,
-    Blocked,
-    Paused,
-    Succeeded,
-    Failed,
-    Stopped,
+    Finalizing,
+    Terminal,
 }
 
-impl RunStatus {
+impl RunPhase {
+    /// Whether the durable phase transition is permitted by the attempt
+    /// state machine. Repeating the current phase is not a transition.
     #[must_use]
-    pub const fn is_terminal(self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed | Self::Stopped)
+    pub const fn can_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::Admitted, Self::Running | Self::Finalizing)
+                | (Self::Running, Self::Finalizing)
+                | (Self::Finalizing, Self::Terminal)
+        )
     }
+
+    #[must_use]
+    pub const fn grants_attempt_authority(self) -> bool {
+        matches!(self, Self::Running)
+    }
+}
+
+/// Immutable result selected by the first transition to [`RunPhase::Finalizing`].
+/// The finalizer projects this onto the task only after every ephemeral
+/// resource has been released or durably transferred.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum RunOutcome {
+    Succeeded,
+    Blocked { reason: String },
+    Failed { reason: RunFailureReason },
+    Cancelled { reason: String },
 }
 
 /// Whether the daemon can currently observe an exact runner instance.
@@ -161,85 +180,23 @@ pub enum ObserverHealth {
     Degraded,
 }
 
-/// Lifecycle state of one resident interactive provider process (one per
-/// agent, PTY-backed, spanning many task-episodes).
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionState {
-    Starting,
-    Idle,
-    Working,
-    WaitingForInput,
-    Stopped,
-    Failed,
-}
-
-impl SessionState {
-    #[must_use]
-    pub const fn is_live(self) -> bool {
-        !matches!(self, Self::Stopped | Self::Failed)
-    }
-}
-
-/// The provider hook event a `factoryctl hook` invocation was called for.
-///
-/// `PermissionRequest` is the immediate provider approval hook. Current
-/// Claude and Codex configurations both emit it before a native approval
-/// prompt; the daemon observes it and never answers that provider prompt.
-/// The separate `PreToolUse` hook is where the daemon answers its own
-/// allow/deny policy.
+/// The provider hook event accepted by `factoryctl hook`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderHookEvent {
-    SessionStart,
-    UserPromptSubmit,
     PreToolUse,
-    PermissionRequest,
-    PostToolUse,
-    Notification,
-    Stop,
-    SubagentStop,
-    SessionEnd,
-}
-
-/// Claude's typed `Notification` cause. The provider sends these as an
-/// opaque payload field; keeping the parsed cause beside the session state
-/// prevents operator-facing status from guessing answerability from prose.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderNotificationKind {
-    PermissionPrompt,
-    ElicitationDialog,
-    ElicitationUrlDialog,
-    AgentNeedsInput,
-    IdlePrompt,
-    AuthSuccess,
-    ElicitationComplete,
-    ElicitationResponse,
-    AgentCompleted,
 }
 
 impl ProviderHookEvent {
     /// The exact event name Claude Code and Codex use in their own hook
-    /// wire protocols and configuration files (`SessionStart`,
-    /// `UserPromptSubmit`, ...) — independent of this enum's own
+    /// wire protocols and configuration files — independent of this enum's own
     /// `snake_case` wire serialization used inside `LocalRequest::
     /// ProviderHook`. This is what `factoryctl hook <Event>` accepts as its
     /// positional argument and what generated provider hook commands are
     /// invoked with.
     #[must_use]
     pub const fn provider_event_name(self) -> &'static str {
-        match self {
-            Self::SessionStart => "SessionStart",
-            Self::UserPromptSubmit => "UserPromptSubmit",
-            Self::PreToolUse => "PreToolUse",
-            Self::PermissionRequest => "PermissionRequest",
-            Self::PostToolUse => "PostToolUse",
-            Self::Notification => "Notification",
-            Self::Stop => "Stop",
-            Self::SubagentStop => "SubagentStop",
-            Self::SessionEnd => "SessionEnd",
-        }
+        "PreToolUse"
     }
 
     /// Parses the exact provider event name back into this enum. Inverse of
@@ -247,30 +204,8 @@ impl ProviderHookEvent {
     /// including this enum's own `snake_case` serialization.
     #[must_use]
     pub fn parse_provider_event_name(value: &str) -> Option<Self> {
-        Some(match value {
-            "SessionStart" => Self::SessionStart,
-            "UserPromptSubmit" => Self::UserPromptSubmit,
-            "PreToolUse" => Self::PreToolUse,
-            "PermissionRequest" => Self::PermissionRequest,
-            "PostToolUse" => Self::PostToolUse,
-            "Notification" => Self::Notification,
-            "Stop" => Self::Stop,
-            "SubagentStop" => Self::SubagentStop,
-            "SessionEnd" => Self::SessionEnd,
-            _ => return None,
-        })
+        (value == "PreToolUse").then_some(Self::PreToolUse)
     }
-}
-
-/// Why a run (task-episode) was closed.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunClosedBy {
-    TaskDone,
-    TaskBlocked,
-    OperatorCancel,
-    OperatorStop,
-    SessionEnded,
 }
 
 /// A durable, privacy-safe category for a failed run.
@@ -348,8 +283,8 @@ pub struct TaskDetail {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    /// Why `factoryctl task blocked` was called, when `snapshot.status` is
-    /// [`TaskStatus::Blocked`]; `None` otherwise.
+    /// The immutable attempt block reason projected by the finalizer when
+    /// `snapshot.status` is [`TaskStatus::Blocked`]; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
 }
@@ -366,16 +301,10 @@ pub struct AgentSnapshot {
     /// The active attempt, or `None` when this agent is idle.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_run_id: Option<RunId>,
-    /// Durable operator hold: while `true`, the daemon does not deliver new
-    /// work into this agent's session.
+    /// Durable operator hold: while `true`, the daemon does not admit new
+    /// work for this agent.
     #[serde(default)]
     pub paused: bool,
-    /// The agent's current resident session, or `None` when it has none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_session_id: Option<SessionId>,
-    /// Absolute path to the agent's git worktree, once created.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -415,51 +344,13 @@ pub struct RunSnapshot {
     pub id: RunId,
     pub project_id: ProjectId,
     pub agent_id: AgentId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parent_run_id: Option<RunId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_id: Option<TaskId>,
-    /// The resident session this episode ran inside. `None` only for runs
-    /// that predate the sessions migration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<SessionId>,
-    pub status: RunStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub activity: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wait_reason: Option<String>,
-    pub worktree: String,
-    #[serde(default)]
-    pub observer_health: ObserverHealth,
-    #[serde(default)]
-    pub observer_health_since_ms: i64,
-    pub started_at_ms: i64,
-    pub status_since_ms: i64,
-    pub updated_at_ms: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ended_at_ms: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit_signal: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_reason: Option<RunFailureReason>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub closed_by: Option<RunClosedBy>,
-}
-
-/// One resident interactive provider process for one agent. Many task
-/// episodes ([`RunSnapshot`]) happen inside one session's lifetime.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct SessionSnapshot {
-    pub id: SessionId,
-    pub project_id: ProjectId,
-    pub agent_id: AgentId,
+    pub task_id: TaskId,
     pub provider: Provider,
-    /// The exact values Dark Factory could establish for this session at
-    /// launch. `None` is deliberately unreported, not a guessed provider
-    /// default. These fields are session-owned so ended sessions retain the
-    /// values they actually used.
+    pub phase: RunPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_instance_id: Option<RunnerInstanceId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -468,46 +359,18 @@ pub struct SessionSnapshot {
     pub runtime_permission_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_control_mode: Option<String>,
-    pub state: SessionState,
-    pub state_since_ms: i64,
-    pub worktree: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider_session_id: Option<String>,
-    /// The daemon-owned runner generation for this session. Older daemons may omit it;
-    /// clients must not treat an omitted generation as interchangeable with a known one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_instance_id: Option<RunnerInstanceId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_run_id: Option<RunId>,
-    /// Bounded free-text activity label (e.g. `"tool: Read"`), or `None`
-    /// while idle/starting/stopped.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<String>,
-    /// Whether `activity` was inferred from a generic hook (`true`, shown
-    /// with a `~` by the TUI) rather than naming an exact tool (`false`).
-    #[serde(default)]
-    pub activity_inferred: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_hook_event: Option<ProviderHookEvent>,
-    /// Parsed provider notification cause, when the last hook was a typed
-    /// Claude `Notification`. It is deliberately separate from free text.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub notification_kind: Option<ProviderNotificationKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_hook_at_ms: Option<i64>,
-    /// Bounded operator-facing explanation of why the session is waiting,
-    /// e.g. "permission prompt", "delivery unacknowledged"; at most 512
-    /// bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_reason: Option<String>,
-    /// Independent bounded explanation for degraded terminal observation.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub observer_reason: Option<String>,
     #[serde(default)]
     pub observer_health: ObserverHealth,
-    #[serde(default)]
-    pub observer_health_since_ms: i64,
-    pub started_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observer_reason: Option<String>,
+    pub admitted_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<i64>,
+    pub phase_since_ms: i64,
     pub updated_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ended_at_ms: Option<i64>,
@@ -515,6 +378,19 @@ pub struct SessionSnapshot {
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_signal: Option<i32>,
+}
+
+impl RunSnapshot {
+    /// The outcome is selected exactly once when finalization begins and is
+    /// absent while the attempt still has effect authority.
+    #[must_use]
+    pub const fn has_valid_phase_outcome(&self) -> bool {
+        matches!(
+            (self.phase, self.outcome.is_some()),
+            (RunPhase::Admitted | RunPhase::Running, false)
+                | (RunPhase::Finalizing | RunPhase::Terminal, true)
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -529,7 +405,7 @@ pub enum FactoryEvent {
     PolicyDecision {
         project_id: ProjectId,
         agent_id: AgentId,
-        session_id: SessionId,
+        run_id: RunId,
         tool_name: String,
         decision: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -546,13 +422,13 @@ pub enum FactoryEvent {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pause_reasons: Vec<crate::status::AgentPauseReason>,
     },
-    /// Request/result audit for a daemon-owned repository operation. This
-    /// deliberately contains neither credentials, commit messages, PR
-    /// bodies, nor diff output.
-    RepositoryOperation {
+    /// Decode-only compatibility for repository audit events written before
+    /// the Stage 1 repository execution surface was removed.
+    #[serde(rename = "repository_operation")]
+    LegacyRepositoryOperation {
         project_id: ProjectId,
         agent_id: AgentId,
-        session_id: SessionId,
+        run_id: RunId,
         operation: String,
         phase: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -573,10 +449,27 @@ pub enum FactoryEvent {
         agent: AgentSnapshot,
     },
     RunChanged {
-        run: RunSnapshot,
+        run: Box<RunSnapshot>,
     },
-    SessionChanged {
-        session: SessionSnapshot,
+    /// Decode-only projection for `run_changed` events written before the
+    /// attempt-kernel wire change. The store derives these identities from
+    /// the event index rather than reviving the old resident-session run
+    /// model or exposing its worktree and process metadata.
+    LegacyRunChanged {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_id: Option<TaskId>,
+        agent_id: AgentId,
+        run_id: RunId,
+    },
+    /// Decode-only projection for historical resident-session events. The
+    /// store derives these identities from the event index and never parses
+    /// the obsolete session/process snapshot.
+    LegacySessionChanged {
+        project_id: ProjectId,
+        agent_id: AgentId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        run_id: Option<RunId>,
     },
     /// A task was permanently removed. Unlike `TaskChanged`, there is no
     /// surviving snapshot to publish.
@@ -608,39 +501,22 @@ mod tests {
     use super::ProviderHookEvent;
 
     #[test]
-    fn provider_event_name_round_trips_every_variant() {
-        let events = [
-            ProviderHookEvent::SessionStart,
-            ProviderHookEvent::UserPromptSubmit,
-            ProviderHookEvent::PreToolUse,
-            ProviderHookEvent::PermissionRequest,
-            ProviderHookEvent::PostToolUse,
-            ProviderHookEvent::Notification,
-            ProviderHookEvent::Stop,
-            ProviderHookEvent::SubagentStop,
-            ProviderHookEvent::SessionEnd,
-        ];
-        for event in events {
-            let name = event.provider_event_name();
-            assert_eq!(
-                ProviderHookEvent::parse_provider_event_name(name),
-                Some(event)
-            );
-        }
+    fn provider_event_name_round_trips() {
+        let event = ProviderHookEvent::PreToolUse;
+        assert_eq!(
+            ProviderHookEvent::parse_provider_event_name(event.provider_event_name()),
+            Some(event)
+        );
     }
 
     #[test]
     fn provider_event_name_is_exact_pascal_case_not_this_enums_own_snake_case_wire_form() {
         assert_eq!(
-            ProviderHookEvent::SessionStart.provider_event_name(),
-            "SessionStart"
+            ProviderHookEvent::PreToolUse.provider_event_name(),
+            "PreToolUse"
         );
         assert_eq!(
-            ProviderHookEvent::SubagentStop.provider_event_name(),
-            "SubagentStop"
-        );
-        assert_eq!(
-            ProviderHookEvent::parse_provider_event_name("session_start"),
+            ProviderHookEvent::parse_provider_event_name("pre_tool_use"),
             None
         );
         assert_eq!(ProviderHookEvent::parse_provider_event_name("stop"), None);

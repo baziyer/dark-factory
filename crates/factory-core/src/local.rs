@@ -1,12 +1,12 @@
 //! Versioned request/response protocol for the local control socket.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
 
-use crate::runner::TerminalAttachMode;
+use serde::{Deserialize, Deserializer, Serialize};
+
 use crate::{
     AgentId, AgentRole, AgentSnapshot, EventEnvelope, MessageId, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, RunnerInstanceId, SessionId,
-    SessionSnapshot, SessionState, TaskDetail, TaskId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, TaskDetail, TaskId,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -27,7 +27,7 @@ pub struct AgentProfile {
     /// Provider-scoped permission mode (Claude: `default`/`acceptEdits`/
     /// `plan`; Codex: `on-request`/`never`); `None` is the provider default.
     /// Applied to future provider launches; the resulting runtime value is
-    /// recorded separately on each session.
+    /// recorded separately on each run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     pub instructions: String,
@@ -86,9 +86,6 @@ pub struct AgentDetail {
     /// Absolute path to this agent's memory file. The agent itself is
     /// expected to append durable lessons here.
     pub memory_path: String,
-    /// Absolute path to the private lossless pre-compaction archive directory.
-    #[serde(default)]
-    pub memory_archive_path: String,
     /// Bounded health of the active `memory.md`; unhealthy content is not
     /// copied into this response.
     #[serde(default)]
@@ -132,12 +129,11 @@ pub const MAX_PROJECT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_PAGE_ITEMS: u32 = 10;
 pub const MAX_AGENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
-pub const MAX_SESSION_PAGE_ITEMS: u32 = 1000;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 1000;
 pub const MAX_TASK_TITLE_BYTES: usize = 240;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
-pub const MAX_TERMINAL_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+pub const MAX_REQUEST_CREDENTIAL_BYTES: usize = 1024;
 
 /// Applies the task-title contract shared by every local and connector write.
 #[must_use]
@@ -146,17 +142,54 @@ pub fn normalize_task_title(value: String) -> Option<String> {
     (!value.is_empty() && value.len() <= MAX_TASK_TITLE_BYTES).then_some(value)
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct RunTerminal {
-    pub run_id: RunId,
-    pub head_sequence: i64,
-    pub output: String,
-    pub truncated: bool,
+/// Opaque bearer resolved by factoryd to exactly one operator or attempt
+/// principal. Its kind and owned identities are deliberately not caller
+/// selected.
+#[derive(Clone, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RequestCredential(String);
+
+impl RequestCredential {
+    pub fn new(value: String) -> Result<Self, &'static str> {
+        if value.is_empty() {
+            return Err("request credential must not be empty");
+        }
+        if value.len() > MAX_REQUEST_CREDENTIAL_BYTES {
+            return Err("request credential exceeds the wire limit");
+        }
+        Ok(Self(value))
+    }
+
+    /// Exposes the bearer only to the authentication boundary. Do not log it.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RequestCredential {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RequestCredential(<redacted>)")
+    }
+}
+
+impl<'de> Deserialize<'de> for RequestCredential {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RequestEnvelope {
     pub protocol_version: u16,
+    /// `None` is valid only for explicitly anonymous requests such as health.
+    /// The daemon must never infer operator authority from an absent bearer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<RequestCredential>,
     pub request: LocalRequest,
 }
 
@@ -165,6 +198,16 @@ impl RequestEnvelope {
     pub const fn new(request: LocalRequest) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            credential: None,
+            request,
+        }
+    }
+
+    #[must_use]
+    pub const fn authenticated(request: LocalRequest, credential: RequestCredential) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            credential: Some(credential),
             request,
         }
     }
@@ -179,11 +222,10 @@ pub enum LocalRequest {
         enabled: bool,
     },
     /// The whole daemon at one instant (`factoryctl status`): every
-    /// project's agents with their sessions, runs, and queues, plus the
-    /// attention list and the live-session cap. See [`crate::status`].
+    /// project's agents with their runs and queues, plus the attention list
+    /// and active-run cap. See [`crate::status`].
     FleetStatus,
-    /// One agent's live picture plus its profile and worktree git state
-    /// (`factoryctl agent status`).
+    /// One agent's live run picture plus its profile (`factoryctl agent status`).
     AgentStatus {
         project_id: ProjectId,
         agent_id: AgentId,
@@ -236,10 +278,6 @@ pub enum LocalRequest {
         reasoning_effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_selection_reason: Option<String>,
-        /// Overrides the daemon-managed per-agent worktree with an existing
-        /// absolute path. Not yet implemented; see local_api.rs.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        worktree: Option<String>,
     },
     GetAgent {
         project_id: ProjectId,
@@ -272,8 +310,6 @@ pub enum LocalRequest {
     SendAgentMessage {
         id: MessageId,
         project_id: ProjectId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sender_agent_id: Option<AgentId>,
         recipient_agent_id: AgentId,
         body: String,
     },
@@ -294,13 +330,6 @@ pub enum LocalRequest {
         project_id: ProjectId,
         task_id: TaskId,
         agent_id: AgentId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        parent_run_id: Option<RunId>,
-        /// Defaults to the agent's own worktree once per-agent worktrees
-        /// exist; until then a request without one is rejected. Semantics:
-        /// "deliver now / put at the front of the agent's queue".
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        worktree: Option<String>,
     },
     ListTasks {
         project_id: ProjectId,
@@ -360,40 +389,25 @@ pub enum LocalRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         agent_id: Option<AgentId>,
     },
-    GetRunTerminal {
-        project_id: ProjectId,
-        run_id: RunId,
-    },
-    StopRun {
+    /// Records operator cancellation intent. The attempt moves to
+    /// finalizing; only the durable finalizer may make it terminal.
+    CancelRun {
         project_id: ProjectId,
         run_id: RunId,
         grace_ms: u64,
     },
-    /// Closes an open run (task-episode) without touching its session's
-    /// process: `runs.status → stopped`, `closed_by = operator_cancel`. For
-    /// v1 this does not interrupt an in-flight turn.
-    CancelRun {
-        project_id: ProjectId,
-        run_id: RunId,
-    },
-    /// Marks a task's episode succeeded from inside its session: the run
-    /// closes with `closed_by = task_done`, the task becomes `succeeded`.
-    CompleteTask {
-        project_id: ProjectId,
-        task_id: TaskId,
-        /// Bounded like today's persisted task result.
+    /// Proposes success for the exact running attempt derived from the outer
+    /// credential. Callers cannot name another project, task, or run.
+    CompleteAttempt {
         result: String,
     },
-    /// Marks a task's episode blocked from inside its session: the run
-    /// closes with `closed_by = task_blocked`, the task becomes `blocked`.
-    BlockTask {
-        project_id: ProjectId,
-        task_id: TaskId,
-        /// At most 4096 bytes.
+    /// Proposes a block for the exact running attempt derived from the outer
+    /// credential. Callers cannot name another project, task, or run.
+    BlockAttempt {
         reason: String,
     },
-    /// Durably holds an agent's queue: the daemon stops delivering new work
-    /// into its session until `ResumeAgent`.
+    /// Durably holds an agent's queue: the daemon admits no new work for it
+    /// until `ResumeAgent`.
     PauseAgent {
         project_id: ProjectId,
         agent_id: AgentId,
@@ -402,98 +416,15 @@ pub enum LocalRequest {
         project_id: ProjectId,
         agent_id: AgentId,
     },
-    ListSessions {
-        project_id: ProjectId,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        after_id: Option<SessionId>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        limit: Option<usize>,
-    },
-    /// Kills a session's PTY-backed provider process group (graceful, like
-    /// `StopRun`); any open run closes with `closed_by = operator_stop`.
-    StopSession {
-        project_id: ProjectId,
-        session_id: SessionId,
-        grace_ms: u64,
-    },
     /// One `factoryctl hook` invocation, forwarded verbatim from a
-    /// provider's hook subprocess. `token` is the contents of the session's
-    /// `hook.token` file; `payload` is the hook's JSON body, opaque here and
-    /// at most 64 KiB — the daemon extracts whatever fields (session/thread
-    /// id, prompt, message, tool name, `stop_hook_active`, ...) the event
+    /// provider's hook subprocess. The outer credential resolves the exact
+    /// attempt; `payload` is the hook's JSON body, opaque here and
+    /// at most 64 KiB — the daemon extracts whatever fields (provider thread
+    /// id, prompt, message, tool name, ...) the event
     /// needs.
     ProviderHook {
-        token: String,
         event: ProviderHookEvent,
         payload: serde_json::Value,
-    },
-    /// Read-only git state for the calling authenticated session's exact
-    /// daemon-managed worktree. `token` is read from the session token file
-    /// by `factoryctl`; callers never select an agent, project, or path.
-    GitStatus {
-        token: String,
-    },
-    GitDiff {
-        token: String,
-        staged: bool,
-    },
-    /// Stage every change in the session worktree and create one commit.
-    GitCommit {
-        token: String,
-        message: String,
-    },
-    /// Push only the session's current `agent/<id>` branch, without force.
-    GitPush {
-        token: String,
-    },
-    /// Open a PR from the session branch to the repository's default base.
-    PrOpen {
-        token: String,
-        title: String,
-        body: String,
-    },
-    /// Update only a PR whose head is the calling session's branch.
-    PrUpdate {
-        token: String,
-        number: u64,
-        title: String,
-        body: String,
-    },
-    /// Attaches to a terminal-mode session's retained-then-live PTY output
-    /// on this connection. The connection commits to terminal-proxy mode:
-    /// after the first `AttachTerminal`, only more `AttachTerminal` requests
-    /// are accepted on it (a client may attach several sessions on one
-    /// connection). A successful attach produces at least one
-    /// `ServerFrame::TerminalAttachReady` and retained output for explicit
-    /// modes, or the legacy empty `TerminalOutput` boundary, then output
-    /// frames for every attached session are multiplexed onto it, tagged by
-    /// `session_id`. Invalidated cursors produce `TerminalAttachGap`.
-    /// Detaching happens implicitly on disconnect. `TerminalInput` and
-    /// `ResizeTerminal` are independent, ordinary one-shot requests (like
-    /// `StopRun`); they do not need to run on an attached connection.
-    AttachTerminal {
-        project_id: ProjectId,
-        session_id: SessionId,
-        since_offset: u64,
-        #[serde(default, skip_serializing_if = "TerminalAttachMode::is_legacy")]
-        mode: TerminalAttachMode,
-    },
-    /// Writes operator input to a session's PTY. An ordinary one-shot
-    /// request: it does not require a prior or concurrent `AttachTerminal`,
-    /// on this connection or any other. `bytes` is base64-encoded raw bytes;
-    /// opaque to the daemon.
-    TerminalInput {
-        project_id: ProjectId,
-        session_id: SessionId,
-        bytes: String,
-    },
-    /// Resizes a session's PTY. An ordinary one-shot request, like
-    /// `TerminalInput`.
-    ResizeTerminal {
-        project_id: ProjectId,
-        session_id: SessionId,
-        cols: u16,
-        rows: u16,
     },
     ListRuns {
         project_id: ProjectId,
@@ -509,43 +440,6 @@ pub enum LocalRequest {
     Subscribe {
         after_sequence: i64,
     },
-}
-
-/// Why the daemon refused a terminal attach after resolving the requested session.
-///
-/// This is deliberately finite: clients can choose a safe recovery action without parsing
-/// runner or store error text, while the accompanying identities explain which stale selection
-/// lost the race.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AttachRefusalReason {
-    SessionNotFound,
-    SessionEnded,
-    RunnerRejected,
-    RunnerReplaced,
-    RunnerUnavailable,
-}
-
-impl AttachRefusalReason {
-    #[must_use]
-    pub const fn retryable(self) -> bool {
-        matches!(self, Self::RunnerReplaced | Self::RunnerUnavailable)
-    }
-}
-
-/// Typed, bounded attach refusal returned on the terminal-proxy connection.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct AttachRefusal {
-    pub project_id: ProjectId,
-    /// The session selected by the client. When the session still exists, this is also the
-    /// current session identity the daemon checked.
-    pub session_id: SessionId,
-    /// The runner identity reserved by that session, when the session row still exists.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_instance_id: Option<RunnerInstanceId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_state: Option<SessionState>,
-    pub reason: AttachRefusalReason,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -588,10 +482,6 @@ pub enum LocalResponse {
     },
     AgentStatus {
         status: Box<crate::status::AgentStatusDetail>,
-    },
-    GitOutput {
-        operation: String,
-        output: String,
     },
     ProjectCreated {
         project: ProjectSnapshot,
@@ -639,12 +529,6 @@ pub enum LocalResponse {
     TaskAssigned {
         task: TaskDetail,
     },
-    RunTerminal {
-        terminal: RunTerminal,
-    },
-    AttachRefused {
-        refusal: AttachRefusal,
-    },
     AgentCreated {
         agent: AgentSnapshot,
     },
@@ -673,17 +557,13 @@ pub enum LocalResponse {
     RunAccepted {
         run_id: RunId,
     },
-    RunStopped {
-        run_id: RunId,
-    },
     RunCancelled {
         run_id: RunId,
     },
-    TaskCompleted {
-        task: TaskDetail,
-    },
-    TaskBlocked {
-        task: TaskDetail,
+    /// The requested immutable outcome was accepted. The task remains
+    /// running until the daemon-owned finalizer has released every resource.
+    AttemptFinalizing {
+        run_id: RunId,
     },
     AgentPaused {
         agent: AgentSnapshot,
@@ -691,23 +571,9 @@ pub enum LocalResponse {
     AgentResumed {
         agent: AgentSnapshot,
     },
-    Sessions {
-        sessions: Vec<SessionSnapshot>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        next_after_id: Option<SessionId>,
-    },
-    SessionStopped {
-        session_id: SessionId,
-    },
     /// The `reply` JSON is printed verbatim to stdout by `factoryctl hook`.
     ProviderHookReply {
         reply: serde_json::Value,
-    },
-    TerminalInputAccepted {
-        session_id: SessionId,
-    },
-    TerminalResized {
-        session_id: SessionId,
     },
     Tasks {
         tasks: Vec<TaskDetail>,
@@ -759,44 +625,6 @@ pub enum ServerFrame {
         protocol_version: u16,
         event: EventEnvelope,
     },
-    /// One chunk of retained-then-live PTY output for a session attached on
-    /// this connection via `AttachTerminal`. `bytes` is base64-encoded raw
-    /// bytes; opaque to every layer between the runner and the client.
-    TerminalOutput {
-        protocol_version: u16,
-        session_id: SessionId,
-        generation: u64,
-        offset: u64,
-        bytes: String,
-    },
-    /// Negotiated retained-log bounds for an explicit terminal attach.
-    TerminalAttachReady {
-        protocol_version: u16,
-        session_id: SessionId,
-        generation: u64,
-        base_generation: u64,
-        base_offset: u64,
-        start_generation: u64,
-        start_offset: u64,
-        end_offset: u64,
-        #[serde(default)]
-        reset_prefix: String,
-    },
-    /// Actionable recovery metadata when a requested cursor is no longer
-    /// available or is ahead of the runner's live head.
-    TerminalAttachGap {
-        protocol_version: u16,
-        session_id: SessionId,
-        generation: u64,
-        base_generation: u64,
-        base_offset: u64,
-        start_generation: u64,
-        start_offset: u64,
-        end_offset: u64,
-        requested_generation: Option<u64>,
-        requested_offset: u64,
-        reason: String,
-    },
 }
 
 impl ServerFrame {
@@ -807,15 +635,6 @@ impl ServerFrame {
                 protocol_version, ..
             }
             | Self::Event {
-                protocol_version, ..
-            }
-            | Self::TerminalOutput {
-                protocol_version, ..
-            }
-            | Self::TerminalAttachReady {
-                protocol_version, ..
-            }
-            | Self::TerminalAttachGap {
                 protocol_version, ..
             } => *protocol_version,
         }

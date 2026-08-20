@@ -1,6 +1,5 @@
 use factory_core::{AgentId, AgentRole, ProjectId, Provider};
 use factoryd::store::{NewAgent, NewProject, Store, UpdateAgentProfile};
-use rusqlite::Connection;
 
 fn fixture() -> Store {
     let mut store = Store::open_in_memory().unwrap();
@@ -97,93 +96,6 @@ fn agent_profile_rejects_permission_modes_not_declared_by_the_provider() {
     assert_eq!(profile.model, None);
     assert_eq!(profile.permission_mode, None);
     assert_eq!(profile.updated_at_ms, 2);
-}
-
-#[test]
-fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("factory.db");
-    {
-        let mut store = Store::open(&database).unwrap();
-        store
-            .create_project(
-                NewProject {
-                    id: ProjectId::try_from("factory").unwrap(),
-                    name: "Factory".into(),
-                    root: "/tmp/factory".into(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                NewAgent {
-                    id: AgentId::try_from("god").unwrap(),
-                    project_id: ProjectId::try_from("factory").unwrap(),
-                    parent_agent_id: None,
-                    role: AgentRole::Orchestrator,
-                    provider: Provider::Codex,
-                },
-                2,
-            )
-            .unwrap();
-    }
-
-    // Simulate the exact pre-#146 durable state, then let the next Store open
-    // perform the 0022 repair as an upgrade would. The fixture was opened by
-    // the current binary, so remove the later schema before rewinding its
-    // version.
-    let connection = Connection::open(&database).unwrap();
-    connection
-        .execute_batch(
-            "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
-             ALTER TABLE sessions DROP COLUMN resumed_provider_session;
-             ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
-             ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
-             ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",
-        )
-        .unwrap();
-    connection
-        .execute(
-            "UPDATE agent_profiles SET permission_mode = 'bypass' WHERE agent_id = 'god'",
-            [],
-        )
-        .unwrap();
-    // `Store::open` above intentionally created the newest schema so the
-    // fixture can seed a real profile. Rewind it as an actual pre-0022
-    // database, including removing the post-0022 tables, columns, and index;
-    // otherwise later migrations quite correctly reject duplicate schema
-    // changes.
-    connection
-        .execute_batch(
-            "DROP TABLE session_work;
-             DROP INDEX delivery_attempts_session_work_identity;
-             DROP INDEX runs_one_open_per_session;
-             ALTER TABLE tasks DROP COLUMN work_revision;
-             DROP TABLE delivery_attempts;",
-        )
-        .unwrap();
-    connection
-        .execute_batch(
-            "ALTER TABLE sessions DROP COLUMN observer_reason;
-             ALTER TABLE sessions DROP COLUMN notification_kind;",
-        )
-        .unwrap();
-    connection.pragma_update(None, "user_version", 21).unwrap();
-    drop(connection);
-
-    let store = Store::open(&database).unwrap();
-    let detail = store
-        .get_agent_detail(
-            &ProjectId::try_from("factory").unwrap(),
-            &AgentId::try_from("god").unwrap(),
-        )
-        .unwrap();
-    assert_eq!(detail.profile.permission_mode, None);
-
-    // Codex's provider launch regression test proves that this repaired None
-    // value produces its supported on-request posture when auto mode is off,
-    // rather than an approval_policy="bypass" argv entry.
 }
 
 #[test]

@@ -1,18 +1,8 @@
-//! [`CodexProvider`]: the interactive-session [`Provider`] impl for Codex,
-//! plus the per-agent `CODEX_HOME` it seeds and the hooks block it rewrites
-//! into `config.toml` per session. See `docs/providers.md`.
+//! Non-interactive Codex provider.
 //!
-//! Track 5's pivot from a non-interactive `codex exec --json` pipe-mode
-//! adapter (session identity confirmed by decoding Codex's own JSONL event
-//! stream) to a resident interactive `codex` process under a PTY (session
-//! identity learned from the `SessionStart` hook payload, state driven by
-//! hooks thereafter) deleted that whole decoder here: `Decoder`,
-//! `Observation`, item-tracking state, `Outcome`, `FailureReason`, the
-//! non-interactive `prepare()`, and their fixtures/tests
-//! (`crates/factoryd/tests/codex.rs`) are gone (~540 LOC, see
-//! `TRACK5-DESIGN.md` §7). `validate_thread_id` is the one piece that
-//! survived unchanged: both the old decoder and the new [`CodexProvider`]
-//! need to confirm a Codex thread identity is a canonical UUID.
+//! Each admitted run gets one fresh `codex exec` process and one startup
+//! input. Output remains opaque; authority comes from the daemon's run state,
+//! never from a provider stream decoder or a resumable process.
 
 use std::{
     ffi::OsString,
@@ -20,20 +10,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use uuid::Uuid;
-
 use crate::providers::{
-    Capabilities, InteractiveLaunch, Provider, ProviderError, RuntimeMetadata, SpawnContext, hooks,
+    Capabilities, Provider, ProviderError, ProviderLaunch, SpawnContext, hooks,
 };
-
-fn validate_thread_id(value: &str) -> Result<(), ()> {
-    let parsed = Uuid::parse_str(value).map_err(|_| ())?;
-    if parsed.hyphenated().to_string() == value {
-        Ok(())
-    } else {
-        Err(())
-    }
-}
 
 pub const PERMISSION_MODES: [&str; 2] = ["on-request", "never"];
 
@@ -71,46 +50,22 @@ const MINIMAL_CONFIG_TOML: &str =
 /// an explicit `on-request`/`never` profile always wins.
 const DEFAULT_APPROVAL_POLICY: &str = "on-request";
 
-/// Pre-approves this agent's own `factoryctl` calls the same way Codex's
-/// own interactive "don't ask again for commands that start with
-/// `factoryctl`" choice does -- confirmed against a real dogfood session's
-/// own operator-approved `CODEX_HOME/rules/default.rules`, which Codex
-/// wrote in exactly this shape once the operator chose it by hand (see
-/// `docs/providers.md`).
-///
-/// Confirmed from the installed `codex-cli 0.147.0` binary's own strings:
-/// `prefix_rule`'s
-/// `allow` decision is only ever consulted under `approval_policy =
-/// "on-request"` ("you cannot request additional permissions unless the
-/// approval policy is OnRequest"). It is seeded for auto-off or explicitly
-/// `on-request` sessions. When it is consulted, be precise about what it
-/// grants: the same binary's strings describe `prefix_rule` as valid "only
-/// with `sandbox_permissions: \"require_escalated\"`", i.e. this rule
-/// pre-approves **unsandboxed** execution of any command whose parsed
-/// prefix is `factoryctl` -- every subcommand, not just the task/agent
-/// verbs a session's own delivery composes, including `factoryctl update`
-/// (replaces the installed binaries) and `factoryctl init` (rewrites the
-/// launchd job). Codex's own exec-policy checks (`forbid` rules, and its
-/// built-in "blocked by policy" denials) are unaffected either way --
-/// `approval_policy` and rules only ever gate the `allow` side.
-const FACTORYCTL_PREFIX_RULE: &str = "prefix_rule(pattern=[\"factoryctl\"], decision=\"allow\")\n";
-
 /// Top-level tables never copied from the operator's real `~/.codex/
-/// config.toml` into a fresh per-agent seed (this track's item 7):
+/// config.toml` into a fresh attempt-owned seed:
 ///
 /// - `mcp_servers`: the concrete bug this exists to fix -- Codex stalls at
 ///   "Starting MCP servers" launching every one of the operator's own MCP
-///   servers inside a headless factory worker session that never needed
+///   servers inside a headless factory attempt that never needed
 ///   them, several of which expect an interactive terminal/browser/local
 ///   dev server that is not there.
 /// - `projects`: the operator's own per-repo trust decisions (which repos
 ///   *they* have approved running Codex against unprompted) have no
-///   bearing on a factory worker's own worktree, which
+///   bearing on an attempt's own worktree, which
 ///   `rewrite_config_block` already grants trust to explicitly, every
 ///   spawn, on its own terms.
 /// - `hooks`: covers both `[[hooks.<Event>]]`/`[[hooks.<Event>.hooks]]`
 ///   (the operator's own hook commands, which must never run inside a
-///   daemon-owned session -- this seed's whole point is that
+///   daemon-owned attempt -- this seed's whole point is that
 ///   `rewrite_hooks_block` is the *only* source of hooks here) and the
 ///   plain `[hooks.state]` table Codex persists trust decisions into
 ///   (`docs/providers.md` documents the exact shape found on a real
@@ -122,14 +77,14 @@ const FACTORYCTL_PREFIX_RULE: &str = "prefix_rule(pattern=[\"factoryctl\"], deci
 /// `approval_policy`, the operator's own `sandbox_mode` (immediately
 /// overridden by `rewrite_config_block` anyway, but harmless to inherit as
 /// a starting point), and any other root-level scalar -- is kept: those
-/// are exactly "what a factory worker needs" per this track's brief, and
+/// are the provider settings an isolated attempt may inherit, and
 /// none of them reference the operator's own environment.
 const DROPPED_SEED_TABLES: [&str; 3] = ["mcp_servers", "projects", "hooks"];
 
 /// Filters `document` (a copy of the operator's real `config.toml`) down
 /// to the allow-list [`DROPPED_SEED_TABLES`] documents, for the *initial*
 /// seed only (`seed_codex_home_once` never overwrites an existing seeded
-/// `config.toml` -- this runs once per agent, not once per spawn). Not a
+/// `config.toml` -- this runs once for a new attempt home). Not a
 /// general TOML parser, same tradeoff every other marker/table scanner in
 /// this module already makes (`strip_marked_block`,
 /// `first_table_header_offset`): a table is identified purely by its
@@ -171,20 +126,18 @@ fn table_header_top_level_key(line: &str) -> Option<String> {
     Some(key.trim_matches('"').to_owned())
 }
 
-/// Interactive-session [`Provider`] for Codex. Launches `codex
+/// Non-interactive [`Provider`] for Codex. Launches `codex exec
 /// --dangerously-bypass-hook-trust [--model M]
 /// (--dangerously-bypass-approvals-and-sandbox | -c approval_policy=M)
-/// [resume <thread-id>]` with
-/// `CODEX_HOME` pointed at this agent's own seeded home (per orchestrator
-/// amendment A2, `TRACK5-DESIGN.md`: per *agent*, not per session, so
-/// `codex resume` can find its own prior rollout file across a stop and
-/// restart). `--dangerously-bypass-hook-trust` is unconditional: the hooks
+/// -`, reading exactly one task from stdin, with `CODEX_HOME` pointed at
+/// this attempt's generated home. `--dangerously-bypass-hook-trust` is
+/// unconditional: the hooks
 /// this provider writes are 100% daemon-authored into an isolated
 /// `CODEX_HOME` the operator never hand-edits, which already is the
 /// vetting Codex's normal hook-trust prompt would otherwise ask for. See
 /// `docs/providers.md`.
 pub struct CodexProvider {
-    /// The Codex home to seed a fresh per-agent `CODEX_HOME` from
+    /// The source used to seed a fresh attempt-owned `CODEX_HOME`
     /// (`config.toml`, `auth.json`): the daemon's own `$CODEX_HOME` if set
     /// — Codex's own convention, and how a factory runs on a different
     /// account than the operator's shell (`CODEX_HOME=~/.codex-dogfood`
@@ -196,7 +149,7 @@ pub struct CodexProvider {
 impl CodexProvider {
     /// Resolves the seed source exactly as `codex` itself resolves its home:
     /// `$CODEX_HOME` if set, else `$HOME/.codex`. `None` (neither set)
-    /// means a fresh per-agent home always starts from
+    /// means a fresh attempt home always starts from
     /// [`MINIMAL_CONFIG_TOML`] with no `auth.json` link — Codex will then
     /// have no subscription credentials, same as running `codex` with no
     /// prior login.
@@ -229,27 +182,16 @@ impl Default for CodexProvider {
 }
 
 impl Provider for CodexProvider {
-    fn spawn_spec(&self, ctx: &SpawnContext) -> Result<InteractiveLaunch, ProviderError> {
+    fn spawn_spec(&self, ctx: &SpawnContext) -> Result<ProviderLaunch, ProviderError> {
         let codex_home = ctx.agent_dir.join("codex-home");
         seed_codex_home_once(&codex_home, self.source_home.as_deref())?;
         rewrite_hooks_block(&codex_home, &ctx.factoryctl_path, &ctx.hook_token_path)?;
-        rewrite_config_block(&codex_home, &ctx.agent_dir, &ctx.socket_path, &ctx.worktree)?;
-        ensure_factoryctl_rule_present(&codex_home)?;
+        rewrite_config_block(&codex_home, &ctx.worktree)?;
 
-        // Codex's copied-forward config is an actual runtime source when no
-        // launch override is present. Read only root-level scalar keys; a
-        // malformed or absent value remains unreported rather than becoming
-        // a guessed marketing default.
-        let config = fs::read_to_string(codex_home.join("config.toml")).ok();
-        let configured_model = config
-            .as_deref()
-            .and_then(|value| root_config_string(value, "model"));
-        let configured_reasoning_effort = config
-            .as_deref()
-            .and_then(|value| root_config_string(value, "model_reasoning_effort"));
-        let reasoning_effort = ctx.reasoning_effort.clone().or(configured_reasoning_effort);
-
-        let mut args = vec!["--dangerously-bypass-hook-trust".to_owned()];
+        let mut args = vec![
+            "exec".to_owned(),
+            "--dangerously-bypass-hook-trust".to_owned(),
+        ];
         if let Some(model) = &ctx.model {
             args.push("--model".to_owned());
             args.push(model.clone());
@@ -272,79 +214,22 @@ impl Provider for CodexProvider {
             args.push("-c".to_owned());
             args.push(format!("approval_policy=\"{approval_policy}\""));
         }
-        if let Some(thread_id) = &ctx.resume {
-            validate_thread_id(thread_id).map_err(|_| ProviderError::ResumeIdNotUuid {
-                value: thread_id.clone(),
-            })?;
-            args.push("resume".to_owned());
-            args.push(thread_id.clone());
-        }
+        args.push("-".to_owned());
 
-        Ok(InteractiveLaunch {
+        Ok(ProviderLaunch {
             program: PathBuf::from("codex"),
             args,
             env: vec![(
                 "CODEX_HOME".to_owned(),
                 codex_home.to_string_lossy().into_owned(),
             )],
-            generated_files: vec![codex_home.join("config.toml")],
-            runtime: RuntimeMetadata {
-                model: ctx.model.clone().or(configured_model),
-                reasoning_effort,
-                permission_mode: if ctx.permission_mode.is_none() && ctx.auto_mode {
-                    None
-                } else {
-                    Some(
-                        ctx.permission_mode
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_APPROVAL_POLICY.to_owned()),
-                    )
-                },
-                control_mode: Some(if ctx.permission_mode.is_none() && ctx.auto_mode {
-                    "dangerously-bypass-approvals-and-sandbox".to_owned()
-                } else {
-                    format!(
-                        "approval_policy={}",
-                        ctx.permission_mode
-                            .as_deref()
-                            .unwrap_or(DEFAULT_APPROVAL_POLICY)
-                    )
-                }),
-            },
+            startup_input: ctx.startup_input.clone(),
         })
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::for_provider(factory_core::Provider::Codex, true, true, &PERMISSION_MODES)
+        Capabilities::for_provider(factory_core::Provider::Codex, &PERMISSION_MODES)
     }
-}
-
-/// Reads a quoted root-table string from Codex's config without treating a
-/// nested table value as the global setting. This intentionally handles only
-/// the scalar shape Codex writes for these two keys; if the file uses a shape
-/// we cannot establish safely, the caller reports it as unreported.
-fn root_config_string(document: &str, key: &str) -> Option<String> {
-    for line in document.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            break;
-        }
-        let Some((candidate, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        if candidate.trim() != key {
-            continue;
-        }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|value| value.strip_suffix('"'))
-            .map(|value| value.replace("\\\"", "\"").replace("\\\\", "\\"));
-        return value.filter(|value| {
-            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-        });
-    }
-    None
 }
 
 /// Idempotently seeds `codex_home` (mode `0700`, created if missing) the
@@ -361,9 +246,8 @@ fn root_config_string(document: &str, key: &str) -> Option<String> {
 /// copied `rules/*.rules` file are one-time seeds, not a sync (an
 /// operator's or Codex's own later additions to either are never clobbered
 /// by a later spawn); only the `auth.json` link follows the seed home. The
-/// hooks block, the `factoryctl` rule ([`ensure_factoryctl_rule_present`]),
-/// and the sandbox/trust config block are all refreshed separately, every
-/// spawn, by their own dedicated `rewrite_*`/`ensure_*` functions.
+/// hooks and sandbox/trust config blocks are refreshed separately on every
+/// spawn.
 fn seed_codex_home_once(
     codex_home: &Path,
     source_home: Option<&Path>,
@@ -444,8 +328,7 @@ fn seed_rules_directory(
     // `~/.codex/rules/` at all (same fallback shape as `config.toml`'s own
     // "no ~/.codex/config.toml was found"). Any other error (e.g. the
     // directory exists but is unreadable) is surfaced rather than treated
-    // identically to "nothing to copy" (review round 2 finding D, same
-    // reasoning as `ensure_factoryctl_rule_present`'s own fix below).
+    // identically to "nothing to copy".
     let entries = match fs::read_dir(&source_rules_dir) {
         Ok(entries) => entries,
         Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -508,71 +391,8 @@ fn seed_rule_paths(
     Ok(())
 }
 
-/// Idempotently ensures `codex_home/rules/default.rules` contains
-/// [`FACTORYCTL_PREFIX_RULE`], appending it if an existing file -- copied
-/// from the operator by [`seed_rules_directory`], or one Codex itself
-/// wrote after an earlier manual approval, or simply absent -- does not
-/// already have it. Unlike the seed-once copy above, this runs on *every*
-/// spawn: an agent whose `rules/default.rules` already existed before this
-/// line shipped (this track's own dogfood fleet had exactly one such
-/// agent) would otherwise never receive it, since seeding only ever
-/// touches a file that does not yet exist. Never removes anything already
-/// in the file -- an operator's own `forbid` rules, or another `prefix_rule`
-/// Codex wrote, are left exactly as they were.
-///
-/// Skips the append if the file already mentions `factoryctl` *at all*,
-/// not just this exact `allow` line (review round 2 finding E): an
-/// operator whose copied-forward rules already carry, say,
-/// `prefix_rule(pattern=["factoryctl"], decision="forbid")` must not get
-/// an `allow` appended right next to it -- which decision Codex's own
-/// conflict resolution would then apply between the two is not established
-/// here, so the safer default is to leave an operator's own existing
-/// decision about `factoryctl` alone entirely rather than add a second,
-/// possibly contradictory one.
-///
-/// A missing file is the legitimate empty case (`ErrorKind::NotFound`,
-/// e.g. no operator source home at all) and starts from an empty string;
-/// any *other* read failure (permission denied, non-UTF-8 content, a
-/// transient I/O error) must not be treated the same way -- review round 2
-/// finding D: this runs on a file `seed_rules_directory` may have just
-/// copied an operator's own `forbid` rules into, and folding a real read
-/// failure into "empty file" would overwrite them with a file containing
-/// only the `factoryctl` rule, silently destroying them. Fails the spawn
-/// instead, like every other write in this module.
-fn ensure_factoryctl_rule_present(codex_home: &Path) -> Result<(), ProviderError> {
-    let rules_path = codex_home.join("rules").join("default.rules");
-    let existing = match fs::read_to_string(&rules_path) {
-        Ok(contents) => contents,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(source) => {
-            return Err(ProviderError::Seed {
-                path: rules_path,
-                source,
-            });
-        }
-    };
-    if existing.contains("factoryctl") {
-        return Ok(());
-    }
-    let mut updated = existing;
-    if !updated.is_empty() && !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(FACTORYCTL_PREFIX_RULE);
-    hooks::write_private_file(&rules_path, updated.as_bytes()).map_err(|source| {
-        ProviderError::Seed {
-            path: rules_path,
-            source,
-        }
-    })
-}
-
-/// Idempotently rewrites the daemon-owned hooks block in `codex_home`'s
-/// `config.toml`, replacing everything between the `BEGIN`/`END` markers if
-/// present, else appending a fresh block. Called on every spawn: the hook
-/// token path changes per session, so this keeps the seeded config current
-/// without disturbing whatever the operator's real `config.toml` carried
-/// forward from the one-time seed (model, provider, trust settings, ...).
+/// Replaces the generated hook block with this attempt's authenticated
+/// `PreToolUse` policy hook. Operator hooks were removed while seeding.
 fn rewrite_hooks_block(
     codex_home: &Path,
     factoryctl_path: &Path,
@@ -596,55 +416,9 @@ fn rewrite_hooks_block(
     })
 }
 
-/// Idempotently rewrites the daemon-owned sandbox/trust configuration in
-/// `codex_home`'s `config.toml`: `sandbox_mode = "workspace-write"` (a
-/// root-table key -- see [`SANDBOX_MODE_COMMENT_AND_LINE`]'s own doc
-/// comment for why it cannot simply live inside the marker block below)
-/// plus a `CONFIG_BEGIN_MARKER`/`CONFIG_END_MARKER` block holding
-/// `[sandbox_workspace_write]` (`writable_roots` so the sandbox that gates
-/// a session's own spawned tool calls can still reach this agent's
-/// guidance directory and the daemon's control socket's directory;
-/// `network_access = true`, this track's change from the previous `false`
-/// -- confirmed live that `false` denies even the *local* Unix-socket
-/// connect the daemon's own control socket needs (seatbelt has no notion
-/// of "just localhost"), which blocked not only a worker's `git push`/`gh
-/// pr create` but the orchestrator's own non-outbox-covered `factoryctl`
-/// calls (`agent add`/`task add`/`task assign`/`session list`; only `task
-/// done`/`task blocked`/`agent message` have the outbox fallback,
-/// `docs/providers.md`). This is a real widening -- general outbound
-/// network access, not just the daemon's socket -- accepted per
-/// `SECURITY.md`'s own boundary ("the operating-system user it runs as";
-/// "an agent's own `permission_mode` widens or narrows that"), not a gap:
-/// the alternative tried and rejected was a provider-wide
-/// `danger-full-access` bypass, which traded this hang for a worse one
-/// (`codex_apps`'s own MCP server hangs indefinitely at startup under it,
-/// `docs/providers.md`)) and `[projects."<worktree>"]` (`trust_level =
-/// "trusted"`, so the very first Codex session in a fresh Dark Factory
-/// worktree never blocks on Codex's own trust prompt, matching
-/// `ClaudeProvider::pretrust_worktree`). Called on every spawn, after
-/// [`rewrite_hooks_block`]: the worktree/agent-dir/socket path can change
-/// per session, so this keeps them current without disturbing whatever
-/// else the operator's real `config.toml` carried forward from the
-/// one-time seed.
-///
-/// Every path is canonicalized (symlinks resolved) before use, falling
-/// back to the given path unchanged if canonicalization fails -- found
-/// manually against a real session (this track's item 6 check): both
-/// Codex's own trust check and its seatbelt sandbox's path matching
-/// operate on resolved paths, so a `$DARK_FACTORY_HOME` under a symlink
-/// (`/tmp` -> `/private/tmp` on macOS, the concrete case this was found
-/// against) would otherwise silently write entries that never match.
-fn rewrite_config_block(
-    codex_home: &Path,
-    agent_dir: &Path,
-    socket_path: &Path,
-    worktree: &Path,
-) -> Result<(), ProviderError> {
-    let agent_dir = canonicalize_or_given(agent_dir);
+/// Rewrites the generated trust block for the exact attempt worktree.
+fn rewrite_config_block(codex_home: &Path, worktree: &Path) -> Result<(), ProviderError> {
     let worktree = canonicalize_or_given(worktree);
-    let socket_directory = socket_path
-        .parent()
-        .map_or_else(|| canonicalize_or_given(socket_path), canonicalize_or_given);
 
     let config_path = codex_home.join("config.toml");
     let existing = fs::read_to_string(&config_path).map_err(|source| ProviderError::Seed {
@@ -659,7 +433,7 @@ fn rewrite_config_block(
             .trim_end()
             .to_owned();
     rewritten.push_str("\n\n");
-    rewritten.push_str(&config_block_toml(&agent_dir, &socket_directory, &worktree));
+    rewritten.push_str(&config_block_toml(&worktree));
     hooks::write_private_file(&config_path, rewritten.as_bytes()).map_err(|source| {
         ProviderError::Seed {
             path: config_path.clone(),
@@ -672,17 +446,9 @@ fn canonicalize_or_given(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
 }
 
-fn config_block_toml(agent_dir: &Path, socket_directory: &Path, worktree: &Path) -> String {
+fn config_block_toml(worktree: &Path) -> String {
     let mut block = String::new();
     block.push_str(CONFIG_BEGIN_MARKER);
-    block.push('\n');
-    block.push_str("[sandbox_workspace_write]\n");
-    block.push_str(&format!(
-        "writable_roots = [{}, {}]\n",
-        toml_string(&agent_dir.to_string_lossy()),
-        toml_string(&socket_directory.to_string_lossy()),
-    ));
-    block.push_str("network_access = true\n");
     block.push('\n');
     block.push_str(&format!(
         "[projects.{}]\n",
@@ -751,14 +517,8 @@ fn first_table_header_offset(document: &str) -> Option<usize> {
 /// explanatory comment lines -- so [`insert_root_level_line`] re-inserting
 /// Dark Factory's own value can never produce a duplicate-key TOML document
 /// (regardless of what the operator's own copied-forward `config.toml`
-/// already set it to -- this machine's real `~/.codex/config.toml` already
-/// has one), and, critically, never leaves its *own* two comment lines
-/// behind to accumulate one more copy on every single spawn. Found the hard
-/// way running this manually (this track's item 6 check): the first version
-/// of this function only matched the `key = value` line itself, not the
-/// comment above it, so `rewrite_config_block` silently grew its own
-/// `config.toml` by two duplicate comment lines on every spawn -- 73 copies
-/// after a handful of manual session restarts, before this was caught. A
+/// already set it to), and never leaves its own comment lines behind to
+/// accumulate on repeated rewrites. A
 /// `sandbox_mode` key nested inside some other table (not a real Codex
 /// config shape today) is out of scope and left untouched.
 fn strip_root_level_sandbox_mode(document: &str) -> String {
@@ -816,26 +576,7 @@ fn hooks_block_toml(factoryctl_path: &Path, hook_token_path: &Path) -> String {
     let mut block = String::new();
     block.push_str(HOOKS_BEGIN_MARKER);
     block.push('\n');
-    for event in hooks::HOOK_EVENTS {
-        push_hook_entry(&mut block, factoryctl_path, hook_token_path, event);
-    }
-    block.push_str(HOOKS_END_MARKER);
-    block.push('\n');
-    block
-}
-
-/// Appends one `[[hooks.<Event>]]` entry, same shape for every event
-/// (Codex-only or shared): a single `type = "command"` handler invoking
-/// `factoryctl hook`, 30 second timeout. Codex clamps only `SessionEnd`'s
-/// timeout (to 3s, confirmed by its own `clamping SessionEnd hook timeout
-/// to <n>s` log line); every other event, `PermissionRequest` included,
-/// keeps the configured value.
-fn push_hook_entry(
-    block: &mut String,
-    factoryctl_path: &Path,
-    hook_token_path: &Path,
-    event: factory_core::ProviderHookEvent,
-) {
+    let event = factory_core::ProviderHookEvent::PreToolUse;
     let name = event.provider_event_name();
     let command = hooks::hook_command(factoryctl_path, hook_token_path, event);
     block.push_str(&format!("[[hooks.{name}]]\n"));
@@ -843,6 +584,9 @@ fn push_hook_entry(
     block.push_str("type = \"command\"\n");
     block.push_str(&format!("command = \"{}\"\n", toml_escape(&command)));
     block.push_str("timeout = 30\n\n");
+    block.push_str(HOOKS_END_MARKER);
+    block.push('\n');
+    block
 }
 
 fn toml_escape(value: &str) -> String {
@@ -853,31 +597,28 @@ fn toml_escape(value: &str) -> String {
 mod provider_tests {
     use std::os::unix::fs::PermissionsExt;
 
-    use factory_core::{AgentId, ProjectId, SessionId};
+    use factory_core::RunId;
     use serde_json::Value;
 
     use super::*;
 
     fn context(directory: &Path) -> SpawnContext {
         SpawnContext {
-            agent_id: AgentId::try_from("worker-1").unwrap(),
-            project_id: ProjectId::try_from("factory").unwrap(),
-            session_id: SessionId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
+            run_id: RunId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
             worktree: directory.join("worktree"),
+            startup_input: b"fix the admitted task".to_vec(),
             model: None,
             reasoning_effort: None,
             permission_mode: None,
             auto_mode: true,
-            resume: None,
             hook_token_path: directory.join("runtime").join("hook.token"),
             factoryctl_path: PathBuf::from("/abs/factoryctl"),
             agent_dir: directory.join("agent-dir"),
-            socket_path: directory.join("f.sock"),
         }
     }
 
     #[test]
-    fn fresh_launch_has_no_resume_argument_and_sets_codex_home() {
+    fn fresh_launch_is_noninteractive_and_sets_codex_home() {
         let directory = tempfile::tempdir().unwrap();
         let ctx = context(directory.path());
         let launch = CodexProvider::with_source_home(directory.path().join("no-real-home"))
@@ -888,11 +629,14 @@ mod provider_tests {
         assert_eq!(
             launch.args,
             vec![
+                "exec".to_owned(),
                 "--dangerously-bypass-hook-trust".to_owned(),
                 "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                "-".to_owned(),
             ],
             "auto mode bypasses both approvals and the sandbox"
         );
+        assert_eq!(launch.startup_input, b"fix the admitted task");
         let codex_home = directory.path().join("agent-dir").join("codex-home");
         assert_eq!(
             launch.env,
@@ -915,24 +659,21 @@ mod provider_tests {
         assert_eq!(
             launch.args,
             vec![
+                "exec".to_owned(),
                 "--dangerously-bypass-hook-trust".to_owned(),
                 "-c".to_owned(),
                 "approval_policy=\"on-request\"".to_owned(),
+                "-".to_owned(),
             ]
-        );
-        assert_eq!(
-            launch.runtime.permission_mode.as_deref(),
-            Some("on-request")
         );
     }
 
     #[test]
-    fn resume_launch_passes_model_approval_policy_and_thread_id_in_order() {
+    fn launch_passes_model_and_approval_policy() {
         let directory = tempfile::tempdir().unwrap();
         let mut ctx = context(directory.path());
         ctx.model = Some("gpt-5-codex".to_owned());
         ctx.permission_mode = Some("never".to_owned());
-        ctx.resume = Some("9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".to_owned());
         let launch = CodexProvider::with_source_home(directory.path().join("no-real-home"))
             .spawn_spec(&ctx)
             .unwrap();
@@ -940,19 +681,19 @@ mod provider_tests {
         assert_eq!(
             launch.args,
             vec![
+                "exec".to_owned(),
                 "--dangerously-bypass-hook-trust".to_owned(),
                 "--model".to_owned(),
                 "gpt-5-codex".to_owned(),
                 "-c".to_owned(),
                 "approval_policy=\"never\"".to_owned(),
-                "resume".to_owned(),
-                "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d".to_owned(),
+                "-".to_owned(),
             ]
         );
     }
 
     #[test]
-    fn profile_reasoning_effort_overrides_seeded_codex_config_and_is_projected() {
+    fn profile_reasoning_effort_is_passed_explicitly() {
         let directory = tempfile::tempdir().unwrap();
         let mut ctx = context(directory.path());
         ctx.model = Some("gpt-5.6-luna".to_owned());
@@ -967,8 +708,6 @@ mod provider_tests {
                 "model_reasoning_effort=\"medium\"".to_owned(),
             ]
         }));
-        assert_eq!(launch.runtime.model.as_deref(), Some("gpt-5.6-luna"));
-        assert_eq!(launch.runtime.reasoning_effort.as_deref(), Some("medium"));
     }
 
     #[test]
@@ -983,23 +722,15 @@ mod provider_tests {
         assert_eq!(
             launch.args,
             vec![
+                "exec".to_owned(),
                 "--dangerously-bypass-hook-trust".to_owned(),
                 "-c".to_owned(),
                 "approval_policy=\"on-request\"".to_owned(),
+                "-".to_owned(),
             ],
             "an operator's own agent profile permission_mode always wins over \
              DEFAULT_APPROVAL_POLICY"
         );
-    }
-
-    #[test]
-    fn resume_rejects_a_non_uuid_thread_id() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut ctx = context(directory.path());
-        ctx.resume = Some("not-a-uuid".to_owned());
-        let result =
-            CodexProvider::with_source_home(directory.path().join("no-real-home")).spawn_spec(&ctx);
-        assert!(matches!(result, Err(ProviderError::ResumeIdNotUuid { .. })));
     }
 
     #[test]
@@ -1032,139 +763,8 @@ mod provider_tests {
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 
-    /// Q2's pre-seeded approval: a fresh agent's very first `factoryctl`
-    /// call must never block on the same prompt tonight's dogfood run hit
-    /// (`god`'s first `agent add`) -- confirmed against a real dogfood
-    /// session's own operator-approved `CODEX_HOME/rules/default.rules`,
-    /// which is exactly this shape once Codex itself writes it.
-    #[test]
-    fn seeds_a_default_rules_file_pre_approving_factoryctl() {
-        let directory = tempfile::tempdir().unwrap();
-        let ctx = context(directory.path());
-        CodexProvider::with_source_home(directory.path().join("missing"))
-            .spawn_spec(&ctx)
-            .unwrap();
-
-        let rules_path = directory
-            .path()
-            .join("agent-dir")
-            .join("codex-home")
-            .join("rules")
-            .join("default.rules");
-        let contents = fs::read_to_string(&rules_path).unwrap();
-        assert_eq!(contents, FACTORYCTL_PREFIX_RULE);
-
-        let metadata = fs::metadata(&rules_path).unwrap();
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        let dir_metadata = fs::metadata(rules_path.parent().unwrap()).unwrap();
-        assert_eq!(dir_metadata.permissions().mode() & 0o777, 0o700);
-    }
-
-    /// Mirrors `copies_the_real_config_once_and_keeps_the_auth_link_on_the_seed_home`'s
-    /// own "a real user edit is preserved" proof, for the rules file: once
-    /// seeded, a later addition -- an operator's own interactive approval
-    /// of some other command, or Codex's own rewrite of the file -- is
-    /// never clobbered by a later spawn re-seeding.
-    #[test]
-    fn a_later_addition_to_the_seeded_rules_file_is_never_clobbered() {
-        let directory = tempfile::tempdir().unwrap();
-        let ctx = context(directory.path());
-        let provider = CodexProvider::with_source_home(directory.path().join("missing"));
-        provider.spawn_spec(&ctx).unwrap();
-
-        let rules_path = directory
-            .path()
-            .join("agent-dir")
-            .join("codex-home")
-            .join("rules")
-            .join("default.rules");
-        fs::write(
-            &rules_path,
-            format!(
-                "{FACTORYCTL_PREFIX_RULE}prefix_rule(pattern=[\"sleep\", \"30\"], decision=\"allow\")\n"
-            ),
-        )
-        .unwrap();
-
-        provider.spawn_spec(&ctx).unwrap();
-        let contents = fs::read_to_string(&rules_path).unwrap();
-        assert!(contents.contains("sleep"));
-        assert!(contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()));
-    }
-
-    /// Adversarial review finding 4: a real dogfood agent
-    /// (`first-floor-worker-2`) already had `rules/default.rules` -- from
-    /// Codex itself approving some other command -- without the
-    /// `factoryctl` rule, so the old seed-once-if-missing logic would never
-    /// have given it one. `ensure_factoryctl_rule_present` runs every
-    /// spawn, not just at seed time, so the very next spawn appends it
-    /// without disturbing what was already there.
-    #[test]
-    fn an_existing_rules_file_missing_the_factoryctl_rule_gets_it_appended_on_the_next_spawn() {
-        let directory = tempfile::tempdir().unwrap();
-        let ctx = context(directory.path());
-        let rules_path = directory
-            .path()
-            .join("agent-dir")
-            .join("codex-home")
-            .join("rules")
-            .join("default.rules");
-        fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
-        fs::write(
-            &rules_path,
-            "prefix_rule(pattern=[\"./scripts/local-ci.sh\"], decision=\"allow\")\n",
-        )
-        .unwrap();
-
-        CodexProvider::with_source_home(directory.path().join("missing"))
-            .spawn_spec(&ctx)
-            .unwrap();
-
-        let contents = fs::read_to_string(&rules_path).unwrap();
-        assert!(
-            contents.contains("./scripts/local-ci.sh"),
-            "the agent's own already-approved rule must survive"
-        );
-        assert!(
-            contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()),
-            "an existing agent must retroactively get the factoryctl rule too"
-        );
-    }
-
-    /// Adversarial review round 2, finding E: an operator's own explicit
-    /// `factoryctl` decision -- even a `forbid` -- must never get a second,
-    /// possibly contradictory `allow` appended next to it.
-    #[test]
-    fn an_existing_factoryctl_forbid_rule_never_gets_an_allow_appended_next_to_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let ctx = context(directory.path());
-        let rules_path = directory
-            .path()
-            .join("agent-dir")
-            .join("codex-home")
-            .join("rules")
-            .join("default.rules");
-        fs::create_dir_all(rules_path.parent().unwrap()).unwrap();
-        let forbid_rule = "prefix_rule(pattern=[\"factoryctl\"], decision=\"forbid\")\n";
-        fs::write(&rules_path, forbid_rule).unwrap();
-
-        CodexProvider::with_source_home(directory.path().join("missing"))
-            .spawn_spec(&ctx)
-            .unwrap();
-
-        let contents = fs::read_to_string(&rules_path).unwrap();
-        assert_eq!(
-            contents, forbid_rule,
-            "an operator's own factoryctl decision must be left completely alone, \
-             not have an allow appended next to it"
-        );
-    }
-
-    /// Adversarial review finding 6: an operator's own `rules/*.rules`
-    /// files -- including `forbid` rules they wrote to harden their own
-    /// `~/.codex` -- must be carried into a fresh agent's seeded home, not
-    /// silently dropped the way `config.toml`'s `mcp_servers`/`projects`/
-    /// `hooks` tables deliberately are.
+    /// Operator rules are copied unchanged; Dark Factory does not inject a
+    /// generic rule that pre-approves its entire control-plane CLI.
     #[test]
     fn operator_rules_files_including_forbid_rules_are_copied_into_the_seeded_home() {
         let directory = tempfile::tempdir().unwrap();
@@ -1196,10 +796,9 @@ mod provider_tests {
             .join("codex-home")
             .join("rules");
         let default_contents = fs::read_to_string(seeded_rules_dir.join("default.rules")).unwrap();
-        assert!(default_contents.contains("git"));
-        assert!(
-            default_contents.contains(FACTORYCTL_PREFIX_RULE.trim_end()),
-            "the operator's own default.rules must still gain the factoryctl rule"
+        assert_eq!(
+            default_contents,
+            "prefix_rule(pattern=[\"git\", \"push\"], decision=\"allow\")\n"
         );
         let hardening_contents =
             fs::read_to_string(seeded_rules_dir.join("hardening.rules")).unwrap();
@@ -1252,8 +851,7 @@ mod provider_tests {
 
         let ctx = context(directory.path());
         let provider = CodexProvider::with_source_home(real_home.clone());
-        let first_launch = provider.spawn_spec(&ctx).unwrap();
-        assert_eq!(first_launch.runtime.model.as_deref(), Some("gpt-5.6"));
+        provider.spawn_spec(&ctx).unwrap();
 
         let codex_home = directory.path().join("agent-dir").join("codex-home");
         let config_contents = fs::read_to_string(codex_home.join("config.toml")).unwrap();
@@ -1271,13 +869,9 @@ mod provider_tests {
             format!("{base}\nmodel_reasoning_effort = \"xhigh\"\n"),
         )
         .unwrap();
-        let second_launch = provider.spawn_spec(&ctx).unwrap();
+        provider.spawn_spec(&ctx).unwrap();
         let after_second_spawn = fs::read_to_string(codex_home.join("config.toml")).unwrap();
         assert!(after_second_spawn.contains("model_reasoning_effort = \"xhigh\""));
-        assert_eq!(
-            second_launch.runtime.reasoning_effort.as_deref(),
-            Some("xhigh")
-        );
         assert_eq!(after_second_spawn.matches(HOOKS_BEGIN_MARKER).count(), 1);
 
         // A different seed home (another Codex account) re-points the auth
@@ -1326,53 +920,36 @@ mod provider_tests {
         let contents = fs::read_to_string(&config_path).unwrap();
         assert_eq!(contents.matches(HOOKS_BEGIN_MARKER).count(), 1);
         assert_eq!(contents.matches(HOOKS_END_MARKER).count(), 1);
-        assert_eq!(contents.matches("[[hooks.Stop]]").count(), 1);
-        assert_eq!(contents.matches("[[hooks.PermissionRequest]]").count(), 1);
+        assert_eq!(contents.matches("[[hooks.PreToolUse]]").count(), 1);
+        assert!(!contents.contains("[[hooks.Stop]]"));
+        assert!(!contents.contains("[[hooks.PermissionRequest]]"));
     }
 
     #[test]
     fn hooks_block_toml_has_the_exact_designed_shape_for_one_event() {
         let block = hooks_block_toml(
             Path::new("/abs/factoryctl"),
-            Path::new("/abs/runs/session-1/hook.token"),
+            Path::new("/abs/runs/attempt-1/hook.token"),
         );
         assert!(block.starts_with(HOOKS_BEGIN_MARKER));
         assert!(block.trim_end().ends_with(HOOKS_END_MARKER));
         assert!(block.contains(
-            "[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype = \"command\"\ncommand = \"'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' Stop\"\ntimeout = 30\n"
-        ));
-    }
-
-    /// `PermissionRequest` is part of the shared provider hook set, with the
-    /// same command/timeout shape and an unclamped 30s timeout (only
-    /// `SessionEnd` is clamped, to 3s).
-    #[test]
-    fn hooks_block_toml_includes_the_shared_permission_request_event() {
-        let block = hooks_block_toml(
-            Path::new("/abs/factoryctl"),
-            Path::new("/abs/runs/session-1/hook.token"),
-        );
-        assert!(block.contains(
-            "[[hooks.PermissionRequest]]\n[[hooks.PermissionRequest.hooks]]\ntype = \"command\"\ncommand = \"'/abs/factoryctl' hook --token-file '/abs/runs/session-1/hook.token' PermissionRequest\"\ntimeout = 30\n"
+            "[[hooks.PreToolUse]]\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"'/abs/factoryctl' hook --token-file '/abs/runs/attempt-1/hook.token' PreToolUse\"\ntimeout = 30\n"
         ));
     }
 
     #[test]
-    fn capabilities_declare_hooks_resume_and_the_supported_permission_modes() {
+    fn capabilities_declare_the_supported_permission_modes() {
         let capabilities = CodexProvider::new().capabilities();
-        assert!(capabilities.hooks);
-        assert!(capabilities.resume);
         assert_eq!(capabilities.permission_modes, PERMISSION_MODES);
     }
 
     #[test]
     fn config_toml_generated_by_a_fresh_seed_parses_under_codex_doctor() {
         // Guards against a schema regression without spawning a real
-        // interactive session: `codex doctor` is a read-only diagnostic
+        // provider process: `codex doctor` is a read-only diagnostic
         // that parses `CODEX_HOME/config.toml` and reports whether it
-        // loaded, matching the manual verification recorded in this
-        // track's report (`config.toml parse: ok` under `--strict-config`
-        // for exactly this generated shape).
+        // loaded under `--strict-config` for this generated shape.
         if std::process::Command::new("codex")
             .arg("--version")
             .output()
@@ -1409,18 +986,10 @@ mod provider_tests {
 
     #[test]
     fn config_block_toml_has_the_exact_designed_shape() {
-        let block = config_block_toml(
-            Path::new("/abs/agent-dir"),
-            Path::new("/abs"),
-            Path::new("/abs/worktrees/worker-1"),
-        );
+        let block = config_block_toml(Path::new("/abs/worktrees/worker-1"));
         assert_eq!(
             block,
             "# --- dark-factory config BEGIN ---\n\
-             [sandbox_workspace_write]\n\
-             writable_roots = [\"/abs/agent-dir\", \"/abs\"]\n\
-             network_access = true\n\
-             \n\
              [projects.\"/abs/worktrees/worker-1\"]\n\
              trust_level = \"trusted\"\n\
              # --- dark-factory config END ---\n"
@@ -1428,7 +997,7 @@ mod provider_tests {
     }
 
     #[test]
-    fn spawn_spec_sets_sandbox_mode_writable_roots_and_project_trust() {
+    fn spawn_spec_sets_sandbox_mode_and_only_project_trust() {
         let directory = tempfile::tempdir().unwrap();
         let ctx = context(directory.path());
         CodexProvider::with_source_home(directory.path().join("missing"))
@@ -1447,30 +1016,9 @@ mod provider_tests {
                 .count(),
             1
         );
-        assert!(contents.contains("[sandbox_workspace_write]"));
-        // Every path is canonicalized before being written (symlinks
-        // resolved -- see `rewrite_config_block`'s own doc comment for
-        // why, found manually against a real session where
-        // `$DARK_FACTORY_HOME` was under `/tmp`, itself a symlink to
-        // `/private/tmp` on macOS): compare against the same
-        // canonicalize-or-fall-back-to-given resolution the production
-        // code applies, not the raw `SpawnContext` paths, which a tempdir
-        // root under `/var/folders/...` (itself commonly a symlink to
-        // `/private/var/folders/...` on macOS) would otherwise mismatch.
-        assert!(contents.contains(&format!(
-            "writable_roots = [{}, {}]",
-            toml_string(&canonicalize_or_given(&ctx.agent_dir).to_string_lossy()),
-            toml_string(
-                &canonicalize_or_given(ctx.socket_path.parent().unwrap()).to_string_lossy()
-            ),
-        )));
-        assert!(
-            contents.contains("network_access = true"),
-            "workers must reach the network for git push/gh pr create and \
-             the orchestrator's own non-outbox-covered factoryctl calls \
-             need the daemon's control socket -- see config_block_toml's \
-             own doc comment"
-        );
+        assert!(!contents.contains("[sandbox_workspace_write]"));
+        assert!(!contents.contains("writable_roots"));
+        assert!(!contents.contains("network_access"));
         assert!(contents.contains(&format!(
             "[projects.{}]",
             toml_string(&canonicalize_or_given(&ctx.worktree).to_string_lossy())
@@ -1502,13 +1050,12 @@ mod provider_tests {
         assert_eq!(contents.matches(CONFIG_BEGIN_MARKER).count(), 1);
         assert_eq!(contents.matches(CONFIG_END_MARKER).count(), 1);
         assert_eq!(contents.matches("sandbox_mode = ").count(), 1);
-        assert_eq!(contents.matches("[sandbox_workspace_write]").count(), 1);
+        assert!(!contents.contains("[sandbox_workspace_write]"));
         assert_eq!(contents.matches("trust_level = \"trusted\"").count(), 1);
         // Regression: the first version of this rewrite only deduplicated
         // the `sandbox_mode = ...` line itself, not the two explanatory
         // comment lines above it -- those accumulated one more copy on
-        // every spawn (73 copies after a handful of manual session
-        // restarts, this track's item 6 check). Assert on the comment
+        // every spawn (73 copies after repeated launches). Assert on the comment
         // text directly, not just the structural TOML content, since that
         // is exactly what the original bug's blind spot was.
         assert_eq!(
@@ -1522,11 +1069,10 @@ mod provider_tests {
     #[test]
     fn a_real_configs_own_sandbox_mode_is_replaced_not_duplicated_and_a_surviving_trailing_table_is_undisturbed()
      {
-        // The exact shape this track's manual check found on a real
-        // machine's `~/.codex/config.toml`: root-level scalars (including
+        // A representative operator config: root-level scalars (including
         // the operator's own `sandbox_mode`), then dozens of trailing
         // `[projects."..."]` tables (dropped entirely at seed time by
-        // this track's `filter_operator_config_for_seed` -- see the
+        // `filter_operator_config_for_seed` -- see the
         // dedicated `operator_config_is_filtered_...` test below -- so
         // this fixture also keeps one *surviving* trailing table,
         // `[model_providers.*]`, to prove `insert_root_level_line`
@@ -1578,10 +1124,10 @@ mod provider_tests {
         assert!(contents.contains("name = \"Custom\""));
         // The operator's own project trust entries do not: an operator's
         // decision to trust *their own* repos has no bearing on this
-        // factory worker's session (this track's item 7).
+        // factory attempt.
         assert!(!contents.contains("/Users/op/other-repo"));
         assert!(!contents.contains("/Users/op/another-repo"));
-        // This agent's own worktree still gains a trust entry, from
+        // This attempt's own worktree still gains a trust entry, from
         // `rewrite_config_block` -- unrelated to what was (or wasn't)
         // seeded.
         assert!(contents.contains(&format!(
@@ -1607,8 +1153,8 @@ mod provider_tests {
         );
     }
 
-    /// This track's item 7, dedicated fixture: an operator `config.toml`
-    /// carrying exactly the three shapes that motivated the fix --
+    /// An operator config carrying the three shapes that must not be
+    /// inherited:
     /// `[mcp_servers.*]` (the "Starting MCP servers" stall), `[projects.*]`
     /// (an operator's own repo trust, irrelevant to a factory worker), and
     /// `[hooks.state]` (Codex's own persisted hook-trust bookkeeping) plus
@@ -1666,12 +1212,10 @@ mod provider_tests {
         assert!(!contents.contains("/Users/op/some-repo"));
         assert!(!contents.contains("hooks.state"));
         assert!(!contents.contains("operators-own-hook.sh"));
-        // `[[hooks.SessionStart]]` is dropped from the *seed*; the daemon's
-        // own identical-looking header still appears, written fresh by
-        // `rewrite_hooks_block` -- this is what proves the seed's own copy
-        // was actually filtered, not that the file has zero
-        // `hooks.SessionStart` headers at all.
-        assert_eq!(contents.matches("[[hooks.SessionStart]]").count(), 1);
+        // The operator's lifecycle hook is dropped; only the daemon's
+        // authenticated authority hook is generated.
+        assert!(!contents.contains("[[hooks.SessionStart]]"));
+        assert_eq!(contents.matches("[[hooks.PreToolUse]]").count(), 1);
         assert!(contents.contains("factoryctl' hook --token-file"));
 
         // Kept: ordinary settings and an unrelated table.
@@ -1743,16 +1287,6 @@ mod provider_tests {
             Some("model_providers".to_owned())
         );
         assert_eq!(table_header_top_level_key("not a header"), None);
-    }
-
-    #[test]
-    fn runtime_metadata_reads_only_authoritative_root_config_values() {
-        let config = "# comment\nmodel = \"gpt-5.6\"\nmodel_reasoning_effort = \"xhigh\"\n\n[projects.\\\"/work\\\"]\nmodel = \"nested-is-not-global\"\n";
-        assert_eq!(root_config_string(config, "model"), Some("gpt-5.6".into()));
-        assert_eq!(
-            root_config_string(config, "model_reasoning_effort"),
-            Some("xhigh".into())
-        );
     }
 
     #[test]

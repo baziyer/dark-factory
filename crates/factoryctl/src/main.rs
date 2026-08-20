@@ -1,52 +1,32 @@
-use std::{
-    env,
-    io::Write,
-    path::{Path, PathBuf},
-    process,
-};
+use std::{env, io::Write, path::PathBuf, process};
 
 use factory_core::local::{
     GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS,
-    MAX_RUN_PAGE_ITEMS, MAX_SESSION_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, ServerFrame,
+    MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS, RequestCredential, ServerFrame,
 };
-use factory_core::runner::TerminalAttachMode;
 use factory_core::{AgentRole, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
 use uuid::Uuid;
 
-mod attach;
 mod doctor;
 mod events;
 mod init;
-mod outbox;
 mod status;
 mod update_command;
 mod usage;
 
-/// A session's own guidance directory, exported in every session's
-/// environment (`runner_process::SESSION_ENVIRONMENT_NAMES`) — see
-/// `docs/providers.md`'s "Sandboxed providers: the outbox".
-const AGENT_DIR_ENV: &str = "DARK_FACTORY_AGENT_DIR";
-/// Set to `1` to force the outbox fallback even when the daemon socket is
-/// reachable -- exists purely so a test can exercise the sandboxed-connect-
-/// failure path deterministically, without needing to actually break the
-/// socket's permissions. Checked only by the outbox-eligible commands
-/// (`task done`/`task blocked`/`agent message`).
-const FORCE_OUTBOX_ENV: &str = "DARK_FACTORY_FORCE_OUTBOX";
-const SESSION_TOKEN_FILE_ENV: &str = "DARK_FACTORY_SESSION_TOKEN_FILE";
+const ATTEMPT_TOKEN_FILE_ENV: &str = "DARK_FACTORY_ATTEMPT_TOKEN_FILE";
 
-use attach::AttachTarget;
-
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|git|pr|run|session|hook|attach|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|hook|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
 
 Commands:
   health                                      Check the daemon
-  status [--json]                             The whole fleet at one instant: sessions, queues, attention, live-session cap
+  status [--json]                             The whole fleet at one instant: attempts, queues, attention, active-attempt cap
   auto on|off|status                         Set or show the factory-wide provider bypass default
-  capacity status|set N                     Show or change the operator-owned live-session capacity (1..=64)
+  capacity status|set N                     Show or change the operator-owned active-attempt capacity (1..=64)
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
   doctor [--json]                             Diagnose the install, one line each; exit 1 if any fail
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
@@ -57,20 +37,15 @@ Commands:
                                                Manage and run tasks
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
-  git status|diff|commit|push                  Session-authenticated daemon-owned Git operations
-  pr open|update                               Session-authenticated daemon-owned pull requests
   run list|stop                               List and stop process attempts
-  session list|stop                           List and stop resident provider sessions
   hook --token-file PATH <Event>              Forward one provider hook invocation to the daemon
-  attach --project P (--session S | --agent A) Attach to a session's PTY, by ID or by its agent
   events [--follow]                           Read durable events
 
 Run `factoryctl <command> --help` or `factoryctl <command> <action> --help`
 for action-specific options.
 
 Every `--project` may be omitted if `$DARK_FACTORY_PROJECT` is set (as it is
-inside a session's own environment); `agent message --from` similarly
-defaults to `$DARK_FACTORY_AGENT` when unset.
+inside an attempt's own environment).
 
 Options:
   --socket PATH                      Use an explicit local socket
@@ -81,7 +56,7 @@ Check that the daemon is reachable and responding.";
 const STATUS_HELP: &str = "usage: factoryctl status [--json]
 
 A concise human summary of the whole daemon at one instant: projects,
-agents, sessions, project backlogs, assigned worker queues, worktrees, and
+agents, attempts, project backlogs, assigned worker queues, Changes, and
 anything needing attention.
 factory-tui reads the same request. For history, use the list commands.
 
@@ -91,10 +66,10 @@ Options:
 
 const CAPACITY_HELP: &str = "usage: factoryctl capacity <status|set N>
 
-The capacity is a finite daemon-wide live-session bound. `set` is operator-only
-(provider-session shell policy denies this mutation),
+The capacity is a finite daemon-wide active-attempt bound. `set` is operator-only
+(attempt shell policy denies this mutation),
 requires the managed launchd job, shows that launchd will restart only factoryd
-while preserving runner processes/session state, and rolls the plist back if the
+while preserving runner processes/attempt state, and rolls the plist back if the
 reload or health check fails. Valid values are 1 through 64.";
 const INIT_HELP: &str = "usage: factoryctl init [--yes] [--no-launchd]
 
@@ -104,9 +79,8 @@ Guided first install on this machine:
   3. install the binaries next to this factoryctl as $DARK_FACTORY_HOME/bin/<version>/
      and point bin/current at them (a bin/<version> holding a different build of the
      same version is refused, never overwritten)
-  4. state what Dark Factory writes outside its home (the launchd job, worktree
-     pre-trust entries in ~/.claude.json, an agent/<id> branch per agent in each
-     project's repository) and ask before touching launchd
+  4. state that Stage 1 writes outside its home only for the launchd job, and
+     ask before touching launchd
   5. render ~/Library/LaunchAgents/com.dark-factory.factoryd.plist with a PATH that
      can find those CLIs, load it, and wait for the daemon to answer health with
      this version
@@ -128,8 +102,8 @@ const DOCTOR_HELP: &str = "usage: factoryctl doctor [--json]
 Diagnostic checks, one line each: the home directory and its permissions,
 the installed release under bin/, the daemon (reachable? same version as
 this factoryctl?), the launchd job (installed, loaded, PATH covers claude/
-codex?), claude/codex/git on PATH with versions, ~/.claude.json (worktree
-pre-trust), every project's root and stale worktree directories, and
+codex?), claude/codex/git on PATH with versions, Codex credential seeding,
+every configured project's source root, and
 whether a newer release exists (may refresh the cached result, at most one
 fetch per hour). This command does not repair or reconfigure the installation.
 Exits 1 if any check fails; warnings don't change the exit code.
@@ -152,7 +126,7 @@ repoint $DARK_FACTORY_HOME/bin/current at it. If this user's launchd job
 (~/Library/LaunchAgents/com.dark-factory.factoryd.plist) exists it is
 rewritten to run from bin/current (keeping its other arguments and
 environment; PATH gains the provider CLIs' directories if missing) and
-reloaded -- only the daemon restarts; every running session survives. The
+reloaded -- only the daemon restarts; every running attempt survives. The
 job must already run with this $DARK_FACTORY_HOME (a scratch home is
 refused rather than moving the job). Without a launchd job, restart the
 daemon yourself afterwards. Nothing is deleted: a failed reload rolls
@@ -172,26 +146,6 @@ const USAGE_HELP: &str = "usage: factoryctl usage
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
 result. No daemon or socket is involved and nothing is persisted; Claude's
 usage is read by running `/usage` inside Claude's own interactive terminal.";
-const GIT_HELP: &str = "usage: factoryctl git <status|diff|commit|push> [options]
-
-Run Git through factoryd for the calling session's exact managed worktree and
-agent/<id> branch. Identity comes only from DARK_FACTORY_SESSION_TOKEN_FILE.
-The daemon serializes operations and never accepts a path, branch, or remote.
-
-Actions:
-  status                    Show short branch/worktree status
-  diff [--staged]           Show an unstaged or staged diff
-  commit --message TEXT     Stage all worktree changes and commit them
-  push                      Push the managed branch to origin without force";
-const PR_HELP: &str = "usage: factoryctl pr <open|update> [options]
-
-Open or update a pull request through factoryd for the calling session branch.
-The daemon verifies an updated PR has that exact head branch.
-
-Actions:
-  open --title TEXT (--body TEXT | --body-file PATH)
-  update --number N --title TEXT (--body TEXT | --body-file PATH)";
-
 const PROJECT_HELP: &str =
     "usage: factoryctl project <add|list|delete|get|guidance|repository> [options]
 
@@ -261,7 +215,7 @@ const PROJECT_REPOSITORY_HELP: &str =
     "usage: factoryctl project repository set --project ID --remote URL --base BRANCH
 
 Set the daemon-owned remote and PR base for a project. This authority is
-write-once and can be set only while the factory has no live sessions in any
+write-once and can be set only while the factory has no active attempts in any
 project; later retarget attempts are rejected.
 
 Required:
@@ -288,8 +242,8 @@ Actions:
   cancel    Cancel a queued or blocked task
   update    Edit a queued task's title or body
   delete    Delete a task that has no active run
-  done      Mark the task's open episode succeeded, from inside a session
-  blocked   Mark the task's open episode blocked, from inside a session
+  done      Request success for the authenticated attempt
+  blocked   Request a block for the authenticated attempt
 
 Run `factoryctl task <action> --help` for action-specific options.";
 const TASK_ADD_HELP: &str =
@@ -333,8 +287,7 @@ Required:
 
 Options:
   -h, --help              Show this help";
-const TASK_START_HELP: &str =
-    "usage: factoryctl task start --project ID --task ID --agent ID --worktree PATH [options]
+const TASK_START_HELP: &str = "usage: factoryctl task start --project ID --task ID --agent ID
 
 Start a queued task on an idle agent.
 
@@ -342,10 +295,8 @@ Required:
   --project ID           Project the task belongs to
   --task ID              Task to start
   --agent ID             Agent to run it
-  --worktree PATH        Working directory for the run
 
 Options:
-  --parent-run ID          Parent run ID (for orchestrator-spawned runs)
   -h, --help                 Show this help";
 const TASK_RETRY_HELP: &str = "usage: factoryctl task retry --project ID --task ID
 
@@ -359,7 +310,7 @@ Options:
   -h, --help              Show this help";
 const TASK_ASSIGN_HELP: &str = "usage: factoryctl task assign --project ID --task ID [--agent ID]
 
-Assigning to an agent wakes automatic delivery and may start its session.
+Assigning to an agent wakes automatic admission and may start an attempt.
 Omit --agent to return the task to the operator.
 
 Required:
@@ -406,33 +357,23 @@ Required:
 
 Options:
   -h, --help              Show this help";
-const TASK_DONE_HELP: &str =
-    "usage: factoryctl task done --project ID --task ID (--result TEXT | --result-file PATH)
+const TASK_DONE_HELP: &str = "usage: factoryctl task done (--result TEXT | --result-file PATH)
 
-Marks a task's open episode succeeded from inside its own session: the run
-closes with closed_by=task_done and the task becomes succeeded. Intended to
-be called by the agent itself once it finishes its work, using the
-DARK_FACTORY_AGENT/DARK_FACTORY_SESSION_TOKEN_FILE identity in its session
-environment; it does not take an --agent flag.
+Requests success for the exact running attempt identified by
+DARK_FACTORY_ATTEMPT_TOKEN_FILE. The caller cannot select another task or run.
 
 Required:
-  --project ID           Project the task belongs to
-  --task ID              Task to complete
   --result TEXT          Result text (mutually exclusive with --result-file)
   --result-file PATH     Local file to read the result text from
 
 Options:
   -h, --help              Show this help";
-const TASK_BLOCKED_HELP: &str =
-    "usage: factoryctl task blocked --project ID --task ID --reason TEXT
+const TASK_BLOCKED_HELP: &str = "usage: factoryctl task blocked --reason TEXT
 
-Marks a task's open episode blocked from inside its own session: the run
-closes with closed_by=task_blocked and the task becomes blocked. Like `task
-done`, identity comes from the session environment, not an --agent flag.
+Requests a block for the exact running attempt identified by
+DARK_FACTORY_ATTEMPT_TOKEN_FILE. The caller cannot select another task or run.
 
 Required:
-  --project ID           Project the task belongs to
-  --task ID              Task to block
   --reason TEXT          Why the task is blocked (at most 4096 bytes)
 
 Options:
@@ -448,7 +389,7 @@ Actions:
   list      List agents in a project
   delete    Delete an agent that has no open run
   get       Fetch one agent, including its guidance file paths
-  status    One agent's live picture: session, run, last hook, queue, inbox, worktree git state
+  status    One agent's live picture: attempt, queue, inbox, budget, and attention
   profile   Manage an agent's model, permission mode, and guidance files
   budget    Show, set, or reset the agent's durable provider budget
   message   Send a durable message from one agent to another
@@ -476,8 +417,6 @@ Options:
                                omitted means a plain interactive shell)
   --reasoning-effort TIER      Codex reasoning tier (none|low|medium|high|xhigh|max)
   --model-reason REASON        Auditable reason for an explicit model or escalation
-  --worktree PATH              Absolute path to an existing git worktree,
-                               overriding the daemon-managed default
   -h, --help                   Show this help";
 const AGENT_LIST_HELP: &str = "usage: factoryctl agent list --project ID [options]
 
@@ -507,13 +446,11 @@ Options:
 const AGENT_STATUS_HELP: &str = "usage: factoryctl agent status --project ID --agent ID
 
 One agent at one instant: its snapshot and profile (as `agent get`), its
-live session -- or the most recent ended one, so a failure stays visible --
-with state, activity, last hook event and time, and wait reason; its current
-run; the queued tasks assigned to it (oldest first, first 10 listed, full
-depth alongside); undelivered inbox messages; structured bounded attention
-reasons with source IDs, age, and safe actions (the same projection shown by
-`factoryctl status` and `factory-tui`); and, when it has a worktree, `git
-status` summarized (branch, changed files, dirty). Memory is projected with
+active attempt and most recent terminal attempt with phase, outcome, observer
+health, activity, and wait reason; the queued tasks assigned to it (first 10
+listed, full depth alongside); undelivered inbox messages; and structured
+bounded attention reasons with source IDs, age, and safe actions (the same
+projection shown by `factoryctl status` and `factory-tui`). Memory is projected with
 bounded health (`ok`, `near_limit`, `oversized`, `invalid_utf8`, or
 `path_error`); unhealthy content is omitted, never allowed to hide status.
 
@@ -524,8 +461,8 @@ Options:
   -h, --help             Show this help";
 const AGENT_GET_HELP: &str = "usage: factoryctl agent get --project ID --agent ID
 
-Fetch one agent, including the absolute paths of its `instructions.md`,
-`memory.md`, and private lossless memory archive, plus current memory health.
+Fetch one agent, including the absolute paths of its `instructions.md` and
+`memory.md`, plus current memory health.
 Healthy memory content is included; oversized or invalid content is omitted
 so the mechanical lookup still succeeds.
 
@@ -573,8 +510,6 @@ Required:
 
 Options:
   --id ID                    Explicit message ID (default: generated UUID)
-  --from AGENT_ID             Sender agent ID (default: $DARK_FACTORY_AGENT if
-                                set inside a session, else none/system)
   -h, --help                   Show this help";
 const AGENT_INBOX_HELP: &str = "usage: factoryctl agent inbox --project ID --agent ID [options]
 
@@ -591,7 +526,7 @@ Options:
 const AGENT_PAUSE_HELP: &str = "usage: factoryctl agent pause --project ID --agent ID
 
 Durably holds this agent's queue: the daemon stops delivering new tasks or
-messages into its session until `agent resume`. Its current session, if
+messages into an attempt until `agent resume`. Its current attempt, if
 any, keeps running; this only affects future delivery.
 
 Required:
@@ -603,7 +538,7 @@ Options:
 const AGENT_RESUME_HELP: &str = "usage: factoryctl agent resume --project ID --agent ID
 
 Undoes `agent pause`: the daemon resumes delivering queued work into this
-agent's session.
+agent's future attempt.
 
 Required:
   --project ID           Project the agent belongs to
@@ -646,64 +581,7 @@ Options:
   --grace-ms N              Grace period before a harder stop (default 0, max 60000)
   -h, --help                  Show this help";
 
-const ATTACH_HELP: &str =
-    "usage: factoryctl attach --project ID (--session ID | --agent ID) [--full-history | --since-offset N]
-
-Attach to a session's PTY: puts the local terminal in raw mode, replays
-the latest bounded retained tail by default, then
-streams live output and forwards stdin as operator input. Resizes the
-remote PTY to match the local terminal on attach and on every SIGWINCH.
-Detach with Ctrl-] without affecting the session.
-
-Required:
-  --project ID               Project the session belongs to
-  --session ID                Session to attach to (--run is accepted as an alias)
-  --agent ID                  Attach to this agent's current live session
-                               instead (resolved via `session list`; exactly
-                               one of --session/--run/--agent is required)
-
-Options:
-  --full-history              Replay all currently retained output
-  --since-offset N            Resume from an explicit retained byte offset
-  --generation N              Generation paired with --since-offset
-  -h, --help                    Show this help";
-
-const SESSION_HELP: &str = "usage: factoryctl session <list|stop> [options]
-
-Inspect and control resident provider sessions (one per agent, PTY-backed,
-spanning many task episodes).
-
-Actions:
-  list      List sessions in a project
-  stop      Gracefully stop a session's provider process
-
-Run `factoryctl session <action> --help` for action-specific options.";
-const SESSION_LIST_HELP: &str = "usage: factoryctl session list --project ID [options]
-
-List sessions in a project, ordered by ID.
-
-Required:
-  --project ID           Project to list sessions from
-
-Options:
-  --after ID               Resume after this session ID
-  --limit N                  Page size (default and max: 1000)
-  -h, --help                   Show this help";
-const SESSION_STOP_HELP: &str =
-    "usage: factoryctl session stop --project ID --session ID [--grace-ms N]
-
-Gracefully stops a session's PTY-backed provider process group. Any open
-run (task episode) closes with closed_by=operator_stop.
-
-Required:
-  --project ID           Project the session belongs to
-  --session ID           Session to stop
-
-Options:
-  --grace-ms N              Grace period before a harder stop (default 0, max 60000)
-  -h, --help                  Show this help";
-
-const HOOK_HELP: &str = "usage: factoryctl hook --token-file PATH <Event>
+const HOOK_HELP: &str = "usage: factoryctl hook --token-file PATH PreToolUse
 
 Forwards one provider hook invocation (a Claude Code `--settings` hook or a
 Codex `CODEX_HOME/config.toml` hook) to the daemon. Reads the hook's JSON
@@ -712,18 +590,14 @@ request together with the token file's contents, and prints the daemon's
 `reply` JSON verbatim to stdout so the provider can act on it (for example
 `{\"decision\":\"block\",\"reason\":\"...\"}`).
 
-Always exits 0 and prints `{}` on stdout if the token file cannot be read,
-stdin is not valid bounded JSON, or the daemon is unreachable, errors, or is
-slow (5 second timeout) — a broken or slow hook must never wedge the
-operator's live Claude Code or Codex session. This command is meant to be
-invoked by the provider itself, from a generated hook command line, not
-typed by an operator.
+Always exits 0, but fails closed with a provider denial if the token file
+cannot be read, stdin is not valid bounded JSON, or the daemon is unreachable,
+errors, or is slow (5 second timeout). This command is generated for the
+provider; it is not an operator command.
 
 Required:
-  --token-file PATH        This session's private hook token file
-  <Event>                     One of: SessionStart, UserPromptSubmit,
-                               PreToolUse, PermissionRequest, PostToolUse,
-                               Notification, Stop, SubagentStop, SessionEnd
+  --token-file PATH        This attempt's private credential file
+  PreToolUse                 The sole supported authority hook
 
 Options:
   -h, --help                    Show this help";
@@ -732,7 +606,6 @@ const PROJECT_LIST_LIMIT: u32 = MAX_PROJECT_PAGE_ITEMS;
 const TASK_LIST_LIMIT: u32 = MAX_TASK_PAGE_ITEMS;
 const AGENT_LIST_LIMIT: u32 = MAX_AGENT_PAGE_ITEMS;
 const RUN_LIST_LIMIT: u32 = MAX_RUN_PAGE_ITEMS;
-const SESSION_LIST_LIMIT: u32 = MAX_SESSION_PAGE_ITEMS;
 /// Hard bound on `factoryctl hook`'s stdin payload, matching
 /// `LocalRequest::ProviderHook`'s documented 64 KiB payload limit
 /// (`factory-core/src/local.rs`).
@@ -814,13 +687,6 @@ enum CliCommand {
         project_id: String,
         task_id: String,
         agent_id: String,
-        parent_run_id: Option<String>,
-        worktree: String,
-    },
-    Attach {
-        project_id: String,
-        target: AttachTarget,
-        mode: TerminalAttachMode,
     },
     TaskRetry {
         project_id: String,
@@ -855,13 +721,9 @@ enum CliCommand {
         task_id: String,
     },
     TaskDone {
-        project_id: String,
-        task_id: String,
         result: String,
     },
     TaskBlocked {
-        project_id: String,
-        task_id: String,
         reason: String,
     },
     AgentAdd {
@@ -873,7 +735,6 @@ enum CliCommand {
         model: Option<String>,
         reasoning_effort: Option<String>,
         model_selection_reason: Option<String>,
-        worktree: Option<String>,
     },
     AgentList {
         project_id: String,
@@ -910,7 +771,6 @@ enum CliCommand {
     AgentMessage {
         id: Option<String>,
         project_id: String,
-        sender_agent_id: Option<String>,
         recipient_agent_id: String,
         body: String,
     },
@@ -932,23 +792,6 @@ enum CliCommand {
         project_id: String,
         agent_id: String,
     },
-    GitStatus,
-    GitDiff {
-        staged: bool,
-    },
-    GitCommit {
-        message: String,
-    },
-    GitPush,
-    PrOpen {
-        title: String,
-        body: String,
-    },
-    PrUpdate {
-        number: u64,
-        title: String,
-        body: String,
-    },
     RunList {
         project_id: String,
         after_id: Option<String>,
@@ -957,16 +800,6 @@ enum CliCommand {
     RunStop {
         project_id: String,
         run_id: String,
-        grace_ms: u64,
-    },
-    SessionList {
-        project_id: String,
-        after_id: Option<String>,
-        limit: u32,
-    },
-    SessionStop {
-        project_id: String,
-        session_id: String,
         grace_ms: u64,
     },
     Hook {
@@ -1025,7 +858,7 @@ fn run() -> Result<i32, String> {
         let previous = capacity::status_from_environment()?.configured;
         let requested = capacity::validate(*value)?;
         eprintln!(
-            "capacity: {previous} -> {requested} live sessions; launchd will restart only factoryd, preserving live runner processes and session state; higher values can increase concurrent provider/subscription use, lower values leave work queued"
+            "capacity: {previous} -> {requested} active attempts; launchd will restart only factoryd, preserving live runner processes and attempt state; higher values can increase concurrent provider/subscription use, lower values leave work queued"
         );
         let change = capacity::set_from_environment(&socket, *value)?;
         println!("{}", capacity_result(&change));
@@ -1040,15 +873,27 @@ fn run() -> Result<i32, String> {
     if let CliCommand::Doctor { json } = command {
         return doctor::run(&doctor::Options { json }, &socket);
     }
-    let client = Client::new(socket);
-    if let CliCommand::Attach {
-        project_id,
-        target,
-        mode,
-    } = command
-    {
-        return attach::run(&client, &project_id, &target, mode);
-    }
+    let attempt_scoped = command_requires_attempt_credential(&command);
+    let ambient_attempt = if env::var_os(ATTEMPT_TOKEN_FILE_ENV).is_some() {
+        Some(attempt_credential()?)
+    } else if attempt_scoped {
+        return Err(format!(
+            "{ATTEMPT_TOKEN_FILE_ENV} is required; this command only works inside an attempt"
+        ));
+    } else {
+        None
+    };
+    let client = if matches!(&command, CliCommand::Health | CliCommand::Hook { .. }) {
+        Client::new(socket)
+    } else if let Some(credential) = ambient_attempt {
+        // A provider cannot accidentally cross into operator authority by
+        // invoking an operator-shaped command. The daemon will evaluate the
+        // request against this exact attempt and reject it if unauthorized.
+        Client::authenticated(socket, credential)
+    } else {
+        let resolved_factory_home = resolve_factory_home(factory_home.as_deref(), home.as_deref())?;
+        Client::authenticated(socket, operator_credential(&resolved_factory_home)?)
+    };
     if let CliCommand::Hook { token_file, event } = command {
         return Ok(run_hook(&client, &token_file, event));
     }
@@ -1091,9 +936,6 @@ fn run() -> Result<i32, String> {
 
     let human_status = matches!(&command, CliCommand::Status { json: false });
     let request = request_for(command)?;
-    if is_outboxable(&request) {
-        return run_outboxable(&client, request, &mut output);
-    }
     let frame = client.request(request).map_err(|error| error.to_string())?;
     if human_status {
         match &frame {
@@ -1133,108 +975,26 @@ fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
         "previous": change.previous,
         "capacity": change.current,
         "launchd": "reloaded",
-        "live_sessions_preserved": true,
+        "active_attempts_preserved": true,
     })
 }
 
-/// The agent-facing mutations a session's own `factoryctl` calls make on
-/// itself -- `task done`, `task blocked`, `agent message` -- are the only
-/// commands that fall back to the file outbox (`outbox` module) when the
-/// daemon socket can't be reached. Every other command fails exactly as it
-/// always has: silently papering over an unreachable daemon for, say,
-/// `project add` would just hide a real operator-facing failure behind a
-/// misleading "queued" message nothing is ever going to deliver from an
-/// operator's own shell.
-fn is_outboxable(request: &LocalRequest) -> bool {
+fn command_requires_attempt_credential(command: &CliCommand) -> bool {
     matches!(
-        request,
-        LocalRequest::CompleteTask { .. }
-            | LocalRequest::BlockTask { .. }
-            | LocalRequest::SendAgentMessage { .. }
+        command,
+        CliCommand::TaskDone { .. } | CliCommand::TaskBlocked { .. }
     )
 }
 
-/// Sends one outbox-eligible request, falling back to `outbox::queue` on a
-/// connect/send failure (or unconditionally when `DARK_FACTORY_FORCE_OUTBOX`
-/// is set, so a test can exercise the fallback without breaking the socket
-/// itself). See the `outbox` module and `docs/providers.md`'s "Sandboxed
-/// providers: the outbox".
-///
-/// When `$DARK_FACTORY_AGENT_DIR` is unset, this behaves exactly as it did
-/// before the outbox existed: a connect failure surfaces its original
-/// error, and (the only way to reach this without ever attempting the
-/// daemon) forcing the outbox with no agent directory to queue into is
-/// reported explicitly rather than silently doing nothing.
-fn run_outboxable(
-    client: &Client,
-    request: LocalRequest,
-    output: &mut impl Write,
-) -> Result<i32, String> {
-    let force_outbox = env::var(FORCE_OUTBOX_ENV).ok().as_deref() == Some("1");
-    if !force_outbox {
-        match client.request(request.clone()) {
-            Ok(frame) => {
-                write_frame(output, &frame)?;
-                return Ok(if is_error(&frame) { 2 } else { 0 });
-            }
-            Err(error) => {
-                return match env::var(AGENT_DIR_ENV) {
-                    Ok(agent_dir) => queue_to_outbox(&agent_dir, request, output),
-                    Err(_) => Err(error.to_string()),
-                };
-            }
-        }
-    }
-    match env::var(AGENT_DIR_ENV) {
-        Ok(agent_dir) => queue_to_outbox(&agent_dir, request, output),
-        Err(_) => Err(format!(
-            "{FORCE_OUTBOX_ENV} is set but {AGENT_DIR_ENV} is not; nowhere to queue the request"
-        )),
-    }
-}
-
-fn queue_to_outbox(
-    agent_dir: &str,
-    request: LocalRequest,
-    output: &mut impl Write,
-) -> Result<i32, String> {
-    let agent_dir = PathBuf::from(agent_dir);
-    let path = outbox::queue(&agent_dir, &request).map_err(|error| error.to_string())?;
-    let relative = path.strip_prefix(&agent_dir).unwrap_or(path.as_path());
-    writeln!(
-        output,
-        "queued: {} (delivered on the next hook)",
-        relative.display()
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(0)
-}
-
-/// Executes `factoryctl hook`: forwards one provider hook payload to the
-/// daemon and prints its `reply` JSON verbatim. Lifecycle hooks fail open so
-/// they cannot wedge a provider; `PreToolUse` fails closed because losing
-/// the daemon must not silently remove the auto-mode policy gate.
-///
-/// Before sending the hook itself, drains `$DARK_FACTORY_AGENT_DIR/outbox/`
-/// (a no-op when the variable is unset or the directory doesn't exist) —
-/// see the `outbox` module and `docs/providers.md`'s "Sandboxed providers:
-/// the outbox". This runs on every hook event, not just `Stop`, so a
-/// queued request is carried at the very next opportunity rather than
-/// waiting specifically for the end of a turn.
+/// Executes the sole authority hook. Losing the daemon must not silently
+/// remove the attempt policy gate, so every local failure denies the tool.
 fn run_hook(client: &Client, token_file: &str, event: ProviderHookEvent) -> i32 {
-    if let Ok(agent_dir) = env::var(AGENT_DIR_ENV) {
-        outbox::drain(client, Path::new(&agent_dir));
-    }
     let reply = hook_reply(client, token_file, event).unwrap_or_else(|| {
-        if event == ProviderHookEvent::PreToolUse {
-            serde_json::json!({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "Dark Factory policy unavailable"
-            }})
-        } else {
-            serde_json::json!({})
-        }
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Dark Factory policy unavailable"
+        }})
     });
     println!("{reply}");
     0
@@ -1245,19 +1005,12 @@ fn hook_reply(
     token_file: &str,
     event: ProviderHookEvent,
 ) -> Option<serde_json::Value> {
-    let token = std::fs::read_to_string(token_file).ok()?;
-    let token = token.trim().to_owned();
-    if token.is_empty() {
-        return None;
-    }
+    let credential = credential_from_file(token_file).ok()?;
     let payload = read_bounded_stdin_json(HOOK_PAYLOAD_LIMIT_BYTES)?;
     let frame = client
-        .request_with_timeout(
-            LocalRequest::ProviderHook {
-                token,
-                event,
-                payload,
-            },
+        .request_with_timeout_authenticated(
+            LocalRequest::ProviderHook { event, payload },
+            credential,
             HOOK_REQUEST_TIMEOUT,
         )
         .ok()?;
@@ -1506,17 +1259,8 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         }
         "project" => parse_project(args).map(|command| (socket, command)),
         "task" => parse_task(args).map(|command| (socket, command)),
-        "attach" => {
-            if wants_help(&args) {
-                return Ok((socket, CliCommand::Help(ATTACH_HELP)));
-            }
-            parse_attach(args).map(|command| (socket, command))
-        }
         "agent" => parse_agent(args).map(|command| (socket, command)),
-        "git" => parse_git(args).map(|command| (socket, command)),
-        "pr" => parse_pr(args).map(|command| (socket, command)),
         "run" => parse_run(args).map(|command| (socket, command)),
-        "session" => parse_session(args).map(|command| (socket, command)),
         "hook" => {
             if wants_help(&args) {
                 return Ok((socket, CliCommand::Help(HOOK_HELP)));
@@ -1525,75 +1269,6 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
         }
         "events" => events::parse(args).map(|command| (socket, command)),
         _ => Err(format!("unknown command {command:?}; {USAGE}")),
-    }
-}
-
-fn parse_git(mut args: Vec<String>) -> Result<CliCommand, String> {
-    if args.is_empty() || is_help_flag(&args[0]) {
-        return Ok(CliCommand::Help(GIT_HELP));
-    }
-    let action = take_action(&mut args, "git")?;
-    if wants_help(&args) {
-        return Ok(CliCommand::Help(GIT_HELP));
-    }
-    match action.as_str() {
-        "status" => {
-            require_empty(&args)?;
-            Ok(CliCommand::GitStatus)
-        }
-        "diff" => {
-            let staged = take_flag(&mut args, "--staged")?;
-            require_empty(&args)?;
-            Ok(CliCommand::GitDiff { staged })
-        }
-        "commit" => {
-            let message = required_option(&mut args, "--message")?;
-            require_empty(&args)?;
-            Ok(CliCommand::GitCommit { message })
-        }
-        "push" => {
-            require_empty(&args)?;
-            Ok(CliCommand::GitPush)
-        }
-        _ => Err(format!("unknown git action {action:?}")),
-    }
-}
-
-fn parse_pr(mut args: Vec<String>) -> Result<CliCommand, String> {
-    if args.is_empty() || is_help_flag(&args[0]) {
-        return Ok(CliCommand::Help(PR_HELP));
-    }
-    let action = take_action(&mut args, "pr")?;
-    if wants_help(&args) {
-        return Ok(CliCommand::Help(PR_HELP));
-    }
-    let title = required_option(&mut args, "--title")?;
-    let body = take_option(&mut args, "--body")?;
-    let body_file = take_option(&mut args, "--body-file")?;
-    let body = match (body, body_file) {
-        (Some(body), None) => body,
-        (None, Some(path)) => read_guidance_file(&path)?,
-        (Some(_), Some(_)) => return Err("--body and --body-file are mutually exclusive".into()),
-        (None, None) => return Err("--body or --body-file is required".into()),
-    };
-    match action.as_str() {
-        "open" => {
-            require_empty(&args)?;
-            Ok(CliCommand::PrOpen { title, body })
-        }
-        "update" => {
-            let number = parse_number(&required_option(&mut args, "--number")?, "--number")?;
-            if number == 0 {
-                return Err("--number must be positive".into());
-            }
-            require_empty(&args)?;
-            Ok(CliCommand::PrUpdate {
-                number,
-                title,
-                body,
-            })
-        }
-        _ => Err(format!("unknown pr action {action:?}")),
     }
 }
 
@@ -1759,15 +1434,11 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             let project_id = required_project(&mut args)?;
             let task_id = required_option(&mut args, "--task")?;
             let agent_id = required_option(&mut args, "--agent")?;
-            let parent_run_id = take_option(&mut args, "--parent-run")?;
-            let worktree = required_option(&mut args, "--worktree")?;
             require_empty(&args)?;
             Ok(CliCommand::TaskStart {
                 project_id,
                 task_id,
                 agent_id,
-                parent_run_id,
-                worktree,
             })
         }
         "retry" => {
@@ -1847,8 +1518,6 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             })
         }
         "done" => {
-            let project_id = required_project(&mut args)?;
-            let task_id = required_option(&mut args, "--task")?;
             let result = take_option(&mut args, "--result")?;
             let result_file = take_option(&mut args, "--result-file")?;
             let result = match (result, result_file) {
@@ -1860,115 +1529,14 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 (None, None) => return Err("task done requires --result or --result-file".into()),
             };
             require_empty(&args)?;
-            Ok(CliCommand::TaskDone {
-                project_id,
-                task_id,
-                result,
-            })
+            Ok(CliCommand::TaskDone { result })
         }
         "blocked" => {
-            let project_id = required_project(&mut args)?;
-            let task_id = required_option(&mut args, "--task")?;
             let reason = required_option(&mut args, "--reason")?;
             require_empty(&args)?;
-            Ok(CliCommand::TaskBlocked {
-                project_id,
-                task_id,
-                reason,
-            })
+            Ok(CliCommand::TaskBlocked { reason })
         }
         _ => Err(format!("unknown task action {action:?}")),
-    }
-}
-
-fn parse_attach(mut args: Vec<String>) -> Result<CliCommand, String> {
-    let project_id = required_project(&mut args)?;
-    // `--run` is a deprecated alias kept during the transition to resident
-    // sessions (a session's id is currently its run's id; see
-    // `local_api.rs`'s `resolve_transitional_run_id`).
-    let session = take_option(&mut args, "--session")?;
-    let run = take_option(&mut args, "--run")?;
-    let agent = take_option(&mut args, "--agent")?;
-    let target = match (session, run, agent) {
-        (Some(session_id), None, None) => AttachTarget::Session(session_id),
-        (None, Some(run_id), None) => AttachTarget::Session(run_id),
-        (None, None, Some(agent_id)) => AttachTarget::Agent(agent_id),
-        (None, None, None) => return Err("--session or --agent is required".into()),
-        _ => return Err("--session, --run, and --agent may not be combined".into()),
-    };
-    let since_offset = take_option(&mut args, "--since-offset")?
-        .map(|value| parse_number(&value, "--since-offset"))
-        .transpose()?;
-    let generation = take_option(&mut args, "--generation")?
-        .map(|value| parse_number(&value, "--generation"))
-        .transpose()?;
-    let full_history = take_flag(&mut args, "--full-history")?;
-    if full_history && (since_offset.is_some() || generation.is_some()) {
-        return Err(
-            "--full-history may not be combined with --since-offset or --generation".into(),
-        );
-    }
-    if generation.is_some() && since_offset.is_none() {
-        return Err("--generation requires --since-offset".into());
-    }
-    let mode = if full_history {
-        TerminalAttachMode::FullHistory
-    } else if let Some(offset) = since_offset {
-        if offset == 0 && generation.is_none() {
-            TerminalAttachMode::FullHistory
-        } else {
-            TerminalAttachMode::Offset { generation, offset }
-        }
-    } else {
-        TerminalAttachMode::Tail
-    };
-    require_empty(&args)?;
-    Ok(CliCommand::Attach {
-        project_id,
-        target,
-        mode,
-    })
-}
-
-fn parse_session(mut args: Vec<String>) -> Result<CliCommand, String> {
-    if args.is_empty() || is_help_flag(&args[0]) {
-        return Ok(CliCommand::Help(SESSION_HELP));
-    }
-    let action = take_action(&mut args, "session")?;
-    if wants_help(&args) {
-        return Ok(CliCommand::Help(match action.as_str() {
-            "list" => SESSION_LIST_HELP,
-            "stop" => SESSION_STOP_HELP,
-            _ => SESSION_HELP,
-        }));
-    }
-    match action.as_str() {
-        "list" => {
-            let project_id = required_project(&mut args)?;
-            let after_id = take_option(&mut args, "--after")?;
-            let (limit, _) = take_limit(&mut args, SESSION_LIST_LIMIT, MAX_SESSION_PAGE_ITEMS)?;
-            require_empty(&args)?;
-            Ok(CliCommand::SessionList {
-                project_id,
-                after_id,
-                limit,
-            })
-        }
-        "stop" => {
-            let project_id = required_project(&mut args)?;
-            let session_id = required_option(&mut args, "--session")?;
-            let grace_ms = take_option(&mut args, "--grace-ms")?
-                .map(|value| parse_number(&value, "--grace-ms"))
-                .transpose()?
-                .unwrap_or(0u64);
-            require_empty(&args)?;
-            Ok(CliCommand::SessionStop {
-                project_id,
-                session_id,
-                grace_ms,
-            })
-        }
-        _ => Err(format!("unknown session action {action:?}")),
     }
 }
 
@@ -2024,7 +1592,6 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
             let model = take_option(&mut args, "--model")?;
             let reasoning_effort = take_option(&mut args, "--reasoning-effort")?;
             let model_selection_reason = take_option(&mut args, "--model-reason")?;
-            let worktree = take_option(&mut args, "--worktree")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentAdd {
                 id,
@@ -2035,7 +1602,6 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
                 model,
                 reasoning_effort,
                 model_selection_reason,
-                worktree,
             })
         }
         "list" => {
@@ -2139,14 +1705,12 @@ fn parse_agent(mut args: Vec<String>) -> Result<CliCommand, String> {
         "message" => {
             let id = take_option(&mut args, "--id")?;
             let project_id = required_project(&mut args)?;
-            let sender_agent_id = take_option_or_env(&mut args, "--from", "DARK_FACTORY_AGENT")?;
             let recipient_agent_id = required_option(&mut args, "--to")?;
             let body = required_option(&mut args, "--body")?;
             require_empty(&args)?;
             Ok(CliCommand::AgentMessage {
                 id,
                 project_id,
-                sender_agent_id,
                 recipient_agent_id,
                 body,
             })
@@ -2335,18 +1899,11 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id,
             task_id,
             agent_id,
-            parent_run_id,
-            worktree,
         } => Ok(LocalRequest::StartTask {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
             agent_id: parse_id(agent_id, "agent")?,
-            parent_run_id: parent_run_id
-                .map(|id| parse_id(id, "parent run"))
-                .transpose()?,
-            worktree: Some(worktree),
         }),
-        CliCommand::Attach { .. } => Err("attach is handled before local requests".into()),
         CliCommand::TaskRetry {
             project_id,
             task_id,
@@ -2407,24 +1964,8 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             task_id: parse_id(task_id, "task")?,
         }),
-        CliCommand::TaskDone {
-            project_id,
-            task_id,
-            result,
-        } => Ok(LocalRequest::CompleteTask {
-            project_id: parse_id(project_id, "project")?,
-            task_id: parse_id(task_id, "task")?,
-            result,
-        }),
-        CliCommand::TaskBlocked {
-            project_id,
-            task_id,
-            reason,
-        } => Ok(LocalRequest::BlockTask {
-            project_id: parse_id(project_id, "project")?,
-            task_id: parse_id(task_id, "task")?,
-            reason,
-        }),
+        CliCommand::TaskDone { result } => Ok(LocalRequest::CompleteAttempt { result }),
+        CliCommand::TaskBlocked { reason } => Ok(LocalRequest::BlockAttempt { reason }),
         CliCommand::AgentAdd {
             id,
             project_id,
@@ -2434,7 +1975,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             model,
             reasoning_effort,
             model_selection_reason,
-            worktree,
         } => Ok(LocalRequest::CreateAgent {
             id: id
                 .map(|id| parse_id(id, "agent"))
@@ -2449,7 +1989,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             model,
             reasoning_effort,
             model_selection_reason,
-            worktree,
         }),
         CliCommand::AgentList {
             project_id,
@@ -2498,7 +2037,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::AgentMessage {
             id,
             project_id,
-            sender_agent_id,
             recipient_agent_id,
             body,
         } => Ok(LocalRequest::SendAgentMessage {
@@ -2507,9 +2045,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 .transpose()?
                 .unwrap_or(generated_id()?),
             project_id: parse_id(project_id, "project")?,
-            sender_agent_id: sender_agent_id
-                .map(|id| parse_id(id, "sender agent"))
-                .transpose()?,
             recipient_agent_id: parse_id(recipient_agent_id, "recipient agent")?,
             body,
         }),
@@ -2547,35 +2082,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id: parse_id(project_id, "project")?,
             agent_id: parse_id(agent_id, "agent")?,
         }),
-        CliCommand::GitStatus => Ok(LocalRequest::GitStatus {
-            token: session_token()?,
-        }),
-        CliCommand::GitDiff { staged } => Ok(LocalRequest::GitDiff {
-            token: session_token()?,
-            staged,
-        }),
-        CliCommand::GitCommit { message } => Ok(LocalRequest::GitCommit {
-            token: session_token()?,
-            message,
-        }),
-        CliCommand::GitPush => Ok(LocalRequest::GitPush {
-            token: session_token()?,
-        }),
-        CliCommand::PrOpen { title, body } => Ok(LocalRequest::PrOpen {
-            token: session_token()?,
-            title,
-            body,
-        }),
-        CliCommand::PrUpdate {
-            number,
-            title,
-            body,
-        } => Ok(LocalRequest::PrUpdate {
-            token: session_token()?,
-            number,
-            title,
-            body,
-        }),
         CliCommand::RunList {
             project_id,
             after_id,
@@ -2589,29 +2095,9 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
             project_id,
             run_id,
             grace_ms,
-        } => Ok(LocalRequest::StopRun {
+        } => Ok(LocalRequest::CancelRun {
             project_id: parse_id(project_id, "project")?,
             run_id: parse_id(run_id, "run")?,
-            grace_ms,
-        }),
-        CliCommand::SessionList {
-            project_id,
-            after_id,
-            limit,
-        } => Ok(LocalRequest::ListSessions {
-            project_id: parse_id(project_id, "project")?,
-            after_id: after_id
-                .map(|id| parse_id(id, "session cursor"))
-                .transpose()?,
-            limit: Some(usize::try_from(limit).unwrap_or(usize::MAX)),
-        }),
-        CliCommand::SessionStop {
-            project_id,
-            session_id,
-            grace_ms,
-        } => Ok(LocalRequest::StopSession {
-            project_id: parse_id(project_id, "project")?,
-            session_id: parse_id(session_id, "session")?,
             grace_ms,
         }),
         CliCommand::Hook { .. } => Err("hook is handled before local requests".into()),
@@ -2619,17 +2105,27 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
     }
 }
 
-fn session_token() -> Result<String, String> {
-    let path = env::var(SESSION_TOKEN_FILE_ENV).map_err(|_| {
-        format!("{SESSION_TOKEN_FILE_ENV} is required; this command only works inside a session")
+fn attempt_credential() -> Result<RequestCredential, String> {
+    let path = env::var(ATTEMPT_TOKEN_FILE_ENV).map_err(|_| {
+        format!("{ATTEMPT_TOKEN_FILE_ENV} is required; this command only works inside an attempt")
     })?;
-    let token = std::fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read session token file: {error}"))?;
+    credential_from_file(&path)
+}
+
+fn credential_from_file(path: &str) -> Result<RequestCredential, String> {
+    let token = std::fs::read_to_string(path)
+        .map_err(|error| format!("cannot read attempt credential file: {error}"))?;
     let token = token.trim().to_owned();
-    if token.is_empty() {
-        return Err("session token file is empty".into());
-    }
-    Ok(token)
+    RequestCredential::new(token).map_err(str::to_owned)
+}
+
+fn operator_credential(factory_home: &std::path::Path) -> Result<RequestCredential, String> {
+    credential_from_file(
+        factory_home
+            .join("operator.token")
+            .to_str()
+            .ok_or("operator credential path is not valid UTF-8")?,
+    )
 }
 
 fn generated_id<T>() -> Result<T, String>
@@ -2668,6 +2164,15 @@ fn resolve_socket_path(
         .ok_or_else(|| "no socket configured and HOME is unavailable".into())
 }
 
+fn resolve_factory_home(factory_home: Option<&str>, home: Option<&str>) -> Result<PathBuf, String> {
+    if let Some(path) = factory_home.filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(path));
+    }
+    home.filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path).join(".dark-factory"))
+        .ok_or_else(|| "DARK_FACTORY_HOME and HOME are unavailable".into())
+}
+
 fn take_action(args: &mut Vec<String>, command: &str) -> Result<String, String> {
     if args.is_empty() {
         Err(format!("{command} requires an action"))
@@ -2681,7 +2186,7 @@ fn required_option(args: &mut Vec<String>, name: &str) -> Result<String, String>
 }
 
 /// `--project`, falling back to `$DARK_FACTORY_PROJECT` when the flag is
-/// absent (so a command run from inside a session's own environment does
+/// absent (so a command run from inside an attempt's own environment does
 /// not have to repeat `--project` the daemon already told it). Behavior for
 /// every existing call is unchanged unless that environment variable is
 /// set: the flag still wins when both are present.
@@ -2793,51 +2298,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn repository_commands_expose_no_target_or_force_selectors() {
-        let (_, command) = parse_args(vec![
-            "git".into(),
-            "commit".into(),
-            "--message".into(),
-            "small fix".into(),
-        ])
-        .unwrap();
-        assert!(matches!(command, CliCommand::GitCommit { ref message } if message == "small fix"));
-
-        let (_, command) = parse_args(vec![
-            "pr".into(),
-            "update".into(),
-            "--number".into(),
-            "7".into(),
-            "--title".into(),
-            "Revised".into(),
-            "--body".into(),
-            "Details".into(),
-        ])
-        .unwrap();
-        assert!(matches!(command, CliCommand::PrUpdate { number: 7, .. }));
-
-        assert!(parse_args(vec!["git".into(), "push".into(), "--force".into()]).is_err());
-        assert!(
-            parse_args(vec![
-                "git".into(),
-                "push".into(),
-                "--branch".into(),
-                "main".into()
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_args(vec![
-                "pr".into(),
-                "open".into(),
-                "--repo".into(),
-                "other/repo".into()
-            ])
-            .is_err()
-        );
-    }
-
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
     }
@@ -2886,14 +2346,14 @@ mod tests {
     }
 
     #[test]
-    fn capacity_result_promises_live_session_preservation_in_the_cli_contract() {
+    fn capacity_result_promises_active_attempt_preservation_in_the_cli_contract() {
         let value = capacity_result(&capacity::CapacityChange {
             previous: 4,
             current: 8,
         });
         assert_eq!(value["previous"], 4);
         assert_eq!(value["capacity"], 8);
-        assert_eq!(value["live_sessions_preserved"], true);
+        assert_eq!(value["active_attempts_preserved"], true);
     }
 
     #[test]
@@ -3003,11 +2463,6 @@ mod tests {
             CliCommand::Help(events::HELP)
         );
         assert_eq!(
-            parse_args(args(&["attach", "--help"])).unwrap().1,
-            CliCommand::Help(ATTACH_HELP)
-        );
-
-        assert_eq!(
             parse_args(args(&["project"])).unwrap().1,
             CliCommand::Help(PROJECT_HELP)
         );
@@ -3089,9 +2544,9 @@ mod tests {
             );
         }
         assert!(PROJECT_REPOSITORY_HELP.contains("write-once"));
-        assert!(PROJECT_REPOSITORY_HELP.contains("no live sessions in any\nproject"));
-        assert!(TASK_ASSIGN_HELP.contains("wakes automatic delivery"));
-        assert!(TASK_ASSIGN_HELP.contains("may start its session"));
+        assert!(PROJECT_REPOSITORY_HELP.contains("no active attempts in any\nproject"));
+        assert!(TASK_ASSIGN_HELP.contains("wakes automatic admission"));
+        assert!(TASK_ASSIGN_HELP.contains("may start an attempt"));
         assert!(!TASK_ASSIGN_HELP.contains("without starting"));
 
         assert_eq!(
@@ -3132,18 +2587,6 @@ mod tests {
                 parse_args(args(&["run", action, "--help"])).unwrap().1,
                 CliCommand::Help(expected),
                 "run {action} --help"
-            );
-        }
-
-        assert_eq!(
-            parse_args(args(&["session"])).unwrap().1,
-            CliCommand::Help(SESSION_HELP)
-        );
-        for (action, expected) in [("list", SESSION_LIST_HELP), ("stop", SESSION_STOP_HELP)] {
-            assert_eq!(
-                parse_args(args(&["session", action, "--help"])).unwrap().1,
-                CliCommand::Help(expected),
-                "session {action} --help"
             );
         }
 
@@ -3264,36 +2707,8 @@ mod tests {
                     model: Some("gpt-5-codex".into()),
                     reasoning_effort: None,
                     model_selection_reason: None,
-                    worktree: None,
                 }
             )
-        );
-        assert_eq!(
-            parse_args(args(&[
-                "agent",
-                "add",
-                "--project",
-                "project-1",
-                "--role",
-                "worker",
-                "--provider",
-                "shell",
-                "--worktree",
-                "/abs/worktree",
-            ]))
-            .unwrap()
-            .1,
-            CliCommand::AgentAdd {
-                id: None,
-                project_id: "project-1".into(),
-                parent_agent_id: None,
-                role: AgentRole::Worker,
-                provider: Provider::Shell,
-                model: None,
-                reasoning_effort: None,
-                model_selection_reason: None,
-                worktree: Some("/abs/worktree".into()),
-            }
         );
         assert_eq!(
             parse_args(args(&[
@@ -3305,10 +2720,6 @@ mod tests {
                 "task-1",
                 "--agent",
                 "agent-1",
-                "--worktree",
-                "/work/agent-1",
-                "--parent-run",
-                "run-parent",
             ]))
             .unwrap(),
             (
@@ -3317,8 +2728,6 @@ mod tests {
                     project_id: "project-1".into(),
                     task_id: "task-1".into(),
                     agent_id: "agent-1".into(),
-                    parent_run_id: Some("run-parent".into()),
-                    worktree: "/work/agent-1".into(),
                 }
             )
         );
@@ -3422,177 +2831,6 @@ mod tests {
         assert!(STATUS_HELP.contains("A concise human summary"));
         assert!(STATUS_HELP.contains("--json"));
         assert!(!STATUS_HELP.contains("One JSON frame"));
-    }
-
-    #[test]
-    fn attach_defaults_to_a_bounded_tail_and_supports_explicit_history_or_cursor() {
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1"
-            ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::Attach {
-                    project_id: "project-1".into(),
-                    target: AttachTarget::Session("session-1".into()),
-                    mode: TerminalAttachMode::Tail,
-                }
-            )
-        );
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--full-history",
-            ]))
-            .unwrap()
-            .1,
-            CliCommand::Attach {
-                project_id: "project-1".into(),
-                target: AttachTarget::Session("session-1".into()),
-                mode: TerminalAttachMode::FullHistory,
-            }
-        );
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--since-offset",
-                "0",
-            ]))
-            .unwrap()
-            .1,
-            CliCommand::Attach {
-                project_id: "project-1".into(),
-                target: AttachTarget::Session("session-1".into()),
-                mode: TerminalAttachMode::FullHistory,
-            }
-        );
-        assert!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--full-history",
-                "--since-offset",
-                "4",
-            ]))
-            .is_err()
-        );
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--since-offset",
-                "4096",
-            ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::Attach {
-                    project_id: "project-1".into(),
-                    target: AttachTarget::Session("session-1".into()),
-                    mode: TerminalAttachMode::Offset {
-                        generation: None,
-                        offset: 4096
-                    },
-                }
-            )
-        );
-        assert!(parse_args(args(&["attach", "--project", "project-1"])).is_err());
-        assert!(
-            request_for(CliCommand::Attach {
-                project_id: "project-1".into(),
-                target: AttachTarget::Session("session-1".into()),
-                mode: TerminalAttachMode::Tail,
-            })
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn attach_resolves_agent_as_an_alternative_target_to_session() {
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--agent",
-                "agent-1"
-            ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::Attach {
-                    project_id: "project-1".into(),
-                    target: AttachTarget::Agent("agent-1".into()),
-                    mode: TerminalAttachMode::Tail,
-                }
-            )
-        );
-        assert!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--agent",
-                "agent-1"
-            ]))
-            .is_err()
-        );
-        assert!(parse_args(args(&["attach", "--project", "project-1"])).is_err());
-    }
-
-    #[test]
-    fn attach_accepts_run_as_a_deprecated_alias_for_session() {
-        assert_eq!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--run",
-                "run-1"
-            ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::Attach {
-                    project_id: "project-1".into(),
-                    target: AttachTarget::Session("run-1".into()),
-                    mode: TerminalAttachMode::Tail,
-                }
-            )
-        );
-        assert!(
-            parse_args(args(&[
-                "attach",
-                "--project",
-                "project-1",
-                "--session",
-                "session-1",
-                "--run",
-                "run-1"
-            ]))
-            .is_err()
-        );
     }
 
     #[test]
@@ -3746,8 +2984,6 @@ mod tests {
             "message",
             "--project",
             "factory",
-            "--from",
-            "god",
             "--to",
             "worker",
             "--body",
@@ -3758,12 +2994,10 @@ mod tests {
         assert!(matches!(
             request,
             LocalRequest::SendAgentMessage {
-                sender_agent_id: Some(sender),
                 recipient_agent_id,
                 body,
                 ..
-            } if sender == "god".try_into().unwrap()
-                && recipient_agent_id == "worker".try_into().unwrap()
+            } if recipient_agent_id == "worker".try_into().unwrap()
                 && body == "Please report your result."
         ));
 
@@ -3793,7 +3027,6 @@ mod tests {
             model: None,
             reasoning_effort: None,
             model_selection_reason: None,
-            worktree: None,
         })
         .unwrap();
         let LocalRequest::CreateAgent { id, role, .. } = request else {
@@ -3806,8 +3039,6 @@ mod tests {
             project_id: "project-1".into(),
             task_id: "task-1".into(),
             agent_id: "agent-1".into(),
-            parent_run_id: None,
-            worktree: "/work/agent-1".into(),
         })
         .unwrap();
         assert!(matches!(request, LocalRequest::StartTask { .. }));
@@ -4126,7 +3357,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             request_for(command).unwrap(),
-            LocalRequest::StopRun {
+            LocalRequest::CancelRun {
                 project_id: "project-1".try_into().unwrap(),
                 run_id: "run-1".try_into().unwrap(),
                 grace_ms: 0,
@@ -4146,7 +3377,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             request_for(command).unwrap(),
-            LocalRequest::StopRun {
+            LocalRequest::CancelRun {
                 project_id: "project-1".try_into().unwrap(),
                 run_id: "run-1".try_into().unwrap(),
                 grace_ms: 2500,
@@ -4174,22 +3405,10 @@ mod tests {
 
     #[test]
     fn task_done_and_blocked_commands_parse_and_map_to_new_requests() {
-        let (_, command) = parse_args(args(&[
-            "task",
-            "done",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
-            "--result",
-            "all good",
-        ]))
-        .unwrap();
+        let (_, command) = parse_args(args(&["task", "done", "--result", "all good"])).unwrap();
         assert_eq!(
             request_for(command).unwrap(),
-            LocalRequest::CompleteTask {
-                project_id: "project-1".try_into().unwrap(),
-                task_id: "task-1".try_into().unwrap(),
+            LocalRequest::CompleteAttempt {
                 result: "all good".into(),
             }
         );
@@ -4199,19 +3418,13 @@ mod tests {
         let (_, command) = parse_args(args(&[
             "task",
             "done",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
             "--result-file",
             file.path().to_str().unwrap(),
         ]))
         .unwrap();
         assert_eq!(
             request_for(command).unwrap(),
-            LocalRequest::CompleteTask {
-                project_id: "project-1".try_into().unwrap(),
-                task_id: "task-1".try_into().unwrap(),
+            LocalRequest::CompleteAttempt {
                 result: "result from a file\n".into(),
             }
         );
@@ -4219,10 +3432,6 @@ mod tests {
         let error = parse_args(args(&[
             "task",
             "done",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
             "--result",
             "a",
             "--result-file",
@@ -4231,33 +3440,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "--result and --result-file may not both be provided");
 
-        let error = parse_args(args(&[
-            "task",
-            "done",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
-        ]))
-        .unwrap_err();
+        let error = parse_args(args(&["task", "done"])).unwrap_err();
         assert_eq!(error, "task done requires --result or --result-file");
 
-        let (_, command) = parse_args(args(&[
-            "task",
-            "blocked",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
-            "--reason",
-            "waiting on review",
-        ]))
-        .unwrap();
+        let (_, command) =
+            parse_args(args(&["task", "blocked", "--reason", "waiting on review"])).unwrap();
         assert_eq!(
             request_for(command).unwrap(),
-            LocalRequest::BlockTask {
-                project_id: "project-1".try_into().unwrap(),
-                task_id: "task-1".try_into().unwrap(),
+            LocalRequest::BlockAttempt {
                 reason: "waiting on review".into(),
             }
         );
@@ -4296,60 +3486,6 @@ mod tests {
             LocalRequest::ResumeAgent {
                 project_id: "project-1".try_into().unwrap(),
                 agent_id: "agent-1".try_into().unwrap(),
-            }
-        );
-    }
-
-    #[test]
-    fn session_list_and_stop_commands_parse_and_map_to_new_requests() {
-        let (_, command) =
-            parse_args(args(&["session", "list", "--project", "project-1"])).unwrap();
-        assert_eq!(
-            request_for(command).unwrap(),
-            LocalRequest::ListSessions {
-                project_id: "project-1".try_into().unwrap(),
-                after_id: None,
-                limit: Some(SESSION_LIST_LIMIT as usize),
-            }
-        );
-
-        let (_, command) = parse_args(args(&[
-            "session",
-            "list",
-            "--project",
-            "project-1",
-            "--after",
-            "session-1",
-            "--limit",
-            "5",
-        ]))
-        .unwrap();
-        assert_eq!(
-            request_for(command).unwrap(),
-            LocalRequest::ListSessions {
-                project_id: "project-1".try_into().unwrap(),
-                after_id: Some("session-1".try_into().unwrap()),
-                limit: Some(5),
-            }
-        );
-
-        let (_, command) = parse_args(args(&[
-            "session",
-            "stop",
-            "--project",
-            "project-1",
-            "--session",
-            "session-1",
-            "--grace-ms",
-            "1500",
-        ]))
-        .unwrap();
-        assert_eq!(
-            request_for(command).unwrap(),
-            LocalRequest::StopSession {
-                project_id: "project-1".try_into().unwrap(),
-                session_id: "session-1".try_into().unwrap(),
-                grace_ms: 1500,
             }
         );
     }
@@ -4415,20 +3551,29 @@ mod tests {
             "hook",
             "--token-file",
             "/runs/session-1/hook.token",
-            "SubagentStop",
+            "PreToolUse",
         ]))
         .unwrap();
         assert_eq!(
             command,
             CliCommand::Hook {
                 token_file: "/runs/session-1/hook.token".into(),
-                event: ProviderHookEvent::SubagentStop,
+                event: ProviderHookEvent::PreToolUse,
             }
         );
         assert_eq!(
             request_for(command).unwrap_err(),
             "hook is handled before local requests"
         );
+
+        let error = parse_args(args(&[
+            "hook",
+            "--token-file",
+            "/runs/session-1/hook.token",
+            "SubagentStop",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, "unknown hook event \"SubagentStop\"");
 
         let error = parse_args(args(&[
             "hook",

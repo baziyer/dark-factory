@@ -1,8 +1,8 @@
-//! Operator-owned live-session capacity.
+//! Operator-owned active-attempt capacity.
 //!
 //! Capacity is a launchd setting rather than a daemon request: changing it
-//! restarts only `factoryd`, while detached runner processes and their durable
-//! session rows remain in place. Keeping the operation here gives `factoryctl`
+//! restarts only `factoryd`, while runner processes and their durable run rows
+//! remain in place. Keeping the operation here gives `factoryctl`
 //! and `factory-tui` the same validation, launchd, health, and rollback path.
 
 use std::{
@@ -34,7 +34,7 @@ pub fn validate(value: usize) -> Result<usize, String> {
         Ok(value)
     } else {
         Err(format!(
-            "capacity must be between 1 and {MAX_MAX_ACTIVE_RUNS} live sessions"
+            "capacity must be between 1 and {MAX_MAX_ACTIVE_RUNS} active attempts"
         ))
     }
 }
@@ -86,7 +86,7 @@ pub fn status_for(
 
 /// Applies one capacity change. The setting is deliberately absent from the
 /// local daemon protocol; the daemon's explicit PreToolUse policy denies
-/// provider-session shell mutations before this operator-side service runs.
+/// attempt-scoped shell mutations before this operator-side service runs.
 pub fn set(
     home: &Path,
     user_home: &Path,

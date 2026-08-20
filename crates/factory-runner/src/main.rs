@@ -1,13 +1,16 @@
-use std::{env, io::Read, path::PathBuf, process};
-
-use factory_core::{
-    RunId, RunnerInstanceId,
-    runner::{MAX_STARTUP_STDIN_BYTES, TerminalSize},
+use std::{
+    env, fs, io::Read, os::unix::process::CommandExt as _, path::PathBuf, process, thread,
+    time::Duration,
 };
+
+use factory_core::{RunId, RunnerInstanceId, runner::MAX_STARTUP_STDIN_BYTES};
 use factory_runner::{Config, Error};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if exec_gate_requested(env::args().skip(1)) {
+        exec_gate(env::args().skip(2));
+    }
     if version_requested(env::args().skip(1)) {
         println!("factory-runner {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -20,6 +23,39 @@ async fn main() {
         eprintln!("factory-runner: {error}");
         process::exit(1);
     }
+}
+
+fn exec_gate_requested(mut arguments: impl Iterator<Item = String>) -> bool {
+    matches!(arguments.next().as_deref(), Some("--exec-gate"))
+}
+
+fn exec_gate(mut arguments: impl Iterator<Item = String>) -> ! {
+    let Some(gate_path) = arguments.next().map(PathBuf::from) else {
+        eprintln!("factory-runner exec gate: missing activation path");
+        process::exit(125);
+    };
+    if arguments.next().as_deref() != Some("--") {
+        eprintln!("factory-runner exec gate: missing separator");
+        process::exit(125);
+    }
+    let Some(program) = arguments.next() else {
+        eprintln!("factory-runner exec gate: missing provider program");
+        process::exit(125);
+    };
+    let parent = rustix::process::getppid();
+    while !gate_path.exists() {
+        if rustix::process::getppid() != parent {
+            process::exit(0);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if let Err(error) = fs::remove_file(&gate_path) {
+        eprintln!("factory-runner exec gate: activation could not be consumed: {error}");
+        process::exit(125);
+    }
+    let error = process::Command::new(program).args(arguments).exec();
+    eprintln!("factory-runner exec gate: provider exec failed: {error}");
+    process::exit(125);
 }
 
 fn version_requested(mut arguments: impl Iterator<Item = String>) -> bool {
@@ -50,8 +86,6 @@ fn parse_arguments() -> Result<Config, Error> {
     let mut runtime_dir = None;
     let mut cwd = None;
     let mut stdin_bytes = None;
-    let mut terminal_cols = None;
-    let mut terminal_rows = None;
     let mut program = None;
     let mut agent_arguments = Vec::new();
 
@@ -69,18 +103,6 @@ fn parse_arguments() -> Result<Config, Error> {
                 let value = required(&mut arguments, "--stdin-bytes")?;
                 stdin_bytes = Some(value.parse::<usize>().map_err(|_| {
                     Error::InvalidArguments("--stdin-bytes must be a non-negative integer".into())
-                })?);
-            }
-            "--terminal-cols" => {
-                let value = required(&mut arguments, "--terminal-cols")?;
-                terminal_cols = Some(value.parse::<u16>().map_err(|_| {
-                    Error::InvalidArguments("--terminal-cols must be a 16-bit integer".into())
-                })?);
-            }
-            "--terminal-rows" => {
-                let value = required(&mut arguments, "--terminal-rows")?;
-                terminal_rows = Some(value.parse::<u16>().map_err(|_| {
-                    Error::InvalidArguments("--terminal-rows must be a 16-bit integer".into())
                 })?);
             }
             "--" => {
@@ -104,15 +126,6 @@ fn parse_arguments() -> Result<Config, Error> {
     let runtime_dir = required_value(runtime_dir, "--runtime-dir")?;
     let cwd = required_value(cwd, "--cwd")?;
     let program = required_value(program, "agent program after --")?;
-    let terminal = match (terminal_cols, terminal_rows) {
-        (Some(cols), Some(rows)) => Some(TerminalSize { cols, rows }),
-        (None, None) => None,
-        _ => {
-            return Err(Error::InvalidArguments(
-                "--terminal-cols and --terminal-rows must be given together".into(),
-            ));
-        }
-    };
     let startup_input = read_startup_input(stdin_bytes)?;
     Ok(Config {
         run_id,
@@ -122,7 +135,7 @@ fn parse_arguments() -> Result<Config, Error> {
         startup_input,
         program,
         arguments: agent_arguments,
-        terminal,
+        exec_gate_program: env::current_exe().map_err(Error::Io)?,
     })
 }
 
@@ -164,7 +177,7 @@ fn required_value<T>(value: Option<T>, name: &str) -> Result<T, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::version_requested;
+    use super::{exec_gate_requested, version_requested};
 
     #[test]
     fn version_is_a_standalone_read_only_command() {
@@ -174,5 +187,11 @@ mod tests {
         assert!(!version_requested(
             ["--version".to_owned(), "extra".to_owned()].into_iter()
         ));
+    }
+
+    #[test]
+    fn exec_gate_is_a_distinct_internal_mode() {
+        assert!(exec_gate_requested(["--exec-gate".to_owned()].into_iter()));
+        assert!(!exec_gate_requested(["--version".to_owned()].into_iter()));
     }
 }

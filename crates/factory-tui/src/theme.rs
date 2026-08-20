@@ -27,9 +27,9 @@ pub struct Theme {
     pub queued: char,
     /// `░` — one cell of a workshop's free capacity.
     pub capacity: char,
-    /// `!` — badge for an agent/session waiting on human input.
+    /// `!` — badge for an attempt waiting on human input.
     pub needs_input: char,
-    /// `×` — badge for a failed agent/session/run.
+    /// `×` — badge for a failed attempt.
     pub failed: char,
     /// `✓` — badge shown on a completed task, never on the agent glyph itself.
     pub complete: char,

@@ -1,10 +1,10 @@
 use factory_core::{
-    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, RunId, RunnerInstanceId,
-    SessionId, TaskId, TaskStatus, local::MAX_TASK_BODY_BYTES,
+    AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, TaskId, TaskStatus,
+    local::MAX_TASK_BODY_BYTES,
 };
 use factoryd::store::{
-    ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewSession,
-    NewTask, Store, StoreError, UpdateAgentProfile,
+    ConnectorEventInput, ConnectorEventResult, NewAgent, NewAgentMessage, NewProject, NewTask,
+    Store, StoreError, UpdateAgentProfile,
 };
 use std::sync::{Arc, Barrier};
 
@@ -433,66 +433,6 @@ fn concurrent_tool_observations_cannot_cross_the_limit() {
     assert!(budget.exhausted);
 }
 
-/// Creates a live session for `agent` and opens a task-episode for `task`
-/// inside it, mirroring what the old `reserve_task_run` helper below used
-/// to do in one call. `seed` must be unique per call within a test (it
-/// seeds the session/runner identity).
-fn open_episode(
-    store: &mut Store,
-    project: &str,
-    task: &str,
-    agent: &str,
-    seed: &str,
-    now: i64,
-) -> RunId {
-    let session_id = SessionId::try_from(format!("session-{seed}")).unwrap();
-    store
-        .create_session(
-            NewSession {
-                id: session_id.clone(),
-                project_id: project_id(project),
-                agent_id: agent_id(agent),
-                provider: Provider::Codex,
-                runtime_model: None,
-                runtime_reasoning_effort: None,
-                runtime_permission_mode: None,
-                runtime_control_mode: None,
-                provider_session_id: None,
-                worktree: format!("/work/{project}"),
-                codex_home: None,
-                hook_token: "a".repeat(64),
-                runner_instance_id: RunnerInstanceId::try_from(format!("instance-{seed}")).unwrap(),
-                runner_runtime: format!("/private/runners/{seed}"),
-                runner_protocol_version: 1,
-            },
-            now,
-        )
-        .unwrap();
-    store
-        .assign_task(
-            &project_id(project),
-            &task_id(task),
-            Some(&agent_id(agent)),
-            now,
-        )
-        .unwrap();
-    store
-        .open_run_episode(&session_id, &task_id(task), now)
-        .unwrap()
-        .run
-        .id
-}
-
-/// Closes `seed`'s session as an unverifiable process exit -- the episode
-/// (if still open) closes `failed`/`process`, `closed_by = session_ended`,
-/// mirroring the old `fail_run_launch`/`fail_run_unverifiable` helpers'
-/// role in these tests: making a run terminal without revealing anything
-/// about *why*.
-fn end_episode(store: &mut Store, seed: &str, now: i64) {
-    let session_id = SessionId::try_from(format!("session-{seed}")).unwrap();
-    store.end_session(&session_id, None, None, now).unwrap();
-}
-
 #[test]
 fn project_task_and_events_survive_reopen() {
     let directory = tempfile::tempdir().unwrap();
@@ -751,89 +691,6 @@ fn list_pages_use_a_stable_id_cursor() {
         .unwrap()
         .0;
     assert_eq!(tasks[0].snapshot.id, task_id("task-c"));
-}
-
-#[test]
-fn failed_tasks_can_be_requeued_without_losing_assignment_or_history() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("factory.db");
-    let mut store = Store::open(&database).unwrap();
-    store
-        .create_project(
-            NewProject {
-                id: project_id("factory"),
-                name: "Factory".into(),
-                root: "/work/factory".into(),
-            },
-            1,
-        )
-        .unwrap();
-    store
-        .create_task(
-            NewTask {
-                id: task_id("task-1"),
-                project_id: project_id("factory"),
-                parent_task_id: None,
-                title: "Retry me".into(),
-                body: "Try again".into(),
-                priority: 0,
-            },
-            2,
-        )
-        .unwrap();
-    store
-        .create_agent(
-            NewAgent {
-                id: AgentId::try_from("god").unwrap(),
-                project_id: project_id("factory"),
-                parent_agent_id: None,
-                role: AgentRole::Orchestrator,
-                provider: Provider::Codex,
-            },
-            3,
-        )
-        .unwrap();
-    open_episode(&mut store, "factory", "task-1", "god", "run-1", 4);
-    end_episode(&mut store, "run-1", 5);
-
-    let (task, event) = store
-        .retry_task(&project_id("factory"), &task_id("task-1"), 6)
-        .unwrap();
-    assert_eq!(task.snapshot.status, TaskStatus::Queued);
-    assert_eq!(
-        task.snapshot.assigned_agent_id,
-        Some(AgentId::try_from("god").unwrap())
-    );
-    assert_eq!(task.result, None);
-    assert!(matches!(
-        event.event,
-        factory_core::FactoryEvent::TaskChanged { .. }
-    ));
-    let snapshot = store
-        .webhook_snapshot(
-            &project_id("factory"),
-            &AgentId::try_from("god").unwrap(),
-            7,
-        )
-        .unwrap();
-    assert_eq!(snapshot.tasks[0].started_at_ms, None);
-    assert_eq!(snapshot.tasks[0].completed_at_ms, None);
-    assert!(!store.events_after(0, 100).unwrap().is_empty());
-    drop(store);
-
-    let reopened = Store::open(&database).unwrap();
-    let snapshot = reopened
-        .webhook_snapshot(
-            &project_id("factory"),
-            &AgentId::try_from("god").unwrap(),
-            8,
-        )
-        .unwrap();
-    assert_eq!(
-        snapshot.tasks[0].status,
-        factoryd::store::OperationalTaskStatus::Todo
-    );
-    assert_eq!(snapshot.tasks[0].started_at_ms, None);
 }
 
 #[test]
@@ -1166,25 +1023,10 @@ fn cancel_task_moves_queued_or_blocked_to_cancelled_and_keeps_assignment() {
         .retry_task(&project_id("factory"), &task_id("task-1"), 7)
         .unwrap();
     assert_eq!(retried.snapshot.status, TaskStatus::Queued);
-
-    // A running task (an open episode) can also be cancelled: the episode
-    // closes `operator_cancel`, the task moves to `cancelled`, and the
-    // session is left untouched (D1/WIRE lifecycle recap).
-    open_episode(&mut store, "factory", "task-1", "curie", "run-1", 8);
-    let (cancelled, event) = store
-        .cancel_task(&project_id("factory"), &task_id("task-1"), 9)
-        .unwrap();
-    assert_eq!(cancelled.snapshot.status, TaskStatus::Cancelled);
-    assert!(matches!(event.event, FactoryEvent::TaskChanged { .. }));
-
-    assert!(matches!(
-        store.cancel_task(&project_id("factory"), &task_id("task-1"), 10),
-        Err(StoreError::TaskNotCancellable)
-    ));
 }
 
 #[test]
-fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
+fn update_task_edits_a_queued_task() {
     let mut store = Store::open_in_memory().unwrap();
     store
         .create_project(
@@ -1248,23 +1090,10 @@ fn update_task_edits_a_queued_task_and_rejects_a_running_one() {
         .unwrap();
     assert_eq!(updated.snapshot.title, "New title");
     assert_eq!(updated.body, "New body");
-
-    open_episode(&mut store, "factory", "task-1", "curie", "run-1", 6);
-    assert!(matches!(
-        store.update_task(
-            &project_id("factory"),
-            &task_id("task-1"),
-            Some("Too late".into()),
-            None,
-            None,
-            7,
-        ),
-        Err(StoreError::TaskNotEditable)
-    ));
 }
 
 #[test]
-fn delete_task_requires_no_active_run_and_no_subtasks() {
+fn delete_task_requires_no_subtasks() {
     let mut store = Store::open_in_memory().unwrap();
     store
         .create_project(
@@ -1332,15 +1161,8 @@ fn delete_task_requires_no_active_run_and_no_subtasks() {
             .all(|task| task.snapshot.id != task_id("child"))
     );
 
-    open_episode(&mut store, "factory", "parent", "curie", "run-1", 7);
-    assert!(matches!(
-        store.delete_task(&project_id("factory"), &task_id("parent"), 8),
-        Err(StoreError::TaskHasActiveRun)
-    ));
-
-    end_episode(&mut store, "run-1", 9);
     let event = store
-        .delete_task(&project_id("factory"), &task_id("parent"), 10)
+        .delete_task(&project_id("factory"), &task_id("parent"), 7)
         .unwrap();
     assert!(matches!(event.event, FactoryEvent::TaskDeleted { .. }));
     assert!(
@@ -1352,46 +1174,7 @@ fn delete_task_requires_no_active_run_and_no_subtasks() {
 }
 
 #[test]
-fn recreating_a_deleted_task_id_gets_a_new_immutable_incarnation() {
-    let mut store = Store::open_in_memory().unwrap();
-    store
-        .create_project(
-            NewProject {
-                id: project_id("factory"),
-                name: "Factory".into(),
-                root: "/work/factory".into(),
-            },
-            1,
-        )
-        .unwrap();
-    let create = |title: &str| NewTask {
-        id: task_id("task-1"),
-        project_id: project_id("factory"),
-        parent_task_id: None,
-        title: title.into(),
-        body: String::new(),
-        priority: 0,
-    };
-    store.create_task(create("Original"), 2).unwrap();
-    let original = store
-        .task_delivery_marker(&task_id("task-1"))
-        .unwrap()
-        .incarnation_id;
-
-    store
-        .delete_task(&project_id("factory"), &task_id("task-1"), 3)
-        .unwrap();
-    store.create_task(create("Replacement"), 4).unwrap();
-    let replacement = store
-        .task_delivery_marker(&task_id("task-1"))
-        .unwrap()
-        .incarnation_id;
-
-    assert_ne!(original, replacement);
-}
-
-#[test]
-fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
+fn delete_agent_requires_no_children_and_unassigns_its_tasks() {
     let mut store = Store::open_in_memory().unwrap();
     store
         .create_project(
@@ -1437,25 +1220,6 @@ fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
         )
         .unwrap();
 
-    open_episode(&mut store, "factory", "task-1", "curie", "run-1", 5);
-    assert!(matches!(
-        store.delete_agent(&project_id("factory"), &agent_id("curie"), 6),
-        Err(StoreError::AgentHasActiveRun)
-    ));
-
-    end_episode(&mut store, "run-1", 7);
-    store
-        .retry_task(&project_id("factory"), &task_id("task-1"), 8)
-        .unwrap();
-    store
-        .assign_task(
-            &project_id("factory"),
-            &task_id("task-1"),
-            Some(&agent_id("curie")),
-            9,
-        )
-        .unwrap();
-
     store
         .create_agent(
             NewAgent {
@@ -1465,19 +1229,19 @@ fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
                 role: AgentRole::Worker,
                 provider: Provider::Codex,
             },
-            10,
+            5,
         )
         .unwrap();
     assert!(matches!(
-        store.delete_agent(&project_id("factory"), &agent_id("curie"), 11),
+        store.delete_agent(&project_id("factory"), &agent_id("curie"), 6),
         Err(StoreError::AgentHasChildren)
     ));
     store
-        .delete_agent(&project_id("factory"), &agent_id("child-of-curie"), 12)
+        .delete_agent(&project_id("factory"), &agent_id("child-of-curie"), 7)
         .unwrap();
 
     let events = store
-        .delete_agent(&project_id("factory"), &agent_id("curie"), 13)
+        .delete_agent(&project_id("factory"), &agent_id("curie"), 8)
         .unwrap();
     assert!(
         events
@@ -1505,7 +1269,7 @@ fn delete_agent_requires_no_open_run_and_unassigns_its_tasks() {
 }
 
 #[test]
-fn delete_project_requires_no_active_run_and_cascades() {
+fn delete_project_cascades() {
     let mut store = Store::open_in_memory().unwrap();
     store
         .create_project(
@@ -1543,15 +1307,7 @@ fn delete_project_requires_no_active_run_and_cascades() {
         )
         .unwrap();
 
-    open_episode(&mut store, "factory", "task-1", "curie", "run-1", 4);
-    assert!(matches!(
-        store.delete_project(&project_id("factory"), 5),
-        Err(StoreError::ProjectHasActiveRun)
-    ));
-
-    end_episode(&mut store, "run-1", 6);
-
-    let event = store.delete_project(&project_id("factory"), 7).unwrap();
+    let event = store.delete_project(&project_id("factory"), 4).unwrap();
     assert!(matches!(event.event, FactoryEvent::ProjectDeleted { .. }));
     assert!(
         store
@@ -1574,7 +1330,7 @@ fn delete_project_requires_no_active_run_and_cascades() {
     );
 
     assert!(matches!(
-        store.delete_project(&project_id("factory"), 8),
+        store.delete_project(&project_id("factory"), 5),
         Err(StoreError::ProjectNotFound)
     ));
 }
@@ -1750,7 +1506,7 @@ fn delete_project_cascades_agent_profiles_and_messages() {
 }
 
 #[test]
-fn delete_task_nulls_delivered_run_id_on_agent_messages_but_keeps_them_as_history() {
+fn delete_task_keeps_unrelated_agent_messages_as_history() {
     let mut store = Store::open_in_memory().unwrap();
     store
         .create_project(
@@ -1798,110 +1554,13 @@ fn delete_task_nulls_delivered_run_id_on_agent_messages_but_keeps_them_as_histor
         })
         .unwrap();
     store
-        .assign_task(
-            &project_id("factory"),
-            &task_id("task-1"),
-            Some(&agent_id("curie")),
-            5,
-        )
-        .unwrap();
-
-    // Opening the episode delivers the message into it.
-    let run_id = open_episode(&mut store, "factory", "task-1", "curie", "run-1", 6);
-    let delivered = store
-        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
-        .unwrap();
-    assert_eq!(delivered.len(), 1);
-    assert!(delivered[0].delivered_at_ms.is_some());
-    assert_eq!(delivered[0].delivered_run_id, Some(run_id.clone()));
-
-    // The episode closes without touching delivery (unlike a launch that
-    // never happened), so the task can now be deleted once the run is
-    // terminal.
-    let closed = store
-        .cancel_run(&project_id("factory"), &run_id, 7)
-        .unwrap();
-    assert_eq!(closed.task.snapshot.status, TaskStatus::Cancelled);
-
-    store
-        .delete_task(&project_id("factory"), &task_id("task-1"), 8)
+        .delete_task(&project_id("factory"), &task_id("task-1"), 5)
         .unwrap();
 
     let after_delete = store
         .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
         .unwrap();
     assert_eq!(after_delete.len(), 1);
-    assert!(after_delete[0].delivered_at_ms.is_some());
+    assert_eq!(after_delete[0].delivered_at_ms, None);
     assert_eq!(after_delete[0].delivered_run_id, None);
-}
-
-/// `open_run_episode`'s delivery-marking is undone if the run never
-/// actually starts is future work (5C's PTY-typed-delivery acknowledgement,
-/// TRACK5-DESIGN.md A3); today delivery is unconditional once the episode
-/// opens, and stays delivered even if that episode is later closed without
-/// producing anything (mirrored here by an immediate `cancel_run`).
-#[test]
-fn open_run_episode_delivers_pending_messages_and_delivery_survives_a_cancelled_episode() {
-    let mut store = Store::open_in_memory().unwrap();
-    store
-        .create_project(
-            NewProject {
-                id: project_id("factory"),
-                name: "Factory".into(),
-                root: "/work/factory".into(),
-            },
-            1,
-        )
-        .unwrap();
-    store
-        .create_agent(
-            NewAgent {
-                id: agent_id("curie"),
-                project_id: project_id("factory"),
-                parent_agent_id: None,
-                role: AgentRole::Worker,
-                provider: Provider::Codex,
-            },
-            2,
-        )
-        .unwrap();
-    store
-        .create_task(
-            NewTask {
-                id: task_id("task-1"),
-                project_id: project_id("factory"),
-                parent_task_id: None,
-                title: "Task".into(),
-                body: String::new(),
-                priority: 0,
-            },
-            3,
-        )
-        .unwrap();
-    store
-        .send_agent_message(NewAgentMessage {
-            id: MessageId::try_from("message-1").unwrap(),
-            project_id: project_id("factory"),
-            sender_agent_id: None,
-            recipient_agent_id: agent_id("curie"),
-            body: "Please look at task-1.".into(),
-            created_at_ms: 4,
-        })
-        .unwrap();
-
-    let run_id = open_episode(&mut store, "factory", "task-1", "curie", "run-1", 5);
-    let delivered = store
-        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
-        .unwrap();
-    assert_eq!(delivered.len(), 1);
-    assert!(delivered[0].delivered_at_ms.is_some());
-    assert_eq!(delivered[0].delivered_run_id, Some(run_id.clone()));
-
-    store
-        .cancel_run(&project_id("factory"), &run_id, 6)
-        .unwrap();
-    let still_delivered = store
-        .list_agent_messages(&project_id("factory"), &agent_id("curie"), None, 100)
-        .unwrap();
-    assert!(still_delivered[0].delivered_at_ms.is_some());
 }

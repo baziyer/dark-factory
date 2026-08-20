@@ -6,8 +6,8 @@
 //! installed runtime. `--install` then downloads and verifies the release into
 //! `$DARK_FACTORY_HOME/bin/<version>/`, repoints `bin/current`, and — if
 //! this machine's launchd job exists — rewrites it to run from `bin/current`
-//! and reloads it, restarting only the daemon; running sessions are never
-//! touched (`ARCHITECTURE.md`, invariant 4). Without a launchd job the
+//! and reloads it, restarting only the daemon; running attempts remain under
+//! their durable runner resources (`ARCHITECTURE.md`). Without a launchd job the
 //! binaries are installed and activated and the operator restarts the daemon
 //! however they run it.
 //!

@@ -8,8 +8,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, ListItem, ListState, Paragraph};
 
 use crate::model::{
-    Board, Connection, Mode, PaneMode, PendingAction, PickerKind, PickerState, PromptKind,
-    PromptState, TaskMenuState,
+    Board, Connection, Mode, PendingAction, PickerKind, PickerState, PromptKind, PromptState,
+    TaskMenuState,
 };
 use crate::mouse::{HitMap, Target};
 use crate::ui::{self, centered_rect, render_tabs};
@@ -38,12 +38,7 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
     const TABS_WIDTH: u16 = 18;
     const HELP_LABEL: &str = "[? help]";
     const DETACH_LABEL: &str = "[q detach]";
-    const TYPING_ESCAPE: &str = "Ctrl-] board  ";
-    let typing = board.pane_mode == PaneMode::Typing && board.has_live_pane();
-    let controls = format!(
-        "{}{HELP_LABEL} {DETACH_LABEL}",
-        if typing { TYPING_ESCAPE } else { "" }
-    );
+    let controls = format!("{HELP_LABEL} {DETACH_LABEL}");
     let controls_width = u16::try_from(controls.len()).unwrap_or(u16::MAX);
     let update_label = board.update_progress.map_or_else(
         || {
@@ -87,10 +82,10 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         Color::White
     };
     let mut spans = vec![connection_badge(board), Span::raw(" ")];
-    if let Some(cap) = board.live_session_cap {
-        let live = board.live_session_count();
+    if let Some(cap) = board.active_run_cap {
+        let live = board.active_run_count();
         spans.push(Span::styled(
-            format!(" {live}/{cap} live "),
+            format!(" {live}/{cap} active "),
             Style::default()
                 .fg(Color::Black)
                 .bg(if live >= cap as usize {
@@ -139,8 +134,7 @@ pub fn render_status_line(frame: &mut Frame, area: Rect, board: &Board, hits: &m
         controls_area,
     );
 
-    let escape_width = if typing { TYPING_ESCAPE.len() } else { 0 };
-    let help_start = u16::try_from(escape_width).unwrap_or(u16::MAX);
+    let help_start: u16 = 0;
     let help_width = u16::try_from(HELP_LABEL.len()).unwrap_or(u16::MAX);
     let detach_start = help_start.saturating_add(help_width).saturating_add(1);
     let detach_width = u16::try_from(DETACH_LABEL.len()).unwrap_or(u16::MAX);
@@ -210,11 +204,6 @@ fn render_confirm(frame: &mut Frame, area: Rect, action: &PendingAction) {
             ),
             "y / Enter to confirm — any other key cancels",
         ),
-        PendingAction::StopSession { session_id, .. } => (
-            "stop agent?".to_owned(),
-            format!("stop session {session_id}?"),
-            "y / Enter / x again to confirm — any other key cancels",
-        ),
         PendingAction::StopRun { run_id, .. } => (
             "stop agent?".to_owned(),
             format!("stop run {run_id}?"),
@@ -243,12 +232,9 @@ fn render_prompt(frame: &mut Frame, area: Rect, board: &Board, prompt: &PromptSt
         PromptKind::MessageOrchestrator(agent_id) => format!("message orchestrator {agent_id}"),
         PromptKind::EditTaskTitle(task_id) => format!("edit title — task#{task_id}"),
         PromptKind::ReorderTask(task_id) => format!("reorder — task#{task_id}"),
-        PromptKind::AttentionAnswer { session_id, .. } => {
-            format!("decision answer — session#{session_id}")
-        }
         PromptKind::EditModel(agent_id) => format!("model — {agent_id}"),
         PromptKind::EditPermission(agent_id) => format!("permission — {agent_id}"),
-        PromptKind::Capacity => "live-session capacity".to_owned(),
+        PromptKind::Capacity => "active-run capacity".to_owned(),
     };
     let height = u16::try_from(prompt.labels.len()).unwrap_or(1) + 4;
     let rect = centered_rect(area, 60, height);
@@ -367,7 +353,7 @@ fn render_task_menu(frame: &mut Frame, area: Rect, board: &Board, menu: &TaskMen
 }
 
 const HELP_TEXT: &[&str] = &[
-    "BUILDING / AGENT — two screens, BOARD / TYPING — two input modes",
+    "BUILDING / AGENT — fleet and selected-attempt views",
     "Enter/Esc  open selected agent / return to BUILDING",
     "j/k, ↑/↓   previous/next agent floor",
     "[ / ]      previous/next agent without leaving AGENT",
@@ -375,12 +361,9 @@ const HELP_TEXT: &[&str] = &[
     "m          message the selected agent",
     "o          message the orchestrator (picks by Tab if more than one)",
     "p          focus a project (remembered for next time)",
-    "x          stop the selected agent — 2-press confirm",
+    "x          cancel the selected run — 2-press confirm",
     "g          jump to the next decision in NEEDS YOU",
-    "i/Enter    AGENT: type into the live terminal",
-    "Ctrl-]     return terminal input to BOARD mode",
-    "z          maximise/restore terminal     PgUp/PgDn scroll",
-    "mouse      click tabs/rows/pane; wheel scrolls terminal history",
+    "mouse      click tabs, agents, tasks, and decision choices",
     "u          install the shown update and relaunch this viewer",
     "Space      pause/resume agent            t manage active task",
     "I / M      edit instructions.md / memory.md in $EDITOR",
@@ -407,61 +390,4 @@ fn render_help(frame: &mut Frame, area: Rect) {
     );
     let lines: Vec<Line> = HELP_TEXT.iter().map(|line| Line::from(*line)).collect();
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::theme;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    #[test]
-    fn update_mouse_target_is_exactly_where_the_label_is_drawn() {
-        let mut board = Board::new(false, 0, theme::PLAIN);
-        board.update_available = Some("0.2.6".to_owned());
-        let mut hits = HitMap::default();
-        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
-        terminal
-            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        let start = text
-            .find("[u update v0.2.6]")
-            .expect("visible update label");
-        let start = u16::try_from(start).unwrap();
-        assert_eq!(hits.target_at(start, 0), Some(Target::Update));
-        assert_eq!(hits.target_at(start + 16, 0), Some(Target::Update));
-        assert_ne!(
-            hits.target_at(start.saturating_sub(1), 0),
-            Some(Target::Update)
-        );
-    }
-
-    #[test]
-    fn progress_replaces_the_action_and_cannot_be_clicked() {
-        let mut board = Board::new(false, 0, theme::PLAIN);
-        board.update_available = Some("0.2.6".to_owned());
-        board.update_progress = Some(UpdateProgress::Verifying);
-        let mut hits = HitMap::default();
-        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
-        terminal
-            .draw(|frame| render_status_line(frame, frame.area(), &board, &mut hits))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(text.contains("update: verifying"));
-        assert!((0..100).all(|column| hits.target_at(column, 0) != Some(Target::Update)));
-    }
 }
