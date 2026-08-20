@@ -48,7 +48,11 @@ canonical_directory() {
 }
 
 path_identity() {
-    stat -f '%d:%i' "$1" 2>/dev/null || stat -c '%d:%i' "$1" 2>/dev/null
+    if identity_result=$(stat -f '%d:%i' "$1" 2>/dev/null); then
+        printf '%s\n' "$identity_result"
+    else
+        stat -c '%d:%i' "$1" 2>/dev/null
+    fi
 }
 
 same_identity() {

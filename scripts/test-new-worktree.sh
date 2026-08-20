@@ -356,6 +356,41 @@ long_slug=$(awk 'BEGIN { for (i = 0; i < 1024; i++) printf "x" }')
 expect_failure bounded-diagnostic "$hostile_repository" "$long_slug"
 assert_bounded_output "$temporary/bounded-diagnostic.out" 512
 
+stat_shim_directory="$temporary/stat shim"
+mkdir "$stat_shim_directory"
+cat >"$stat_shim_directory/stat" <<'EOF'
+#!/bin/sh
+set -eu
+
+if [ "$1" = -f ]; then
+    stat_count=0
+    [ ! -f "$DF_TEST_STAT_STATE" ] || read -r stat_count <"$DF_TEST_STAT_STATE"
+    stat_count=$((stat_count + 1))
+    printf '%s\n' "$stat_count" >"$DF_TEST_STAT_STATE"
+    printf 'failed-filesystem-output-%s\n' "$stat_count"
+    exit 1
+fi
+
+[ "$1" = -c ] && [ "$2" = '%d:%i' ] || exit 2
+exec "$DF_TEST_REAL_STAT" -f "$2" "$3"
+EOF
+chmod +x "$stat_shim_directory/stat"
+stat_repository="$temporary/stat fallback repository"
+init_repository "$stat_repository"
+real_stat=$(command -v stat)
+if ! (
+    cd "$stat_repository"
+    env \
+        PATH="$stat_shim_directory:$PATH" \
+        DF_TEST_REAL_STAT="$real_stat" \
+        DF_TEST_STAT_STATE="$temporary/stat-state" \
+        ./scripts/new-worktree.sh stat-fallback
+) >"$temporary/stat-fallback.out" 2>&1; then
+    fail "stat fallback output contaminated path identity"
+fi
+assert_directory "$stat_repository/.worktrees/stat-fallback"
+assert_registered "$stat_repository" "$stat_repository/.worktrees/stat-fallback"
+
 smudge_repository="$temporary/smudge failure repository"
 smudge_target="$smudge_repository/.worktrees/smudge-failure"
 init_repository "$smudge_repository"
