@@ -34,43 +34,8 @@ use tokio::{
     sync::oneshot,
 };
 
-// --- Real sibling binaries (same technique as `sessions_e2e.rs`) --------
-
-/// `env!("CARGO_BIN_EXE_*")` only resolves for binaries owned by *this*
-/// package, not a dev-dependency's own binary targets (confirmed by
-/// `sessions_e2e.rs`, which this mirrors): build them explicitly, once per
-/// test process, into the same workspace `target/` `factoryd`'s own binary
-/// lives in.
-fn ensure_sibling_binaries_built() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "factory-runner", "-p", "factoryctl"])
-            .status()
-            .expect("could not run cargo build for factory-runner/factoryctl");
-        assert!(
-            status.success(),
-            "cargo build -p factory-runner -p factoryctl failed"
-        );
-    });
-}
-
-fn workspace_target_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_factoryd"))
-        .parent()
-        .expect("factoryd binary has a parent directory")
-        .to_path_buf()
-}
-
-fn factory_runner_path() -> PathBuf {
-    ensure_sibling_binaries_built();
-    workspace_target_dir().join("factory-runner")
-}
-
-fn factoryctl_path() -> PathBuf {
-    ensure_sibling_binaries_built();
-    workspace_target_dir().join("factoryctl")
-}
+mod common;
+use common::{factory_runner_path, factoryctl_path};
 
 fn shell_agent_path() -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

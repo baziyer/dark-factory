@@ -41,6 +41,24 @@ bypass, or release the lease. The summary contract is checked by
 this macOS-specific lease harness and its release fixtures; GitHub runs that
 mode in an isolated hosted job.
 
+`./scripts/local-ci.sh --fingerprint` prints the exact ordered phase manifest
+without acquiring the lease or running a command. The
+`test-local-ci-fingerprint.sh` phase compares that manifest with a checked-in
+expected list, so deleting, duplicating, or silently replacing a release,
+source, binary, test, or diff phase fails before the gate can claim equivalent
+coverage. During a real gate each phase reports a wall-clock elapsed duration;
+the output is diagnostic timing only and does not alter ordering or failure
+status.
+
+The two factoryd resident-session integration tests use one explicit binary
+seam. Run `./scripts/prepare-test-binaries.sh` through the lease before a
+focused `sessions_e2e` or `session_start_deadline` command. It builds the exact
+locked workspace test profile once with `--no-run`, and the shared test helper
+accepts only executable siblings of the exact `factoryd` test binary in that
+target directory. The tests never invoke Cargo themselves and never resolve a
+binary through `PATH`; the focused command must still use
+`./scripts/with-local-ci-lease.sh`.
+
 After the macOS lease records its diagnostic owner, the single `local-ci.sh`
 entry boundary removes inherited Dark Factory home, socket, and task/session
 identity overrides before any gate child runs. Tests still set their own

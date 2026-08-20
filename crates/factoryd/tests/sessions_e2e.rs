@@ -35,6 +35,9 @@ use factoryctl::{capacity, launchd, probes};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
+mod common;
+use common::{factory_runner_path, factoryctl_path};
+
 /// Both ceilings were 10s/20s originally; raised (this track's item 10)
 /// because this machine runs with a third-party process pegging a core
 /// (not ours), which was flaking the shorter ceilings under load -- not a
@@ -227,45 +230,6 @@ impl Drop for Daemon {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
-}
-
-/// `env!("CARGO_BIN_EXE_*")` only resolves for binaries owned by *this*
-/// package (confirmed against every other integration test in this
-/// workspace -- none cross a package boundary either); it does not extend
-/// to a dev-dependency's own binary targets. Instead: build them
-/// explicitly, once per test process, into the same workspace `target/`
-/// directory `factoryd`'s own binary lives in (no `--target-dir` override,
-/// so it is guaranteed to be the same directory), then reference them by
-/// that now-known path.
-fn ensure_sibling_binaries_built() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "factory-runner", "-p", "factoryctl"])
-            .status()
-            .expect("could not run cargo build for factory-runner/factoryctl");
-        assert!(
-            status.success(),
-            "cargo build -p factory-runner -p factoryctl failed"
-        );
-    });
-}
-
-fn workspace_target_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_factoryd"))
-        .parent()
-        .expect("factoryd binary has a parent directory")
-        .to_path_buf()
-}
-
-fn factory_runner_path() -> PathBuf {
-    ensure_sibling_binaries_built();
-    workspace_target_dir().join("factory-runner")
-}
-
-fn factoryctl_path() -> PathBuf {
-    ensure_sibling_binaries_built();
-    workspace_target_dir().join("factoryctl")
 }
 
 /// Stages two complete runtime directories for the managed-launchd capacity
@@ -729,38 +693,18 @@ fn wait_for_session_state(client: &Client, agent_id: &str, state: SessionState) 
     })
 }
 
-/// Like [`wait_for_session_state`] for `Idle`, but confirms it *stays*
-/// idle continuously across a full settle window before returning, not
-/// just at one single later instant. This catches a delivery still in
-/// flight after a fast hook cycle, without making the product rely on a
-/// test-only sleep or a fixture-specific acknowledgement.
-const IDLE_SETTLE_WINDOW: Duration = Duration::from_secs(3);
-const IDLE_SETTLE_POLL: Duration = Duration::from_millis(150);
-
+/// Wait for the durable idle state after the session's current run is
+/// terminal. This replaces the old fixed settle window with the two
+/// observable state barriers the test actually needs.
 fn wait_for_stable_idle(client: &Client, agent_id: &str) -> SessionSnapshot {
-    loop {
-        let idle = wait_for_session_state(client, agent_id, SessionState::Idle);
-        let settle_deadline = Instant::now() + IDLE_SETTLE_WINDOW;
-        let mut stayed_idle = true;
-        while Instant::now() < settle_deadline {
-            std::thread::sleep(IDLE_SETTLE_POLL);
-            match session_by_agent(client, agent_id) {
-                Some(session) if session.id == idle.id && session.state == SessionState::Idle => {}
-                _ => {
-                    stayed_idle = false;
-                    break;
-                }
-            }
-        }
-        if !stayed_idle {
-            continue;
-        }
-        if let Some(final_snapshot) = session_by_agent(client, agent_id) {
-            if final_snapshot.id == idle.id && final_snapshot.state == SessionState::Idle {
-                return final_snapshot;
-            }
-        }
-    }
+    poll_until(DELIVERY_TIMEOUT, || {
+        let session = session_by_agent(client, agent_id)
+            .filter(|session| session.state == SessionState::Idle)?;
+        let has_live_run = list_runs(client)
+            .into_iter()
+            .any(|run| run.session_id.as_ref() == Some(&session.id) && !run.status.is_terminal());
+        (!has_live_run).then_some(session)
+    })
 }
 
 fn wait_for_task_status(client: &Client, task_id: &str, status: TaskStatus) -> TaskDetail {
@@ -1164,8 +1108,8 @@ fn task_assigned_during_a_clean_stop_delivers_after_the_session_is_replaced() {
 
     create_task(&client, "task-1", "First", "complete before stopping");
     assign_task(&client, "task-1", "curie");
-    let first_session = wait_for_stable_idle(&client, "curie");
     wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let first_session = wait_for_stable_idle(&client, "curie");
 
     // The RPC only acknowledges the runner's stop request; the old session
     // remains live and idle until its terminal event is observed. Assign the
@@ -1232,8 +1176,8 @@ fn resumed_provider_thread_recovers_a_lost_next_task_delivery() {
 
     create_task(&client, "task-1", "First", "complete before resuming");
     assign_task(&client, "task-1", "curie");
-    let first_session = wait_for_stable_idle(&client, "curie");
     wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
+    let first_session = wait_for_stable_idle(&client, "curie");
     assert_eq!(
         first_session.provider_session_id.as_deref(),
         Some(FAKE_CODEX_THREAD_ID)
@@ -1579,13 +1523,17 @@ fn factoryd_process_group_kill_does_not_take_sessions() {
     assign_task(&client, "task-1", "curie");
     wait_for_task_status(&client, "task-1", TaskStatus::Succeeded);
     let session_before = wait_for_stable_idle(&client, "curie");
+    let runner_instance_before = session_before.runner_instance_id.clone();
+    assert!(
+        runner_instance_before.is_some(),
+        "runner survival requires a daemon-owned runner generation"
+    );
 
     assert_eq!(live_runners_under(home.path()), 1);
     project.daemon.stop_process_group();
-    // The decisive check: the runner process is still there after the
-    // whole group was signalled -- and stays there (a signalled runner
-    // would be tearing its provider down right now).
-    std::thread::sleep(Duration::from_secs(2));
+    // The decisive checks are causal: the runner remains observable and the
+    // restarted daemon reports the same runner generation, so a replacement
+    // process cannot satisfy this survival assertion.
     assert_eq!(
         live_runners_under(home.path()),
         1,
@@ -1602,6 +1550,10 @@ fn factoryd_process_group_kill_does_not_take_sessions() {
     );
     assert_eq!(sessions[0].id, session_before.id);
     assert_eq!(sessions[0].state, SessionState::Idle);
+    assert_eq!(
+        sessions[0].runner_instance_id, runner_instance_before,
+        "the daemon restart must recover the original runner, not respawn it"
+    );
 
     create_task(&client, "task-2", "Second", "after the group kill");
     assign_task(&client, "task-2", "curie");
@@ -1917,14 +1869,27 @@ fn spawn_failure_is_visible_backs_off_and_recovers_with_a_single_delivery() {
         "the task must stay durably queued through repeated spawn failures, never lost"
     );
 
-    // Backed off, not stormed: `SPAWN_BACKOFF_INITIAL` (5s) then doubling
-    // bounds retries to a handful in this window, unlike the original
-    // bug's 18 attempts in a similar span with no backoff at all.
-    std::thread::sleep(Duration::from_secs(16));
-    let attempts = list_sessions(&client)
-        .into_iter()
-        .filter(|session| session.agent_id.as_str() == "curie")
-        .count();
+    // Backed off, not stormed: wait for the causal observation of the second
+    // failed session and prove its durable state timestamp is at least four
+    // seconds after the first. The production backoff is 5s; a removed
+    // backoff fails this observable barrier without sleeping in the test.
+    let first_failed_id = failed.id.clone();
+    let first_failed_at = failed.state_since_ms;
+    let attempts = poll_until(Duration::from_secs(16), || {
+        let sessions = list_sessions(&client);
+        let retry_observed = sessions.iter().any(|session| {
+            session.agent_id.as_str() == "curie"
+                && session.id != first_failed_id
+                && session.state == SessionState::Failed
+                && session.state_since_ms.saturating_sub(first_failed_at) >= 4_000
+        });
+        retry_observed.then_some(
+            sessions
+                .into_iter()
+                .filter(|session| session.agent_id.as_str() == "curie")
+                .count(),
+        )
+    });
     assert!(
         attempts <= 4,
         "backoff should bound retries within ~16s to a handful, got {attempts}"
