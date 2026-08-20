@@ -8,6 +8,7 @@ deadline=$repository_root/crates/factoryd/tests/session_start_deadline.rs
 common=$repository_root/crates/factoryd/tests/common/mod.rs
 
 grep -F 'cargo +1.88.0 test --locked --workspace --all-targets --no-run' "$helper" >/dev/null
+grep -F 'command -v lockf' "$helper" >/dev/null
 grep -F 'path.parent()' "$common" >/dev/null
 grep -F 'mod common;' "$sessions" >/dev/null
 grep -F 'mod common;' "$deadline" >/dev/null

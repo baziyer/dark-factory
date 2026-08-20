@@ -3,7 +3,7 @@ set -eu
 
 script_dir=$(CDPATH='' cd -- "$(dirname "$0")" && pwd)
 
-if [ "${DARK_FACTORY_LOCAL_CI_LEASE_HELD-}" != 1 ]; then
+if [ "${DARK_FACTORY_LOCAL_CI_LEASE_HELD-}" != 1 ] && command -v lockf >/dev/null 2>&1; then
     exec "$script_dir/with-local-ci-lease.sh" "$script_dir/prepare-test-binaries.sh"
 fi
 
