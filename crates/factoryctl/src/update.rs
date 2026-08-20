@@ -36,6 +36,8 @@ pub const MANIFEST_URL_ENV: &str = "DARK_FACTORY_UPDATE_URL";
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_ASSET_URL_BYTES: usize = 4096;
+const MAX_ASSET_KEY_BYTES: usize = 128;
 /// Every binary in an installed release runtime.
 pub const RELEASE_BINARIES: [&str; 4] = ["factoryd", "factory-runner", "factoryctl", "factory-tui"];
 
@@ -83,6 +85,85 @@ impl UpdateCheck {
             manifest.assets.contains_key(platform_key()) && is_newer(&manifest.version, current)
         })
     }
+}
+
+/// Returns the canonical stable release spelling (`MAJOR.MINOR.PATCH`).
+/// Release identities become directory names and terminal text, so aliases,
+/// prereleases, separators, controls, whitespace, and non-ASCII text are all
+/// rejected before a manifest can reach either surface.
+pub fn canonical_stable_version(version: &str) -> Result<String, String> {
+    let mut parts = version.split('.');
+    let mut numbers = [0_u64; 3];
+    for number in &mut numbers {
+        let part = parts
+            .next()
+            .filter(|part| !part.is_empty())
+            .ok_or_else(|| format!("release version {version:?} is not MAJOR.MINOR.PATCH"))?;
+        if !part.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(format!(
+                "release version {version:?} is not a stable ASCII MAJOR.MINOR.PATCH"
+            ));
+        }
+        *number = part
+            .parse()
+            .map_err(|_| format!("release version {version:?} is out of range"))?;
+        if number.to_string() != part {
+            return Err(format!(
+                "release version {version:?} is not canonically spelled"
+            ));
+        }
+    }
+    if parts.next().is_some() {
+        return Err(format!(
+            "release version {version:?} is not MAJOR.MINOR.PATCH"
+        ));
+    }
+    Ok(format!("{}.{}.{}", numbers[0], numbers[1], numbers[2]))
+}
+
+/// Validates every fetched or cached field used as a path, command argument,
+/// checksum, or human label. Unknown extra platform assets remain allowed,
+/// but their keys and URLs must still be bounded safe ASCII.
+pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
+    let canonical = canonical_stable_version(&manifest.version)?;
+    if canonical != manifest.version {
+        return Err(format!(
+            "release version {:?} is not canonical ({canonical})",
+            manifest.version
+        ));
+    }
+    if manifest.assets.is_empty() {
+        return Err(format!("release {canonical} has no assets"));
+    }
+    for (key, asset) in &manifest.assets {
+        if key.is_empty()
+            || key.len() > MAX_ASSET_KEY_BYTES
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(format!("release {canonical} has an invalid asset key"));
+        }
+        if asset.url.is_empty()
+            || asset.url.len() > MAX_ASSET_URL_BYTES
+            || !asset.url.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(format!(
+                "release {canonical} asset {key} has an invalid URL"
+            ));
+        }
+        if asset.sha256.len() != 64
+            || !asset
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "release {canonical} asset {key} has an invalid SHA-256"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The validated version `$DARK_FACTORY_HOME/bin/current` points at.
@@ -218,14 +299,12 @@ fn platform_key_for(os: &str, arch: &str) -> &'static str {
 #[must_use]
 pub fn check(home: &Path, url: &str, now_ms: i64, force: bool) -> UpdateCheck {
     let previous = read_cache(home);
-    if !force {
-        if let Some(previous) = &previous {
-            let age_ms = now_ms.saturating_sub(previous.checked_at_ms);
-            if previous.current == CURRENT_VERSION
-                && (0..=CHECK_INTERVAL.as_millis() as i64).contains(&age_ms)
-            {
-                return previous.clone();
-            }
+    if !force && let Some(previous) = &previous {
+        let age_ms = now_ms.saturating_sub(previous.checked_at_ms);
+        if previous.current == CURRENT_VERSION
+            && (0..=CHECK_INTERVAL.as_millis() as i64).contains(&age_ms)
+        {
+            return previous.clone();
         }
     }
     let result = match fetch_manifest(url) {
@@ -251,7 +330,11 @@ pub fn check(home: &Path, url: &str, now_ms: i64, force: bool) -> UpdateCheck {
 /// Reads and parses the cache; anything unreadable or malformed is `None`.
 fn read_cache(home: &Path) -> Option<UpdateCheck> {
     let bytes = fs::read(cache_path(home)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let check: UpdateCheck = serde_json::from_slice(&bytes).ok()?;
+    if let Some(manifest) = &check.latest {
+        validate_manifest(manifest).ok()?;
+    }
+    Some(check)
 }
 
 fn write_cache(home: &Path, check: &UpdateCheck) -> io::Result<()> {
@@ -264,7 +347,10 @@ fn write_cache(home: &Path, check: &UpdateCheck) -> io::Result<()> {
 /// Downloads and parses the manifest at `url` with `curl`.
 fn fetch_manifest(url: &str) -> Result<Manifest, String> {
     let bytes = curl(url, MAX_MANIFEST_BYTES)?;
-    serde_json::from_slice(&bytes).map_err(|error| format!("manifest is not valid: {error}"))
+    let manifest: Manifest = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("manifest is not valid: {error}"))?;
+    validate_manifest(&manifest).map_err(|error| format!("manifest is not valid: {error}"))?;
+    Ok(manifest)
 }
 
 /// Fetches `url` to memory with `curl`, bounded to `max_bytes`. Follows
@@ -399,6 +485,56 @@ mod tests {
     }
 
     #[test]
+    fn release_manifest_rejects_unsafe_or_nonstable_identity_fields() {
+        let manifest = |version: &str, sha256: &str, url: &str| Manifest {
+            version: version.to_owned(),
+            assets: [(
+                platform_key().to_owned(),
+                Asset {
+                    url: url.to_owned(),
+                    sha256: sha256.to_owned(),
+                },
+            )]
+            .into(),
+        };
+        let digest = "ab".repeat(32);
+        assert!(
+            validate_manifest(&manifest("1.2.3", &digest, "https://example.invalid/a")).is_ok()
+        );
+        for version in [
+            "1.2.3-rc.1",
+            "v1.2.3",
+            "1.2.03",
+            "999.0.0-x/../../outside",
+            "1.2.3\u{1b}[2J",
+            "1.2.3-é",
+        ] {
+            assert!(
+                validate_manifest(&manifest(version, &digest, "https://example.invalid/a"))
+                    .is_err(),
+                "accepted {version:?}"
+            );
+        }
+        assert!(validate_manifest(&manifest("1.2.3", "00", "https://example.invalid/a")).is_err());
+        assert!(
+            validate_manifest(&manifest(
+                "1.2.3",
+                &"AB".repeat(32),
+                "https://example.invalid/a"
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_manifest(&manifest(
+                "1.2.3",
+                &digest,
+                "https://example.invalid/\nforge"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn available_requires_a_newer_version_for_this_platform() {
         let manifest = |version: &str, key: &str| Manifest {
             version: version.to_owned(),
@@ -472,5 +608,32 @@ mod tests {
         assert_ne!(refreshed.error, cached.error);
         assert!(refreshed.error.is_some());
         assert_eq!(read_cache(home.path()), Some(refreshed));
+    }
+
+    #[test]
+    fn unsafe_cached_manifest_is_never_projected_or_installed() {
+        let home = tempfile::tempdir().unwrap();
+        let hostile = UpdateCheck {
+            checked_at_ms: 1,
+            current: CURRENT_VERSION.to_owned(),
+            latest: Some(Manifest {
+                version: "999.0.0-x/../../outside".to_owned(),
+                assets: [(
+                    platform_key().to_owned(),
+                    Asset {
+                        url: "https://example.invalid/a".to_owned(),
+                        sha256: "00".repeat(32),
+                    },
+                )]
+                .into(),
+            }),
+            error: None,
+        };
+        fs::write(
+            cache_path(home.path()),
+            serde_json::to_vec(&hostile).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(read_cache(home.path()), None);
     }
 }

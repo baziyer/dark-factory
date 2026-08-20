@@ -62,7 +62,7 @@ pub fn rollback_report(
 }
 
 /// The rollback authority captured while [`MutationLock`] is held.
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct MutationSnapshot {
     pub active_version: Option<String>,
     pub plist: Option<String>,
@@ -73,6 +73,27 @@ pub struct MutationSnapshot {
 /// repointed first; if restoring the old job fails, the new runtime is put
 /// back so the active link still matches the job launchd has.
 pub fn rollback_after_health_failure(
+    home: &Path,
+    plist: &Path,
+    snapshot: &MutationSnapshot,
+    current_version: &str,
+    health: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    rollback_after_health_failure_for(
+        &crate::launchd::LaunchdTarget::for_user(rustix::process::getuid().as_raw()),
+        home,
+        plist,
+        snapshot,
+        current_version,
+        health,
+    )
+}
+
+/// Restores a runtime and one explicitly selected managed launchd job.
+/// Recovery callers use the same target identity captured by their durable
+/// transaction rather than re-deriving authority after a crash.
+pub fn rollback_after_health_failure_for(
+    target: &crate::launchd::LaunchdTarget,
     home: &Path,
     plist: &Path,
     snapshot: &MutationSnapshot,
@@ -90,7 +111,7 @@ pub fn rollback_after_health_failure(
     snapshot.restore_runtime(home)?;
     let rollback_home = home.to_owned();
     let current_version = current_version.to_owned();
-    crate::launchd::restore_with_rollback(plist, home, previous_plist, move || {
+    crate::launchd::restore_with_rollback_for(target, plist, home, previous_plist, move || {
         crate::install::activate(&rollback_home, &current_version)
     })
     .map_err(|error| error.to_string())?;

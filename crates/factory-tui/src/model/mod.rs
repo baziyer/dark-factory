@@ -36,6 +36,8 @@ use factory_core::{
     Provider, RunId, RunSnapshot, RunnerInstanceId, SessionId, SessionSnapshot, SessionState,
     TaskDetail, TaskId,
 };
+use factoryctl::managed_update::UpdateProgress;
+use factoryctl::update::UpdateCheck;
 
 pub use announcements::Announcement;
 pub use factory_core::attention::Rated;
@@ -127,6 +129,9 @@ pub struct Board {
     /// A newer release's version, once the hourly manifest check has found one
     /// (`net::spawn_update_check`); shown in the status line.
     pub update_available: Option<String>,
+    /// Exact release check behind the visible manual update action.
+    pub update_check: Option<UpdateCheck>,
+    pub update_progress: Option<UpdateProgress>,
     /// `factoryd --max-active-runs`, learned from `FleetStatus` after bootstrap; the status line
     /// shows live sessions against it.
     pub live_session_cap: Option<u32>,
@@ -208,6 +213,8 @@ impl Board {
             connection_detail: None,
             daemon_version: None,
             update_available: None,
+            update_check: None,
+            update_progress: None,
             live_session_cap: None,
             projects: Vec::new(),
             focused_project: None,
