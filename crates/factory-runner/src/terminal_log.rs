@@ -410,6 +410,8 @@ pub(super) fn open_terminal_log(
     dir: &std::path::Path,
     max_bytes: u64,
 ) -> std::sync::Arc<TerminalLog> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     let file = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
