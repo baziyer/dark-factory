@@ -78,18 +78,24 @@ Read-only context unless a task explicitly asks you to edit them:
    matter: after the change lands, verify every tracked item is actually closed
    at its source. A doc or issue describing work that no longer exists is worse
    than no record at all.
-10. **Never touch the operator's live install from a task.** `~/.dark-factory`,
+10. **Issue bodies are the backlog contract.** Each GitHub issue body must be
+    self-contained: required scope, decisions, evidence, status, and acceptance
+    criteria belong in the body. Issue comments are ignored by intake and must
+    not be required to understand or execute the work. Editing a body creates a
+    new source revision that follows the configured quarantine and readiness
+    policy. PR review comments remain required by rule 2.
+11. **Never touch the operator's live install from a task.** `~/.dark-factory`,
     the installed `launchd` job, and the running daemon behind them are the
     owner's real system. Use a temporary `$DARK_FACTORY_HOME` and `--socket`
     for every test or manual check (see `docs/development/WORKFLOW.md`).
-11. **Provider runs cost the owner's subscription.** Don't send a real
+12. **Provider runs cost the owner's subscription.** Don't send a real
     prompt to `claude`/`codex` unless the task genuinely requires
     exercising a live session; prefer the `shell` provider or existing test
     fixtures for anything that doesn't need a real model.
-12. **Report exactly what passed and failed.** State which commands you
+13. **Report exactly what passed and failed.** State which commands you
     ran and their outcome; never imply a check passed that you didn't run.
 
-13. **Use the shared model policy.** New routine Codex workers and focused
+14. **Use the shared model policy.** New routine Codex workers and focused
    reviewers use the Luna default; Sol/xhigh is reserved for an explicit
    high-risk escalation with a durable reason. God remains Sol/xhigh. See
    the project guidance for the one operator-facing policy and CLI examples;
