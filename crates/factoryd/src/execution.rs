@@ -5141,7 +5141,7 @@ mod tests {
                         provider_session_id: None,
                         worktree: "/tmp/factory/worktree".to_owned(),
                         codex_home: None,
-                        hook_token: "a".repeat(64),
+                        hook_token: session_uuid.replace('-', "").repeat(2),
                         runner_instance_id: RunnerInstanceId::try_from(session_uuid).unwrap(),
                         runner_runtime: format!("/tmp/factory/runs/{agent_name}"),
                         runner_protocol_version: 1,
