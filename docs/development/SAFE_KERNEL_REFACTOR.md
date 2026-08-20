@@ -69,7 +69,7 @@ The transition and projection contract is exhaustive:
 | Provider proposes a block | `running -> finalizing` | `blocked(reason)` | `blocked` |
 | Spawn fails before provider exec | `admitted -> finalizing` | `failed(reason)` | `failed` |
 | Provider/runner exits before an outcome | `running -> finalizing` | `failed(reason)` | `failed` |
-| Operator cancels before terminal | `admitted|running -> finalizing` | `cancelled(reason)` | `cancelled` |
+| Operator cancels before the first `finalizing` transition | `admitted|running -> finalizing` | `cancelled(reason)` | `cancelled` |
 | Finalizer proves every resource released/transferred | `finalizing -> terminal` | unchanged | exact mapping above |
 
 The first durable transition to `finalizing` wins. An outcome received before
@@ -135,7 +135,9 @@ resource.
 
 ## Kernel invariants
 
-These invariants are the acceptance contract for every implementation PR:
+These are boot-candidate invariants. Each intermediate PR must satisfy its own
+stage checkpoint below and fail closed for capabilities delivered by a later
+stage; it must not claim the complete boot contract early.
 
 1. Every provider-mediated mutation derives its project, agent, task, attempt,
    change, source path, and allowed operation from one unforgeable attempt
@@ -145,8 +147,11 @@ These invariants are the acceptance contract for every implementation PR:
 3. Admission atomically captures the task incarnation and revision, provider
    configuration, change/worktree lease, and capability before any provider
    effect is possible.
-4. Only `running` permits provider execution. A provider outcome moves the
-   attempt to `finalizing`; it does not directly close the task or attempt.
+4. Only `running` grants provider effect authority or permits initial provider
+   `exec`. The first `finalizing` transition atomically revokes tool, mutation,
+   repository, and outcome authority and requests stop. The exact provider
+   process may still exist while draining or awaiting reap as an owned resource;
+   it may not initiate another authorized effect.
 5. One restartable finalizer is the only code allowed to write `terminal`.
    Terminalization requires all ephemeral resources to be released or a
    retained artifact to be durably transferred to its next owner.
@@ -210,6 +215,13 @@ The default is one reviewed PR per stage. A stage may be split once at a
 demonstrably independent seam, but its PRs remain serial and the superseded
 path is deleted in the same stage. Do not run parallel architecture branches.
 
+An intermediate stage is deliberately not bootable, but it must be internally
+safe: unsupported later-stage operations fail closed and its stage checkpoint
+passes. Stage 1 has no production Change allocator for new work. Its
+module-private causal fixtures insert an exact Change row backed by a disposable
+temporary directory; production source admission remains disabled until Stage
+2. This is a test fixture, not a public abstraction or second ownership path.
+
 ### Stage 1: atomic attempt and resource-authority cutover
 
 Purpose: replace resident sessions, delivery authority, endpoint-specific
@@ -256,7 +268,10 @@ resource/finalizer seam cannot safely be postponed to a later stage.
 
 Stage checkpoint:
 
-- No provider exists without one admitted/running run and exact capability.
+- No provider effect authority exists outside one exact `running` run. A
+  provider process may remain during `finalizing` only as an authority-revoked,
+  stop-requested resource being drained or reaped; no provider process survives
+  terminal.
 - Every hook, repository mutation, and outcome is refused unless the exact run
   is `running` and the request is in that principal's allowlist.
 - Spawn failure, provider exit, success, block, and cancellation all converge
@@ -316,8 +331,14 @@ regenerable runtime output without multiplying the cache by source revision.
   identity plus toolchain, target triple, profile, feature/package/target
   selection, and compiler/linker configuration. Exact source revision is not a
   cache namespace dimension.
-- [ ] Hold one writer lease through source selection, build, open, copy, hash,
-  sync, and atomic bundle publication.
+- [ ] At build admission, atomically revoke Change mutation authority, wait for
+  registered/in-flight source writers to quiesce, create an exact Git tree with
+  a private index, and materialize that tree into a daemon-owned immutable
+  source snapshot. Restore mutation authority only after snapshot publication
+  or fail-closed cleanup.
+- [ ] Hold one writer lease through immutable source selection, build, open,
+  copy, hash, sync, and atomic bundle publication. Compilation reads only the
+  immutable snapshot, never the live writable Change.
 - [ ] Put exact source snapshot, `Cargo.lock`, allowlisted build environment,
   cache configuration, executable digest, and required fixture digests in the
   immutable bundle provenance manifest.
@@ -333,6 +354,9 @@ regenerable runtime output without multiplying the cache by source revision.
   refuse new build admission until leases release.
 - [ ] Prove multiple source revisions reuse the same mutable cache namespace
   while producing distinct exact-source immutable bundles.
+- [ ] Mutate the live Change after snapshot selection and during compilation;
+  prove the bundle still corresponds exactly to the selected snapshot. If
+  stable snapshot publication cannot be proven, fail closed before compiling.
 - [ ] Delete runtime Cargo builds, mutable sibling executable discovery, and
   obsolete headroom-only logic after replacement proof.
 - [ ] Keep local-CI serialization daemon-independent. Replace its shell lease
@@ -342,8 +366,10 @@ regenerable runtime output without multiplying the cache by source revision.
 Stage and boot checkpoint:
 
 - Executable replacement after bundle preparation cannot change what runs.
-- Regenerable quota pressure converges below its configured bound without
-  touching leased resources or unique retained Changes.
+- Regenerable quota pressure converges immediately when safe entries suffice.
+  If protected leases alone exceed the bound, the daemon reports the exact
+  overage, refuses new build admission, and converges only after leases release;
+  it never touches unique retained Changes.
 - Multiple revisions do not create multiple Cargo cache namespaces for the same
   project build configuration.
 - All causal suites below pass on the exact reviewed head.
@@ -364,8 +390,9 @@ the externally visible effect, not only an internal callback or row.
 | Failure, cancel, retry | Spawn failure, provider crash, and operator cancellation each finalize to the documented task result. Retry is refused before terminal, then creates a new RunId and work revision while retaining the same Change. Stale credentials remain invalid. |
 | External finalization | Own a process group, runtime root, temporary root, and throwaway launchd job. Kill provider, runner, daemon, and fixture separately. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. |
 | Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs. Tampered bundles fail closed. Restart between prepare and launch preserves the same manifest/digest. Reclamation cannot remove an execution-leased bundle. |
+| Immutable source | Select source snapshot A, then mutate the live Change before and during compilation. The bundle is built entirely from A and records A's exact tree, or publication fails closed; it never records a mixed or later tree. |
 | Cache reuse | Build two exact source revisions with the same project/build configuration. They use one mutable cache namespace and publish different source-bound immutable manifests. |
-| Bounded storage | Exceed the regenerable quota with active, executing, and reclaimable entries. Reclamation reaches the hard bound using only safe entries and is idempotent. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
+| Bounded storage | When safe regenerable entries suffice, reclamation reaches the hard bound and is idempotent. When protected leases alone exceed it, new build admission is refused and exact overage is reported until lease release permits convergence. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
 | Source-view boundary | The provider source view has no discoverable Git administrative locator; ordinary worktree creation fails. Exact factoryd status/diff/commit operations still target the retained Change. |
 | God policy only | God may propose priority and assignment. Worktree creation, process launch, repository publication, outcome submission, capacity/budget mutation, and operator control fail. Killing God does not change finalization. |
 
