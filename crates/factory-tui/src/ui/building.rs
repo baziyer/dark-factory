@@ -322,7 +322,7 @@ mod tests {
             Vec::new(),
         );
         let item = attention(
-            AttentionReasonKind::BudgetExhausted,
+            AttentionReasonKind::WorkerBlocked,
             Some("alice"),
             Some("blocked"),
             None,
@@ -346,7 +346,7 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("BUILDING"));
         assert!(text.contains("ACTION — NEEDS YOU"));
-        assert!(text.contains("Reset budget"));
+        assert!(text.contains("Retry task"));
         assert!(text.contains("task: blocked"));
     }
 

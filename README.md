@@ -131,9 +131,10 @@ choices, an optional safe default, and each consequence. Press `Enter` when a
 safe default is shown, or `1`–`9` for a displayed choice. Provider questions
 use a bounded answer prompt; provider permissions require an explicit typed
 Approve or Reject choice. Budget reset has no default and requires a second
-confirmation. Free-form worker-block reasons remain diagnostics until the
-daemon can prove a typed human decision; delivery, observer, capacity, and
-unproven deterministic recovery stay with the control plane. Press `?` for all keys.
+confirmation. A blocked task with exact identity offers an explicit, no-default
+Retry task choice through the existing shared request; a worker block without
+an exact task remains diagnostic. Delivery, observer, capacity, and unproven
+deterministic recovery stay with the control plane. Press `?` for all keys.
 Press `q` to detach.
 Detaching does not stop any agent.
 

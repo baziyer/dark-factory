@@ -19,8 +19,9 @@ project unless `--project` selects one.
 
 BUILDING shows the full factory. Each project is a building. Each agent has a
 floor. NEEDS YOU is the decision subset of fleet attention, globally sorted
-most urgent and then oldest first. Free-form worker blocks and deterministic
-recovery remain diagnostics until the daemon can prove a typed human choice;
+most urgent and then oldest first. A worker-blocked item with exact task
+identity offers one explicit, no-default Retry task choice through the shared
+request. Opaque worker blocks and deterministic recovery remain diagnostics;
 they do not become operator decisions merely because work stopped.
 
 BUILDING separates durable lifecycle from current activity. Each row names the

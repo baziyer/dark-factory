@@ -1653,16 +1653,10 @@ mod tests {
     }
 
     #[test]
-    fn g_skips_free_form_worker_blocks_and_opens_the_first_typed_decision() {
+    fn g_skips_worker_blocks_without_exact_tasks_and_opens_the_first_typed_decision() {
         let mut board = board();
         board.attention = vec![
-            attention(
-                AttentionReasonKind::WorkerBlocked,
-                None,
-                Some("old-task"),
-                None,
-                10,
-            ),
+            attention(AttentionReasonKind::WorkerBlocked, None, None, None, 10),
             attention(
                 AttentionReasonKind::ProviderQuestion,
                 Some("alice"),
@@ -1693,6 +1687,161 @@ mod tests {
         assert!(board.attention_focus.as_ref().is_some_and(|focus| {
             !focus.resolved && focus.item.reason.kind == AttentionReasonKind::ProviderQuestion
         }));
+    }
+
+    #[test]
+    fn blocked_task_retry_uses_the_same_exact_keyboard_and_mouse_request() {
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        let expected = LocalRequest::RetryTask {
+            project_id: ProjectId::try_from("proj").unwrap(),
+            task_id: TaskId::try_from("blocked").unwrap(),
+        };
+
+        let mut keyboard = board();
+        keyboard.attention = vec![item.clone()];
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Char('g'))),
+            Intent::Redraw
+        ));
+        assert_eq!(
+            keyboard.selected_task.as_ref().map(TaskId::as_str),
+            Some("blocked")
+        );
+        assert!(matches!(
+            keyboard.handle_key(key(KeyCode::Enter)),
+            Intent::Redraw
+        ));
+        let Intent::SendWithIdentity {
+            request: keyboard_request,
+            ..
+        } = keyboard.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a typed retry request");
+        };
+        assert_eq!(keyboard_request, expected);
+
+        let mut mouse = board();
+        mouse.attention = vec![item.clone()];
+        let Intent::SendWithIdentity {
+            request: mouse_request,
+            ..
+        } = mouse.handle_mouse_target(MouseTarget::AttentionChoice(item, 0))
+        else {
+            panic!("blocked task click did not emit a typed retry request");
+        };
+        assert_eq!(mouse_request, expected);
+        assert_eq!(mouse_request, keyboard_request);
+    }
+
+    #[test]
+    fn blocked_task_retry_suppresses_pending_and_reconciles_error_then_success() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item.clone()];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+        assert!(matches!(
+            board.handle_key(key(KeyCode::Char('1'))),
+            Intent::Redraw
+        ));
+        assert!(matches!(
+            board.handle_mouse_target(MouseTarget::AttentionChoice(item.clone(), 0)),
+            Intent::Redraw
+        ));
+
+        board.apply_operation_response(operation_id, request, Err("retry rejected".into()));
+        assert!(board.pending_attention.is_none());
+        assert_eq!(board.decision_items(), vec![item.clone()]);
+
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice was not retryable after an error");
+        };
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 11),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.decision_items().is_empty());
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved)
+        );
+    }
+
+    #[test]
+    fn blocked_task_retry_stale_projection_clears_pending_before_delayed_success() {
+        let mut board = board();
+        let item = attention(
+            AttentionReasonKind::WorkerBlocked,
+            Some("alice"),
+            Some("blocked"),
+            None,
+            10,
+        );
+        board.attention = vec![item];
+        board.handle_key(key(KeyCode::Char('g')));
+        let Intent::SendWithIdentity {
+            operation_id,
+            request,
+        } = board.handle_key(key(KeyCode::Char('1')))
+        else {
+            panic!("blocked task choice did not emit a retry request");
+        };
+
+        board.apply_fleet_status(factory_core::status::FleetStatus {
+            generated_at_ms: 11,
+            event_sequence: 11,
+            auto_mode: true,
+            live_session_cap: 4,
+            live_sessions: 1,
+            projects: Vec::new(),
+            attention: Vec::new(),
+        });
+        assert!(board.pending_attention.is_none());
+        assert!(board.decision_items().is_empty());
+        assert!(
+            board
+                .attention_focus
+                .as_ref()
+                .is_some_and(|focus| focus.resolved)
+        );
+
+        board.apply_operation_response(
+            operation_id,
+            request,
+            Ok(LocalResponse::TaskRetried {
+                task: task("blocked", "proj", TaskStatus::Queued, Some("alice"), 12),
+            }),
+        );
+        assert!(board.pending_attention.is_none());
+        assert!(board.decision_items().is_empty());
     }
 
     #[test]

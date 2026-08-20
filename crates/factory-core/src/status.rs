@@ -340,18 +340,22 @@ impl<'de> Deserialize<'de> for AttentionItem {
 
 impl AttentionItem {
     /// Machine recovery belongs to the daemon/control plane, not the
-    /// operator's decision inbox. Inferred state and free-form worker blocks
-    /// are retained for diagnostics, but neither proves that only a human can
-    /// resolve the condition, so both stay out of NEEDS YOU.
+    /// operator's decision inbox. A blocked task with exact identity has the
+    /// existing typed retry operation; opaque worker blocks and inferred state
+    /// remain diagnostics because neither has a bounded operator action.
     #[must_use]
     pub const fn needs_operator_decision(&self) -> bool {
-        matches!(
-            self.reason.kind,
+        match self.reason.kind {
+            AttentionReasonKind::WorkerBlocked => self.task_id.is_some(),
             AttentionReasonKind::ProviderQuestion
-                | AttentionReasonKind::ProviderPermission
-                | AttentionReasonKind::BudgetExhausted
-                | AttentionReasonKind::PausedWithWork
-        )
+            | AttentionReasonKind::ProviderPermission
+            | AttentionReasonKind::BudgetExhausted
+            | AttentionReasonKind::PausedWithWork => true,
+            AttentionReasonKind::DeliveryRecovery
+            | AttentionReasonKind::ObserverProblem
+            | AttentionReasonKind::Inferred
+            | AttentionReasonKind::WaitingForCapacity => false,
+        }
     }
 
     /// Builds the same bounded card data for CLI and TUI. Choices are typed
@@ -367,6 +371,15 @@ impl AttentionItem {
             self.run_id.as_ref().map_or("—", crate::RunId::as_str),
         ));
         let choices = match self.reason.kind {
+            AttentionReasonKind::WorkerBlocked if self.task_id.is_some() => {
+                vec![AttentionChoice {
+                    label: "Retry task".to_owned(),
+                    action: AttentionAction::RetryTask,
+                    consequence:
+                        "returns the blocked task to the queue and clears its recorded reason"
+                            .to_owned(),
+                }]
+            }
             AttentionReasonKind::WorkerBlocked => Vec::new(),
             AttentionReasonKind::PausedWithWork => vec![AttentionChoice {
                 label: "Resume agent".to_owned(),
@@ -1241,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_inbox_requires_a_typed_human_decision_and_fails_closed_on_budget() {
+    fn decision_inbox_requires_an_exact_typed_action_and_has_no_retry_default() {
         let project = ProjectId::try_from("p").unwrap();
         let agents = vec![status(
             agent("a", true),
@@ -1279,8 +1292,11 @@ mod tests {
                 AttentionAction::InspectRecovery,
             ),
         };
-        assert!(!worker.needs_operator_decision());
+        assert!(worker.needs_operator_decision());
         assert!(!delivery.needs_operator_decision());
+        let mut opaque_worker = worker.clone();
+        opaque_worker.task_id = None;
+        assert!(!opaque_worker.needs_operator_decision());
         let mut inferred = worker.clone();
         inferred.reason = reason(
             AttentionReasonKind::Inferred,
@@ -1290,10 +1306,12 @@ mod tests {
         );
         assert!(!inferred.needs_operator_decision());
         let decision = worker.decision();
-        assert!(decision.choices.is_empty());
+        assert_eq!(decision.choices.len(), 1);
+        assert_eq!(decision.choices[0].action, AttentionAction::RetryTask);
         assert_eq!(decision.recommended, None);
         assert!(decision.evidence.contains("project: p"));
         assert!(!decision.cause.contains('\u{1b}'));
+        assert!(opaque_worker.decision().choices.is_empty());
         let mut budget = worker.clone();
         budget.reason = reason(
             AttentionReasonKind::BudgetExhausted,
@@ -1308,13 +1326,14 @@ mod tests {
         );
         assert_eq!(budget.decision().recommended, None);
         items.push(worker);
+        items.push(opaque_worker);
         items.push(budget);
         items.push(delivery);
         let inbox: Vec<_> = items
             .into_iter()
             .filter(AttentionItem::needs_operator_decision)
             .collect();
-        assert_eq!(inbox.len(), 2); // paused work plus the explicit budget decision
+        assert_eq!(inbox.len(), 3); // paused work, exact retry, and explicit budget decision
         assert!(inbox.iter().all(AttentionItem::needs_operator_decision));
     }
 

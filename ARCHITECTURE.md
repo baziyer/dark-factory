@@ -151,10 +151,12 @@ catalogue.
    delivery or observation failures, exhausted budgets, and lifecycle
    inference; every client receives the same bounded control-safe summary,
    source IDs, age, and safe action. NEEDS YOU is a decision inbox: only
-   reasons with a valid typed operator decision enter it. Unproven lifecycle
-   inference has no valid typed operator action and remains a control-plane
-   concern alongside delivery, observer, capacity, and other deterministic
-   recovery. Selecting a row keeps BUILDING visible and shows
+   reasons with a valid typed operator decision enter it. A worker-blocked item
+   enters only when it carries exact task identity for the existing typed retry
+   operation; retry has no default. Opaque worker blocks and unproven lifecycle
+   inference remain control-plane concerns alongside delivery, observer,
+   capacity, and other deterministic recovery. Selecting a row keeps BUILDING
+   visible and shows
    the same bounded cause, exact evidence, typed choices, optional safe
    recommendation, and consequences in both `factoryctl status` and the TUI.
    Permission and budget choices have no default and require explicit selection;

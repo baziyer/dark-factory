@@ -364,7 +364,7 @@ mod tests {
             concat!(
                 "Dark Factory: factoryctl v",
                 env!("CARGO_PKG_VERSION"),
-                " | active runtime version unknown | auto on | sessions 2/4 | projects 2 | attention 2\n",
+                " | active runtime version unknown | auto on | sessions 2/4 | projects 2 | attention 3\n",
                 "\nDark Factory [2J 東京🛠️é (factory) | agents 3 | backlog 5\n",
                 "  author | working | queue 2 | inbox 1 | dirty (3 files) on feature/ status]0;forged\n",
                 "  paused-worker | no session | paused | queue 1 | inbox 0 | worktree unavailable: git timed out\n",
@@ -376,6 +376,8 @@ mod tests {
                 "    2. Reject — denies the exact provider request\n",
                 "  budget exhausted | factory/author | age 0s | cause: tool-call budget exhausted | evidence: project: factory agent: author task: — session: — run: — | action: factoryctl agent budget reset --project factory --agent author\n",
                 "    1. Reset budget — resets the durable tool-call budget before more work runs\n",
+                "  worker blocked | factory/author | age 0s | cause: dependency missing | evidence: project: factory agent: author task: task-7 session: — run: — | action: factoryctl task retry --project factory --task task-7\n",
+                "    1. Retry task — returns the blocked task to the queue and clears its recorded reason\n",
             )
         );
         assert!(
@@ -387,7 +389,7 @@ mod tests {
         assert!(output.contains("東京🛠️e\u{301}"));
         assert!(!output.contains('\u{202e}'));
         assert!(!output.contains('\u{2066}'));
-        assert!(!output.contains("dependency missing"));
+        assert!(output.contains("dependency missing"));
     }
 
     #[test]
