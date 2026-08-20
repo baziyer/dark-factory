@@ -245,6 +245,10 @@ pub enum Error {
     MemoryCompaction(#[from] guidance::GuidanceError),
     #[error("could not write session hook token: {0}")]
     HookToken(#[from] hooks::HookTokenError),
+    #[error("could not create the owned session-attempt runtime: {0}")]
+    AttemptRuntimeCreate(#[source] io::Error),
+    #[error("could not remove the owned session-attempt runtime: {0}")]
+    AttemptRuntimeCleanup(#[source] io::Error),
     #[error("runner launch failed: {0}")]
     Spawn(#[from] runner_process::Error),
     #[error("runner control failed: {0}")]
@@ -1656,6 +1660,61 @@ fn select_provider(kind: Provider) -> Box<dyn providers::Provider + Send> {
     }
 }
 
+/// Exact ownership guard for one newly created `runs/<session-id>` attempt.
+///
+/// The path is claimed before any bearer material is written. Every normal
+/// failure is cleaned explicitly; `Drop` is only the unwind backstop. The
+/// guard never owns the shared runtime root or any sibling, and is disarmed
+/// only after the runner child has been handed to its supervisor.
+struct AttemptRuntime {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl AttemptRuntime {
+    fn claim(runtime_root: &Path, session_id: &SessionId) -> Result<Self, Error> {
+        prepare_runtime_root(runtime_root)?;
+        let path = runtime_root.join(session_id.as_str());
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&path)
+            .map_err(Error::AttemptRuntimeCreate)?;
+        Ok(Self { path, armed: true })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn cleanup(&mut self) -> Result<(), Error> {
+        fs::remove_dir_all(&self.path).map_err(Error::AttemptRuntimeCleanup)?;
+        self.armed = false;
+        Ok(())
+    }
+
+    fn cleanup_on_error<T>(&mut self, result: Result<T, Error>) -> Result<T, Error> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.cleanup()?;
+                Err(error)
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AttemptRuntime {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 async fn spawn_session_for_agent(
     config: &Config,
     state: &DaemonState,
@@ -1705,9 +1764,11 @@ async fn spawn_session_for_agent(
     };
 
     let session_id = new_session_id()?;
-    let runtime_dir = config.runtime_root.join(session_id.as_str());
+    let mut attempt_runtime = AttemptRuntime::claim(&config.runtime_root, &session_id)?;
+    let runtime_dir = attempt_runtime.path().to_owned();
     let hook_token_path = runtime_dir.join("hook.token");
-    let hook_token = hooks::write_hook_token(&hook_token_path)?;
+    let hook_token = attempt_runtime
+        .cleanup_on_error(hooks::write_hook_token(&hook_token_path).map_err(Error::from))?;
 
     let agent_dir = factory_core::paths::agent_dir(&config.guidance_root, project_id, agent_id);
 
@@ -1726,9 +1787,11 @@ async fn spawn_session_for_agent(
         agent_dir,
         socket_path: config.socket_path.clone(),
     };
-    let launch = provider_impl.spawn_spec(&ctx)?;
+    let launch =
+        attempt_runtime.cleanup_on_error(provider_impl.spawn_spec(&ctx).map_err(Error::from))?;
 
-    let runner_instance_id = new_runner_instance_id()?;
+    let runner_instance_id = attempt_runtime.cleanup_on_error(new_runner_instance_id())?;
+    let runner_run_id = attempt_runtime.cleanup_on_error(session_run_id(&session_id))?;
     let (codex_home, extra_env) = split_provider_environment(launch.env);
     let mut session_environment = vec![
         (
@@ -1780,7 +1843,7 @@ async fn spawn_session_for_agent(
             .collect(),
         provider_environment,
         session_environment,
-        run_id: session_run_id(&session_id)?,
+        run_id: runner_run_id.clone(),
         runner_instance_id: runner_instance_id.clone(),
         runtime_dir: runtime_dir.clone(),
         cwd: worktree_path,
@@ -1798,7 +1861,7 @@ async fn spawn_session_for_agent(
     // missing `factory-runner`) ever showed up, and it retried forever
     // with no visible trace and no runtime-directory cleanup (18 leaked
     // `runs/<uuid>/` directories in the repro that motivated this).
-    let created_at_ms = now_ms()?;
+    let created_at_ms = attempt_runtime.cleanup_on_error(now_ms())?;
     let new_session = crate::store::NewSession {
         id: session_id.clone(),
         project_id: project_id.clone(),
@@ -1816,21 +1879,18 @@ async fn spawn_session_for_agent(
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         runner_protocol_version: 1,
     };
-    let snapshot = state
+    let create_result = state
         .commit_and_publish(move |store| {
             let (snapshot, events) = store.create_session(new_session, created_at_ms)?;
             Ok((snapshot, events))
         })
-        .await?;
+        .await
+        .map_err(Error::from);
+    let snapshot = attempt_runtime.cleanup_on_error(create_result)?;
 
     let child = match runner_process::spawn_runner(launch_spec, STARTUP_GRACE).await {
         Ok(child) => child,
         Err(error) => {
-            // Nothing ever ran in this attempt's runtime directory (the
-            // hook token file, and any provider-seeded config written
-            // into it by `spawn_spec` above) -- remove it rather than
-            // leaving one leaked directory behind per failed attempt.
-            let _ = fs::remove_dir_all(&runtime_dir);
             let reason = truncate_utf8(&error.to_string(), MAX_WAIT_REASON_BYTES);
             let fail_session_id = session_id.clone();
             let fail_at_ms = now_ms().unwrap_or(created_at_ms);
@@ -1846,6 +1906,7 @@ async fn spawn_session_for_agent(
                     Ok((snapshot, events))
                 })
                 .await;
+            attempt_runtime.cleanup()?;
             return Err(Error::Spawn(error));
         }
     };
@@ -1856,10 +1917,11 @@ async fn spawn_session_for_agent(
         session_id.clone(),
         agent.snapshot.provider == Provider::Codex,
         runtime_dir,
-        session_run_id(&session_id)?,
+        runner_run_id,
         runner_instance_id,
         child,
     ));
+    attempt_runtime.disarm();
     Ok(snapshot)
 }
 
@@ -3693,6 +3755,18 @@ mod tests {
         }
     }
 
+    fn assert_only_owned_runtime_was_removed(runtime_root: &Path) {
+        let entries = fs::read_dir(runtime_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![std::ffi::OsString::from("keep")]);
+        assert_eq!(
+            fs::read_to_string(runtime_root.join("keep").join("sentinel")).unwrap(),
+            "preserve me"
+        );
+    }
+
     fn deadline_session(
         directory: &Path,
         project_id: &ProjectId,
@@ -4332,6 +4406,185 @@ mod tests {
             backoff.try_begin_preparation(&agent_id),
             "clearing the mark must restore normal dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_preparation_failure_removes_only_the_owned_attempt_runtime() {
+        let directory = private_tempdir();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+
+        let mut store = Store::open_in_memory().unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: worktree.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .set_agent_worktree(
+                &project_id,
+                &agent_id,
+                worktree.to_string_lossy().into_owned(),
+                3,
+            )
+            .unwrap();
+        guidance::ensure_agent(directory.path(), &project_id, &agent_id).unwrap();
+
+        let agent_dir = factory_core::paths::agent_dir(directory.path(), &project_id, &agent_id);
+        let codex_home = agent_dir.join("codex-home");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(codex_home.join("rules").join("default.rules"))
+            .unwrap();
+        hooks::write_private_file(
+            &codex_home.join("config.toml"),
+            b"model = \"fixture-model\"\n",
+        )
+        .unwrap();
+
+        let cfg = config(directory.path());
+        prepare_runtime_root(&cfg.runtime_root).unwrap();
+        fs::create_dir(cfg.runtime_root.join("keep")).unwrap();
+        fs::write(
+            cfg.runtime_root.join("keep").join("sentinel"),
+            "preserve me",
+        )
+        .unwrap();
+        let event_count = store.events_after(0, 100).unwrap().len();
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+
+        assert!(matches!(
+            spawn_session_for_agent(&cfg, &state, &wake_tx, &project_id, &agent_id).await,
+            Err(Error::Provider(_))
+        ));
+
+        let (sessions, events) = state
+            .with_store({
+                let project_id = project_id.clone();
+                move |store| {
+                    Ok((
+                        store.list_sessions(&project_id, None, 10)?,
+                        store.events_after(0, 100)?,
+                    ))
+                }
+            })
+            .await
+            .unwrap();
+        assert!(sessions.is_empty());
+        assert_eq!(events.len(), event_count);
+        assert_only_owned_runtime_was_removed(&cfg.runtime_root);
+        assert!(codex_home.join("config.toml").is_file());
+    }
+
+    #[tokio::test]
+    async fn session_insert_failure_removes_only_the_owned_attempt_runtime() {
+        let directory = private_tempdir();
+        let database = directory.path().join("factory.db");
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let agent_id = AgentId::try_from("curie").unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                crate::store::NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: worktree.to_string_lossy().into_owned(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_agent(
+                crate::store::NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                2,
+            )
+            .unwrap();
+        store
+            .set_agent_worktree(
+                &project_id,
+                &agent_id,
+                worktree.to_string_lossy().into_owned(),
+                3,
+            )
+            .unwrap();
+        guidance::ensure_agent(directory.path(), &project_id, &agent_id).unwrap();
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER force_session_insert_failure
+                 BEFORE INSERT ON sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'forced session insert failure');
+                 END;",
+            )
+            .unwrap();
+
+        let cfg = config(directory.path());
+        prepare_runtime_root(&cfg.runtime_root).unwrap();
+        fs::create_dir(cfg.runtime_root.join("keep")).unwrap();
+        fs::write(
+            cfg.runtime_root.join("keep").join("sentinel"),
+            "preserve me",
+        )
+        .unwrap();
+        let event_count = store.events_after(0, 100).unwrap().len();
+        let state = DaemonState::new(store);
+        let (wake_tx, _wake_rx) = mpsc::channel(8);
+
+        assert!(matches!(
+            spawn_session_for_agent(&cfg, &state, &wake_tx, &project_id, &agent_id).await,
+            Err(Error::State(_))
+        ));
+
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        let counts = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sessions),
+                    (SELECT COUNT(*) FROM session_work),
+                    (SELECT COUNT(*) FROM events)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, event_count as i64));
+        assert_only_owned_runtime_was_removed(&cfg.runtime_root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5343,6 +5596,7 @@ mod tests {
                      ALTER TABLE delivery_attempts DROP COLUMN run_id;
                      ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                      ALTER TABLE tasks DROP COLUMN work_revision;
+                     DROP INDEX sessions_one_live_principal_hook_token;
                      ALTER TABLE sessions DROP COLUMN principal_version;
                      PRAGMA user_version = 28;
                      PRAGMA foreign_keys = ON;",

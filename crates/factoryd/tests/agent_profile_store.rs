@@ -139,6 +139,7 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
             "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
              ALTER TABLE sessions DROP COLUMN resumed_provider_session;
              ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+             DROP INDEX sessions_one_live_principal_hook_token;
              ALTER TABLE sessions DROP COLUMN principal_version;
              ALTER TABLE agent_profiles DROP COLUMN model_selection_reason;
              ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;",

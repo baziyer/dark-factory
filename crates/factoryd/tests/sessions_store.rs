@@ -57,6 +57,7 @@ fn rewind_session_work_migration(database: &std::path::Path) {
              ALTER TABLE delivery_attempts DROP COLUMN run_id;
              ALTER TABLE delivery_attempts DROP COLUMN task_revision;
              ALTER TABLE tasks DROP COLUMN work_revision;
+             DROP INDEX sessions_one_live_principal_hook_token;
              ALTER TABLE sessions DROP COLUMN principal_version;
              PRAGMA user_version = 28;
              PRAGMA foreign_keys = ON;",
@@ -142,6 +143,31 @@ fn fixture() -> Store {
         )
         .unwrap();
     store
+}
+
+fn add_project_agent(store: &mut Store, project: &str, agent: &str, created_at_ms: i64) {
+    store
+        .create_project(
+            NewProject {
+                id: project_id(project),
+                name: project.into(),
+                root: format!("/work/{project}"),
+            },
+            created_at_ms,
+        )
+        .unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent_id(agent),
+                project_id: project_id(project),
+                parent_agent_id: None,
+                role: AgentRole::Worker,
+                provider: Provider::Codex,
+            },
+            created_at_ms + 1,
+        )
+        .unwrap();
 }
 
 #[test]
@@ -548,6 +574,7 @@ fn migrations_0019_through_0030_follow_the_budget_schema_in_order() {
                  ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
                  ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
+                 DROP INDEX sessions_one_live_principal_hook_token;
                  ALTER TABLE sessions DROP COLUMN principal_version;
                  DROP TABLE delivery_attempts;
                  DROP TABLE connector_events;
@@ -620,7 +647,8 @@ fn migration_0030_marks_existing_sessions_legacy_and_new_sessions_authenticated(
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE sessions DROP COLUMN principal_version;
+                "DROP INDEX sessions_one_live_principal_hook_token;
+                 ALTER TABLE sessions DROP COLUMN principal_version;
                  PRAGMA user_version = 29;",
             )
             .unwrap();
@@ -646,6 +674,19 @@ fn migration_0030_marks_existing_sessions_legacy_and_new_sessions_authenticated(
             "unexpected principal version for {session}"
         );
     }
+    let index_sql: String = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'sessions_one_live_principal_hook_token'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        index_sql.split_whitespace().collect::<Vec<_>>().join(" "),
+        "CREATE UNIQUE INDEX sessions_one_live_principal_hook_token ON sessions(hook_token) \
+         WHERE ended_at_ms IS NULL AND principal_version = 1"
+    );
 }
 
 #[test]
@@ -732,6 +773,7 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
+                 DROP INDEX sessions_one_live_principal_hook_token;
                  ALTER TABLE sessions DROP COLUMN principal_version;
                  PRAGMA user_version = 27;
                  PRAGMA foreign_keys = ON;",
@@ -876,6 +918,7 @@ fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defens
                  ALTER TABLE delivery_attempts DROP COLUMN run_id;
                  ALTER TABLE delivery_attempts DROP COLUMN task_revision;
                  ALTER TABLE tasks DROP COLUMN work_revision;
+                 DROP INDEX sessions_one_live_principal_hook_token;
                  ALTER TABLE sessions DROP COLUMN principal_version;
                  PRAGMA user_version = 28;
                  PRAGMA foreign_keys = ON;",
@@ -1408,6 +1451,209 @@ fn only_one_live_session_per_agent_is_allowed() {
     store
         .create_session(new_session("s2", "factory", "curie"), 8)
         .unwrap();
+}
+
+#[test]
+fn live_bearer_collision_is_transactional_across_projects_and_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("bearer-collision.db");
+    let bearer = "d".repeat(64);
+    let baseline_events;
+    {
+        let mut store = Store::open(&database).unwrap();
+        add_project_agent(&mut store, "factory", "curie", 1);
+        add_project_agent(&mut store, "other", "feynman", 3);
+        let mut first = new_session("first-session", "factory", "curie");
+        first.hook_token = bearer.clone();
+        store.create_session(first, 5).unwrap();
+        baseline_events = store.events_after(0, 100).unwrap().len();
+    }
+
+    let mut store = Store::open(&database).unwrap();
+    let mut second = new_session("second-session", "other", "feynman");
+    second.hook_token = bearer;
+    let error = store.create_session(second, 6).unwrap_err();
+    assert!(matches!(error, StoreError::LiveSessionHookTokenCollision));
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let counts = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM sessions),
+                (SELECT COUNT(*) FROM session_work),
+                (SELECT COUNT(*) FROM events)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(counts, (1, 1, baseline_events as i64));
+}
+
+#[test]
+fn authentication_ignores_matching_nonauthoritative_rows_in_either_order() {
+    for (invalid_session, valid_session, invalid_agent, valid_agent) in [
+        ("a-invalid", "z-valid", "ada", "zuse"),
+        ("z-invalid", "a-valid", "zuse", "ada"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("candidate-order.db");
+        let credential = "e".repeat(64);
+        {
+            let mut store = Store::open(&database).unwrap();
+            add_project_agent(&mut store, "factory", invalid_agent, 1);
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id(valid_agent),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                    },
+                    3,
+                )
+                .unwrap();
+            let mut invalid = new_session(invalid_session, "factory", invalid_agent);
+            invalid.hook_token = "1".repeat(64);
+            store.create_session(invalid, 4).unwrap();
+            let mut valid = new_session(valid_session, "factory", valid_agent);
+            valid.hook_token = "2".repeat(64);
+            store.create_session(valid, 5).unwrap();
+        }
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET hook_token = ?1, principal_version = 0 WHERE id = ?2",
+                rusqlite::params![credential, invalid_session],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE sessions SET hook_token = ?1 WHERE id = ?2",
+                rusqlite::params![credential, valid_session],
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(&database).unwrap();
+        let principal = store
+            .authenticate_session(credential.as_bytes())
+            .unwrap()
+            .expect("the one authoritative matching row must authenticate");
+        assert_eq!(principal.agent_id, agent_id(valid_agent));
+        assert_eq!(principal.session_id, session_id(valid_session));
+    }
+}
+
+#[test]
+fn authentication_rejects_duplicate_live_principal_corruption() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("duplicate-principals.db");
+    let credential = "f".repeat(64);
+    {
+        let mut store = Store::open(&database).unwrap();
+        add_project_agent(&mut store, "factory", "ada", 1);
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id("zuse"),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                3,
+            )
+            .unwrap();
+        let mut first = new_session("a-session", "factory", "ada");
+        first.hook_token = "1".repeat(64);
+        store.create_session(first, 4).unwrap();
+        let mut second = new_session("z-session", "factory", "zuse");
+        second.hook_token = "2".repeat(64);
+        store.create_session(second, 5).unwrap();
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch("DROP INDEX sessions_one_live_principal_hook_token;")
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET hook_token = ?1 WHERE id IN ('a-session', 'z-session')",
+            [credential.as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&database).unwrap();
+    assert!(
+        store
+            .authenticate_session(credential.as_bytes())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn ended_stopping_and_version_zero_sessions_never_authenticate() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("nonauthoritative-principals.db");
+    let mut store = Store::open(&database).unwrap();
+    add_project_agent(&mut store, "factory", "ended", 1);
+    for (agent, timestamp) in [("stopping", 3), ("legacy", 4)] {
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id(agent),
+                    project_id: project_id("factory"),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Codex,
+                },
+                timestamp,
+            )
+            .unwrap();
+    }
+    for (session, agent, token, timestamp) in [
+        ("ended-session", "ended", "3", 5),
+        ("stopping-session", "stopping", "4", 6),
+        ("legacy-session", "legacy", "5", 7),
+    ] {
+        let mut input = new_session(session, "factory", agent);
+        input.hook_token = token.repeat(64);
+        store.create_session(input, timestamp).unwrap();
+    }
+    store
+        .end_session(&session_id("ended-session"), Some(0), None, 8)
+        .unwrap();
+    store
+        .request_session_stop(&project_id("factory"), &session_id("stopping-session"), 9)
+        .unwrap();
+    drop(store);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE sessions SET principal_version = 0 WHERE id = 'legacy-session'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&database).unwrap();
+    for token in ["3", "4", "5"] {
+        assert!(
+            store
+                .authenticate_session(token.repeat(64).as_bytes())
+                .unwrap()
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -2460,9 +2706,9 @@ fn a_different_live_session_cannot_complete_another_sessions_task() {
     store
         .open_run_episode(&owner.id, &task_id("task-1"), 7)
         .unwrap();
-    let (other, _) = store
-        .create_session(new_session("other-session", "factory", "feynman"), 8)
-        .unwrap();
+    let mut other_session = new_session("other-session", "factory", "feynman");
+    other_session.hook_token = "b".repeat(64);
+    let (other, _) = store.create_session(other_session, 8).unwrap();
 
     assert!(
         store

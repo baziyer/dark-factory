@@ -605,6 +605,8 @@ pub enum StoreError {
     SessionStopping,
     #[error("session hook token is invalid")]
     InvalidHookToken,
+    #[error("another live authenticated session already owns this hook token")]
+    LiveSessionHookTokenCollision,
     #[error("run is not in the required state")]
     InvalidRunState,
     #[error("private execution metadata is empty, relative, or too large")]
@@ -1372,6 +1374,17 @@ impl Store {
         if already_live {
             return Err(StoreError::SessionAlreadyLive);
         }
+        let bearer_already_live: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sessions
+                WHERE hook_token = ?1 AND ended_at_ms IS NULL AND principal_version = 1
+             )",
+            params![input.hook_token],
+            |row| row.get(0),
+        )?;
+        if bearer_already_live {
+            return Err(StoreError::LiveSessionHookTokenCollision);
+        }
         let resumed_provider_session = match input.provider_session_id.as_deref() {
             Some(provider_session_id) => transaction.query_row(
                 "SELECT EXISTS(
@@ -1484,10 +1497,16 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
         let mut matched = None;
+        let mut matching_principals = 0_u8;
         for (id, expected, principal_version, stop_requested_at_ms) in rows {
-            if constant_time_eq(expected.as_bytes(), credential) {
-                matched = (principal_version == 1 && stop_requested_at_ms.is_none()).then_some(id);
+            let credential_matches = constant_time_eq(expected.as_bytes(), credential);
+            if credential_matches && principal_version == 1 && stop_requested_at_ms.is_none() {
+                matching_principals = matching_principals.saturating_add(1);
+                matched = (matching_principals == 1).then_some(id);
             }
+        }
+        if matching_principals != 1 {
+            return Ok(None);
         }
         let Some(id) = matched else {
             return Ok(None);
