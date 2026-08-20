@@ -13,16 +13,16 @@ use std::{
     pin::Pin,
     process::Stdio,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use factory_core::{
     RunId, RunnerInstanceId,
     runner::{
         DEFAULT_TERMINAL_ATTACH_TAIL_BYTES, MAX_RUNNER_ERROR_BYTES, MAX_RUNNER_FRAME_BYTES,
-        MAX_RUNNER_OUTPUT_TEXT_BYTES, MAX_RUNNER_SPOOL_BYTES, MAX_STARTUP_STDIN_BYTES,
-        MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES,
-        OutputStream, RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
+        MAX_RUNNER_OUTPUT_TEXT_BYTES, MAX_STARTUP_STDIN_BYTES, MAX_TERMINAL_INPUT_BYTES,
+        MAX_TERMINAL_LOG_BYTES, MAX_TERMINAL_OUTPUT_CHUNK_BYTES, OutputStream,
+        RUNNER_PROTOCOL_VERSION, RequestEnvelope, RunnerErrorCode, RunnerEvent,
         RunnerEventEnvelope, RunnerFrame, RunnerRequest, TerminalAttachMode, TerminalSize,
         decode_terminal_bytes, encode_terminal_bytes,
     },
@@ -34,13 +34,16 @@ use rustix::process::{
 };
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream, unix::OwnedWriteHalf},
     process::Command,
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
     task::{JoinHandle, JoinSet},
     time::{Instant, Sleep, sleep, timeout},
 };
+
+mod event_log;
+use event_log::EventLog;
 
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_STOP_GRACE: Duration = Duration::from_secs(60);
@@ -98,8 +101,6 @@ const RAW_MODE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// backstop that fails and retries a session stuck `starting`
 /// (`docs/providers.md`).
 const RAW_MODE_POLL_TIMEOUT: Duration = Duration::from_secs(120);
-const BROADCAST_CAPACITY: usize = 32;
-const TERMINAL_RESERVE_BYTES: usize = MAX_RUNNER_ERROR_BYTES + 4096;
 const TERMINAL_LOG_FILE: &str = "terminal.log";
 const TERMINAL_LOG_ROTATED_FILE: &str = "terminal.log.1";
 const TERMINAL_BROADCAST_CAPACITY: usize = 64;
@@ -139,26 +140,6 @@ struct PreparedRuntime {
     log: Arc<EventLog>,
     terminal_log: Option<Arc<TerminalLog>>,
     socket_path: PathBuf,
-}
-
-struct EventLog {
-    spool_path: PathBuf,
-    inner: Mutex<LogInner>,
-    events: broadcast::Sender<RunnerEventEnvelope>,
-}
-
-struct LogInner {
-    file: BufWriter<File>,
-    head: i64,
-    terminal_sequence: Option<i64>,
-    bytes: usize,
-    output_truncated: bool,
-}
-
-#[derive(Clone, Copy)]
-struct LogSnapshot {
-    head: i64,
-    terminal_sequence: Option<i64>,
 }
 
 struct RuntimeState {
@@ -274,100 +255,6 @@ impl ControlError {
             code,
             message: truncate_utf8(message.into(), MAX_RUNNER_ERROR_BYTES),
         }
-    }
-}
-
-impl EventLog {
-    fn new(spool_path: PathBuf, file: File) -> Arc<Self> {
-        let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
-        Arc::new(Self {
-            spool_path,
-            inner: Mutex::new(LogInner {
-                file: BufWriter::new(file),
-                head: 0,
-                terminal_sequence: None,
-                bytes: 0,
-                output_truncated: false,
-            }),
-            events,
-        })
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<RunnerEventEnvelope> {
-        self.events.subscribe()
-    }
-
-    async fn snapshot(&self) -> LogSnapshot {
-        let inner = self.inner.lock().await;
-        LogSnapshot {
-            head: inner.head,
-            terminal_sequence: inner.terminal_sequence,
-        }
-    }
-
-    async fn append_output(
-        &self,
-        stream: OutputStream,
-        text: String,
-        lossy: bool,
-    ) -> Result<(), Error> {
-        debug_assert!(text.len() <= MAX_RUNNER_OUTPUT_TEXT_BYTES);
-        let event = RunnerEvent::Output {
-            stream,
-            text,
-            lossy,
-        };
-        let published = {
-            let mut inner = self.inner.lock().await;
-            if inner.terminal_sequence.is_some() || inner.output_truncated {
-                return Ok(());
-            }
-            let envelope = next_envelope(&inner, event);
-            let encoded = encode_event(&envelope)?;
-            if inner.bytes + encoded.len() + TERMINAL_RESERVE_BYTES > MAX_RUNNER_SPOOL_BYTES {
-                inner.output_truncated = true;
-                let truncated = next_envelope(
-                    &inner,
-                    RunnerEvent::OutputTruncated {
-                        limit_bytes: u64::try_from(MAX_RUNNER_SPOOL_BYTES)
-                            .expect("spool limit fits u64"),
-                    },
-                );
-                Some(append_encoded(&mut inner, truncated, false).await?)
-            } else {
-                Some(append_encoded(&mut inner, envelope, false).await?)
-            }
-        };
-        if let Some(event) = published {
-            let _ = self.events.send(event);
-        }
-        Ok(())
-    }
-
-    async fn append_lifecycle(&self, event: RunnerEvent, terminal: bool) -> Result<i64, Error> {
-        let published = {
-            let mut inner = self.inner.lock().await;
-            if inner.terminal_sequence.is_some() {
-                return Err(Error::Task(
-                    "attempted to append a second terminal event".into(),
-                ));
-            }
-            let envelope = next_envelope(&inner, event);
-            let encoded_len = encode_event(&envelope)?.len();
-            if inner.bytes + encoded_len > MAX_RUNNER_SPOOL_BYTES {
-                return Err(Error::Task(
-                    "terminal event does not fit the bounded spool".into(),
-                ));
-            }
-            let envelope = append_encoded(&mut inner, envelope, true).await?;
-            if terminal {
-                inner.terminal_sequence = Some(envelope.sequence);
-            }
-            envelope
-        };
-        let sequence = published.sequence;
-        let _ = self.events.send(published);
-        Ok(sequence)
     }
 }
 
@@ -761,40 +648,6 @@ fn ansi_sequence_end(bytes: &[u8], mut index: usize) -> usize {
         }
     }
     index
-}
-
-fn next_envelope(inner: &LogInner, event: RunnerEvent) -> RunnerEventEnvelope {
-    RunnerEventEnvelope {
-        protocol_version: RUNNER_PROTOCOL_VERSION,
-        sequence: inner.head + 1,
-        occurred_at_ms: now_ms(),
-        event,
-    }
-}
-
-fn encode_event(event: &RunnerEventEnvelope) -> Result<Vec<u8>, Error> {
-    let mut encoded = serde_json::to_vec(event)?;
-    if encoded.len() > MAX_RUNNER_FRAME_BYTES {
-        return Err(Error::Task("runner event exceeded the frame limit".into()));
-    }
-    encoded.push(b'\n');
-    Ok(encoded)
-}
-
-async fn append_encoded(
-    inner: &mut LogInner,
-    event: RunnerEventEnvelope,
-    sync: bool,
-) -> Result<RunnerEventEnvelope, Error> {
-    let encoded = encode_event(&event)?;
-    inner.file.write_all(&encoded).await?;
-    inner.file.flush().await?;
-    if sync {
-        inner.file.get_ref().sync_data().await?;
-    }
-    inner.bytes += encoded.len();
-    inner.head = event.sequence;
-    Ok(event)
 }
 
 pub async fn run(config: Config) -> Result<(), Error> {
@@ -1483,7 +1336,7 @@ async fn subscribe_connection(
         },
     )
     .await?;
-    replay_events(&state.log.spool_path, write, after_sequence, snapshot.head).await?;
+    replay_events(state.log.spool_path(), write, after_sequence, snapshot.head).await?;
     send_frame(
         write,
         &RunnerFrame::CaughtUp {
@@ -1508,12 +1361,12 @@ async fn subscribe_connection(
                     delivered = event.sequence;
                 }
                 Ok(event) => {
-                    replay_events(&state.log.spool_path, write, delivered, event.sequence).await?;
+                    replay_events(state.log.spool_path(), write, delivered, event.sequence).await?;
                     delivered = event.sequence;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
                     let head = state.log.snapshot().await.head;
-                    replay_events(&state.log.spool_path, write, delivered, head).await?;
+                    replay_events(state.log.spool_path(), write, delivered, head).await?;
                     delivered = head;
                 }
                 Err(broadcast::error::RecvError::Closed) => return Ok(()),
@@ -2574,13 +2427,6 @@ fn truncate_utf8(mut text: String, maximum: usize) -> String {
     }
     text.truncate(length);
     text
-}
-
-fn now_ms() -> i64 {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]
