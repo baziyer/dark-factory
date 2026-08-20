@@ -159,6 +159,10 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
             "DROP TABLE session_work;
              DROP INDEX delivery_attempts_session_work_identity;
              DROP INDEX runs_one_open_per_session;
+             DROP INDEX orchestrator_cycle_ledger_project_state;
+             DROP TABLE orchestrator_cycle_ledger;
+             DROP TABLE orchestrator_scheduler_state;
+             ALTER TABLE delivery_attempts DROP COLUMN orchestrator_cycle_lease_id;
              ALTER TABLE tasks DROP COLUMN work_revision;
              DROP TABLE delivery_attempts;",
         )
@@ -170,9 +174,38 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
         )
         .unwrap();
     connection.pragma_update(None, "user_version", 21).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('orchestrator_scheduler_state', 'orchestrator_cycle_ledger')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "pre-0022 fixture must not pre-create migration 0030 scheduler objects"
+    );
     drop(connection);
 
     let store = Store::open(&database).unwrap();
+    let connection = Connection::open(&database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 30);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'orchestrator_scheduler_state'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1,
+        "current schema must create scheduler state through migration 0030"
+    );
     let detail = store
         .get_agent_detail(
             &ProjectId::try_from("factory").unwrap(),
