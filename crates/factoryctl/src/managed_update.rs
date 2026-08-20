@@ -956,6 +956,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn fake_manifest(version: &str) -> Manifest {
         Manifest {
             version: version.to_owned(),
@@ -970,6 +971,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn install_fake_runtime(home: &Path, version: &str) {
         let source = home.join("source");
         fs::create_dir_all(&source).unwrap();
@@ -982,6 +984,7 @@ mod tests {
         install::activate(home, version).unwrap();
     }
 
+    #[cfg(target_os = "macos")]
     fn managed_plist(home: &Path) -> String {
         format!(
             "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>ProgramArguments</key><array><string>{}/bin/current/factoryd</string></array><key>EnvironmentVariables</key><dict><key>DARK_FACTORY_HOME</key><string>{}</string></dict></dict></plist>",
