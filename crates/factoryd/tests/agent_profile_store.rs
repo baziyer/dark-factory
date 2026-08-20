@@ -131,8 +131,8 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
 
     // Simulate the exact pre-#146 durable state, then let the next Store open
     // perform the 0022 repair as an upgrade would. The fixture was opened by
-    // the current binary, so remove only the later #155 columns before
-    // rewinding its schema version.
+    // the current binary, so remove the later schema before rewinding its
+    // version.
     let connection = Connection::open(&database).unwrap();
     connection
         .execute_batch(
@@ -151,10 +151,16 @@ fn migration_repairs_legacy_codex_bypass_before_the_next_launch() {
         .unwrap();
     // `Store::open` above intentionally created the newest schema so the
     // fixture can seed a real profile. Rewind it as an actual pre-0022
-    // database, including removing the post-0022 table; otherwise migration
-    // 0024/0025 quite correctly reject duplicate schema changes.
+    // database, including removing the post-0022 tables, columns, and index;
+    // otherwise later migrations quite correctly reject duplicate schema
+    // changes.
     connection
-        .execute_batch("DROP TABLE delivery_attempts;")
+        .execute_batch(
+            "DROP TABLE session_work;
+             DROP INDEX runs_one_open_per_session;
+             ALTER TABLE tasks DROP COLUMN work_revision;
+             DROP TABLE delivery_attempts;",
+        )
         .unwrap();
     connection
         .execute_batch(

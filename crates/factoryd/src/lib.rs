@@ -10,6 +10,7 @@ pub mod providers;
 pub mod repository;
 pub mod runner_client;
 pub mod runner_process;
+pub mod session_work;
 pub mod store;
 pub mod webhook_http;
 pub mod worktrees;

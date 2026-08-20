@@ -77,15 +77,20 @@ tty.setraw(sys.stdin.fileno())
 hook("SessionStart", {"session_id": thread_id})
 
 # A resumed provider can expose a raw terminal before its prior thread's
-# composer is ready. The first bounded delivery intentionally models the
-# observed no-prompt/no-run loss; the daemon's one outer retry must recover.
+# composer is ready. The first delivery intentionally models the observed
+# no-prompt/no-run loss; the daemon must retire this poisoned resumed thread
+# and let the queued task enter one fresh conversation.
 ignored_resumed_deliveries = 1 if resumed else 0
-ignored_fresh_deliveries = 1 if not resumed and generation > 0 else 0
 buffer = bytearray()
 prompt_log = os.path.join(os.path.dirname(token), "fake-codex-prompts.jsonl")
-delay_hook = os.path.exists(
-    os.path.join(os.path.dirname(sys.argv[0]), "delay-user-prompt-submit")
+delay_hook_path = os.path.join(
+    os.path.dirname(sys.argv[0]), "delay-user-prompt-submit"
 )
+try:
+    with open(delay_hook_path, encoding="utf-8") as delay:
+        delay_hook_seconds = float(delay.read())
+except (FileNotFoundError, ValueError):
+    delay_hook_seconds = 0
 while True:
     data = os.read(sys.stdin.fileno(), 1)
     if not data:
@@ -100,18 +105,12 @@ while True:
             # bare CR cannot recover it.
             buffer.clear()
             continue
-        if ignored_fresh_deliveries:
-            ignored_fresh_deliveries -= 1
-            # A fresh conversation remains eligible for the ordinary bounded
-            # same-composer retry. Keep the text buffered so its recovery CR
-            # can acknowledge this transient miss without spawning again.
-            continue
         buffer.clear()
         if prompt_log:
             with open(prompt_log, "a", encoding="utf-8") as log:
                 log.write(json.dumps(text) + "\n")
-        if delay_hook:
-            time.sleep(3)
+        if delay_hook_seconds:
+            time.sleep(delay_hook_seconds)
         hook("UserPromptSubmit", {"prompt": text})
         hook("PreToolUse", {"tool_name": "Bash"})
         hook("PostToolUse", {"tool_name": "Bash"})

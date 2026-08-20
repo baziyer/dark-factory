@@ -77,13 +77,24 @@ catalogue.
    delivery durably, synchronously, as part of handling that exact hook
    request; a session already `working`/`waiting_for_input` is instead
    delivered via its `Stop`/`SubagentStop` hook's block-reply contract. A
-   delivery attempt row stores the exact prompt, task incarnation, prior
-   run count, and message identities. Each typed prompt carries an invisible
-   attempt nonce that the acknowledgement must echo, binding the hook to the
-   immutable attempt even when task ids are deleted and recreated. Retry state is durable: a daemon
-   restart consumes an interrupted in-flight attempt, and only an explicit
-   operator resume resets a terminal attempt. Recovery never retypes a body
-   whose submission may already have been accepted. A resumed Codex composer
+   `session_work` is the one provider-independent authority for this work,
+   separate from the provider lifecycle state on `sessions`. Its exhaustive
+   states are `empty`, `delivering`, `uncertain`, and `running`, guarded by a
+   monotonic compare-and-swap revision. Reservation captures the exact attempt,
+   task incarnation, task work revision, and preallocated run
+   id before any external effect. Immediately before the first PTY write or
+   hook reply it moves to `uncertain`; only the exact echoed attempt may move
+   it to `running`, and only exact run completion or session end returns it to
+   `empty`. A provider becoming idle, an operator resume, a journal retry, or
+   an in-memory lock cannot release it. `delivery_attempts` retains prompt and
+   effect history but is an audit journal, never a second owner. The journal's
+   exact acknowledged identity is the idempotency receipt; run counts and task
+   status are not evidence that a prompt landed. A crash while still
+   `delivering` may retry the stored attempt, while `uncertain` is never
+   replayed because submission may already have been accepted. Each typed
+   prompt carries an invisible attempt nonce that the acknowledgement must
+   echo, binding the hook to the immutable attempt even when task ids are
+   deleted and recreated. A resumed Codex composer
    that does not acknowledge its first delivery is retired: the daemon blocks
    that exact provider thread from future resume, stops its runner, and sends
    the still-queued task once in a fresh conversation after the runner's exit
@@ -95,13 +106,15 @@ catalogue.
    the old runner's actual exit is observed. Resumed-vs-fresh launch provenance
    is recorded at session creation; a fresh Codex `SessionStart` assigning a
    thread id cannot turn it into a resumed launch or cause fresh-conversation
-   churn. Other recoveries may submit a bare CR to an existing provider buffer
-   and wait the normal bound.
+   churn. No recovery writes a second body or submit keystroke while authority
+   is `uncertain`: exact identity cannot prove that the first external effect
+   did not already trigger provider work.
    The hook must match that
    stored prompt exactly before acknowledging it, so a stale hook cannot
-   recompose a newer queue head. A single pending-delivery slot per agent
-   keeps the dispatcher's PTY-typed path and a hook-reply delivery from ever
-   composing and delivering the same task or messages twice. `factoryd`'s own restart never stops a
+   recompose a newer queue head. The per-agent pending-delivery slot only
+   reduces duplicate preparation; correctness comes from the durable
+   `session_work` CAS when the dispatcher and hook-reply paths race.
+   `factoryd`'s own restart never stops a
    session: `factory-runner` is a detached process tree — spawned as its
    own process-group leader, and the launchd job abandons its group, so a
    group-wide signal to the daemon (launchd's `bootout`, a terminal's
@@ -329,12 +342,12 @@ one task event, and only then wakes that agent. Moving a queued task uses the
 same assignment field, including `NULL` for the backlog, so no other worker
 can observe a transient delivery.
 
-Each task row has an internal immutable incarnation identity, separate from
-its operator-facing task id. Delivery commits carry that identity plus the
-resident session's prior episode count, so only a run created for the exact
-composed task incarnation makes a concurrent commit idempotent. Retrying a
-task preserves its incarnation; deleting and recreating the same task id does
-not.
+Each task row has an internal immutable incarnation identity and a monotonic
+work revision, separate from its operator-facing task id. A reservation binds
+both identities and a preallocated run id into
+`session_work`; only that exact attempt's atomic acknowledgement makes a
+concurrent commit idempotent. Retrying or editing advances the work revision;
+deleting and recreating the same task id also gets a new incarnation.
 
 ### Runtime-resolved provider settings
 
@@ -391,11 +404,12 @@ the acceptance condition is the new task body entering a running task.
   process necessarily exits. While that stop intent is durable, queued work
   is never typed into the still-live session; the dispatcher waits for the
   terminal event and then starts the successor, resuming the provider thread
-  when its capabilities support that. A delivery with no provider hook is
-  retried once after a durable bounded delay; if it still cannot be
-  acknowledged, the session remains durably `waiting_for_input` with
-  `delivery unacknowledged` and the terminal attempt remains recoverable by
-  an explicit resume, so recovery is truthful rather than an invisible queue
-  wedge. Stop admission shares the per-agent delivery slot and persists stop
+  when its capabilities support that. A reserved delivery interrupted before
+  the external-effect claim may retry its stored bytes. After the claim, a
+  missing provider hook leaves the session durably `waiting_for_input` with
+  `delivery unacknowledged` and its authority `uncertain`; neither a journal
+  retry nor a second submit is allowed. Exact session termination releases the fence
+  so the still-queued task can deliver once into a successor. Stop admission
+  shares the per-agent delivery slot and persists stop
   intent before signalling the runner, so no admitted delivery can open a
   later run after stop wins.

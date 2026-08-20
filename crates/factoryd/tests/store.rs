@@ -1373,18 +1373,19 @@ fn recreating_a_deleted_task_id_gets_a_new_immutable_incarnation() {
         priority: 0,
     };
     store.create_task(create("Original"), 2).unwrap();
-    let session_id = SessionId::try_from("session-1").unwrap();
-    let (original, _) = store
-        .task_delivery_marker(&session_id, &task_id("task-1"))
-        .unwrap();
+    let original = store
+        .task_delivery_marker(&task_id("task-1"))
+        .unwrap()
+        .incarnation_id;
 
     store
         .delete_task(&project_id("factory"), &task_id("task-1"), 3)
         .unwrap();
     store.create_task(create("Replacement"), 4).unwrap();
-    let (replacement, _) = store
-        .task_delivery_marker(&session_id, &task_id("task-1"))
-        .unwrap();
+    let replacement = store
+        .task_delivery_marker(&task_id("task-1"))
+        .unwrap()
+        .incarnation_id;
 
     assert_ne!(original, replacement);
 }

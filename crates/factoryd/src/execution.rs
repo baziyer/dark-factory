@@ -72,8 +72,8 @@ pub(crate) enum PromptDeliveryAdmission {
 
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 /// How long a PTY delivery waits for a matching `UserPromptSubmit` hook.
-/// Recovery uses the same bound after its bare CR and never retypes an input
-/// that the provider may already have accepted.
+/// Expiry leaves the exact authority uncertain; it never authorizes another
+/// provider input while the original bytes or hook may still cross.
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Gap between a composed delivery's text and its submitting `\r`, sent as
 /// two separate `TerminalInput` writes (`type_and_await_ack`'s doc comment
@@ -112,7 +112,7 @@ const MAX_DELIVERY_TEXT_BYTES: usize = 48_000;
 /// Invisible prompt suffix used to bind a provider's prompt hook to the
 /// immutable durable attempt that wrote it. Providers echo the submitted
 /// prompt in `UserPromptSubmit`; if they normalize away the nonce, the
-/// daemon refuses to guess and leaves the attempt retryable instead.
+/// daemon refuses to guess and leaves the attempt uncertain instead.
 pub(crate) const DELIVERY_ATTEMPT_MARKER: &str = "\u{2063}dark-factory-attempt:";
 /// Per-task-body budget inside a composed delivery, leaving room for
 /// guidance sections within [`MAX_DELIVERY_TEXT_BYTES`].
@@ -233,6 +233,8 @@ pub enum Error {
     SessionBusy,
     #[error("a delivery for this agent is already in flight; retry shortly")]
     DeliveryInProgress,
+    #[error("the provider did not acknowledge the exact task delivery; the task remains queued")]
+    DeliveryUnacknowledged,
     #[error("agent has no worktree; create one first")]
     NoWorktree,
     #[error("system clock is before the Unix epoch")]
@@ -325,12 +327,10 @@ impl Handle {
 
     /// Opens a task-episode inside the agent's live, idle session right
     /// now (bypassing FIFO order -- the operator asked for this exact
-    /// task), then makes a best-effort attempt to type its instructions in
-    /// and wait for acknowledgement before returning. The episode is
-    /// durable once this returns `Ok` even if the best-effort typing did
-    /// not: a stuck delivery surfaces as the session going
-    /// `waiting_for_input`, observable in `session list`/the TUI, not as a
-    /// lost task.
+    /// task), then types its instructions and waits for exact provider
+    /// acknowledgement. `Ok` means the task/run admission and acknowledgement
+    /// committed atomically; an unacknowledged external effect stays durably
+    /// `uncertain` and returns an error rather than manufacturing a run.
     pub async fn start_task(&self, input: StartTask) -> Result<StartedRun, Error> {
         let StartTask {
             project_id,
@@ -372,13 +372,12 @@ impl Handle {
         if existing_attempt.is_some() {
             return Err(Error::DeliveryInProgress);
         }
-        let (task, messages, (task_incarnation_id, prior_run_count)) = self
+        let (task, messages, marker) = self
             .state
             .with_store({
                 let project_id = project_id.clone();
                 let agent_id = agent_id.clone();
                 let task_id = task_id.clone();
-                let session_id = session.id.clone();
                 move |store| {
                     let task = store.get_task(&project_id, &task_id)?;
                     if task.snapshot.status != factory_core::TaskStatus::Queued
@@ -387,7 +386,7 @@ impl Handle {
                         return Err(StoreError::TaskNotQueued);
                     }
                     let messages = store.undelivered_messages_for_agent(&project_id, &agent_id)?;
-                    let marker = store.task_delivery_marker(&session_id, &task_id)?;
+                    let marker = store.task_delivery_marker(&task_id)?;
                     Ok((task, messages, marker))
                 }
             })
@@ -407,8 +406,10 @@ impl Handle {
             &session.id,
             Delivery {
                 task_id: Some(task_id.clone()),
-                task_incarnation_id: Some(task_incarnation_id),
-                prior_run_count: Some(prior_run_count),
+                task_incarnation_id: Some(marker.incarnation_id),
+                task_revision: Some(marker.task_revision),
+                run_id: None,
+                require_queue_head: false,
                 message_ids: messages.iter().map(|message| message.id.clone()).collect(),
                 text,
             },
@@ -416,36 +417,7 @@ impl Handle {
         )
         .await?;
 
-        let attempt_id = attempt.id.clone();
-        let claim_now_ms = now_ms()?;
-        let attempt = self
-            .state
-            .commit_and_publish(move |store| {
-                let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
-                Ok((attempt, Vec::new()))
-            })
-            .await?
-            .ok_or(Error::DeliveryInProgress)?;
-
-        let opened_at_ms = now_ms()?;
-        let session_id = session.id.clone();
-        let open_task_id = task_id.clone();
-        let message_ids = attempt.message_ids.clone();
-        let opened = self
-            .state
-            .commit_and_publish(move |store| {
-                let opened = store.open_run_episode_with_message_ids(
-                    &session_id,
-                    &open_task_id,
-                    Some(&message_ids),
-                    opened_at_ms,
-                )?;
-                let events = opened.events.clone();
-                Ok((opened, events))
-            })
-            .await?;
-        let run_id = opened.run.id.clone();
-
+        let run_id = attempt.run_id.clone().ok_or(Error::CorruptExecution)?;
         let target = self
             .state
             .with_store({
@@ -459,13 +431,24 @@ impl Handle {
             session_run_id(&session.id)?,
             target.runner_instance_id,
         );
+
+        // This is the last durable seam before the first external write.
+        let attempt_id = attempt.id.clone();
+        let claim_now_ms = now_ms()?;
+        let attempt = self
+            .state
+            .commit_and_publish(move |store| {
+                let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
+                Ok((attempt, Vec::new()))
+            })
+            .await?
+            .ok_or(Error::DeliveryInProgress)?;
         if type_and_await_ack(
             &self.state,
             &client,
             &session.id,
             &attempt.id,
             &attempt.text,
-            false,
         )
         .await
         {
@@ -500,6 +483,7 @@ impl Handle {
                     Ok(((), vec![event]))
                 })
                 .await;
+            return Err(Error::DeliveryUnacknowledged);
         }
         Ok(StartedRun { run_id })
     }
@@ -2060,7 +2044,9 @@ async fn wait_for_runner_exit(
 struct Delivery {
     task_id: Option<factory_core::TaskId>,
     task_incarnation_id: Option<String>,
-    prior_run_count: Option<usize>,
+    task_revision: Option<i64>,
+    run_id: Option<RunId>,
+    require_queue_head: bool,
     message_ids: Vec<factory_core::MessageId>,
     text: String,
 }
@@ -2070,7 +2056,9 @@ impl Delivery {
         Self {
             task_id: attempt.task_id.clone(),
             task_incarnation_id: attempt.task_incarnation_id.clone(),
-            prior_run_count: attempt.prior_run_count,
+            task_revision: attempt.task_revision,
+            run_id: attempt.run_id.clone(),
+            require_queue_head: false,
             message_ids: attempt.message_ids.clone(),
             text: attempt.text.clone(),
         }
@@ -2082,12 +2070,10 @@ async fn compose_delivery(
     guidance_root: &Path,
     project_id: &ProjectId,
     agent_id: &AgentId,
-    session_id: &SessionId,
 ) -> Result<Option<Delivery>, DaemonStateError> {
     let guidance_root = guidance_root.to_path_buf();
     let project_id = project_id.clone();
     let agent_id = agent_id.clone();
-    let session_id = session_id.clone();
     state
         .with_store(move |store| {
             if store.agent_is_held(&project_id, &agent_id)? {
@@ -2104,11 +2090,13 @@ async fn compose_delivery(
                 .transpose()?;
             let task_marker = task_id
                 .as_ref()
-                .map(|id| store.task_delivery_marker(&session_id, id))
+                .map(|id| store.task_delivery_marker(id))
                 .transpose()?;
-            let (task_incarnation_id, prior_run_count) = task_marker
-                .map(|(incarnation_id, count)| (Some(incarnation_id), Some(count)))
-                .unwrap_or((None, None));
+            let (task_incarnation_id, task_revision) = if let Some(marker) = task_marker {
+                (Some(marker.incarnation_id), Some(marker.task_revision))
+            } else {
+                (None, None)
+            };
             let agent = store.get_agent_detail(&project_id, &agent_id)?;
             let text = compose_text(
                 &guidance_root,
@@ -2118,10 +2106,13 @@ async fn compose_delivery(
                 &messages,
                 agent.snapshot.role,
             );
+            let require_queue_head = task_id.is_some();
             Ok(Some(Delivery {
                 task_id,
                 task_incarnation_id,
-                prior_run_count,
+                task_revision,
+                run_id: None,
+                require_queue_head,
                 message_ids: messages.iter().map(|message| message.id.clone()).collect(),
                 text,
             }))
@@ -2145,7 +2136,8 @@ async fn ensure_delivery_attempt(
         session_id: session_id.clone(),
         task_id: delivery.task_id,
         task_incarnation_id: delivery.task_incarnation_id,
-        prior_run_count: delivery.prior_run_count,
+        task_revision: delivery.task_revision,
+        require_queue_head: delivery.require_queue_head,
         message_ids: delivery.message_ids,
         text: format!(
             "{}\n{}{}\u{2063}",
@@ -2190,9 +2182,10 @@ async fn commit_delivery(
             match (
                 delivery.task_id,
                 delivery.task_incarnation_id,
-                delivery.prior_run_count,
+                delivery.task_revision,
+                delivery.run_id,
             ) {
-                (Some(task_id), Some(task_incarnation_id), Some(prior_run_count)) => {
+                (Some(task_id), Some(task_incarnation_id), Some(task_revision), Some(run_id)) => {
                     match store.open_run_episode_with_delivery_attempt(
                         &session_id,
                         &task_id,
@@ -2204,24 +2197,21 @@ async fn commit_delivery(
                             let run_id = opened.run.id.clone();
                             Ok((Some(run_id), opened.events))
                         }
-                        // The synchronous `UserPromptSubmit` hook commit can
-                        // win this dispatcher's later ack-driven commit. A
-                        // sufficiently fast client can also finish that run
-                        // before this retry, yielding `TaskNotQueued` instead
-                        // of `AgentUnavailable`. The immutable incarnation and
-                        // run count captured while composing are the durable
-                        // attempt identity: only a new run for this exact task
-                        // row in this session proves the candidate committed.
-                        // Historical retries and delete/recreate ABA do not.
+                        // The synchronous hook commit can win this later
+                        // acknowledgement commit, and the task can even finish
+                        // before this transaction. The attempt journal is an
+                        // exact receipt written atomically with the authority;
+                        // never infer success from run counts or task state.
                         Err(StoreError::AgentUnavailable | StoreError::TaskNotQueued)
-                            if store.delivery_attempt_committed(
+                            if store.delivery_attempt_acknowledged(
+                                &attempt_id,
                                 &session_id,
                                 &task_id,
                                 &task_incarnation_id,
-                                prior_run_count,
+                                task_revision,
+                                &run_id,
                             )? =>
                         {
-                            store.acknowledge_delivery_attempt(&attempt_id, now_ms)?;
                             Ok((None, Vec::new()))
                         }
                         Err(StoreError::SessionStopping | StoreError::SessionNotLive) => {
@@ -2230,7 +2220,7 @@ async fn commit_delivery(
                         Err(error) => Err(error),
                     }
                 }
-                (None, None, None) => {
+                (None, None, None, None) => {
                     match store.deliver_agent_messages_by_ids_with_delivery_attempt(
                         &project_id,
                         &agent_id,
@@ -2418,14 +2408,8 @@ async fn deliver_pending(
         if !backoff.try_begin_preparation(agent_id) {
             return Ok(());
         }
-        let delivery_result = compose_delivery(
-            state,
-            &config.guidance_root,
-            project_id,
-            agent_id,
-            &session.id,
-        )
-        .await;
+        let delivery_result =
+            compose_delivery(state, &config.guidance_root, project_id, agent_id).await;
         backoff.end_preparation(agent_id);
         let Some(delivery) = delivery_result? else {
             return Ok(());
@@ -2449,17 +2433,6 @@ async fn deliver_pending(
     {
         return Ok(());
     }
-    let attempt_id = attempt.id.clone();
-    let claim_now_ms = now_ms()?;
-    let claimed = state
-        .commit_and_publish(move |store| {
-            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
-            Ok((attempt, Vec::new()))
-        })
-        .await?;
-    let Some(attempt) = claimed else {
-        return Ok(());
-    };
     let target = state
         .with_store({
             let project_id = project_id.clone();
@@ -2472,16 +2445,20 @@ async fn deliver_pending(
         session_run_id(&session.id)?,
         target.runner_instance_id,
     );
-    if type_and_await_ack(
-        state,
-        &client,
-        &session.id,
-        &attempt.id,
-        &attempt.text,
-        attempt.failure_count > 0,
-    )
-    .await
-    {
+    // Resolve the immutable runner target first; claim Uncertain only at the
+    // last durable seam before the first external write.
+    let attempt_id = attempt.id.clone();
+    let claim_now_ms = now_ms()?;
+    let claimed = state
+        .commit_and_publish(move |store| {
+            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now_ms)?;
+            Ok((attempt, Vec::new()))
+        })
+        .await?;
+    let Some(attempt) = claimed else {
+        return Ok(());
+    };
+    if type_and_await_ack(state, &client, &session.id, &attempt.id, &attempt.text).await {
         commit_delivery(
             state,
             project_id,
@@ -2590,8 +2567,6 @@ async fn deliver_pending(
 /// Types `text` into `session_id`'s PTY, then submits it with a trailing
 /// `\r` sent as its own later write, waiting up to [`ACK_TIMEOUT`] for the
 /// exact delivery attempt's `UserPromptSubmit` hook to confirm receipt.
-/// Recovery submits only a bare CR to an already-buffered prompt and waits
-/// for the same bound; it never retypes the body after that possible submit.
 /// Subscribing to the daemon's event stream *before* writing (not after)
 /// avoids missing a hook that fires between the write and the subscribe
 /// call.
@@ -2608,53 +2583,21 @@ async fn deliver_pending(
 /// the text lets that burst visibly end before `\r` arrives on its own,
 /// which is what actually submits it.
 ///
-/// Deliberate simplification of TRACK5-DESIGN.md/A3's "bounded prefix
-/// compare" of the acknowledged prompt against what was typed: the daemon
-/// only durably publishes a hook's *category* (`last_hook_event`) and a
-/// bounded, often-generic `activity` label, never the raw prompt text (see
-/// `local_api::compute_hook_fields`) -- plumbing the exact text through
-/// `commit_and_publish`'s event bus for this alone was out of proportion
-/// here. Ack is instead "the next `UserPromptSubmit` hook for this exact
-/// session, timestamped no earlier than this write" -- sound because
-/// `TerminalInput` is the only writer besides the operator's own keystrokes
-/// during an unacknowledged delivery, an edge case out of scope for v1.
+/// Acknowledgement is the exact nonce-bearing `UserPromptSubmit` hook. The
+/// synchronous hook transaction changes the attempt journal and
+/// `session_work` together; this waiter only observes that durable receipt.
 async fn type_and_await_ack(
     state: &DaemonState,
     client: &RunnerClient,
     session_id: &SessionId,
     attempt_id: &str,
     text: &str,
-    recovery: bool,
 ) -> bool {
     let body = encode_terminal_bytes(text.as_bytes());
     let submit = encode_terminal_bytes(b"\r");
     let mut events = state.subscribe();
     if !delivery_attempt_active(state, attempt_id).await {
         return false;
-    }
-    if recovery {
-        let mut flush_events = state.subscribe();
-        let Ok(flush_started_at_ms) = now_ms() else {
-            return false;
-        };
-        // The CR may already have been accepted by the provider even when
-        // its hook is slow. Never retype the body after that admission: a
-        // second body+CR could submit the same model turn twice. If the
-        // normal acknowledgement bound expires, the caller records a
-        // durable failure and explicit resume is required to re-arm it.
-        return client
-            .terminal_input(encode_terminal_bytes(b"\r"))
-            .await
-            .is_ok()
-            && wait_for_ack(
-                state,
-                &mut flush_events,
-                session_id,
-                attempt_id,
-                flush_started_at_ms,
-                ACK_TIMEOUT,
-            )
-            .await;
     }
     let Ok(write_started_at_ms) = now_ms() else {
         return false;
@@ -2777,14 +2720,8 @@ pub async fn stop_hook_reply(
     let Some(_delivery_slot) = state.try_delivery_slot(&session.agent_id) else {
         return Ok(serde_json::json!({}));
     };
-    let Some(delivery) = compose_delivery(
-        state,
-        guidance_root,
-        &session.project_id,
-        &session.agent_id,
-        &session.id,
-    )
-    .await?
+    let Some(delivery) =
+        compose_delivery(state, guidance_root, &session.project_id, &session.agent_id).await?
     else {
         return Ok(serde_json::json!({}));
     };
@@ -2803,24 +2740,23 @@ pub async fn stop_hook_reply(
     ) {
         return Ok(serde_json::json!({}));
     }
+    let attempt_id = attempt.id.clone();
+    let claim_now = now_ms().map_err(|_| StoreError::InvalidExecutionMetadata)?;
+    let claimed = state
+        .commit_and_publish(move |store| {
+            let attempt = store.begin_delivery_attempt(&attempt_id, claim_now)?;
+            Ok((attempt, Vec::new()))
+        })
+        .await?;
+    let Some(attempt) = claimed else {
+        return Ok(serde_json::json!({}));
+    };
     let reason = attempt.text.clone();
-    let now = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(0);
-    commit_delivery(
-        state,
-        &session.project_id,
-        &session.agent_id,
-        &session.id,
-        &attempt.id,
-        Delivery::from_attempt(&attempt),
-        now,
-    )
-    .await?;
+    // The block reply is the external effect, not an acknowledgement. Keep
+    // the exact reservation `uncertain` until the provider echoes its nonce
+    // in `UserPromptSubmit`; that hook atomically admits Running. A daemon
+    // crash after this return can therefore never manufacture a run for a
+    // reply the provider did not receive.
     Ok(serde_json::json!({"decision": "block", "reason": reason}))
 }
 
@@ -3473,7 +3409,7 @@ mod tests {
                 5,
             )
             .unwrap();
-        let (task_id, task_incarnation_id, prior_run_count, message_ids) = match delivery {
+        let (task_id, task_incarnation_id, task_revision, message_ids) = match delivery {
             RecoveryFixtureDelivery::Task => {
                 let task_id = TaskId::try_from("recovery-task").unwrap();
                 store
@@ -3492,9 +3428,13 @@ mod tests {
                 store
                     .assign_task(&project_id, &task_id, Some(&agent_id), 6)
                     .unwrap();
-                let (incarnation, count) =
-                    store.task_delivery_marker(&resumed.id, &task_id).unwrap();
-                (Some(task_id), Some(incarnation), Some(count), Vec::new())
+                let marker = store.task_delivery_marker(&task_id).unwrap();
+                (
+                    Some(task_id),
+                    Some(marker.incarnation_id),
+                    Some(marker.task_revision),
+                    Vec::new(),
+                )
             }
             RecoveryFixtureDelivery::Message => {
                 let message_id = MessageId::try_from("recovery-message").unwrap();
@@ -3519,7 +3459,8 @@ mod tests {
                 session_id: resumed.id.clone(),
                 task_id,
                 task_incarnation_id,
-                prior_run_count,
+                task_revision,
+                require_queue_head: false,
                 message_ids,
                 text: "recover me".into(),
                 created_at_ms: 6,
@@ -3634,7 +3575,8 @@ mod tests {
             session_id: session_id.clone(),
             task_id: delivery.task_id.clone(),
             task_incarnation_id: delivery.task_incarnation_id.clone(),
-            prior_run_count: delivery.prior_run_count,
+            task_revision: delivery.task_revision,
+            require_queue_head: delivery.require_queue_head,
             message_ids: delivery.message_ids.clone(),
             text: delivery.text.clone(),
             created_at_ms,
@@ -5241,13 +5183,13 @@ mod tests {
         // delete it, then create and run a different task with the same
         // operator-facing id. Its replacement run must not prove the old
         // composed text was delivered.
-        let (old_incarnation, old_run_count) = store
-            .task_delivery_marker(&session_id, &aba_task_id)
-            .unwrap();
+        let old_marker = store.task_delivery_marker(&aba_task_id).unwrap();
         let aba_delivery = Delivery {
             task_id: Some(aba_task_id.clone()),
-            task_incarnation_id: Some(old_incarnation.clone()),
-            prior_run_count: Some(old_run_count),
+            task_incarnation_id: Some(old_marker.incarnation_id.clone()),
+            task_revision: Some(old_marker.task_revision),
+            run_id: None,
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "old task body".to_owned(),
         };
@@ -5259,7 +5201,8 @@ mod tests {
                 session_id: session_id.clone(),
                 task_id: aba_delivery.task_id.clone(),
                 task_incarnation_id: aba_delivery.task_incarnation_id.clone(),
-                prior_run_count: aba_delivery.prior_run_count,
+                task_revision: aba_delivery.task_revision,
+                require_queue_head: false,
                 message_ids: aba_delivery.message_ids.clone(),
                 text: aba_delivery.text.clone(),
                 created_at_ms: 1_005,
@@ -5296,13 +5239,13 @@ mod tests {
         // Original race: the candidate observes no prior episode, then the
         // hook opens one and the fast client finishes it before this commit.
         // The durable attempt is created while the task is still queued.
-        let (race_incarnation, prior_run_count) = store
-            .task_delivery_marker(&session_id, &race_task_id)
-            .unwrap();
+        let race_marker = store.task_delivery_marker(&race_task_id).unwrap();
         let race_delivery = Delivery {
             task_id: Some(race_task_id.clone()),
-            task_incarnation_id: Some(race_incarnation.clone()),
-            prior_run_count: Some(prior_run_count),
+            task_incarnation_id: Some(race_marker.incarnation_id.clone()),
+            task_revision: Some(race_marker.task_revision),
+            run_id: None,
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "already delivered".to_owned(),
         };
@@ -5314,14 +5257,21 @@ mod tests {
                 session_id: session_id.clone(),
                 task_id: race_delivery.task_id.clone(),
                 task_incarnation_id: race_delivery.task_incarnation_id.clone(),
-                prior_run_count: race_delivery.prior_run_count,
+                task_revision: race_delivery.task_revision,
+                require_queue_head: false,
                 message_ids: race_delivery.message_ids.clone(),
                 text: race_delivery.text.clone(),
                 created_at_ms: 1_010,
             })
             .unwrap();
         store
-            .open_run_episode(&session_id, &race_task_id, 1_011)
+            .open_run_episode_with_delivery_attempt(
+                &session_id,
+                &race_task_id,
+                Some(&[]),
+                Some(&race_attempt.id),
+                1_011,
+            )
             .unwrap();
         store
             .complete_task(&project_id, &race_task_id, "done".to_owned(), 1_012)
@@ -5335,7 +5285,7 @@ mod tests {
             &agent_id,
             &session_id,
             &race_attempt.id,
-            race_delivery,
+            Delivery::from_attempt(&race_attempt),
             1_011,
         )
         .await
@@ -5411,18 +5361,19 @@ mod tests {
             })
             .await
             .unwrap();
-        let (task_incarnation, retry_run_count) = state
+        let marker = state
             .with_store({
-                let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&task_id)
             })
             .await
             .unwrap();
         let cancelled_delivery = Delivery {
             task_id: Some(task_id.clone()),
-            task_incarnation_id: Some(task_incarnation.clone()),
-            prior_run_count: Some(retry_run_count),
+            task_incarnation_id: Some(marker.incarnation_id.clone()),
+            task_revision: Some(marker.task_revision),
+            run_id: None,
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "cancelled retry".to_owned(),
         };
@@ -5476,18 +5427,19 @@ mod tests {
             })
             .await
             .unwrap();
-        let (task_incarnation, retry_run_count) = state
+        let marker = state
             .with_store({
-                let session_id = session_id.clone();
                 let task_id = task_id.clone();
-                move |store| store.task_delivery_marker(&session_id, &task_id)
+                move |store| store.task_delivery_marker(&task_id)
             })
             .await
             .unwrap();
         let unavailable_delivery = Delivery {
             task_id: Some(task_id.clone()),
-            task_incarnation_id: Some(task_incarnation),
-            prior_run_count: Some(retry_run_count),
+            task_incarnation_id: Some(marker.incarnation_id),
+            task_revision: Some(marker.task_revision),
+            run_id: None,
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "blocked by another run".to_owned(),
         };
@@ -5501,7 +5453,7 @@ mod tests {
             1_012,
         )
         .await;
-        state
+        let blocked = state
             .commit_and_publish({
                 let session_id = session_id.clone();
                 let occupying_task_id = occupying_task_id.clone();
@@ -5511,22 +5463,23 @@ mod tests {
                 }
             })
             .await
-            .unwrap();
-        let unavailable = commit_delivery(
+            .unwrap_err();
+        assert!(matches!(
+            blocked,
+            DaemonStateError::Store(StoreError::AgentUnavailable)
+        ));
+        let admitted = commit_delivery(
             &state,
             &project_id,
             &agent_id,
             &session_id,
             &unavailable_attempt.id,
-            unavailable_delivery,
+            Delivery::from_attempt(&unavailable_attempt),
             1_014,
         )
         .await
-        .unwrap_err();
-        assert!(matches!(
-            unavailable,
-            DaemonStateError::Store(StoreError::AgentUnavailable)
-        ));
+        .unwrap();
+        assert_eq!(admitted, unavailable_attempt.run_id);
     }
 
     #[test]

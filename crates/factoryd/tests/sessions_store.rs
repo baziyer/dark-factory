@@ -4,6 +4,7 @@ use factory_core::{
     AgentId, AgentRole, FactoryEvent, MessageId, ProjectId, Provider, ProviderHookEvent,
     ProviderNotificationKind, RunId, RunnerInstanceId, SessionId, SessionState, TaskId, TaskStatus,
 };
+use factoryd::session_work::Phase as SessionWorkPhase;
 use factoryd::store::{
     DeliveryAttemptState, NewAgent, NewAgentMessage, NewDeliveryAttempt, NewProject, NewSession,
     NewTask, ProviderDeliveryRecovery, Store, StoreError,
@@ -126,6 +127,121 @@ fn fixture() -> Store {
 }
 
 #[test]
+fn session_work_cas_fences_every_successor_until_exact_completion() {
+    let mut store = fixture();
+    let (session, _) = store
+        .create_session(new_session("authority-session", "factory", "curie"), 5)
+        .unwrap();
+    store
+        .record_hook_event(
+            &session.id,
+            ProviderHookEvent::SessionStart,
+            None,
+            false,
+            None,
+            6,
+        )
+        .unwrap();
+    let marker = store.task_delivery_marker(&task_id("task-1")).unwrap();
+    let first = NewDeliveryAttempt {
+        id: "authority-attempt".into(),
+        project_id: project_id("factory"),
+        agent_id: agent_id("curie"),
+        session_id: session.id.clone(),
+        task_id: Some(task_id("task-1")),
+        task_incarnation_id: Some(marker.incarnation_id.clone()),
+        task_revision: Some(marker.task_revision),
+        require_queue_head: false,
+        message_ids: Vec::new(),
+        text: "exact authority prompt".into(),
+        created_at_ms: 7,
+    };
+    let reserved = store.ensure_delivery_attempt(first.clone()).unwrap();
+    let work = store.session_work(&session.id).unwrap().work.unwrap();
+    assert_eq!(work.revision, 1);
+    assert!(matches!(
+        work.phase,
+        SessionWorkPhase::Delivering(ref lease) if lease.attempt_id == first.id
+    ));
+
+    let mut successor = first.clone();
+    successor.id = "successor-attempt".into();
+    let retained = store.ensure_delivery_attempt(successor).unwrap();
+    assert_eq!(retained.id, first.id);
+    assert_eq!(
+        store
+            .session_work(&session.id)
+            .unwrap()
+            .work
+            .unwrap()
+            .revision,
+        1,
+        "a recomposed successor must retain the exact durable reservation"
+    );
+    assert!(
+        store
+            .begin_delivery_attempt("wrong-attempt", 8)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .session_work(&session.id)
+            .unwrap()
+            .work
+            .unwrap()
+            .revision,
+        1
+    );
+
+    store
+        .begin_delivery_attempt(&reserved.id, 9)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store.session_work(&session.id).unwrap().work.unwrap().phase,
+        SessionWorkPhase::Uncertain(ref lease) if lease.attempt_id == first.id
+    ));
+    assert!(
+        store
+            .begin_delivery_attempt(&reserved.id, 10)
+            .unwrap()
+            .is_none()
+    );
+    assert!(matches!(
+        store.reset_delivery_attempt(&project_id("factory"), &agent_id("curie"), 11),
+        Err(StoreError::SessionWorkConflict)
+    ));
+
+    let opened = store
+        .open_run_episode_with_delivery_attempt(
+            &session.id,
+            &task_id("task-1"),
+            Some(&[]),
+            Some(&reserved.id),
+            12,
+        )
+        .unwrap();
+    assert_eq!(Some(opened.run.id.clone()), reserved.run_id);
+    assert!(matches!(
+        store.session_work(&session.id).unwrap().work.unwrap().phase,
+        SessionWorkPhase::Running(ref lease)
+            if lease.task.as_ref().map(|task| &task.run_id) == Some(&opened.run.id)
+    ));
+    store
+        .complete_task(
+            &project_id("factory"),
+            &task_id("task-1"),
+            "done".into(),
+            13,
+        )
+        .unwrap();
+    let empty = store.session_work(&session.id).unwrap().work.unwrap();
+    assert_eq!(empty.revision, 4);
+    assert!(matches!(empty.phase, SessionWorkPhase::Empty));
+}
+
+#[test]
 fn session_lifecycle_updates_and_projects_the_live_agent_relation() {
     let mut store = fixture();
     let (created, create_events) = store
@@ -190,7 +306,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
     store
         .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 8)
         .unwrap();
-    let (incarnation, count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    let marker = store.task_delivery_marker(&task).unwrap();
     store
         .ensure_delivery_attempt(NewDeliveryAttempt {
             id: "ack-attempt".into(),
@@ -198,8 +314,9 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
             agent_id: agent_id("curie"),
             session_id: resumed.id.clone(),
             task_id: Some(task.clone()),
-            task_incarnation_id: Some(incarnation),
-            prior_run_count: Some(count),
+            task_incarnation_id: Some(marker.incarnation_id),
+            task_revision: Some(marker.task_revision),
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "accepted prompt".into(),
             created_at_ms: 8,
@@ -247,7 +364,7 @@ fn acknowledged_delivery_wins_the_atomic_recovery_fence() {
 
 /// Builds a raw pre-0014 database (schema 13, the pre-sessions shape) with
 /// one legacy *open* run, then opens it through the real `Store::open` --
-/// which always migrates to the current `SCHEMA_VERSION`, 28 after the
+/// which always migrates to the current `SCHEMA_VERSION`, 29 after the
 /// connector-event migration, runtime metadata, legacy permission repair,
 /// model policy, delivery attempts, provider resume recovery, observer
 /// reason, typed notification cause, and the widened Claude notification
@@ -344,14 +461,14 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
         connection.pragma_update(None, "user_version", 13).unwrap();
     }
 
-    // Opening through the real store runs migrations 0014 through 0028.
+    // Opening through the real store runs migrations 0014 through 0029.
     let store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 29);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -396,7 +513,7 @@ fn migration_0014_force_closes_a_legacy_open_run_and_reaches_current_schema() {
 }
 
 #[test]
-fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
+fn migrations_0019_through_0029_follow_the_budget_schema_in_order() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("schema-18.db");
     drop(Store::open(&database).unwrap());
@@ -404,7 +521,11 @@ fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE session_work;
+                 DROP INDEX runs_one_open_per_session;
+                 ALTER TABLE tasks DROP COLUMN work_revision;
+                 ALTER TABLE sessions DROP COLUMN provider_resume_blocked_at_ms;
                  ALTER TABLE sessions DROP COLUMN resumed_provider_session;
                  ALTER TABLE sessions DROP COLUMN delivery_recovery_stop_requested_at_ms;
                  DROP TABLE delivery_attempts;
@@ -414,7 +535,8 @@ fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
                  ALTER TABLE agent_profiles DROP COLUMN reasoning_effort;
                  ALTER TABLE sessions DROP COLUMN observer_reason;
                  ALTER TABLE sessions DROP COLUMN notification_kind;
-                 PRAGMA user_version = 18;",
+                 PRAGMA user_version = 18;
+                 PRAGMA foreign_keys = ON;",
             )
             .unwrap();
     }
@@ -424,7 +546,7 @@ fn migrations_0019_through_0028_follow_the_budget_schema_in_order() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 29);
     connection
         .prepare("SELECT remote_url, base_branch FROM project_repository_authority")
         .unwrap();
@@ -499,7 +621,8 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
                 session_id: session.id,
                 task_id: None,
                 task_incarnation_id: None,
-                prior_run_count: Some(0),
+                task_revision: None,
+                require_queue_head: false,
                 message_ids: vec![message_id],
                 text: "deliver this message".into(),
                 created_at_ms: 6,
@@ -507,20 +630,31 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
             .unwrap();
     }
 
-    // Round-3's schema is v27. Lowering the version on this populated v27
-    // shape forces the real 0028 rebuild; the child rows make an FK-on DROP
-    // fail with SQLite 787, so this fixture specifically guards the
-    // foreign_keys-off/rebuild/foreign_keys-on discipline.
+    // Remove the v29 authority additions before lowering this populated
+    // database to v27. This forces the real 0028 rebuild and subsequent
+    // 0029 backfill; the child rows make an FK-on DROP fail with SQLite 787,
+    // so the fixture also guards 0028's foreign-key rebuild discipline.
     {
         let connection = rusqlite::Connection::open(&database).unwrap();
-        connection.pragma_update(None, "user_version", 27).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE session_work;
+                 DROP INDEX runs_one_open_per_session;
+                 ALTER TABLE delivery_attempts DROP COLUMN run_id;
+                 ALTER TABLE delivery_attempts DROP COLUMN task_revision;
+                 ALTER TABLE tasks DROP COLUMN work_revision;
+                 PRAGMA user_version = 27;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
     }
     let store = Store::open(&database).unwrap();
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 29);
     let message_count: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM agent_messages WHERE id = 'migration-message'",
@@ -553,6 +687,157 @@ fn migration_0028_rebuilds_a_populated_session_graph_with_foreign_keys() {
             .iter()
             .any(|session| session.id == session_id("migration-session"))
     );
+}
+
+#[test]
+fn migration_0029_quarantines_duplicate_open_session_owners_before_unique_defense() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("corrupt-v28.db");
+    let session = session_id("corrupt-session");
+    {
+        let mut store = Store::open(&database).unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id("factory"),
+                    name: "Factory".into(),
+                    root: "/work/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        for agent in ["curie", "fermi"] {
+            store
+                .create_agent(
+                    NewAgent {
+                        id: agent_id(agent),
+                        project_id: project_id("factory"),
+                        parent_agent_id: None,
+                        role: AgentRole::Worker,
+                        provider: Provider::Codex,
+                    },
+                    2,
+                )
+                .unwrap();
+        }
+        for (task, agent) in [("task-a", "curie"), ("task-b", "fermi")] {
+            store
+                .create_task(
+                    NewTask {
+                        id: task_id(task),
+                        project_id: project_id("factory"),
+                        parent_task_id: None,
+                        title: task.into(),
+                        body: String::new(),
+                        priority: 0,
+                    },
+                    3,
+                )
+                .unwrap();
+            store
+                .assign_task(
+                    &project_id("factory"),
+                    &task_id(task),
+                    Some(&agent_id(agent)),
+                    4,
+                )
+                .unwrap();
+        }
+        store
+            .create_session(new_session("corrupt-session", "factory", "curie"), 5)
+            .unwrap();
+        store
+            .open_run_episode(&session, &task_id("task-a"), 6)
+            .unwrap();
+    }
+
+    // v28 had no session-scoped uniqueness. Inject a row that is valid under
+    // its agent/task constraints but contradicts the session owner, then
+    // remove the v29 columns exactly as an upgrade would encounter them.
+    {
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX runs_one_open_per_session;
+                 INSERT INTO runs (
+                    id, project_id, agent_id, session_id, parent_run_id, task_id,
+                    status, activity, wait_reason, worktree, started_at_ms,
+                    status_since_ms, updated_at_ms, ended_at_ms, closed_by,
+                    failure_reason, stop_requested_at_ms
+                 ) VALUES (
+                    'duplicate-run', 'factory', 'fermi', 'corrupt-session', NULL,
+                    'task-b', 'running', NULL, NULL, '/work/factory', 7, 7, 7,
+                    NULL, NULL, NULL, NULL
+                 );
+                 UPDATE tasks SET status = 'running' WHERE id = 'task-b';
+                 INSERT INTO delivery_attempts (
+                    id, project_id, agent_id, session_id, task_id,
+                    task_incarnation_id, prior_run_count, message_ids_json, text,
+                    failure_count, next_attempt_at_ms, state, created_at_ms,
+                    updated_at_ms, task_revision, run_id
+                 ) SELECT
+                    'contradictory-attempt', 'factory', 'fermi', 'corrupt-session',
+                    'task-b', incarnation_id, 0, '[]', 'legacy uncertain prompt',
+                    2, 7, 'retryable', 7, 7, work_revision,
+                    '33333333-3333-4333-8333-333333333333'
+                 FROM tasks WHERE id = 'task-b';
+                 PRAGMA foreign_keys = OFF;
+                 DROP TABLE session_work;
+                 ALTER TABLE delivery_attempts DROP COLUMN run_id;
+                 ALTER TABLE delivery_attempts DROP COLUMN task_revision;
+                 ALTER TABLE tasks DROP COLUMN work_revision;
+                 PRAGMA user_version = 28;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+    }
+
+    let mut store = Store::open(&database).unwrap();
+    let quarantined = store.session_work(&session).unwrap();
+    assert!(quarantined.work.is_none());
+    assert!(
+        quarantined
+            .quarantine_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("2 open run(s), 1 active delivery attempt(s)"))
+    );
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let open: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE session_id = 'corrupt-session' AND ended_at_ms IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let failed: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM runs WHERE session_id = 'corrupt-session' AND status = 'failed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!((open, failed), (0, 2));
+    let unique_index: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_schema
+             WHERE type = 'index' AND name = 'runs_one_open_per_session'
+               AND sql LIKE 'CREATE UNIQUE INDEX%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unique_index, 1);
+    drop(connection);
+
+    assert!(matches!(
+        store.begin_delivery_attempt("contradictory-attempt", 8),
+        Err(StoreError::SessionWorkQuarantined(_))
+    ));
+    store.end_session(&session, Some(0), None, 8).unwrap();
+    assert!(matches!(
+        store.session_work(&session).unwrap().work.unwrap().phase,
+        SessionWorkPhase::Empty
+    ));
 }
 
 /// Builds a raw pre-0015 database (schema 14, `0014_sessions.sql`'s
@@ -633,14 +918,14 @@ fn migration_0015_widens_the_last_hook_event_check_to_accept_permission_request(
             .unwrap();
     }
 
-    // Opening through the real store runs the 0015 through 0028 migrations.
+    // Opening through the real store runs the 0015 through 0029 migrations.
     let mut store = Store::open(&database).unwrap();
 
     let connection = rusqlite::Connection::open(&database).unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 28);
+    assert_eq!(version, 29);
     assert!(
         store.auto_mode().unwrap(),
         "pre-17 databases default auto mode on"
@@ -830,7 +1115,7 @@ fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() 
     store
         .assign_task(&project_id("factory"), &task, Some(&agent_id("curie")), 7)
         .unwrap();
-    let (incarnation, prior_run_count) = store.task_delivery_marker(&resumed.id, &task).unwrap();
+    let marker = store.task_delivery_marker(&task).unwrap();
     store
         .ensure_delivery_attempt(NewDeliveryAttempt {
             id: "recovery-attempt".into(),
@@ -838,16 +1123,21 @@ fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() 
             agent_id: agent_id("curie"),
             session_id: resumed.id.clone(),
             task_id: Some(task),
-            task_incarnation_id: Some(incarnation),
-            prior_run_count: Some(prior_run_count),
+            task_incarnation_id: Some(marker.incarnation_id),
+            task_revision: Some(marker.task_revision),
+            require_queue_head: false,
             message_ids: Vec::new(),
             text: "recover me".into(),
             created_at_ms: 7,
         })
         .unwrap();
+    store
+        .begin_delivery_attempt("recovery-attempt", 8)
+        .unwrap()
+        .expect("delivery becomes externally uncertain before recovery");
 
     store
-        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, "recovery-attempt", 8)
+        .request_fresh_provider_recovery(&project_id("factory"), &resumed.id, "recovery-attempt", 9)
         .unwrap();
     assert_eq!(
         store.delivery_attempt_state("recovery-attempt").unwrap(),
@@ -870,9 +1160,9 @@ fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() 
         "the poisoned provider thread must not be selected again"
     );
 
-    store.end_session(&resumed.id, Some(0), None, 9).unwrap();
+    store.end_session(&resumed.id, Some(0), None, 10).unwrap();
     let (fresh, _) = store
-        .create_session(new_session("fresh", "factory", "curie"), 10)
+        .create_session(new_session("fresh", "factory", "curie"), 11)
         .unwrap();
     assert!(
         !store
@@ -880,7 +1170,7 @@ fn failed_codex_resume_identity_is_excluded_until_a_fresh_thread_is_confirmed() 
             .unwrap()
     );
     store
-        .set_provider_session_id(&fresh.id, new_thread, 11)
+        .set_provider_session_id(&fresh.id, new_thread, 12)
         .unwrap()
         .expect("fresh Codex session confirms a new thread");
     assert!(
