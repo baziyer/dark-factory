@@ -41,6 +41,13 @@ bypass, or release the lease. The summary contract is checked by
 this macOS-specific lease harness and its release fixtures; GitHub runs that
 mode in an isolated hosted job.
 
+After the macOS lease records its diagnostic owner, the single `local-ci.sh`
+entry boundary removes inherited Dark Factory home, socket, and task/session
+identity overrides before any gate child runs. Tests still set their own
+throwaway homes and sockets, while local-CI test seams, Cargo/Rust toolchain
+inputs, and provider configuration remain available. Callers therefore run the
+authoritative gate directly; they do not need a separate `env -u` recipe.
+
 Before either source gate starts a broad Rust compile,
 `scripts/check-build-headroom.sh` reports the exact filesystem bytes available
 to the active Cargo target and that target's exact allocated bytes (the
