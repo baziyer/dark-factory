@@ -1,6 +1,12 @@
 # Dark Factory roadmap
 
-Status: 18 August 2026
+Status: 20 August 2026
+
+> Dark Factory is currently frozen while the
+> [safe kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md) replaces
+> resident-session work authority, killable cleanup, per-agent worktrees, and
+> per-worktree build targets. That epic supersedes the implementation ordering
+> below until its boot gate is met.
 
 Dark Factory's current baseline is a durable local supervisor and native
 control plane: resident PTY-backed Claude Code, Codex, and shell sessions;
