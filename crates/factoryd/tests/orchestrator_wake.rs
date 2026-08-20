@@ -61,6 +61,17 @@ impl Daemon {
     fn client(&self) -> Client {
         Client::new(&self.socket)
     }
+
+    fn crash_preserving_sessions(mut self) {
+        let pid = self.child.id().to_string();
+        let status = Command::new("kill")
+            .args(["-KILL", &pid])
+            .status()
+            .expect("kill factoryd for replacement");
+        assert!(status.success(), "factoryd replacement kill failed");
+        self.child.wait().expect("wait for replaced factoryd");
+        std::mem::forget(self);
+    }
 }
 
 impl Drop for Daemon {
@@ -448,7 +459,7 @@ try:
         text = buffer.decode("utf-8", errors="replace")
         buffer.clear()
         record(text)
-        if mode == "orchestrator-no-ack" and "task:bootstrap-task" not in text:
+        if mode in ("orchestrator-no-ack", "orchestrator-restart-no-ack") and "task:bootstrap-task" not in text:
             no_ack_count += 1
             if no_ack_count == 1:
                 time.sleep(40)
@@ -897,4 +908,129 @@ fn two_unacknowledged_cycles_recover_once_until_a_new_event() {
     );
 
     drop(daemon);
+}
+
+#[test]
+fn daemon_replacement_recovers_the_resident_terminal_cycle_once() {
+    let home = private_tempdir();
+    fs::create_dir(home.path().join("projects")).unwrap();
+    fs::set_permissions(
+        home.path().join("projects"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::create_dir(home.path().join("projects/factory")).unwrap();
+    fs::set_permissions(
+        home.path().join("projects/factory"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fs::write(home.path().join("projects/factory/PROJECT.md"), []).unwrap();
+    fs::set_permissions(
+        home.path().join("projects/factory/PROJECT.md"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let daemon = Daemon::start(home.path());
+    let client = daemon.client();
+    let root = home.path().join("repo");
+    init_git_repo(&root);
+    create_project(&client, &root);
+
+    let orchestrator_log = home.path().join("orchestrator-prompts.jsonl");
+    let orchestrator_fixture = write_fixture(
+        home.path(),
+        "orchestrator-restart-no-ack",
+        "orchestrator-prompts.jsonl",
+        None,
+    );
+    let worker_fixture = write_fixture(home.path(), "worker-a", "worker-a-prompts.jsonl", None);
+    create_agent(
+        &client,
+        "orchestrator",
+        None,
+        AgentRole::Orchestrator,
+        &orchestrator_fixture,
+    );
+    create_agent(
+        &client,
+        "worker-a",
+        Some("orchestrator"),
+        AgentRole::Worker,
+        &worker_fixture,
+    );
+    create_task(
+        &client,
+        "roadmap-root",
+        "roadmap root",
+        "ROADMAP_SECRET_ROOT",
+    );
+    create_task(
+        &client,
+        "bootstrap-task",
+        "orchestrator bootstrap",
+        "bootstrap the bounded cycle",
+    );
+    create_task(
+        &client,
+        "worker-a-task",
+        "worker A terminal tranche",
+        "worker-a-private-body",
+    );
+
+    assign_task(&client, "bootstrap-task", "orchestrator");
+    wait_for_first_prompt(&client, &orchestrator_log, SETUP_TIMEOUT);
+    wait_for_task(&client, "bootstrap-task", TaskStatus::Succeeded);
+    wait_for_agent_state(&client, "orchestrator", SessionState::Idle);
+    assign_task(&client, "worker-a-task", "worker-a");
+    wait_for_task(&client, "worker-a-task", TaskStatus::Succeeded);
+
+    let first_cycle = wait_until_with_timeout(
+        "the first unacknowledged cycle prompt",
+        RECOVERY_FENCE_TIMEOUT,
+        || {
+            let lines = log_lines(&orchestrator_log);
+            lines
+                .iter()
+                .any(|line| !line.contains("task:bootstrap-task"))
+                .then_some(lines)
+        },
+    );
+    assert_eq!(
+        first_cycle
+            .iter()
+            .filter(|line| !line.contains("task:bootstrap-task"))
+            .count(),
+        1
+    );
+    wait_for_agent_state(&client, "orchestrator", SessionState::WaitingForInput);
+
+    // Replace only factoryd. The runner owns the shell fixture and remains
+    // alive, so startup must recover the exact resident SessionWork instead
+    // of cleaning its terminal cycle lease and leaving the session stuck.
+    daemon.crash_preserving_sessions();
+    let replacement = Daemon::start(home.path());
+    let replacement_client = replacement.client();
+    let lines = wait_for_log_lines(&orchestrator_log, 3, RECOVERY_FENCE_TIMEOUT);
+    let cycle_prompts: Vec<_> = lines
+        .iter()
+        .filter(|line| !line.contains("task:bootstrap-task"))
+        .collect();
+    assert_eq!(
+        cycle_prompts.len(),
+        2,
+        "replacement must recover one follow-up, not strand or duplicate the resident cycle"
+    );
+    thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        log_lines(&orchestrator_log)
+            .iter()
+            .filter(|line| !line.contains("task:bootstrap-task"))
+            .count(),
+        2,
+        "repeat restart safety ticks must not emit a successor without new intent"
+    );
+    drop(replacement_client);
+    drop(replacement);
 }

@@ -2821,6 +2821,22 @@ impl Store {
         &mut self,
         input: NewDeliveryAttempt,
     ) -> Result<DeliveryAttempt> {
+        self.ensure_delivery_attempt_with_cycle(input, None)
+    }
+
+    pub(crate) fn ensure_orchestrator_cycle_delivery_attempt(
+        &mut self,
+        input: NewDeliveryAttempt,
+        cycle_lease_id: &str,
+    ) -> Result<DeliveryAttempt> {
+        self.ensure_delivery_attempt_with_cycle(input, Some(cycle_lease_id))
+    }
+
+    fn ensure_delivery_attempt_with_cycle(
+        &mut self,
+        input: NewDeliveryAttempt,
+        cycle_lease_id: Option<&str>,
+    ) -> Result<DeliveryAttempt> {
         if input.id.is_empty()
             || input.text.is_empty()
             || input.text.len() > 65_536
@@ -2851,6 +2867,11 @@ impl Store {
                     .and_then(|work| work.phase.lease())
                     .is_some_and(|lease| lease.attempt_id == existing.id)
                 {
+                    if cycle_lease_id.is_some()
+                        && existing.orchestrator_cycle_lease_id.as_deref() != cycle_lease_id
+                    {
+                        return Err(StoreError::SessionWorkConflict);
+                    }
                     return Ok(existing);
                 }
             }
@@ -2927,7 +2948,7 @@ impl Store {
                 next_attempt_at_ms, state, created_at_ms, updated_at_ms,
                 task_revision, run_id, orchestrator_cycle_lease_id
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, NULL, 'in_flight',
-                       ?10, ?10, ?11, ?12, NULL)",
+                       ?10, ?10, ?11, ?12, ?13)",
             params![
                 input.id.as_str(),
                 input.project_id.as_str(),
@@ -2941,6 +2962,7 @@ impl Store {
                 input.created_at_ms,
                 input.task_revision,
                 lease.task.as_ref().map(|task| task.run_id.as_str()),
+                cycle_lease_id,
             ],
         )?;
         persist_session_work(
@@ -2952,6 +2974,18 @@ impl Store {
         )?;
         let attempt = load_delivery_attempt(&transaction, &input.id)?
             .ok_or(StoreError::InvalidExecutionMetadata)?;
+        if let Some(cycle_lease_id) = cycle_lease_id {
+            let changed = transaction.execute(
+                "UPDATE orchestrator_cycle_ledger
+                 SET attempt_id = ?1
+                 WHERE lease_id = ?2 AND project_id = ?3
+                   AND state = 'leased' AND attempt_id IS NULL",
+                params![input.id.as_str(), cycle_lease_id, input.project_id.as_str()],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::SessionWorkConflict);
+            }
+        }
         transaction.commit()?;
         Ok(attempt)
     }
@@ -3147,6 +3181,7 @@ impl Store {
     /// the audit record, but never treat journal retryability as permission
     /// to replay an authority that is already `uncertain`.
     pub fn recover_delivery_attempts(&mut self, now_ms: i64) -> Result<()> {
+        self.recover_resident_orchestrator_cycles(now_ms)?;
         self.connection.execute(
             "UPDATE delivery_attempts
              SET failure_count = failure_count + 1,
@@ -3160,6 +3195,41 @@ impl Store {
             ],
         )?;
         self.recover_orchestrator_cycles(now_ms)?;
+        Ok(())
+    }
+
+    /// Reconcile an unacknowledged terminal cycle against its still-live
+    /// resident session before generic restart cleanup clears the scheduler
+    /// lease. The runner survives a daemon replacement; its durable
+    /// `SessionWork` is therefore the exact ownership identity that must be
+    /// recovered first.
+    fn recover_resident_orchestrator_cycles(&mut self, now_ms: i64) -> Result<()> {
+        let resident = {
+            let mut statement = self.connection.prepare(
+                "SELECT s.project_id, s.active_agent_id, d.session_id
+                 FROM orchestrator_scheduler_state s
+                 JOIN orchestrator_cycle_ledger c ON c.lease_id = s.active_lease_id
+                 JOIN delivery_attempts d ON d.id = c.attempt_id
+                 JOIN sessions session ON session.id = d.session_id
+                 WHERE s.active_agent_id IS NOT NULL
+                   AND d.state = 'terminal'
+                   AND session.ended_at_ms IS NULL
+                   AND session.state = 'waiting_for_input'
+                   AND session.wait_reason = 'delivery unacknowledged'",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        parse_id(row.get(0)?, 0)?,
+                        parse_id(row.get(1)?, 1)?,
+                        parse_id(row.get(2)?, 2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (project_id, agent_id, session_id) in resident {
+            self.recover_live_orchestrator_cycle(&project_id, &agent_id, &session_id, now_ms)?;
+        }
         Ok(())
     }
 
@@ -3294,40 +3364,6 @@ impl Store {
         Ok(Some(OrchestratorCycleLease { lease_id }))
     }
 
-    /// Associates the immutable delivery journal row with a claimed cycle.
-    /// This small fence closes the claim-to-attempt crash window without
-    /// making the scheduler depend on provider text or public events.
-    pub(crate) fn bind_orchestrator_cycle_attempt(
-        &mut self,
-        lease_id: &str,
-        attempt_id: &str,
-        now_ms: i64,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE orchestrator_cycle_ledger
-             SET attempt_id = ?1
-             WHERE lease_id = ?2 AND state = 'leased' AND attempt_id IS NULL",
-            params![attempt_id, lease_id],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::SessionWorkConflict);
-        }
-        let changed = transaction.execute(
-            "UPDATE delivery_attempts
-             SET orchestrator_cycle_lease_id = ?1, updated_at_ms = ?2
-             WHERE id = ?3 AND task_id IS NULL AND message_ids_json = '[]'",
-            params![lease_id, now_ms, attempt_id],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidExecutionMetadata);
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     fn recover_orchestrator_cycles(&mut self, now_ms: i64) -> Result<()> {
         let transaction = self
             .connection
@@ -3342,9 +3378,9 @@ impl Store {
         now_ms: i64,
     ) -> Result<()> {
         let mut statement = transaction.prepare(
-            "SELECT s.project_id, s.active_lease_id, s.active_agent_id,
+            "SELECT s.project_id, s.active_lease_id,
                     c.from_sequence, c.through_sequence, c.attempt_id, d.state,
-                    c.created_at_ms, s.pending_from_sequence,
+                    s.pending_from_sequence,
                     s.pending_through_sequence
              FROM orchestrator_scheduler_state s
              JOIN orchestrator_cycle_ledger c ON c.lease_id = s.active_lease_id
@@ -3356,14 +3392,12 @@ impl Store {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3371,52 +3405,14 @@ impl Store {
         for (
             project_id,
             lease_id,
-            active_agent_id,
             from_sequence,
             through_sequence,
             attempt_id,
             attempt_state,
-            lease_created_at_ms,
             pending_from_sequence,
             pending_through_sequence,
         ) in rows
         {
-            let inferred_attempt_id = if attempt_id.is_none() {
-                if let Some(agent_id) = active_agent_id.as_deref() {
-                    transaction
-                        .query_row(
-                            "SELECT id FROM delivery_attempts
-                             WHERE project_id = ?1 AND agent_id = ?2
-                               AND task_id IS NULL AND message_ids_json = '[]'
-                               AND orchestrator_cycle_lease_id IS NULL
-                               AND created_at_ms > ?3
-                               AND state IN ('in_flight', 'retryable', 'terminal')
-                             ORDER BY created_at_ms DESC, id DESC LIMIT 1",
-                            params![project_id.as_str(), agent_id, lease_created_at_ms],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()?
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            if let Some(attempt_id) = inferred_attempt_id.as_deref() {
-                transaction.execute(
-                    "UPDATE orchestrator_cycle_ledger
-                     SET attempt_id = ?1
-                     WHERE lease_id = ?2 AND state = 'leased' AND attempt_id IS NULL",
-                    params![attempt_id, lease_id],
-                )?;
-                transaction.execute(
-                    "UPDATE delivery_attempts
-                     SET orchestrator_cycle_lease_id = ?1, updated_at_ms = ?2
-                     WHERE id = ?3",
-                    params![lease_id, now_ms, attempt_id],
-                )?;
-                continue;
-            }
             let should_requeue = attempt_id.is_none()
                 || matches!(
                     attempt_state.as_deref(),
@@ -8815,23 +8811,44 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .ensure_delivery_attempt(NewDeliveryAttempt {
-                id: "cycle-attempt".into(),
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                task_id: None,
-                task_incarnation_id: None,
-                task_revision: None,
-                require_queue_head: false,
-                message_ids: Vec::new(),
-                text: "fixed orchestrator instruction".into(),
-                created_at_ms: 6,
-            })
+            .ensure_orchestrator_cycle_delivery_attempt(
+                NewDeliveryAttempt {
+                    id: "cycle-attempt".into(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    task_incarnation_id: None,
+                    task_revision: None,
+                    require_queue_head: false,
+                    message_ids: Vec::new(),
+                    text: "fixed orchestrator instruction".into(),
+                    created_at_ms: 5,
+                },
+                &lease.lease_id,
+            )
             .unwrap();
-        store
-            .bind_orchestrator_cycle_attempt(&lease.lease_id, "cycle-attempt", 7)
+        let bound_attempt: String = store
+            .connection
+            .query_row(
+                "SELECT attempt_id FROM orchestrator_cycle_ledger WHERE lease_id = ?1",
+                params![lease.lease_id.as_str()],
+                |row| row.get(0),
+            )
             .unwrap();
+        assert_eq!(bound_attempt, "cycle-attempt");
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT orchestrator_cycle_lease_id FROM delivery_attempts WHERE id = ?1",
+                    params!["cycle-attempt"],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap()
+                .as_deref(),
+            Some(lease.lease_id.as_str())
+        );
 
         store.end_session(&session_id, Some(0), None, 8).unwrap();
 
@@ -8938,22 +8955,22 @@ mod tests {
             .unwrap()
             .unwrap();
         store
-            .ensure_delivery_attempt(NewDeliveryAttempt {
-                id: "live-cycle-attempt".into(),
-                project_id: project_id.clone(),
-                agent_id: agent_id.clone(),
-                session_id: session_id.clone(),
-                task_id: None,
-                task_incarnation_id: None,
-                task_revision: None,
-                require_queue_head: false,
-                message_ids: Vec::new(),
-                text: "fixed orchestrator instruction".into(),
-                created_at_ms: 7,
-            })
-            .unwrap();
-        store
-            .bind_orchestrator_cycle_attempt(&lease.lease_id, "live-cycle-attempt", 8)
+            .ensure_orchestrator_cycle_delivery_attempt(
+                NewDeliveryAttempt {
+                    id: "live-cycle-attempt".into(),
+                    project_id: project_id.clone(),
+                    agent_id: agent_id.clone(),
+                    session_id: session_id.clone(),
+                    task_id: None,
+                    task_incarnation_id: None,
+                    task_revision: None,
+                    require_queue_head: false,
+                    message_ids: Vec::new(),
+                    text: "fixed orchestrator instruction".into(),
+                    created_at_ms: 6,
+                },
+                &lease.lease_id,
+            )
             .unwrap();
         store
             .begin_delivery_attempt("live-cycle-attempt", 9)
@@ -9276,7 +9293,7 @@ mod tests {
                 require_queue_head: false,
                 message_ids: Vec::new(),
                 text: "fixed orchestrator instruction".into(),
-                created_at_ms: 10,
+                created_at_ms: 11,
             })
             .unwrap();
         store
@@ -9381,7 +9398,8 @@ mod tests {
                     |row| row.get::<_, Option<String>>(0),
                 )
                 .unwrap(),
-            None
+            None,
+            "a newer unowned attempt must not inherit a lease"
         );
         assert_eq!(
             store

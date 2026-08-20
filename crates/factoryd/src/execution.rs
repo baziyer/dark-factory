@@ -2340,12 +2340,11 @@ async fn ensure_delivery_attempt(
     };
     state
         .commit_and_publish(move |store| {
-            let attempt = store.ensure_delivery_attempt(input)?;
-            if let Some(lease_id) = cycle_lease_id
-                && attempt.orchestrator_cycle_lease_id.is_none()
-            {
-                store.bind_orchestrator_cycle_attempt(&lease_id, &attempt.id, now_ms)?;
-            }
+            let attempt = if let Some(lease_id) = cycle_lease_id {
+                store.ensure_orchestrator_cycle_delivery_attempt(input, &lease_id)?
+            } else {
+                store.ensure_delivery_attempt(input)?
+            };
             Ok((attempt, Vec::new()))
         })
         .await
