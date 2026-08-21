@@ -56,8 +56,6 @@ const CONNECT_GRACE: Duration = Duration::from_secs(5);
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 const RUNNER_EXIT_GRACE: Duration = Duration::from_secs(5);
 const RUST_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-/// One initial launch plus one crash-recovery replacement.
-const MAX_RUST_EFFECT_ATTEMPTS: usize = 2;
 const DEFAULT_FINALIZE_GRACE_MS: u64 = 5_000;
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
@@ -1306,7 +1304,7 @@ async fn reconcile_rust_completion(
     run_id: RunId,
 ) -> Result<(), Error> {
     let lookup_run = run_id.clone();
-    let (check, run, change) = state
+    let (check, run) = state
         .with_store(move |store| {
             let check = store
                 .rust_completion_check(&lookup_run)?
@@ -1316,23 +1314,42 @@ async fn reconcile_rust_completion(
                 .into_iter()
                 .find(|candidate| candidate.run.id == lookup_run)
                 .ok_or(StoreError::RunNotFound)?;
-            let change = store
-                .change(&check.project_id, &check.change_id)?
-                .ok_or(StoreError::ChangeNotFound)?;
-            Ok((check, run, change))
+            Ok((check, run))
         })
         .await?;
-    if run.run.phase != RunPhase::Finalizing || change.phase != ChangePhase::Available {
+    if run.run.phase != RunPhase::Finalizing {
         return Err(DaemonStateError::Store(StoreError::InvalidRunState).into());
     }
     if !initial_attempt_resources_released(&run.resources) {
         return Ok(());
     }
     match check.phase {
-        RustCompletionPhase::Pending => start_rust_completion(config, state, check, change).await,
-        RustCompletionPhase::Running => recover_rust_completion(config, state, check, change).await,
+        RustCompletionPhase::Pending => {
+            let change = load_available_completion_change(state, &check).await?;
+            start_rust_completion(config, state, check, change).await
+        }
+        RustCompletionPhase::Running => recover_rust_completion(config, state, check).await,
         RustCompletionPhase::Passed | RustCompletionPhase::Failed => Ok(()),
     }
+}
+
+async fn load_available_completion_change(
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+) -> Result<Change, Error> {
+    let project_id = check.project_id.clone();
+    let change_id = check.change_id.clone();
+    let change = state
+        .with_store(move |store| {
+            store
+                .change(&project_id, &change_id)?
+                .ok_or(StoreError::ChangeNotFound)
+        })
+        .await?;
+    if change.phase != ChangePhase::Available {
+        return Err(DaemonStateError::Store(StoreError::InvalidRunState).into());
+    }
+    Ok(change)
 }
 
 fn initial_attempt_resources_released(resources: &[KernelResource]) -> bool {
@@ -1398,16 +1415,13 @@ async fn start_rust_completion(
     }
 
     let worker_result = match run_rust_worker_effect(config, state, &check, &temporary.path).await {
-        Ok(result) => result,
+        Ok(RustWorkerEffectOutcome::Released(result)) => result,
+        Ok(RustWorkerEffectOutcome::Pending) => return Ok(()),
         Err(error) => {
             return fail_claimed_rust_setup(config, state, &check, &error).await;
         }
     };
-    let persisted = persist_measured_rust_worker_result(config, state, &check, worker_result).await;
-    if persisted.is_ok() {
-        release_completion_temporary_root(state, &check.run_id).await?;
-    }
-    persisted
+    finish_released_rust_effect(config, state, &check, worker_result).await
 }
 
 async fn prepare_rust_worker_invocation(
@@ -1462,23 +1476,7 @@ async fn run_rust_worker_effect(
     state: &DaemonState,
     check: &RustCompletionCheck,
     temporary_root: &Path,
-) -> Result<rust_verify::WorkerResult, Error> {
-    let resources = state
-        .with_store({
-            let run_id = check.run_id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await?;
-    if resources
-        .iter()
-        .filter(|resource| resource.kind == KernelResourceKind::EffectProcess)
-        .count()
-        >= MAX_RUST_EFFECT_ATTEMPTS
-    {
-        return Ok(failed_worker_result(
-            "Rust verification exceeded its durable restart bound",
-        ));
-    }
+) -> Result<RustWorkerEffectOutcome, Error> {
     let nonce = Uuid::new_v4().simple().to_string();
     let invocation_path = temporary_root.join("worker.json");
     let result_path = temporary_root.join("result.json");
@@ -1502,15 +1500,57 @@ async fn run_rust_worker_effect(
     .await?;
     let pid = prepared.child_pid();
     let birth = process_birth_fingerprint(pid)?.ok_or(Error::ProcessIdentityUnavailable(pid))?;
-    register_effect_resources(state, &check.run_id, &nonce, pid, &birth, &finish_path).await?;
-    let mut child = prepared.activate().await?;
+    if let Err(error) =
+        register_effect_resources(state, &check.run_id, &nonce, pid, &birth, &finish_path).await
+    {
+        // The registration operation may have committed before its result
+        // was lost. Dropping `prepared` reaps a gate that never executed, but
+        // only durable reconciliation may decide whether effect rows exist.
+        tracing::warn!(
+            run_id = %check.run_id,
+            %error,
+            "Rust verifier registration is uncertain; deferring to durable reconciliation"
+        );
+        return Ok(RustWorkerEffectOutcome::Pending);
+    }
+    let mut child = match prepared.activate().await {
+        Ok(child) => child,
+        Err(error) => {
+            let result = failed_worker_result(&error.to_string());
+            return match terminate_effect_group(state, &check.run_id, None, &finish_path).await {
+                Ok(()) => Ok(RustWorkerEffectOutcome::Released(result)),
+                Err(cleanup_error) => {
+                    tracing::warn!(
+                        run_id = %check.run_id,
+                        %cleanup_error,
+                        "registered Rust verifier activation failed before exact resources were released"
+                    );
+                    Ok(RustWorkerEffectOutcome::Pending)
+                }
+            };
+        }
+    };
     let worker_result =
         wait_for_worker_result(&mut child, &result_path, RUST_VERIFICATION_TIMEOUT).await;
-    terminate_effect_group(state, &check.run_id, Some(&mut child), &finish_path).await?;
-    match worker_result {
-        Ok(result) => Ok(result),
-        Err(error) => Ok(failed_worker_result(&error.to_string())),
+    if let Err(error) =
+        terminate_effect_group(state, &check.run_id, Some(&mut child), &finish_path).await
+    {
+        tracing::warn!(
+            run_id = %check.run_id,
+            %error,
+            "registered Rust verifier has not been proven released"
+        );
+        return Ok(RustWorkerEffectOutcome::Pending);
     }
+    Ok(RustWorkerEffectOutcome::Released(match worker_result {
+        Ok(result) => result,
+        Err(error) => failed_worker_result(&error.to_string()),
+    }))
+}
+
+enum RustWorkerEffectOutcome {
+    Released(rust_verify::WorkerResult),
+    Pending,
 }
 
 struct CompletionTemporaryRoot {
@@ -1887,11 +1927,24 @@ async fn terminate_effect_group(
 
 #[cfg(target_os = "linux")]
 fn kill_registered_effect_group(resource: &KernelResource) -> Result<(), Error> {
-    let Some(pgid) = locator_number(&resource.locator, "pgid") else {
-        return Ok(());
-    };
-    if process_birth_fingerprint(pgid)?.as_deref() != resource.birth_fingerprint.as_deref() {
-        return Ok(());
+    let pgid = locator_number(&resource.locator, "pgid").ok_or(DaemonStateError::Store(
+        StoreError::InvalidExecutionMetadata,
+    ))?;
+    let expected = resource
+        .birth_fingerprint
+        .as_deref()
+        .ok_or(DaemonStateError::Store(
+            StoreError::InvalidExecutionMetadata,
+        ))?;
+    if !exact_effect_group_leader(Some(expected), process_birth_fingerprint(pgid)?.as_deref()) {
+        if process_group_absent(resource)? {
+            return Ok(());
+        }
+        // A process group may outlive its leader. Without that leader's exact
+        // birth identity, signalling the numeric PGID could hit a reused
+        // group. Keep the check and its cache nonterminal until group absence
+        // is independently proven.
+        return Err(Error::ProcessIdentityUnavailable(pgid));
     }
     let Some(pid) = Pid::from_raw(pgid as i32) else {
         return Ok(());
@@ -1903,6 +1956,11 @@ fn kill_registered_effect_group(resource: &KernelResource) -> Result<(), Error> 
             source: io::Error::from_raw_os_error(error.raw_os_error()),
         }),
     }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn exact_effect_group_leader(expected: Option<&str>, current: Option<&str>) -> bool {
+    expected.is_some() && expected == current
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1995,6 +2053,16 @@ async fn persist_measured_rust_worker_result(
         return fail_running_with_cache_handoff(state, check, &failure).await;
     }
     persist_rust_worker_result(state, check, result).await
+}
+
+async fn finish_released_rust_effect(
+    config: &Config,
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    result: rust_verify::WorkerResult,
+) -> Result<(), Error> {
+    persist_measured_rust_worker_result(config, state, check, result).await?;
+    release_completion_temporary_root(state, &check.run_id).await
 }
 
 async fn persist_rust_worker_result(
@@ -2140,8 +2208,18 @@ async fn recover_rust_completion(
     config: &Config,
     state: &DaemonState,
     check: RustCompletionCheck,
-    change: Change,
 ) -> Result<(), Error> {
+    let resources = state
+        .with_store({
+            let run_id = check.run_id.clone();
+            move |store| store.kernel_resources(&run_id)
+        })
+        .await?;
+    if rust_effect_was_attempted(&resources) {
+        return recover_prior_rust_effect(config, state, check, resources).await;
+    }
+
+    let change = load_available_completion_change(state, &check).await?;
     let temporary = match prepare_completion_temporary_root(config, state, &check).await {
         Ok(temporary) => temporary,
         Err(error) => {
@@ -2161,29 +2239,46 @@ async fn recover_rust_completion(
         return fail_claimed_rust_setup(config, state, &check, &error).await;
     }
     let path = temporary.path;
-    let resources = state
-        .with_store({
-            let run_id = check.run_id.clone();
-            move |store| store.kernel_resources(&run_id)
-        })
-        .await?;
-    let result_path = path.join("result.json");
+    let result = match run_rust_worker_effect(config, state, &check, &path).await {
+        Ok(RustWorkerEffectOutcome::Released(result)) => result,
+        Ok(RustWorkerEffectOutcome::Pending) => return Ok(()),
+        Err(error) => return fail_claimed_rust_setup(config, state, &check, &error).await,
+    };
+    finish_released_rust_effect(config, state, &check, result).await
+}
+
+async fn recover_prior_rust_effect(
+    config: &Config,
+    state: &DaemonState,
+    check: RustCompletionCheck,
+    resources: Vec<KernelResource>,
+) -> Result<(), Error> {
     if let Some(effect) = resources.iter().find(|resource| {
         matches!(
             resource.kind,
             KernelResourceKind::EffectProcess | KernelResourceKind::EffectGroup
         ) && resource.state != KernelResourceState::Released
     }) {
-        let Some(finish_path) = locator_named_path(&effect.locator, "finish") else {
-            return fail_rust_completion(
-                state,
-                &check,
-                "Rust verifier effect finish locator is invalid",
-            )
-            .await;
-        };
+        let finish_path = locator_named_path(&effect.locator, "finish").ok_or(
+            DaemonStateError::Store(StoreError::InvalidExecutionMetadata),
+        )?;
         terminate_effect_group(state, &check.run_id, None, &finish_path).await?;
     }
+
+    let temporary = match prepare_completion_temporary_root(config, state, &check).await {
+        Ok(temporary) => temporary,
+        Err(error) => {
+            return finish_released_rust_effect(
+                config,
+                state,
+                &check,
+                failed_worker_result(&error.to_string()),
+            )
+            .await;
+        }
+    };
+    let path = temporary.path;
+    let result_path = path.join("result.json");
     let result_exists = result_path.try_exists().map_err(|source| Error::Runtime {
         path: result_path.clone(),
         source,
@@ -2197,18 +2292,20 @@ async fn recover_rust_completion(
             Err(error) => failed_worker_result(&error.to_string()),
         }
     } else {
-        match run_rust_worker_effect(config, state, &check, &path).await {
-            Ok(result) => result,
-            Err(error) => {
-                return fail_claimed_rust_setup(config, state, &check, &error).await;
-            }
-        }
+        failed_worker_result(
+            "Rust verification was interrupted by daemon restart; refusing to rebuild from mutable Change source",
+        )
     };
-    let persisted = persist_measured_rust_worker_result(config, state, &check, result).await;
-    if persisted.is_ok() {
-        release_completion_temporary_root(state, &check.run_id).await?;
-    }
-    persisted
+    finish_released_rust_effect(config, state, &check, result).await
+}
+
+fn rust_effect_was_attempted(resources: &[KernelResource]) -> bool {
+    resources.iter().any(|resource| {
+        matches!(
+            resource.kind,
+            KernelResourceKind::EffectProcess | KernelResourceKind::EffectGroup
+        )
+    })
 }
 
 async fn release_completion_temporary_root(
@@ -4220,6 +4317,75 @@ mod tests {
                 StoreError::ResourceIdentityMismatch
             )))
         ));
+    }
+
+    #[test]
+    fn running_recovery_routes_a_prior_effect_before_a_replacement_source() {
+        let directory = private_tempdir();
+        let source = directory.path().join("change");
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&source)
+            .unwrap();
+        let selected_file = source.join("selected");
+        fs::write(&selected_file, b"A\n").unwrap();
+        let selected_identity = rust_verify::exact_directory_identity(&source).unwrap();
+
+        // This is the crash boundary exercised by the external smoke: the
+        // first verifier selected A, then the retained Change was replaced
+        // before daemon recovery. Prior effect evidence routes recovery to
+        // reaping/result handling before the replacement Change is consulted.
+        fs::rename(&source, directory.path().join("selected-a")).unwrap();
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&source)
+            .unwrap();
+        fs::write(source.join("selected"), b"B\n").unwrap();
+        assert_ne!(
+            rust_verify::exact_directory_identity(&source).unwrap(),
+            selected_identity
+        );
+
+        let run_id = RunId::try_from("run-1").unwrap();
+        let resource = |id: &str, kind| KernelResource {
+            id: id.to_owned(),
+            run_id: run_id.clone(),
+            kind,
+            state: KernelResourceState::Active,
+            locator: "{}".to_owned(),
+            birth_fingerprint: Some("first-verifier".to_owned()),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 2,
+            released_at_ms: None,
+        };
+        let prior_effect = vec![
+            resource("effect", KernelResourceKind::EffectProcess),
+            resource("effect-group", KernelResourceKind::EffectGroup),
+        ];
+
+        assert!(rust_effect_was_attempted(&prior_effect));
+        let released_effect = prior_effect
+            .into_iter()
+            .map(|mut resource| {
+                resource.state = KernelResourceState::Released;
+                resource
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            rust_effect_was_attempted(&released_effect),
+            "durable evidence of any prior verifier must prevent setup replay"
+        );
+        assert!(!rust_effect_was_attempted(&[]));
+    }
+
+    #[test]
+    fn verifier_group_kill_requires_the_exact_live_leader() {
+        assert!(exact_effect_group_leader(Some("birth-a"), Some("birth-a")));
+        assert!(!exact_effect_group_leader(Some("birth-a"), None));
+        assert!(!exact_effect_group_leader(Some("birth-a"), Some("birth-b")));
+        assert!(!exact_effect_group_leader(None, None));
     }
 
     #[test]
