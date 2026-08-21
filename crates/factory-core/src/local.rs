@@ -164,7 +164,7 @@ pub struct RustStorageSnapshot {
     pub complete: bool,
 }
 
-/// Applies the task-title contract shared by every local and connector write.
+/// Applies the task-title contract shared by local task writes.
 #[must_use]
 pub fn normalize_task_title(value: String) -> Option<String> {
     let value = value.trim().to_owned();

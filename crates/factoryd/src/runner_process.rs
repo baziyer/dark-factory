@@ -665,7 +665,6 @@ mod tests {
             "CLAUDE_CODE_OAUTH_TOKEN" => Some(OsString::from("claude-secret-sentinel")),
             "GOOGLE_API_KEY" => Some(OsString::from("google-secret-sentinel")),
             "VERCEL_TOKEN" => Some(OsString::from("vercel-secret-sentinel")),
-            "DARK_FACTORY_WEBHOOK_SECRET" => Some(OsString::from("webhook-secret-sentinel")),
             "DARK_FACTORY_TASK" => Some(OsString::from("private task sentinel")),
             "SSH_AUTH_SOCK" => Some(OsString::from("/secret/agent.sock")),
             "HTTPS_PROXY" => Some(OsString::from("https://secret-proxy.example")),
@@ -770,7 +769,6 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
             .env("CLAUDE_CODE_OAUTH_TOKEN", "claude-secret-sentinel")
             .env("GOOGLE_API_KEY", "google-secret-sentinel")
             .env("VERCEL_TOKEN", "vercel-secret-sentinel")
-            .env("DARK_FACTORY_WEBHOOK_SECRET", "webhook-secret-sentinel")
             .env("DARK_FACTORY_TASK", "private task sentinel")
             .env("SSH_AUTH_SOCK", "/secret/agent.sock")
             .env("HTTPS_PROXY", "https://secret-proxy.example")
@@ -840,7 +838,6 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert!(!output.contains("codex-secret-sentinel"));
         assert!(!output.contains("claude-secret-sentinel"));
         assert!(!output.contains("VERCEL_TOKEN"));
-        assert!(!output.contains("DARK_FACTORY_WEBHOOK_SECRET"));
         assert!(!output.contains("DARK_FACTORY_TASK"));
         assert!(!output.contains("private task sentinel"));
         assert!(!output.contains("SSH_AUTH_SOCK"));

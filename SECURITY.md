@@ -26,10 +26,10 @@ attempt; it does **not** isolate a hostile same-user process from readable
 files, credentials, other processes, or the local socket. That claim requires
 a separate OS user, container, or sandbox.
 
-The local API is a private Unix socket with owner-only directory/socket modes.
-The optional webhook listener binds to loopback and uses an owner-only HMAC
-secret. Exposing either boundary beyond the machine is external deployment
-work and is unsupported.
+The only request boundary is a private Unix socket with owner-only
+directory/socket modes. There is no HTTP webhook or generic connector listener.
+Exposing the local API beyond the machine is external deployment work and is
+unsupported.
 
 ## Principals and capabilities
 
@@ -45,7 +45,7 @@ Every request carries a versioned envelope and is resolved once as one of:
 
 Missing credentials never imply operator access. Bearers are redacted from
 debug/display output and are not accepted in argv, environment variables,
-events, logs, webhook payloads, or caller-selected identity fields. The first
+events, logs, request payloads, or caller-selected identity fields. The first
 transition to `finalizing` revokes attempt mutation authority atomically. Old,
 forged, cross-project, taskless, and terminal credentials fail closed.
 
@@ -100,7 +100,7 @@ risk within the same-user boundary. It never bypasses daemon authentication,
 attempt scope, run phase, or finalization rules.
 
 Provider output remains opaque and bounded. It never becomes lifecycle
-authority and does not enter public events, webhook responses, or tracing.
+authority and does not enter public events, local-API responses, or tracing.
 
 ## Source and repository boundary
 
@@ -152,8 +152,8 @@ does not claim an instantaneous filesystem byte ceiling while Cargo is writing.
 
 ## Bounded inputs and durable data
 
-Local frames, hook payloads, webhook bodies, guidance, messages, events, logs,
-and generated configuration have hard size limits. SQLite uses durable
+Local frames, hook payloads, guidance, messages, events, logs, and generated
+configuration have hard size limits. SQLite uses durable
 transactions for authority. Guidance and memory files are bounded content, not
 an authority ledger.
 

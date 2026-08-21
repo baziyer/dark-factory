@@ -351,7 +351,7 @@ const TASK_DELETE_HELP: &str = "usage: factoryctl task delete --project ID --tas
 
 Delete a task that has no non-terminal run, no retained Change, no subtasks,
 and no run that is a parent of another run. Also deletes its terminal runs and
-any rows that reference it (questions, dependencies, webhook capabilities).
+any rows that reference it, including inert rows from historical schemas.
 
 Required:
   --project ID           Project the task belongs to
