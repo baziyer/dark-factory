@@ -1,7 +1,8 @@
 use std::{
-    fs,
+    fs, io,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -19,11 +20,16 @@ use factoryd::{
         NewProject, NewRunAdmission, NewTask, PreparedProcessIdentity, Store,
     },
 };
-use rustix::process::{Pid, Signal, kill_process, kill_process_group, test_kill_process};
+use rustix::{
+    io::Errno,
+    process::{Pid, test_kill_process},
+};
+use tokio::process::Child;
 
 const RUN_ID: &str = "11111111-1111-4111-8111-111111111111";
 const RUNNER_INSTANCE_ID: &str = "22222222-2222-4222-8222-222222222222";
 const RUNTIME_NONCE: &str = "33333333333343338333333333333333";
+const CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -86,7 +92,7 @@ impl Fixture {
                     id: TaskId::try_from("task-1").unwrap(),
                     project_id: project_id.clone(),
                     parent_task_id: None,
-                    title: "prove crash cuts".into(),
+                    title: "prove observer convergence".into(),
                     body: "fixture only".into(),
                     priority: 0,
                 },
@@ -188,121 +194,66 @@ impl Fixture {
     }
 }
 
-struct ProcessReaper {
-    runner: Option<Pid>,
-    provider_group: Option<Pid>,
+struct ReleaseOnDrop(PathBuf);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.0, b"release");
+    }
 }
 
-impl ProcessReaper {
-    fn new(runner: u32) -> Self {
-        Self {
-            runner: pid(runner),
-            provider_group: None,
+struct OwnedRunner(Option<Child>);
+
+impl OwnedRunner {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    async fn wait(&mut self) -> std::process::ExitStatus {
+        let status = self.0.as_mut().unwrap().wait().await.unwrap();
+        self.0.take();
+        status
+    }
+
+    fn kill_and_reap(&mut self) -> io::Result<std::process::ExitStatus> {
+        let child = self.0.as_mut().expect("owned runner is already reaped");
+        child.start_kill()?;
+        let deadline = Instant::now() + CHILD_REAP_TIMEOUT;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.0.take();
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned runner did not reap after exact-child kill",
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
 }
 
-impl Drop for ProcessReaper {
+impl Drop for OwnedRunner {
     fn drop(&mut self) {
-        if let Some(group) = self.provider_group {
-            let _ = kill_process_group(group, Signal::KILL);
-        }
-        if let Some(runner) = self.runner {
-            let _ = kill_process(runner, Signal::KILL);
+        if self.0.is_some()
+            && let Err(error) = self.kill_and_reap()
+            && !thread::panicking()
+        {
+            panic!("failed to reap owned runner during cleanup: {error}");
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn durable_execution_converges_across_every_blocked_exec_and_cleanup_cut() {
+async fn production_observer_defers_terminal_until_external_group_absence_across_restart() {
     let (fixture, mut store, admitted) = Fixture::new();
-    register_runtime(&mut store, &fixture, &admitted, 5);
-
-    let setup = runner_process::prepare_runner(fixture.launch_spec())
-        .await
-        .unwrap();
-    let setup_locator =
-        runner_setup_locator(setup.setup_path(), &admitted.target.runner_instance_id);
-    let setup_birth = runner_setup_birth(setup.setup_device(), setup.setup_inode());
-    store
-        .register_admitted_runner_setup(&fixture.run_id, &setup_locator, &setup_birth, 6)
-        .unwrap();
-
-    // Cut: exact locked startup setup is durable before the outer gate exists.
+    let _provider_release = ReleaseOnDrop(fixture.provider_release.clone());
+    let _descendant_release = ReleaseOnDrop(fixture.descendant_release.clone());
+    let (mut runner, prepared_provider, runner_pid, provider_pid) =
+        manually_seed_running_observer_fixture(&fixture, &mut store, &admitted).await;
     drop(store);
-    let mut store = fixture.reopen();
-    assert_eq!(run(&store, &fixture.run_id).phase, RunPhase::Admitted);
-    assert!(!fixture.marker.exists());
-
-    let prepared_runner = setup.spawn().unwrap();
-    let runner_pid = prepared_runner.child_pid();
-    let mut reaper = ProcessReaper::new(runner_pid);
-    let runner_locator = runner_locator(runner_pid, &fixture.runner_instance_id);
-    let runner_birth = process_birth(runner_pid).unwrap();
-    store
-        .register_admitted_runner(
-            &fixture.run_id,
-            &setup_locator,
-            &setup_birth,
-            &runner_locator,
-            &runner_birth,
-            7,
-        )
-        .unwrap();
-
-    // Cut: the inert outer gate PID is durable before factory-runner execs.
-    drop(store);
-    let store = fixture.reopen();
-    assert_eq!(run(&store, &fixture.run_id).phase, RunPhase::Admitted);
-    assert!(!fixture.marker.exists());
-    drop(store);
-
-    let mut runner_child = prepared_runner.activate().await.unwrap();
-    assert_eq!(runner_child.id(), Some(runner_pid));
-    let client = RunnerClient::new(
-        &fixture.runtime,
-        fixture.run_id.clone(),
-        fixture.runner_instance_id.clone(),
-    );
-    let prepared_provider = prepare_with_grace(&client).await;
-    let provider_pid = prepared_provider.child_pid();
-    reaper.provider_group = pid(prepared_provider.process_group_id());
-    assert!(!fixture.marker.exists());
-
-    // Cut: the runner prepared the exact provider gate, but running authority
-    // is still absent until all reported identities are committed together.
-    let mut store = fixture.reopen();
-    assert_eq!(run(&store, &fixture.run_id).phase, RunPhase::Admitted);
-    let provider_birth = process_birth(provider_pid).unwrap();
-    let (running, _) = store
-        .activate_prepared_run(
-            &fixture.run_id,
-            PreparedProcessIdentity {
-                runtime_locator: runtime_locator(&fixture.runtime),
-                runtime_birth_fingerprint: runtime_birth(&fixture.runtime),
-                runner_locator,
-                runner_birth_fingerprint: runner_birth,
-                provider_locator: serde_json::json!({ "pid": provider_pid }).to_string(),
-                provider_birth_fingerprint: provider_birth.clone(),
-                process_group_locator: serde_json::json!({
-                    "pgid": prepared_provider.process_group_id()
-                })
-                .to_string(),
-                process_group_birth_fingerprint: provider_birth,
-            },
-            8,
-        )
-        .unwrap();
-    assert_eq!(running.phase, RunPhase::Running);
-
-    // Cut: the exact attempt is running durably while the provider remains
-    // inert behind the inner gate.
-    drop(store);
-    assert_eq!(
-        run(&fixture.reopen(), &fixture.run_id).phase,
-        RunPhase::Running
-    );
-    assert!(!fixture.marker.exists());
 
     prepared_provider.activate().await.unwrap();
     wait_for_path(&fixture.marker).await;
@@ -313,8 +264,7 @@ async fn durable_execution_converges_across_every_blocked_exec_and_cleanup_cut()
         .unwrap();
     assert_eq!(fs::read_to_string(&fixture.marker).unwrap(), "x");
 
-    // Cut: provider activation is externally visible while no exit or outcome
-    // has been invented in SQLite.
+    // The observer begins from a real running child with no invented outcome.
     assert_eq!(
         run(&fixture.reopen(), &fixture.run_id).phase,
         RunPhase::Running
@@ -326,20 +276,17 @@ async fn durable_execution_converges_across_every_blocked_exec_and_cleanup_cut()
     // resource open so this ordering is externally inspectable.
     let state = DaemonState::new(fixture.reopen());
     let (handle, manager) = execution::spawn(fixture.execution_config(), state.clone()).unwrap();
-    let runner_wait = tokio::spawn(async move { runner_child.wait().await.unwrap() });
     fs::write(&fixture.provider_release, b"release").unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_secs(5), runner_wait)
+        tokio::time::timeout(Duration::from_secs(5), runner.wait())
             .await
             .expect("production observer did not acknowledge the runner exit")
-            .unwrap()
             .success()
     );
-    reaper.runner = None;
     wait_for_observer_cut(&state, &fixture.run_id).await;
-    assert!(test_kill_process(pid(runner_pid).unwrap()).is_err());
-    assert!(test_kill_process(pid(provider_pid).unwrap()).is_err());
-    assert!(test_kill_process(pid(descendant_pid).unwrap()).is_ok());
+    assert!(process_absent(runner_pid));
+    assert!(process_absent(provider_pid));
+    assert!(!process_absent(descendant_pid));
     handle.shutdown().await.unwrap();
     manager.await.unwrap().unwrap();
     drop(state);
@@ -370,7 +317,6 @@ async fn durable_execution_converges_across_every_blocked_exec_and_cleanup_cut()
     // external group keeps finalization durable across manager shutdown.
     fs::write(&fixture.descendant_release, b"release").unwrap();
     wait_for_process_absence(descendant_pid).await;
-    reaper.provider_group = None;
     let store = fixture.reopen();
     assert_eq!(run(&store, &fixture.run_id).phase, RunPhase::Finalizing);
     assert!(
@@ -421,6 +367,96 @@ async fn durable_execution_converges_across_every_blocked_exec_and_cleanup_cut()
 
     handle.shutdown().await.unwrap();
     manager.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_wait_is_followed_by_exact_child_kill_and_reap() {
+    let child = tokio::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let raw_pid = child.id().unwrap();
+    let mut runner = OwnedRunner::new(child);
+
+    let wait = tokio::time::timeout(Duration::from_millis(20), runner.wait()).await;
+    assert!(
+        wait.is_err(),
+        "the live child exited before wait cancellation"
+    );
+    assert!(
+        runner.0.is_some(),
+        "cancelling wait disarmed exact Child cleanup authority"
+    );
+    drop(runner);
+    assert!(
+        process_absent(raw_pid),
+        "dropping the exact Child owner did not reap the runner"
+    );
+}
+
+// Manual observer-boundary fixture: setup registration, runner PID
+// registration, provider PID/PGID registration, and the Running Store
+// transition deliberately bypass production launch orchestration. This test
+// therefore proves no launch ordering or launch micro-window.
+async fn manually_seed_running_observer_fixture(
+    fixture: &Fixture,
+    store: &mut Store,
+    admitted: &AdmittedRun,
+) -> (OwnedRunner, PreparedRunner, u32, u32) {
+    register_runtime(store, fixture, admitted, 5);
+    let setup = runner_process::prepare_runner(fixture.launch_spec())
+        .await
+        .unwrap();
+    let setup_locator =
+        runner_setup_locator(setup.setup_path(), &admitted.target.runner_instance_id);
+    let setup_birth = runner_setup_birth(setup.setup_device(), setup.setup_inode());
+    store
+        .register_admitted_runner_setup(&fixture.run_id, &setup_locator, &setup_birth, 6)
+        .unwrap();
+    let prepared_runner = setup.spawn().unwrap();
+    let runner_pid = prepared_runner.child_pid();
+    let runner_locator = runner_locator(runner_pid, &fixture.runner_instance_id);
+    let runner_birth = process_birth(runner_pid).unwrap();
+    store
+        .register_admitted_runner(
+            &fixture.run_id,
+            &setup_locator,
+            &setup_birth,
+            &runner_locator,
+            &runner_birth,
+            7,
+        )
+        .unwrap();
+    let runner = OwnedRunner::new(prepared_runner.activate().await.unwrap());
+    let client = RunnerClient::new(
+        &fixture.runtime,
+        fixture.run_id.clone(),
+        fixture.runner_instance_id.clone(),
+    );
+    let prepared_provider = prepare_with_grace(&client).await;
+    let provider_pid = prepared_provider.child_pid();
+    let provider_birth = process_birth(provider_pid).unwrap();
+    let (running, _) = store
+        .activate_prepared_run(
+            &fixture.run_id,
+            PreparedProcessIdentity {
+                runtime_locator: runtime_locator(&fixture.runtime),
+                runtime_birth_fingerprint: runtime_birth(&fixture.runtime),
+                runner_locator,
+                runner_birth_fingerprint: runner_birth,
+                provider_locator: serde_json::json!({ "pid": provider_pid }).to_string(),
+                provider_birth_fingerprint: provider_birth.clone(),
+                process_group_locator: serde_json::json!({
+                    "pgid": prepared_provider.process_group_id()
+                })
+                .to_string(),
+                process_group_birth_fingerprint: provider_birth,
+            },
+            8,
+        )
+        .unwrap();
+    assert_eq!(running.phase, RunPhase::Running);
+    (runner, prepared_provider, runner_pid, provider_pid)
 }
 
 async fn prepare_with_grace(client: &RunnerClient) -> PreparedRunner {
@@ -505,6 +541,14 @@ fn pid(value: u32) -> Option<Pid> {
     i32::try_from(value).ok().and_then(Pid::from_raw)
 }
 
+fn process_absent(raw_pid: u32) -> bool {
+    match test_kill_process(pid(raw_pid).unwrap()) {
+        Err(Errno::SRCH) => true,
+        Ok(()) => false,
+        Err(error) => panic!("process {raw_pid} presence probe failed: {error}"),
+    }
+}
+
 async fn wait_for_path(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() && Instant::now() < deadline {
@@ -514,13 +558,12 @@ async fn wait_for_path(path: &Path) {
 }
 
 async fn wait_for_process_absence(raw_pid: u32) {
-    let pid = pid(raw_pid).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while test_kill_process(pid).is_ok() && Instant::now() < deadline {
+    while !process_absent(raw_pid) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(
-        test_kill_process(pid).is_err(),
+        process_absent(raw_pid),
         "process {raw_pid} survived its release gate"
     );
 }
