@@ -3,7 +3,7 @@ set -eu
 
 usage() {
     echo "usage: scripts/new-worktree.sh <slug>" >&2
-    echo "  creates .worktrees/<slug> on a new branch <slug>, based on main" >&2
+    echo "  creates .worktrees/<slug> on a new branch <slug>, without contacting a remote" >&2
 }
 
 slug="${1:-}"
@@ -35,14 +35,19 @@ if git -C "$repository_root" show-ref --verify --quiet "refs/heads/$branch"; the
     exit 1
 fi
 
-if git -C "$repository_root" remote get-url origin >/dev/null 2>&1; then
-    git -C "$repository_root" fetch --quiet origin main
+if git -C "$repository_root" show-ref --verify --quiet refs/remotes/origin/main; then
     base="origin/main"
 else
     base="main"
 fi
 
-git -C "$repository_root" worktree add -b "$branch" "$target" "$base"
+empty_hooks=$(mktemp -d "${TMPDIR:-/tmp}/dark-factory-empty-hooks.XXXXXX")
+trap 'rmdir "$empty_hooks" 2>/dev/null || true' EXIT HUP INT TERM
+chmod 700 "$empty_hooks"
+git -C "$repository_root" -c core.hooksPath="$empty_hooks" \
+    worktree add -b "$branch" "$target" "$base"
+rmdir "$empty_hooks"
+trap - EXIT HUP INT TERM
 
 cat <<EOF
 
@@ -52,5 +57,6 @@ Next steps:
   cd $target
   cargo build --workspace
   ./scripts/local-ci.sh
-  git push -u origin $branch   # then open a PR
+  Publish $branch and open a PR through an authorized host credential broker
+  or App-backed tool surface.
 EOF

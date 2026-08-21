@@ -10,7 +10,10 @@ socket, exact resource identities, and an independent reaper.
 
 ## Day to day
 
-1. Create one branch in one development worktree:
+1. Create one branch in one development worktree. For agent automation, first
+   obtain a current local base through the remote-access boundary below; the
+   helper itself never contacts a remote. Human contributors may refresh their
+   checkout through their normal Git workflow.
 
    ```sh
    ./scripts/new-worktree.sh <slug>
@@ -33,8 +36,9 @@ socket, exact resource identities, and an independent reaper.
    ```
 
    Ubuntu x86-64 contributors use `./scripts/local-ci.sh --linux-source`.
-5. Push and open a PR describing behavior, deleted authority paths, exact
-   base/head, focused proof, and unverified lanes.
+5. Publish the branch and open a PR through the remote-access boundary below,
+   describing behavior, deleted authority paths, exact base/head, focused
+   proof, and unverified lanes.
 6. A reviewer other than the author reads `base..head` cold, tries to break
    correctness/security/simplification, and posts findings plus what resisted
    attack. The author resolves every finding; the reviewer rechecks and gives
@@ -117,6 +121,29 @@ Linux source-only lane. The aggregate `required` context is the merge gate.
 Review the exact `.github/workflows/` diff before approving an external run: a
 PR evaluates its own workflow and can change `runs-on`. A green workflow never
 replaces CODEOWNERS approval and resolved review threads.
+
+Agent automation must use an explicitly authorized credential broker or
+App-backed tool surface supplied by its host for every authenticated remote
+read or write. This includes private checkout and fetch as well as publishing
+refs, opening or updating pull requests, reviewing, merging, and deleting
+refs. The current coordinator's connected GitHub App is one such surface;
+Claude or another harness may provide an equivalent. Agents must not use
+ambient `git fetch`, `git pull`, `git clone`, `git push`, `gh`, `gh auth`, or
+SSH-based access: those paths can consult the operator's credential helper,
+login keychain, SSH agent, or other user credential state.
+
+Anonymous HTTPS reads of public repositories are allowed when credential
+lookup and interactive prompting are disabled. A host may instead inject a
+short-lived, repository-scoped read credential for checkout without exposing
+it to the agent. If no authorized surface is available, authenticated access
+stops without contacting the remote. There is no token fallback for agent
+writes: operator approval does not authorize injecting `GH_TOKEN`,
+`GITHUB_TOKEN`, a personal access token, or another write credential into an
+agent process. Never use interactive authentication, write a credential into a
+worktree or repository, or expose it through a prompt, command output, or log.
+This is a contributor-agent workflow boundary, not the future Dark Factory
+product GitHub integration. Human operators may continue to use their normal
+Git and GitHub CLI configuration for separately reviewed human actions.
 
 Public state may include a milestone, exact ref/SHA, checks, links, and next
 operator action. Attempt identities, prompts, guidance, raw provider output,
