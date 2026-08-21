@@ -206,15 +206,7 @@ impl Store {
         if agent.snapshot.paused {
             return Ok(None);
         }
-        let already_open: bool = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM runs
-                 WHERE phase <> 'terminal' AND agent_id = ?1
-             )",
-            [input.agent_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if already_open {
+        if agent.snapshot.current_run_id.is_some() {
             return Ok(None);
         }
         let task_id = transaction
@@ -1965,6 +1957,35 @@ mod tests {
         assert!(admitted.target.change_id.is_none());
         assert_eq!(
             store.get_task(&project_id, &low).unwrap().snapshot.status,
+            TaskStatus::Queued
+        );
+    }
+
+    #[test]
+    fn admission_uses_the_canonical_created_at_then_id_queue_tiebreakers() {
+        let (mut store, project_id, agent_id) = queued_worker();
+        let later_id = queue_task(&mut store, &project_id, &agent_id, "task-b", 1, 3);
+        let earlier_id = queue_task(&mut store, &project_id, &agent_id, "task-a", 1, 3);
+
+        let admitted = store
+            .admit_next_run(
+                next_admission(
+                    "11111111-1111-4111-8111-111111111111",
+                    project_id.clone(),
+                    agent_id,
+                ),
+                4,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(admitted.target.task_id, earlier_id);
+        assert_eq!(
+            store
+                .get_task(&project_id, &later_id)
+                .unwrap()
+                .snapshot
+                .status,
             TaskStatus::Queued
         );
     }
