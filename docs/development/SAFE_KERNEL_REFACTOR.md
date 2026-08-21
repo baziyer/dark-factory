@@ -411,9 +411,10 @@ approval.
   are excluded, and same-UID test code is not sandboxed.
 - [x] Register each worker, process group, and temporary root durably before
   use. Result publication is atomic, every effect has a fixed 30-minute
-  deadline, and restart either consumes its exact result or starts a bounded
-  replacement from the same persisted invocation. Finalization reconciles all
-  registered resources.
+  deadline, and restart either consumes its exact result or starts one bounded
+  replacement from the same persisted invocation. At most two verifier effects
+  exist for a check: the initial launch and that replacement. Finalization
+  reconciles all registered resources.
 - [x] Deny direct `cargo`, `rustc`, and `rustup` tool calls and recognized
   mutable `target/.../{debug,release}` launches in cooperative provider hook
   policy. Provider startup guidance says that `factoryctl task done` is the

@@ -26,9 +26,10 @@ pub use kernel::{
     AdmittedRun, AttemptPrincipal, AttemptTarget, KernelResource, KernelResourceKind,
     KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
 };
+pub(crate) use rust_builds::{MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT};
 pub use rust_builds::{
-    ProjectExecutionPolicy, RustBuildCache, RustCacheLifecycle, RustCompletionCheck,
-    RustCompletionPhase, RustStoragePolicy, RustStorageSummary,
+    RustBuildCache, RustCacheLifecycle, RustCompletionCheck, RustCompletionPhase,
+    RustStorageSummary,
 };
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
@@ -305,11 +306,6 @@ pub enum StoreError {
          (runs linked to Changes: {linked_runs})"
     )]
     ChangeMigrationRequiresEmptyAuthority { linked_runs: i64 },
-    #[error(
-        "bounded-build migration requires a quiescent schema-31 database \
-         (nonterminal runs: {nonterminal_runs})"
-    )]
-    BuildMigrationRequiresQuiescence { nonterminal_runs: i64 },
     #[error("migration left a foreign key violation behind")]
     ForeignKeyViolation,
     #[error("event page size must be between 1 and {MAX_EVENT_PAGE}")]
@@ -2240,10 +2236,6 @@ impl Store {
             params![project_id.as_str()],
         )?;
         transaction.execute(
-            "DELETE FROM rust_build_caches WHERE project_id = ?1 AND lifecycle = 'removed'",
-            params![project_id.as_str()],
-        )?;
-        transaction.execute(
             "DELETE FROM tasks WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
@@ -3142,7 +3134,7 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     let has_rust_artifacts: bool = connection.query_row(
         "SELECT EXISTS(
              SELECT 1 FROM rust_build_caches
-             WHERE project_id = ?1 AND lifecycle <> 'removed'
+             WHERE project_id = ?1
          )",
         params![project_id.as_str()],
         |row| row.get(0),
@@ -3656,7 +3648,6 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         current = 31;
     }
     if current == 31 && target == SCHEMA_VERSION {
-        ensure_build_migration_quiescent(connection)?;
         connection.pragma_update(None, "foreign_keys", false)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0032_bounded_rust_builds.sql"))?;
@@ -3666,19 +3657,6 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
-}
-
-fn ensure_build_migration_quiescent(connection: &Connection) -> Result<()> {
-    let nonterminal_runs = connection.query_row(
-        "SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'",
-        [],
-        |row| row.get(0),
-    )?;
-    if nonterminal_runs == 0 {
-        Ok(())
-    } else {
-        Err(StoreError::BuildMigrationRequiresQuiescence { nonterminal_runs })
-    }
 }
 
 fn ensure_change_migration_empty_authority(connection: &Connection) -> Result<()> {
@@ -4772,6 +4750,7 @@ mod tests {
             "session_work",
             "delivery_attempts",
             "project_repository_authority",
+            "rust_storage_policy",
         ] {
             let exists: bool = store
                 .connection
@@ -4792,5 +4771,96 @@ mod tests {
             )
             .unwrap();
         assert_eq!(agent_worktree_columns, 0);
+    }
+
+    #[test]
+    fn bounded_build_migration_preserves_schema_31_runs() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_to(&mut connection, 31).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES ('project-1', 'Project', '/tmp/project-1', 1, 1);
+                 INSERT INTO agents (
+                    id, project_id, role, provider, paused, created_at_ms, updated_at_ms
+                 ) VALUES ('worker-1', 'project-1', 'worker', 'shell', 0, 1, 1);
+                 INSERT INTO tasks (
+                    id, project_id, assigned_agent_id, title, body, status, priority,
+                    created_at_ms, updated_at_ms, incarnation_id, work_revision
+                 ) VALUES (
+                    'task-1', 'project-1', 'worker-1', 'Task', 'Body', 'running', 0,
+                    1, 1, 'task-incarnation-1', 0
+                 );
+                 INSERT INTO runs (
+                    id, project_id, agent_id, task_id, task_incarnation_id,
+                    admitted_task_work_revision, source_root, phase, outcome,
+                    capability_digest, provider, runner_instance_id, runner_runtime,
+                    runner_protocol_version, admitted_at_ms, running_at_ms,
+                    finalizing_at_ms, phase_since_ms, updated_at_ms
+                 ) VALUES (
+                    '11111111-1111-4111-8111-111111111111', 'project-1', 'worker-1',
+                    'task-1', 'task-incarnation-1', 0, '/tmp/source', 'finalizing',
+                    'succeeded',
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'shell', '22222222-2222-4222-8222-222222222222', '/tmp/runner',
+                    1, 1, 2, 3, 3, 3
+                 );",
+            )
+            .unwrap();
+        let runs_before: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let indexes_before: Vec<(String, String)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema
+                     WHERE type = 'index' AND tbl_name = 'runs' AND sql IS NOT NULL
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+
+        migrate_to(&mut connection, SCHEMA_VERSION).unwrap();
+
+        let runs_after: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'runs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let indexes_after: Vec<(String, String)> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name, sql FROM sqlite_schema
+                     WHERE type = 'index' AND tbl_name = 'runs' AND sql IS NOT NULL
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        assert_eq!(runs_after, runs_before);
+        assert_eq!(indexes_after, indexes_before);
+        let preserved: (String, bool) = connection
+            .query_row(
+                "SELECT phase, capability_digest IS NOT NULL FROM runs WHERE id = ?1",
+                ["11111111-1111-4111-8111-111111111111"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, ("finalizing".to_owned(), true));
     }
 }

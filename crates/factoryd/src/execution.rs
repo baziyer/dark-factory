@@ -43,8 +43,9 @@ use crate::{
     store::{
         AdmittedRun, Change, ChangeBaseIdentity, ChangeMaterialization, ChangeRemovalKind,
         ChangeReservation, ChangeSourceIdentity, KernelResource, KernelResourceKind,
-        KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
-        RustBuildCache, RustCacheLifecycle, RustCompletionCheck, RustCompletionPhase, StoreError,
+        KernelResourceState, MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewRunAdmission,
+        PreparedProcessIdentity, RecoverableKernelRun, RustBuildCache, RustCacheLifecycle,
+        RustCompletionCheck, RustCompletionPhase, StoreError,
     },
 };
 
@@ -55,7 +56,8 @@ const CONNECT_GRACE: Duration = Duration::from_secs(5);
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 const RUNNER_EXIT_GRACE: Duration = Duration::from_secs(5);
 const RUST_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const MAX_RUST_EFFECT_ATTEMPTS: usize = 8;
+/// One initial launch plus one crash-recovery replacement.
+const MAX_RUST_EFFECT_ATTEMPTS: usize = 2;
 const DEFAULT_FINALIZE_GRACE_MS: u64 = 5_000;
 const DELETE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const DELETE_DRAIN_POLL: Duration = Duration::from_millis(50);
@@ -1996,10 +1998,18 @@ async fn persist_rust_worker_result(
     let verify_cache = check.cache_key.clone().ok_or(DaemonStateError::Store(
         StoreError::InvalidRustBuildMetadata,
     ))?;
-    tokio::task::spawn_blocking(move || {
+    let verified = tokio::task::spawn_blocking(move || {
         rust_verify::verify_exact_bundle(&staging, &verify_source, &verify_bundle, &verify_cache)
     })
-    .await??;
+    .await?;
+    if let Err(error) = verified {
+        return fail_rust_completion(
+            state,
+            check,
+            &format!("prepared Rust test bundle failed final verification: {error}"),
+        )
+        .await;
+    }
 
     let pass_run = check.run_id.clone();
     let pass_revision = check.revision;
@@ -2206,13 +2216,13 @@ async fn reconcile_rust_storage(config: &Config, state: &DaemonState) -> Result<
     if let Some(candidate) = recoverable.into_iter().next() {
         return reclaim_rust_artifact(state, candidate).await;
     }
-    let (policy, summary) = state
-        .with_store(|store| Ok((store.rust_storage_policy()?, store.rust_storage_summary()?)))
+    let summary = state
+        .with_store(|store| store.rust_storage_summary())
         .await?;
-    let over_limit = summary.cache_count > policy.max_cache_count
+    let over_limit = summary.cache_count > MAX_RUST_CACHE_COUNT
         || summary
             .cache_bytes
-            .is_some_and(|bytes| bytes > policy.max_cache_bytes);
+            .is_some_and(|bytes| bytes > MAX_RUST_CACHE_BYTES);
     if !over_limit {
         return Ok(());
     }
@@ -2237,22 +2247,31 @@ async fn reconcile_declared_rust_cache(
     let path = PathBuf::from(candidate.path);
     let incarnation = candidate.project_incarnation_id;
     let digest = candidate.cache_key;
-    let present = path.try_exists().map_err(|source| Error::Runtime {
-        path: path.clone(),
-        source,
-    })?;
+    let quarantine = format!(".reclaim-cache-{digest}");
+    let removed = tokio::task::spawn_blocking(move || {
+        rust_verify::remove_empty_claimed_directory(&path, &quarantine)
+    })
+    .await?;
     let at_ms = now_ms()?;
-    state
-        .commit_and_publish(move |store| {
-            if present {
-                let failure = "declared Rust cache exists without a durable exact identity";
-                store.record_rust_cache_failure(&incarnation, &digest, failure, at_ms)?;
-            } else {
-                store.finish_absent_declared_rust_cache(&incarnation, &digest, at_ms)?;
-            }
-            Ok(((), Vec::new()))
-        })
-        .await?;
+    match removed {
+        Ok(()) => {
+            state
+                .commit_and_publish(move |store| {
+                    store.finish_absent_declared_rust_cache(&incarnation, &digest)?;
+                    Ok(((), Vec::new()))
+                })
+                .await?;
+        }
+        Err(error) => {
+            let failure = bounded_completion_failure(&error.to_string());
+            state
+                .commit_and_publish(move |store| {
+                    store.record_rust_cache_failure(&incarnation, &digest, &failure, at_ms)?;
+                    Ok(((), Vec::new()))
+                })
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -2287,7 +2306,7 @@ async fn reclaim_rust_artifact(
         Ok(()) => {
             state
                 .commit_and_publish(move |store| {
-                    store.finish_rust_cache_reclaim(&incarnation, &digest, at_ms)?;
+                    store.finish_rust_cache_reclaim(&incarnation, &digest)?;
                     Ok(((), Vec::new()))
                 })
                 .await?;

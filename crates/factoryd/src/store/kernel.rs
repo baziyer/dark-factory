@@ -1843,6 +1843,17 @@ mod tests {
 
     const BEARER: &str = "attempt-secret";
 
+    fn project_incarnation(store: &Store, project_id: &ProjectId) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT incarnation_id FROM projects WHERE id = ?1",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     fn admit_worker_provisioning_with_verification(
         store: &mut Store,
         verification: factory_core::CompletionVerification,
@@ -2082,10 +2093,7 @@ mod tests {
             factory_core::CompletionVerification::RustWorkspaceTest,
         );
         let project_id = ProjectId::try_from("factory").unwrap();
-        let original_incarnation = store
-            .project_execution_policy(&project_id)
-            .unwrap()
-            .incarnation_id;
+        let original_incarnation = project_incarnation(&store, &project_id);
         let _ = request_rust_success(&mut store, &run_id);
 
         assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
@@ -2104,10 +2112,7 @@ mod tests {
             super::super::RustCompletionPhase::Pending
         );
         assert_eq!(
-            store
-                .project_execution_policy(&project_id)
-                .unwrap()
-                .incarnation_id,
+            project_incarnation(&store, &project_id),
             original_incarnation
         );
         release_all(&mut store, &run_id, 9);
@@ -2227,13 +2232,13 @@ mod tests {
         assert_eq!(store.recoverable_rust_reclaims().unwrap().len(), 1);
         store.begin_rust_cache_reclaim(&cache, 16).unwrap();
         store
-            .finish_rust_cache_reclaim(&cache.project_incarnation_id, &cache.cache_key, 17)
+            .finish_rust_cache_reclaim(&cache.project_incarnation_id, &cache.cache_key)
             .unwrap();
         assert!(store.recoverable_rust_reclaims().unwrap().is_empty());
     }
 
     #[test]
-    fn project_delete_refuses_live_rust_caches_and_clears_removed_tombstones() {
+    fn project_delete_requires_cache_absence() {
         let mut store = Store::open_in_memory().unwrap();
         let project_id = ProjectId::try_from("factory").unwrap();
         store
@@ -2246,10 +2251,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let incarnation = store
-            .project_execution_policy(&project_id)
-            .unwrap()
-            .incarnation_id;
+        let incarnation = project_incarnation(&store, &project_id);
         store
             .connection
             .execute(
@@ -2266,11 +2268,13 @@ mod tests {
             store.check_project_deletable(&project_id),
             Err(StoreError::ProjectHasRustCaches)
         ));
+        let cache = store.rust_reclaim_candidates(1).unwrap().remove(0);
+        store.begin_rust_cache_reclaim(&cache, 3).unwrap();
         store
-            .connection
-            .execute("UPDATE rust_build_caches SET lifecycle = 'removed'", [])
+            .finish_rust_cache_reclaim(&cache.project_incarnation_id, &cache.cache_key)
             .unwrap();
-        store.delete_project(&project_id, 3).unwrap();
+        assert_eq!(store.rust_storage_summary().unwrap().cache_count, 0);
+        store.delete_project(&project_id, 5).unwrap();
         assert!(matches!(
             store.get_project(&project_id),
             Err(StoreError::ProjectNotFound)
@@ -2297,10 +2301,7 @@ mod tests {
             ),
             Err(StoreError::ProjectHasActiveRun)
         ));
-        let incarnation = store
-            .project_execution_policy(&project_id)
-            .unwrap()
-            .incarnation_id;
+        let incarnation = project_incarnation(&store, &project_id);
         store
             .connection
             .execute(

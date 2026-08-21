@@ -37,8 +37,8 @@ use crate::{
     execution,
     guidance::{self, GuidanceError},
     store::{
-        AgentMessage, AttemptPrincipal, NewAgent, NewAgentMessage, NewProject, NewTask, Store,
-        StoreError, UpdateAgentProfile,
+        AgentMessage, AttemptPrincipal, MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT, NewAgent,
+        NewAgentMessage, NewProject, NewTask, Store, StoreError, UpdateAgentProfile,
     },
 };
 
@@ -802,20 +802,19 @@ async fn handle_request(
         LocalRequest::RustStorageStatus => {
             let storage = state
                 .with_store(|store| {
-                    let policy = store.rust_storage_policy()?;
                     let summary = store.rust_storage_summary()?;
                     Ok(RustStorageSnapshot {
-                        max_cache_count: policy.max_cache_count,
-                        max_cache_bytes: policy.max_cache_bytes,
+                        max_cache_count: MAX_RUST_CACHE_COUNT,
+                        max_cache_bytes: MAX_RUST_CACHE_BYTES,
                         cache_count: summary.cache_count,
                         cache_bytes: summary.cache_bytes,
                         protected_count: summary.protected_count,
                         reclaimable_count: summary.reclaimable_count,
                         failed_count: summary.failed_count,
-                        cache_count_over_limit: summary.cache_count > policy.max_cache_count,
+                        cache_count_over_limit: summary.cache_count > MAX_RUST_CACHE_COUNT,
                         cache_bytes_over_limit: summary
                             .cache_bytes
-                            .is_some_and(|bytes| bytes > policy.max_cache_bytes),
+                            .is_some_and(|bytes| bytes > MAX_RUST_CACHE_BYTES),
                         complete: summary.cache_bytes.is_some() && summary.failed_count == 0,
                     })
                 })
