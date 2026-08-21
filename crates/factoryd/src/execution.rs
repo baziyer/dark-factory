@@ -341,9 +341,11 @@ async fn run_manager(
                         }
                     }
                     Command::ReconcileRun { run_id, grace_ms } => {
-                        reconcile_one(
+                        if let Err(error) = reconcile_one(
                             &state, &commands, &mut observed, run_id, grace_ms,
-                        ).await?;
+                        ).await {
+                            tracing::warn!(%error, "attempt reconciliation paused");
+                        }
                     }
                     Command::ObserverFinished(run_id) => {
                         observed.remove(&run_id);
@@ -352,10 +354,12 @@ async fn run_manager(
             }
             _ = tick.tick() => {
                 reconcile_runs(&state, &commands, &mut observed).await?;
-                reconcile_agents(
+                if let Err(error) = reconcile_agents(
                     Arc::clone(&config), state.clone(), commands.clone(),
                     &mut observed, Arc::clone(&agent_gate),
-                ).await?;
+                ).await {
+                    tracing::warn!(%error, "automatic dispatch reconciliation paused");
+                }
             }
         }
     }
@@ -894,15 +898,23 @@ async fn reconcile_runs(
         .with_store(|store| store.recoverable_kernel_runs())
         .await?;
     for run in recoverable {
-        if run.run.phase == RunPhase::Admitted {
-            recover_admitted_run(state, commands, observed, run).await?;
-            continue;
+        let run_id = run.run.id.clone();
+        let result = async {
+            if run.run.phase == RunPhase::Admitted {
+                recover_admitted_run(state, commands, observed, run).await?;
+                return Ok::<(), Error>(());
+            }
+            if release_absent_resources(state, &run).await? {
+                return Ok(());
+            }
+            if observed.insert(run.run.id.clone()) {
+                spawn_observer(state.clone(), commands.clone(), run, None);
+            }
+            Ok(())
         }
-        if release_absent_resources(state, &run).await? {
-            continue;
-        }
-        if observed.insert(run.run.id.clone()) {
-            spawn_observer(state.clone(), commands.clone(), run, None);
+        .await;
+        if let Err(error) = result {
+            tracing::warn!(%run_id, %error, "attempt reconciliation paused");
         }
     }
     Ok(())
@@ -1109,9 +1121,27 @@ async fn observe_run(
             return Err(error.into());
         }
         Err(error) => {
-            mark_runner_unresolved(state, run, &error.to_string()).await;
-            if run.run.phase == RunPhase::Running {
-                let run_id = run.run.id.clone();
+            // The runner may have exited and removed its listener while this
+            // observer was retrying. Refresh durable phase first: an exact
+            // absent identity is stronger evidence than a stale socket error
+            // and can complete an already-requested outcome without turning
+            // a successful attempt into a process failure.
+            let run_id = run.run.id.clone();
+            let refreshed = state
+                .with_store(move |store| {
+                    store
+                        .recoverable_kernel_runs()?
+                        .into_iter()
+                        .find(|candidate| candidate.run.id == run_id)
+                        .ok_or(StoreError::RunNotFound)
+                })
+                .await?;
+            if release_absent_resources(state, &refreshed).await? {
+                return Ok(());
+            }
+            mark_runner_unresolved(state, &refreshed, &error.to_string()).await;
+            if refreshed.run.phase == RunPhase::Running {
+                let run_id = refreshed.run.id.clone();
                 let failed_at_ms = now_ms()?;
                 state
                     .commit_and_publish(move |store| {
@@ -1124,8 +1154,11 @@ async fn observe_run(
                     })
                     .await?;
             }
-            if matches!(run.run.phase, RunPhase::Running | RunPhase::Finalizing) {
-                kill_registered_processes(&run.resources)?;
+            if matches!(
+                refreshed.run.phase,
+                RunPhase::Running | RunPhase::Finalizing
+            ) {
+                kill_registered_processes(&refreshed.resources)?;
             }
             return Err(error.into());
         }
