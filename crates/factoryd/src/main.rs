@@ -1,4 +1,15 @@
-use std::{env, error::Error, ffi::OsStr, ffi::OsString, io, path::PathBuf, sync::Arc};
+use std::{
+    env,
+    error::Error,
+    ffi::OsStr,
+    ffi::OsString,
+    fs, io,
+    os::unix::fs::{MetadataExt as _, PermissionsExt as _},
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use factory_core::local::RequestCredential;
 use factoryd::{
@@ -21,8 +32,10 @@ struct Config {
     runner: PathBuf,
     factoryctl: PathBuf,
     git: PathBuf,
+    cargo: Option<PathBuf>,
     runtime_root: PathBuf,
     changes_root: PathBuf,
+    artifacts_root: PathBuf,
     /// `$DARK_FACTORY_HOME`: root of the project/agent guidance tree (see
     /// `factory_core::paths`).
     guidance_root: PathBuf,
@@ -32,6 +45,9 @@ struct Config {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    if let Some(worker) = rust_worker_invocation()? {
+        return run_rust_worker(worker);
+    }
     if let Some(path) = materializer_invocation_path()? {
         return match factoryd::run_change_materializer(&path) {
             Ok(never) => match never {},
@@ -80,8 +96,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             runner_program: config.runner,
             factoryctl_path: config.factoryctl,
             git_program: config.git,
+            cargo_program: config.cargo,
             runtime_root: config.runtime_root,
             changes_root: config.changes_root,
+            artifacts_root: config.artifacts_root,
             guidance_root: config.guidance_root,
             socket_path: instance.socket_path().to_path_buf(),
             max_active_runs: config.max_active_runs,
@@ -141,6 +159,87 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
     result?;
+    Ok(())
+}
+
+struct RustWorkerInvocation {
+    invocation: PathBuf,
+    result: PathBuf,
+    finish: PathBuf,
+    expected_parent_pid: u32,
+}
+
+fn rust_worker_invocation() -> Result<Option<RustWorkerInvocation>, Box<dyn Error>> {
+    let mut arguments = env::args_os().skip(1);
+    let Some(first) = arguments.next() else {
+        return Ok(None);
+    };
+    if first != "--rust-verify-worker" {
+        return Ok(None);
+    }
+    let invocation = next_hidden_path(&mut arguments, "invocation")?;
+    let result = next_hidden_path(&mut arguments, "result")?;
+    let finish = next_hidden_path(&mut arguments, "finish")?;
+    let expected_parent_pid = arguments
+        .next()
+        .and_then(|value| value.to_str().and_then(|value| value.parse::<u32>().ok()))
+        .filter(|value| *value > 0)
+        .ok_or("--rust-verify-worker requires an expected parent PID")?;
+    if arguments.next().is_some() {
+        return Err("--rust-verify-worker accepts exactly four values".into());
+    }
+    Ok(Some(RustWorkerInvocation {
+        invocation,
+        result,
+        finish,
+        expected_parent_pid,
+    }))
+}
+
+fn next_hidden_path(
+    arguments: &mut impl Iterator<Item = OsString>,
+    name: &str,
+) -> Result<PathBuf, Box<dyn Error>> {
+    arguments
+        .next()
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| format!("--rust-verify-worker requires a {name} path").into())
+}
+
+fn run_rust_worker(worker: RustWorkerInvocation) -> Result<(), Box<dyn Error>> {
+    let expected_parent = rustix::process::Pid::from_raw(worker.expected_parent_pid as i32)
+        .ok_or("invalid Rust worker parent PID")?;
+    if rustix::process::getppid() != Some(expected_parent) {
+        return Err("Rust worker parent identity changed before execution".into());
+    }
+    let finish_watch = worker.finish.clone();
+    thread::spawn(move || {
+        loop {
+            if finish_watch.exists() {
+                return;
+            }
+            if rustix::process::getppid() != Some(expected_parent) {
+                let _ = rustix::process::kill_process_group(
+                    rustix::process::getpid(),
+                    rustix::process::Signal::KILL,
+                );
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    factoryd::run_rust_verifier_worker(&worker.invocation, &worker.result)?;
+    while !worker.finish.exists() {
+        if rustix::process::getppid() != Some(expected_parent) {
+            let _ = rustix::process::kill_process_group(
+                rustix::process::getpid(),
+                rustix::process::Signal::KILL,
+            );
+            return Err("Rust worker parent identity changed".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     Ok(())
 }
 
@@ -276,8 +375,10 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         runner,
         factoryctl,
         git: resolve_executable_on_path("git")?,
+        cargo: resolve_cargo_on_path().ok(),
         runtime_root: home.join("runs"),
         changes_root: home.join("changes"),
+        artifacts_root: home.join("artifacts"),
         guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
         webhook_config: None,
@@ -297,6 +398,110 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
 fn resolve_executable_on_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
     let path = env::var_os("PATH").ok_or("PATH is not set")?;
     resolve_executable_in_path(name, &path).map_err(Into::into)
+}
+
+fn resolve_cargo_on_path() -> Result<PathBuf, Box<dyn Error>> {
+    let path = env::var_os("PATH").ok_or("PATH is not set")?;
+    let rustup_home = env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")));
+    let requested_toolchain = env::var("RUSTUP_TOOLCHAIN").ok();
+    resolve_cargo_in_path(
+        &path,
+        rustup_home.as_deref(),
+        requested_toolchain.as_deref(),
+    )
+    .map_err(Into::into)
+}
+
+/// Resolves the real fixed Cargo toolchain without executing rustup during
+/// daemon startup. A standard `cargo -> rustup` PATH entry is mapped through
+/// rustup's bounded settings file to its real Cargo and sibling rustc.
+fn resolve_cargo_in_path(
+    path: &OsStr,
+    rustup_home: Option<&Path>,
+    requested_toolchain: Option<&str>,
+) -> Result<PathBuf, String> {
+    for directory in env::split_paths(path) {
+        let candidate = directory.join("cargo");
+        let Ok(executable) =
+            factoryd::runner_process::checked_executable(&candidate, "Cargo verifier")
+        else {
+            continue;
+        };
+        let cargo = if executable.file_name() == Some(OsStr::new("rustup")) {
+            let home = rustup_home.ok_or("rustup Cargo requires RUSTUP_HOME or HOME")?;
+            let home = fs::canonicalize(home)
+                .map_err(|_| "rustup home is missing or cannot be resolved")?;
+            verify_owned_toolchain_directory(&home)?;
+            let toolchain = match requested_toolchain {
+                Some(value) => value.to_owned(),
+                None => default_rustup_toolchain(&home.join("settings.toml"))?,
+            };
+            if !safe_toolchain_name(&toolchain) {
+                return Err("rustup toolchain name is invalid".into());
+            }
+            factoryd::runner_process::checked_executable(
+                &home.join("toolchains").join(toolchain).join("bin/cargo"),
+                "Cargo verifier",
+            )
+            .map_err(|error| error.to_string())?
+        } else {
+            executable
+        };
+        let parent = cargo
+            .parent()
+            .ok_or("Cargo verifier has no toolchain directory")?;
+        factoryd::runner_process::checked_executable(&parent.join("rustc"), "Rust compiler")
+            .map_err(|error| error.to_string())?;
+        return Ok(cargo);
+    }
+    Err("cargo was not found as a usable fixed toolchain on PATH".into())
+}
+
+fn verify_owned_toolchain_directory(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "rustup home is unreadable")?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("rustup home must be an owned, non-writable-by-others directory".into());
+    }
+    Ok(())
+}
+
+fn default_rustup_toolchain(settings: &Path) -> Result<String, String> {
+    let metadata =
+        fs::symlink_metadata(settings).map_err(|_| "rustup settings are missing or unreadable")?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err("rustup settings are not a bounded regular file".into());
+    }
+    let content =
+        fs::read_to_string(settings).map_err(|_| "rustup settings are not valid UTF-8")?;
+    content
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("default_toolchain")
+                .and_then(|value| value.trim_start().strip_prefix('='))
+                .map(str::trim)
+                .and_then(|value| value.strip_prefix('"'))
+                .and_then(|value| value.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+        .filter(|value| safe_toolchain_name(value))
+        .ok_or_else(|| "rustup settings have no valid default toolchain".into())
+}
+
+fn safe_toolchain_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        && value != "."
+        && value != ".."
 }
 
 fn resolve_executable_in_path(name: &str, path: &OsStr) -> Result<PathBuf, String> {
@@ -340,6 +545,9 @@ fn parse_arguments(
             Some("--runtime-root") => {
                 config.runtime_root = next_path(&mut arguments, "--runtime-root")?;
             }
+            Some("--artifacts-root") => {
+                config.artifacts_root = next_path(&mut arguments, "--artifacts-root")?;
+            }
             Some("--max-active-runs") => {
                 let value = arguments
                     .next()
@@ -358,7 +566,7 @@ fn parse_arguments(
             }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--max-active-runs N] [--webhook-config PATH]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--artifacts-root PATH] [--max-active-runs N] [--webhook-config PATH]"
                 );
                 std::process::exit(0);
             }
@@ -423,7 +631,10 @@ mod tests {
         path::PathBuf,
     };
 
-    use super::{Config, parse_arguments, resolve_executable_in_path, resolve_webhook_config};
+    use super::{
+        Config, parse_arguments, resolve_cargo_in_path, resolve_executable_in_path,
+        resolve_webhook_config,
+    };
 
     fn config() -> Config {
         Config {
@@ -433,8 +644,10 @@ mod tests {
             runner: PathBuf::from("/bin/factory-runner"),
             factoryctl: PathBuf::from("/bin/factoryctl"),
             git: PathBuf::from("/usr/bin/git"),
+            cargo: Some(PathBuf::from("/usr/bin/cargo")),
             runtime_root: PathBuf::from("/state/runs"),
             changes_root: PathBuf::from("/state/changes"),
+            artifacts_root: PathBuf::from("/state/artifacts"),
             guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
             webhook_config: None,
@@ -471,6 +684,37 @@ mod tests {
     }
 
     #[test]
+    fn rustup_proxy_resolves_to_one_real_cargo_and_rustc_toolchain() {
+        let current = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&current).unwrap();
+        let bin = root.path().join("bin");
+        let rustup_home = root.path().join("rustup-home");
+        let toolchain_bin = rustup_home.join("toolchains/stable-test/bin");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir_all(&toolchain_bin).unwrap();
+        let rustup = bin.join("rustup");
+        fs::write(&rustup, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("rustup", bin.join("cargo")).unwrap();
+        for name in ["cargo", "rustc"] {
+            let executable = toolchain_bin.join(name);
+            fs::write(&executable, "#!/bin/sh\n").unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            rustup_home.join("settings.toml"),
+            "version = \"12\"\ndefault_toolchain = \"stable-test\"\n",
+        )
+        .unwrap();
+        let path = std::env::join_paths([bin]).unwrap();
+
+        assert_eq!(
+            resolve_cargo_in_path(&path, Some(&rustup_home), None).unwrap(),
+            toolchain_bin.join("cargo").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
     fn execution_paths_and_capacity_are_explicit_and_bounded() {
         let parsed = parse_arguments(
             config(),
@@ -481,6 +725,8 @@ mod tests {
                 "/opt/dark-factory/factoryctl",
                 "--runtime-root",
                 "/private/runs",
+                "--artifacts-root",
+                "/private/artifacts",
                 "--max-active-runs",
                 "2",
             ]),
@@ -495,6 +741,7 @@ mod tests {
             PathBuf::from("/opt/dark-factory/factoryctl")
         );
         assert_eq!(parsed.runtime_root, PathBuf::from("/private/runs"));
+        assert_eq!(parsed.artifacts_root, PathBuf::from("/private/artifacts"));
         assert_eq!(parsed.max_active_runs, 2);
         assert!(parsed.webhook_config.is_none());
 

@@ -6,8 +6,9 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentSnapshot, ChangeId, ChangeSnapshot, ChangeStorageSnapshot,
-    EventEnvelope, LegacySourceId, LegacySourceSnapshot, MessageId, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, TaskDetail, TaskId,
+    CompletionVerification, EventEnvelope, LegacySourceId, LegacySourceSnapshot, MessageId,
+    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot,
+    TaskDetail, TaskId,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -143,6 +144,23 @@ pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_REQUEST_CREDENTIAL_BYTES: usize = 1024;
 
+/// Bounded operator projection of the daemon-owned Rust artifact inventory.
+/// Missing byte totals mean at least one live artifact has not been measured;
+/// counts and policy limits remain exact in that case.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RustStorageSnapshot {
+    pub max_cache_count: u64,
+    pub max_cache_bytes: u64,
+    pub cache_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_bytes: Option<u64>,
+    pub protected_count: u64,
+    pub reclaimable_count: u64,
+    pub cache_count_over_limit: bool,
+    pub cache_bytes_over_limit: bool,
+    pub complete: bool,
+}
+
 /// Applies the task-title contract shared by every local and connector write.
 #[must_use]
 pub fn normalize_task_title(value: String) -> Option<String> {
@@ -233,6 +251,8 @@ pub enum LocalRequest {
     /// project's agents with their runs and queues, plus the attention list
     /// and active-run cap. See [`crate::status`].
     FleetStatus,
+    /// Exact persisted Rust artifact inventory and its bounded policy.
+    RustStorageStatus,
     /// One agent's live run picture plus its profile (`factoryctl agent status`).
     AgentStatus {
         project_id: ProjectId,
@@ -254,6 +274,10 @@ pub enum LocalRequest {
     UpdateProjectGuidance {
         project_id: ProjectId,
         text: String,
+    },
+    SetProjectCompletionVerification {
+        project_id: ProjectId,
+        verification: CompletionVerification,
     },
     CreateTask {
         id: TaskId,
@@ -328,11 +352,6 @@ pub enum LocalRequest {
         #[serde(skip_serializing_if = "Option::is_none")]
         after_id: Option<AgentId>,
         limit: u32,
-    },
-    StartTask {
-        project_id: ProjectId,
-        task_id: TaskId,
-        agent_id: AgentId,
     },
     ListTasks {
         project_id: ProjectId,
@@ -510,10 +529,16 @@ pub enum LocalResponse {
     FleetStatus {
         status: crate::status::FleetStatus,
     },
+    RustStorageStatus {
+        storage: RustStorageSnapshot,
+    },
     AgentStatus {
         status: Box<crate::status::AgentStatusDetail>,
     },
     ProjectCreated {
+        project: ProjectSnapshot,
+    },
+    ProjectCompletionVerificationUpdated {
         project: ProjectSnapshot,
     },
     Projects {
@@ -581,14 +606,13 @@ pub enum LocalResponse {
         #[serde(skip_serializing_if = "Option::is_none")]
         next_after_id: Option<AgentId>,
     },
-    RunAccepted {
-        run_id: RunId,
-    },
     RunCancelled {
         run_id: RunId,
     },
-    /// The requested immutable outcome was accepted. The task remains
-    /// running until the daemon-owned finalizer has released every resource.
+    /// The requested immutable outcome was accepted and attempt authority was
+    /// revoked. The task remains running until any configured completion check
+    /// finishes and the daemon-owned finalizer releases every resource; a
+    /// requested success can therefore terminalize as unverifiable failure.
     AttemptFinalizing {
         run_id: RunId,
     },

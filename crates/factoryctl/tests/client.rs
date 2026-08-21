@@ -143,6 +143,7 @@ fn subscribe_exposes_each_frame_without_polling() {
                             id: ProjectId::try_from("project-1").unwrap(),
                             name: "Project One".into(),
                             root: "/work/project-one".into(),
+                            completion_verification: factory_core::CompletionVerification::None,
                             created_at_ms: 1_000,
                             updated_at_ms: 1_000,
                         },

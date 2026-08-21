@@ -1,15 +1,16 @@
 # Architecture
 
 Dark Factory separates model policy from durable work authority. This file
-describes the attempt kernel and daemon-owned Change model implemented on the
-refactor branch, plus the fail-closed build boundary that remains for Stage 3.
+describes the attempt kernel, daemon-owned Change model, and fail-closed
+completion-verification boundary implemented across the safe-kernel refactor.
 It is a contract, not a component catalogue.
 
 ## Current status
 
-Stages 1 and 2 remain frozen implementation work pending pull-request and boot
-review. They are not a boot candidate. Do not start the daemon against the
-operator installation or submit real provider work.
+Stages 1 and 2 are merged. Stage 3 is implemented on an isolated branch but has
+not passed its exact-head gates, independent review, or merge; the separate
+boot review also remains. Do not start the daemon against the operator
+installation or submit real provider work.
 
 The complete design and causal proof matrix live in
 [`docs/development/SAFE_KERNEL_REFACTOR.md`](docs/development/SAFE_KERNEL_REFACTOR.md).
@@ -25,7 +26,7 @@ Task: queued --------> running ----------------------> terminal result
                          v
 Run:  admitted -> running -> finalizing -> terminal
           |          |           |
-          |          |           +-- immutable outcome, no effect authority
+          |          |           +-- immutable outcome request, no authority
           |          +-- exact attempt bearer authorizes bounded effects
           +-- child may be prepared but cannot exec
 
@@ -35,8 +36,11 @@ Resource: declared -> active -> releasing -> released
 
 The run outcome is distinct from its phase: succeeded, blocked with a reason,
 failed with a typed reason, or cancelled with a reason. The first durable move
-to `finalizing` wins. Later completion, block, cancel, or exit observations are
-idempotent and cannot replace that outcome.
+to `finalizing` freezes its requested outcome. Later completion, block, cancel,
+or exit observations are idempotent and cannot replace that request. The
+public outcome remains unset until the finalizer completes. For a configured
+Rust check, failed verification is the one documented refinement: it converts
+requested success into `failed(unverifiable)` rather than claiming success.
 
 Only the finalizer writes `terminal`. It may do so only when every ephemeral
 resource is released and every retained artifact is durably transferred to
@@ -146,10 +150,39 @@ can only forget the metadata row by typed ID.
 
 ## Build and storage boundary
 
-Stages 1 and 2 do not solve build storage. Stage 3 must replace per-checkout Cargo
-targets with a bounded project cache keyed by toolchain/profile configuration,
-then prepare content-addressed immutable executable bundles with verified
-digests. Mutable `target/debug` sibling launch is not an acceptable boot path.
+Stages 1 and 2 did not solve build storage. The Stage 3 branch gives each project an
+operator-selected verification policy: `None` or one fixed
+`RustWorkspaceTest`. There is no provider-visible generic build operation or
+Cargo shim. For a Rust-policy worker, `factoryctl task done` is the single
+completion boundary: the daemon moves the run to `finalizing`, revokes its
+authority, reaps every provider process group, and only then snapshots source
+and starts verification. Orchestrator runs are not verified this way.
+
+The source snapshot is a canonical scan/copy/scan of the plain Stage 2 Change;
+it is published only when the manifests agree. This deliberately replaces the
+earlier private-Git-index and in-flight-writer design: Changes contain no Git
+administration, and a hook has no trustworthy `PostToolUse` writer ledger.
+
+Rust verification uses one mutable cache per random project incarnation and
+fixed Cargo/rustc identity and configuration, not per Change or source
+revision. It compiles only the private snapshot, copies the top-level Cargo
+test executables into a content-addressed directory under the run's registered
+temporary root, verifies its manifest/identity/digest, and launches those
+copies. The immutable snapshot is the test working directory; fixtures are not
+copied into the executable directory, doctests are not run, and test code may
+still launch other same-UID processes. Mutable `target/debug` or
+`target/release` top-level launch is forbidden. These checks prevent confused
+or cooperative replacement; they are not a sandbox against hostile same-UID
+code.
+
+Regenerable cache storage has a hard entry count and a measured byte policy.
+Starting a writer makes byte status incomplete; after its exact process group
+is reaped, factoryd remeasures allocated bytes and reclaims unprotected caches
+until the policy converges. A measured over-limit cache cannot be claimed for
+another verification. Status reports aggregate measured bytes and protected
+entry count, not an invented protected-byte subtotal. An ordinary directory
+cannot promise a portable instantaneous byte ceiling while Cargo is writing,
+so the architecture does not claim one.
 
 Until that stage and its storage proofs land, Dark Factory remains frozen.
 

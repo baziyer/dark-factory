@@ -1,10 +1,12 @@
 # Safe kernel refactor epic
 
-Status: architecture and Stage 1 merged; Stage 2 passes its branch gates and working-tree adversarial review, pending exact-PR-head review and merge, 21 August 2026
+Status: architecture and Stages 1-2 merged; Stage 3 implementation in progress, 21 August 2026
 
 Architecture merge: `f4f17d05315368139e408296ade6e95982cff137`
 
 Stage 1 merge: `301785e51a6bc4b280cf9c1aadc6e208f628121d`
+
+Stage 2 merge: `9b5e3aec5648518c885f9ddfd0d7b5921911e654`
 
 Audit baseline: `c19091ea2eb2b20c2de8717cb14799340268c8c7`
 
@@ -51,7 +53,7 @@ Task:       queued / running / blocked / succeeded / failed / cancelled
 Run:        admitted -> running -> finalizing -> terminal
                  \----------/          |             |
                   exact capability      |             +-- durable outcome
-                                        +-- immutable pending outcome
+                                        +-- immutable outcome request
                                       |
                                       v
 Resources: declared -> active -> releasing -> released
@@ -67,22 +69,28 @@ are not competing top-level lifecycle states.
 
 The transition and projection contract is exhaustive:
 
-| Trigger | Run transition | Pending outcome | Final task status |
+| Trigger | Run transition | Immutable request | Finalizer-selected outcome/task status |
 | --- | --- | --- | --- |
-| Provider proposes completion | `running -> finalizing` | `succeeded` | `succeeded` |
+| Provider proposes completion; policy is `None` | `running -> finalizing` | `succeeded(result)` | `succeeded` |
+| Provider proposes completion; Rust verification passes | `running -> finalizing` | `succeeded(result)` | `succeeded` |
+| Provider proposes completion; Rust verification fails | `running -> finalizing` | `succeeded(result)` | `failed(unverifiable)` |
 | Provider proposes a block | `running -> finalizing` | `blocked(reason)` | `blocked` |
 | Spawn fails before provider exec | `admitted -> finalizing` | `failed(reason)` | `failed` |
 | Provider/runner exits before an outcome | `running -> finalizing` | `failed(reason)` | `failed` |
 | Operator cancels before the first `finalizing` transition | `admitted|running -> finalizing` | `cancelled(reason)` | `cancelled` |
 | Finalizer proves every resource released/transferred | `finalizing -> terminal` | unchanged | exact mapping above |
 
-The first durable transition to `finalizing` wins. An outcome received before
-exit is preserved; exit received first records failure; late outcomes, exits,
-and cancellation requests are idempotent no-ops. Cleanup failure never changes
-the outcome: it leaves the run visibly `finalizing` with an unresolved
-resource. Retry is an explicit, post-terminal operation that increments the
-task work revision, returns that exact task incarnation to `queued`, and later
-admits a new `RunId`; there is no implicit retry or reuse of run authority.
+The first durable transition to `finalizing` freezes the requested outcome and
+revokes authority. A request received before exit is preserved; exit received
+first requests failure; late requests, exits, and cancellations are idempotent
+no-ops. The public run outcome remains unset until the durable finalizer has
+released resources and, for requested Rust success, obtained the verification
+result. Verification may therefore turn only a requested success into the
+typed `failed(unverifiable)` outcome. Cleanup failure does not invent an
+outcome: it leaves the run visibly `finalizing` with an unresolved resource.
+Retry is an explicit, post-terminal operation that increments the task work
+revision, returns that exact task incarnation to `queued`, and later admits a
+new `RunId`; there is no implicit retry or reuse of run authority.
 
 ## Why this reset is necessary
 
@@ -159,18 +167,20 @@ stage; it must not claim the complete boot contract early.
 5. One restartable finalizer is the only code allowed to write `terminal`.
    Terminalization requires all ephemeral resources to be released or a
    retained artifact to be durably transferred to its next owner.
-6. Process, process-group, runtime-root, temporary-root, launchd-job, build,
-   bundle, and execution identities are registered durably and reconciled by
-   factoryd. `Drop` and shell traps remain optional fast cleanup, never
-   correctness authority.
+6. Process, process-group, runtime-root, and temporary-root identities are
+   registered durably and reconciled by factoryd. Retained Change and cache
+   ownership is recorded separately. `Drop` and shell traps remain optional
+   fast cleanup, never correctness authority.
 7. A retry creates a new attempt. It may lease the same retained change only
    after the preceding attempt is terminal.
 8. Factoryd creates, records, and removes Change source trees. Providers
    receive a leased `.git`-free source directory but cannot choose or create
    source paths through the product API.
-9. Rust builds use a bounded project cache with one writer lease per project
-   configuration. Executions use daemon-owned prepared bundles, not mutable
-   Cargo outputs.
+9. A project configured for Rust verification can complete only through one
+   fixed daemon-owned workspace-test policy. It uses a bounded cache with one
+   writer per project/toolchain configuration and executes exact attempt-owned
+   prepared test copies, never mutable Cargo outputs. Providers get no generic
+   build API.
 10. God has scheduling capabilities only. Its absence, confusion, or death
     cannot bypass admission, authority, finalization, storage, or security
     invariants.
@@ -362,54 +372,86 @@ filesystem isolation requires the separate hardened-runner project.
 
 Do not boot Dark Factory after this intermediate stage.
 
-### Stage 3: bounded builds, immutable bundles, and regenerable storage
+### Stage 3: bounded verification and regenerable storage
 
-Purpose: remove per-worktree targets, mutable binary launch, and unbounded
-regenerable runtime output without multiplying the cache by source revision.
+Purpose: remove per-Change targets and mutable top-level test launch without
+multiplying the reusable cache by source revision. The implementation is on an
+isolated branch; these checked items do not imply gates, review, merge, or boot
+approval.
 
-- [ ] Add a bounded mutable Cargo cache namespace keyed only by project
-  identity plus toolchain, target triple, profile, feature/package/target
-  selection, and compiler/linker configuration. Exact source revision is not a
-  cache namespace dimension.
-- [ ] At build admission, atomically revoke Change mutation authority, wait for
-  registered/in-flight source writers to quiesce, create an exact Git tree with
-  a private index, and materialize that tree into a daemon-owned immutable
-  source snapshot. Restore mutation authority only after snapshot publication
-  or fail-closed cleanup.
-- [ ] Hold one writer lease through immutable source selection, build, open,
-  copy, hash, sync, and atomic bundle publication. Compilation reads only the
-  immutable snapshot, never the live writable Change.
-- [ ] Put exact source snapshot, `Cargo.lock`, allowlisted build environment,
-  cache configuration, executable digest, and required fixture digests in the
-  immutable bundle provenance manifest.
-- [ ] Publish daemon-owned content-addressed executable and required-fixture
-  bundles. Verify by digest and execute an already verified file descriptor or
-  equivalent immutable handoff.
-- [ ] Hold reader/execution leases so reclamation cannot remove a live bundle.
-- [ ] Hard-bound regenerable caches, bundles, runtime roots, and logs by bytes
-  and count; report active, regenerable, retained, unresolved, and reclaimable
-  storage separately.
-- [ ] Reclaim only registered, identity-matched, unleased regenerable
-  resources. If protected regenerable resources alone exceed a hard bound,
-  refuse new build admission until leases release.
-- [ ] Prove multiple source revisions reuse the same mutable cache namespace
-  while producing distinct exact-source immutable bundles.
-- [ ] Mutate the live Change after snapshot selection and during compilation;
-  prove the bundle still corresponds exactly to the selected snapshot. If
-  stable snapshot publication cannot be proven, fail closed before compiling.
-- [ ] Delete runtime Cargo builds, mutable sibling executable discovery, and
-  obsolete headroom-only logic after replacement proof.
-- [ ] Keep local-CI serialization daemon-independent. Replace its shell lease
+- [x] Add one operator-owned project verification setting: `None` or the fixed
+  `RustWorkspaceTest` policy. Completion, not a provider-visible build command,
+  owns verification. Mode changes are refused while a project has nonterminal
+  work, and orchestrator runs do not use this policy.
+- [x] On a Rust-policy completion request, enter `finalizing`, revoke mutation
+  authority, and reap every provider process group before reading source. Only
+  then compute a canonical source digest and copy the stable `.git`-free Change
+  into an attempt-owned private snapshot. Refuse use if a before/copy/after
+  manifest differs.
+- [x] Add one mutable cache namespace keyed by random project incarnation,
+  exact Cargo and rustc content identity, target, and fixed workspace-test
+  configuration. Source revision and `Cargo.lock` are provenance, not cache
+  namespace dimensions. A standard rustup proxy is resolved at startup to one
+  real installed Cargo/rustc pair without invoking rustup; absence disables
+  Rust policy without preventing a non-Rust daemon from starting.
+- [x] Make the durable completion check the one cache-writer lease. Hold it
+  through snapshot creation, `cargo test --no-run`, executable discovery,
+  copy, digest, sync, and prepared execution. Compilation reads only the
+  private snapshot, never the writable Change.
+- [x] Prepare a content-addressed executable directory inside the run's
+  registered temporary root. Its manifest records source digest, `Cargo.lock`,
+  closed build configuration, toolchain identity, and each copied top-level
+  test executable. Re-verify exact identity and digest before path launch;
+  never launch a mutable `target/debug` or `target/release` top-level sibling.
+  The snapshot is the test working directory; fixtures are not copied, doctests
+  are excluded, and same-UID test code is not sandboxed.
+- [x] Register each worker, process group, and temporary root durably before
+  use. Result publication is atomic, every effect has a fixed 30-minute
+  deadline, and restart either consumes its exact result or starts a bounded
+  replacement from the same persisted invocation. Finalization reconciles all
+  registered resources.
+- [x] Deny direct `cargo`, `rustc`, and `rustup` tool calls and recognized
+  mutable `target/.../{debug,release}` launches in cooperative provider hook
+  policy. Provider startup guidance says that `factoryctl task done` is the
+  sole Rust verification path; there is no Cargo shim or generic
+  provider-visible build API.
+- [x] Enforce a hard cache-count limit before external effects and a measured
+  byte policy that converges after each writer releases. A running writer makes
+  byte status incomplete; its exact group is reaped before allocated bytes are
+  remeasured. An already measured over-limit cache cannot be claimed again.
+  Status reports aggregate measured bytes and protected count, not a fictional
+  protected-byte subtotal or instantaneous compiler-write ceiling.
+- [x] Reclaim only registered, identity-matched, unleased regenerable caches.
+  Snapshots and executable staging are attempt resources removed by the durable
+  finalizer. Unique retained Changes are never automatic reclamation targets.
+- [x] Prove multiple source revisions reuse one mutable cache namespace while
+  producing different source-bound manifests, and prove a live-Change mutation
+  cannot produce a mixed snapshot.
+- [x] Delete runtime provider Cargo builds, mutable top-level executable
+  discovery, persistent bundles with no consumer, the
+  unused `launch-ui.sh`, and dead hook-token generation after replacement
+  proof. Keep the headroom check as an early developer-CI refusal, not runtime
+  ownership or reclamation.
+- [x] Keep local-CI serialization daemon-independent. Replace its shell lease
   only if a standalone Rust helper remains usable while factoryd is absent and
   produces measured net deletion with equal causal coverage.
 
-Stage and boot checkpoint:
+Why this is smaller than the first Stage 3 design: `PreToolUse` has no matching
+post-tool authority, a Stage 2 Change is intentionally not a Git repository,
+and ordinary directories have no portable instantaneous byte quota. The daemon
+therefore does not pretend to wait for provider-reported writers, create a
+private Git index, or offer arbitrary Cargo commands. It first revokes the only
+attempt authority and reaps the provider, then snapshots stable ordinary files
+for one fixed completion test.
 
-- Executable replacement after bundle preparation cannot change what runs.
-- Regenerable quota pressure converges immediately when safe entries suffice.
-  If protected leases alone exceed the bound, the daemon reports the exact
-  overage, refuses new build admission, and converges only after leases release;
-  it never touches unique retained Changes.
+Stage and boot checkpoint still pending exact-head proof:
+
+- Replacing a mutable Cargo output after preparation cannot change the selected
+  top-level executable; launch re-verifies the attempt-owned staging identity
+  and digest.
+- Regenerable cache pressure converges when safe entries suffice. Running
+  writers make byte status incomplete; measured over-limit cache reuse is
+  refused until reclamation converges. Unique retained Changes are untouched.
 - Multiple revisions do not create multiple Cargo cache namespaces for the same
   project build configuration.
 - All causal suites below pass on the exact reviewed head.
@@ -425,14 +467,14 @@ the externally visible effect, not only an internal callback or row.
 | --- | --- |
 | Crash/restart | Crash after admission, resource declaration, fork-before-release, exec release, provider exit, external deletion, and before ledger acknowledgement. Restart must produce at most one provider execution, no prompt replay, exact identity, and idempotent cleanup. |
 | Taskless refusal | With no admitted attempt, no provider process exists. Old/forged capabilities, hooks, repository requests, outcome requests, and queued replays cannot mutate task, budget, repository, or provider state. |
-| Outcome/exit race | Exercise outcome-before-exit and exit-before-outcome. The first durable `finalizing` transition wins, late signals are harmless, and task projection matches the immutable outcome. |
-| Completion ordering | After a provider proposes success, another mutation and successor admission are refused until process drain and resource release complete; only then may run/task become terminal. |
+| Outcome/exit race | Exercise request-before-exit and exit-before-request. The first durable `finalizing` request wins, late signals are harmless, and the finalizer selects the documented outcome. Only failed configured verification may turn requested success into `failed(unverifiable)`. |
+| Completion ordering | After a provider proposes success, another mutation and successor admission are refused. Reap every provider group, publish one stable source snapshot, run configured verification, and release resources before terminal. Verification failure records failure through the same finalizer. |
 | Failure, cancel, retry | Spawn failure, provider crash, and operator cancellation each finalize to the documented task result. Retry is refused before terminal, then creates a new RunId and work revision while retaining the same Change. Stale credentials remain invalid. |
 | External finalization | Own a process group, runtime root, temporary root, and throwaway launchd job. Kill provider, runner, daemon, and fixture separately. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. |
-| Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs. Tampered bundles fail closed. Restart between prepare and launch preserves the same manifest/digest. Reclamation cannot remove an execution-leased bundle. |
-| Immutable source | Select source snapshot A, then mutate the live Change before and during compilation. The bundle is built entirely from A and records A's exact tree, or publication fails closed; it never records a mixed or later tree. |
-| Cache reuse | Build two exact source revisions with the same project/build configuration. They use one mutable cache namespace and publish different source-bound immutable manifests. |
-| Bounded storage | When safe regenerable entries suffice, reclamation reaches the hard bound and is idempotent. When protected leases alone exceed it, new build admission is refused and exact overage is reported until lease release permits convergence. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
+| Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs from the exact attempt-owned staging identity. Tampered or identity-replaced staging fails closed. Restart consumes the atomically published exact result or reruns the bounded worker from the persisted invocation. |
+| Immutable source | Request completion, prove the provider group is gone, and scan/copy/scan source A. A concurrent mutation either yields one canonical A snapshot or makes publication fail before compilation; no mixed snapshot is accepted. |
+| Cache reuse | Build two exact source revisions with the same project/toolchain configuration. They use one mutable cache namespace and produce different source-bound immutable manifests. |
+| Bounded storage | Count admission refuses a new cache before effects. A running writer makes byte status incomplete; after exact group reap, allocated bytes are remeasured and safe reclamation converges idempotently. Reuse of a measured over-limit cache is refused. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
 | Source-view boundary | The provider source view has no discoverable Git administrative locator; repository discovery and ordinary worktree creation fail. The exact retained Change remains inspectable and removable only through daemon-owned operations. |
 | God policy only | God may propose priority and assignment. Worktree creation, process launch, repository publication, outcome submission, capacity/budget mutation, and operator control fail. Killing God does not change finalization. |
 
@@ -515,8 +557,8 @@ kernel; the second should wait for measured post-kernel evidence.
 
 ### Delete with the kernel
 
-- Remove `StartTask` as a second admission model. Queue assignment plus one
-  admission transaction should be sufficient.
+- [x] Remove `StartTask` as a second admission model. Queue assignment plus one
+  automatic admission transaction is sufficient.
 - Remove public session/run lifecycle commands in favor of attempt inspection,
   outcome, cancel intent, and resource status.
 - Remove the generic serialized `LocalRequest` outbox. If offline durability is
@@ -576,12 +618,13 @@ The baseline deletion map is reviewable rather than aspirational:
 | Session, episode, delivery journal, direct terminalization | `store.rs`, `session_work.rs` | 3,000-4,000 |
 | Session protocol/API, generic outbox, resume clients/projections | `local_api.rs`, `factory-core`, providers, CLI/TUI | 2,000-3,000 |
 | Per-agent worktrees and caller path/branch selection | worktrees, paths, API/CLI | 500-1,000 |
-| Mutable sibling launch and obsolete build/headroom paths | runner/build scripts and fixtures | 300-800 |
+| Mutable sibling launch, dead UI launcher, and obsolete runtime build paths | runner/build scripts and fixtures | 150-500 |
 
-The daemon-independent local-CI lease is excluded unless its replacement is
-both smaller and equally causal. Stage 1 should delete or replace roughly
-8,000-10,000 lines while adding 3,000-4,000 lines of kernel and proof, for
-about 4,000-6,000 net deletion. Later stages must not erase that reduction.
+The daemon-independent local-CI lease and its headroom check are excluded
+unless a replacement is both smaller and equally causal. Stage 1 should delete
+or replace roughly 8,000-10,000 lines while adding 3,000-4,000 lines of kernel
+and proof, for about 4,000-6,000 net deletion. Later stages must not erase that
+reduction.
 
 Target across the epic:
 
@@ -605,8 +648,8 @@ record branch implementation, but must not imply review, gates, or acceptance.
 | --- | --- | --- | ---: | --- | --- | --- | --- |
 | Architecture decision | #281 | `f4f17d05315368139e408296ade6e95982cff137` | docs only | docs checks | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/281#pullrequestreview-4987687825) | Merged |
 | 1. Attempt/resource cutover | #282 | `301785e51a6bc4b280cf9c1aadc6e208f628121d` | -39,399 total lines | passed | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/282#pullrequestreview-4988698847) | Merged |
-| 2. Change/source ownership | pending | — | pending exact count | branch gate passed | pending | working-tree ALLOW; exact PR head required | Ready for PR |
-| 3. Build/bundle/storage | — | — | — | — | — | — | Not started |
+| 2. Change/source ownership | #283 | `9b5e3aec5648518c885f9ddfd0d7b5921911e654` | +6,567 total lines | passed | required passed | [ALLOW](https://github.com/baziyer/dark-factory/pull/283#pullrequestreview-4989347657) | Merged |
+| 3. Verification/cache | pending | — | pending exact count | pending | pending | pending | Implemented on branch; unreviewed |
 | Boot review | — | — | — | — | — | — | Frozen |
 
 For every implementation PR:
@@ -633,7 +676,8 @@ independent review confirms:
 - factoryd can finalize exact external resources after crashes and restarts;
 - factoryd is the only supported product path that creates or removes Change
   source trees, and provider source views expose no Git administrative locator;
-- builds and executable launches use the bounded cache and immutable bundles;
+- configured verification uses the bounded cache and exact attempt-owned test
+  staging with verified identity and digest;
 - storage reporting and reclamation are identity-safe and bounded;
 - God is policy-only and GitHub intake is still quarantined;
 - the full causal matrix and authoritative local/hosted gates pass on the exact

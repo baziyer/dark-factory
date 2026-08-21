@@ -10,6 +10,7 @@ pub mod policy;
 pub mod providers;
 pub mod runner_client;
 pub mod runner_process;
+mod rust_verify;
 pub mod store;
 pub mod webhook_http;
 
@@ -20,4 +21,13 @@ pub fn run_change_materializer(
     invocation: &std::path::Path,
 ) -> Result<std::convert::Infallible, String> {
     change_source::run_materializer_invocation(invocation).map_err(|error| error.to_string())
+}
+
+/// Internal entrypoint used only by the registered Rust-verifier worker mode.
+#[doc(hidden)]
+pub fn run_rust_verifier_worker(
+    invocation: &std::path::Path,
+    result: &std::path::Path,
+) -> Result<(), String> {
+    rust_verify::run_worker_file(invocation, result).map_err(|error| error.to_string())
 }

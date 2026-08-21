@@ -7,10 +7,10 @@ just points here; if anything else conflicts, this file wins.
 
 Dark Factory is a pure-Rust, terminal-first runtime that turns a software
 backlog into continuous agent progress: a durable queue, orchestrator, and
-process supervisor for Claude Code and Codex CLI sessions, watched and
-directed through `factory-tui`, a detachable Ratatui board. One operator
-runs many agents from one machine; `factoryd` owns every session end to
-end, so closing the CLI or the TUI never stops an agent.
+process supervisor for fresh Claude Code and Codex CLI attempts, watched and
+directed through `factory-tui`, a Ratatui board. One operator runs many agents
+from one machine; `factoryd` owns every admitted attempt and external resource
+through finalization, so closing a client never stops admitted work.
 
 It is not an Electron/Tauri/browser app, not a coding model, not an agent
 pretending to be an employee, and not a general agent framework. See
@@ -51,16 +51,14 @@ Read-only context unless a task explicitly asks you to edit them:
    fallbacks that hide a real failure behind a plausible-looking success.
 4. **Simplest implementation over cleverness.** Prefer the boring, obvious
    fix. Maintainability beats a clever one-liner.
-5. **Shared operation first; TUI primary.** Every daemon-owned runtime action
-   is a `factoryd` local-API operation. Bootstrap, service-lifecycle, and
-   update actions that must work while the daemon is absent live in shared
-   Rust library code. `factory-tui` is the primary operator client;
-   `factoryctl` provides parity for recovery, diagnostics, scripting, and
-   automation. Neither client gets a shortcut or hidden behavior unavailable
-   through the shared operation.
-6. **Tests around the load-bearing paths**: queue durability, event
-   projection (durable state → wire events → TUI model), PTY lifecycle,
-   detach/reattach. A change to any of these needs a test that would have
+5. **CLI first.** Every operator action is a `factoryctl` request;
+   `factory-tui` calls the exact same local-API request path, never a shortcut
+   only the TUI can take. Bootstrap, service-lifecycle, and update actions that
+   must work while the daemon is absent live in shared Rust library code.
+6. **Tests around the load-bearing paths**: queue and attempt durability,
+   event projection (durable state → wire events → client model), exact
+   resource registration/finalization, Change ownership, and crash/restart
+   recovery. A change to any of these needs a causal test that would have
    caught the bug it fixes.
 7. **Run `./scripts/local-ci.sh` before finishing.** It is the
    authoritative gate (fmt, clippy at `-D warnings`, the full test suite,

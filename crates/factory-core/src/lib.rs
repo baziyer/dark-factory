@@ -141,6 +141,16 @@ pub enum RunPhase {
     Terminal,
 }
 
+/// Project policy applied when a worker requests a successful attempt outcome.
+/// Non-success outcomes never require a verification build.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionVerification {
+    #[default]
+    None,
+    RustWorkspaceTest,
+}
+
 /// Durable lifecycle of one daemon-owned writable source tree.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -225,9 +235,10 @@ impl RunPhase {
     }
 }
 
-/// Immutable result selected by the first transition to [`RunPhase::Finalizing`].
-/// The finalizer projects this onto the task only after every ephemeral
-/// resource has been released or durably transferred.
+/// Outcome proposed by the transition to [`RunPhase::Finalizing`] and selected
+/// by the finalizer for [`RunPhase::Terminal`]. A successful proposal may
+/// become `Failed(Unverifiable)` when the project's completion check fails;
+/// blocked, failed, and cancelled proposals remain exact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RunOutcome {
@@ -324,6 +335,8 @@ pub struct ProjectSnapshot {
     pub id: ProjectId,
     pub name: String,
     pub root: String,
+    #[serde(default)]
+    pub completion_verification: CompletionVerification,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
@@ -448,8 +461,9 @@ pub struct RunSnapshot {
 }
 
 impl RunSnapshot {
-    /// The outcome is selected exactly once when finalization begins and is
-    /// absent while the attempt still has effect authority.
+    /// During finalization `outcome` is the immutable requested outcome. At
+    /// terminal it is the daemon-selected actual outcome after any completion
+    /// verification. It is absent while the attempt still has effect authority.
     #[must_use]
     pub const fn has_valid_phase_outcome(&self) -> bool {
         matches!(

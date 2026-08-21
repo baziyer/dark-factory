@@ -17,8 +17,8 @@ use factory_core::{
         MAX_AGENT_MESSAGE_BYTES, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS,
         MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_LOCAL_FRAME_BYTES, MAX_PROJECT_PAGE_ITEMS,
         MAX_RUN_PAGE_ITEMS, MAX_TASK_BODY_BYTES, MAX_TASK_PAGE_ITEMS, MAX_TASK_TITLE_BYTES,
-        ProjectDetail as LocalProjectDetail, RequestCredential, RequestEnvelope, ServerFrame,
-        normalize_task_title,
+        ProjectDetail as LocalProjectDetail, RequestCredential, RequestEnvelope,
+        RustStorageSnapshot, ServerFrame, normalize_task_title,
     },
     status,
 };
@@ -34,7 +34,7 @@ pub use crate::daemon_state::DaemonState as ApiState;
 
 use crate::{
     daemon_state::DaemonStateError,
-    execution::{self, StartTask},
+    execution,
     guidance::{self, GuidanceError},
     store::{
         AgentMessage, AttemptPrincipal, NewAgent, NewAgentMessage, NewProject, NewTask, Store,
@@ -136,6 +136,7 @@ mod protocol_tests {
             )
             .is_ok()
         );
+        assert!(authorize_attempt(&attempt, &LocalRequest::RustStorageStatus).is_err());
     }
 }
 
@@ -241,6 +242,7 @@ impl ApiFailure {
                 | StoreError::AgentUnavailable
                 | StoreError::CapacityReached { .. }
                 | StoreError::ChangeCapacityReached { .. }
+                | StoreError::RustStorageCapacityReached { .. }
                 | StoreError::ChangeRevisionConflict
                 | StoreError::InvalidChangeState
                 | StoreError::ChangeIdentityMismatch
@@ -248,6 +250,7 @@ impl ApiFailure {
                 | StoreError::TaskHasChanges
                 | StoreError::TaskChangeUnavailable
                 | StoreError::ProjectHasChanges
+                | StoreError::ProjectHasRustCaches
                 | StoreError::RunResourcesUnreleased { .. }
                 | StoreError::ResourceIdentityMismatch
                 | StoreError::InvalidRunState
@@ -539,17 +542,18 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         LocalRequest::ListAgents { project_id, .. } => orchestrator && same_project(project_id),
         LocalRequest::SetAutoMode { .. }
         | LocalRequest::FleetStatus
+        | LocalRequest::RustStorageStatus
         | LocalRequest::CreateProject { .. }
         | LocalRequest::GetProject { .. }
         | LocalRequest::ListProjects { .. }
         | LocalRequest::UpdateProjectGuidance { .. }
+        | LocalRequest::SetProjectCompletionVerification { .. }
         | LocalRequest::CreateAgent { .. }
         | LocalRequest::GetAgent { .. }
         | LocalRequest::AgentStatus { .. }
         | LocalRequest::UpdateAgentProfile { .. }
         | LocalRequest::SetAgentBudget { .. }
         | LocalRequest::ResetAgentBudget { .. }
-        | LocalRequest::StartTask { .. }
         | LocalRequest::RetryTask { .. }
         | LocalRequest::CancelTask { .. }
         | LocalRequest::PauseAgent { .. }
@@ -770,6 +774,52 @@ async fn handle_request(
                 .await?;
             ensure_project_guidance(guidance_root, &project_id).await?;
             Ok(LocalResponse::ProjectCreated { project })
+        }
+        LocalRequest::SetProjectCompletionVerification {
+            project_id,
+            verification,
+        } => {
+            if verification == factory_core::CompletionVerification::RustWorkspaceTest
+                && !execution.rust_verification_available()
+            {
+                return Err(ApiFailure::Conflict(
+                    "Rust verification is unavailable because factoryd found no fixed Cargo and rustc toolchain at startup"
+                        .into(),
+                ));
+            }
+            let project = state
+                .commit_and_publish(move |store| {
+                    let (project, event) = store.set_project_completion_verification(
+                        &project_id,
+                        verification,
+                        now_ms()?,
+                    )?;
+                    Ok((project, vec![event]))
+                })
+                .await?;
+            Ok(LocalResponse::ProjectCompletionVerificationUpdated { project })
+        }
+        LocalRequest::RustStorageStatus => {
+            let storage = state
+                .with_store(|store| {
+                    let policy = store.rust_storage_policy()?;
+                    let summary = store.rust_storage_summary()?;
+                    Ok(RustStorageSnapshot {
+                        max_cache_count: policy.max_cache_count,
+                        max_cache_bytes: policy.max_cache_bytes,
+                        cache_count: summary.cache_count,
+                        cache_bytes: summary.cache_bytes,
+                        protected_count: summary.protected_count,
+                        reclaimable_count: summary.reclaimable_count,
+                        cache_count_over_limit: summary.cache_count > policy.max_cache_count,
+                        cache_bytes_over_limit: summary
+                            .cache_bytes
+                            .is_some_and(|bytes| bytes > policy.max_cache_bytes),
+                        complete: summary.cache_bytes.is_some(),
+                    })
+                })
+                .await?;
+            Ok(LocalResponse::RustStorageStatus { storage })
         }
         LocalRequest::ListProjects { after_id, limit } => {
             let limit = page_limit("project", limit, MAX_PROJECT_PAGE_ITEMS)?;
@@ -1081,22 +1131,6 @@ async fn handle_request(
             Ok(LocalResponse::AgentMessages {
                 messages,
                 next_after_id,
-            })
-        }
-        LocalRequest::StartTask {
-            project_id,
-            task_id,
-            agent_id,
-        } => {
-            let started = execution
-                .start_task(StartTask {
-                    project_id,
-                    task_id,
-                    agent_id,
-                })
-                .await?;
-            Ok(LocalResponse::RunAccepted {
-                run_id: started.run_id,
             })
         }
         LocalRequest::ListTasks {
@@ -1861,6 +1895,19 @@ async fn delete_project_locked(
     guidance_root: &Path,
     project_id: ProjectId,
 ) -> Result<(), ApiFailure> {
+    let reclaim_project_id = project_id.clone();
+    let scheduled = state
+        .commit_and_publish(move |store| {
+            let scheduled =
+                store.begin_project_rust_cache_reclamation(&reclaim_project_id, now_ms()?)?;
+            Ok((scheduled, Vec::new()))
+        })
+        .await?;
+    if scheduled > 0 {
+        return Err(ApiFailure::Conflict(
+            "project Rust cache cleanup was scheduled; retry deletion after finalization".into(),
+        ));
+    }
     let check_project_id = project_id.clone();
     state
         .with_store(move |store| store.check_project_deletable(&check_project_id))

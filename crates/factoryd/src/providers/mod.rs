@@ -54,7 +54,7 @@ pub struct SpawnContext {
     pub auto_mode: bool,
     /// Absolute path to this run's private hook-token file. The file is
     /// expected to already exist (written by
-    /// [`hooks::write_hook_token`]) — a provider only needs its path to
+    /// [`hooks::write_private_file`]) — a provider only needs its path to
     /// embed in generated hook commands, never its contents.
     pub hook_token_path: PathBuf,
     /// Trusted absolute path to the `factoryctl` binary that generated hook

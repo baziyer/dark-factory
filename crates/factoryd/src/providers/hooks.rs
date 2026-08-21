@@ -38,24 +38,6 @@ pub enum HookTokenError {
     Invalid { path: PathBuf, reason: String },
 }
 
-/// Generates a fresh 32-byte (64 lowercase hex character) hook token and
-/// writes it to `path` at mode `0600`, creating the parent directory (mode
-/// `0700`) if needed. Returns the token so the caller can also persist it as
-/// the attempt principal for the daemon's side of the comparison.
-///
-/// # Errors
-///
-/// Returns [`HookTokenError::Random`] if the platform RNG is unavailable, or
-/// [`HookTokenError::Io`] if the file cannot be written.
-pub fn write_hook_token(path: &Path) -> Result<String, HookTokenError> {
-    let token = random_hex().map_err(|error| HookTokenError::Random(error.to_string()))?;
-    write_private_file(path, token.as_bytes()).map_err(|source| HookTokenError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    Ok(token)
-}
-
 /// Reads the existing operator credential or creates it exactly once.
 /// Existing files must be regular files owned by this process's user, mode
 /// `0600`, and contain exactly one 64-character lowercase hexadecimal token.
@@ -197,8 +179,8 @@ fn random_hex() -> Result<String, getrandom::Error> {
 
 /// Atomically overwrites a private file (mode `0600`) through a temp file
 /// plus rename, creating its parent directory (mode `0700`) if needed.
-/// Shared by the hook token, Claude's generated `claude-settings.json`, and
-/// Codex's seeded `config.toml`.
+/// Shared by the attempt credential, Claude's generated
+/// `claude-settings.json`, and Codex's seeded `config.toml`.
 ///
 /// # Errors
 ///
@@ -314,39 +296,9 @@ pub fn hook_command(
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-
-    #[test]
-    fn write_hook_token_is_64_lowercase_hex_characters_at_mode_0600() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("nested").join("hook.token");
-        let token = write_hook_token(&path).unwrap();
-
-        assert_eq!(token.len(), 64);
-        assert!(
-            token.bytes().all(|byte| byte.is_ascii_hexdigit()
-                && (byte.is_ascii_digit() || byte.is_ascii_lowercase()))
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), token);
-
-        let file_metadata = fs::metadata(&path).unwrap();
-        assert_eq!(file_metadata.permissions().mode() & 0o777, 0o600);
-        let directory_metadata = fs::metadata(path.parent().unwrap()).unwrap();
-        assert_eq!(directory_metadata.permissions().mode() & 0o777, 0o700);
-        assert_eq!(file_metadata.uid(), rustix::process::geteuid().as_raw());
-    }
-
-    #[test]
-    fn write_hook_token_generates_a_different_token_each_call() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("hook.token");
-        let first = write_hook_token(&path).unwrap();
-        let second = write_hook_token(&path).unwrap();
-        assert_ne!(first, second);
-        assert_eq!(fs::read_to_string(&path).unwrap(), second);
-    }
 
     #[test]
     fn operator_token_is_stable_across_restarts() {

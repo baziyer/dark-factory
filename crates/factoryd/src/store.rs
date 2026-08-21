@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 mod changes;
 mod kernel;
+mod rust_builds;
 pub use changes::{
     Change, ChangeBaseIdentity, ChangeMaterialization, ChangeMutation, ChangeRemovalKind,
     ChangeReservation, ChangeSourceIdentity, ChangeStorageSummary,
@@ -24,6 +25,10 @@ pub use changes::{
 pub use kernel::{
     AdmittedRun, AttemptPrincipal, AttemptTarget, KernelResource, KernelResourceKind,
     KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
+};
+pub use rust_builds::{
+    ProjectExecutionPolicy, RustBuildCache, RustCacheLifecycle, RustCompletionCheck,
+    RustCompletionPhase, RustStoragePolicy, RustStorageSummary,
 };
 
 /// One project's rows for `factory_core::status::FleetStatus`: the project,
@@ -36,7 +41,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -300,6 +305,11 @@ pub enum StoreError {
          (runs linked to Changes: {linked_runs})"
     )]
     ChangeMigrationRequiresEmptyAuthority { linked_runs: i64 },
+    #[error(
+        "bounded-build migration requires a quiescent schema-31 database \
+         (nonterminal runs: {nonterminal_runs})"
+    )]
+    BuildMigrationRequiresQuiescence { nonterminal_runs: i64 },
     #[error("migration left a foreign key violation behind")]
     ForeignKeyViolation,
     #[error("event page size must be between 1 and {MAX_EVENT_PAGE}")]
@@ -382,10 +392,24 @@ pub enum StoreError {
     TaskChangeUnavailable,
     #[error("project owns retained Change or legacy-source metadata")]
     ProjectHasChanges,
+    #[error("project owns a regenerable Rust build cache")]
+    ProjectHasRustCaches,
     #[error("run was not found")]
     RunNotFound,
     #[error("run still owns {count} unreleased resources")]
     RunResourcesUnreleased { count: i64 },
+    #[error("run completion verification has not reached a terminal result")]
+    CompletionVerificationPending,
+    #[error("Rust completion verification was not found")]
+    RustCompletionCheckNotFound,
+    #[error("Rust completion verification is not in the required phase")]
+    InvalidRustCompletionPhase,
+    #[error("another Rust build holds the project cache writer lease")]
+    RustCacheWriterBusy,
+    #[error("Rust {kind} storage capacity is {limit} artifacts")]
+    RustStorageCapacityReached { kind: &'static str, limit: u64 },
+    #[error("Rust build metadata is invalid or exceeds its bound")]
+    InvalidRustBuildMetadata,
     #[error("resource was not found")]
     ResourceNotFound,
     #[error("resource identity no longer matches the registered resource")]
@@ -619,6 +643,7 @@ impl Store {
             id: input.id,
             name: input.name,
             root: input.root,
+            completion_verification: factory_core::CompletionVerification::None,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
@@ -629,15 +654,20 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        let incarnation_id = Uuid::new_v4().simple().to_string();
+
         transaction.execute(
-            "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO projects (
+                id, name, root, created_at_ms, updated_at_ms,
+                incarnation_id, completion_verification
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'none')",
             params![
                 project.id.as_str(),
                 project.name,
                 project.root,
                 project.created_at_ms,
-                project.updated_at_ms
+                project.updated_at_ms,
+                incarnation_id,
             ],
         )?;
         let sequence = append_event(&transaction, now_ms, &event)?;
@@ -1519,7 +1549,7 @@ impl Store {
     pub fn get_project(&self, project_id: &ProjectId) -> Result<ProjectSnapshot> {
         self.connection
             .query_row(
-                "SELECT id, name, root, created_at_ms, updated_at_ms
+                "SELECT id, name, root, completion_verification, created_at_ms, updated_at_ms
                  FROM projects WHERE id = ?1",
                 params![project_id.as_str()],
                 |row| {
@@ -1527,8 +1557,9 @@ impl Store {
                         id: parse_id(row.get(0)?, 0)?,
                         name: row.get(1)?,
                         root: row.get(2)?,
-                        created_at_ms: row.get(3)?,
-                        updated_at_ms: row.get(4)?,
+                        completion_verification: parse_completion_verification(row.get(3)?, 3)?,
+                        created_at_ms: row.get(4)?,
+                        updated_at_ms: row.get(5)?,
                     })
                 },
             )
@@ -1546,7 +1577,7 @@ impl Store {
             return Err(StoreError::InvalidStateLimit);
         }
         let mut statement = self.connection.prepare(
-            "SELECT id, name, root, created_at_ms, updated_at_ms
+            "SELECT id, name, root, completion_verification, created_at_ms, updated_at_ms
              FROM projects
              WHERE (?1 IS NULL OR id > ?1)
              ORDER BY id
@@ -1559,8 +1590,9 @@ impl Store {
                     id: parse_id(row.get(0)?, 0)?,
                     name: row.get(1)?,
                     root: row.get(2)?,
-                    created_at_ms: row.get(3)?,
-                    updated_at_ms: row.get(4)?,
+                    completion_verification: parse_completion_verification(row.get(3)?, 3)?,
+                    created_at_ms: row.get(4)?,
+                    updated_at_ms: row.get(5)?,
                 })
             },
         )?;
@@ -2208,6 +2240,10 @@ impl Store {
             params![project_id.as_str()],
         )?;
         transaction.execute(
+            "DELETE FROM rust_build_caches WHERE project_id = ?1 AND lifecycle = 'removed'",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
             "DELETE FROM tasks WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
@@ -2286,7 +2322,7 @@ impl Store {
     /// `factory_core::status`.
     pub fn fleet_status(&self) -> Result<Vec<ProjectStatusRows>> {
         let mut projects = self.connection.prepare(
-            "SELECT id, name, root, created_at_ms, updated_at_ms
+            "SELECT id, name, root, completion_verification, created_at_ms, updated_at_ms
              FROM projects ORDER BY created_at_ms, id",
         )?;
         let projects = projects
@@ -2295,8 +2331,9 @@ impl Store {
                     id: parse_id(row.get(0)?, 0)?,
                     name: row.get(1)?,
                     root: row.get(2)?,
-                    created_at_ms: row.get(3)?,
-                    updated_at_ms: row.get(4)?,
+                    completion_verification: parse_completion_verification(row.get(3)?, 3)?,
+                    created_at_ms: row.get(4)?,
+                    updated_at_ms: row.get(5)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3102,6 +3139,17 @@ fn check_project_deletable(connection: &Connection, project_id: &ProjectId) -> R
     if has_change_metadata {
         return Err(StoreError::ProjectHasChanges);
     }
+    let has_rust_artifacts: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM rust_build_caches
+             WHERE project_id = ?1 AND lifecycle <> 'removed'
+         )",
+        params![project_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if has_rust_artifacts {
+        return Err(StoreError::ProjectHasRustCaches);
+    }
     Ok(())
 }
 
@@ -3317,7 +3365,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 }
 
 fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
-    debug_assert!(matches!(target, 29 | 30 | SCHEMA_VERSION));
+    debug_assert!(matches!(target, 29 | 30 | 31 | SCHEMA_VERSION));
     let mut current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current < 0 {
         return Err(StoreError::InvalidSchemaVersion(current));
@@ -3596,7 +3644,7 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
         current = 30;
     }
-    if current == 30 && target == SCHEMA_VERSION {
+    if current == 30 && target >= 31 {
         ensure_change_migration_empty_authority(connection)?;
         connection.pragma_update(None, "foreign_keys", false)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3605,8 +3653,32 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
         verify_no_foreign_key_violations(connection)?;
+        current = 31;
+    }
+    if current == 31 && target == SCHEMA_VERSION {
+        ensure_build_migration_quiescent(connection)?;
+        connection.pragma_update(None, "foreign_keys", false)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0032_bounded_rust_builds.sql"))?;
+        transaction.pragma_update(None, "user_version", 32)?;
+        transaction.commit()?;
+        connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
+}
+
+fn ensure_build_migration_quiescent(connection: &Connection) -> Result<()> {
+    let nonterminal_runs = connection.query_row(
+        "SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'",
+        [],
+        |row| row.get(0),
+    )?;
+    if nonterminal_runs == 0 {
+        Ok(())
+    } else {
+        Err(StoreError::BuildMigrationRequiresQuiescence { nonterminal_runs })
+    }
 }
 
 fn ensure_change_migration_empty_authority(connection: &Connection) -> Result<()> {
@@ -3948,6 +4020,15 @@ fn task_snapshot_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnaps
 
 fn parse_task_status(value: &str, column: usize) -> rusqlite::Result<TaskStatus> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+    })
+}
+
+fn parse_completion_verification(
+    value: String,
+    column: usize,
+) -> rusqlite::Result<factory_core::CompletionVerification> {
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
     })
 }

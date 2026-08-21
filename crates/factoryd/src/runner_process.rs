@@ -117,12 +117,12 @@ pub enum Error {
 /// The caller must durably register [`Self::child_pid`] before calling
 /// [`Self::activate`]. Dropping this value kills the inert exec gate, so there
 /// is no unregistered runner to outlive the daemon.
-pub struct PreparedRunnerProcess {
+struct PreparedProcess {
     child: Option<Child>,
     activation_path: PathBuf,
 }
 
-impl PreparedRunnerProcess {
+impl PreparedProcess {
     fn new(child: Child, activation_path: PathBuf) -> Self {
         Self {
             child: Some(child),
@@ -163,12 +163,50 @@ impl PreparedRunnerProcess {
     }
 }
 
-impl Drop for PreparedRunnerProcess {
+impl Drop for PreparedProcess {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.start_kill();
         }
     }
+}
+
+/// One durably registerable runner process held behind the shared exec gate.
+pub struct PreparedRunnerProcess(PreparedProcess);
+
+impl PreparedRunnerProcess {
+    #[must_use]
+    pub fn child_pid(&self) -> u32 {
+        self.0.child_pid()
+    }
+
+    pub async fn activate(self) -> Result<Child, Error> {
+        self.0.activate().await
+    }
+}
+
+/// One daemon effect process held behind the same register-before-exec gate.
+pub struct PreparedEffectProcess(PreparedProcess);
+
+impl PreparedEffectProcess {
+    #[must_use]
+    pub fn child_pid(&self) -> u32 {
+        self.0.child_pid()
+    }
+
+    pub async fn activate(self) -> Result<Child, Error> {
+        self.0.activate().await
+    }
+}
+
+/// Closed launch description for a daemon-owned effect subprocess.
+pub struct EffectLaunchSpec {
+    pub gate_program: PathBuf,
+    pub program: PathBuf,
+    pub arguments: Vec<OsString>,
+    pub environment: Vec<(OsString, OsString)>,
+    pub cwd: PathBuf,
+    pub activation_path: PathBuf,
 }
 
 struct CapturedEnvironment {
@@ -304,7 +342,52 @@ async fn prepare_runner_with_environment(
     if child.id().is_none() {
         return Err(Error::MissingProcessId);
     }
-    Ok(PreparedRunnerProcess::new(child, activation_path))
+    Ok(PreparedRunnerProcess(PreparedProcess::new(
+        child,
+        activation_path,
+    )))
+}
+
+/// Prepares a daemon-owned effect without allowing its program to execute.
+///
+/// The caller supplies the complete, closed environment and must durably
+/// register [`PreparedEffectProcess::child_pid`] before activation. The gate
+/// is its own process-group leader, so all descendants remain under one exact
+/// finalizer-owned group.
+pub async fn prepare_effect(spec: EffectLaunchSpec) -> Result<PreparedEffectProcess, Error> {
+    if !spec.gate_program.is_absolute() {
+        return Err(Error::RunnerPathNotAbsolute {
+            program: spec.gate_program,
+        });
+    }
+    let gate = checked_executable(&spec.gate_program, "effect gate")?;
+    let program = checked_executable(&spec.program, "effect")?;
+    ensure_exec_gate_absent(&spec.activation_path)?;
+    let expected_parent = rustix::process::getpid();
+    let mut command = Command::new(&gate);
+    command.process_group(0);
+    command
+        .arg("--exec-gate")
+        .arg(&spec.activation_path)
+        .arg("--expected-parent-pid")
+        .arg(expected_parent.as_raw_nonzero().get().to_string())
+        .arg("--")
+        .arg(program)
+        .args(spec.arguments)
+        .current_dir(spec.cwd)
+        .env_clear()
+        .envs(spec.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let child = command.spawn().map_err(Error::Spawn)?;
+    if child.id().is_none() {
+        return Err(Error::MissingProcessId);
+    }
+    Ok(PreparedEffectProcess(PreparedProcess::new(
+        child,
+        spec.activation_path,
+    )))
 }
 
 #[cfg(test)]
@@ -551,9 +634,10 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        CapturedEnvironment, Error, LaunchSpec, ProviderEnvironment, SAFE_ENVIRONMENT_NAMES,
-        apply_runner_environment, has_dot_or_dot_dot_component, is_owned_directory,
-        prepare_runner_with_environment, resolve_executable, spawn_runner_with_environment,
+        CapturedEnvironment, EffectLaunchSpec, Error, LaunchSpec, ProviderEnvironment,
+        SAFE_ENVIRONMENT_NAMES, apply_runner_environment, has_dot_or_dot_dot_component,
+        is_owned_directory, prepare_effect, prepare_runner_with_environment, resolve_executable,
+        spawn_runner_with_environment,
     };
 
     fn id<T>(value: &str) -> T
@@ -1251,6 +1335,38 @@ printf '%s\n' "$@" > "$TMPDIR/provider-argv"
         assert_eq!(child.id(), Some(prepared_pid));
         assert!(child.wait().await.unwrap().success());
         assert!(directory.path().join("runner-argv").exists());
+    }
+
+    #[tokio::test]
+    async fn effect_process_cannot_run_before_its_exact_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        scripts(directory.path());
+        let activation = directory.path().join("effect.activate");
+        let marker = directory.path().join("effect-ran");
+        let prepared = prepare_effect(EffectLaunchSpec {
+            gate_program: directory.path().join("runner-probe"),
+            program: PathBuf::from("/bin/sh"),
+            arguments: vec![
+                OsString::from("-c"),
+                OsString::from(format!("printf ran > {}", marker.display())),
+            ],
+            environment: vec![(
+                OsString::from("TMPDIR"),
+                directory.path().as_os_str().to_owned(),
+            )],
+            cwd: directory.path().to_owned(),
+            activation_path: activation,
+        })
+        .await
+        .unwrap();
+        let prepared_pid = prepared.child_pid();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!marker.exists());
+
+        let mut child = prepared.activate().await.unwrap();
+        assert_eq!(child.id(), Some(prepared_pid));
+        assert!(child.wait().await.unwrap().success());
+        assert_eq!(fs::read_to_string(marker).unwrap(), "ran");
     }
 
     #[tokio::test]

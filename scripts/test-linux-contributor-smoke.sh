@@ -32,6 +32,16 @@ grep -Fq 'run stop' "$smoke" || fail "smoke does not stop its owned run"
 grep -Fq 'wait_for_tracked_processes' "$smoke" || fail "smoke lacks bounded runner proof"
 grep -Fq 'DARK_FACTORY_SMOKE_FORCE_FAILURE' "$smoke" \
     || fail "smoke lacks interrupted cleanup exercise"
+grep -Fq 'project verification' "$smoke" \
+    || fail "smoke does not enable daemon-owned Rust verification"
+grep -Fq 'storage status --json' "$smoke" \
+    || fail "smoke does not prove bounded Rust artifact reporting"
+grep -Fq 'cache_count_over_limit' "$smoke" \
+    || fail "smoke checks stale Rust storage fields"
+grep -Fq 'verifier-launches' "$smoke" \
+    || fail "smoke does not crash and resume immutable Rust verification"
+grep -Fq "printf 'B\\n'" "$smoke" \
+    || fail "smoke does not mutate the retained Change after source selection"
 
 if DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 \
     "$smoke"; then

@@ -8,9 +8,9 @@ clients of the same private local API.
 > **Development freeze:** `main` is part-way through the
 > [safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not
 > install or start this revision, enable auto mode, submit provider work, or
-> point it at `~/.dark-factory`. Stages 1 and 2 are implemented on the current
-> refactor branch; the bounded build cache, immutable executable bundles, and
-> independent boot review are still incomplete.
+> point it at `~/.dark-factory`. Stages 1 and 2 are merged. Stage 3 is being
+> implemented on its isolated branch; its exact-head gates, independent review,
+> merge, and the separate boot review are still incomplete.
 
 ## The smaller runtime model
 
@@ -63,10 +63,14 @@ Paths retained from the pre-kernel architecture are metadata-only
 deletes them. An operator may forget only the metadata record by its typed ID.
 
 Orchestrator policy runs may use their bounded guidance/project policy
-context, but this revision is still not a boot candidate. Stage 3 must add the
-bounded project build cache, immutable prepared executable bundles, and
-regenerable-storage reclamation before the factory can be reviewed for
-re-enablement.
+context, but this revision is still not a boot candidate. The Stage 3 branch
+adds an operator-selected `None`/`RustWorkspaceTest` completion policy, one
+shared project/toolchain cache, attempt-owned immutable test-executable
+staging, and convergent cache reclamation. Providers receive no generic build
+API: direct Rust toolchains are refused by their cooperative hook policy, and
+`factoryctl task done` owns configured final verification after the provider
+has been reaped. A separate exact-head review must accept those claims before
+merge or boot review.
 
 ## Repository layout
 
