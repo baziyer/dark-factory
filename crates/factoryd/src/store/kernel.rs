@@ -14,9 +14,10 @@ use super::changes::{
 use super::rust_builds::insert_completion_check_if_required;
 use super::{
     AgentMessage, ChangeReservation, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES,
-    MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, Result, Store, StoreError,
-    append_agent_changed_event, append_event, load_agent, load_agent_profile, load_task,
-    parse_agent_role, parse_id, parse_observer_health, parse_provider,
+    MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, NewAgentMessage, NewTask, Result, Store,
+    StoreError, TaskDetail, append_agent_changed_event, append_event, assign_task_in_transaction,
+    insert_agent_message, insert_task, load_agent, load_agent_profile, load_task, parse_agent_role,
+    parse_id, parse_observer_health, parse_provider,
 };
 
 const CAPABILITY_HEX_LEN: usize = 64;
@@ -70,14 +71,17 @@ pub struct AttemptTarget {
 pub struct AttemptPrincipal {
     pub run_id: RunId,
     pub project_id: ProjectId,
-    pub task_id: TaskId,
     pub agent_id: AgentId,
     pub role: AgentRole,
-    pub provider: Provider,
-    pub phase: RunPhase,
     pub source_root: String,
-    pub change_id: Option<ChangeId>,
-    pub change_phase: Option<ChangePhase>,
+}
+
+struct RunningAttemptAuthority {
+    project_id: ProjectId,
+    task_id: TaskId,
+    agent_id: AgentId,
+    parent_agent_id: Option<AgentId>,
+    role: AgentRole,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -632,8 +636,7 @@ impl Store {
         let digest = capability_digest(bearer);
         self.connection
             .query_row(
-                "SELECT r.id, r.project_id, r.task_id, r.agent_id, a.role,
-                        r.provider, r.phase, r.source_root, r.change_id, c.phase
+                "SELECT r.id, r.project_id, r.agent_id, a.role, r.source_root
                  FROM runs r
                  JOIN agents a ON a.id = r.agent_id AND a.project_id = r.project_id
                  LEFT JOIN changes c ON c.id = r.change_id AND c.project_id = r.project_id
@@ -644,6 +647,144 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    pub fn send_message_as_attempt(
+        &mut self,
+        run_id: &RunId,
+        requested_project_id: &ProjectId,
+        id: MessageId,
+        recipient_agent_id: AgentId,
+        body: String,
+        now_ms: i64,
+    ) -> Result<AgentMessage> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority = load_running_attempt_authority(&transaction, run_id)?;
+        require_attempt_project(&authority, requested_project_id)?;
+        let recipient = load_agent(&transaction, &recipient_agent_id)?
+            .filter(|agent| agent.snapshot.project_id == authority.project_id)
+            .ok_or(StoreError::AttemptScopeDenied)?;
+        let allowed = recipient.snapshot.id == authority.agent_id
+            || match authority.role {
+                AgentRole::Worker => {
+                    authority.parent_agent_id.as_ref() == Some(&recipient.snapshot.id)
+                        || nearest_orchestrator_ancestor(
+                            &transaction,
+                            &authority.project_id,
+                            &authority.agent_id,
+                        )? == Some(recipient.snapshot.id.clone())
+                }
+                AgentRole::Orchestrator => is_strict_descendant(
+                    &transaction,
+                    &authority.project_id,
+                    &authority.agent_id,
+                    &recipient.snapshot.id,
+                )?,
+            };
+        if !allowed {
+            return Err(StoreError::AttemptScopeDenied);
+        }
+        let message = insert_agent_message(
+            &transaction,
+            NewAgentMessage {
+                id,
+                project_id: authority.project_id,
+                sender_agent_id: Some(authority.agent_id),
+                recipient_agent_id,
+                body,
+                created_at_ms: now_ms,
+            },
+        )?;
+        transaction.commit()?;
+        Ok(message)
+    }
+
+    pub fn create_task_as_attempt(
+        &mut self,
+        run_id: &RunId,
+        mut input: NewTask,
+        assigned_agent_id: Option<AgentId>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority = load_running_attempt_authority(&transaction, run_id)?;
+        require_attempt_project(&authority, &input.project_id)?;
+        let assigned_agent_id = assigned_agent_id.ok_or(StoreError::AttemptScopeDenied)?;
+        if authority.role != AgentRole::Orchestrator
+            || !is_strict_descendant(
+                &transaction,
+                &authority.project_id,
+                &authority.agent_id,
+                &assigned_agent_id,
+            )?
+            || input
+                .parent_task_id
+                .as_ref()
+                .is_some_and(|parent| parent != &authority.task_id)
+        {
+            return Err(StoreError::AttemptScopeDenied);
+        }
+        input.parent_task_id = Some(authority.task_id);
+        let (task, event) = insert_task(&transaction, input, Some(assigned_agent_id), now_ms)?;
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
+    }
+
+    pub fn assign_task_as_attempt(
+        &mut self,
+        run_id: &RunId,
+        requested_project_id: &ProjectId,
+        task_id: &TaskId,
+        assigned_agent_id: Option<&AgentId>,
+        now_ms: i64,
+    ) -> Result<(TaskDetail, EventEnvelope)> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority = load_running_attempt_authority(&transaction, run_id)?;
+        require_attempt_project(&authority, requested_project_id)?;
+        let assigned_agent_id = assigned_agent_id.ok_or(StoreError::AttemptScopeDenied)?;
+        if authority.role != AgentRole::Orchestrator
+            || !is_strict_descendant(
+                &transaction,
+                &authority.project_id,
+                &authority.agent_id,
+                assigned_agent_id,
+            )?
+        {
+            return Err(StoreError::AttemptScopeDenied);
+        }
+        let (task, event) = assign_task_in_transaction(
+            &transaction,
+            &authority.project_id,
+            task_id,
+            Some(assigned_agent_id),
+            now_ms,
+        )?;
+        let sequence = append_event(&transaction, now_ms, &event)?;
+        transaction.commit()?;
+        Ok((
+            task,
+            EventEnvelope {
+                protocol_version: factory_core::PROTOCOL_VERSION,
+                sequence,
+                occurred_at_ms: now_ms,
+                event,
+            },
+        ))
     }
 
     pub fn request_attempt_outcome(
@@ -1306,35 +1447,116 @@ pub fn capability_digest(bearer: &str) -> String {
 }
 
 fn attempt_principal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptPrincipal> {
-    let role: String = row.get(4)?;
-    let provider: String = row.get(5)?;
-    let phase: String = row.get(6)?;
+    let role: String = row.get(3)?;
     Ok(AttemptPrincipal {
         run_id: parse_id(row.get(0)?, 0)?,
         project_id: parse_id(row.get(1)?, 1)?,
-        task_id: parse_id(row.get(2)?, 2)?,
-        agent_id: parse_id(row.get(3)?, 3)?,
-        role: parse_agent_role(&role, 4)?,
-        provider: parse_provider(&provider, 5)?,
-        phase: parse_phase(&phase, 6)?,
-        source_root: row.get(7)?,
-        change_id: row
-            .get::<_, Option<String>>(8)?
-            .map(|value| parse_id(value, 8))
-            .transpose()?,
-        change_phase: row
-            .get::<_, Option<String>>(9)?
-            .map(|value| {
-                parse_change_phase(&value).ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        10,
-                        rusqlite::types::Type::Text,
-                        format!("invalid Change phase {value:?}").into(),
-                    )
-                })
-            })
-            .transpose()?,
+        agent_id: parse_id(row.get(2)?, 2)?,
+        role: parse_agent_role(&role, 3)?,
+        source_root: row.get(4)?,
     })
+}
+
+fn load_running_attempt_authority(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+) -> Result<RunningAttemptAuthority> {
+    transaction
+        .query_row(
+            "SELECT r.project_id, r.task_id, r.agent_id, a.parent_agent_id, a.role
+             FROM runs r
+             JOIN agents a ON a.id = r.agent_id AND a.project_id = r.project_id
+             WHERE r.id = ?1 AND r.phase = 'running'",
+            [run_id.as_str()],
+            |row| {
+                let parent_agent_id: Option<String> = row.get(3)?;
+                let role: String = row.get(4)?;
+                Ok(RunningAttemptAuthority {
+                    project_id: parse_id(row.get(0)?, 0)?,
+                    task_id: parse_id(row.get(1)?, 1)?,
+                    agent_id: parse_id(row.get(2)?, 2)?,
+                    parent_agent_id: parent_agent_id
+                        .map(|value| parse_id(value, 3))
+                        .transpose()?,
+                    role: parse_agent_role(&role, 4)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(StoreError::InvalidHookToken)
+}
+
+fn require_attempt_project(
+    authority: &RunningAttemptAuthority,
+    requested_project_id: &ProjectId,
+) -> Result<()> {
+    if authority.project_id == *requested_project_id {
+        Ok(())
+    } else {
+        Err(StoreError::AttemptScopeDenied)
+    }
+}
+
+fn is_strict_descendant(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    ancestor_id: &AgentId,
+    candidate_id: &AgentId,
+) -> Result<bool> {
+    transaction
+        .query_row(
+            "WITH RECURSIVE descendants(id) AS (
+                 SELECT id FROM agents
+                 WHERE project_id = ?1 AND parent_agent_id = ?2
+                 UNION
+                 SELECT child.id FROM agents child
+                 JOIN descendants parent ON child.parent_agent_id = parent.id
+                 WHERE child.project_id = ?1
+             )
+             SELECT EXISTS(SELECT 1 FROM descendants WHERE id = ?3)",
+            params![
+                project_id.as_str(),
+                ancestor_id.as_str(),
+                candidate_id.as_str()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn nearest_orchestrator_ancestor(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    agent_id: &AgentId,
+) -> Result<Option<AgentId>> {
+    transaction
+        .query_row(
+            "WITH RECURSIVE ancestors(id, parent_agent_id, role, depth, path) AS (
+                 SELECT parent.id, parent.parent_agent_id, parent.role, 1,
+                        '/' || parent.id || '/'
+                 FROM agents child
+                 JOIN agents parent
+                   ON parent.id = child.parent_agent_id
+                  AND parent.project_id = child.project_id
+                 WHERE child.project_id = ?1 AND child.id = ?2
+                 UNION ALL
+                 SELECT parent.id, parent.parent_agent_id, parent.role,
+                        ancestor.depth + 1, ancestor.path || parent.id || '/'
+                 FROM ancestors ancestor
+                 JOIN agents parent
+                   ON parent.id = ancestor.parent_agent_id
+                  AND parent.project_id = ?1
+                 WHERE instr(ancestor.path, '/' || parent.id || '/') = 0
+             )
+             SELECT id FROM ancestors
+             WHERE role = 'orchestrator'
+             ORDER BY depth
+             LIMIT 1",
+            params![project_id.as_str(), agent_id.as_str()],
+            |row| parse_id(row.get(0)?, 0),
+        )
+        .optional()
+        .map_err(StoreError::from)
 }
 
 fn validate_capability_digest(value: &str) -> Result<()> {
@@ -2156,6 +2378,199 @@ mod tests {
         }
     }
 
+    fn id<T>(value: &str) -> T
+    where
+        T: TryFrom<String>,
+        <T as TryFrom<String>>::Error: std::fmt::Debug,
+    {
+        T::try_from(value.to_owned()).unwrap()
+    }
+
+    fn create_scope_agent(
+        store: &mut Store,
+        project_id: &ProjectId,
+        agent_id: &str,
+        parent_agent_id: Option<&str>,
+        role: AgentRole,
+        now_ms: i64,
+    ) {
+        store
+            .create_agent(
+                NewAgent {
+                    id: id(agent_id),
+                    project_id: project_id.clone(),
+                    parent_agent_id: parent_agent_id.map(id),
+                    role,
+                    provider: Provider::Shell,
+                },
+                now_ms,
+            )
+            .unwrap();
+    }
+
+    fn scope_attempt(authority_agent_id: &str) -> (Store, RunId, ProjectId, TaskId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id: ProjectId = id("factory");
+        let other_project_id: ProjectId = id("other-project");
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: other_project_id.clone(),
+                    name: "Other".into(),
+                    root: "/tmp/other-project".into(),
+                },
+                1,
+            )
+            .unwrap();
+
+        for (agent, parent, role) in [
+            ("root-orchestrator", None, AgentRole::Orchestrator),
+            ("grand-worker", Some("root-orchestrator"), AgentRole::Worker),
+            ("middle-worker", Some("grand-worker"), AgentRole::Worker),
+            ("worker", Some("middle-worker"), AgentRole::Worker),
+            ("worker-child", Some("worker"), AgentRole::Worker),
+            ("sibling-worker", Some("middle-worker"), AgentRole::Worker),
+            (
+                "nested-orchestrator",
+                Some("grand-worker"),
+                AgentRole::Orchestrator,
+            ),
+            (
+                "orchestrator-child",
+                Some("nested-orchestrator"),
+                AgentRole::Worker,
+            ),
+            (
+                "orchestrator-grandchild",
+                Some("orchestrator-child"),
+                AgentRole::Worker,
+            ),
+        ] {
+            create_scope_agent(&mut store, &project_id, agent, parent, role, 2);
+        }
+        create_scope_agent(
+            &mut store,
+            &other_project_id,
+            "external-worker",
+            None,
+            AgentRole::Worker,
+            2,
+        );
+
+        let authority_task_id: TaskId = id("authority-task");
+        let authority_agent_id: AgentId = id(authority_agent_id);
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: authority_task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Authority task".into(),
+                    body: "Exercise exact attempt scope".into(),
+                    priority: 0,
+                },
+                authority_agent_id.clone(),
+                3,
+            )
+            .unwrap();
+        let run_id: RunId = id("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let runner_instance_id: RunnerInstanceId = id("22222222-2222-4222-8222-222222222222");
+        let role = if authority_agent_id.as_str() == "worker" {
+            AgentRole::Worker
+        } else {
+            AgentRole::Orchestrator
+        };
+        let change_id: Option<ChangeId> = (role == AgentRole::Worker).then(|| id("scope-change"));
+        store
+            .admit_run(
+                NewRunAdmission {
+                    run_id: run_id.clone(),
+                    project_id: project_id.clone(),
+                    task_id: authority_task_id.clone(),
+                    agent_id: authority_agent_id,
+                    expected_provider: Provider::Shell,
+                    capability_digest: capability_digest("scope-secret"),
+                    runtime_claim: "runtime-claim:cccccccccccc4ccc8ccccccccccccccc".into(),
+                    runner_instance_id,
+                    runner_runtime: "/tmp/factory-runner".into(),
+                    max_active_runs: 1,
+                    change_reservation: change_id.as_ref().map(|change_id| ChangeReservation {
+                        id: change_id.clone(),
+                        source_root: "/tmp/scope-change".into(),
+                        max_factory_changes: 1,
+                    }),
+                    policy_cwd: (role == AgentRole::Orchestrator)
+                        .then(|| "/tmp/factory-policy".into()),
+                },
+                4,
+            )
+            .unwrap();
+        if let Some(change_id) = change_id {
+            let base = ChangeBaseIdentity {
+                repository_root: "/tmp/factory".into(),
+                device: 11,
+                inode: 12,
+            };
+            let base_oid = "0123456789abcdef0123456789abcdef01234567";
+            store
+                .record_change_base(&project_id, &change_id, 0, base_oid, &base, 5)
+                .unwrap();
+            store
+                .mark_change_available(
+                    &project_id,
+                    &change_id,
+                    1,
+                    &ChangeMaterialization {
+                        base_oid: base_oid.into(),
+                        base,
+                        source: ChangeSourceIdentity {
+                            source_root: "/tmp/scope-change".into(),
+                            device: 13,
+                            inode: 14,
+                            size_bytes: 15,
+                        },
+                    },
+                    5,
+                )
+                .unwrap();
+        }
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        (store, run_id, project_id, authority_task_id)
+    }
+
+    fn mutation_footprint(store: &Store) -> (i64, i64, i64, i64) {
+        let event_sequence = store.latest_event_sequence().unwrap();
+        let task_count = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        let work_revision = store
+            .connection
+            .query_row(
+                "SELECT COALESCE(SUM(work_revision), 0) FROM tasks",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let message_count = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM agent_messages", [], |row| row.get(0))
+            .unwrap();
+        (event_sequence, task_count, work_revision, message_count)
+    }
+
     fn request_rust_success(store: &mut Store, run_id: &RunId) -> Vec<EventEnvelope> {
         store
             .activate_prepared_run(run_id, prepared_identity(), 7)
@@ -2196,7 +2611,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_resolves_only_its_exact_attempt_and_durable_change() {
+    fn credential_resolves_only_its_exact_attempt_and_available_change() {
         let mut store = Store::open_in_memory().unwrap();
         let run_id = admit_worker(&mut store);
         assert!(store.authenticate_attempt("wrong").unwrap().is_none());
@@ -2206,11 +2621,6 @@ mod tests {
             .unwrap();
         let principal = store.authenticate_attempt(BEARER).unwrap().unwrap();
         assert_eq!(principal.run_id, run_id);
-        assert_eq!(
-            principal.change_id.as_ref().map(ChangeId::as_str),
-            Some("change-1")
-        );
-        assert_eq!(principal.change_phase, Some(ChangePhase::Available));
         assert_eq!(principal.source_root, "/tmp/factory-change-1");
         assert!(matches!(
             store.begin_change_removal(
@@ -2221,6 +2631,492 @@ mod tests {
             ),
             Err(StoreError::ChangeLeased)
         ));
+    }
+
+    #[test]
+    fn worker_messages_only_self_parent_and_nearest_orchestrator() {
+        let (mut store, run_id, project_id, _) = scope_attempt("worker");
+        for (message_id, recipient) in [
+            ("message-self", "worker"),
+            ("message-parent", "middle-worker"),
+            ("message-orchestrator", "root-orchestrator"),
+        ] {
+            let message = store
+                .send_message_as_attempt(
+                    &run_id,
+                    &project_id,
+                    id(message_id),
+                    id(recipient),
+                    format!("message to {recipient}"),
+                    7,
+                )
+                .unwrap();
+            assert_eq!(message.sender_agent_id, Some(id("worker")));
+            assert_eq!(message.recipient_agent_id, id(recipient));
+        }
+
+        let before = mutation_footprint(&store);
+        for (message_id, recipient) in [
+            ("denied-grandparent", "grand-worker"),
+            ("denied-sibling", "sibling-worker"),
+            ("denied-descendant", "worker-child"),
+            ("denied-other-branch", "nested-orchestrator"),
+            ("denied-cross-project", "external-worker"),
+        ] {
+            assert!(matches!(
+                store.send_message_as_attempt(
+                    &run_id,
+                    &project_id,
+                    id(message_id),
+                    id(recipient),
+                    "scope escape".into(),
+                    8,
+                ),
+                Err(StoreError::AttemptScopeDenied)
+            ));
+        }
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn orchestrator_messages_only_self_and_strict_descendants() {
+        let (mut store, run_id, project_id, _) = scope_attempt("nested-orchestrator");
+        for (message_id, recipient) in [
+            ("message-self", "nested-orchestrator"),
+            ("message-child", "orchestrator-child"),
+            ("message-grandchild", "orchestrator-grandchild"),
+        ] {
+            store
+                .send_message_as_attempt(
+                    &run_id,
+                    &project_id,
+                    id(message_id),
+                    id(recipient),
+                    format!("message to {recipient}"),
+                    7,
+                )
+                .unwrap();
+        }
+
+        let before = mutation_footprint(&store);
+        for (message_id, recipient) in [
+            ("denied-parent", "grand-worker"),
+            ("denied-ancestor", "root-orchestrator"),
+            ("denied-sibling", "middle-worker"),
+            ("denied-cross-project", "external-worker"),
+        ] {
+            assert!(matches!(
+                store.send_message_as_attempt(
+                    &run_id,
+                    &project_id,
+                    id(message_id),
+                    id(recipient),
+                    "scope escape".into(),
+                    8,
+                ),
+                Err(StoreError::AttemptScopeDenied)
+            ));
+        }
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn worker_attempt_cannot_create_or_assign_tasks() {
+        let (mut store, run_id, project_id, authority_task_id) = scope_attempt("worker");
+        store
+            .create_task(
+                NewTask {
+                    id: id("assignment-target"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id.clone()),
+                    title: "Assignment target".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                7,
+            )
+            .unwrap();
+        let before = mutation_footprint(&store);
+        assert!(matches!(
+            store.create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("worker-created-task"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id),
+                    title: "Forbidden".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("worker-child")),
+                8,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert!(matches!(
+            store.assign_task_as_attempt(
+                &run_id,
+                &project_id,
+                &id("assignment-target"),
+                Some(&id("worker-child")),
+                8,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn orchestrator_task_creation_derives_parent_and_descendant_assignment() {
+        let (mut store, run_id, project_id, authority_task_id) =
+            scope_attempt("nested-orchestrator");
+        let (derived, _) = store
+            .create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("derived-child-task"),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Derived child".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("orchestrator-child")),
+                7,
+            )
+            .unwrap();
+        assert_eq!(
+            derived.snapshot.parent_task_id,
+            Some(authority_task_id.clone())
+        );
+        assert_eq!(
+            derived.snapshot.assigned_agent_id,
+            Some(id("orchestrator-child"))
+        );
+        let (explicit, _) = store
+            .create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("explicit-child-task"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id.clone()),
+                    title: "Explicit child".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("orchestrator-grandchild")),
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            explicit.snapshot.parent_task_id,
+            Some(authority_task_id.clone())
+        );
+
+        store
+            .create_task(
+                NewTask {
+                    id: id("wrong-parent"),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Wrong parent".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                9,
+            )
+            .unwrap();
+        let before = mutation_footprint(&store);
+        for (task_id, parent_task_id, assigned_agent_id) in [
+            (
+                "denied-wrong-parent",
+                Some(id("wrong-parent")),
+                Some(id("orchestrator-child")),
+            ),
+            (
+                "denied-self-assignment",
+                Some(authority_task_id.clone()),
+                Some(id("nested-orchestrator")),
+            ),
+            (
+                "denied-sibling-assignment",
+                Some(authority_task_id.clone()),
+                Some(id("middle-worker")),
+            ),
+            (
+                "denied-ancestor-assignment",
+                Some(authority_task_id.clone()),
+                Some(id("root-orchestrator")),
+            ),
+            (
+                "denied-cross-project-assignment",
+                Some(authority_task_id.clone()),
+                Some(id("external-worker")),
+            ),
+            (
+                "denied-unassigned-task",
+                Some(authority_task_id.clone()),
+                None,
+            ),
+        ] {
+            assert!(matches!(
+                store.create_task_as_attempt(
+                    &run_id,
+                    NewTask {
+                        id: id(task_id),
+                        project_id: project_id.clone(),
+                        parent_task_id,
+                        title: "Forbidden child".into(),
+                        body: String::new(),
+                        priority: 0,
+                    },
+                    assigned_agent_id,
+                    10,
+                ),
+                Err(StoreError::AttemptScopeDenied)
+            ));
+        }
+        assert!(matches!(
+            store.create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("denied-cross-project"),
+                    project_id: id("other-project"),
+                    parent_task_id: None,
+                    title: "Cross-project child".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("external-worker")),
+                10,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn orchestrator_assignment_requires_a_strict_descendant_and_never_unassigns() {
+        let (mut store, run_id, project_id, authority_task_id) =
+            scope_attempt("nested-orchestrator");
+        store
+            .create_task(
+                NewTask {
+                    id: id("assignment-target"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id),
+                    title: "Assignment target".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                7,
+            )
+            .unwrap();
+        let (assigned, _) = store
+            .assign_task_as_attempt(
+                &run_id,
+                &project_id,
+                &id("assignment-target"),
+                Some(&id("orchestrator-grandchild")),
+                8,
+            )
+            .unwrap();
+        assert_eq!(
+            assigned.snapshot.assigned_agent_id,
+            Some(id("orchestrator-grandchild"))
+        );
+
+        let before = mutation_footprint(&store);
+        assert!(matches!(
+            store.assign_task_as_attempt(&run_id, &project_id, &id("assignment-target"), None, 9,),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        for recipient in [
+            "nested-orchestrator",
+            "grand-worker",
+            "root-orchestrator",
+            "middle-worker",
+            "external-worker",
+        ] {
+            assert!(matches!(
+                store.assign_task_as_attempt(
+                    &run_id,
+                    &project_id,
+                    &id("assignment-target"),
+                    Some(&id(recipient)),
+                    9,
+                ),
+                Err(StoreError::AttemptScopeDenied)
+            ));
+        }
+        assert!(matches!(
+            store.assign_task_as_attempt(
+                &run_id,
+                &id("other-project"),
+                &id("assignment-target"),
+                Some(&id("external-worker")),
+                9,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn fabricated_task_and_run_ancestry_cannot_expand_agent_authority() {
+        let (mut store, run_id, project_id, authority_task_id) =
+            scope_attempt("nested-orchestrator");
+        let fabricated_task_id: TaskId = id("fabricated-child-task");
+        store
+            .create_task(
+                NewTask {
+                    id: fabricated_task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id.clone()),
+                    title: "Fabricated ancestry".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                7,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO runs (
+                    id, project_id, agent_id, task_id, task_incarnation_id,
+                    admitted_task_work_revision, change_id, parent_run_id, source_root,
+                    phase, outcome, outcome_detail, outcome_result, capability_digest,
+                    provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
+                    runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
+                    runner_instance_id, runner_runtime, runner_protocol_version,
+                    last_runner_sequence, terminal_runner_sequence, runner_reconciled_at_ms,
+                    stop_requested_at_ms, admitted_at_ms, running_at_ms, finalizing_at_ms,
+                    phase_since_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal
+                 )
+                 SELECT 'fabricated-parent-run', project_id, 'middle-worker', id, incarnation_id,
+                        work_revision, NULL, NULL, '/tmp/fabricated-parent',
+                        'terminal', 'succeeded', NULL, NULL, NULL,
+                        'shell', NULL, NULL, NULL, NULL, NULL, NULL, 'unknown', NULL,
+                        NULL, NULL, NULL, 0, NULL, NULL, NULL,
+                        7, NULL, 7, 7, 7, 7, NULL, NULL
+                 FROM tasks WHERE id = ?1 AND project_id = ?2",
+                params![fabricated_task_id.as_str(), project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE runs SET parent_run_id = 'fabricated-parent-run' WHERE id = ?1",
+                [run_id.as_str()],
+            )
+            .unwrap();
+
+        let before = mutation_footprint(&store);
+        assert!(matches!(
+            store.assign_task_as_attempt(
+                &run_id,
+                &project_id,
+                &fabricated_task_id,
+                Some(&id("middle-worker")),
+                8,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert!(matches!(
+            store.create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("fabricated-created-task"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id),
+                    title: "Fabricated created task".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("middle-worker")),
+                8,
+            ),
+            Err(StoreError::AttemptScopeDenied)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
+    }
+
+    #[test]
+    fn finalizing_and_stale_runs_cannot_mutate_attempt_scoped_state() {
+        let (mut store, run_id, project_id, authority_task_id) =
+            scope_attempt("nested-orchestrator");
+        store
+            .create_task(
+                NewTask {
+                    id: id("assignment-target"),
+                    project_id: project_id.clone(),
+                    parent_task_id: Some(authority_task_id),
+                    title: "Assignment target".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                7,
+            )
+            .unwrap();
+        store
+            .request_attempt_outcome(&run_id, &RunOutcome::Succeeded, Some("done"), 8)
+            .unwrap();
+        let before = mutation_footprint(&store);
+        assert!(matches!(
+            store.send_message_as_attempt(
+                &run_id,
+                &project_id,
+                id("finalizing-message"),
+                id("orchestrator-child"),
+                "too late".into(),
+                9,
+            ),
+            Err(StoreError::InvalidHookToken)
+        ));
+        assert!(matches!(
+            store.create_task_as_attempt(
+                &run_id,
+                NewTask {
+                    id: id("finalizing-task"),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Too late".into(),
+                    body: String::new(),
+                    priority: 0,
+                },
+                Some(id("orchestrator-child")),
+                9,
+            ),
+            Err(StoreError::InvalidHookToken)
+        ));
+        assert!(matches!(
+            store.assign_task_as_attempt(
+                &run_id,
+                &project_id,
+                &id("assignment-target"),
+                Some(&id("orchestrator-child")),
+                9,
+            ),
+            Err(StoreError::InvalidHookToken)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
+
+        release_all(&mut store, &run_id, 10);
+        store.finalize_run(&run_id, 11).unwrap();
+        let before = mutation_footprint(&store);
+        assert!(matches!(
+            store.send_message_as_attempt(
+                &run_id,
+                &project_id,
+                id("stale-message"),
+                id("orchestrator-child"),
+                "stale".into(),
+                12,
+            ),
+            Err(StoreError::InvalidHookToken)
+        ));
+        assert_eq!(mutation_footprint(&store), before);
     }
 
     #[test]

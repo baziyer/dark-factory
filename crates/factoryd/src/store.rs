@@ -266,6 +266,8 @@ pub enum StoreError {
     ResourceIdentityMismatch,
     #[error("attempt credential is invalid")]
     InvalidHookToken,
+    #[error("request is outside the admitted attempt's authority")]
+    AttemptScopeDenied,
     #[error("run is not in the required state")]
     InvalidRunState,
     #[error("attempt already has a different terminal outcome")]
@@ -790,34 +792,10 @@ impl Store {
 
     /// Stores a private message without appending a public factory event.
     pub fn send_agent_message(&mut self, input: NewAgentMessage) -> Result<AgentMessage> {
-        validate_agent_message(&input.body, input.created_at_ms)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        load_agent(&transaction, &input.recipient_agent_id)?
-            .filter(|agent| agent.snapshot.project_id == input.project_id)
-            .ok_or(StoreError::AgentNotFound)?;
-        if let Some(sender_agent_id) = &input.sender_agent_id {
-            load_agent(&transaction, sender_agent_id)?
-                .filter(|agent| agent.snapshot.project_id == input.project_id)
-                .ok_or(StoreError::AgentNotFound)?;
-        }
-        transaction.execute(
-            "INSERT INTO agent_messages (
-                id, project_id, sender_agent_id, recipient_agent_id,
-                body, created_at_ms, delivered_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
-            params![
-                input.id.as_str(),
-                input.project_id.as_str(),
-                input.sender_agent_id.as_ref().map(AgentId::as_str),
-                input.recipient_agent_id.as_str(),
-                input.body,
-                input.created_at_ms,
-            ],
-        )?;
-        let message =
-            load_agent_message(&transaction, &input.id)?.ok_or(StoreError::InvalidAgentMessage)?;
+        let message = insert_agent_message(&transaction, input)?;
         transaction.commit()?;
         Ok(message)
     }
@@ -1146,35 +1124,8 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task = load_task(&transaction, task_id)?
-            .filter(|task| task.snapshot.project_id == *project_id)
-            .ok_or(StoreError::TaskNotFound)?;
-        if task.snapshot.status != TaskStatus::Queued {
-            return Err(StoreError::TaskNotQueued);
-        }
-        if let Some(agent_id) = agent_id {
-            let exists = load_agent(&transaction, agent_id)?
-                .is_some_and(|agent| agent.snapshot.project_id == *project_id);
-            if !exists {
-                return Err(StoreError::AgentNotFound);
-            }
-        }
-        transaction.execute(
-            "UPDATE tasks
-             SET assigned_agent_id = ?1, updated_at_ms = ?2,
-                 work_revision = work_revision + 1
-             WHERE id = ?3 AND project_id = ?4 AND status = 'queued'",
-            params![
-                agent_id.map(AgentId::as_str),
-                now_ms,
-                task_id.as_str(),
-                project_id.as_str(),
-            ],
-        )?;
-        let task = load_task(&transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
-        let event = FactoryEvent::TaskChanged {
-            task: task.snapshot.clone(),
-        };
+        let (task, event) =
+            assign_task_in_transaction(&transaction, project_id, task_id, agent_id, now_ms)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
         Ok((
@@ -2344,6 +2295,48 @@ fn insert_task(
     Ok((record, event))
 }
 
+fn assign_task_in_transaction(
+    transaction: &Transaction<'_>,
+    project_id: &ProjectId,
+    task_id: &TaskId,
+    agent_id: Option<&AgentId>,
+    now_ms: i64,
+) -> Result<(TaskDetail, FactoryEvent)> {
+    let task = load_task(transaction, task_id)?
+        .filter(|task| task.snapshot.project_id == *project_id)
+        .ok_or(StoreError::TaskNotFound)?;
+    if task.snapshot.status != TaskStatus::Queued {
+        return Err(StoreError::TaskNotQueued);
+    }
+    if let Some(agent_id) = agent_id {
+        let exists = load_agent(transaction, agent_id)?
+            .is_some_and(|agent| agent.snapshot.project_id == *project_id);
+        if !exists {
+            return Err(StoreError::AgentNotFound);
+        }
+    }
+    let changed = transaction.execute(
+        "UPDATE tasks
+         SET assigned_agent_id = ?1, updated_at_ms = ?2,
+             work_revision = work_revision + 1
+         WHERE id = ?3 AND project_id = ?4 AND status = 'queued'",
+        params![
+            agent_id.map(AgentId::as_str),
+            now_ms,
+            task_id.as_str(),
+            project_id.as_str(),
+        ],
+    )?;
+    if changed != 1 {
+        return Err(StoreError::TaskNotQueued);
+    }
+    let task = load_task(transaction, task_id)?.ok_or(StoreError::TaskNotFound)?;
+    let event = FactoryEvent::TaskChanged {
+        task: task.snapshot.clone(),
+    };
+    Ok((task, event))
+}
+
 fn load_task(connection: &Connection, task_id: &TaskId) -> Result<Option<TaskDetail>> {
     connection
         .query_row(
@@ -2441,6 +2434,36 @@ fn load_agent_message(
         )
         .optional()
         .map_err(StoreError::from)
+}
+
+fn insert_agent_message(
+    transaction: &Transaction<'_>,
+    input: NewAgentMessage,
+) -> Result<AgentMessage> {
+    validate_agent_message(&input.body, input.created_at_ms)?;
+    load_agent(transaction, &input.recipient_agent_id)?
+        .filter(|agent| agent.snapshot.project_id == input.project_id)
+        .ok_or(StoreError::AgentNotFound)?;
+    if let Some(sender_agent_id) = &input.sender_agent_id {
+        load_agent(transaction, sender_agent_id)?
+            .filter(|agent| agent.snapshot.project_id == input.project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+    }
+    transaction.execute(
+        "INSERT INTO agent_messages (
+            id, project_id, sender_agent_id, recipient_agent_id,
+            body, created_at_ms, delivered_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+        params![
+            input.id.as_str(),
+            input.project_id.as_str(),
+            input.sender_agent_id.as_ref().map(AgentId::as_str),
+            input.recipient_agent_id.as_str(),
+            input.body,
+            input.created_at_ms,
+        ],
+    )?;
+    load_agent_message(transaction, &input.id)?.ok_or(StoreError::InvalidAgentMessage)
 }
 
 fn agent_message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMessage> {

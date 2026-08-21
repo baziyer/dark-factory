@@ -52,20 +52,15 @@ enum Principal {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
-    use factory_core::{Provider, TaskId};
+    use factory_core::TaskId;
 
     fn orchestrator_attempt() -> AttemptPrincipal {
         AttemptPrincipal {
             run_id: RunId::try_from("2f5a1e2e-2222-4444-8888-0123456789ab").unwrap(),
             project_id: ProjectId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
-            task_id: TaskId::try_from("22222222-2222-4222-8222-222222222222").unwrap(),
             agent_id: AgentId::try_from("god").unwrap(),
             role: AgentRole::Orchestrator,
-            provider: Provider::Shell,
-            phase: RunPhase::Running,
             source_root: "/private/runtime/policy".into(),
-            change_id: None,
-            change_phase: None,
         }
     }
 
@@ -137,6 +132,77 @@ mod protocol_tests {
             .is_ok()
         );
         assert!(authorize_attempt(&attempt, &LocalRequest::RustStorageStatus).is_err());
+    }
+
+    #[test]
+    fn attempt_shape_authorization_keeps_inbox_private_and_task_edits_operator_only() {
+        let attempt = orchestrator_attempt();
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::ListAgentMessages {
+                    project_id: attempt.project_id.clone(),
+                    agent_id: attempt.agent_id.clone(),
+                    after_id: None,
+                    limit: 1,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::ListAgentMessages {
+                    project_id: attempt.project_id.clone(),
+                    agent_id: AgentId::try_from("descendant").unwrap(),
+                    after_id: None,
+                    limit: 1,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_attempt(
+                &attempt,
+                &LocalRequest::UpdateTask {
+                    project_id: attempt.project_id.clone(),
+                    task_id: TaskId::try_from("task").unwrap(),
+                    title: Some("rewrite".into()),
+                    body: None,
+                    priority: None,
+                },
+            )
+            .is_err()
+        );
+
+        let mut worker = attempt;
+        worker.role = AgentRole::Worker;
+        assert!(
+            authorize_attempt(
+                &worker,
+                &LocalRequest::CreateTask {
+                    id: TaskId::try_from("child").unwrap(),
+                    project_id: worker.project_id.clone(),
+                    parent_task_id: None,
+                    title: "child".into(),
+                    body: String::new(),
+                    priority: 0,
+                    agent_id: Some(AgentId::try_from("descendant").unwrap()),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_attempt(
+                &worker,
+                &LocalRequest::AssignTask {
+                    project_id: worker.project_id.clone(),
+                    task_id: TaskId::try_from("task").unwrap(),
+                    agent_id: Some(AgentId::try_from("descendant").unwrap()),
+                },
+            )
+            .is_err()
+        );
     }
 }
 
@@ -215,6 +281,10 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidHookToken) => (
                 ErrorCode::Unauthorized,
                 "attempt credential is invalid".into(),
+            ),
+            Self::Store(StoreError::AttemptScopeDenied) => (
+                ErrorCode::Unauthorized,
+                "request is outside the admitted attempt's authority".into(),
             ),
             Self::Store(
                 error @ (StoreError::AgentNotFound
@@ -480,11 +550,6 @@ async fn resolve_principal(
         .with_store(move |store| store.authenticate_attempt(&bearer))
         .await?
         .ok_or_else(|| ApiFailure::Unauthorized("invalid request credential".into()))?;
-    if principal.phase != RunPhase::Running {
-        return Err(ApiFailure::Unauthorized(
-            "attempt authority is not active".into(),
-        ));
-    }
     Ok(Principal::Attempt(principal))
 }
 
@@ -531,10 +596,9 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
             project_id,
             agent_id,
             ..
-        } => same_project(project_id) && (orchestrator || agent_id == &attempt.agent_id),
+        } => same_project(project_id) && agent_id == &attempt.agent_id,
         LocalRequest::SendAgentMessage { project_id, .. } => same_project(project_id),
         LocalRequest::CreateTask { project_id, .. }
-        | LocalRequest::UpdateTask { project_id, .. }
         | LocalRequest::AssignTask { project_id, .. } => orchestrator && same_project(project_id),
         LocalRequest::ListAgents { project_id, .. } => orchestrator && same_project(project_id),
         LocalRequest::SetAutoMode { .. }
@@ -551,6 +615,7 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         | LocalRequest::UpdateAgentProfile { .. }
         | LocalRequest::SetAgentBudget { .. }
         | LocalRequest::ResetAgentBudget { .. }
+        | LocalRequest::UpdateTask { .. }
         | LocalRequest::RetryTask { .. }
         | LocalRequest::CancelTask { .. }
         | LocalRequest::PauseAgent { .. }
@@ -576,17 +641,7 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
     }
 }
 
-fn mutation_attempt(principal: &Principal) -> Option<RunId> {
-    match principal {
-        Principal::Attempt(attempt) => Some(attempt.run_id.clone()),
-        Principal::Anonymous | Principal::Operator => None,
-    }
-}
-
-fn verify_mutation_attempt(store: &Store, run_id: Option<&RunId>) -> crate::store::Result<()> {
-    let Some(run_id) = run_id else {
-        return Ok(());
-    };
+fn verify_mutation_attempt(store: &Store, run_id: &RunId) -> crate::store::Result<()> {
     let running = store
         .kernel_run(run_id)?
         .is_some_and(|run| run.phase == RunPhase::Running);
@@ -850,22 +905,26 @@ async fn handle_request(
             }
             let wake_project_id = project_id.clone();
             let wake_agent_id = agent_id.clone();
-            let authority_run_id = mutation_attempt(principal);
+            let authority_run_id = match principal {
+                Principal::Attempt(attempt) => Some(attempt.run_id.clone()),
+                Principal::Operator => None,
+                Principal::Anonymous => unreachable!("anonymous task creation was authorized"),
+            };
             let task = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
-                    let (task, event) = store.create_task_with_assignment(
-                        NewTask {
-                            id,
-                            project_id,
-                            parent_task_id,
-                            title,
-                            body,
-                            priority,
-                        },
-                        agent_id,
-                        now_ms()?,
-                    )?;
+                    let input = NewTask {
+                        id,
+                        project_id,
+                        parent_task_id,
+                        title,
+                        body,
+                        priority,
+                    };
+                    let (task, event) = if let Some(run_id) = authority_run_id {
+                        store.create_task_as_attempt(&run_id, input, agent_id, now_ms()?)?
+                    } else {
+                        store.create_task_with_assignment(input, agent_id, now_ms()?)?
+                    };
                     Ok((task, vec![event]))
                 })
                 .await?;
@@ -1077,29 +1136,34 @@ async fn handle_request(
                     "agent message must be at most {MAX_AGENT_MESSAGE_BYTES} bytes"
                 )));
             }
-            let sender_agent_id = match principal {
-                Principal::Attempt(attempt) => Some(attempt.agent_id.clone()),
-                Principal::Operator => None,
-                Principal::Anonymous => {
-                    return Err(ApiFailure::Unauthorized(
-                        "agent messages require an authenticated principal".to_owned(),
-                    ));
-                }
-            };
             let wake_project_id = project_id.clone();
             let wake_agent_id = recipient_agent_id.clone();
-            let authority_run_id = mutation_attempt(principal);
+            let authority_run_id = match principal {
+                Principal::Attempt(attempt) => Some(attempt.run_id.clone()),
+                Principal::Operator => None,
+                Principal::Anonymous => unreachable!("anonymous messaging was authorized"),
+            };
             let message = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
-                    let message = store.send_agent_message(NewAgentMessage {
-                        id,
-                        project_id,
-                        sender_agent_id,
-                        recipient_agent_id,
-                        body,
-                        created_at_ms: now_ms()?,
-                    })?;
+                    let message = if let Some(run_id) = authority_run_id {
+                        store.send_message_as_attempt(
+                            &run_id,
+                            &project_id,
+                            id,
+                            recipient_agent_id,
+                            body,
+                            now_ms()?,
+                        )?
+                    } else {
+                        store.send_agent_message(NewAgentMessage {
+                            id,
+                            project_id,
+                            sender_agent_id: None,
+                            recipient_agent_id,
+                            body,
+                            created_at_ms: now_ms()?,
+                        })?
+                    };
                     Ok((message, Vec::new()))
                 })
                 .await?;
@@ -1224,10 +1288,8 @@ async fn handle_request(
                     "task body must be at most {MAX_TASK_BODY_BYTES} bytes"
                 )));
             }
-            let authority_run_id = mutation_attempt(principal);
             let task = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
                     let (task, event) = store.update_task(
                         &project_id,
                         &task_id,
@@ -1322,12 +1384,24 @@ async fn handle_request(
             agent_id,
         } => {
             let wake_project_id = project_id.clone();
-            let authority_run_id = mutation_attempt(principal);
+            let authority_run_id = match principal {
+                Principal::Attempt(attempt) => Some(attempt.run_id.clone()),
+                Principal::Operator => None,
+                Principal::Anonymous => unreachable!("anonymous assignment was authorized"),
+            };
             let task = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, authority_run_id.as_ref())?;
-                    let (task, event) =
-                        store.assign_task(&project_id, &task_id, agent_id.as_ref(), now_ms()?)?;
+                    let (task, event) = if let Some(run_id) = authority_run_id {
+                        store.assign_task_as_attempt(
+                            &run_id,
+                            &project_id,
+                            &task_id,
+                            agent_id.as_ref(),
+                            now_ms()?,
+                        )?
+                    } else {
+                        store.assign_task(&project_id, &task_id, agent_id.as_ref(), now_ms()?)?
+                    };
                     Ok((task, vec![event]))
                 })
                 .await?;
@@ -1445,7 +1519,7 @@ async fn handle_request(
             let authority_run_id = attempt.run_id.clone();
             let budget_denied = state
                 .commit_and_publish(move |store| {
-                    verify_mutation_attempt(store, Some(&authority_run_id))?;
+                    verify_mutation_attempt(store, &authority_run_id)?;
                     let (_, denied, event) =
                         store.observe_tool_call(&project_id, &agent_id, now_ms()?)?;
                     Ok((denied, vec![event]))
