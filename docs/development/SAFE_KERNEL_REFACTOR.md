@@ -245,8 +245,14 @@ the exact-head local/hosted gates and independent adversarial review pass.
   process path. Register every process, group, runner, runtime root, temporary
   root, and disposable job used by attempt execution.
 - [x] Add the blocked-child launch handshake. Declare intent, fork without
-  provider execution, persist PID/PGID/birth fingerprint and resource state,
-  move the run to `running`, then release the child to `exec`.
+  runner execution, persist the stable runner PID, then release that gate into
+  the runner. Repeat the parent-bound gate for the provider, persist
+  PID/PGID/birth fingerprint and resource state, move the run to `running`,
+  then release the provider child to `exec`.
+- [x] Persist a random logical runtime claim and claim-derived path before
+  `mkdir`, then replace it with the exact device/inode before writing any
+  credential or configuration. Crash recovery can quarantine and reap either
+  the claimed pre-bind root or the exact bound root.
 - [x] Replace caller-selected complete/block/cancel operations with the exact
   outcome contract above. The first durable transition to `finalizing` wins.
 - [x] Make one finalizer the sole writer of terminal run/task state and resume
@@ -283,6 +289,9 @@ Stage checkpoint:
   execution is absent until Stage 2 can bind it to an exact Change.
 - Spawn failure, provider exit, success, block, and cancellation all converge
   through `finalizing`; restart resumes the same finalizer.
+- The isolated shell smoke kills `factoryd` during a running attempt, restarts
+  the same temporary home, and proves the exact runner, task, and runtime root
+  converge without a second provider launch.
 - No successor run is admitted until the earlier run is terminal.
 - Reused PID, job, path, or runner identities are refused rather than killed or
   deleted.

@@ -10,7 +10,7 @@ CREATE TABLE changes (
     branch TEXT CHECK (
         branch IS NULL OR length(CAST(branch AS BLOB)) BETWEEN 1 AND 255
     ),
-    worktree TEXT NOT NULL UNIQUE CHECK (
+    worktree TEXT NOT NULL CHECK (
         length(CAST(worktree AS BLOB)) BETWEEN 1 AND 4096
         AND substr(worktree, 1, 1) = '/'
     ),
@@ -43,7 +43,7 @@ INSERT INTO changes (
 )
 SELECT
     'legacy-agent-' || id, project_id, NULL, NULL, NULL, worktree,
-    updated_at_ms, 'retained legacy agent worktree from schema 29',
+    updated_at_ms, 'retained legacy agent source path from schema 29',
     created_at_ms, updated_at_ms
 FROM agents
 WHERE worktree IS NOT NULL;
@@ -153,12 +153,20 @@ SELECT
     'terminal',
     CASE r.status
         WHEN 'succeeded' THEN 'succeeded'
-        WHEN 'stopped' THEN 'cancelled'
+        WHEN 'blocked' THEN 'blocked'
+        WHEN 'stopped' THEN CASE r.closed_by
+            WHEN 'task_blocked' THEN 'blocked'
+            ELSE 'cancelled'
+        END
         ELSE 'failed'
     END,
     CASE r.status
         WHEN 'succeeded' THEN NULL
-        WHEN 'stopped' THEN COALESCE(r.closed_by, 'legacy stop')
+        WHEN 'blocked' THEN COALESCE(t.blocked_reason, 'legacy block')
+        WHEN 'stopped' THEN CASE r.closed_by
+            WHEN 'task_blocked' THEN COALESCE(t.blocked_reason, 'legacy block')
+            ELSE COALESCE(r.closed_by, 'legacy stop')
+        END
         ELSE COALESCE(r.failure_reason, r.closed_by, 'unverifiable')
     END,
     NULL, NULL,
@@ -170,7 +178,7 @@ SELECT
     NULL, NULL, s.runner_protocol_version,
     0, NULL, NULL,
     r.stop_requested_at_ms, r.started_at_ms, r.started_at_ms, r.status_since_ms,
-    r.status_since_ms, r.updated_at_ms, r.ended_at_ms, s.exit_code, s.exit_signal
+    r.status_since_ms, r.updated_at_ms, r.ended_at_ms, NULL, NULL
 FROM runs r
 JOIN agents a ON a.id = r.agent_id AND a.project_id = r.project_id
 JOIN tasks t ON t.id = r.task_id AND t.project_id = r.project_id

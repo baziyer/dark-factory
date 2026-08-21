@@ -374,6 +374,8 @@ pub enum StoreError {
     InvalidHookToken,
     #[error("run is not in the required state")]
     InvalidRunState,
+    #[error("attempt already has a different terminal outcome")]
+    AttemptOutcomeConflict,
     #[error("private execution metadata is empty, relative, or too large")]
     InvalidExecutionMetadata,
     #[error("webhook input is invalid")]
@@ -3990,10 +3992,42 @@ mod tests {
         store
             .connection
             .execute(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES ('project-2', 'Other project', '/tmp/project-2', 1, 1)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
                 "INSERT INTO agents (
-                    id, project_id, role, provider, paused, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, 'worker', 'shell', 0, 2, 2)",
+                    id, project_id, role, provider, paused, worktree,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('worker-3', 'project-2', 'worker', 'shell', 0,
+                           '/tmp/shared-legacy-source', 2, 2)",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents (
+                    id, project_id, role, provider, paused, worktree,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'worker', 'shell', 0,
+                           '/tmp/shared-legacy-source', 2, 2)",
                 params![agent_id.as_str(), project_id.as_str()],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO agents (
+                    id, project_id, role, provider, paused, worktree,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ('worker-2', ?1, 'worker', 'shell', 0,
+                           '/tmp/shared-legacy-source', 2, 2)",
+                params![project_id.as_str()],
             )
             .unwrap();
         for (task_id, now_ms) in [(&first_task_id, 3), (&second_task_id, 4)] {
@@ -4012,6 +4046,38 @@ mod tests {
                         agent_id.as_str(),
                         format!("Task {now_ms}"),
                         now_ms,
+                        format!("incarnation-{now_ms}"),
+                    ],
+                )
+                .unwrap();
+        }
+        for (task_id, status, blocked_reason, now_ms) in [
+            (
+                "task-blocked",
+                "blocked",
+                Some("needs operator input"),
+                5_i64,
+            ),
+            ("task-cancelled", "cancelled", None, 6_i64),
+            ("task-failed", "failed", None, 7_i64),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO tasks (
+                        id, project_id, assigned_agent_id, title, body, status,
+                        priority, created_at_ms, updated_at_ms, completed_at_ms,
+                        blocked_reason, incarnation_id, work_revision
+                     ) VALUES (?1, ?2, ?3, ?4, 'body', ?5,
+                               1, ?6, 20, 20, ?7, ?8, 0)",
+                    params![
+                        task_id,
+                        project_id.as_str(),
+                        agent_id.as_str(),
+                        format!("Task {now_ms}"),
+                        status,
+                        now_ms,
+                        blocked_reason,
                         format!("incarnation-{now_ms}"),
                     ],
                 )
@@ -4056,6 +4122,57 @@ mod tests {
                         task_id.as_str(),
                         started_at_ms,
                         started_at_ms + 1,
+                    ],
+                )
+                .unwrap();
+        }
+        for (run_id, task_id, status, closed_by, failure_reason, started_at_ms) in [
+            (
+                "run-blocked",
+                "task-blocked",
+                "stopped",
+                "task_blocked",
+                None,
+                11_i64,
+            ),
+            (
+                "run-cancelled",
+                "task-cancelled",
+                "stopped",
+                "operator_cancel",
+                None,
+                13_i64,
+            ),
+            (
+                "run-failed",
+                "task-failed",
+                "failed",
+                "session_ended",
+                Some("provider"),
+                15_i64,
+            ),
+        ] {
+            store
+                .connection
+                .execute(
+                    "INSERT INTO runs (
+                        id, project_id, agent_id, session_id, task_id, status,
+                        worktree, started_at_ms, status_since_ms, updated_at_ms,
+                        ended_at_ms, closed_by, failure_reason
+                     ) VALUES (
+                        ?1, ?2, ?3, 'session-1', ?4, ?5,
+                        '/tmp/legacy-worker', ?6, ?7, ?7, ?7, ?8, ?9
+                     )",
+                    params![
+                        run_id,
+                        project_id.as_str(),
+                        agent_id.as_str(),
+                        task_id,
+                        status,
+                        started_at_ms,
+                        started_at_ms + 1,
+                        closed_by,
+                        failure_reason,
                     ],
                 )
                 .unwrap();
@@ -4154,7 +4271,82 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(migrated, (2, 2));
+        assert_eq!(migrated, (5, 5));
+    }
+
+    #[test]
+    fn kernel_migration_preserves_legacy_block_cancel_and_failure_semantics() {
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        migrate(&mut store.connection).unwrap();
+
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT id, outcome, outcome_detail, exit_code, exit_signal
+                 FROM runs
+                 WHERE id IN ('run-blocked', 'run-cancelled', 'run-failed')
+                 ORDER BY id",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "run-blocked".to_owned(),
+                    "blocked".to_owned(),
+                    Some("needs operator input".to_owned()),
+                    None,
+                    None,
+                ),
+                (
+                    "run-cancelled".to_owned(),
+                    "cancelled".to_owned(),
+                    Some("operator_cancel".to_owned()),
+                    None,
+                    None,
+                ),
+                (
+                    "run-failed".to_owned(),
+                    "failed".to_owned(),
+                    Some("provider".to_owned()),
+                    None,
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn kernel_migration_preserves_every_shared_legacy_source_association() {
+        let mut store = schema_29_with_two_terminal_runs_and_legacy_event();
+        migrate(&mut store.connection).unwrap();
+
+        let migrated: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*),
+                        COUNT(*) FILTER (WHERE project_id = 'project-1'),
+                        COUNT(*) FILTER (WHERE project_id = 'project-2')
+                 FROM changes
+                 WHERE worktree = '/tmp/shared-legacy-source'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(migrated, (3, 2, 1));
     }
 
     #[test]

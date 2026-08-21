@@ -2,9 +2,9 @@
 set -eu
 
 # A short, provider-free contributor check for Ubuntu. The workspace tests
-# exercise the deeper PTY/restart/attach lifecycle; this script proves that a
-# fresh source checkout can bring up the real binaries and complete one task
-# through the public CLI and shell-provider boundary.
+# exercise the deeper attempt/resource lifecycle; this script proves that a
+# fresh source checkout can bring up the real binaries and complete one
+# orchestrator task through the public CLI and one-shot shell provider.
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 target_root=${CARGO_TARGET_DIR:-"$repo_root/target"}
@@ -12,7 +12,6 @@ bin_dir="$target_root/debug"
 factoryd="$bin_dir/factoryd"
 factoryctl="$bin_dir/factoryctl"
 factory_tui="$bin_dir/factory-tui"
-fixture="$repo_root/crates/factoryd/tests/fixtures/shell-agent.sh"
 
 for binary in "$factoryd" "$factoryctl" "$factory_tui"; do
     test -x "$binary" || {
@@ -20,7 +19,6 @@ for binary in "$factoryd" "$factoryctl" "$factory_tui"; do
         exit 1
     }
 done
-test -x "$fixture"
 
 if test -n "${DARK_FACTORY_SMOKE_ROOT:-}"; then
     scratch=$DARK_FACTORY_SMOKE_ROOT
@@ -32,85 +30,107 @@ if test -n "${DARK_FACTORY_SMOKE_ROOT:-}"; then
 else
     scratch=$(mktemp -d /tmp/dark-factory-linux-smoke.XXXXXX)
 fi
+scratch=$(CDPATH= cd -- "$scratch" && pwd -P)
 home="$scratch/home"
 repo="$scratch/repo"
 socket="$home/f.sock"
 mkdir -p "$home" "$repo" "$scratch/user"
 chmod 700 "$home" "$scratch/user"
-# A contributor may invoke this from inside an agent session. Do not let that
-# session's authenticated identity, outbox, or trusted helper leak into the
-# throwaway smoke; the daemon will supply fresh values to its shell session.
-unset DARK_FACTORY_AGENT DARK_FACTORY_PROJECT DARK_FACTORY_SESSION_TOKEN_FILE \
-    DARK_FACTORY_AGENT_DIR DARK_FACTORY_FACTORYCTL DARK_FACTORY_FORCE_OUTBOX
+# A contributor may invoke this from inside an attempt. Do not let that
+# attempt identity leak into the throwaway smoke; the daemon supplies a fresh
+# credential to its one-shot shell child.
+unset DARK_FACTORY_AGENT DARK_FACTORY_PROJECT DARK_FACTORY_ATTEMPT_TOKEN_FILE \
+    DARK_FACTORY_FACTORYCTL
 export DARK_FACTORY_HOME="$home"
 export DARK_FACTORY_SOCKET="$socket"
 export HOME="$scratch/user"
 
 daemon_pid=
-session_id=
+run_id=
 tracked_processes="$scratch/runner-processes"
+provider_launches="$scratch/provider-launches"
 
-session_list() {
-    "$factoryctl" --socket "$socket" session list \
-        --project linux-smoke-project --limit 100 >"$scratch/sessions.json"
+shell_quote() {
+    printf "'"
+    printf '%s' "$1" | sed "s/'/'\\\\''/g"
+    printf "'"
 }
 
-discover_session() {
-    session_list || return 1
-    sed 's/},{/\n/g' "$scratch/sessions.json" \
-        | grep -E '"state":"(starting|idle|working|waiting_for_input)"' \
+run_list() {
+    "$factoryctl" --socket "$socket" run list \
+        --project linux-smoke-project --limit 100 >"$scratch/runs.json"
+}
+
+discover_run() {
+    run_list || return 1
+    sed 's/},{/\n/g' "$scratch/runs.json" \
+        | grep -E '"phase":"(admitted|running|finalizing)"' \
         | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' \
         | tail -1
 }
 
-session_is_live() {
-    session_list || return 1
-    sed 's/},{/\n/g' "$scratch/sessions.json" \
-        | grep -F "\"id\":\"$session_id\"" \
-        | grep -Eq '"state":"(starting|idle|working|waiting_for_input)"'
+run_is_open() {
+    run_list || return 1
+    sed 's/},{/\n/g' "$scratch/runs.json" \
+        | grep -F "\"id\":\"$run_id\"" \
+        | grep -Eq '"phase":"(admitted|running|finalizing)"'
 }
 
-session_is_ready() {
-    session_list || return 1
-    sed 's/},{/\n/g' "$scratch/sessions.json" \
-        | grep -F "\"id\":\"$session_id\"" \
-        | grep -Eq '"state":"(idle|working|waiting_for_input)"'
+run_is_running() {
+    run_list || return 1
+    sed 's/},{/\n/g' "$scratch/runs.json" \
+        | grep -F "\"id\":\"$run_id\"" \
+        | grep -Eq '"phase":"running"'
 }
 
-wait_for_live_session() {
+wait_for_open_run() {
     attempt=0
-    while test -z "$session_id"; do
-        session_id=$(discover_session || true)
+    while test -z "$run_id"; do
+        run_id=$(discover_run || true)
         attempt=$((attempt + 1))
-        test -n "$session_id" || {
+        test -n "$run_id" || {
             test "$attempt" -lt 300 || {
-                cat "$scratch/sessions.json" >&2 2>/dev/null || true
-                echo "shell-provider session did not appear" >&2
+                cat "$scratch/runs.json" >&2 2>/dev/null || true
+                echo "shell-provider run did not appear" >&2
                 return 1
             }
             sleep 0.1
         }
     done
+}
+
+wait_for_running_run() {
+    wait_for_open_run
     attempt=0
-    while ! session_is_live; do
+    while ! run_is_running; do
         attempt=$((attempt + 1))
         test "$attempt" -lt 300 || {
-            cat "$scratch/sessions.json" >&2 2>/dev/null || true
-            echo "shell-provider session was not live" >&2
+            cat "$scratch/runs.json" >&2 2>/dev/null || true
+            cat "$scratch/factoryd.log" >&2 2>/dev/null || true
+            echo "shell-provider run did not become running" >&2
             return 1
         }
         sleep 0.1
     done
 }
 
-wait_for_ready_session() {
-    wait_for_live_session
+wait_for_provider_launch() {
     attempt=0
-    while ! session_is_ready; do
+    while :; do
+        launches=0
+        test ! -f "$provider_launches" \
+            || launches=$(wc -l <"$provider_launches" | tr -d '[:space:]')
+        test "$launches" = 1 && return 0
+        test "$launches" -lt 2 || {
+            cat "$provider_launches" >&2
+            echo "shell provider launched more than once before daemon crash" >&2
+            return 1
+        }
         attempt=$((attempt + 1))
         test "$attempt" -lt 300 || {
-            cat "$scratch/sessions.json" >&2 2>/dev/null || true
-            echo "shell-provider session did not become ready" >&2
+            cat "$provider_launches" >&2 2>/dev/null || true
+            cat "$scratch/factoryd.log" >&2 2>/dev/null || true
+            echo "shell provider did not record its exact launch" >&2
             return 1
         }
         sleep 0.1
@@ -158,7 +178,7 @@ wait_for_tracked_processes() {
         test -z "$survivor" && return 0
         attempt=$((attempt + 1))
         test "$attempt" -lt 100 || {
-            echo "scratch runner descendant survived session stop: $survivor" >&2
+            echo "scratch runner descendant survived run finalization: $survivor" >&2
             return 1
         }
         sleep 0.1
@@ -183,17 +203,17 @@ wait_for_pid_exit() {
     return 0
 }
 
-stop_owned_session() {
-    test -n "$session_id" || return 0
-    if session_is_live; then
-        "$factoryctl" --socket "$socket" session stop \
-            --project linux-smoke-project --session "$session_id" --grace-ms 1000 >/dev/null
+stop_owned_run() {
+    test -n "$run_id" || return 0
+    if run_is_open; then
+        "$factoryctl" --socket "$socket" run stop \
+            --project linux-smoke-project --run "$run_id" --grace-ms 1000 >/dev/null
     fi
     attempt=0
-    while session_is_live; do
+    while run_is_open; do
         attempt=$((attempt + 1))
         test "$attempt" -lt 100 || {
-            echo "owned smoke session did not close: $session_id" >&2
+            echo "owned smoke run did not become terminal: $run_id" >&2
             return 1
         }
         sleep 0.1
@@ -205,9 +225,9 @@ cleanup() {
     trap - EXIT HUP INT TERM
     cleanup_status=0
     if test -n "$daemon_pid" && kill -0 "$daemon_pid" 2>/dev/null; then
-        if test -n "$session_id"; then
+        if test -n "$run_id"; then
             snapshot_runner_processes || cleanup_status=1
-            stop_owned_session || cleanup_status=1
+            stop_owned_run || cleanup_status=1
             wait_for_tracked_processes || cleanup_status=1
             snapshot_runner_processes || cleanup_status=1
             test ! -s "$tracked_processes" || {
@@ -218,8 +238,8 @@ cleanup() {
         kill -TERM "$daemon_pid" 2>/dev/null || cleanup_status=1
         wait_for_pid_exit "$daemon_pid" factoryd || cleanup_status=1
         wait "$daemon_pid" 2>/dev/null || true
-    elif test -n "$session_id"; then
-        echo "factoryd exited before the owned session was stopped" >&2
+    elif test -n "$run_id"; then
+        echo "factoryd exited before the owned run was finalized" >&2
         cleanup_status=1
     fi
     if test -e "$socket"; then
@@ -237,6 +257,21 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+start_daemon() {
+    "$factoryd" --socket "$socket" >"$scratch/factoryd.log" 2>&1 &
+    daemon_pid=$!
+    attempt=0
+    while ! "$factoryctl" --socket "$socket" health >/dev/null 2>&1; do
+        attempt=$((attempt + 1))
+        test "$attempt" -lt 300 || {
+            cat "$scratch/factoryd.log" >&2
+            echo "factoryd did not become healthy" >&2
+            return 1
+        }
+        sleep 0.1
+    done
+}
+
 git -C "$repo" init -q -b main
 git -C "$repo" config user.email linux-smoke@example.invalid
 git -C "$repo" config user.name "Linux source smoke"
@@ -244,40 +279,40 @@ printf '%s\n' '# Linux source smoke' >"$repo/README.md"
 git -C "$repo" add README.md
 git -C "$repo" commit -q -m 'initialize Linux source smoke repository'
 
-"$factoryd" --socket "$socket" >"$scratch/factoryd.log" 2>&1 &
-daemon_pid=$!
+start_daemon
 
-attempt=0
-while ! "$factoryctl" --socket "$socket" health >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    test "$attempt" -lt 300 || {
-        cat "$scratch/factoryd.log" >&2
-        echo "factoryd did not become healthy" >&2
-        exit 1
-    }
-    sleep 0.1
-done
-
-socket_mode=$(stat -c '%a' "$socket")
+if socket_mode=$(stat -c '%a' "$socket" 2>/dev/null); then
+    :
+else
+    socket_mode=$(stat -f '%Lp' "$socket")
+fi
 test "$socket_mode" = 600 || {
     echo "expected private socket mode 600, got $socket_mode" >&2
     exit 1
 }
 
-# `--version` is the non-interactive source launch check for the TUI. The
-# interactive PTY/attach path is covered by the deterministic sessions suite.
+# `--version` is the non-interactive source launch check for the TUI.
 "$factory_tui" --version >/dev/null
 
-"$factoryctl" project add \
+if ! "$factoryctl" project add \
     --id linux-smoke-project \
     --name 'Linux source smoke' \
-    --root "$repo" >/dev/null
+    --root "$repo" >"$scratch/project-add.json"; then
+    cat "$scratch/project-add.json" >&2
+    exit 1
+fi
+if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
+    shell_command='sleep 30'
+else
+    launch_path=$(shell_quote "$provider_launches")
+    shell_command="printf '%s\\n' launch >> $launch_path; sleep 5; exec \"\$DARK_FACTORY_FACTORYCTL\" task done --result \"Linux source smoke complete\""
+fi
 "$factoryctl" agent add \
     --id linux-smoke-agent \
     --project linux-smoke-project \
-    --role worker \
+    --role orchestrator \
     --provider shell \
-    --model "$fixture" >/dev/null
+    --model "$shell_command" >/dev/null
 "$factoryctl" task add \
     --id linux-smoke-task \
     --project linux-smoke-project \
@@ -286,10 +321,20 @@ test "$socket_mode" = 600 || {
     --body 'Use the deterministic shell provider and report success.' >/dev/null
 
 if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
-    wait_for_ready_session
-    echo "intentional Linux smoke interruption after session admission" >&2
+    wait_for_open_run
+    echo "intentional Linux smoke interruption after run admission" >&2
     exit 23
 fi
+
+# Prove that a detached registered runner survives an abrupt daemon death and
+# that the same durable attempt is recovered and finalized after restart.
+wait_for_running_run
+wait_for_provider_launch
+snapshot_runner_processes
+kill -KILL "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+daemon_pid=
+start_daemon
 
 attempt=0
 while ! "$factoryctl" task get \
@@ -304,6 +349,31 @@ while ! "$factoryctl" task get \
     }
     sleep 0.1
 done
-wait_for_live_session
+wait_for_tracked_processes
+test "$(wc -l <"$provider_launches" | tr -d '[:space:]')" = 1 || {
+    cat "$provider_launches" >&2 2>/dev/null || true
+    echo "daemon restart replayed the provider launch" >&2
+    exit 1
+}
+run_list
+test "$(grep -o '"id":"[^"]*"' "$scratch/runs.json" | wc -l | tr -d '[:space:]')" = 1 \
+    && grep -Fq "\"id\":\"$run_id\"" "$scratch/runs.json" \
+    && grep -Fq '"phase":"terminal"' "$scratch/runs.json" \
+    && grep -Fq '"outcome":{"type":"succeeded"' "$scratch/runs.json" || {
+    cat "$scratch/runs.json" >&2
+    echo "daemon restart did not preserve one exact successful run" >&2
+    exit 1
+}
+snapshot_runner_processes
+test ! -s "$tracked_processes" || {
+    cat "$tracked_processes" >&2
+    echo "terminal task retained a daemon child" >&2
+    exit 1
+}
+test ! -d "$home/runs" || test -z "$(find "$home/runs" -mindepth 1 -print -quit)" || {
+    find "$home/runs" -mindepth 1 -maxdepth 2 -print >&2
+    echo "terminal task retained a runtime root" >&2
+    exit 1
+}
 
-echo "Linux source smoke passed: private socket, factoryd health, factory-tui, shell task, and owned session teardown"
+echo "Linux source smoke passed: private socket, daemon crash/restart recovery, one-shot shell task, and resource teardown"

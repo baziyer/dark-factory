@@ -17,7 +17,9 @@ use factory_core::{
     AgentId, AgentRole, ProjectId, Provider, RunFailureReason, RunId, RunPhase, RunnerInstanceId,
     TaskId, runner::RunnerEvent,
 };
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{
+    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -102,8 +104,6 @@ pub enum Error {
     Runtime { path: PathBuf, source: io::Error },
     #[error("process identity was unavailable for pid {0}")]
     ProcessIdentityUnavailable(u32),
-    #[error("runner process id was unavailable")]
-    RunnerPidUnavailable,
 }
 
 enum Command {
@@ -396,7 +396,9 @@ async fn start_run(
 ) -> Result<StartedProcess, Error> {
     let run_id = new_run_id()?;
     let runner_instance_id = new_runner_instance_id()?;
-    let runtime_dir = config.runtime_root.join(run_id.as_str());
+    let runtime_nonce = Uuid::new_v4().simple().to_string();
+    let runtime_claim = format!("runtime-claim:{runtime_nonce}");
+    let runtime_dir = config.runtime_root.join(&runtime_nonce);
     let policy_dir = runtime_dir.join("policy");
     let bearer = random_bearer();
     let digest = capability_digest(&bearer);
@@ -417,6 +419,7 @@ async fn start_run(
         agent_id: input.agent_id,
         expected_provider: provider,
         capability_digest: digest,
+        runtime_claim,
         runner_instance_id: runner_instance_id.clone(),
         runner_runtime: runtime_dir.to_string_lossy().into_owned(),
         max_active_runs: config.max_active_runs,
@@ -459,6 +462,7 @@ async fn launch_admitted(
         Err(error) => return Err((error, None, recovery)),
     };
     let register_runtime_run_id = admitted.run.id.clone();
+    let registered_runtime_claim = admitted.target.runtime_claim.clone();
     let runtime_registered_at_ms = match now_ms() {
         Ok(value) => value,
         Err(error) => return Err((error, None, recovery)),
@@ -468,6 +472,7 @@ async fn launch_admitted(
             store.register_admitted_runtime(
                 &register_runtime_run_id,
                 &runtime_locator,
+                &registered_runtime_claim,
                 &runtime_birth,
                 runtime_registered_at_ms,
             )?;
@@ -529,30 +534,27 @@ async fn launch_admitted(
         cwd: PathBuf::from(&admitted.target.worktree),
         startup_input: launch.startup_input,
     };
-    let child = match runner_process::spawn_runner(spec, CONNECT_GRACE).await {
-        Ok(child) => child,
+    let prepared_runner = match runner_process::prepare_runner(spec).await {
+        Ok(prepared) => prepared,
         Err(error) => return Err((error.into(), None, recovery)),
     };
-    let runner_pid = match child.id() {
-        Some(pid) => pid,
-        None => return Err((Error::RunnerPidUnavailable, Some(child), recovery)),
-    };
+    let runner_pid = prepared_runner.child_pid();
     let runner_locator = runner_locator(runner_pid, &admitted.target.runner_instance_id);
     let runner_birth = match process_birth_fingerprint(runner_pid) {
         Ok(Some(fingerprint)) => fingerprint,
         Ok(None) => {
             return Err((
                 Error::ProcessIdentityUnavailable(runner_pid),
-                Some(child),
+                None,
                 recovery,
             ));
         }
-        Err(error) => return Err((error, Some(child), recovery)),
+        Err(error) => return Err((error, None, recovery)),
     };
     let register_run_id = admitted.run.id.clone();
     let registered_at_ms = match now_ms() {
         Ok(value) => value,
-        Err(error) => return Err((error, Some(child), recovery)),
+        Err(error) => return Err((error, None, recovery)),
     };
     if let Err(error) = state
         .commit_and_publish(move |store| {
@@ -566,8 +568,12 @@ async fn launch_admitted(
         })
         .await
     {
-        return Err((error.into(), Some(child), recovery));
+        return Err((error.into(), None, recovery));
     }
+    let child = match prepared_runner.activate().await {
+        Ok(child) => child,
+        Err(error) => return Err((error.into(), None, recovery)),
+    };
     let client = RunnerClient::new(
         &runtime_dir,
         admitted.run.id.clone(),
@@ -1369,8 +1375,20 @@ async fn release_registered_runtime(
         mark_resource_unresolved(state, resource, "runtime locator does not match its run").await?;
         return Ok(());
     }
-    let quarantine = path.with_file_name(format!(".finalize-{}", run.run.id.as_str()));
-    match remove_runtime_if_exact(&path, &quarantine, resource.birth_fingerprint.as_deref()) {
+    let claim_nonce = resource
+        .birth_fingerprint
+        .as_deref()
+        .and_then(runtime_claim_nonce);
+    let quarantine = claim_nonce.map_or_else(
+        || path.with_file_name(format!(".finalize-{}", run.run.id.as_str())),
+        |nonce| path.with_file_name(format!(".finalize-{nonce}")),
+    );
+    let removal = if let Some(nonce) = claim_nonce {
+        remove_runtime_if_claimed(&path, &quarantine, nonce)
+    } else {
+        remove_runtime_if_exact(&path, &quarantine, resource.birth_fingerprint.as_deref())
+    };
+    match removal {
         Ok(RuntimeRemoval::Missing | RuntimeRemoval::Removed) => {
             release_resource(state, resource).await
         }
@@ -1387,6 +1405,34 @@ async fn release_registered_runtime(
         }
         Err(error) => mark_resource_unresolved(state, resource, &error.to_string()).await,
     }
+}
+
+fn runtime_claim_nonce(fingerprint: &str) -> Option<&str> {
+    let nonce = fingerprint.strip_prefix("runtime-claim:")?;
+    let parsed = Uuid::parse_str(nonce).ok()?;
+    (parsed.simple().to_string() == nonce).then_some(nonce)
+}
+
+fn remove_runtime_if_claimed(
+    path: &Path,
+    quarantine: &Path,
+    nonce: &str,
+) -> Result<RuntimeRemoval, Error> {
+    let expected_quarantine = format!(".finalize-{nonce}");
+    if path.file_name().and_then(|name| name.to_str()) != Some(nonce)
+        || quarantine.file_name().and_then(|name| name.to_str())
+            != Some(expected_quarantine.as_str())
+    {
+        return Ok(RuntimeRemoval::Unproven);
+    }
+    let current = match runtime_birth_fingerprint(path)? {
+        Some(fingerprint) => Some(fingerprint),
+        None => runtime_birth_fingerprint(quarantine)?,
+    };
+    let Some(current) = current else {
+        return Ok(RuntimeRemoval::Missing);
+    };
+    remove_runtime_if_exact(path, quarantine, Some(&current))
 }
 
 #[cfg(target_os = "linux")]
@@ -1539,13 +1585,16 @@ fn process_resource_absent(resource: &KernelResource) -> Result<bool, Error> {
         return Ok(false);
     };
     let current = process_birth_fingerprint(pid)?;
-    Ok(match current {
-        None => true,
-        Some(current) => resource
-            .birth_fingerprint
-            .as_deref()
-            .is_some_and(|expected| current != expected),
-    })
+    if current.is_none() {
+        return Ok(true);
+    }
+    #[cfg(target_os = "linux")]
+    return Ok(resource
+        .birth_fingerprint
+        .as_deref()
+        .is_some_and(|expected| current.as_deref() != Some(expected)));
+    #[cfg(not(target_os = "linux"))]
+    Ok(false)
 }
 
 fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
@@ -1557,7 +1606,11 @@ fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
     };
     match test_kill_process_group(pid) {
         Ok(()) | Err(rustix::io::Errno::PERM) => {
+            #[cfg(not(target_os = "linux"))]
+            return Ok(false);
+            #[cfg(target_os = "linux")]
             let current = process_birth_fingerprint(pgid)?;
+            #[cfg(target_os = "linux")]
             Ok(current.is_some() && current.as_deref() != resource.birth_fingerprint.as_deref())
         }
         Err(rustix::io::Errno::SRCH) => Ok(true),
@@ -1635,18 +1688,17 @@ fn process_birth_fingerprint(pid: u32) -> Result<Option<String>, Error> {
 
 #[cfg(not(target_os = "linux"))]
 fn process_birth_fingerprint(pid: u32) -> Result<Option<String>, Error> {
-    let output = std::process::Command::new("/bin/ps")
-        .args(["-o", "lstart=", "-p", &pid.to_string()])
-        .output()
-        .map_err(|source| Error::Runtime {
-            path: PathBuf::from("/bin/ps"),
-            source,
-        })?;
-    if !output.status.success() {
+    let Some(pid) = Pid::from_raw(pid as i32) else {
         return Ok(None);
+    };
+    match test_kill_process(pid) {
+        Ok(()) | Err(rustix::io::Errno::PERM) => Ok(Some("weak-presence-only".to_owned())),
+        Err(rustix::io::Errno::SRCH) => Ok(None),
+        Err(error) => Err(Error::Runtime {
+            path: PathBuf::from(format!("process:{pid}")),
+            source: io::Error::from_raw_os_error(error.raw_os_error()),
+        }),
     }
-    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    Ok((!value.is_empty()).then(|| format!("process-start:{value}")))
 }
 
 fn remove_runtime(path: &Path) -> Result<(), Error> {
@@ -1912,6 +1964,26 @@ mod tests {
         assert_eq!(locator_number("pid 42", "pid"), None);
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn weak_process_identity_mismatch_never_proves_absence() {
+        let resource = KernelResource {
+            id: "runner-resource".to_owned(),
+            run_id: RunId::try_from("run-1").unwrap(),
+            kind: KernelResourceKind::RunnerProcess,
+            state: KernelResourceState::Releasing,
+            locator: serde_json::json!({ "pid": std::process::id() }).to_string(),
+            birth_fingerprint: Some("different-weak-fingerprint".to_owned()),
+            retry_count: 0,
+            last_failure: None,
+            declared_at_ms: 1,
+            updated_at_ms: 1,
+            released_at_ms: None,
+        };
+
+        assert!(!process_resource_absent(&resource).unwrap());
+    }
+
     #[test]
     fn runtime_removal_refuses_a_replacement_inode() {
         let parent = private_tempdir();
@@ -1986,5 +2058,23 @@ mod tests {
         );
         assert!(!runtime.exists());
         assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn durable_claim_reaps_runtime_created_before_inode_binding() {
+        let parent = private_tempdir();
+        let nonce = "22222222222242228222222222222222";
+        let runtime = parent.path().join(nonce);
+        let quarantine = parent.path().join(format!(".finalize-{nonce}"));
+        fs::DirBuilder::new()
+            .mode(PRIVATE_DIRECTORY_MODE)
+            .create(&runtime)
+            .unwrap();
+
+        assert_eq!(
+            remove_runtime_if_claimed(&runtime, &quarantine, nonce).unwrap(),
+            RuntimeRemoval::Removed
+        );
+        assert!(!runtime.exists());
     }
 }

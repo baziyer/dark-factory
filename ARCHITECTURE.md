@@ -74,14 +74,17 @@ Providers receive one `startup_input` on stdin; stdin then closes. There is no
 resident process, PTY attach surface, terminal input, delivery replay, or
 provider-process resume.
 
-Launch is a two-step handshake:
+Launch is one nested register-before-exec handshake:
 
-1. `factoryd` records the admitted run and declares its runtime and process
-   resources.
-2. `factory-runner` creates a child blocked before provider `exec` and reports
-   the stable PID and process group.
-3. `factoryd` persists those exact identities and moves the run to `running`.
-4. The runner releases the child to `exec`.
+1. `factoryd` records the admitted run with a random runtime claim. The
+   claim-derived path is durable before `mkdir`; its inode replaces the claim
+   before any credential, configuration, or process is created inside it.
+2. `factoryd` spawns an inert runner exec gate tied to the exact daemon parent,
+   persists its stable PID, then activates the same PID into `factory-runner`.
+3. The runner creates a second parent-bound child gate before provider `exec`
+   and reports the stable provider PID and process group.
+4. `factoryd` persists those identities and moves the run to `running`.
+5. The runner releases the child to provider `exec`.
 
 If preparation or activation fails, the run enters `finalizing`; a provider
 must never execute first and become durable later. The runner is a
@@ -91,7 +94,9 @@ The resource ledger records process, process group, runner, runtime root, and
 other external effects before use. Each record contains enough identity to
 refuse PID, path, or job-label reuse. Rust `Drop` and shell traps may accelerate
 cleanup, but correctness comes from the durable daemon finalizer, including
-after restart.
+after restart. On platforms without a stable process birth identity, a live or
+reused PID remains unresolved: weak presence can never authorize signalling or
+terminalization.
 
 ## Provider boundary
 
