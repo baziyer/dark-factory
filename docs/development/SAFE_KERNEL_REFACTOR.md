@@ -403,9 +403,10 @@ approval.
   and after each top-level test; mutation fails verification before any later
   test can launch.
 - [x] Prepare a content-addressed executable directory inside the run's
-  registered temporary root. Its manifest records source digest, `Cargo.lock`,
-  closed build configuration, toolchain identity, and each copied top-level
-  test executable. Re-verify exact identity and digest before path launch;
+  registered temporary root. Its manifest commits to the source (including
+  `Cargo.lock`), closed build configuration, toolchain identity, and each
+  copied top-level test executable. Re-verify exact identity and digest before
+  path launch;
   never launch a mutable `target/debug` or `target/release` top-level sibling.
   The snapshot is the test working directory; fixtures are not copied, doctests
   are excluded, and same-UID test code is not sandboxed.

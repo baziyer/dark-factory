@@ -1384,14 +1384,27 @@ async fn start_rust_completion(
             Ok((check, Vec::new()))
         })
         .await?;
+    let cache_key = check.cache_key.as_deref().ok_or(DaemonStateError::Store(
+        StoreError::InvalidRustBuildMetadata,
+    ))?;
+    let cache = match prepare_rust_cache(config, state, &check, cache_key).await {
+        Ok(cache) => cache,
+        Err(error) => return fail_claimed_rust_setup(config, state, &check, None, &error).await,
+    };
     if let Err(error) =
-        prepare_rust_worker_invocation(config, state, &check, &change, &temporary).await
+        prepare_rust_worker_invocation(config, &check, &change, &temporary, &cache).await
     {
-        return fail_claimed_rust_setup(config, state, &check, &error).await;
+        return fail_claimed_rust_setup(config, state, &check, Some(&cache), &error).await;
     }
 
-    let worker_result = run_rust_worker_effect(config, state, &check, &temporary.path).await?;
-    let persisted = persist_rust_worker_result(state, &check, worker_result).await;
+    let worker_result = match run_rust_worker_effect(config, state, &check, &temporary.path).await {
+        Ok(result) => result,
+        Err(error) => {
+            return fail_claimed_rust_setup(config, state, &check, Some(&cache), &error).await;
+        }
+    };
+    let persisted =
+        persist_measured_rust_worker_result(config, state, &check, &cache, worker_result).await;
     if persisted.is_ok() {
         release_completion_temporary_root(state, &check.run_id).await?;
     }
@@ -1400,18 +1413,14 @@ async fn start_rust_completion(
 
 async fn prepare_rust_worker_invocation(
     config: &Config,
-    state: &DaemonState,
     check: &RustCompletionCheck,
     change: &Change,
     temporary: &CompletionTemporaryRoot,
+    cache: &RustBuildCache,
 ) -> Result<(), Error> {
     let cargo = config.cargo_program.clone().ok_or(DaemonStateError::Store(
         StoreError::InvalidRustBuildMetadata,
     ))?;
-    let cache_key = check.cache_key.as_deref().ok_or(DaemonStateError::Store(
-        StoreError::InvalidRustBuildMetadata,
-    ))?;
-    let cache = prepare_rust_cache(config, state, check, cache_key).await?;
     let change_identity = rust_verify::ExactDirectoryIdentity {
         device: change.source_dev.ok_or(DaemonStateError::Store(
             StoreError::InvalidRustBuildMetadata,
@@ -1499,7 +1508,6 @@ async fn run_rust_worker_effect(
     let worker_result =
         wait_for_worker_result(&mut child, &result_path, RUST_VERIFICATION_TIMEOUT).await;
     terminate_effect_group(state, &check.run_id, Some(&mut child), &finish_path).await?;
-    remeasure_rust_cache(config, state, check).await?;
     match worker_result {
         Ok(result) => Ok(result),
         Err(error) => Ok(failed_worker_result(&error.to_string())),
@@ -1975,6 +1983,23 @@ async fn release_effect_resources(state: &DaemonState, run_id: &RunId) -> Result
     }
 }
 
+async fn persist_measured_rust_worker_result(
+    config: &Config,
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    cache: &RustBuildCache,
+    result: rust_verify::WorkerResult,
+) -> Result<(), Error> {
+    if let Err(error) = remeasure_rust_cache(config, state, check).await {
+        let failure = bounded_completion_failure(&format!(
+            "Rust cache could not be measured after its writer exited: {error}"
+        ));
+        fail_rust_completion(state, check, &failure).await?;
+        return begin_failed_rust_cache_reclaim(state, check, cache, &failure).await;
+    }
+    persist_rust_worker_result(state, check, result).await
+}
+
 async fn persist_rust_worker_result(
     state: &DaemonState,
     check: &RustCompletionCheck,
@@ -2060,15 +2085,51 @@ async fn fail_claimed_rust_setup(
     config: &Config,
     state: &DaemonState,
     check: &RustCompletionCheck,
+    cache: Option<&RustBuildCache>,
     error: &Error,
 ) -> Result<(), Error> {
-    let failure = match remeasure_rust_cache(config, state, check).await {
+    let measurement = remeasure_rust_cache(config, state, check).await;
+    let failure = bounded_completion_failure(&match &measurement {
         Ok(()) => error.to_string(),
         Err(measurement_error) => format!(
             "{error}; Rust cache could not be measured after setup failure: {measurement_error}"
         ),
-    };
-    fail_and_release_rust_setup(state, check, &failure).await
+    });
+    fail_rust_completion(state, check, &failure).await?;
+    if measurement.is_err()
+        && let Some(cache) = cache
+    {
+        begin_failed_rust_cache_reclaim(state, check, cache, &failure).await?;
+    }
+    release_completion_temporary_root(state, &check.run_id).await
+}
+
+async fn begin_failed_rust_cache_reclaim(
+    state: &DaemonState,
+    check: &RustCompletionCheck,
+    cache: &RustBuildCache,
+    failure: &str,
+) -> Result<(), Error> {
+    let run_id = check.run_id.clone();
+    let cache = cache.clone();
+    let failure = bounded_completion_failure(failure);
+    let at_ms = now_ms()?;
+    state
+        .commit_and_publish(move |store| {
+            let failed = store
+                .rust_completion_check(&run_id)?
+                .ok_or(StoreError::RustCompletionCheckNotFound)?;
+            store.begin_failed_rust_cache_reclaim(
+                &run_id,
+                failed.revision,
+                &cache,
+                &failure,
+                at_ms,
+            )?;
+            Ok(((), Vec::new()))
+        })
+        .await?;
+    Ok(())
 }
 
 fn bounded_completion_failure(failure: &str) -> String {
@@ -2096,10 +2157,17 @@ async fn recover_rust_completion(
             return fail_and_release_rust_setup(state, &check, &error.to_string()).await;
         }
     };
+    let cache_key = check.cache_key.as_deref().ok_or(DaemonStateError::Store(
+        StoreError::InvalidRustBuildMetadata,
+    ))?;
+    let cache = match prepare_rust_cache(config, state, &check, cache_key).await {
+        Ok(cache) => cache,
+        Err(error) => return fail_claimed_rust_setup(config, state, &check, None, &error).await,
+    };
     if let Err(error) =
-        prepare_rust_worker_invocation(config, state, &check, &change, &temporary).await
+        prepare_rust_worker_invocation(config, &check, &change, &temporary, &cache).await
     {
-        return fail_claimed_rust_setup(config, state, &check, &error).await;
+        return fail_claimed_rust_setup(config, state, &check, Some(&cache), &error).await;
     }
     let path = temporary.path;
     let resources = state
@@ -2125,11 +2193,6 @@ async fn recover_rust_completion(
         };
         terminate_effect_group(state, &check.run_id, None, &finish_path).await?;
     }
-    // A daemon crash may occur after the effect exits but before its resources
-    // are released. Whether or not recovery found an active resource above,
-    // restore the authoritative measured-byte state before consuming a result
-    // or starting the next bounded effect.
-    remeasure_rust_cache(config, state, &check).await?;
     let result_exists = result_path.try_exists().map_err(|source| Error::Runtime {
         path: result_path.clone(),
         source,
@@ -2143,9 +2206,15 @@ async fn recover_rust_completion(
             Err(error) => failed_worker_result(&error.to_string()),
         }
     } else {
-        run_rust_worker_effect(config, state, &check, &path).await?
+        match run_rust_worker_effect(config, state, &check, &path).await {
+            Ok(result) => result,
+            Err(error) => {
+                return fail_claimed_rust_setup(config, state, &check, Some(&cache), &error).await;
+            }
+        }
     };
-    let persisted = persist_rust_worker_result(state, &check, result).await;
+    let persisted =
+        persist_measured_rust_worker_result(config, state, &check, &cache, result).await;
     if persisted.is_ok() {
         release_completion_temporary_root(state, &check.run_id).await?;
     }
