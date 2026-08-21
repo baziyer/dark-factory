@@ -67,9 +67,10 @@ unmigrated Postgres journal makes readiness and delivery acknowledgement fail
 closed. The URL must bind its host, user, password, database, and TLS mode and
 authenticate as the provisioned `dark_factory_broker_runtime` role. The
 Marketplace owner `DATABASE_URL`, `DATABASE_URL_UNPOOLED`, `NEON_PROJECT_ID`,
-and all `PG*`/`POSTGRES_*` aliases must be absent from a deployment; their
-presence proves the owner integration remains connected and selects the fixed
-inactive router. The Vercel function also activates only when
+operator-only `DARK_FACTORY_NEON_API_KEY`, and all `PG*`/`POSTGRES_*` aliases
+must be absent from a deployment; their presence proves the owner integration
+remains connected and selects the fixed inactive router. The Vercel function
+also activates only when
 platform metadata sets `VERCEL_ENV=production`; preview, development, missing,
 and unknown values use the fixed inactive router even if credentials were
 accidentally scoped there.
@@ -79,24 +80,30 @@ The intended stable route is
 the adapter does not register that domain, deploy the service, configure an
 App, or activate a webhook. Production credentials are never shared with
 preview deployments; preview integration requires a distinct disposable App,
-secret, database, and activation contract. Migration and runtime-role
-provisioning happen explicitly before deployment, never at function cold start.
-The operator temporarily connects the Marketplace owner integration and pipes
-the restricted URL from `vercel env run -e production -- cargo run --locked
---bin provision-runtime` directly into `vercel env add
-DARK_FACTORY_BROKER_DATABASE_URL production --sensitive --force`. The
-provisioner reconnects with the derived restricted URL and runs the same
-readiness proof before emitting it. The operator then disconnects the
-integration, verifies every owner URL and alias is absent while the custom
-runtime setting remains, and only then deploys. Production is never deployed
-while owner credentials are attached. This is an operator deployment step, not provider or task authority
-to pull production configuration. Readiness verifies the exact migration,
+secret, database, and activation contract. Migration and runtime-role creation
+happen in a separate reviewed operation, never at function cold start. For an
+existing exact `NOLOGIN` runtime role, the resumable bootstrap in
+`control-plane/README.md` first audits the bound Neon project, role, schema,
+migration, and ACL contract, then retrieves the existing password through
+Neon's typed reveal endpoint. Only the documented unavailable response permits
+one explicit reset. The restricted URL is stored as a sensitive Vercel
+production variable before a separate activation-only command uses fresh
+verified owner connections, repeats the full audit, enables `LOGIN`, and
+verifies the restricted connection. Failures keep the URL stored and the owner
+integration attached, so the broker remains inactive and activation can be
+resumed without another reset. The operator revokes the temporary
+project-scoped Neon key, then disconnects the integration, verifies every owner
+URL and alias is absent while the custom runtime setting remains, and only then
+deploys after independent adversarial `ALLOW`. Production is never deployed
+while owner credentials are attached. This is an operator deployment step,
+not provider or task authority to pull production configuration. Readiness
+verifies the exact migration,
 schema and physical table identity, both primary-key conflict arbiters, fixed
 role/session settings, and catalog-exact least-privilege ACLs;
 it is a read-only structural and authority proof. The disposable and live
-Postgres gates prove rollback-only conflict behavior. The provisioner sends
-PostgreSQL only a client-derived SCRAM verifier, never the generated runtime
-password. Product webhook intake and operator/PWA projections
+Postgres gates prove rollback-only conflict behavior. Bootstrap SQL never
+contains the runtime password. Product webhook intake and operator/PWA
+projections
 keep separate routes, configuration, storage namespaces, and authentication
 even if they later share hardened HTTP or signature primitives.
 

@@ -35,8 +35,8 @@ name = "broker"
 path = "api/broker.rs"
 
 [[bin]]
-name = "provision-runtime"
-path = "tools/provision_runtime.rs"
+name = "runtime-bootstrap"
+path = "tools/runtime_bootstrap.rs"
 required-features = ["provision-runtime"]
 
 [profile.release]

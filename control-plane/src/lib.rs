@@ -4,6 +4,8 @@
 
 #[cfg(feature = "development-sqlite")]
 use std::path::Path;
+#[cfg(feature = "provision-runtime")]
+use std::{future::Future, time::Duration};
 
 use axum::{
     Router,
@@ -161,12 +163,33 @@ pub enum ProductionOpenError {
 pub enum ProvisionError {
     #[error("owner database configuration is unavailable")]
     Configuration,
-    #[error("control-plane runtime provisioning failed")]
+    #[error("control-plane runtime database audit failed")]
     Database,
-    #[error("Neon runtime credential reset was rejected")]
+    #[error("Neon runtime credential recovery was rejected")]
     Api,
+    #[error("Neon does not have a stored password for the runtime role")]
+    PasswordUnavailable,
     #[error("Neon runtime credential reset outcome is indeterminate")]
     IndeterminateReset,
+}
+
+#[cfg(feature = "provision-runtime")]
+pub struct RecoveredRuntimeCredential {
+    database_url: String,
+    reset_performed: bool,
+}
+
+#[cfg(feature = "provision-runtime")]
+impl RecoveredRuntimeCredential {
+    #[must_use]
+    pub fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    #[must_use]
+    pub const fn reset_was_performed(&self) -> bool {
+        self.reset_performed
+    }
 }
 
 #[cfg(feature = "development-sqlite")]
@@ -187,38 +210,72 @@ pub fn production_app_from_env() -> Router {
 }
 
 #[cfg(feature = "provision-runtime")]
-pub async fn provision_runtime_from_env() -> Result<String, ProvisionError> {
+pub async fn recover_runtime_credential_from_env(
+    reset_if_unavailable: bool,
+) -> Result<RecoveredRuntimeCredential, ProvisionError> {
     let owner_database_url =
         required_environment(DATABASE_URL_ENV).map_err(|_| ProvisionError::Configuration)?;
     let expected_project_id =
         required_environment(NEON_PROJECT_ID_ENV).map_err(|_| ProvisionError::Configuration)?;
     let api_key =
         required_environment(NEON_API_KEY_ENV).map_err(|_| ProvisionError::Configuration)?;
-    let preparation_pool =
+    let owner_pool =
         journal::neon_owner_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
     let api = neon::NeonApi::new(&api_key).map_err(map_neon_error)?;
-    let identity = journal::prepare_runtime(&preparation_pool, &expected_project_id)
+    let identity = journal::recover_runtime_identity(&owner_pool, &expected_project_id)
         .await
         .map_err(|_| ProvisionError::Database)?;
-    // Neon may terminate compute connections while rotating a role password.
-    // Close the preparation pool before the non-idempotent request, then make
-    // activation prove itself over a newly established verified connection.
-    preparation_pool.close().await;
-    let password = api
-        .reset_runtime_password(&identity)
+    owner_pool.close().await;
+    let recovered = api
+        .recover_runtime_password(&identity, reset_if_unavailable)
         .await
         .map_err(map_neon_error)?;
-    let activation_pool =
-        journal::neon_owner_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
-    journal::activate_runtime(&activation_pool, &identity)
-        .await
-        .map_err(|_| ProvisionError::Database)?;
+    let runtime_url = runtime_database_url(&owner_database_url, recovered.password())?;
+    Ok(RecoveredRuntimeCredential {
+        database_url: runtime_url,
+        reset_performed: matches!(recovered.source(), neon::PasswordSource::Reset),
+    })
+}
 
-    let runtime_url = runtime_database_url(&owner_database_url, &password)?;
-    journal::verify_runtime(&runtime_url)
-        .await
-        .map_err(|_| ProvisionError::Database)?;
-    Ok(runtime_url)
+#[cfg(feature = "provision-runtime")]
+const ACTIVATION_RETRY_DELAYS: [Duration; 8] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(8),
+    Duration::from_secs(8),
+    Duration::from_secs(8),
+    Duration::from_secs(8),
+];
+
+#[cfg(feature = "provision-runtime")]
+pub async fn activate_runtime_from_env() -> Result<(), ProvisionError> {
+    let owner_database_url =
+        required_environment(DATABASE_URL_ENV).map_err(|_| ProvisionError::Configuration)?;
+    let expected_project_id =
+        required_environment(NEON_PROJECT_ID_ENV).map_err(|_| ProvisionError::Configuration)?;
+    let runtime_database_url = required_environment(RUNTIME_DATABASE_URL_ENV)
+        .map_err(|_| ProvisionError::Configuration)?;
+    journal::neon_owner_pool(&owner_database_url)
+        .map_err(|_| ProvisionError::Configuration)?
+        .close()
+        .await;
+    if !runtime_url_matches_owner(&owner_database_url, &runtime_database_url) {
+        return Err(ProvisionError::Configuration);
+    }
+
+    retry_with_delays(&ACTIVATION_RETRY_DELAYS, || async {
+        let owner_pool = journal::neon_owner_pool(&owner_database_url)
+            .map_err(|_| ProvisionError::Configuration)?;
+        let activation = journal::activate_runtime(&owner_pool, &expected_project_id).await;
+        owner_pool.close().await;
+        activation.map_err(|_| ProvisionError::Database)?;
+        journal::verify_runtime(&runtime_database_url)
+            .await
+            .map_err(|_| ProvisionError::Database)
+    })
+    .await
 }
 
 #[cfg(feature = "provision-runtime")]
@@ -242,9 +299,54 @@ fn runtime_database_url(
 }
 
 #[cfg(feature = "provision-runtime")]
+fn runtime_url_matches_owner(owner_database_url: &str, runtime_database_url: &str) -> bool {
+    let (Ok(owner), Ok(runtime)) = (
+        Url::parse(owner_database_url),
+        Url::parse(runtime_database_url),
+    ) else {
+        return false;
+    };
+    let query = runtime.query_pairs().collect::<Vec<_>>();
+    runtime.scheme() == owner.scheme()
+        && runtime.host_str() == owner.host_str()
+        && runtime.port() == owner.port()
+        && runtime.path() == owner.path()
+        && runtime.fragment().is_none()
+        && runtime.username() == journal::RUNTIME_ROLE
+        && runtime
+            .password()
+            .is_some_and(|password| !password.is_empty())
+        && query == [("sslmode".into(), "verify-full".into())]
+}
+
+#[cfg(feature = "provision-runtime")]
+async fn retry_with_delays<T, Operation, Attempt>(
+    delays: &[Duration],
+    mut operation: Operation,
+) -> Result<T, ProvisionError>
+where
+    Operation: FnMut() -> Attempt,
+    Attempt: Future<Output = Result<T, ProvisionError>>,
+{
+    let mut delays = delays.iter();
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                let Some(delay) = delays.next() else {
+                    return Err(error);
+                };
+                tokio::time::sleep(*delay).await;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "provision-runtime")]
 const fn map_neon_error(error: neon::Error) -> ProvisionError {
     match error {
         neon::Error::Configuration => ProvisionError::Configuration,
+        neon::Error::PasswordUnavailable => ProvisionError::PasswordUnavailable,
         neon::Error::IndeterminateReset => ProvisionError::IndeterminateReset,
         neon::Error::Rejected => ProvisionError::Api,
     }
@@ -400,5 +502,39 @@ mod tests {
             parsed.query_pairs().collect::<Vec<_>>(),
             [("sslmode".into(), "verify-full".into())]
         );
+        assert!(runtime_url_matches_owner(
+            "postgresql://owner:owner-password@ep-example.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+            &url,
+        ));
+        assert!(!runtime_url_matches_owner(
+            "postgresql://owner:owner-password@ep-other.eu-west-2.aws.neon.tech/neondb?sslmode=require",
+            &url,
+        ));
+    }
+
+    #[cfg(feature = "provision-runtime")]
+    #[tokio::test]
+    async fn activation_retry_is_bounded_and_stops_after_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = AtomicUsize::new(0);
+        let result = retry_with_delays(&[Duration::ZERO, Duration::ZERO], || async {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            (attempt == 1)
+                .then_some("activated")
+                .ok_or(ProvisionError::Database)
+        })
+        .await;
+        assert_eq!(result, Ok("activated"));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let attempts = AtomicUsize::new(0);
+        let result = retry_with_delays(&[Duration::ZERO, Duration::ZERO], || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(ProvisionError::Database)
+        })
+        .await;
+        assert_eq!(result, Err(ProvisionError::Database));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
     }
 }

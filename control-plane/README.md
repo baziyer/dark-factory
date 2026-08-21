@@ -77,83 +77,94 @@ and separately reviewed activation contract rather than borrowing production
 values. Do not put values in `.env.example`, commit an `.env` file, pull them
 into an agent worktree, or store them in a provider process or macOS Keychain.
 
-Provision the dedicated empty Neon PostgreSQL 17-or-newer database before the
-first deployment. Keep Neon's optional Data API disabled. For production
-project `withered-mouse-49434395`, create a temporary project-scoped API key;
-never use a general personal or organization-wide key. Temporarily connect the
-Vercel Marketplace database so its owner `DATABASE_URL` and `NEON_PROJECT_ID`
-are available only to the operator command.
+The recovery bootstrap expects the checked migration, exact ACLs, and fixed
+`dark_factory_broker_runtime` role to exist already, with the role `NOLOGIN`.
+It deliberately cannot create or normalize a role, apply a migration, or put a
+password in SQL. A fresh database bootstrap or future migration is a separate
+reviewed operation. Keep Neon's optional Data API disabled.
 
-Build the provisioner before putting the key in any process environment:
+Build the optional bootstrap binary before putting a Neon key in any process:
 
 ```sh
-cargo build --locked --release --features provision-runtime --bin provision-runtime
+cargo build --locked --release --features provision-runtime --bin runtime-bootstrap
 ```
 
-On macOS, then copy the temporary key to the clipboard and run this one shell
-invocation from the trusted linked `control-plane/` project. The command text
-contains no credential: only the provisioner child receives the key, the
-generated database URL moves through the pipe without being printed, and an
-exit trap clears the clipboard on success or failure.
+For production project `withered-mouse-49434395`, create one temporary
+project-scoped API key only after the code and release binary have passed
+independent review. Never use a personal or organization-wide key. Keep the
+Vercel Marketplace integration connected so its owner `DATABASE_URL` and
+`NEON_PROJECT_ID` keep every broker deployment inactive. Copy the temporary
+key to the macOS clipboard, then stage the existing restricted credential:
 
 ```sh
 DARK_FACTORY_VERCEL_GLOBAL_CONFIG=/absolute/path/to/isolated-vercel-config \
 DARK_FACTORY_VERCEL_PROJECT_DIR=/absolute/path/to/linked-control-plane \
-  ./scripts/provision-production.sh
+  ./scripts/bootstrap-production.sh stage
 ```
 
-Both paths are mandatory. The script rejects any `.env*` file in the linked
-project and invokes both Vercel processes from an empty environment containing
-only `PATH` and `TMPDIR`. It passes the isolated paths to Vercel's
-`--global-config` and `--cwd` flags and refuses to fall back to ambient or
-Keychain authentication.
+The stage transaction takes an advisory lock and proves the exact Neon project
+and branch, provider role, runtime role with `NOLOGIN`, membership, schema,
+tables, constraints, migration record, default privileges, and ACLs. It then
+confirms the exact role through Neon and calls the typed
+`GET .../roles/dark_factory_broker_runtime/reveal_password` endpoint. A `200`
+password is used without a reset. HTTP `412` is the only unavailable response;
+the command fails with a fixed message and does not reset. Every other response
+also fails closed.
 
-Immediately revoke the temporary Neon key after every bootstrap attempt,
-whether it succeeds or fails. Do not add it to Vercel, an `.env` file, shell
-history, Dark Factory state, an agent prompt, or the macOS Keychain. A later
-rotation or explicit recovery from an indeterminate reset uses a newly created
-temporary project-scoped key and revokes it again after that one attempt.
+Only after that exact `412`, the explicit fallback permits one reset:
 
-The optional provisioner is not linked into the default broker binary. It
-first rejects any owner URL whose host is not a strict `.neon.tech` name, and
-every SQLx connection is upgraded to certificate and hostname verification.
+```sh
+DARK_FACTORY_VERCEL_GLOBAL_CONFIG=/absolute/path/to/isolated-vercel-config \
+DARK_FACTORY_VERCEL_PROJECT_DIR=/absolute/path/to/linked-control-plane \
+  ./scripts/bootstrap-production.sh stage --reset-if-unavailable
+```
+
+The flag does not force a reset: reveal still runs first. If reveal remains
+unavailable, exactly one non-idempotent reset `POST` is sent and never retried.
+As soon as its exact role and password response is accepted, the restricted URL
+moves directly through a pipe into the sensitive production-scoped
+`DARK_FACTORY_BROKER_DATABASE_URL`; reset operation polling cannot discard the
+only returned password. Stage never enables `LOGIN`, disconnects the owner
+integration, or deploys. A reset transport failure, any non-success response,
+or malformed success is indeterminate and requires an operator decision; it is
+never hidden behind another automatic reset.
+
+Both isolation paths are mandatory absolute directories. The helper rejects
+any `.env*` file in the linked project and invokes every Vercel command from an
+empty environment containing only `PATH` and `TMPDIR`, with explicit
+`--global-config` and `--cwd`. Only the bootstrap child sees the clipboard key.
+An exit trap clears the clipboard on success or failure and always reminds the
+operator to revoke the key. Revoke it immediately after every stage attempt;
+the helper cannot safely revoke a lost key without adding broader Neon
+authority. Never put the key in Vercel, a file, shell history, Dark Factory
+state, an agent prompt, an ambient provider CLI, or the macOS Keychain.
+
+After the sensitive URL is confirmed present by name only, activate without a
+Neon key:
+
+```sh
+DARK_FACTORY_VERCEL_GLOBAL_CONFIG=/absolute/path/to/isolated-vercel-config \
+DARK_FACTORY_VERCEL_PROJECT_DIR=/absolute/path/to/linked-control-plane \
+  ./scripts/bootstrap-production.sh activate
+```
+
+Activation obtains both URLs in memory through isolated `vercel env run`; it
+never prints, pulls, or writes either value. It rejects a restricted URL whose
+scheme, Neon host, port, database, fixed role, or exact `sslmode=verify-full`
+does not match the owner URL. Each bounded attempt creates a fresh owner pool
+whose connections use certificate and hostname verification, validates the
+exact provider identity, removes any provider database ACL restored by Neon,
+and repeats the full role/schema/ACL/migration audit. Only then does it enable
+`LOGIN`. It accepts an already-`LOGIN` exact role so a crash after commit is
+resumable, then verifies the restricted connection. Nine attempts span 47
+seconds; a later activation-only rerun is safe and uses the Vercel-stored URL.
+Any failure leaves the URL stored and the broker inactive because the owner
+integration remains connected.
+
 Marketplace `channel_binding=require` input is tolerated but is not copied to
-the result because SQLx 0.8 does not enforce it. The emitted runtime URL uses
-`sslmode=verify-full` only.
-
-Under one database transaction and advisory lock, the provisioner binds the
-connection's `neon.project_id` and `neon.branch_id`, requires the project to
-equal `NEON_PROJECT_ID`, applies the checked migration, creates or normalizes
-only `dark_factory_broker_runtime` as `NOLOGIN PASSWORD NULL`, resets its
-session defaults, and normalizes the database/schema/table ACLs. Neon's
-provider-managed database grant to `neon_superuser` is revoked only after the
-bound Neon connection proves the project's exact provider-role attributes and
-the database owner's direct, non-admin, `cloud_admin`-granted membership in it;
-the managed role must have Neon's observed `NULL` validity rather than the
-runtime role's explicit `infinity` validity. The runtime readiness contract is
-not widened to accept the provider grant.
-PostgreSQL's required creator management grant is accepted only when it names
-the current database owner, has `ADMIN`, and has neither `SET` nor `INHERIT`.
-
-Only after that fail-closed commit does the operator-only adapter use the fixed
-Neon API host. It first confirms that the exact role is visible on the bound
-project and branch, issues exactly one password-reset `POST`, and polls the
-typed operations at a bounded rate. Redirects are disabled and all requests
-have bounded timeouts. The `POST` is never automatically retried: a transport
-failure, server error, malformed success, or any later operation poll failure
-or timeout is indeterminate because Neon may have changed the password without
-returning a usable result. Rerun only as an explicit operator recovery
-decision. After successful operations, a fresh owner pool re-audits the
-exact role, membership, schema, tables, constraints, ACLs, default ACLs, and
-migration record in one transaction while the role is still `NOLOGIN`. The
-preparation pool is closed before the reset and activation uses a fresh owner
-pool, so a provider-side connection reset cannot reuse a stale socket. Because
-Neon's reset operation can restore the managed `neon_superuser` database ACL,
-activation repeats the same exact provider-role gate and revoke before that
-full audit. Only then does it enable `LOGIN` without putting a secret in SQL
-and prove runtime readiness through the generated URL. Fixed stderr never
-contains API bodies, keys, passwords, or URLs; stdout contains only the proven
-restricted URL.
+the restricted URL because SQLx 0.8 does not enforce it. Every SQLx connection
+is upgraded independently to `VerifyFull`. Fixed stderr never contains API
+bodies, keys, passwords, or URLs.
 
 The schema audit pins every ordered column's type, default, and `attnotnull`
 value directly. Explicit check and primary-key constraints are compared
@@ -164,18 +175,18 @@ non-inherited, single-column attribute-number set. This catches invalid or
 drifted `NOT NULL` constraints without depending on their version-specific
 catalog representation.
 
-Next disconnect the Marketplace integration before any deployment. Confirm
+Only after independent adversarial `ALLOW`, disconnect the Marketplace
+integration before any deployment. Confirm
 with `vercel env ls production` that `DATABASE_URL`,
 `DATABASE_URL_UNPOOLED`, `NEON_PROJECT_ID`, `DARK_FACTORY_NEON_API_KEY`, and
 every `PG*`/`POSTGRES_*` alias are gone. The custom
 `DARK_FACTORY_BROKER_DATABASE_URL` added by the pipe must remain. Do not
 display or pull its value.
 
-Never deploy while the owner integration is connected. Future migrations use
-the same connect, provision/rotate, disconnect, replace-runtime-URL, deploy
-sequence; rotating the role before replacing the deployed URL creates a brief
-intentional maintenance interval. These are operator deployment commands, not
-authority for an agent task to fetch or store production configuration.
+Never deploy while the owner integration is connected. Future migrations need
+a separately reviewed connect, migrate, recover/rotate, activate, disconnect,
+and deploy sequence. These are operator deployment commands, not authority for
+an unrelated agent task to fetch or store production configuration.
 
 Then create a production deployment with the four runtime settings.
 `/readyz` performs a read-only verification of the exact migration digest,
@@ -205,7 +216,7 @@ cargo clippy --locked --all-targets --features development-sqlite -- -D warnings
 cargo test --locked --features provision-runtime
 cargo fmt --all -- --check
 cargo build --locked --release --bin broker
-cargo build --locked --release --features provision-runtime --bin provision-runtime
+cargo build --locked --release --features provision-runtime --bin runtime-bootstrap
 ```
 
 The destructive authority/schema lane is intentionally opt-in because it

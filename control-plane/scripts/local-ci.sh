@@ -17,9 +17,9 @@ cargo +1.88.0 test --locked --all-targets
 cargo +1.88.0 test --locked --all-targets --features development-sqlite
 
 # The Neon management API client exists only in the explicit operator
-# provisioner feature. Its typed protocol tests never call the live API.
+# bootstrap feature. Its typed protocol tests never call the live API.
 cargo +1.88.0 test --locked --all-targets --features provision-runtime
-zsh -n scripts/provision-production.sh
+zsh -n scripts/bootstrap-production.sh
 
 for ignore_file in .gitignore .vercelignore; do
     for pattern in .env '.env.*' '!.env.example' '.vercel/'; do

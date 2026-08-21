@@ -38,9 +38,6 @@ pub(crate) enum Error {
     #[error("runtime database role has unexpected memberships or ownership")]
     RuntimeRoleDrift,
     #[cfg(feature = "provision-runtime")]
-    #[error("PostgreSQL 17 or newer is required")]
-    UnsupportedPostgres,
-    #[cfg(feature = "provision-runtime")]
     #[error("database is not the expected Neon project and branch")]
     InvalidNeonIdentity,
 }
@@ -229,75 +226,58 @@ pub(crate) async fn verify_runtime(database_url: &str) -> Result<(), Error> {
 }
 
 #[cfg(feature = "provision-runtime")]
-async fn migrate(transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), Error> {
-    let supported: bool =
-        sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 170000")
-            .fetch_one(&mut **transaction)
-            .await?;
-    if !supported {
-        return Err(Error::UnsupportedPostgres);
-    }
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS public.dark_factory_schema_migrations (
-            component TEXT NOT NULL,
-            revision TEXT NOT NULL,
-            digest TEXT NOT NULL,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            CONSTRAINT dark_factory_schema_migrations_pkey PRIMARY KEY (component),
-            CONSTRAINT dark_factory_schema_migrations_digest_format
-                CHECK (digest ~ '^[0-9a-f]{64}$')
-        )",
-    )
-    .execute(&mut **transaction)
-    .await?;
-    let existing = sqlx::query(
-        "SELECT revision, digest
-         FROM public.dark_factory_schema_migrations
-         WHERE component = $1",
-    )
-    .bind(MIGRATION_COMPONENT)
-    .fetch_optional(&mut **transaction)
-    .await?;
-    let digest = migration_digest();
-    if let Some(row) = existing {
-        let revision: String = row.try_get("revision")?;
-        let stored_digest: String = row.try_get("digest")?;
-        if revision != MIGRATION_REVISION || stored_digest != digest {
-            return Err(Error::MigrationConflict);
-        }
-        return Ok(());
-    }
-
-    sqlx::raw_sql(MIGRATION_SQL)
-        .execute(&mut **transaction)
-        .await?;
-    sqlx::query(
-        "INSERT INTO public.dark_factory_schema_migrations (
-            component, revision, digest
-         ) VALUES ($1, $2, $3)",
-    )
-    .bind(MIGRATION_COMPONENT)
-    .bind(MIGRATION_REVISION)
-    .bind(digest)
-    .execute(&mut **transaction)
-    .await?;
-    Ok(())
-}
-
-#[cfg(feature = "provision-runtime")]
-pub(crate) async fn prepare_runtime(
+pub(crate) async fn recover_runtime_identity(
     pool: &PgPool,
     expected_project_id: &str,
 ) -> Result<NeonIdentity, Error> {
     let mut transaction = pool.begin().await?;
+    let identity = locked_runtime_identity(&mut transaction, expected_project_id).await?;
+    normalize_neon_provider_database_acl(&mut transaction).await?;
+    audit_runtime_before_login(&mut transaction, false).await?;
+    transaction.commit().await?;
+    Ok(identity)
+}
+
+#[cfg(feature = "provision-runtime")]
+pub(crate) async fn activate_runtime(
+    pool: &PgPool,
+    expected_project_id: &str,
+) -> Result<NeonIdentity, Error> {
+    let mut transaction = pool.begin().await?;
+    let identity = locked_runtime_identity(&mut transaction, expected_project_id).await?;
+    normalize_neon_provider_database_acl(&mut transaction).await?;
+    let runtime_can_login: bool = sqlx::query_scalar(
+        "SELECT rolcanlogin
+         FROM pg_catalog.pg_roles
+         WHERE rolname = $1",
+    )
+    .bind(RUNTIME_ROLE)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or(Error::RuntimeRoleDrift)?;
+    audit_runtime_before_login(&mut transaction, runtime_can_login).await?;
+    if !runtime_can_login {
+        sqlx::query("ALTER ROLE dark_factory_broker_runtime LOGIN")
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
+    Ok(identity)
+}
+
+#[cfg(feature = "provision-runtime")]
+async fn locked_runtime_identity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected_project_id: &str,
+) -> Result<NeonIdentity, Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(441684976339)")
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
     let (project_id, branch_id): (Option<String>, Option<String>) = sqlx::query_as(
         "SELECT current_setting('neon.project_id', true),
                 current_setting('neon.branch_id', true)",
     )
-    .fetch_one(&mut *transaction)
+    .fetch_one(&mut **transaction)
     .await?;
     let (Some(project_id), Some(branch_id)) = (project_id, branch_id) else {
         return Err(Error::InvalidNeonIdentity);
@@ -308,162 +288,6 @@ pub(crate) async fn prepare_runtime(
     {
         return Err(Error::InvalidNeonIdentity);
     }
-    migrate(&mut transaction).await?;
-    let owner: String = sqlx::query_scalar("SELECT current_user")
-        .fetch_one(&mut *transaction)
-        .await?;
-    if owner == RUNTIME_ROLE {
-        return Err(Error::RuntimeRoleDrift);
-    }
-
-    let existing_role = sqlx::query(
-        "SELECT rolcanlogin, rolinherit, rolsuper, rolcreatedb, rolcreaterole,
-                rolreplication, rolbypassrls,
-                pg_catalog.shobj_description(oid, 'pg_authid') AS comment
-         FROM pg_catalog.pg_roles
-         WHERE rolname = $1",
-    )
-    .bind(RUNTIME_ROLE)
-    .fetch_optional(&mut *transaction)
-    .await?;
-    if let Some(role) = existing_role {
-        let exact = !role.try_get::<bool, _>("rolinherit")?
-            && !role.try_get::<bool, _>("rolsuper")?
-            && !role.try_get::<bool, _>("rolcreatedb")?
-            && !role.try_get::<bool, _>("rolcreaterole")?
-            && !role.try_get::<bool, _>("rolreplication")?
-            && !role.try_get::<bool, _>("rolbypassrls")?
-            && role.try_get::<Option<String>, _>("comment")?.as_deref()
-                == Some(RUNTIME_ROLE_COMMENT);
-        if !exact {
-            return Err(Error::RuntimeRoleDrift);
-        }
-    } else {
-        let create_role: String = sqlx::query_scalar(
-            "SELECT format(
-                 'CREATE ROLE %I NOLOGIN NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L PASSWORD NULL',
-                 $1, 'infinity'
-             )",
-        )
-        .bind(RUNTIME_ROLE)
-        .fetch_one(&mut *transaction)
-        .await?;
-        sqlx::raw_sql(&create_role)
-            .execute(&mut *transaction)
-            .await?;
-        sqlx::raw_sql(
-            "COMMENT ON ROLE dark_factory_broker_runtime IS 'dark-factory-control-plane managed runtime role v1'",
-        )
-        .execute(&mut *transaction)
-        .await?;
-    }
-
-    let role_drift: bool = sqlx::query_scalar(
-        "WITH runtime AS (
-             SELECT oid
-             FROM pg_catalog.pg_roles
-             WHERE rolname = $1
-         ),
-         provisioning_owner AS (
-             SELECT oid
-             FROM pg_catalog.pg_roles
-             WHERE rolname = current_user
-         ),
-         database_row AS (
-             SELECT datdba
-             FROM pg_catalog.pg_database
-             WHERE datname = current_database()
-         )
-         SELECT provisioning_owner.oid <> database_row.datdba
-             OR (
-                 SELECT count(*)
-                 FROM pg_catalog.pg_auth_members membership
-                 WHERE membership.member = runtime.oid
-                    OR membership.roleid = runtime.oid
-             ) <> 1
-             OR NOT EXISTS (
-                 SELECT 1
-                 FROM pg_catalog.pg_auth_members membership
-                 WHERE membership.roleid = runtime.oid
-                   AND membership.member = provisioning_owner.oid
-                   AND membership.admin_option
-                   AND NOT membership.inherit_option
-                   AND NOT membership.set_option
-             )
-             OR EXISTS (
-                 SELECT 1
-                 FROM pg_catalog.pg_shdepend dependency
-                 WHERE dependency.refclassid = 'pg_authid'::regclass
-                   AND dependency.refobjid = runtime.oid
-                   AND dependency.deptype = 'o'
-             )
-         FROM runtime, provisioning_owner, database_row",
-    )
-    .bind(RUNTIME_ROLE)
-    .fetch_one(&mut *transaction)
-    .await?;
-    if role_drift {
-        return Err(Error::RuntimeRoleDrift);
-    }
-
-    let normalize_role: String = sqlx::query_scalar(
-        "SELECT format(
-             'ALTER ROLE %I RESET ALL; ALTER ROLE %I IN DATABASE %I RESET ALL; ALTER ROLE %I WITH NOLOGIN PASSWORD NULL NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L',
-             $1, $1, current_database(), $1, 'infinity'
-         )",
-    )
-    .bind(RUNTIME_ROLE)
-    .fetch_one(&mut *transaction)
-    .await?;
-    sqlx::raw_sql(&normalize_role)
-        .execute(&mut *transaction)
-        .await?;
-
-    normalize_neon_provider_database_acl(&mut transaction).await?;
-
-    let database_acl: String = sqlx::query_scalar(
-        "SELECT format(
-             'REVOKE CONNECT, TEMPORARY ON DATABASE %I FROM PUBLIC; REVOKE ALL ON DATABASE %I FROM dark_factory_broker_runtime; GRANT CONNECT ON DATABASE %I TO dark_factory_broker_runtime',
-             current_database(), current_database(), current_database()
-         )",
-    )
-    .fetch_one(&mut *transaction)
-    .await?;
-    sqlx::raw_sql(&database_acl)
-        .execute(&mut *transaction)
-        .await?;
-    let unexpected_public_functions: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1
-             FROM pg_catalog.pg_proc procedure
-             JOIN pg_catalog.pg_namespace namespace ON namespace.oid = procedure.pronamespace
-             WHERE namespace.nspname = 'public'
-         )",
-    )
-    .fetch_one(&mut *transaction)
-    .await?;
-    if unexpected_public_functions {
-        return Err(Error::RuntimeRoleDrift);
-    }
-
-    sqlx::raw_sql(
-        "REVOKE ALL ON SCHEMA public FROM PUBLIC;
-         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
-         REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
-         REVOKE ALL ON SCHEMA public FROM dark_factory_broker_runtime;
-         REVOKE ALL ON ALL TABLES IN SCHEMA public FROM dark_factory_broker_runtime;
-         REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM dark_factory_broker_runtime;
-         GRANT USAGE ON SCHEMA public TO dark_factory_broker_runtime;
-         GRANT SELECT, INSERT ON TABLE public.maintainer_deliveries TO dark_factory_broker_runtime;
-         GRANT SELECT ON TABLE public.dark_factory_schema_migrations TO dark_factory_broker_runtime;
-         ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM PUBLIC;
-         ALTER DEFAULT PRIVILEGES REVOKE ALL ON SEQUENCES FROM PUBLIC;
-         ALTER DEFAULT PRIVILEGES REVOKE ALL ON TABLES FROM dark_factory_broker_runtime;
-         ALTER DEFAULT PRIVILEGES REVOKE ALL ON SEQUENCES FROM dark_factory_broker_runtime",
-    )
-    .execute(&mut *transaction)
-    .await?;
-    transaction.commit().await?;
     Ok(NeonIdentity {
         project_id,
         branch_id,
@@ -471,34 +295,17 @@ pub(crate) async fn prepare_runtime(
 }
 
 #[cfg(feature = "provision-runtime")]
-pub(crate) async fn activate_runtime(pool: &PgPool, identity: &NeonIdentity) -> Result<(), Error> {
-    let mut transaction = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(441684976339)")
-        .execute(&mut *transaction)
-        .await?;
-    let (project_id, branch_id): (Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT current_setting('neon.project_id', true),
-                current_setting('neon.branch_id', true)",
-    )
-    .fetch_one(&mut *transaction)
-    .await?;
-    if project_id.as_deref() != Some(&identity.project_id)
-        || branch_id.as_deref() != Some(&identity.branch_id)
-    {
+async fn audit_runtime_before_login(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected_login: bool,
+) -> Result<(), Error> {
+    if !runtime_role_is_exact_for_activation(transaction, expected_login).await? {
         return Err(Error::RuntimeRoleDrift);
     }
-    normalize_neon_provider_database_acl(&mut transaction).await?;
-    if !runtime_role_is_exact_for_activation(&mut transaction).await? {
+    postgres_contract_is_exact(transaction, expected_login, false).await?;
+    if !default_privileges_are_exact(transaction).await? {
         return Err(Error::RuntimeRoleDrift);
     }
-    postgres_contract_is_exact(&mut transaction, false, false).await?;
-    if !default_privileges_are_exact(&mut transaction).await? {
-        return Err(Error::RuntimeRoleDrift);
-    }
-    sqlx::query("ALTER ROLE dark_factory_broker_runtime LOGIN")
-        .execute(&mut *transaction)
-        .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
@@ -565,6 +372,7 @@ const fn neon_provider_identity_is_expected(
 #[cfg(feature = "provision-runtime")]
 async fn runtime_role_is_exact_for_activation(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    expected_login: bool,
 ) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "WITH runtime AS (
@@ -581,7 +389,7 @@ async fn runtime_role_is_exact_for_activation(
          database_row AS (
              SELECT datdba FROM pg_catalog.pg_database WHERE datname = current_database()
          )
-         SELECT NOT runtime.rolcanlogin
+         SELECT runtime.rolcanlogin = $3
             AND NOT runtime.rolinherit
             AND NOT runtime.rolsuper
             AND NOT runtime.rolcreatedb
@@ -624,6 +432,7 @@ async fn runtime_role_is_exact_for_activation(
     )
     .bind(RUNTIME_ROLE)
     .bind(RUNTIME_ROLE_COMMENT)
+    .bind(expected_login)
     .fetch_one(&mut **transaction)
     .await
 }
@@ -1480,9 +1289,7 @@ impl SqliteJournal {
 mod tests {
     use sqlx::{Executor as _, Row as _};
 
-    use super::{
-        activate_runtime, neon_owner_pool, neon_provider_identity_is_expected, prepare_runtime,
-    };
+    use super::{activate_runtime, neon_owner_pool, neon_provider_identity_is_expected};
 
     #[test]
     fn neon_provider_identity_requires_one_exact_role_and_owner_membership() {
@@ -1495,7 +1302,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires an explicit disposable Neon owner database URL"]
-    async fn activation_removes_a_provider_acl_restored_after_preparation() {
+    async fn activation_removes_a_provider_acl_and_is_resumable() {
         let database_url = std::env::var("DARK_FACTORY_TEST_NEON_OWNER_DATABASE_URL")
             .expect("disposable Neon owner database URL");
         let pool = neon_owner_pool(&database_url).unwrap();
@@ -1504,7 +1311,9 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let identity = prepare_runtime(&pool, &expected_project_id).await.unwrap();
+        pool.execute("ALTER ROLE dark_factory_broker_runtime NOLOGIN")
+            .await
+            .unwrap();
         let restore_provider_acl: String = sqlx::query_scalar(
             "SELECT format(
                  'GRANT ALL ON DATABASE %I TO neon_superuser',
@@ -1517,7 +1326,9 @@ mod tests {
         pool.execute(restore_provider_acl.as_str()).await.unwrap();
 
         let result = async {
-            activate_runtime(&pool, &identity).await?;
+            let activated = activate_runtime(&pool, &expected_project_id).await?;
+            assert_eq!(activated.project_id, expected_project_id);
+            activate_runtime(&pool, &expected_project_id).await?;
             let row = sqlx::query(
                 "SELECT role.rolcanlogin,
                         EXISTS (
@@ -1539,7 +1350,9 @@ mod tests {
             ))
         }
         .await;
-        let cleanup = prepare_runtime(&pool, &expected_project_id).await;
+        let cleanup = pool
+            .execute("ALTER ROLE dark_factory_broker_runtime NOLOGIN")
+            .await;
         let (runtime_can_login, provider_acl_exists) = result.unwrap();
         cleanup.unwrap();
         assert!(runtime_can_login);

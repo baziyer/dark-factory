@@ -1,7 +1,7 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use reqwest::{
-    Client,
+    Client, StatusCode,
     header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue},
     redirect::Policy,
 };
@@ -13,22 +13,41 @@ use crate::journal::{NeonIdentity, RUNTIME_ROLE};
 const API_BASE: &str = "https://console.neon.tech/api/v2/";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const OPERATIONS_TIMEOUT: Duration = Duration::from_secs(60);
-const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Error {
     Configuration,
     Rejected,
+    PasswordUnavailable,
     IndeterminateReset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PasswordSource {
+    Revealed,
+    Reset,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RecoveredPassword {
+    password: String,
+    source: PasswordSource,
+}
+
+impl RecoveredPassword {
+    pub(crate) fn password(&self) -> &str {
+        &self.password
+    }
+
+    pub(crate) const fn source(&self) -> PasswordSource {
+        self.source
+    }
 }
 
 pub(crate) struct NeonApi {
     client: Client,
     base: Url,
-    operations_timeout: Duration,
-    poll_interval: Duration,
 }
 
 impl NeonApi {
@@ -36,17 +55,10 @@ impl NeonApi {
         Self::with_base(
             api_key,
             Url::parse(API_BASE).map_err(|_| Error::Configuration)?,
-            OPERATIONS_TIMEOUT,
-            POLL_INTERVAL,
         )
     }
 
-    fn with_base(
-        api_key: &str,
-        base: Url,
-        operations_timeout: Duration,
-        poll_interval: Duration,
-    ) -> Result<Self, Error> {
+    fn with_base(api_key: &str, base: Url) -> Result<Self, Error> {
         if api_key.is_empty()
             || api_key.len() > 1024
             || api_key
@@ -69,18 +81,14 @@ impl NeonApi {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|_| Error::Configuration)?;
-        Ok(Self {
-            client,
-            base,
-            operations_timeout,
-            poll_interval,
-        })
+        Ok(Self { client, base })
     }
 
-    pub(crate) async fn reset_runtime_password(
+    pub(crate) async fn recover_runtime_password(
         &self,
         identity: &NeonIdentity,
-    ) -> Result<String, Error> {
+        reset_if_unavailable: bool,
+    ) -> Result<RecoveredPassword, Error> {
         let role_endpoint = self.endpoint(&[
             "projects",
             &identity.project_id,
@@ -104,88 +112,62 @@ impl NeonApi {
         if !role.role.is_compatible(identity) {
             return Err(Error::Rejected);
         }
-        let mut endpoint = role_endpoint;
-        endpoint
+
+        let mut reveal_endpoint = role_endpoint.clone();
+        reveal_endpoint
+            .path_segments_mut()
+            .map_err(|_| Error::Configuration)?
+            .push("reveal_password");
+        let response = self
+            .client
+            .get(reveal_endpoint)
+            .send()
+            .await
+            .map_err(|_| Error::Rejected)?;
+        if response.status().is_success() {
+            let password = decode_json::<RolePasswordResponse>(response)
+                .await
+                .map_err(|_| Error::Rejected)?
+                .validate()
+                .ok_or(Error::Rejected)?;
+            return Ok(RecoveredPassword {
+                password,
+                source: PasswordSource::Revealed,
+            });
+        }
+        if response.status() != StatusCode::PRECONDITION_FAILED {
+            return Err(Error::Rejected);
+        }
+        if !reset_if_unavailable {
+            return Err(Error::PasswordUnavailable);
+        }
+
+        let mut reset_endpoint = role_endpoint;
+        reset_endpoint
             .path_segments_mut()
             .map_err(|_| Error::Configuration)?
             .push("reset_password");
         // This non-idempotent request is deliberately issued exactly once.
-        // A transport failure or malformed success response may mean Neon
-        // rotated the password without returning it, so it is indeterminate.
+        // Once the typed response is accepted, its password is returned
+        // immediately for durable staging. Activation waits separately over
+        // fresh database connections instead of risking loss while polling.
         let response = self
             .client
-            .post(endpoint)
+            .post(reset_endpoint)
             .send()
             .await
             .map_err(|_| Error::IndeterminateReset)?;
-        if response.status().is_server_error() {
-            return Err(Error::IndeterminateReset);
-        }
         if !response.status().is_success() {
-            return Err(Error::Rejected);
+            return Err(Error::IndeterminateReset);
         }
         let reset = decode_json::<ResetResponse>(response)
             .await
             .map_err(|_| Error::IndeterminateReset)?;
         let password = reset.validate(identity).ok_or(Error::IndeterminateReset)?;
-        self.wait_for_operations(identity, &reset.operations)
-            .await?;
-        Ok(password.to_owned())
-    }
-
-    async fn wait_for_operations(
-        &self,
-        identity: &NeonIdentity,
-        operations: &[Operation],
-    ) -> Result<(), Error> {
-        if operations.is_empty() {
-            return Err(Error::IndeterminateReset);
-        }
-        let deadline = Instant::now() + self.operations_timeout;
-        for operation in operations {
-            if !operation.is_valid_for(identity) {
-                return Err(Error::IndeterminateReset);
-            }
-            let mut status = operation.status;
-            while !status.is_terminal() {
-                if Instant::now() >= deadline {
-                    return Err(Error::IndeterminateReset);
-                }
-                tokio::time::sleep(self.poll_interval).await;
-                let endpoint = self
-                    .endpoint(&[
-                        "projects",
-                        &identity.project_id,
-                        "operations",
-                        &operation.id,
-                    ])
-                    .map_err(|_| Error::IndeterminateReset)?;
-                let response = self
-                    .client
-                    .get(endpoint)
-                    .send()
-                    .await
-                    .map_err(|_| Error::IndeterminateReset)?;
-                if !response.status().is_success() {
-                    return Err(Error::IndeterminateReset);
-                }
-                let polled = decode_json::<OperationResponse>(response)
-                    .await
-                    .map_err(|_| Error::IndeterminateReset)?
-                    .operation;
-                if polled.id != operation.id {
-                    return Err(Error::IndeterminateReset);
-                }
-                if !polled.is_valid_for(identity) {
-                    return Err(Error::IndeterminateReset);
-                }
-                status = polled.status;
-            }
-            if status != OperationStatus::Finished {
-                return Err(Error::IndeterminateReset);
-            }
-        }
-        Ok(())
+        Ok(RecoveredPassword {
+            password,
+            source: PasswordSource::Reset,
+        })
     }
 
     fn endpoint(&self, segments: &[&str]) -> Result<Url, Error> {
@@ -193,6 +175,7 @@ impl NeonApi {
         endpoint
             .path_segments_mut()
             .map_err(|_| Error::Configuration)?
+            .pop_if_empty()
             .extend(segments);
         Ok(endpoint)
     }
@@ -212,15 +195,31 @@ async fn decode_json<T: DeserializeOwned>(mut response: reqwest::Response) -> Re
 #[derive(Deserialize)]
 struct ResetResponse {
     role: ResetRole,
-    operations: Vec<Operation>,
 }
 
 impl ResetResponse {
-    fn validate(&self, identity: &NeonIdentity) -> Option<&str> {
-        let password = self.role.password.as_deref()?;
-        (self.role.is_compatible(identity) && !password.is_empty() && password.len() <= 1024)
-            .then_some(password)
+    fn validate(self, identity: &NeonIdentity) -> Option<String> {
+        let role_is_compatible = self.role.is_compatible(identity);
+        let password = self.role.password?;
+        (role_is_compatible && password_is_valid(&password)).then_some(password)
     }
+}
+
+#[derive(Deserialize)]
+struct RolePasswordResponse {
+    password: String,
+}
+
+impl RolePasswordResponse {
+    fn validate(self) -> Option<String> {
+        password_is_valid(&self.password).then_some(self.password)
+    }
+}
+
+fn password_is_valid(password: &str) -> bool {
+    !password.is_empty()
+        && password.len() <= 1024
+        && !password.bytes().any(|byte| byte.is_ascii_control())
 }
 
 #[derive(Deserialize)]
@@ -244,53 +243,6 @@ struct RoleResponse {
     role: ResetRole,
 }
 
-#[derive(Deserialize)]
-struct OperationResponse {
-    operation: Operation,
-}
-
-#[derive(Deserialize)]
-struct Operation {
-    id: String,
-    project_id: String,
-    branch_id: Option<String>,
-    status: OperationStatus,
-}
-
-impl Operation {
-    fn is_valid_for(&self, identity: &NeonIdentity) -> bool {
-        !self.id.is_empty()
-            && self.id.len() <= 128
-            && self.project_id == identity.project_id
-            && self
-                .branch_id
-                .as_deref()
-                .is_none_or(|branch| branch == identity.branch_id)
-    }
-}
-
-#[derive(Clone, Copy, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum OperationStatus {
-    Scheduling,
-    Running,
-    Finished,
-    Failed,
-    Error,
-    Cancelling,
-    Cancelled,
-    Skipped,
-}
-
-impl OperationStatus {
-    const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Finished | Self::Failed | Self::Error | Self::Cancelled | Self::Skipped
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -306,51 +258,105 @@ mod tests {
     const OPERATION: &str = "6bef07a0-ebca-40cd-9100-7324036cfff2";
 
     #[tokio::test]
-    async fn typed_reset_waits_for_the_exact_operation() {
+    async fn typed_recovery_reveals_the_existing_password_without_resetting_it() {
         let responses = [
             response("200 OK", &role_body()),
-            response(
-                "200 OK",
-                &reset_body("running", "generated-runtime-password"),
-            ),
-            response("200 OK", &operation_body("finished")),
+            response("200 OK", &password_body("existing-runtime-password")),
         ];
         let (base, server) = mock_server(responses);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(2),
-            Duration::from_millis(1),
-        )
-        .unwrap();
-        let password = api.reset_runtime_password(&identity()).await.unwrap();
-        assert_eq!(password, "generated-runtime-password");
-        server.join().unwrap();
+        let api = NeonApi::with_base("test-key", base).unwrap();
+
+        let recovered = api
+            .recover_runtime_password(&identity(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.password(), "existing-runtime-password");
+        assert_eq!(recovered.source(), PasswordSource::Revealed);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                format!(
+                    "GET /api/v2/projects/{PROJECT}/branches/{BRANCH}/roles/{RUNTIME_ROLE} HTTP/1.1"
+                ),
+                format!(
+                    "GET /api/v2/projects/{PROJECT}/branches/{BRANCH}/roles/{RUNTIME_ROLE}/reveal_password HTTP/1.1"
+                ),
+            ]
+        );
     }
 
     #[tokio::test]
-    async fn rejected_and_indeterminate_posts_are_never_retried() {
-        let (base, rejected_server) = mock_server([
+    async fn unavailable_reveal_requires_an_explicit_reset_decision() {
+        let responses = [
             response("200 OK", &role_body()),
+            response("412 Precondition Failed", "{}"),
+        ];
+        let (base, server) = mock_server(responses);
+        let api = NeonApi::with_base("test-key", base).unwrap();
+
+        assert_eq!(
+            api.recover_runtime_password(&identity(), false).await,
+            Err(Error::PasswordUnavailable)
+        );
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn explicit_fallback_resets_once_and_returns_before_operation_polling() {
+        let responses = [
+            response("200 OK", &role_body()),
+            response("412 Precondition Failed", "{}"),
+            response("200 OK", &reset_body("running", "new-runtime-password")),
+        ];
+        let (base, server) = mock_server(responses);
+        let api = NeonApi::with_base("test-key", base).unwrap();
+
+        let recovered = api
+            .recover_runtime_password(&identity(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.password(), "new-runtime-password");
+        assert_eq!(recovered.source(), PasswordSource::Reset);
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                format!(
+                    "GET /api/v2/projects/{PROJECT}/branches/{BRANCH}/roles/{RUNTIME_ROLE} HTTP/1.1"
+                ),
+                format!(
+                    "GET /api/v2/projects/{PROJECT}/branches/{BRANCH}/roles/{RUNTIME_ROLE}/reveal_password HTTP/1.1"
+                ),
+                format!(
+                    "POST /api/v2/projects/{PROJECT}/branches/{BRANCH}/roles/{RUNTIME_ROLE}/reset_password HTTP/1.1"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_failed_reset_post_is_indeterminate_and_never_retried() {
+        let (base, forbidden_server) = mock_server([
+            response("200 OK", &role_body()),
+            response("412 Precondition Failed", "{}"),
             response("403 Forbidden", "{}"),
         ]);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        let api = NeonApi::with_base("test-key", base).unwrap();
         assert_eq!(
-            api.reset_runtime_password(&identity()).await,
-            Err(Error::Rejected)
+            api.recover_runtime_password(&identity(), true).await,
+            Err(Error::IndeterminateReset)
         );
-        rejected_server.join().unwrap();
+        forbidden_server.join().unwrap();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let indeterminate_server = thread::spawn(move || {
-            for response in [Some(response("200 OK", &role_body())), None] {
+            for response in [
+                Some(response("200 OK", &role_body())),
+                Some(response("412 Precondition Failed", "{}")),
+                None,
+            ] {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0_u8; 4096];
                 let _ = stream.read(&mut request);
@@ -362,12 +368,10 @@ mod tests {
         let api = NeonApi::with_base(
             "test-key",
             Url::parse(&format!("http://{address}/api/v2/")).unwrap(),
-            Duration::from_secs(1),
-            Duration::from_millis(1),
         )
         .unwrap();
         assert_eq!(
-            api.reset_runtime_password(&identity()).await,
+            api.recover_runtime_password(&identity(), true).await,
             Err(Error::IndeterminateReset)
         );
         indeterminate_server.join().unwrap();
@@ -377,79 +381,52 @@ mod tests {
     async fn server_error_after_reset_post_is_indeterminate() {
         let (base, server) = mock_server([
             response("200 OK", &role_body()),
+            response("412 Precondition Failed", "{}"),
             response("503 Service Unavailable", "{}"),
         ]);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        let api = NeonApi::with_base("test-key", base).unwrap();
         assert_eq!(
-            api.reset_runtime_password(&identity()).await,
+            api.recover_runtime_password(&identity(), true).await,
             Err(Error::IndeterminateReset)
         );
         server.join().unwrap();
     }
 
     #[tokio::test]
-    async fn every_failure_after_an_accepted_reset_is_indeterminate() {
-        let (base, poll_server) = mock_server([
+    async fn malformed_reset_response_is_indeterminate() {
+        let (base, server) = mock_server([
             response("200 OK", &role_body()),
-            response(
-                "200 OK",
-                &reset_body("running", "generated-runtime-password"),
-            ),
-            response("503 Service Unavailable", "{}"),
+            response("412 Precondition Failed", "{}"),
+            response("200 OK", r#"{"role":{},"operations":[]}"#),
         ]);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        let api = NeonApi::with_base("test-key", base).unwrap();
         assert_eq!(
-            api.reset_runtime_password(&identity()).await,
+            api.recover_runtime_password(&identity(), true).await,
             Err(Error::IndeterminateReset)
         );
-        poll_server.join().unwrap();
+        server.join().unwrap();
+    }
 
-        let (base, failed_server) = mock_server([
-            response("200 OK", &role_body()),
-            response(
-                "200 OK",
-                &reset_body("failed", "generated-runtime-password"),
-            ),
-        ]);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        )
-        .unwrap();
-        assert_eq!(
-            api.reset_runtime_password(&identity()).await,
-            Err(Error::IndeterminateReset)
+    #[tokio::test]
+    async fn returned_reset_password_is_not_lost_to_operation_state() {
+        let body = format!(
+            r#"{{"role":{{"branch_id":"{BRANCH}","name":"{RUNTIME_ROLE}","password":"preserved-password"}},"operations":[]}}"#
         );
-        failed_server.join().unwrap();
+        let (base, server) = mock_server([
+            response("200 OK", &role_body()),
+            response("412 Precondition Failed", "{}"),
+            response("200 OK", &body),
+        ]);
+        let api = NeonApi::with_base("test-key", base).unwrap();
 
-        let (base, timeout_server) = mock_server([
-            response("200 OK", &role_body()),
-            response(
-                "200 OK",
-                &reset_body("running", "generated-runtime-password"),
-            ),
-        ]);
-        let api =
-            NeonApi::with_base("test-key", base, Duration::ZERO, Duration::from_millis(1)).unwrap();
-        assert_eq!(
-            api.reset_runtime_password(&identity()).await,
-            Err(Error::IndeterminateReset)
-        );
-        timeout_server.join().unwrap();
+        let recovered = api
+            .recover_runtime_password(&identity(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(recovered.password(), "preserved-password");
+        assert_eq!(recovered.source(), PasswordSource::Reset);
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -461,15 +438,9 @@ mod tests {
             "Connection: close\r\n\r\n"
         )
         .to_owned()]);
-        let api = NeonApi::with_base(
-            "test-key",
-            base,
-            Duration::from_secs(1),
-            Duration::from_millis(1),
-        )
-        .unwrap();
+        let api = NeonApi::with_base("test-key", base).unwrap();
         assert_eq!(
-            api.reset_runtime_password(&identity()).await,
+            api.recover_runtime_password(&identity(), false).await,
             Err(Error::Rejected)
         );
         server.join().unwrap();
@@ -488,15 +459,13 @@ mod tests {
         )
     }
 
+    fn password_body(password: &str) -> String {
+        format!(r#"{{"password":"{password}"}}"#)
+    }
+
     fn role_body() -> String {
         format!(
             r#"{{"role":{{"branch_id":"{BRANCH}","name":"{RUNTIME_ROLE}","protected":false}}}}"#
-        )
-    }
-
-    fn operation_body(status: &str) -> String {
-        format!(
-            r#"{{"operation":{{"id":"{OPERATION}","project_id":"{PROJECT}","branch_id":"{BRANCH}","status":"{status}"}}}}"#
         )
     }
 
@@ -507,16 +476,26 @@ mod tests {
         )
     }
 
-    fn mock_server<const N: usize>(responses: [String; N]) -> (Url, thread::JoinHandle<()>) {
+    fn mock_server<const N: usize>(
+        responses: [String; N],
+    ) -> (Url, thread::JoinHandle<Vec<String>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
+            let mut requests = Vec::with_capacity(N);
             for response in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut request = [0_u8; 4096];
-                let _ = stream.read(&mut request);
+                let bytes = stream.read(&mut request).unwrap();
+                let first_line = String::from_utf8_lossy(&request[..bytes])
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_owned();
+                requests.push(first_line);
                 stream.write_all(response.as_bytes()).unwrap();
             }
+            requests
         });
         (
             Url::parse(&format!("http://{address}/api/v2/")).unwrap(),
