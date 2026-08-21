@@ -139,6 +139,10 @@ pub const MAX_EVENT_PAGE_ITEMS: u32 = 16;
 pub const MAX_TASK_TITLE_BYTES: usize = 240;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
+/// Maximum encoded JSON value carried by one authenticated provider hook.
+pub const MAX_PROVIDER_HOOK_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Largest provider tool name retained in a durable policy-decision event.
+pub const MAX_PROVIDER_TOOL_NAME_BYTES: usize = 256;
 pub const MAX_REQUEST_CREDENTIAL_BYTES: usize = 1024;
 
 /// Bounded operator projection of the daemon-owned Rust artifact inventory.

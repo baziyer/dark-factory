@@ -2,8 +2,8 @@ use std::path::Path;
 
 use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, ExecutionMode, FactoryEvent,
-    MessageId, ProjectId, Provider, RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot,
-    RunnerInstanceId, TaskId,
+    MessageId, PROTOCOL_VERSION, ProjectId, Provider, RunFailureReason, RunId, RunOutcome,
+    RunPhase, RunSnapshot, RunnerInstanceId, TaskId, local::MAX_PROVIDER_TOOL_NAME_BYTES,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -16,15 +16,17 @@ use super::rust_builds::insert_completion_check_if_required;
 use super::{
     AgentMessage, ChangeReservation, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES,
     MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, NewAgentMessage, NewTask, Result, Store,
-    StoreError, TaskDetail, append_agent_changed_event, append_event, assign_task_in_transaction,
-    insert_agent_message, insert_task, load_agent, load_agent_profile, load_task, parse_agent_role,
-    parse_execution_mode, parse_id, parse_observer_health, parse_provider,
+    StoreError, TaskDetail, agent_pause_reasons, append_agent_changed_event, append_event,
+    assign_task_in_transaction, budget_from_row, insert_agent_message, insert_task, load_agent,
+    load_agent_profile, load_task, parse_agent_role, parse_execution_mode, parse_id,
+    parse_observer_health, parse_provider,
 };
 
 const CAPABILITY_HEX_LEN: usize = 64;
 const MAX_RESOURCE_LOCATOR_BYTES: usize = 4096;
 const MAX_RESOURCE_FINGERPRINT_BYTES: usize = 1024;
 const MAX_RESOURCE_FAILURE_BYTES: usize = 4096;
+const MAX_POLICY_RULE_BYTES: usize = 128;
 
 pub struct NewRunAdmission {
     pub run_id: RunId,
@@ -74,6 +76,24 @@ pub struct AttemptPrincipal {
     pub agent_id: AgentId,
     pub role: AgentRole,
     pub source_root: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptToolPolicy {
+    pub tool_name: String,
+    pub denied_by: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptToolVerdict {
+    Allow,
+    DenyBudget,
+    DenyPolicy { rule: String },
+}
+
+pub struct RecordedAttemptToolDecision {
+    pub verdict: AttemptToolVerdict,
+    pub events: Vec<EventEnvelope>,
 }
 
 struct RunningAttemptAuthority {
@@ -651,6 +671,104 @@ impl Store {
             )
             .optional()
             .map_err(StoreError::from)
+    }
+
+    /// Linearizes one provider tool call against attempt revocation. The run
+    /// authority check, budget transition, and both durable audit events share
+    /// one immediate transaction, so callers can observe neither a split audit
+    /// trail, and a revocation that commits first makes this call fail.
+    pub fn decide_tool_call_as_attempt(
+        &mut self,
+        run_id: &RunId,
+        policy: AttemptToolPolicy,
+        now_ms: i64,
+    ) -> Result<RecordedAttemptToolDecision> {
+        validate_attempt_tool_policy(&policy)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let authority = load_running_attempt_authority(&transaction, run_id)?;
+        let before = transaction.query_row(
+            "SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms
+             FROM agent_budgets WHERE agent_id = ?1",
+            [authority.agent_id.as_str()],
+            budget_from_row,
+        )?;
+        let budget_denied = before.exhausted
+            || before
+                .max_tool_calls
+                .is_some_and(|limit| before.tool_calls >= limit);
+        if budget_denied {
+            transaction.execute(
+                "UPDATE agent_budgets SET exhausted = 1, updated_at_ms = ?1
+                 WHERE agent_id = ?2",
+                params![now_ms, authority.agent_id.as_str()],
+            )?;
+        } else {
+            transaction.execute(
+                "UPDATE agent_budgets
+                 SET tool_calls = tool_calls + 1, updated_at_ms = ?1
+                 WHERE agent_id = ?2",
+                params![now_ms, authority.agent_id.as_str()],
+            )?;
+        }
+        let budget = transaction.query_row(
+            "SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms
+             FROM agent_budgets WHERE agent_id = ?1",
+            [authority.agent_id.as_str()],
+            budget_from_row,
+        )?;
+        let pause_reasons =
+            agent_pause_reasons(&transaction, &authority.project_id, &authority.agent_id)?;
+        let budget_event = FactoryEvent::AgentBudgetChanged {
+            project_id: authority.project_id.clone(),
+            agent_id: authority.agent_id.clone(),
+            budget,
+            action: if budget_denied { "denied" } else { "observed" }.into(),
+            paused: !pause_reasons.is_empty(),
+            pause_reasons,
+        };
+        let budget_sequence = append_event(&transaction, now_ms, &budget_event)?;
+        let verdict = if budget_denied {
+            AttemptToolVerdict::DenyBudget
+        } else if let Some(rule) = policy.denied_by.as_ref() {
+            AttemptToolVerdict::DenyPolicy { rule: rule.clone() }
+        } else {
+            AttemptToolVerdict::Allow
+        };
+        let policy_event = FactoryEvent::PolicyDecision {
+            project_id: authority.project_id,
+            agent_id: authority.agent_id,
+            run_id: run_id.clone(),
+            tool_name: policy.tool_name,
+            decision: if verdict == AttemptToolVerdict::Allow {
+                "allow"
+            } else {
+                "deny"
+            }
+            .into(),
+            rule: policy.denied_by,
+        };
+        let policy_sequence = append_event(&transaction, now_ms, &policy_event)?;
+        transaction.commit()?;
+
+        Ok(RecordedAttemptToolDecision {
+            verdict,
+            events: vec![
+                EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence: budget_sequence,
+                    occurred_at_ms: now_ms,
+                    event: budget_event,
+                },
+                EventEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    sequence: policy_sequence,
+                    occurred_at_ms: now_ms,
+                    event: policy_event,
+                },
+            ],
+        })
     }
 
     pub fn send_message_as_attempt(
@@ -1488,6 +1606,20 @@ fn load_running_attempt_authority(
         )
         .optional()?
         .ok_or(StoreError::InvalidHookToken)
+}
+
+fn validate_attempt_tool_policy(policy: &AttemptToolPolicy) -> Result<()> {
+    let invalid_tool_name = policy.tool_name.is_empty()
+        || policy.tool_name.len() > MAX_PROVIDER_TOOL_NAME_BYTES
+        || policy.tool_name.chars().any(char::is_control);
+    let invalid_rule = policy.denied_by.as_deref().is_some_and(|rule| {
+        rule.is_empty() || rule.len() > MAX_POLICY_RULE_BYTES || rule.chars().any(char::is_control)
+    });
+    if invalid_tool_name || invalid_rule {
+        Err(StoreError::InvalidToolPolicy)
+    } else {
+        Ok(())
+    }
 }
 
 fn require_attempt_project(
@@ -2716,6 +2848,229 @@ mod tests {
             ),
             Err(StoreError::ChangeLeased)
         ));
+    }
+
+    fn tool_policy(denied_by: Option<&str>) -> AttemptToolPolicy {
+        AttemptToolPolicy {
+            tool_name: "Read".into(),
+            denied_by: denied_by.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn tool_decision_commits_budget_and_exact_audit_events_together() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        let project_id = id("factory");
+        let agent_id = id("worker");
+        store
+            .set_agent_budget(&project_id, &agent_id, Some(2), 7)
+            .unwrap();
+
+        let allowed = store
+            .decide_tool_call_as_attempt(&run_id, tool_policy(None), 8)
+            .unwrap();
+        assert_eq!(allowed.verdict, AttemptToolVerdict::Allow);
+        assert_eq!(allowed.events.len(), 2);
+        assert_eq!(allowed.events[1].sequence, allowed.events[0].sequence + 1);
+        assert!(matches!(
+            &allowed.events[0].event,
+            FactoryEvent::AgentBudgetChanged {
+                project_id: event_project,
+                agent_id: event_agent,
+                budget,
+                action,
+                ..
+            } if event_project == &project_id
+                && event_agent == &agent_id
+                && budget.tool_calls == 1
+                && !budget.exhausted
+                && action == "observed"
+        ));
+        assert!(matches!(
+            &allowed.events[1].event,
+            FactoryEvent::PolicyDecision {
+                project_id: event_project,
+                agent_id: event_agent,
+                run_id: event_run,
+                decision,
+                rule: None,
+                ..
+            } if event_project == &project_id
+                && event_agent == &agent_id
+                && event_run == &run_id
+                && decision == "allow"
+        ));
+
+        let policy_denied = store
+            .decide_tool_call_as_attempt(&run_id, tool_policy(Some("secret_path")), 9)
+            .unwrap();
+        assert_eq!(
+            policy_denied.verdict,
+            AttemptToolVerdict::DenyPolicy {
+                rule: "secret_path".into()
+            }
+        );
+        assert!(matches!(
+            &policy_denied.events[1].event,
+            FactoryEvent::PolicyDecision {
+                decision,
+                rule: Some(rule),
+                ..
+            } if decision == "deny" && rule == "secret_path"
+        ));
+
+        let budget_denied = store
+            .decide_tool_call_as_attempt(&run_id, tool_policy(None), 10)
+            .unwrap();
+        assert_eq!(budget_denied.verdict, AttemptToolVerdict::DenyBudget);
+        assert!(matches!(
+            &budget_denied.events[0].event,
+            FactoryEvent::AgentBudgetChanged { budget, action, .. }
+                if budget.tool_calls == 2 && budget.exhausted && action == "denied"
+        ));
+        assert!(matches!(
+            &budget_denied.events[1].event,
+            FactoryEvent::PolicyDecision { decision, .. } if decision == "deny"
+        ));
+        assert!(matches!(
+            store.resume_agent(&project_id, &agent_id, 11),
+            Err(StoreError::AgentBudgetExhausted)
+        ));
+
+        store.pause_agent(&project_id, &agent_id, 12).unwrap();
+        store
+            .reset_agent_budget(&project_id, &agent_id, 13)
+            .unwrap();
+        let status = store.agent_status(&project_id, &agent_id).unwrap();
+        assert!(status.agent.paused);
+        assert_eq!(
+            status.pause_reasons,
+            vec![factory_core::status::AgentPauseReason::AgentHold]
+        );
+        store.resume_agent(&project_id, &agent_id, 14).unwrap();
+    }
+
+    #[test]
+    fn tool_decision_rolls_back_budget_when_policy_audit_insert_fails() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        let project_id = id("factory");
+        let agent_id = id("worker");
+        let budget_before = store.agent_budget(&project_id, &agent_id).unwrap();
+        let sequence_before = store.latest_event_sequence().unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_policy_audit
+                 BEFORE INSERT ON events WHEN NEW.kind = 'policy_decision'
+                 BEGIN SELECT RAISE(ABORT, 'reject policy audit'); END;",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.decide_tool_call_as_attempt(&run_id, tool_policy(None), 7),
+            Err(StoreError::Sqlite(_))
+        ));
+        assert_eq!(
+            store.agent_budget(&project_id, &agent_id).unwrap(),
+            budget_before
+        );
+        assert_eq!(store.latest_event_sequence().unwrap(), sequence_before);
+    }
+
+    #[test]
+    fn finalizing_before_tool_decision_revokes_authority_without_mutation() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker(&mut store);
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        store
+            .request_attempt_outcome(&run_id, &RunOutcome::Succeeded, None, 7)
+            .unwrap();
+        let project_id = id("factory");
+        let agent_id = id("worker");
+        let budget_before = store.agent_budget(&project_id, &agent_id).unwrap();
+        let sequence_before = store.latest_event_sequence().unwrap();
+
+        assert!(matches!(
+            store.decide_tool_call_as_attempt(&run_id, tool_policy(None), 8),
+            Err(StoreError::InvalidHookToken)
+        ));
+        assert_eq!(
+            store.agent_budget(&project_id, &agent_id).unwrap(),
+            budget_before
+        );
+        assert_eq!(store.latest_event_sequence().unwrap(), sequence_before);
+    }
+
+    #[test]
+    fn concurrent_tool_decisions_cannot_cross_the_budget_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("factory.db");
+        let mut store = Store::open(&database).unwrap();
+        let run_id = admit_worker(&mut store);
+        store
+            .activate_prepared_run(&run_id, prepared_identity(), 6)
+            .unwrap();
+        let project_id = id("factory");
+        let agent_id = id("worker");
+        store
+            .set_agent_budget(&project_id, &agent_id, Some(1), 7)
+            .unwrap();
+        let sequence_before = store.latest_event_sequence().unwrap();
+        drop(store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut joins = Vec::new();
+        for now_ms in [8, 9] {
+            let database = database.clone();
+            let barrier = barrier.clone();
+            let run_id = run_id.clone();
+            joins.push(std::thread::spawn(move || {
+                let mut store = Store::open(database).unwrap();
+                barrier.wait();
+                store
+                    .decide_tool_call_as_attempt(&run_id, tool_policy(None), now_ms)
+                    .unwrap()
+                    .verdict
+            }));
+        }
+        let mut verdicts = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        verdicts.sort_by_key(|verdict| match verdict {
+            AttemptToolVerdict::Allow => 0,
+            AttemptToolVerdict::DenyBudget => 1,
+            AttemptToolVerdict::DenyPolicy { .. } => 2,
+        });
+        assert_eq!(
+            verdicts,
+            vec![AttemptToolVerdict::Allow, AttemptToolVerdict::DenyBudget]
+        );
+
+        let store = Store::open(database).unwrap();
+        let budget = store.agent_budget(&project_id, &agent_id).unwrap();
+        assert_eq!(budget.tool_calls, 1);
+        assert!(budget.exhausted);
+        let events = store.events_after(sequence_before, 4).unwrap();
+        assert_eq!(events.len(), 4);
+        for pair in events.chunks_exact(2) {
+            assert!(matches!(
+                pair[0].event,
+                FactoryEvent::AgentBudgetChanged { .. }
+            ));
+            assert!(matches!(pair[1].event, FactoryEvent::PolicyDecision { .. }));
+            assert_eq!(pair[1].sequence, pair[0].sequence + 1);
+        }
     }
 
     #[test]

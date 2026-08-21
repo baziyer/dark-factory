@@ -23,8 +23,9 @@ pub use changes::{
     ChangeReservation, ChangeSourceIdentity, ChangeStorageSummary,
 };
 pub use kernel::{
-    AdmittedRun, AttemptPrincipal, AttemptTarget, KernelResource, KernelResourceKind,
-    KernelResourceState, NewRunAdmission, PreparedProcessIdentity, RecoverableKernelRun,
+    AdmittedRun, AttemptPrincipal, AttemptTarget, AttemptToolPolicy, AttemptToolVerdict,
+    KernelResource, KernelResourceKind, KernelResourceState, NewRunAdmission,
+    PreparedProcessIdentity, RecordedAttemptToolDecision, RecoverableKernelRun,
 };
 pub(crate) use rust_builds::{MAX_RUST_CACHE_BYTES, MAX_RUST_CACHE_COUNT};
 pub use rust_builds::{
@@ -268,6 +269,8 @@ pub enum StoreError {
     ResourceIdentityMismatch,
     #[error("attempt credential is invalid")]
     InvalidHookToken,
+    #[error("provider tool policy input is invalid or exceeds its bound")]
+    InvalidToolPolicy,
     #[error("request is outside the admitted attempt's authority")]
     AttemptScopeDenied,
     #[error("run is not in the required state")]
@@ -347,24 +350,6 @@ impl Store {
             params![enabled, now_ms],
         )?;
         let event = FactoryEvent::DispatchPolicyChanged { enabled };
-        let sequence = append_event(&transaction, now_ms, &event)?;
-        transaction.commit()?;
-        Ok(EventEnvelope {
-            protocol_version: PROTOCOL_VERSION,
-            sequence,
-            occurred_at_ms: now_ms,
-            event,
-        })
-    }
-
-    pub fn record_policy_decision(
-        &mut self,
-        event: FactoryEvent,
-        now_ms: i64,
-    ) -> Result<EventEnvelope> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let sequence = append_event(&transaction, now_ms, &event)?;
         transaction.commit()?;
         Ok(EventEnvelope {
@@ -671,55 +656,6 @@ impl Store {
         transaction.commit()?;
         Ok((
             budget,
-            EventEnvelope {
-                protocol_version: PROTOCOL_VERSION,
-                sequence,
-                occurred_at_ms: now_ms,
-                event,
-            },
-        ))
-    }
-
-    /// Counts one authenticated tool-call attempt. Returns `true` when the
-    /// provider must deny it. The first `max_tool_calls` attempts are allowed;
-    /// the next one exhausts and durably pauses the agent.
-    pub fn observe_tool_call(
-        &mut self,
-        project_id: &ProjectId,
-        agent_id: &AgentId,
-        now_ms: i64,
-    ) -> Result<(AgentBudget, bool, EventEnvelope)> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1 AND EXISTS (SELECT 1 FROM agents WHERE id = ?1 AND project_id = ?2)", params![agent_id.as_str(), project_id.as_str()], budget_from_row).optional()?.ok_or(StoreError::AgentNotFound)?;
-        let denied = before.exhausted
-            || before
-                .max_tool_calls
-                .is_some_and(|limit| before.tool_calls >= limit);
-        if denied {
-            transaction.execute(
-                "UPDATE agent_budgets SET exhausted = 1, updated_at_ms = ?1 WHERE agent_id = ?2",
-                params![now_ms, agent_id.as_str()],
-            )?;
-        } else {
-            transaction.execute("UPDATE agent_budgets SET tool_calls = tool_calls + 1, updated_at_ms = ?1 WHERE agent_id = ?2", params![now_ms, agent_id.as_str()])?;
-        }
-        let budget = transaction.query_row("SELECT max_tool_calls, tool_calls, exhausted, reset_at_ms, updated_at_ms FROM agent_budgets WHERE agent_id = ?1", [agent_id.as_str()], budget_from_row)?;
-        let pause_reasons = agent_pause_reasons(&transaction, project_id, agent_id)?;
-        let event = FactoryEvent::AgentBudgetChanged {
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            budget: budget.clone(),
-            action: if denied { "denied" } else { "observed" }.into(),
-            paused: !pause_reasons.is_empty(),
-            pause_reasons,
-        };
-        let sequence = append_event(&transaction, now_ms, &event)?;
-        transaction.commit()?;
-        Ok((
-            budget,
-            denied,
             EventEnvelope {
                 protocol_version: PROTOCOL_VERSION,
                 sequence,
