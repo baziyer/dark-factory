@@ -657,68 +657,88 @@ impl Store {
         }
     }
 
-    /// Hands an exact bound-but-unmeasured cache from a failed completion
-    /// check to the normal crash-recoverable reclamation path. Exact retries
-    /// preserve the first failure evidence; a different check, cache identity,
-    /// or failure cannot adopt or rewrite the row.
-    pub fn begin_failed_rust_cache_reclaim(
+    /// Atomically fails a running completion check and hands its exact durable
+    /// bound-but-unmeasured cache to the crash-recoverable reclamation path.
+    /// Exact retries preserve the first failure evidence and timestamps.
+    pub fn fail_rust_completion_and_reclaim_cache(
         &mut self,
         run_id: &RunId,
-        expected_check_revision: i64,
-        cache: &RustBuildCache,
+        expected_running_revision: i64,
         failure: &str,
         now_ms: i64,
-    ) -> Result<RustBuildCache> {
+    ) -> Result<(RustCompletionCheck, RustBuildCache)> {
         validate_failure(failure)?;
-        let inode = cache.inode.ok_or(StoreError::InvalidRustBuildMetadata)?;
-        validate_bound_identity(&cache.path, inode)?;
-        let dev = cache.dev.ok_or(StoreError::InvalidRustBuildMetadata)?;
-        if cache.bytes.is_some() {
-            return Err(StoreError::InvalidRustBuildMetadata);
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let check =
+            load_check(&transaction, run_id)?.ok_or(StoreError::RustCompletionCheckNotFound)?;
+        let cache_key = check
+            .cache_key
+            .as_deref()
+            .ok_or(StoreError::InvalidRustCompletionPhase)?;
+        let cache = load_cache(&transaction, &check.project_incarnation_id, cache_key)?
+            .ok_or(StoreError::InvalidRustBuildMetadata)?;
+        let exact_bound_unmeasured = cache.lifecycle == RustCacheLifecycle::Available
+            && cache.dev.is_some()
+            && cache.inode.is_some()
+            && cache.bytes.is_none()
+            && cache.failure.is_none();
+
+        if check.phase == RustCompletionPhase::Running
+            && check.revision == expected_running_revision
+            && exact_bound_unmeasured
+        {
+            let check_changed = transaction.execute(
+                "UPDATE rust_completion_checks
+                 SET phase = 'failed', failure = ?1, revision = revision + 1,
+                     updated_at_ms = ?2, terminal_at_ms = ?2
+                 WHERE run_id = ?3 AND phase = 'running' AND revision = ?4",
+                params![failure, now_ms, run_id.as_str(), expected_running_revision],
+            )?;
+            let cache_changed = transaction.execute(
+                "UPDATE rust_build_caches
+                 SET lifecycle = 'reclaiming', failure = ?1, updated_at_ms = ?2
+                 WHERE project_id = ?3 AND project_incarnation_id = ?4
+                   AND cache_key = ?5 AND path = ?6 AND dev = ?7 AND inode = ?8
+                   AND bytes IS NULL AND failure IS NULL AND lifecycle = 'available'",
+                params![
+                    failure,
+                    now_ms,
+                    cache.project_id.as_str(),
+                    cache.project_incarnation_id,
+                    cache.cache_key,
+                    cache.path,
+                    cache.dev.map(to_i64).transpose()?,
+                    cache.inode.map(to_i64).transpose()?,
+                ],
+            )?;
+            if check_changed != 1 || cache_changed != 1 {
+                return Err(StoreError::InvalidRustBuildMetadata);
+            }
+        } else {
+            let retry_revision = expected_running_revision
+                .checked_add(1)
+                .ok_or(StoreError::InvalidRustBuildMetadata)?;
+            let exact_retry = check.phase == RustCompletionPhase::Failed
+                && check.revision == retry_revision
+                && check.failure.as_deref() == Some(failure)
+                && cache.lifecycle == RustCacheLifecycle::Reclaiming
+                && cache.dev.is_some()
+                && cache.inode.is_some()
+                && cache.bytes.is_none()
+                && cache.failure.as_deref() == Some(failure);
+            if !exact_retry {
+                return Err(StoreError::InvalidRustBuildMetadata);
+            }
         }
-        let changed = self.connection.execute(
-            "UPDATE rust_build_caches AS cache
-             SET lifecycle = 'reclaiming',
-                 failure = CASE WHEN cache.lifecycle = 'available' THEN ?1 ELSE cache.failure END,
-                 updated_at_ms = CASE
-                    WHEN cache.lifecycle = 'available' THEN ?2 ELSE cache.updated_at_ms
-                 END
-             WHERE cache.project_id = ?3
-               AND cache.project_incarnation_id = ?4 AND cache.cache_key = ?5
-               AND cache.path = ?6 AND cache.dev = ?7 AND cache.inode = ?8
-               AND cache.bytes IS NULL
-               AND (cache.lifecycle = 'available'
-                    OR (cache.lifecycle = 'reclaiming' AND cache.failure = ?1))
-               AND EXISTS (
-                    SELECT 1 FROM rust_completion_checks check_row
-                    WHERE check_row.run_id = ?9 AND check_row.phase = 'failed'
-                      AND check_row.revision = ?10
-                      AND check_row.project_id = cache.project_id
-                      AND check_row.project_incarnation_id = cache.project_incarnation_id
-                      AND check_row.cache_key = cache.cache_key
-               )",
-            params![
-                failure,
-                now_ms,
-                cache.project_id.as_str(),
-                cache.project_incarnation_id,
-                cache.cache_key,
-                cache.path,
-                to_i64(dev)?,
-                to_i64(inode)?,
-                run_id.as_str(),
-                expected_check_revision,
-            ],
-        )?;
-        if changed != 1 {
-            return Err(StoreError::InvalidRustBuildMetadata);
-        }
-        load_cache(
-            &self.connection,
-            &cache.project_incarnation_id,
-            &cache.cache_key,
-        )?
-        .ok_or(StoreError::InvalidRustBuildMetadata)
+
+        let check =
+            load_check(&transaction, run_id)?.ok_or(StoreError::RustCompletionCheckNotFound)?;
+        let cache = load_cache(&transaction, &check.project_incarnation_id, cache_key)?
+            .ok_or(StoreError::InvalidRustBuildMetadata)?;
+        transaction.commit()?;
+        Ok((check, cache))
     }
 
     pub fn finish_rust_cache_reclaim(
@@ -1474,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_check_hands_only_its_exact_unmeasured_cache_to_reclamation() {
+    fn running_check_failure_atomically_hands_its_cache_to_reclamation() {
         let mut store = Store::open_in_memory().unwrap();
         let (project_id, incarnation) = project(&mut store);
         let run_id = RunId::try_from("77777777-7777-4777-8777-777777777777").unwrap();
@@ -1486,86 +1506,49 @@ mod tests {
             RustCompletionPhase::Running,
             Some(CACHE_A),
         );
+        assert!(matches!(
+            store.fail_rust_completion_and_reclaim_cache(&run_id, 0, "measurement failed", 3,),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        assert_eq!(
+            store.rust_completion_check(&run_id).unwrap().unwrap().phase,
+            RustCompletionPhase::Running
+        );
         store
             .declare_rust_cache(&run_id, "/tmp/cache-a", 3)
             .unwrap();
-        let cache = store
+        assert!(matches!(
+            store.fail_rust_completion_and_reclaim_cache(&run_id, 0, "measurement failed", 4,),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        assert_eq!(
+            store.rust_completion_check(&run_id).unwrap().unwrap().phase,
+            RustCompletionPhase::Running
+        );
+        store
             .bind_rust_cache_identity(&run_id, "/tmp/cache-a", 1, 2, 4)
             .unwrap();
 
-        assert!(matches!(
-            store.begin_failed_rust_cache_reclaim(&run_id, 0, &cache, "measurement failed", 5),
-            Err(StoreError::InvalidRustBuildMetadata)
-        ));
-        let failed = store
-            .fail_rust_completion_check(&run_id, 0, "measurement failed", 6)
+        let (failed, reclaiming) = store
+            .fail_rust_completion_and_reclaim_cache(&run_id, 0, "measurement failed", 8)
             .unwrap();
-
-        let mut wrong_key = cache.clone();
-        wrong_key.cache_key = CACHE_B.to_owned();
-        assert!(matches!(
-            store.begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision,
-                &wrong_key,
-                "measurement failed",
-                7,
-            ),
-            Err(StoreError::InvalidRustBuildMetadata)
-        ));
-        let mut stale_identity = cache.clone();
-        stale_identity.inode = Some(3);
-        assert!(matches!(
-            store.begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision,
-                &stale_identity,
-                "measurement failed",
-                7,
-            ),
-            Err(StoreError::InvalidRustBuildMetadata)
-        ));
-        assert!(matches!(
-            store.begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision - 1,
-                &cache,
-                "measurement failed",
-                7,
-            ),
-            Err(StoreError::InvalidRustBuildMetadata)
-        ));
-
-        let reclaiming = store
-            .begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision,
-                &cache,
-                "measurement failed",
-                8,
-            )
-            .unwrap();
+        assert_eq!(failed.phase, RustCompletionPhase::Failed);
+        assert_eq!(failed.revision, 1);
+        assert_eq!(failed.failure.as_deref(), Some("measurement failed"));
         assert_eq!(reclaiming.lifecycle, RustCacheLifecycle::Reclaiming);
         assert_eq!(reclaiming.failure.as_deref(), Some("measurement failed"));
         assert_eq!(reclaiming.updated_at_ms, 8);
+
         let retry = store
-            .begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision,
-                &reclaiming,
-                "measurement failed",
-                9,
-            )
+            .fail_rust_completion_and_reclaim_cache(&run_id, 0, "measurement failed", 9)
             .unwrap();
-        assert_eq!(retry, reclaiming);
+        assert_eq!(retry, (failed.clone(), reclaiming.clone()));
         assert!(matches!(
-            store.begin_failed_rust_cache_reclaim(
-                &run_id,
-                failed.revision,
-                &reclaiming,
-                "different failure",
-                9,
-            ),
+            store.fail_rust_completion_and_reclaim_cache(&run_id, 0, "different failure", 9,),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        assert!(matches!(
+            store.fail_rust_completion_and_reclaim_cache(&run_id, 1, "measurement failed", 9),
             Err(StoreError::InvalidRustBuildMetadata)
         ));
 
@@ -1580,6 +1563,50 @@ mod tests {
             }
         );
         assert_eq!(store.recoverable_rust_reclaims().unwrap(), vec![reclaiming]);
+    }
+
+    #[test]
+    fn cache_handoff_failure_rolls_back_the_check_failure() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project_id, incarnation) = project(&mut store);
+        let run_id = RunId::try_from("88888888-8888-4888-8888-888888888888").unwrap();
+        insert_test_check(
+            &store,
+            &run_id,
+            &project_id,
+            &incarnation,
+            RustCompletionPhase::Running,
+            Some(CACHE_A),
+        );
+        store
+            .declare_rust_cache(&run_id, "/tmp/cache-a", 3)
+            .unwrap();
+        store
+            .bind_rust_cache_identity(&run_id, "/tmp/cache-a", 1, 2, 4)
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER reject_cache_handoff
+                 BEFORE UPDATE OF lifecycle ON rust_build_caches
+                 BEGIN SELECT RAISE(ABORT, 'injected handoff failure'); END;",
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .fail_rust_completion_and_reclaim_cache(&run_id, 0, "measurement failed", 5,)
+                .is_err()
+        );
+        assert_eq!(
+            store.rust_completion_check(&run_id).unwrap().unwrap().phase,
+            RustCompletionPhase::Running
+        );
+        let cache = load_cache(&store.connection, &incarnation, CACHE_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cache.lifecycle, RustCacheLifecycle::Available);
+        assert_eq!(cache.failure, None);
     }
 
     #[test]
