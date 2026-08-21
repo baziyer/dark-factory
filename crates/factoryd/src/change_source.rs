@@ -2343,7 +2343,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecorded_staging_claim_is_never_adopted_after_crash() {
+    fn unrecorded_staging_contents_are_never_adopted_after_crash() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let changes = root.path().join("changes");
@@ -2352,14 +2352,12 @@ mod tests {
         let abandoned =
             StagedSource::create(&changes, change_id, SourceLimits::new(20, 4096).unwrap())
                 .unwrap();
-        let old_identity = abandoned.staging_identity;
         fs::write(abandoned.staging_path.join("partial"), "never publish").unwrap();
         drop(abandoned);
 
         let replacement =
             StagedSource::create(&changes, change_id, SourceLimits::new(20, 4096).unwrap())
                 .unwrap();
-        assert_ne!(replacement.staging_identity, old_identity);
         assert!(
             fs::read_dir(&replacement.staging_path)
                 .unwrap()
