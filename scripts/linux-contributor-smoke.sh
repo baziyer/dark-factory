@@ -90,10 +90,11 @@ change_record() {
 wait_for_file() {
     path=$1
     label=$2
+    limit=${3:-300}
     attempt=0
     while ! test -e "$path"; do
         attempt=$((attempt + 1))
-        test "$attempt" -lt 300 || {
+        test "$attempt" -lt "$limit" || {
             cat "$scratch/factoryd.log" >&2 2>/dev/null || true
             echo "$label did not appear" >&2
             return 1
@@ -470,16 +471,18 @@ mod tests {
 
     #[test]
     fn immutable_prepared_binary_runs() {
-        assert_eq!(fs::read_to_string("revision.txt").unwrap(), "A\n");
+        let revision = fs::read_to_string("revision.txt").unwrap();
         writeln!(
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(r#"$scratch/verifier-launches"#)
                 .unwrap(),
-            "launch"
+            "{}",
+            revision.trim_end()
         )
         .unwrap();
+        assert_eq!(revision, "A\n");
         // This descendant must outlive factoryd's five-second effect reap
         // bound. The smoke kills only its group leader and proves no cache or
         // temporary-root cleanup races this still-running writer.
@@ -574,7 +577,10 @@ fi
 # group leader while its exact test descendant remains alive, then crash the
 # daemon while that one effect and one God attempt are both active.
 run_id=$(wait_for_task_run linux-smoke-task)
-wait_for_file "$scratch/verifier-launches" "Rust verifier"
+# Hosted Linux may compile this first tiny verification crate from a cold
+# toolchain cache. Bound setup separately from the later five-second causal
+# reap assertion so cold compilation cannot masquerade as a lifecycle failure.
+wait_for_file "$scratch/verifier-launches" "Rust verifier" 900
 run_has "$run_id" '"phase":"finalizing".*"outcome":{"type":"succeeded"' || {
     cat "$scratch/runs.json" >&2
     echo "worker success request was not durable before provider exit" >&2
@@ -665,6 +671,11 @@ run_has "$run_id" '"reason":"unverifiable"' \
 test "$(wc -l <"$scratch/verifier-launches" | tr -d '[:space:]')" = 1 || {
     cat "$scratch/verifier-launches" >&2
     echo "daemon recovery launched a second verifier against mutable source" >&2
+    exit 1
+}
+test "$(sed -n '1p' "$scratch/verifier-launches")" = A || {
+    cat "$scratch/verifier-launches" >&2
+    echo "Rust verifier observed mutable replacement source" >&2
     exit 1
 }
 wait_for_tracked_processes "$crash_processes"
