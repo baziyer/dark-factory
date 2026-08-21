@@ -398,6 +398,7 @@ impl RustWorkspaceTest {
     /// fixed path launch. The held file remains live until that test exits.
     fn execute(&self, prepared: &PreparedRustWorkspaceTest) -> Result<RustWorkspaceTestResult> {
         self.verify_prepared_paths(prepared)?;
+        self.verify_snapshot(prepared)?;
         let manifest = read_bundle_manifest(&prepared.bundle_root)?;
         verify_bundle(
             &prepared.bundle_root,
@@ -408,6 +409,7 @@ impl RustWorkspaceTest {
         )?;
         let mut executions = Vec::with_capacity(manifest.executables.len());
         for executable in &manifest.executables {
+            self.verify_snapshot(prepared)?;
             let path = prepared.bundle_root.join("bin").join(&executable.name);
             let mut held = open_regular_nofollow(&path)
                 .map_err(|_| RustVerifyError::ExecutableTampered(path.clone()))?;
@@ -424,6 +426,7 @@ impl RustWorkspaceTest {
             // macOS a safe descriptor exec is unavailable in stable Rust, so
             // the private exact path is the handoff under the same-UID caveat.
             drop(held);
+            self.verify_snapshot(prepared)?;
             if output.stdout_exceeded || output.stderr_exceeded {
                 return Err(RustVerifyError::TestOutputTooLarge(path));
             }
@@ -446,6 +449,14 @@ impl RustWorkspaceTest {
             success: executions.iter().all(|execution| execution.success),
             executions,
         })
+    }
+
+    fn verify_snapshot(&self, prepared: &PreparedRustWorkspaceTest) -> Result<()> {
+        if capture_tree(&prepared.snapshot_root)?.digest() == prepared.snapshot_digest {
+            Ok(())
+        } else {
+            Err(RustVerifyError::SourceChanged)
+        }
     }
 
     fn verify_roots(&self) -> Result<()> {
@@ -733,6 +744,13 @@ pub(crate) fn write_worker_invocation(path: &Path, invocation: &WorkerInvocation
         .parent()
         .ok_or_else(|| RustVerifyError::UnsafePath(path.to_owned()))?;
     verify_private_directory(parent)?;
+    if path_exists(path)? {
+        return if read_worker_invocation(path)? == *invocation {
+            Ok(())
+        } else {
+            Err(RustVerifyError::InvalidCheckpoint)
+        };
+    }
     write_create_only_json(path, invocation, MAX_WORKER_INVOCATION_BYTES)
 }
 
@@ -1978,10 +1996,11 @@ mod tests {
         artifact: PathBuf,
         invocation_log: PathBuf,
         run_marker: PathBuf,
+        later_run_marker: PathBuf,
     }
 
     impl Fixture {
-        fn new(mutate_live_source: bool) -> Self {
+        fn new(mutate_live_source: bool, mutate_snapshot_in_test: bool) -> Self {
             let temporary = tempfile::Builder::new()
                 .prefix("df-rust-verify-")
                 .tempdir()
@@ -1995,6 +2014,7 @@ mod tests {
             let worker_temporary = root.join("worker-temporary");
             let invocation_log = root.join("invocations.log");
             let run_marker = root.join("ran.txt");
+            let later_run_marker = root.join("ran-later.txt");
             for directory in [&changes, &change, &cache_parent, &worker_temporary] {
                 private_directory(directory);
             }
@@ -2010,8 +2030,21 @@ mod tests {
             } else {
                 String::new()
             };
+            let test_mutation = if mutate_snapshot_in_test {
+                "printf B > revision.txt\\n"
+            } else {
+                ""
+            };
+            let later_artifact = if mutate_snapshot_in_test {
+                format!(
+                    "later=\"$CARGO_TARGET_DIR/debug/deps/fake-test-later\"\nprintf '#!/bin/sh\\nprintf later > {}\\n' > \"$later\"\nchmod 755 \"$later\"\nprintf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' \"$later\"\n",
+                    shell_literal(&later_run_marker)
+                )
+            } else {
+                String::new()
+            };
             let script = format!(
-                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$CARGO_TARGET_DIR\" >> {log}\nmkdir -p \"$CARGO_TARGET_DIR/debug/deps\"\nrevision=$(sed -n '1p' \"$PWD/revision.txt\")\nartifact=\"$CARGO_TARGET_DIR/debug/deps/fake-test\"\nprintf '#!/bin/sh\\nprintf %s > {marker}\\n' \"$revision\" > \"$artifact\"\nchmod 755 \"$artifact\"\n{mutation}printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' \"$artifact\"\n",
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$CARGO_TARGET_DIR\" >> {log}\nmkdir -p \"$CARGO_TARGET_DIR/debug/deps\"\nrevision=$(sed -n '1p' \"$PWD/revision.txt\")\nartifact=\"$CARGO_TARGET_DIR/debug/deps/fake-test\"\nprintf '#!/bin/sh\\n{test_mutation}printf %s > {marker}\\n' \"$revision\" > \"$artifact\"\nchmod 755 \"$artifact\"\n{mutation}printf '{{\"reason\":\"compiler-artifact\",\"profile\":{{\"test\":true}},\"executable\":\"%s\"}}\\n' \"$artifact\"\n{later_artifact}",
                 log = shell_literal(&invocation_log),
                 marker = shell_literal(&run_marker),
             );
@@ -2035,6 +2068,7 @@ mod tests {
                 artifact,
                 invocation_log,
                 run_marker,
+                later_run_marker,
             }
         }
 
@@ -2063,7 +2097,7 @@ mod tests {
 
     #[test]
     fn live_source_mutation_during_build_cannot_change_selected_snapshot() {
-        let fixture = Fixture::new(true);
+        let fixture = Fixture::new(true, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         assert_eq!(
@@ -2080,8 +2114,25 @@ mod tests {
     }
 
     #[test]
+    fn a_test_that_mutates_the_snapshot_fails_verification() {
+        let fixture = Fixture::new(false, true);
+        let operation = fixture.operation();
+        let prepared = operation.prepare().unwrap();
+
+        assert!(matches!(
+            operation.execute(&prepared),
+            Err(RustVerifyError::SourceChanged)
+        ));
+        assert_eq!(
+            fs::read_to_string(prepared.snapshot_root().join("revision.txt")).unwrap(),
+            "B"
+        );
+        assert!(!fixture.later_run_marker.exists());
+    }
+
+    #[test]
     fn two_source_revisions_reuse_one_cache_and_publish_distinct_bundles() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let first = operation.prepare().unwrap();
         fs::write(fixture.change.join("revision.txt"), "B\n").unwrap();
@@ -2097,7 +2148,7 @@ mod tests {
 
     #[test]
     fn replacing_mutable_cargo_output_after_prepare_still_launches_bundle_a() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         fs::write(
@@ -2116,7 +2167,7 @@ mod tests {
 
     #[test]
     fn tampered_bundle_fails_before_launch() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let executable = prepared.bundle_root().join("bin/test-0000");
@@ -2131,7 +2182,7 @@ mod tests {
 
     #[test]
     fn ready_checkpoint_recovers_staging_after_restart_without_rebuilding() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let restarted = fixture.operation().prepare().unwrap();
@@ -2149,7 +2200,7 @@ mod tests {
 
     #[test]
     fn exact_tree_reclamation_refuses_replacement_identity() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let measured = measure_exact_tree(prepared.bundle_root()).unwrap();
@@ -2175,7 +2226,7 @@ mod tests {
 
     #[test]
     fn exact_tree_reclamation_recovers_after_quarantine_rename() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let measured = measure_exact_tree(prepared.bundle_root()).unwrap();
@@ -2207,7 +2258,7 @@ mod tests {
 
     #[test]
     fn exact_staging_bundle_is_reverified_before_completion() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let staging = measure_exact_tree(prepared.bundle_root()).unwrap();
@@ -2235,7 +2286,7 @@ mod tests {
 
     #[test]
     fn worker_file_persists_bounded_failure_without_stdio_contract() {
-        let fixture = Fixture::new(false);
+        let fixture = Fixture::new(false, false);
         let invocation_path = fixture.worker_temporary.join("invocation.json");
         let result_path = fixture.worker_temporary.join("result.json");
         let mut change_identity = exact_directory_identity(&fixture.change).unwrap();
@@ -2252,6 +2303,13 @@ mod tests {
             temporary_identity: exact_directory_identity(&fixture.worker_temporary).unwrap(),
         };
         write_worker_invocation(&invocation_path, &invocation).unwrap();
+        write_worker_invocation(&invocation_path, &invocation).unwrap();
+        let mut different = invocation.clone();
+        different.change_id = Uuid::new_v4();
+        assert!(matches!(
+            write_worker_invocation(&invocation_path, &different),
+            Err(RustVerifyError::InvalidCheckpoint)
+        ));
         run_worker_file(&invocation_path, &result_path).unwrap();
         let result = read_worker_result(&result_path).unwrap();
         assert!(!result.success);

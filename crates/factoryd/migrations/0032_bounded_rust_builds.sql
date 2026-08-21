@@ -42,18 +42,6 @@ CREATE TABLE runs (
     phase TEXT NOT NULL CHECK (
         phase IN ('admitted', 'running', 'finalizing', 'terminal')
     ),
-    requested_outcome TEXT CHECK (
-        requested_outcome IS NULL OR
-        requested_outcome IN ('succeeded', 'blocked', 'failed', 'cancelled')
-    ),
-    requested_outcome_detail TEXT CHECK (
-        requested_outcome_detail IS NULL OR
-        length(CAST(requested_outcome_detail AS BLOB)) <= 4096
-    ),
-    requested_outcome_result TEXT CHECK (
-        requested_outcome_result IS NULL OR
-        length(CAST(requested_outcome_result AS BLOB)) <= 131072
-    ),
     outcome TEXT CHECK (
         outcome IS NULL OR outcome IN ('succeeded', 'blocked', 'failed', 'cancelled')
     ),
@@ -105,15 +93,14 @@ CREATE TABLE runs (
     CHECK (parent_run_id IS NULL OR parent_run_id <> id),
     CHECK (
         (phase IN ('admitted', 'running')
-            AND requested_outcome IS NULL AND outcome IS NULL
+            AND outcome IS NULL
             AND finalizing_at_ms IS NULL AND ended_at_ms IS NULL
             AND capability_digest IS NOT NULL) OR
         (phase = 'finalizing'
-            AND requested_outcome IS NOT NULL AND outcome IS NULL
-            AND finalizing_at_ms IS NOT NULL AND ended_at_ms IS NULL
-            AND capability_digest IS NULL) OR
+            AND outcome IS NOT NULL
+            AND finalizing_at_ms IS NOT NULL AND ended_at_ms IS NULL) OR
         (phase = 'terminal'
-            AND requested_outcome IS NOT NULL AND outcome IS NOT NULL
+            AND outcome IS NOT NULL
             AND finalizing_at_ms IS NOT NULL AND ended_at_ms IS NOT NULL
             AND capability_digest IS NULL)
     ),
@@ -133,8 +120,7 @@ CREATE TABLE runs (
 INSERT INTO runs (
     id, project_id, agent_id, task_id, task_incarnation_id,
     admitted_task_work_revision, change_id, parent_run_id, source_root,
-    phase, requested_outcome, requested_outcome_detail, requested_outcome_result,
-    outcome, outcome_detail, outcome_result, capability_digest, provider,
+    phase, outcome, outcome_detail, outcome_result, capability_digest, provider,
     runtime_model, runtime_reasoning_effort, runtime_permission_mode,
     runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
     runner_instance_id, runner_runtime, runner_protocol_version,
@@ -145,8 +131,7 @@ INSERT INTO runs (
 SELECT
     id, project_id, agent_id, task_id, task_incarnation_id,
     admitted_task_work_revision, change_id, parent_run_id, source_root,
-    phase, outcome, outcome_detail, outcome_result,
-    outcome, outcome_detail, outcome_result, NULL, provider,
+    phase, outcome, outcome_detail, outcome_result, capability_digest, provider,
     runtime_model, runtime_reasoning_effort, runtime_permission_mode,
     runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
     runner_instance_id, runner_runtime, runner_protocol_version,
@@ -254,7 +239,7 @@ CREATE TABLE rust_build_caches (
     inode INTEGER CHECK (inode IS NULL OR inode > 0),
     bytes INTEGER CHECK (bytes IS NULL OR bytes >= 0),
     lifecycle TEXT NOT NULL CHECK (
-        lifecycle IN ('declared', 'available', 'reclaiming', 'removed', 'unresolved')
+        lifecycle IN ('declared', 'available', 'reclaiming', 'removed')
     ),
     failure TEXT CHECK (
         failure IS NULL OR length(CAST(failure AS BLOB)) BETWEEN 1 AND 4096
@@ -266,7 +251,7 @@ CREATE TABLE rust_build_caches (
     FOREIGN KEY (project_id, project_incarnation_id)
         REFERENCES projects(id, incarnation_id),
     CHECK (lifecycle <> 'available' OR (dev IS NOT NULL AND inode IS NOT NULL)),
-    CHECK ((lifecycle = 'unresolved') = (failure IS NOT NULL))
+    CHECK (lifecycle <> 'removed' OR failure IS NULL)
 ) STRICT;
 
 CREATE TABLE rust_storage_policy (

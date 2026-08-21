@@ -811,11 +811,12 @@ async fn handle_request(
                         cache_bytes: summary.cache_bytes,
                         protected_count: summary.protected_count,
                         reclaimable_count: summary.reclaimable_count,
+                        failed_count: summary.failed_count,
                         cache_count_over_limit: summary.cache_count > policy.max_cache_count,
                         cache_bytes_over_limit: summary
                             .cache_bytes
                             .is_some_and(|bytes| bytes > policy.max_cache_bytes),
-                        complete: summary.cache_bytes.is_some(),
+                        complete: summary.cache_bytes.is_some() && summary.failed_count == 0,
                     })
                 })
                 .await?;

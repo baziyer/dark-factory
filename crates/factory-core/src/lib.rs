@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,7 +461,7 @@ pub struct RunSnapshot {
 }
 
 impl RunSnapshot {
-    /// During finalization `outcome` is the immutable requested outcome. At
+    /// During finalization `outcome` is the immutable proposed outcome. At
     /// terminal it is the daemon-selected actual outcome after any completion
     /// verification. It is absent while the attempt still has effect authority.
     #[must_use]

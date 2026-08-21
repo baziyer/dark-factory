@@ -73,7 +73,6 @@ pub enum RustCacheLifecycle {
     Available,
     Reclaiming,
     Removed,
-    Unresolved,
 }
 
 impl RustCacheLifecycle {
@@ -83,7 +82,6 @@ impl RustCacheLifecycle {
             "available" => Self::Available,
             "reclaiming" => Self::Reclaiming,
             "removed" => Self::Removed,
-            "unresolved" => Self::Unresolved,
             _ => return None,
         })
     }
@@ -118,6 +116,7 @@ pub struct RustStorageSummary {
     pub cache_bytes: Option<u64>,
     pub protected_count: u64,
     pub reclaimable_count: u64,
+    pub failed_count: u64,
 }
 
 impl Store {
@@ -449,13 +448,14 @@ impl Store {
         Ok(cache)
     }
 
-    pub fn bind_rust_cache(
+    /// Binds the daemon-declared cache to an exact filesystem identity.
+    /// A writer never inherits a pre-write byte measurement.
+    pub fn bind_rust_cache_identity(
         &mut self,
         run_id: &RunId,
         path: &str,
         dev: u64,
         inode: u64,
-        bytes: u64,
         now_ms: i64,
     ) -> Result<RustBuildCache> {
         validate_bound_identity(path, inode)?;
@@ -470,16 +470,15 @@ impl Store {
         }
         let changed = self.connection.execute(
             "UPDATE rust_build_caches
-             SET dev = ?1, inode = ?2, bytes = ?3, lifecycle = 'available',
-                 failure = NULL, updated_at_ms = ?4, last_used_at_ms = ?4
-             WHERE project_incarnation_id = ?5 AND cache_key = ?6
-               AND path = ?7
+             SET dev = ?1, inode = ?2, bytes = NULL, lifecycle = 'available',
+                 failure = NULL, updated_at_ms = ?3, last_used_at_ms = ?3
+             WHERE project_incarnation_id = ?4 AND cache_key = ?5
+               AND path = ?6
                AND (lifecycle = 'declared' OR
                     (lifecycle = 'available' AND dev = ?1 AND inode = ?2))",
             params![
                 to_i64(dev)?,
                 to_i64(inode)?,
-                to_i64(bytes)?,
                 now_ms,
                 check.project_incarnation_id,
                 cache_key,
@@ -489,6 +488,57 @@ impl Store {
         if changed != 1 {
             return Err(StoreError::InvalidRustBuildMetadata);
         }
+        load_cache(&self.connection, &check.project_incarnation_id, cache_key)?
+            .ok_or(StoreError::InvalidRustBuildMetadata)
+    }
+
+    /// Records the exact cache size only after the writer process group has
+    /// been reaped. Check revision and filesystem identity make crash retries
+    /// idempotent without allowing an earlier writer to measure a newer one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_rust_cache_measurement(
+        &mut self,
+        run_id: &RunId,
+        expected_revision: i64,
+        path: &str,
+        dev: u64,
+        inode: u64,
+        bytes: u64,
+        now_ms: i64,
+    ) -> Result<RustBuildCache> {
+        validate_bound_identity(path, inode)?;
+        let changed = self.connection.execute(
+            "UPDATE rust_build_caches AS cache
+             SET bytes = ?1, failure = NULL, updated_at_ms = ?2,
+                 last_used_at_ms = ?2
+             WHERE cache.path = ?3 AND cache.dev = ?4 AND cache.inode = ?5
+               AND cache.lifecycle = 'available'
+               AND EXISTS (
+                    SELECT 1 FROM rust_completion_checks check_row
+                    WHERE check_row.run_id = ?6 AND check_row.phase = 'running'
+                      AND check_row.revision = ?7
+                      AND check_row.project_incarnation_id = cache.project_incarnation_id
+                      AND check_row.cache_key = cache.cache_key
+               )",
+            params![
+                to_i64(bytes)?,
+                now_ms,
+                path,
+                to_i64(dev)?,
+                to_i64(inode)?,
+                run_id.as_str(),
+                expected_revision,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::InvalidRustBuildMetadata);
+        }
+        let check =
+            load_check(&self.connection, run_id)?.ok_or(StoreError::RustCompletionCheckNotFound)?;
+        let cache_key = check
+            .cache_key
+            .as_deref()
+            .ok_or(StoreError::InvalidRustCompletionPhase)?;
         load_cache(&self.connection, &check.project_incarnation_id, cache_key)?
             .ok_or(StoreError::InvalidRustBuildMetadata)
     }
@@ -561,6 +611,12 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        let failed_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM rust_build_caches
+             WHERE lifecycle <> 'removed' AND failure IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(RustStorageSummary {
             cache_count: from_i64(cache_count, 0)?,
             cache_bytes: (cache_count == cache_measured)
@@ -568,6 +624,7 @@ impl Store {
                 .transpose()?,
             protected_count: from_i64(protected_count, 0)?,
             reclaimable_count: from_i64(reclaimable_count, 0)?,
+            failed_count: from_i64(failed_count, 0)?,
         })
     }
 
@@ -628,8 +685,8 @@ impl Store {
     }
 
     /// Artifacts declared before an external mkdir/publish effect but not yet
-    /// bound. Restart must either resume exact publication or mark these
-    /// unresolved; they are never silently treated as reclaimable.
+    /// bound. Restart keeps a failed declaration recoverable and visible;
+    /// it is never silently treated as reclaimable.
     pub fn recoverable_rust_cache_declarations(&self) -> Result<Vec<RustBuildCache>> {
         let mut output = Vec::new();
         let mut caches = self.connection.prepare(
@@ -692,7 +749,7 @@ impl Store {
         finish_reclaim(&self.connection, incarnation_id, cache_key, now_ms)
     }
 
-    pub fn fail_rust_cache_reclaim(
+    pub fn record_rust_cache_failure(
         &mut self,
         incarnation_id: &str,
         cache_key: &str,
@@ -700,16 +757,6 @@ impl Store {
         now_ms: i64,
     ) -> Result<()> {
         fail_reclaim(&self.connection, incarnation_id, cache_key, failure, now_ms)
-    }
-
-    pub fn mark_rust_cache_unresolved(
-        &mut self,
-        incarnation_id: &str,
-        cache_key: &str,
-        failure: &str,
-        now_ms: i64,
-    ) -> Result<()> {
-        self.fail_rust_cache_reclaim(incarnation_id, cache_key, failure, now_ms)
     }
 
     /// Completes reconciliation after an exact filesystem absence check.
@@ -723,8 +770,8 @@ impl Store {
     }
 
     /// Atomically turns a deletable project's exact regenerable caches into
-    /// durable reclaim intents. Ambiguous declarations and unresolved
-    /// identities remain explicit blockers.
+    /// durable reclaim intents. Ambiguous declarations remain explicit
+    /// blockers.
     pub fn begin_project_rust_cache_reclamation(
         &mut self,
         project_id: &ProjectId,
@@ -766,7 +813,7 @@ impl Store {
         let has_ambiguous_cache: bool = transaction.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM rust_build_caches
-                WHERE project_id = ?1 AND lifecycle IN ('declared', 'unresolved')
+                WHERE project_id = ?1 AND lifecycle = 'declared'
              )",
             [project_id.as_str()],
             |row| row.get(0),
@@ -822,7 +869,7 @@ fn declare_cache_row(
                     params![now_ms, incarnation_id, cache_key],
                 )?;
             }
-            RustCacheLifecycle::Reclaiming | RustCacheLifecycle::Unresolved => {
+            RustCacheLifecycle::Reclaiming => {
                 return Err(StoreError::InvalidRustBuildMetadata);
             }
         }
@@ -881,10 +928,10 @@ fn ensure_cache_claim_capacity(transaction: &Transaction<'_>) -> Result<()> {
 pub(super) fn insert_completion_check_if_required(
     transaction: &Transaction<'_>,
     run: &factory_core::RunSnapshot,
-    requested_outcome: &RunOutcome,
+    proposal: &RunOutcome,
     now_ms: i64,
 ) -> Result<()> {
-    if !matches!(requested_outcome, RunOutcome::Succeeded) {
+    if !matches!(proposal, RunOutcome::Succeeded) {
         return Ok(());
     }
     let (role, verification, incarnation_id, change_id): (String, String, String, Option<String>) =
@@ -1047,7 +1094,7 @@ fn fail_reclaim(
     validate_failure(failure)?;
     let changed = connection.execute(
         "UPDATE rust_build_caches
-         SET lifecycle = 'unresolved', failure = ?1, updated_at_ms = ?2
+         SET failure = ?1, updated_at_ms = ?2
          WHERE project_incarnation_id = ?3 AND cache_key = ?4
            AND lifecycle IN ('declared', 'reclaiming') AND NOT EXISTS (
                 SELECT 1 FROM rust_completion_checks r
@@ -1418,6 +1465,62 @@ mod tests {
     }
 
     #[test]
+    fn cache_is_incomplete_until_exact_post_reap_measurement() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project_id, incarnation) = project(&mut store);
+        let run_id = RunId::try_from("66666666-6666-4666-8666-666666666666").unwrap();
+        insert_test_check(
+            &store,
+            &run_id,
+            &project_id,
+            &incarnation,
+            RustCompletionPhase::Running,
+            Some(CACHE_A),
+        );
+
+        let declared = store
+            .declare_rust_cache(&run_id, "/tmp/cache-a", 3)
+            .unwrap();
+        assert_eq!(declared.lifecycle, RustCacheLifecycle::Declared);
+        assert_eq!(declared.bytes, None);
+        assert_eq!(store.rust_storage_summary().unwrap().cache_bytes, None);
+
+        let bound = store
+            .bind_rust_cache_identity(&run_id, "/tmp/cache-a", 1, 2, 4)
+            .unwrap();
+        assert_eq!(bound.lifecycle, RustCacheLifecycle::Available);
+        assert_eq!(bound.bytes, None);
+        assert!(matches!(
+            store.pass_rust_completion_check(&run_id, 0, CACHE_B, CACHE_C, 5),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+        assert!(matches!(
+            store.record_rust_cache_measurement(&run_id, 1, "/tmp/cache-a", 1, 2, 7, 5),
+            Err(StoreError::InvalidRustBuildMetadata)
+        ));
+
+        let measured = store
+            .record_rust_cache_measurement(&run_id, 0, "/tmp/cache-a", 1, 2, 7, 6)
+            .unwrap();
+        assert_eq!(measured.bytes, Some(7));
+        assert_eq!(
+            store
+                .record_rust_cache_measurement(&run_id, 0, "/tmp/cache-a", 1, 2, 7, 7)
+                .unwrap()
+                .bytes,
+            Some(7)
+        );
+        assert_eq!(store.rust_storage_summary().unwrap().cache_bytes, Some(7));
+        assert_eq!(
+            store
+                .pass_rust_completion_check(&run_id, 0, CACHE_B, CACHE_C, 8)
+                .unwrap()
+                .phase,
+            RustCompletionPhase::Passed
+        );
+    }
+
+    #[test]
     fn project_cache_reclamation_requires_exact_unambiguous_inventory() {
         let mut store = Store::open_in_memory().unwrap();
         let (project_id, incarnation) = project(&mut store);
@@ -1435,8 +1538,9 @@ mod tests {
             Err(StoreError::ProjectHasRustCaches)
         ));
         store
-            .mark_rust_cache_unresolved(&incarnation, CACHE_A, "identity unknown", 4)
+            .record_rust_cache_failure(&incarnation, CACHE_A, "identity unknown", 4)
             .unwrap();
+        assert_eq!(store.rust_storage_summary().unwrap().failed_count, 1);
         assert!(matches!(
             store.begin_project_rust_cache_reclamation(&project_id, 5),
             Err(StoreError::ProjectHasRustCaches)
@@ -1496,11 +1600,11 @@ mod tests {
         assert_eq!(recoverable.len(), 3);
         assert!(!recoverable.iter().any(|cache| cache.cache_key == CACHE_A));
         assert!(matches!(
-            store.mark_rust_cache_unresolved(&incarnation, CACHE_A, "missing", 3),
+            store.record_rust_cache_failure(&incarnation, CACHE_A, "missing", 3),
             Err(StoreError::InvalidRustBuildMetadata)
         ));
         store
-            .mark_rust_cache_unresolved(&incarnation, CACHE_B, "missing", 3)
+            .record_rust_cache_failure(&incarnation, CACHE_B, "missing", 3)
             .unwrap();
         store
             .finish_absent_declared_rust_cache(&incarnation, CACHE_C, 3)
@@ -1529,7 +1633,7 @@ mod tests {
             .unwrap();
         store.begin_rust_cache_reclaim(&cache, 4).unwrap();
         store
-            .mark_rust_cache_unresolved(&incarnation, CACHE_D, "identity changed", 5)
+            .record_rust_cache_failure(&incarnation, CACHE_D, "identity changed", 5)
             .unwrap();
         assert!(store.rust_reclaim_candidates(8).unwrap().is_empty());
     }

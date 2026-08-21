@@ -1094,13 +1094,14 @@ fn write_storage_status(
     };
     writeln!(
         output,
-        "Rust storage: caches {}/{} ({} / {} bytes), protected {}, reclaimable {}, {state}",
+        "Rust storage: caches {}/{} ({} / {} bytes), protected {}, reclaimable {}, failed {}, {state}",
         storage.cache_count,
         storage.max_cache_count,
         optional_bytes(storage.cache_bytes),
         storage.max_cache_bytes,
         storage.protected_count,
         storage.reclaimable_count,
+        storage.failed_count,
     )
     .map_err(|error| error.to_string())
 }
