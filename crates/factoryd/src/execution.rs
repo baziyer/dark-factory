@@ -22,6 +22,7 @@ use factory_core::{
 #[cfg(not(target_os = "linux"))]
 use rustix::process::test_kill_process;
 use rustix::process::{Pid, test_kill_process_group};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
@@ -3530,17 +3531,42 @@ fn process_resource_absent(resource: &KernelResource) -> Result<bool, Error> {
     let Some(pid) = locator_number(&resource.locator, "pid") else {
         return Ok(false);
     };
+    process_identity_absent(pid, resource.birth_fingerprint.as_deref())
+}
+
+fn process_identity_absent(pid: u32, expected_birth: Option<&str>) -> Result<bool, Error> {
     let current = process_birth_fingerprint(pid)?;
     if current.is_none() {
         return Ok(true);
     }
     #[cfg(target_os = "linux")]
-    return Ok(resource
-        .birth_fingerprint
-        .as_deref()
-        .is_some_and(|expected| current.as_deref() != Some(expected)));
+    return Ok(expected_birth.is_some_and(|expected| current.as_deref() != Some(expected)));
     #[cfg(not(target_os = "linux"))]
-    Ok(false)
+    {
+        let _ = expected_birth;
+        Ok(false)
+    }
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum RunnerResourceLocator {
+    Setup(RunnerSetupLocator),
+    Pid(RunnerPidLocator),
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RunnerSetupLocator {
+    setup_path: PathBuf,
+    runner_instance_id: RunnerInstanceId,
+}
+
+#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct RunnerPidLocator {
+    pid: u32,
+    runner_instance_id: RunnerInstanceId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3554,32 +3580,61 @@ fn runner_resource_status(
     run: &RecoverableKernelRun,
     resource: &KernelResource,
 ) -> Result<RunnerResourceStatus, Error> {
-    if locator_number(&resource.locator, "pid").is_some() {
-        return Ok(if process_resource_absent(resource)? {
-            RunnerResourceStatus::Absent
-        } else {
-            RunnerResourceStatus::Present
-        });
-    }
-    let Some(setup_path) = locator_named_path(&resource.locator, "setup_path") else {
-        return Ok(RunnerResourceStatus::Unresolved(
-            "runner has neither a durable process identity nor a setup lease",
-        ));
+    let locator = match serde_json::from_str::<RunnerResourceLocator>(&resource.locator) {
+        Ok(locator) => locator,
+        Err(_) => {
+            return Ok(RunnerResourceStatus::Unresolved(
+                "runner resource locator is malformed",
+            ));
+        }
     };
-    let expected_setup_path = Path::new(&run.runner_runtime).join(RUNNER_STARTUP_LEASE_FILE);
-    let locator_instance = serde_json::from_str::<serde_json::Value>(&resource.locator)
-        .ok()
-        .and_then(|locator| {
-            locator
-                .get("runner_instance_id")?
-                .as_str()
-                .map(str::to_owned)
-        });
-    if setup_path != expected_setup_path
-        || locator_instance.as_deref() != Some(run.runner_instance_id.as_str())
-    {
+    let RunnerSetupLocator {
+        setup_path,
+        runner_instance_id,
+    } = match locator {
+        RunnerResourceLocator::Setup(setup) => setup,
+        RunnerResourceLocator::Pid(RunnerPidLocator {
+            pid,
+            runner_instance_id,
+        }) => {
+            if runner_instance_id != run.runner_instance_id {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process locator does not match its run",
+                ));
+            }
+            if i32::try_from(pid).ok().and_then(Pid::from_raw).is_none() {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process locator has an invalid PID",
+                ));
+            }
+            if !runner_pid_birth_is_compatible(resource.birth_fingerprint.as_deref()) {
+                return Ok(RunnerResourceStatus::Unresolved(
+                    "runner process fingerprint is incompatible with its locator",
+                ));
+            }
+            return Ok(
+                if process_identity_absent(pid, resource.birth_fingerprint.as_deref())? {
+                    RunnerResourceStatus::Absent
+                } else {
+                    RunnerResourceStatus::Present
+                },
+            );
+        }
+    };
+    if runner_instance_id != run.runner_instance_id {
         return Ok(RunnerResourceStatus::Unresolved(
             "runner setup locator does not match its run",
+        ));
+    }
+    let expected_setup_path = Path::new(&run.runner_runtime).join(RUNNER_STARTUP_LEASE_FILE);
+    if setup_path != expected_setup_path {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup locator does not match its run",
+        ));
+    }
+    if !runner_setup_birth_is_compatible(resource.birth_fingerprint.as_deref()) {
+        return Ok(RunnerResourceStatus::Unresolved(
+            "runner setup fingerprint is incompatible with its locator",
         ));
     }
 
@@ -3637,6 +3692,40 @@ fn runner_resource_status(
             source: source.into(),
         }),
     }
+}
+
+fn runner_setup_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    let Some(fingerprint) = fingerprint else {
+        return true;
+    };
+    let Some(value) = fingerprint.strip_prefix("unix-device:") else {
+        return false;
+    };
+    let Some((device, inode)) = value.split_once(":inode:") else {
+        return false;
+    };
+    let (Ok(device), Ok(inode)) = (device.parse::<u64>(), inode.parse::<u64>()) else {
+        return false;
+    };
+    fingerprint == runner_setup_birth_fingerprint(device, inode)
+}
+
+#[cfg(target_os = "linux")]
+fn runner_pid_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    let Some(fingerprint) = fingerprint else {
+        return false;
+    };
+    let Some(ticks) = fingerprint.strip_prefix("linux-start-ticks:") else {
+        return false;
+    };
+    ticks
+        .parse::<u64>()
+        .is_ok_and(|ticks| fingerprint == format!("linux-start-ticks:{ticks}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn runner_pid_birth_is_compatible(fingerprint: Option<&str>) -> bool {
+    fingerprint == Some("weak-presence-only")
 }
 
 fn process_group_absent(resource: &KernelResource) -> Result<bool, Error> {
@@ -4072,9 +4161,9 @@ expected_parent=$2
 shift 2
 [ "${1:-}" = "--" ] || exit 64
 [ "$PPID" = "$expected_parent" ] || exit 0
+# Keep the probe single-process: a polling child would inherit the lease.
 while [ ! -e "$gate_path" ]; do
     [ "$PPID" = "$expected_parent" ] || exit 0
-    sleep 0.01
 done
 exit 125
 "#,
@@ -4361,6 +4450,64 @@ exit 125
     }
 
     #[tokio::test]
+    async fn mixed_runner_locator_with_a_live_setup_lease_stays_unresolved() {
+        let root = private_tempdir();
+        let mut store = Store::open(root.path().join("state.db")).unwrap();
+        let admitted = admit_shell_attempt(&mut store, root.path());
+        let run_id = admitted.run.id.clone();
+        let runtime = PathBuf::from(&admitted.target.runner_runtime);
+        let state = DaemonState::new(store);
+        register_runtime(&state, &admitted).await;
+        let setup = runner_process::prepare_runner(runner_launch_spec(&admitted, root.path()))
+            .await
+            .unwrap();
+        let setup_path = setup.setup_path().to_owned();
+        register_setup(&state, &admitted, &setup).await;
+        let prepared = setup.spawn().unwrap();
+        let runner_pid = prepared.child_pid();
+        cancel_attempt(&state, &run_id).await;
+
+        let mut recovered = recover_run(&state, &run_id).await;
+        let runner_index = recovered
+            .resources
+            .iter()
+            .position(|resource| resource.kind == KernelResourceKind::RunnerProcess)
+            .unwrap();
+        recovered.resources[runner_index].locator = serde_json::json!({
+            "pid": runner_pid,
+            "runner_instance_id": admitted.target.runner_instance_id.as_str(),
+            "setup_path": &setup_path,
+        })
+        .to_string();
+        assert!(matches!(
+            runner_resource_status(&recovered, &recovered.resources[runner_index]).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(!release_absent_resources(&state, &recovered).await.unwrap());
+        let stored = state
+            .with_store({
+                let run_id = run_id.clone();
+                move |store| store.kernel_resources(&run_id)
+            })
+            .await
+            .unwrap();
+        assert!(stored.iter().any(|resource| {
+            resource.kind == KernelResourceKind::RunnerProcess
+                && resource.state == KernelResourceState::Unresolved
+        }));
+        assert!(runtime.exists());
+        assert!(setup_path.exists());
+        let runner_pid = Pid::from_raw(i32::try_from(runner_pid).unwrap()).unwrap();
+        assert!(rustix::process::test_kill_process(runner_pid).is_ok());
+
+        prepared.terminate().await;
+        assert_eq!(
+            rustix::process::test_kill_process(runner_pid),
+            Err(rustix::io::Errno::SRCH)
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_between_spawn_and_pid_registration_binds_then_reaps_exact_gate() {
         let root = private_tempdir();
         let database = root.path().join("state.db");
@@ -4486,6 +4633,23 @@ exit 125
 
         let setup_path = runtime.join(RUNNER_STARTUP_LEASE_FILE);
         let setup_locator = runner_setup_locator(&setup_path, &runner_instance_id);
+        let wrong_instance = RunnerInstanceId::try_from("runner-2").unwrap();
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(runner_setup_locator(&setup_path, &wrong_instance), None)
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some("weak-presence-only".into()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
         assert_eq!(
             runner_resource_status(&run, &resource(setup_locator.clone(), None)).unwrap(),
             RunnerResourceStatus::Absent
@@ -4497,8 +4661,28 @@ exit 125
             .mode(0o600)
             .open(&setup_path)
             .unwrap();
+        rustix::fs::flock(&setup_file, rustix::fs::FlockOperation::LockExclusive).unwrap();
         let metadata = setup_file.metadata().unwrap();
         let exact_birth = runner_setup_birth_fingerprint(metadata.dev(), metadata.ino());
+        assert_eq!(
+            runner_resource_status(
+                &run,
+                &resource(setup_locator.clone(), Some(exact_birth.clone()))
+            )
+            .unwrap(),
+            RunnerResourceStatus::Present
+        );
+        let mixed_locator = serde_json::json!({
+            "pid": std::process::id(),
+            "runner_instance_id": runner_instance_id.as_str(),
+            "setup_path": &setup_path,
+        })
+        .to_string();
+        assert!(matches!(
+            runner_resource_status(&run, &resource(mixed_locator, Some(exact_birth.clone())))
+                .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
         assert!(matches!(
             runner_resource_status(
                 &run,
@@ -4507,6 +4691,45 @@ exit 125
             .unwrap(),
             RunnerResourceStatus::Unresolved(_)
         ));
+
+        let pid_locator = runner_locator(std::process::id(), &runner_instance_id);
+        assert!(matches!(
+            runner_resource_status(&run, &resource(pid_locator.clone(), None)).unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        assert!(matches!(
+            runner_resource_status(&run, &resource(pid_locator, Some(exact_birth.clone())))
+                .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+        let current_pid_birth = process_birth_fingerprint(std::process::id())
+            .unwrap()
+            .unwrap();
+        for invalid_pid in [0, u32::MAX] {
+            assert!(matches!(
+                runner_resource_status(
+                    &run,
+                    &resource(
+                        runner_locator(invalid_pid, &runner_instance_id),
+                        Some(current_pid_birth.clone())
+                    )
+                )
+                .unwrap(),
+                RunnerResourceStatus::Unresolved(_)
+            ));
+        }
+        assert!(matches!(
+            runner_resource_status(
+                &run,
+                &resource(
+                    runner_locator(std::process::id(), &wrong_instance),
+                    Some(current_pid_birth)
+                )
+            )
+            .unwrap(),
+            RunnerResourceStatus::Unresolved(_)
+        ));
+
         drop(setup_file);
         fs::remove_file(&setup_path).unwrap();
         assert!(matches!(
@@ -4516,10 +4739,57 @@ exit 125
     }
 
     #[test]
-    fn pid_locator_is_typed_json_not_display_text() {
-        let locator = serde_json::json!({ "pid": 42 }).to_string();
-        assert_eq!(locator_number(&locator, "pid"), Some(42));
-        assert_eq!(locator_number("pid 42", "pid"), None);
+    fn runner_locator_is_a_closed_pair_of_typed_variants() {
+        let runner_instance_id = RunnerInstanceId::try_from("runner-1").unwrap();
+        let setup_path = PathBuf::from("/tmp/runner-startup.lease");
+        assert!(matches!(
+            serde_json::from_str::<RunnerResourceLocator>(&runner_setup_locator(
+                &setup_path,
+                &runner_instance_id
+            )),
+            Ok(RunnerResourceLocator::Setup(_))
+        ));
+        assert!(matches!(
+            serde_json::from_str::<RunnerResourceLocator>(&runner_locator(42, &runner_instance_id)),
+            Ok(RunnerResourceLocator::Pid(_))
+        ));
+
+        for malformed in [
+            serde_json::json!({}).to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+                "setup_path": &setup_path,
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+                "unknown": true,
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": "42",
+                "runner_instance_id": runner_instance_id.as_str(),
+            })
+            .to_string(),
+            serde_json::json!({
+                "setup_path": 42,
+                "runner_instance_id": runner_instance_id.as_str(),
+            })
+            .to_string(),
+            serde_json::json!({
+                "pid": 42,
+                "runner_instance_id": "not valid",
+            })
+            .to_string(),
+            "pid 42".into(),
+        ] {
+            assert!(
+                serde_json::from_str::<RunnerResourceLocator>(&malformed).is_err(),
+                "accepted malformed runner locator: {malformed}"
+            );
+        }
     }
 
     #[test]
