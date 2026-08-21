@@ -8,19 +8,20 @@ license = "MIT"
 [features]
 default = []
 development-sqlite = ["dep:rusqlite"]
+provision-runtime = ["dep:reqwest", "dep:serde"]
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
-base64 = "0.22.1"
-getrandom = "0.3.4"
 hex = "0.4.3"
 hmac = "0.12.1"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls"], optional = true }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 serde_json = "1"
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls"] }
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
 tower = "0.5.3"
 url = "2.5.8"
 vercel_runtime = { version = "2.4", features = ["axum"] }
@@ -36,6 +37,7 @@ path = "api/broker.rs"
 [[bin]]
 name = "provision-runtime"
 path = "tools/provision_runtime.rs"
+required-features = ["provision-runtime"]
 
 [profile.release]
 codegen-units = 1

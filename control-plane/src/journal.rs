@@ -3,13 +3,11 @@ use std::{str::FromStr as _, time::Duration};
 #[cfg(feature = "development-sqlite")]
 use std::{path::Path, sync::Arc};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use hmac::{Hmac, Mac as _};
 #[cfg(feature = "development-sqlite")]
 use rusqlite::{Connection, OptionalExtension as _, TransactionBehavior, params};
 use sha2::{Digest as _, Sha256};
 use sqlx::{
-    ConnectOptions as _, PgPool, Row as _,
+    ConnectOptions as _, PgConnection, PgPool, Row as _,
     postgres::{PgConnectOptions, PgPoolOptions, PgSslMode},
 };
 use url::Url;
@@ -36,22 +34,34 @@ pub(crate) enum Error {
     InvalidSchema,
     #[error("control-plane schema migration conflicts with the expected revision")]
     MigrationConflict,
+    #[cfg(feature = "provision-runtime")]
     #[error("runtime database role has unexpected memberships or ownership")]
     RuntimeRoleDrift,
+    #[cfg(feature = "provision-runtime")]
     #[error("PostgreSQL 17 or newer is required")]
     UnsupportedPostgres,
+    #[cfg(feature = "provision-runtime")]
+    #[error("database is not the expected Neon project and branch")]
+    InvalidNeonIdentity,
 }
 
 const MIGRATION_COMPONENT: &str = "maintainer_webhook";
 const MIGRATION_REVISION: &str = "0001";
 const MIGRATION_SQL: &str = include_str!("../migrations/0001_maintainer_deliveries.sql");
 pub(crate) const RUNTIME_ROLE: &str = "dark_factory_broker_runtime";
+#[cfg(feature = "provision-runtime")]
 const RUNTIME_ROLE_COMMENT: &str = "dark-factory-control-plane managed runtime role v1";
 // SQLx reads these process-global settings before it parses a URL and exposes
 // no API for clearing them. Managed Postgres connection aliases are safe
 // because the required URL fields overwrite them below; these optional fields
 // are not aliases and must remain explicit URL authority.
 const UNSUPPORTED_SQLX_ENV: [&str; 4] = ["PGOPTIONS", "PGSSLCERT", "PGSSLKEY", "PGSSLROOTCERT"];
+
+#[cfg(feature = "provision-runtime")]
+pub(crate) struct NeonIdentity {
+    pub(crate) project_id: String,
+    pub(crate) branch_id: String,
+}
 
 #[derive(Clone)]
 pub(crate) enum DeliveryJournal {
@@ -180,13 +190,14 @@ pub(crate) fn postgres_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
         // otherwise survive when its ordinary URL spelling uses a default.
         .port(url.port().unwrap_or(5432))
         .application_name("dark-factory-control-plane")
+        // `channel_binding` in Marketplace URLs is tolerated above but SQLx
+        // 0.8 does not enforce it. Every actual connection therefore upgrades
+        // independently to authenticated certificate and hostname checking.
+        .ssl_mode(PgSslMode::VerifyFull)
         .disable_statement_logging();
-    if !matches!(
-        options.get_ssl_mode(),
-        PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull
-    ) {
+    if !matches!(options.get_ssl_mode(), PgSslMode::VerifyFull) {
         return Err(sqlx::Error::Configuration(
-            "database URL must require TLS".into(),
+            "database URL must use verified TLS".into(),
         ));
     }
     let pool = PgPoolOptions::new()
@@ -198,18 +209,30 @@ pub(crate) fn postgres_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
     Ok(pool)
 }
 
+#[cfg(feature = "provision-runtime")]
+pub(crate) fn neon_owner_pool(database_url: &str) -> Result<PgPool, sqlx::Error> {
+    let url = Url::parse(database_url).map_err(sqlx::Error::config)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| sqlx::Error::Configuration("Neon owner URL must contain a host".into()))?;
+    if host.len() <= ".neon.tech".len() || !host.ends_with(".neon.tech") {
+        return Err(sqlx::Error::Configuration(
+            "Neon owner URL host is not a Neon service host".into(),
+        ));
+    }
+    postgres_pool(database_url)
+}
+
+#[cfg(feature = "provision-runtime")]
 pub(crate) async fn verify_runtime(database_url: &str) -> Result<(), Error> {
     DeliveryJournal::postgres(database_url)?.ready().await
 }
 
-pub(crate) async fn migrate(pool: &PgPool) -> Result<(), Error> {
-    let mut transaction = pool.begin().await?;
-    sqlx::query("SELECT pg_advisory_xact_lock(441684976339)")
-        .execute(&mut *transaction)
-        .await?;
+#[cfg(feature = "provision-runtime")]
+async fn migrate(transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> Result<(), Error> {
     let supported: bool =
         sqlx::query_scalar("SELECT current_setting('server_version_num')::integer >= 170000")
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
     if !supported {
         return Err(Error::UnsupportedPostgres);
@@ -225,7 +248,7 @@ pub(crate) async fn migrate(pool: &PgPool) -> Result<(), Error> {
                 CHECK (digest ~ '^[0-9a-f]{64}$')
         )",
     )
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
     let existing = sqlx::query(
         "SELECT revision, digest
@@ -233,7 +256,7 @@ pub(crate) async fn migrate(pool: &PgPool) -> Result<(), Error> {
          WHERE component = $1",
     )
     .bind(MIGRATION_COMPONENT)
-    .fetch_optional(&mut *transaction)
+    .fetch_optional(&mut **transaction)
     .await?;
     let digest = migration_digest();
     if let Some(row) = existing {
@@ -242,12 +265,11 @@ pub(crate) async fn migrate(pool: &PgPool) -> Result<(), Error> {
         if revision != MIGRATION_REVISION || stored_digest != digest {
             return Err(Error::MigrationConflict);
         }
-        transaction.commit().await?;
         return Ok(());
     }
 
     sqlx::raw_sql(MIGRATION_SQL)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
     sqlx::query(
         "INSERT INTO public.dark_factory_schema_migrations (
@@ -257,17 +279,36 @@ pub(crate) async fn migrate(pool: &PgPool) -> Result<(), Error> {
     .bind(MIGRATION_COMPONENT)
     .bind(MIGRATION_REVISION)
     .bind(digest)
-    .execute(&mut *transaction)
+    .execute(&mut **transaction)
     .await?;
-    transaction.commit().await?;
     Ok(())
 }
 
-pub(crate) async fn provision_runtime(pool: &PgPool, verifier: &str) -> Result<(), Error> {
+#[cfg(feature = "provision-runtime")]
+pub(crate) async fn prepare_runtime(
+    pool: &PgPool,
+    expected_project_id: &str,
+) -> Result<NeonIdentity, Error> {
     let mut transaction = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(441684976339)")
         .execute(&mut *transaction)
         .await?;
+    let (project_id, branch_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT current_setting('neon.project_id', true),
+                current_setting('neon.branch_id', true)",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    let (Some(project_id), Some(branch_id)) = (project_id, branch_id) else {
+        return Err(Error::InvalidNeonIdentity);
+    };
+    if project_id != expected_project_id
+        || !neon_identifier_is_valid(&project_id)
+        || !neon_identifier_is_valid(&branch_id)
+    {
+        return Err(Error::InvalidNeonIdentity);
+    }
+    migrate(&mut transaction).await?;
     let owner: String = sqlx::query_scalar("SELECT current_user")
         .fetch_one(&mut *transaction)
         .await?;
@@ -286,8 +327,7 @@ pub(crate) async fn provision_runtime(pool: &PgPool, verifier: &str) -> Result<(
     .fetch_optional(&mut *transaction)
     .await?;
     if let Some(role) = existing_role {
-        let exact = role.try_get::<bool, _>("rolcanlogin")?
-            && !role.try_get::<bool, _>("rolinherit")?
+        let exact = !role.try_get::<bool, _>("rolinherit")?
             && !role.try_get::<bool, _>("rolsuper")?
             && !role.try_get::<bool, _>("rolcreatedb")?
             && !role.try_get::<bool, _>("rolcreaterole")?
@@ -301,7 +341,7 @@ pub(crate) async fn provision_runtime(pool: &PgPool, verifier: &str) -> Result<(
     } else {
         let create_role: String = sqlx::query_scalar(
             "SELECT format(
-                 'CREATE ROLE %I LOGIN NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L PASSWORD NULL',
+                 'CREATE ROLE %I NOLOGIN NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L PASSWORD NULL',
                  $1, 'infinity'
              )",
         )
@@ -366,19 +406,20 @@ pub(crate) async fn provision_runtime(pool: &PgPool, verifier: &str) -> Result<(
         return Err(Error::RuntimeRoleDrift);
     }
 
-    let alter_role: String = sqlx::query_scalar(
+    let normalize_role: String = sqlx::query_scalar(
         "SELECT format(
-             'ALTER ROLE %I RESET ALL; ALTER ROLE %I IN DATABASE %I RESET ALL; ALTER ROLE %I WITH LOGIN PASSWORD %L NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L',
-             $1, $1, current_database(), $1, $2, 'infinity'
+             'ALTER ROLE %I RESET ALL; ALTER ROLE %I IN DATABASE %I RESET ALL; ALTER ROLE %I WITH NOLOGIN PASSWORD NULL NOINHERIT CONNECTION LIMIT -1 VALID UNTIL %L',
+             $1, $1, current_database(), $1, 'infinity'
          )",
     )
     .bind(RUNTIME_ROLE)
-    .bind(verifier)
     .fetch_one(&mut *transaction)
     .await?;
-    sqlx::raw_sql(&alter_role)
+    sqlx::raw_sql(&normalize_role)
         .execute(&mut *transaction)
         .await?;
+
+    normalize_neon_provider_database_acl(&mut transaction).await?;
 
     let database_acl: String = sqlx::query_scalar(
         "SELECT format(
@@ -423,54 +464,225 @@ pub(crate) async fn provision_runtime(pool: &PgPool, verifier: &str) -> Result<(
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
+    Ok(NeonIdentity {
+        project_id,
+        branch_id,
+    })
+}
+
+#[cfg(feature = "provision-runtime")]
+pub(crate) async fn activate_runtime(pool: &PgPool, identity: &NeonIdentity) -> Result<(), Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(441684976339)")
+        .execute(&mut *transaction)
+        .await?;
+    let (project_id, branch_id): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT current_setting('neon.project_id', true),
+                current_setting('neon.branch_id', true)",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if project_id.as_deref() != Some(&identity.project_id)
+        || branch_id.as_deref() != Some(&identity.branch_id)
+    {
+        return Err(Error::RuntimeRoleDrift);
+    }
+    normalize_neon_provider_database_acl(&mut transaction).await?;
+    if !runtime_role_is_exact_for_activation(&mut transaction).await? {
+        return Err(Error::RuntimeRoleDrift);
+    }
+    postgres_contract_is_exact(&mut transaction, false, false).await?;
+    if !default_privileges_are_exact(&mut transaction).await? {
+        return Err(Error::RuntimeRoleDrift);
+    }
+    sqlx::query("ALTER ROLE dark_factory_broker_runtime LOGIN")
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
     Ok(())
+}
+
+#[cfg(feature = "provision-runtime")]
+async fn normalize_neon_provider_database_acl(connection: &mut PgConnection) -> Result<(), Error> {
+    let provider = sqlx::query(
+        "SELECT count(*) AS row_count,
+            COALESCE(bool_and(
+                NOT provider.rolcanlogin
+                AND provider.rolinherit
+                AND NOT provider.rolsuper
+                AND provider.rolcreatedb
+                AND provider.rolcreaterole
+                AND provider.rolreplication
+                AND provider.rolbypassrls
+                AND provider.rolconnlimit = -1
+                AND provider.rolvaliduntil IS NULL
+                AND provider.oid <> owner.oid
+            ), false) AS role_shape_is_exact,
+            COALESCE(bool_and(
+                NOT membership.admin_option
+                AND membership.inherit_option
+                AND membership.set_option
+                AND grantor.rolname = 'cloud_admin'
+            ), false) AS owner_membership_is_exact
+         FROM pg_catalog.pg_roles provider
+         JOIN pg_catalog.pg_roles owner ON owner.rolname = current_user
+         JOIN pg_catalog.pg_auth_members membership
+           ON membership.roleid = provider.oid
+          AND membership.member = owner.oid
+         JOIN pg_catalog.pg_roles grantor ON grantor.oid = membership.grantor
+         WHERE provider.rolname = 'neon_superuser'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !neon_provider_identity_is_expected(
+        provider.try_get("row_count")?,
+        provider.try_get("role_shape_is_exact")?,
+        provider.try_get("owner_membership_is_exact")?,
+    ) {
+        return Err(Error::InvalidNeonIdentity);
+    }
+    let revoke: String = sqlx::query_scalar(
+        "SELECT format(
+             'REVOKE ALL ON DATABASE %I FROM neon_superuser',
+             current_database()
+         )",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    sqlx::raw_sql(&revoke).execute(&mut *connection).await?;
+    Ok(())
+}
+
+#[cfg(feature = "provision-runtime")]
+const fn neon_provider_identity_is_expected(
+    row_count: i64,
+    role_shape_is_exact: bool,
+    owner_membership_is_exact: bool,
+) -> bool {
+    row_count == 1 && role_shape_is_exact && owner_membership_is_exact
+}
+
+#[cfg(feature = "provision-runtime")]
+async fn runtime_role_is_exact_for_activation(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH runtime AS (
+             SELECT oid, rolcanlogin, rolinherit, rolsuper, rolcreatedb,
+                    rolcreaterole, rolreplication, rolbypassrls, rolconnlimit,
+                    rolvaliduntil, rolconfig,
+                    pg_catalog.shobj_description(oid, 'pg_authid') AS comment
+             FROM pg_catalog.pg_roles
+             WHERE rolname = $1
+         ),
+         provisioning_owner AS (
+             SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user
+         ),
+         database_row AS (
+             SELECT datdba FROM pg_catalog.pg_database WHERE datname = current_database()
+         )
+         SELECT NOT runtime.rolcanlogin
+            AND NOT runtime.rolinherit
+            AND NOT runtime.rolsuper
+            AND NOT runtime.rolcreatedb
+            AND NOT runtime.rolcreaterole
+            AND NOT runtime.rolreplication
+            AND NOT runtime.rolbypassrls
+            AND runtime.rolconnlimit = -1
+            AND COALESCE(runtime.rolvaliduntil = 'infinity'::timestamptz, false)
+            AND runtime.rolconfig IS NULL
+            AND runtime.comment = $2
+            AND provisioning_owner.oid = database_row.datdba
+            AND (
+                SELECT count(*)
+                FROM pg_catalog.pg_auth_members membership
+                WHERE membership.member = runtime.oid
+                   OR membership.roleid = runtime.oid
+            ) = 1
+            AND EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_auth_members membership
+                WHERE membership.roleid = runtime.oid
+                  AND membership.member = provisioning_owner.oid
+                  AND membership.admin_option
+                  AND NOT membership.inherit_option
+                  AND NOT membership.set_option
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_db_role_setting setting
+                WHERE setting.setrole = runtime.oid
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM pg_catalog.pg_shdepend dependency
+                WHERE dependency.refclassid = 'pg_authid'::regclass
+                  AND dependency.refobjid = runtime.oid
+                  AND dependency.deptype = 'o'
+            )
+         FROM runtime, provisioning_owner, database_row",
+    )
+    .bind(RUNTIME_ROLE)
+    .bind(RUNTIME_ROLE_COMMENT)
+    .fetch_one(&mut **transaction)
+    .await
+}
+
+#[cfg(feature = "provision-runtime")]
+async fn default_privileges_are_exact(connection: &mut PgConnection) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH runtime AS (
+             SELECT oid FROM pg_catalog.pg_roles WHERE rolname = $1
+         ),
+         provisioning_owner AS (
+             SELECT oid FROM pg_catalog.pg_roles WHERE rolname = current_user
+         )
+         SELECT NOT EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_default_acl default_acl
+             CROSS JOIN LATERAL pg_catalog.aclexplode(default_acl.defaclacl) acl
+             CROSS JOIN runtime
+             CROSS JOIN provisioning_owner
+             WHERE default_acl.defaclrole = provisioning_owner.oid
+               AND default_acl.defaclobjtype IN ('r', 'S')
+               AND (acl.grantee = 0 OR acl.grantee = runtime.oid)
+         )",
+    )
+    .bind(RUNTIME_ROLE)
+    .fetch_one(&mut *connection)
+    .await
+}
+
+#[cfg(feature = "provision-runtime")]
+fn neon_identifier_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 60
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn migration_digest() -> String {
     hex::encode(Sha256::digest(MIGRATION_SQL.as_bytes()))
 }
 
-pub(crate) fn scram_verifier(password: &str, salt: &[u8]) -> String {
-    const ITERATIONS: u32 = 4096;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(password.as_bytes())
-        .expect("HMAC-SHA-256 accepts passwords of any length");
-    mac.update(salt);
-    mac.update(&1_u32.to_be_bytes());
-    let mut previous = mac.finalize_reset().into_bytes();
-    let mut salted_password = previous;
-    for _ in 1..ITERATIONS {
-        mac.update(&previous);
-        previous = mac.finalize_reset().into_bytes();
-        for (result, block) in salted_password.iter_mut().zip(previous) {
-            *result ^= block;
-        }
-    }
-
-    let mut client_key_mac = Hmac::<Sha256>::new_from_slice(&salted_password)
-        .expect("HMAC-SHA-256 accepts keys of any length");
-    client_key_mac.update(b"Client Key");
-    let stored_key = Sha256::digest(client_key_mac.finalize().into_bytes());
-
-    let mut server_key_mac = Hmac::<Sha256>::new_from_slice(&salted_password)
-        .expect("HMAC-SHA-256 accepts keys of any length");
-    server_key_mac.update(b"Server Key");
-    let server_key = server_key_mac.finalize().into_bytes();
-
-    format!(
-        "SCRAM-SHA-256${ITERATIONS}:{}${}:{}",
-        STANDARD.encode(salt),
-        STANDARD.encode(stored_key),
-        STANDARD.encode(server_key)
-    )
+async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
+    let mut connection = pool.acquire().await?;
+    postgres_contract_is_exact(&mut connection, true, true).await
 }
 
-async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
-    if !runtime_privileges_are_exact(pool).await? || !catalog_acls_are_exact(pool).await? {
+async fn postgres_contract_is_exact(
+    connection: &mut PgConnection,
+    expected_login: bool,
+    require_runtime_session: bool,
+) -> Result<(), Error> {
+    if !runtime_privileges_are_exact(connection, expected_login, require_runtime_session).await?
+        || !catalog_acls_are_exact(connection).await?
+    {
         return Err(Error::MissingPrivileges);
     }
     if !columns_are_exact(
-        pool,
+        connection,
         "public.maintainer_deliveries",
         &[
             ("delivery_id", "text", true, ""),
@@ -487,7 +699,7 @@ async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
     )
     .await?
         || !columns_are_exact(
-            pool,
+            connection,
             "public.dark_factory_schema_migrations",
             &[
                 ("component", "text", true, ""),
@@ -497,10 +709,22 @@ async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
             ],
         )
         .await?
-        || !delivery_constraints_are_exact(pool).await?
-        || !delivery_primary_key_is_exact(pool).await?
-        || !migration_constraints_are_exact(pool).await?
-        || !migration_primary_key_is_exact(pool).await?
+        || !not_null_constraints_are_exact(
+            connection,
+            "public.maintainer_deliveries",
+            &[1, 2, 3, 4, 5, 7, 8, 9, 10],
+        )
+        .await?
+        || !not_null_constraints_are_exact(
+            connection,
+            "public.dark_factory_schema_migrations",
+            &[1, 2, 3, 4],
+        )
+        .await?
+        || !delivery_constraints_are_exact(connection).await?
+        || !delivery_primary_key_is_exact(connection).await?
+        || !migration_constraints_are_exact(connection).await?
+        || !migration_primary_key_is_exact(connection).await?
     {
         return Err(Error::InvalidSchema);
     }
@@ -510,7 +734,7 @@ async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
          WHERE component = $1",
     )
     .bind(MIGRATION_COMPONENT)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await?
     .ok_or(Error::MigrationConflict)?;
     let revision: String = migration.try_get("revision")?;
@@ -521,14 +745,18 @@ async fn postgres_ready(pool: &PgPool) -> Result<(), Error> {
     Ok(())
 }
 
-async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn runtime_privileges_are_exact(
+    connection: &mut PgConnection,
+    expected_login: bool,
+    require_runtime_session: bool,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "WITH me AS (
              SELECT oid, rolcanlogin, rolinherit, rolsuper, rolcreatedb,
                     rolcreaterole, rolreplication, rolbypassrls, rolconnlimit,
                     rolvaliduntil, rolconfig
              FROM pg_catalog.pg_roles
-             WHERE rolname = current_user
+             WHERE rolname = $1
          ),
          target AS (
              SELECT deliveries.oid AS deliveries_oid,
@@ -555,9 +783,8 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
          )
          SELECT current_setting('server_version_num')::integer >= 170000
             AND current_setting('transaction_read_only') = 'off'
-            AND current_user = $1
-            AND session_user = current_user
-            AND me.rolcanlogin
+            AND (NOT $3 OR (current_user = $1 AND session_user = current_user))
+            AND me.rolcanlogin = $2
             AND NOT me.rolinherit
             AND NOT me.rolsuper
             AND NOT me.rolcreatedb
@@ -596,14 +823,14 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
                   AND dependency.deptype = 'o'
             )
             AND (SELECT datdba <> me.oid FROM pg_catalog.pg_database WHERE datname = current_database())
-            AND has_database_privilege(current_user, current_database(), 'CONNECT')
-            AND NOT has_database_privilege(current_user, current_database(), 'CONNECT WITH GRANT OPTION')
-            AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
-            AND NOT has_database_privilege(current_user, current_database(), 'TEMPORARY')
+            AND has_database_privilege($1, current_database(), 'CONNECT')
+            AND NOT has_database_privilege($1, current_database(), 'CONNECT WITH GRANT OPTION')
+            AND NOT has_database_privilege($1, current_database(), 'CREATE')
+            AND NOT has_database_privilege($1, current_database(), 'TEMPORARY')
             AND target.namespace_owner <> me.oid
-            AND has_schema_privilege(current_user, target.namespace_oid, 'USAGE')
-            AND NOT has_schema_privilege(current_user, target.namespace_oid, 'USAGE WITH GRANT OPTION')
-            AND NOT has_schema_privilege(current_user, target.namespace_oid, 'CREATE')
+            AND has_schema_privilege($1, target.namespace_oid, 'USAGE')
+            AND NOT has_schema_privilege($1, target.namespace_oid, 'USAGE WITH GRANT OPTION')
+            AND NOT has_schema_privilege($1, target.namespace_oid, 'CREATE')
             AND NOT EXISTS (
                 SELECT 1
                 FROM pg_catalog.pg_proc procedure
@@ -616,8 +843,8 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
                   AND namespace.nspname <> 'information_schema'
                   AND namespace.nspname !~ '^pg_'
                   AND (
-                      has_schema_privilege(current_user, namespace.oid, 'USAGE')
-                      OR has_schema_privilege(current_user, namespace.oid, 'CREATE')
+                      has_schema_privilege($1, namespace.oid, 'USAGE')
+                      OR has_schema_privilege($1, namespace.oid, 'CREATE')
                   )
             )
             AND target.deliveries_owner <> me.oid
@@ -625,16 +852,16 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
             AND target.deliveries_persistence = 'p'
             AND NOT target.deliveries_rls
             AND NOT target.deliveries_force_rls
-            AND has_table_privilege(current_user, target.deliveries_oid, 'SELECT')
-            AND has_table_privilege(current_user, target.deliveries_oid, 'INSERT')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'UPDATE')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'DELETE')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'TRUNCATE')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'REFERENCES')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'TRIGGER')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'MAINTAIN')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'SELECT WITH GRANT OPTION')
-            AND NOT has_table_privilege(current_user, target.deliveries_oid, 'INSERT WITH GRANT OPTION')
+            AND has_table_privilege($1, target.deliveries_oid, 'SELECT')
+            AND has_table_privilege($1, target.deliveries_oid, 'INSERT')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'UPDATE')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'DELETE')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'TRUNCATE')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'REFERENCES')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'TRIGGER')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'MAINTAIN')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'SELECT WITH GRANT OPTION')
+            AND NOT has_table_privilege($1, target.deliveries_oid, 'INSERT WITH GRANT OPTION')
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_attribute
                 WHERE attrelid = target.deliveries_oid AND attnum > 0 AND attacl IS NOT NULL
@@ -644,15 +871,15 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
             AND target.migrations_persistence = 'p'
             AND NOT target.migrations_rls
             AND NOT target.migrations_force_rls
-            AND has_table_privilege(current_user, target.migrations_oid, 'SELECT')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'INSERT')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'UPDATE')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'DELETE')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'TRUNCATE')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'REFERENCES')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'TRIGGER')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'MAINTAIN')
-            AND NOT has_table_privilege(current_user, target.migrations_oid, 'SELECT WITH GRANT OPTION')
+            AND has_table_privilege($1, target.migrations_oid, 'SELECT')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'INSERT')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'UPDATE')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'DELETE')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'TRUNCATE')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'REFERENCES')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'TRIGGER')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'MAINTAIN')
+            AND NOT has_table_privilege($1, target.migrations_oid, 'SELECT WITH GRANT OPTION')
             AND NOT EXISTS (
                 SELECT 1 FROM pg_catalog.pg_attribute
                 WHERE attrelid = target.migrations_oid AND attnum > 0 AND attacl IS NOT NULL
@@ -683,21 +910,21 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
                   AND relation.oid NOT IN (target.deliveries_oid, target.migrations_oid)
                   AND (
                       (relation.relkind = 'S' AND (
-                          has_sequence_privilege(current_user, relation.oid, 'USAGE')
-                          OR has_sequence_privilege(current_user, relation.oid, 'SELECT')
-                          OR has_sequence_privilege(current_user, relation.oid, 'UPDATE')
+                          has_sequence_privilege($1, relation.oid, 'USAGE')
+                          OR has_sequence_privilege($1, relation.oid, 'SELECT')
+                          OR has_sequence_privilege($1, relation.oid, 'UPDATE')
                       ))
                       OR (relation.relkind IN ('r', 'p', 'v', 'm', 'f') AND (
-                          has_table_privilege(current_user, relation.oid, 'SELECT')
-                          OR has_table_privilege(current_user, relation.oid, 'INSERT')
-                          OR has_table_privilege(current_user, relation.oid, 'UPDATE')
-                          OR has_table_privilege(current_user, relation.oid, 'DELETE')
-                          OR has_table_privilege(current_user, relation.oid, 'TRUNCATE')
-                          OR has_table_privilege(current_user, relation.oid, 'REFERENCES')
-                          OR has_table_privilege(current_user, relation.oid, 'TRIGGER')
-                          OR has_table_privilege(current_user, relation.oid, 'MAINTAIN')
+                          has_table_privilege($1, relation.oid, 'SELECT')
+                          OR has_table_privilege($1, relation.oid, 'INSERT')
+                          OR has_table_privilege($1, relation.oid, 'UPDATE')
+                          OR has_table_privilege($1, relation.oid, 'DELETE')
+                          OR has_table_privilege($1, relation.oid, 'TRUNCATE')
+                          OR has_table_privilege($1, relation.oid, 'REFERENCES')
+                          OR has_table_privilege($1, relation.oid, 'TRIGGER')
+                          OR has_table_privilege($1, relation.oid, 'MAINTAIN')
                           OR has_any_column_privilege(
-                              current_user,
+                              $1,
                               relation.oid,
                               'SELECT,INSERT,UPDATE,REFERENCES'
                           )
@@ -714,16 +941,18 @@ async fn runtime_privileges_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error
          FROM me, target",
     )
     .bind(RUNTIME_ROLE)
-    .fetch_one(pool)
+    .bind(expected_login)
+    .bind(require_runtime_session)
+    .fetch_one(&mut *connection)
     .await
 }
 
-async fn catalog_acls_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn catalog_acls_are_exact(connection: &mut PgConnection) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "WITH me AS (
              SELECT oid
              FROM pg_catalog.pg_roles
-             WHERE rolname = current_user
+             WHERE rolname = $1
          ),
          database_row AS (
              SELECT datdba, datacl
@@ -810,12 +1039,13 @@ async fn catalog_acls_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
             AND (SELECT count(*) FROM acl_rows WHERE object_type = 'deliveries') = 10
             AND (SELECT count(*) FROM acl_rows WHERE object_type = 'migrations') = 9",
     )
-    .fetch_one(pool)
+    .bind(RUNTIME_ROLE)
+    .fetch_one(&mut *connection)
     .await
 }
 
 async fn columns_are_exact(
-    pool: &PgPool,
+    connection: &mut PgConnection,
     relation: &str,
     expected: &[(&str, &str, bool, &str)],
 ) -> Result<bool, sqlx::Error> {
@@ -834,7 +1064,7 @@ async fn columns_are_exact(
          ORDER BY attribute.attnum",
     )
     .bind(relation)
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     if rows.len() != expected.len() {
         return Ok(false);
@@ -851,15 +1081,61 @@ async fn columns_are_exact(
     Ok(true)
 }
 
-async fn delivery_constraints_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn not_null_constraints_are_exact(
+    connection: &mut PgConnection,
+    relation: &str,
+    expected_attnums: &[i16],
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH not_null_constraints AS (
+             SELECT convalidated, condeferrable, condeferred, conislocal,
+                    coninhcount, connoinherit, contypid, conindid,
+                    conparentid, conkey
+             FROM pg_catalog.pg_constraint
+             WHERE conrelid = to_regclass($1)
+               AND contype = 'n'
+         )
+         SELECT CASE
+             WHEN current_setting('server_version_num')::integer >= 180000 THEN
+                 (SELECT count(*) = cardinality($2::smallint[])
+                      AND COALESCE(bool_and(
+                              convalidated
+                              AND NOT condeferrable
+                              AND NOT condeferred
+                              AND conislocal
+                              AND coninhcount = 0
+                              AND NOT connoinherit
+                              AND contypid = 0
+                              AND conindid = 0
+                              AND conparentid = 0
+                              AND cardinality(conkey) = 1
+                          ), false)
+                      AND COALESCE(
+                              array_agg(conkey[1] ORDER BY conkey[1]),
+                              ARRAY[]::smallint[]
+                          ) = $2::smallint[]
+                  FROM not_null_constraints)
+             ELSE NOT EXISTS (SELECT 1 FROM not_null_constraints)
+         END",
+    )
+    .bind(relation)
+    .bind(expected_attnums.to_vec())
+    .fetch_one(&mut *connection)
+    .await
+}
+
+async fn delivery_constraints_are_exact(
+    connection: &mut PgConnection,
+) -> Result<bool, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT conname, contype::text AS type, convalidated,
                 pg_catalog.pg_get_constraintdef(oid, false) AS definition
          FROM pg_catalog.pg_constraint
          WHERE conrelid = 'public.maintainer_deliveries'::regclass
+           AND contype <> 'n'
          ORDER BY conname",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     let expected = [
         (
@@ -947,7 +1223,7 @@ async fn delivery_constraints_are_exact(pool: &PgPool) -> Result<bool, sqlx::Err
     Ok(true)
 }
 
-async fn delivery_primary_key_is_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn delivery_primary_key_is_exact(connection: &mut PgConnection) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT count(*) = 1
          FROM pg_catalog.pg_constraint constraint_row
@@ -966,19 +1242,22 @@ async fn delivery_primary_key_is_exact(pool: &PgPool) -> Result<bool, sqlx::Erro
            AND index_row.indexprs IS NULL
            AND constraint_row.conkey = ARRAY[attribute.attnum]::smallint[]",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await
 }
 
-async fn migration_constraints_are_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn migration_constraints_are_exact(
+    connection: &mut PgConnection,
+) -> Result<bool, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT conname, contype::text AS type, convalidated,
                 pg_catalog.pg_get_constraintdef(oid, false) AS definition
          FROM pg_catalog.pg_constraint
          WHERE conrelid = 'public.dark_factory_schema_migrations'::regclass
+           AND contype <> 'n'
          ORDER BY conname",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *connection)
     .await?;
     let expected = [
         (
@@ -1011,7 +1290,9 @@ async fn migration_constraints_are_exact(pool: &PgPool) -> Result<bool, sqlx::Er
     Ok(true)
 }
 
-async fn migration_primary_key_is_exact(pool: &PgPool) -> Result<bool, sqlx::Error> {
+async fn migration_primary_key_is_exact(
+    connection: &mut PgConnection,
+) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT count(*) = 1
          FROM pg_catalog.pg_constraint constraint_row
@@ -1030,7 +1311,7 @@ async fn migration_primary_key_is_exact(pool: &PgPool) -> Result<bool, sqlx::Err
            AND index_row.indexprs IS NULL
            AND constraint_row.conkey = ARRAY[attribute.attnum]::smallint[]",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await
 }
 
@@ -1083,22 +1364,6 @@ async fn postgres_record(pool: &PgPool, delivery: &Delivery) -> Result<Record, E
     let result = stored.replay(delivery)?;
     transaction.commit().await?;
     Ok(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scram_verifier;
-
-    #[test]
-    fn scram_verifier_matches_independent_pbkdf2_sha256_vector() {
-        assert_eq!(
-            scram_verifier(
-                "correct horse battery staple",
-                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            ),
-            "SCRAM-SHA-256$4096:AAECAwQFBgcICQoLDA0ODw==$ONYbSJBXtKl6bP6PVqw8pm9e7EiacprLnoUQPFS80Hw=:IPOtHuGJ2HifEQg74W2XXqqCrCyQG55GbPRHa6g6n9w="
-        );
-    }
 }
 
 #[cfg(feature = "development-sqlite")]
@@ -1208,5 +1473,76 @@ impl SqliteJournal {
         let connection = Connection::open(self.database.as_ref())?;
         connection.busy_timeout(Duration::from_secs(5))?;
         Ok(connection)
+    }
+}
+
+#[cfg(all(test, feature = "provision-runtime"))]
+mod tests {
+    use sqlx::{Executor as _, Row as _};
+
+    use super::{
+        activate_runtime, neon_owner_pool, neon_provider_identity_is_expected, prepare_runtime,
+    };
+
+    #[test]
+    fn neon_provider_identity_requires_one_exact_role_and_owner_membership() {
+        assert!(neon_provider_identity_is_expected(1, true, true));
+        assert!(!neon_provider_identity_is_expected(0, true, true));
+        assert!(!neon_provider_identity_is_expected(2, true, true));
+        assert!(!neon_provider_identity_is_expected(1, false, true));
+        assert!(!neon_provider_identity_is_expected(1, true, false));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires an explicit disposable Neon owner database URL"]
+    async fn activation_removes_a_provider_acl_restored_after_preparation() {
+        let database_url = std::env::var("DARK_FACTORY_TEST_NEON_OWNER_DATABASE_URL")
+            .expect("disposable Neon owner database URL");
+        let pool = neon_owner_pool(&database_url).unwrap();
+        let expected_project_id: String =
+            sqlx::query_scalar("SELECT current_setting('neon.project_id')")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let identity = prepare_runtime(&pool, &expected_project_id).await.unwrap();
+        let restore_provider_acl: String = sqlx::query_scalar(
+            "SELECT format(
+                 'GRANT ALL ON DATABASE %I TO neon_superuser',
+                 current_database()
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        pool.execute(restore_provider_acl.as_str()).await.unwrap();
+
+        let result = async {
+            activate_runtime(&pool, &identity).await?;
+            let row = sqlx::query(
+                "SELECT role.rolcanlogin,
+                        EXISTS (
+                            SELECT 1
+                            FROM pg_catalog.pg_database database_row
+                            CROSS JOIN LATERAL pg_catalog.aclexplode(database_row.datacl) acl
+                            JOIN pg_catalog.pg_roles grantee ON grantee.oid = acl.grantee
+                            WHERE database_row.datname = current_database()
+                              AND grantee.rolname = 'neon_superuser'
+                        ) AS provider_acl_exists
+                 FROM pg_catalog.pg_roles role
+                 WHERE role.rolname = 'dark_factory_broker_runtime'",
+            )
+            .fetch_one(&pool)
+            .await?;
+            Ok::<_, super::Error>((
+                row.try_get::<bool, _>("rolcanlogin")?,
+                row.try_get::<bool, _>("provider_acl_exists")?,
+            ))
+        }
+        .await;
+        let cleanup = prepare_runtime(&pool, &expected_project_id).await;
+        let (runtime_can_login, provider_acl_exists) = result.unwrap();
+        cleanup.unwrap();
+        assert!(runtime_can_login);
+        assert!(!provider_acl_exists);
     }
 }

@@ -3,7 +3,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use dark_factory_control_plane::{BrokerState, app, provision_runtime_from_env};
+use dark_factory_control_plane::{BrokerState, app};
 use hmac::{Hmac, Mac as _};
 use sha2::Sha256;
 use sqlx::{Executor as _, PgPool, postgres::PgPoolOptions};
@@ -12,9 +12,11 @@ use tower::ServiceExt as _;
 const SECRET: &[u8] = b"0123456789abcdef0123456789abcdef";
 
 #[tokio::test]
-#[ignore = "requires an explicit disposable TLS Postgres DATABASE_URL"]
+#[ignore = "requires explicit disposable owner and prepared runtime database URLs"]
 async fn migrated_postgres_proves_readiness_concurrent_replay_and_conflict() {
     let database_url = std::env::var("DATABASE_URL").expect("disposable DATABASE_URL");
+    let runtime_url = std::env::var("DARK_FACTORY_TEST_RUNTIME_DATABASE_URL")
+        .expect("prepared disposable DARK_FACTORY_TEST_RUNTIME_DATABASE_URL");
     let owner_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)
@@ -33,7 +35,6 @@ async fn migrated_postgres_proves_readiness_concurrent_replay_and_conflict() {
         "the disposable proof requires a non-superuser CREATEROLE owner"
     );
 
-    let runtime_url = provision_runtime_from_env().await.unwrap();
     let owner = runtime_router(&database_url)
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
         .await
@@ -46,49 +47,13 @@ async fn migrated_postgres_proves_readiness_concurrent_replay_and_conflict() {
     exact_concurrent_replay(router.clone()).await;
     concurrent_conflict(router.clone()).await;
 
-    let set_database_read_only: String = sqlx::query_scalar(
-        "SELECT format(
-             'ALTER ROLE dark_factory_broker_runtime IN DATABASE %I SET default_transaction_read_only = on',
-             current_database()
-         )",
-    )
-    .fetch_one(&owner_pool)
-    .await
-    .unwrap();
-    owner_pool
-        .execute(
-            "ALTER ROLE dark_factory_broker_runtime CONNECTION LIMIT 2 VALID UNTIL '2099-01-01';
-             ALTER ROLE dark_factory_broker_runtime SET default_transaction_read_only = on",
-        )
-        .await
-        .unwrap();
-    owner_pool
-        .execute(set_database_read_only.as_str())
-        .await
-        .unwrap();
-
-    let rotated_runtime_url = provision_runtime_from_env().await.unwrap();
-    assert_ne!(runtime_url, rotated_runtime_url);
-    assert!(
-        PgPoolOptions::new()
-            .acquire_timeout(std::time::Duration::from_millis(750))
-            .connect(&runtime_url)
-            .await
-            .is_err(),
-        "the first provisioned password still authenticated after rotation"
-    );
-    let router = runtime_router(&rotated_runtime_url);
-    assert_ready(&router, StatusCode::OK).await;
-    exact_concurrent_replay(router.clone()).await;
-
     let runtime_pool = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&rotated_runtime_url)
+        .connect(&runtime_url)
         .await
         .unwrap();
-    assert_statement_log_excludes_runtime_credentials(&[&runtime_url, &rotated_runtime_url]);
     forbidden_runtime_operations_fail(&runtime_pool, &owner_pool).await;
-    corrupted_schema_and_authority_fail_readiness(&router, &owner_pool, &rotated_runtime_url).await;
+    corrupted_schema_and_authority_fail_readiness(&router, &owner_pool, &runtime_url).await;
 }
 
 fn runtime_router(database_url: &str) -> Router {
@@ -99,19 +64,6 @@ fn runtime_router(database_url: &str) -> Router {
         5678,
     )
     .unwrap())
-}
-
-fn assert_statement_log_excludes_runtime_credentials(runtime_urls: &[&str]) {
-    let Ok(log_file) = std::env::var("DARK_FACTORY_POSTGRES_STATEMENT_LOG") else {
-        return;
-    };
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    let log = std::fs::read_to_string(log_file).unwrap();
-    for runtime_url in runtime_urls {
-        let parsed = url::Url::parse(runtime_url).unwrap();
-        assert!(!log.contains(parsed.password().unwrap()));
-        assert!(!log.contains(runtime_url));
-    }
 }
 
 async fn assert_ready(router: &Router, expected: StatusCode) {
@@ -191,6 +143,40 @@ async fn corrupted_schema_and_authority_fail_readiness(
     owner: &PgPool,
     runtime_url: &str,
 ) {
+    owner
+        .execute("CREATE ROLE dark_factory_broker_forbidden_database_grantee NOLOGIN")
+        .await
+        .unwrap();
+    let (grant_unexpected_database_acl, revoke_unexpected_database_acl): (String, String) =
+        sqlx::query_as(
+            "SELECT
+                 format(
+                     'GRANT CONNECT ON DATABASE %I TO dark_factory_broker_forbidden_database_grantee',
+                     current_database()
+                 ),
+                 format(
+                     'REVOKE ALL ON DATABASE %I FROM dark_factory_broker_forbidden_database_grantee',
+                     current_database()
+                 )",
+        )
+        .fetch_one(owner)
+        .await
+        .unwrap();
+    owner
+        .execute(grant_unexpected_database_acl.as_str())
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::SERVICE_UNAVAILABLE).await;
+    owner
+        .execute(revoke_unexpected_database_acl.as_str())
+        .await
+        .unwrap();
+    owner
+        .execute("DROP ROLE dark_factory_broker_forbidden_database_grantee")
+        .await
+        .unwrap();
+    assert_ready(router, StatusCode::OK).await;
+
     let (grant_connect, revoke_connect): (String, String) = sqlx::query_as(
         "SELECT
              format(

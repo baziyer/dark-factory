@@ -4,9 +4,7 @@ use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode},
 };
-use dark_factory_control_plane::{
-    ProvisionError, production_app_from_env, provision_runtime_from_env,
-};
+use dark_factory_control_plane::production_app_from_env;
 use tower::ServiceExt as _;
 
 const CHILD_ENV: &str = "DARK_FACTORY_PRODUCTION_ENV_TEST_CHILD";
@@ -42,6 +40,7 @@ fn only_production_metadata_activates_and_managed_postgres_aliases_have_no_autho
                 .env("PGUSER", "poison-user")
                 .env("DATABASE_URL_UNPOOLED", "poison-unpooled")
                 .env("NEON_PROJECT_ID", "poison-project")
+                .env("DARK_FACTORY_NEON_API_KEY", "poison-api-key")
                 .env("POSTGRES_USER", "poison-user")
                 .env("POSTGRES_URL", "poison-url")
                 .env("POSTGRES_DATABASE", "poison-database")
@@ -109,6 +108,7 @@ fn managed_owner_aliases() -> &'static [&'static str] {
     &[
         "DATABASE_URL",
         "DATABASE_URL_UNPOOLED",
+        "DARK_FACTORY_NEON_API_KEY",
         "NEON_PROJECT_ID",
         "PGAPPNAME",
         "PGDATABASE",
@@ -164,13 +164,4 @@ async fn environment_child_observes_platform_and_database_boundaries() {
         )
         .as_bytes()
     );
-
-    if std::env::var_os(OWNER_ENV).is_some() {
-        // Bootstrap accepts the provider's aliases but takes its authority
-        // from the explicit owner URL; the function itself stays inactive.
-        assert_eq!(
-            provision_runtime_from_env().await,
-            Err(ProvisionError::Database)
-        );
-    }
 }

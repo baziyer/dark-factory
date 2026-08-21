@@ -16,6 +16,11 @@ cargo +1.88.0 test --locked --all-targets
 # clippy gate above; they must not silently replace this dedicated test lane.
 cargo +1.88.0 test --locked --all-targets --features development-sqlite
 
+# The Neon management API client exists only in the explicit operator
+# provisioner feature. Its typed protocol tests never call the live API.
+cargo +1.88.0 test --locked --all-targets --features provision-runtime
+zsh -n scripts/provision-production.sh
+
 for ignore_file in .gitignore .vercelignore; do
     for pattern in .env '.env.*' '!.env.example' '.vercel/'; do
         grep -Fqx -- "$pattern" "$ignore_file"

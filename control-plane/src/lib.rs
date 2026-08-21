@@ -12,17 +12,21 @@ use axum::{
     response::{IntoResponse as _, Response},
     routing::get,
 };
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+#[cfg(feature = "provision-runtime")]
 use url::Url;
 
 mod journal;
 pub mod maintainer;
+#[cfg(feature = "provision-runtime")]
+mod neon;
 
 use journal::DeliveryJournal;
 use maintainer::{MAX_BODY_BYTES, MaintainerState, SecretRevision, WebhookSecret};
 
 pub const DATABASE_URL_ENV: &str = "DATABASE_URL";
 pub const RUNTIME_DATABASE_URL_ENV: &str = "DARK_FACTORY_BROKER_DATABASE_URL";
+pub const NEON_API_KEY_ENV: &str = "DARK_FACTORY_NEON_API_KEY";
+pub const NEON_PROJECT_ID_ENV: &str = "NEON_PROJECT_ID";
 pub const WEBHOOK_SECRET_ENV: &str = "DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET";
 pub const SECRET_REVISION_ENV: &str = "DARK_FACTORY_MAINTAINER_WEBHOOK_SECRET_REVISION";
 pub const APP_ID_ENV: &str = "DARK_FACTORY_MAINTAINER_APP_ID";
@@ -129,7 +133,8 @@ fn required_environment(name: &'static str) -> Result<String, ProductionOpenErro
 fn owner_database_environment_is_present() -> bool {
     std::env::var_os(DATABASE_URL_ENV).is_some()
         || std::env::var_os("DATABASE_URL_UNPOOLED").is_some()
-        || std::env::var_os("NEON_PROJECT_ID").is_some()
+        || std::env::var_os(NEON_PROJECT_ID_ENV).is_some()
+        || std::env::var_os(NEON_API_KEY_ENV).is_some()
         || std::env::vars_os().any(|(name, _)| {
             name.to_str()
                 .is_some_and(|name| name.starts_with("PG") || name.starts_with("POSTGRES_"))
@@ -158,8 +163,10 @@ pub enum ProvisionError {
     Configuration,
     #[error("control-plane runtime provisioning failed")]
     Database,
-    #[error("runtime credential generation failed")]
-    Entropy,
+    #[error("Neon runtime credential reset was rejected")]
+    Api,
+    #[error("Neon runtime credential reset outcome is indeterminate")]
+    IndeterminateReset,
 }
 
 #[cfg(feature = "development-sqlite")]
@@ -179,37 +186,68 @@ pub fn production_app_from_env() -> Router {
     app(state)
 }
 
+#[cfg(feature = "provision-runtime")]
 pub async fn provision_runtime_from_env() -> Result<String, ProvisionError> {
     let owner_database_url =
         required_environment(DATABASE_URL_ENV).map_err(|_| ProvisionError::Configuration)?;
-    let pool =
-        journal::postgres_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
-    journal::migrate(&pool)
+    let expected_project_id =
+        required_environment(NEON_PROJECT_ID_ENV).map_err(|_| ProvisionError::Configuration)?;
+    let api_key =
+        required_environment(NEON_API_KEY_ENV).map_err(|_| ProvisionError::Configuration)?;
+    let preparation_pool =
+        journal::neon_owner_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
+    let api = neon::NeonApi::new(&api_key).map_err(map_neon_error)?;
+    let identity = journal::prepare_runtime(&preparation_pool, &expected_project_id)
+        .await
+        .map_err(|_| ProvisionError::Database)?;
+    // Neon may terminate compute connections while rotating a role password.
+    // Close the preparation pool before the non-idempotent request, then make
+    // activation prove itself over a newly established verified connection.
+    preparation_pool.close().await;
+    let password = api
+        .reset_runtime_password(&identity)
+        .await
+        .map_err(map_neon_error)?;
+    let activation_pool =
+        journal::neon_owner_pool(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
+    journal::activate_runtime(&activation_pool, &identity)
         .await
         .map_err(|_| ProvisionError::Database)?;
 
-    let mut password = [0_u8; 32];
-    getrandom::fill(&mut password).map_err(|_| ProvisionError::Entropy)?;
-    let password = URL_SAFE_NO_PAD.encode(password);
-    let mut salt = [0_u8; 16];
-    getrandom::fill(&mut salt).map_err(|_| ProvisionError::Entropy)?;
-    let verifier = journal::scram_verifier(&password, &salt);
-    journal::provision_runtime(&pool, &verifier)
+    let runtime_url = runtime_database_url(&owner_database_url, &password)?;
+    journal::verify_runtime(&runtime_url)
         .await
         .map_err(|_| ProvisionError::Database)?;
+    Ok(runtime_url)
+}
 
+#[cfg(feature = "provision-runtime")]
+fn runtime_database_url(
+    owner_database_url: &str,
+    password: &str,
+) -> Result<String, ProvisionError> {
     let mut runtime_url =
-        Url::parse(&owner_database_url).map_err(|_| ProvisionError::Configuration)?;
+        Url::parse(owner_database_url).map_err(|_| ProvisionError::Configuration)?;
     runtime_url
         .set_username(journal::RUNTIME_ROLE)
         .map_err(|_| ProvisionError::Configuration)?;
     runtime_url
-        .set_password(Some(&password))
+        .set_password(Some(password))
         .map_err(|_| ProvisionError::Configuration)?;
-    journal::verify_runtime(runtime_url.as_str())
-        .await
-        .map_err(|_| ProvisionError::Database)?;
+    runtime_url
+        .query_pairs_mut()
+        .clear()
+        .append_pair("sslmode", "verify-full");
     Ok(runtime_url.into())
+}
+
+#[cfg(feature = "provision-runtime")]
+const fn map_neon_error(error: neon::Error) -> ProvisionError {
+    match error {
+        neon::Error::Configuration => ProvisionError::Configuration,
+        neon::Error::IndeterminateReset => ProvisionError::IndeterminateReset,
+        neon::Error::Rejected => ProvisionError::Api,
+    }
 }
 
 pub fn app(state: BrokerState) -> Router {
@@ -342,5 +380,25 @@ mod tests {
                 Some(ProductionOpenError::InvalidDatabaseUrl)
             );
         }
+    }
+
+    #[cfg(feature = "provision-runtime")]
+    #[test]
+    fn provisioned_url_drops_unenforced_channel_binding_and_requires_verified_tls() {
+        let url = runtime_database_url(
+            "postgresql://owner:owner-password@ep-example.eu-west-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require",
+            "runtime password/with punctuation",
+        )
+        .unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        assert_eq!(parsed.username(), journal::RUNTIME_ROLE);
+        assert_eq!(
+            parsed.password(),
+            Some("runtime%20password%2Fwith%20punctuation")
+        );
+        assert_eq!(
+            parsed.query_pairs().collect::<Vec<_>>(),
+            [("sslmode".into(), "verify-full".into())]
+        );
     }
 }
