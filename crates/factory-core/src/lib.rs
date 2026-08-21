@@ -19,7 +19,7 @@ pub mod status;
 /// daemon rejects a newer client explicitly instead of misreading its JSON.
 /// Durable event envelopes retain their own stored schema version and may be
 /// older than this outer frame version during an upgrade.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 const MAX_ID_LEN: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +110,72 @@ id_type!(RunId);
 id_type!(RunnerInstanceId);
 id_type!(ChangeId);
 id_type!(LegacySourceId);
+id_type!(InputEnvelopeId);
+id_type!(WorkCandidateId);
+
+/// Provider-neutral quarantine state. No variant represents executable work.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkCandidateStatus {
+    Quarantined,
+    Stale,
+    Rejected,
+}
+
+impl WorkCandidateStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::Stale => "stale",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+/// One immutable, bounded external-input observation. `content` is untrusted
+/// data and never appears in a public event or executable task implicitly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InputEnvelopeSnapshot {
+    pub id: InputEnvelopeId,
+    pub project_id: ProjectId,
+    pub candidate_id: WorkCandidateId,
+    pub source_kind: String,
+    pub source_id: String,
+    pub delivery_id: String,
+    pub source_revision: String,
+    pub content: String,
+    pub content_digest: String,
+    pub request_digest: String,
+    pub received_at_ms: i64,
+}
+
+/// One source revision held behind the quarantine boundary. There is
+/// deliberately no Task, Message, agent, provider, or execution identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkCandidateSnapshot {
+    pub id: WorkCandidateId,
+    pub project_id: ProjectId,
+    pub origin_envelope_id: InputEnvelopeId,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_revision: String,
+    pub content_digest: String,
+    pub status: WorkCandidateStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
+    pub revision: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InputReceipt {
+    pub envelope: InputEnvelopeSnapshot,
+    pub candidate: WorkCandidateSnapshot,
+    /// True only when the exact delivery and request digest already existed.
+    pub replayed: bool,
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -612,6 +678,20 @@ pub enum FactoryEvent {
     /// A daemon-owned source Change was reserved or durably advanced.
     ChangeChanged {
         change: ChangeSnapshot,
+    },
+    /// A bounded input observation was committed to quarantine. External
+    /// content and source metadata are intentionally absent from the event.
+    InputReceived {
+        project_id: ProjectId,
+        envelope_id: InputEnvelopeId,
+        candidate_id: WorkCandidateId,
+    },
+    /// A candidate moved within quarantine. No event transition can
+    /// materialize executable work.
+    WorkCandidateStatusChanged {
+        project_id: ProjectId,
+        candidate_id: WorkCandidateId,
+        status: WorkCandidateStatus,
     },
     /// Metadata-only removal of one quarantined pre-kernel source record.
     LegacySourceForgotten {

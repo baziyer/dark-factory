@@ -16,12 +16,14 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod changes;
+mod inputs;
 mod kernel;
 mod rust_builds;
 pub use changes::{
     Change, ChangeBaseIdentity, ChangeMaterialization, ChangeMutation, ChangeRemovalKind,
     ChangeReservation, ChangeSourceIdentity, ChangeStorageSummary,
 };
+pub use inputs::NewInputEnvelope;
 pub use kernel::{
     AdmittedRun, AttemptPrincipal, AttemptTarget, AttemptToolPolicy, AttemptToolVerdict,
     KernelResource, KernelResourceKind, KernelResourceState, NewRunAdmission,
@@ -43,7 +45,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -186,6 +188,24 @@ pub enum StoreError {
     AgentNotFound,
     #[error("task was not found in the requested project")]
     TaskNotFound,
+    #[error("input envelope was not found in the requested project")]
+    InputEnvelopeNotFound,
+    #[error("work candidate was not found in the requested project")]
+    WorkCandidateNotFound,
+    #[error("input envelope is invalid or exceeds its bound")]
+    InvalidInputEnvelope,
+    #[error("input delivery id was reused with different request bytes")]
+    InputDeliveryConflict,
+    #[error("source revision was reused with different content")]
+    SourceRevisionConflict,
+    #[error("source current revision changed or was not named exactly")]
+    StaleInputSource,
+    #[error("work candidate status reason is invalid or exceeds its bound")]
+    InvalidWorkCandidateReason,
+    #[error("work candidate revision is stale")]
+    WorkCandidateRevisionConflict,
+    #[error("work candidate is not quarantined and current")]
+    InvalidWorkCandidateState,
     #[error("task page cursor is stale; restart the listing")]
     StaleTaskCursor,
     #[error("task page cursor requires its queue revision")]
@@ -1479,6 +1499,22 @@ impl Store {
             "DELETE FROM task_documents WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
+        transaction.execute(
+            "DELETE FROM input_sources WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_candidate_envelopes WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM work_candidates WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
+        transaction.execute(
+            "DELETE FROM input_envelopes WHERE project_id = ?1",
+            params![project_id.as_str()],
+        )?;
         let deleted = transaction.execute(
             "DELETE FROM projects WHERE id = ?1",
             params![project_id.as_str()],
@@ -2411,7 +2447,10 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 }
 
 fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
-    debug_assert!(matches!(target, 29 | 30 | 31 | 32 | 33 | SCHEMA_VERSION));
+    debug_assert!(matches!(
+        target,
+        29 | 30 | 31 | 32 | 33 | 34 | SCHEMA_VERSION
+    ));
     let mut current: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if current < 0 {
         return Err(StoreError::InvalidSchemaVersion(current));
@@ -2721,12 +2760,20 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
         current = 33;
     }
-    if current == 33 && target == SCHEMA_VERSION {
+    if current == 33 && target >= 34 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!(
             "../migrations/0034_dispatch_execution_modes.sql"
         ))?;
         transaction.pragma_update(None, "user_version", 34)?;
+        transaction.commit()?;
+        verify_no_foreign_key_violations(connection)?;
+        current = 34;
+    }
+    if current == 34 && target == SCHEMA_VERSION {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!("../migrations/0035_input_quarantine.sql"))?;
+        transaction.pragma_update(None, "user_version", 35)?;
         transaction.commit()?;
         verify_no_foreign_key_violations(connection)?;
     }
@@ -2977,6 +3024,13 @@ fn event_metadata(event: &FactoryEvent) -> EventMetadata<'_> {
         FactoryEvent::ChangeChanged { change } => EventMetadata {
             project_id: Some(&change.project_id),
             task_id: Some(&change.task_id),
+            agent_id: None,
+            run_id: None,
+        },
+        FactoryEvent::InputReceived { project_id, .. }
+        | FactoryEvent::WorkCandidateStatusChanged { project_id, .. } => EventMetadata {
+            project_id: Some(project_id),
+            task_id: None,
             agent_id: None,
             run_id: None,
         },
@@ -3253,6 +3307,42 @@ mod tests {
             assert!(!columns.iter().any(|column| column == removed));
             assert!(columns.iter().any(|column| column == added));
         }
+    }
+
+    #[test]
+    fn schema_35_preserves_old_connector_receipts_as_inert_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;",
+            )
+            .unwrap();
+        migrate_to(&mut connection, 34).unwrap();
+        connection
+            .execute(
+                "INSERT INTO connector_events (
+                    endpoint_id, event_id, payload_digest, event_kind,
+                    result_id, received_at_ms
+                 ) VALUES ('old-endpoint', 'old-event', zeroblob(32),
+                           'task', 'old-result', 1)",
+                [],
+            )
+            .unwrap();
+
+        migrate_to(&mut connection, SCHEMA_VERSION).unwrap();
+
+        let old_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM connector_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let input_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM input_envelopes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(old_count, 1);
+        assert_eq!(input_count, 0);
     }
 
     #[test]

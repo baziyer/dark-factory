@@ -14,6 +14,8 @@ framework.
 - An **attempt** (stored as a run) is one execution of one task.
 - A **Change** is the retained, `.git`-free source tree used by worker attempts
   and retries.
+- An **input envelope** is one immutable, bounded, explicitly untrusted
+  observation; a **work candidate** is its source revision held in quarantine.
 
 Each admitted attempt gets a fresh, non-interactive provider process. Its
 credential resolves only while that run is running, and the daemon derives the
@@ -21,6 +23,12 @@ caller's stored attempt identity instead of accepting a caller-selected one.
 Attempt authority is revoked before cleanup and configured completion checks.
 Dark Factory supplies no commit, push, or pull-request surface. Closing the CLI
 or TUI does not stop active work.
+
+The current provider-neutral quarantine is inert. Operator-only
+`factoryctl input` and `factoryctl candidate` actions store, list, inspect, and
+reject untrusted observations; there is deliberately no accept or materialize
+command. Receipt cannot create a task, message, run, Change, prompt, or
+scheduling event. There is still no HTTP listener or GitHub adapter.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed lifecycle and
 [SECURITY.md](SECURITY.md) for threat boundaries.
@@ -82,8 +90,8 @@ factoryctl run stop --project PROJECT_ID --run RUN_ID
 ```
 
 Run `factoryctl --help` or `factoryctl <command> --help` for the exact project,
-agent, and task operations. The CLI remains the canonical control path; the TUI
-does not have a separate mutation API.
+agent, task, input, and candidate operations. The CLI remains the canonical
+control path; the TUI does not have a separate mutation API.
 
 ## Learn more
 

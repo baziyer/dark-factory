@@ -6,9 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentSnapshot, ChangeId, ChangeSnapshot, ChangeStorageSnapshot,
-    CompletionVerification, EventEnvelope, ExecutionMode, LegacySourceId, LegacySourceSnapshot,
-    MessageId, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId,
-    RunSnapshot, TaskDetail, TaskId,
+    CompletionVerification, EventEnvelope, ExecutionMode, InputEnvelopeId, InputEnvelopeSnapshot,
+    InputReceipt, LegacySourceId, LegacySourceSnapshot, MessageId, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId, RunSnapshot, TaskDetail, TaskId,
+    WorkCandidateId, WorkCandidateSnapshot,
 };
 
 /// Private operator-facing configuration. It is deliberately not part of an
@@ -131,6 +132,9 @@ pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
 /// A Change may carry a 4 KiB failure whose JSON escaping expands sixfold.
 /// Sixteen worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
 pub const MAX_CHANGE_PAGE_ITEMS: u32 = 16;
+/// Two maximally escaped 64 KiB untrusted input bodies fit in one frame.
+pub const MAX_INPUT_ENVELOPE_PAGE_ITEMS: u32 = 2;
+pub const MAX_WORK_CANDIDATE_PAGE_ITEMS: u32 = 100;
 /// A legacy row may contain two 4 KiB strings whose JSON escaping expands
 /// substantially. Sixteen worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
 pub const MAX_LEGACY_SOURCE_PAGE_ITEMS: u32 = 16;
@@ -138,6 +142,7 @@ pub const MAX_LEGACY_SOURCE_PAGE_ITEMS: u32 = 16;
 pub const MAX_EVENT_PAGE_ITEMS: u32 = 16;
 pub const MAX_TASK_TITLE_BYTES: usize = 240;
 pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
+pub const MAX_INPUT_CONTENT_BYTES: usize = 64 * 1024;
 pub const MAX_AGENT_MESSAGE_BYTES: usize = 64 * 1024;
 /// Maximum encoded JSON value carried by one authenticated provider hook.
 pub const MAX_PROVIDER_HOOK_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -283,6 +288,44 @@ pub enum LocalRequest {
     SetProjectCompletionVerification {
         project_id: ProjectId,
         verification: CompletionVerification,
+    },
+    /// Stores one provider-neutral observation in quarantine. This request is
+    /// operator-only and cannot materialize executable work.
+    ReceiveInput {
+        project_id: ProjectId,
+        source_kind: String,
+        source_id: String,
+        delivery_id: String,
+        source_revision: String,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_current_candidate_id: Option<WorkCandidateId>,
+    },
+    ListInputEnvelopes {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<InputEnvelopeId>,
+        limit: u32,
+    },
+    GetInputEnvelope {
+        project_id: ProjectId,
+        envelope_id: InputEnvelopeId,
+    },
+    ListWorkCandidates {
+        project_id: ProjectId,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        after_id: Option<WorkCandidateId>,
+        limit: u32,
+    },
+    GetWorkCandidate {
+        project_id: ProjectId,
+        candidate_id: WorkCandidateId,
+    },
+    RejectWorkCandidate {
+        project_id: ProjectId,
+        candidate_id: WorkCandidateId,
+        expected_revision: i64,
+        reason: String,
     },
     CreateTask {
         id: TaskId,
@@ -555,6 +598,28 @@ pub enum LocalResponse {
     },
     ProjectGuidanceUpdated {
         project: ProjectDetail,
+    },
+    InputReceived {
+        receipt: InputReceipt,
+    },
+    InputEnvelopes {
+        envelopes: Vec<InputEnvelopeSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<InputEnvelopeId>,
+    },
+    InputEnvelope {
+        envelope: InputEnvelopeSnapshot,
+    },
+    WorkCandidates {
+        candidates: Vec<WorkCandidateSnapshot>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        next_after_id: Option<WorkCandidateId>,
+    },
+    WorkCandidate {
+        candidate: WorkCandidateSnapshot,
+    },
+    WorkCandidateRejected {
+        candidate: WorkCandidateSnapshot,
     },
     TaskCreated {
         task: TaskDetail,

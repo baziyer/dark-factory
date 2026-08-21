@@ -141,6 +141,8 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
         | FactoryEvent::LegacyRepositoryOperation { .. }
         | FactoryEvent::LegacyRepositoryAuthorityChanged { .. }
         | FactoryEvent::ChangeChanged { .. }
+        | FactoryEvent::InputReceived { .. }
+        | FactoryEvent::WorkCandidateStatusChanged { .. }
         | FactoryEvent::LegacySourceForgotten { .. }
         | FactoryEvent::ProjectChanged { .. }
         | FactoryEvent::ProjectDeleted { .. } => return None,

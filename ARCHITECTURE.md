@@ -78,6 +78,12 @@ pretends the resource disappeared or rewrites the outcome.
    or writable source lease.
 7. A retry creates a new run and new bearer. It never revives an old process
    or credential.
+8. External-input receipt is separate from work authority. An operator-only
+   transaction may create an immutable `InputEnvelope`, one quarantined
+   `WorkCandidate`, and bounded events. It cannot create a Task, Message, Run,
+   Change, provider prompt, ProposedAction, or scheduling event. A changed
+   source revision advances an exact expected-current pointer and stales the
+   old candidate atomically; exact observation replay has no second effect.
 
 ## Process and resource ownership
 
@@ -248,9 +254,12 @@ for their exact run through `DARK_FACTORY_ATTEMPT_TOKEN_FILE` (or an explicit
 hook `--token-file`). A provider-invoked `factoryctl` process cannot cross into
 operator authority by choosing an operator command.
 
-There is no HTTP webhook or generic connector intake. GitHub and other external
-intake remain outside the product; work enters only through the authenticated
-private local API and cannot bypass admission.
+There is no HTTP webhook, GitHub adapter, or generic connector intake. The
+operator may place bounded provider-neutral observations into inert quarantine
+through the authenticated private local API, then list, inspect, or reject
+them. Raw content is private local detail and public events carry only project,
+envelope, candidate, and status identities. There is no accept/materialize
+operation, so receipt cannot become executable work or bypass admission.
 
 ## State outside SQLite
 

@@ -28,6 +28,11 @@ directory/socket modes. There is no HTTP webhook or generic connector listener.
 Exposing the local API beyond the machine is external deployment work and is
 unsupported.
 
+The operator-only quarantine API is not a network ingress or trust decision.
+It stores bounded external observations as untrusted `InputEnvelope` and
+`WorkCandidate` state. Attempt credentials cannot receive, list, inspect, or
+reject that state, and no accept/materialize operation exists.
+
 ## Principals and capabilities
 
 Every request carries a versioned envelope and is resolved once as one of:
@@ -208,6 +213,12 @@ an authority ledger.
 Provider credentials, repository credentials, prompts, raw output, message
 bodies, and source content do not belong in public events or diagnostic
 projections.
+
+Quarantined input content is private operator data. Receipt events contain only
+bounded project/envelope/candidate IDs; candidate-status events add only the
+bounded status. Same-observation replay is effect-idempotent, changed bytes
+conflict, source changes require the exact current candidate, and rejection is
+revision-bound. None of these paths creates executable work.
 
 ## Contributor and CI boundary
 
