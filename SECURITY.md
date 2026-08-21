@@ -12,10 +12,7 @@ security fixes.
 
 ## Current freeze
 
-The safe-kernel refactor is not a live release. Do not install or start this
-revision, enable dispatch, submit provider work, add external intake, or use
-the operator's `~/.dark-factory`. Stage 3 exact-head proof, independent review,
-merge, and the separate boot review remain required.
+Live use remains frozen until an independent exact-main boot review passes.
 
 ## Threat model
 
@@ -113,10 +110,15 @@ has one typed execution mode, frozen onto the run at admission:
   outcome requests remain available;
 - `WorkspaceWrite` is non-interactive and bounds durable writes to the admitted
   source with the provider's native sandbox. Codex also denies both system temp
-  aliases. Claude requires its own per-session temporary scratch directory;
+  aliases. Claude requires its own per-launch temporary scratch directory;
   that provider-owned ephemeral directory is the one explicit write exception;
   and
 - `Unrestricted` uses the provider's explicit approval/sandbox bypass.
+
+The same admission transaction checks capacity, selects the canonical assigned
+queue head, and derives the task revision, role, provider, Change lease, and
+execution mode. A stale dispatcher read cannot choose different work or
+authority.
 
 Codex and Claude agents default to `WorkspaceWrite`. The shell test adapter has
 no native restriction mechanism and therefore supports only `Unrestricted`
@@ -159,8 +161,8 @@ isolation from a hostile same-user process.
 
 ## Build and storage boundary
 
-The complete boot contract requires a Rust-policy completion to revoke attempt
-authority and reap the provider before source selection. The daemon accepts a
+A Rust-policy completion revokes attempt authority and reaps the provider
+before source selection. The daemon accepts a
 private source snapshot only when canonical before/copy/after manifests agree,
 then builds through one project-incarnation/toolchain cache. It copies Cargo's
 top-level test executables into content-addressed staging under the run's
@@ -186,6 +188,9 @@ remeasurement, after which the byte policy converges; an already measured
 over-limit cache is refused for a new verification. The daemon reports total
 measured bytes plus protected entry count and recoverable failure count, and
 does not claim an instantaneous filesystem byte ceiling while Cargo is writing.
+If a verifier group leader disappears while descendants remain, finalization
+and cache measurement stay pending. A reused numeric group ID is not kill
+authority and cannot prove the effect absent.
 
 ## Bounded inputs and durable data
 

@@ -1,23 +1,21 @@
-# Installation frozen
+# Installation status
 
-Do not install or update Dark Factory from the safe-kernel refactor. Stages 1
-and 2 are merged, and Stage 3 is being implemented on an isolated branch, but
-its exact-head gates, independent review, merge, and the separate boot review
-remain incomplete.
+Live use remains frozen until an independent exact-main boot review passes.
 
-In particular, do not:
+Do not install, update, or start a development revision. In particular, do
+not:
 
-- run `factoryctl init` or `factoryctl update --install` from this revision;
+- run `factoryctl init` or `factoryctl update --install` from this checkout;
 - replace binaries under `~/.dark-factory/bin`;
 - load or restart the installed launchd job;
-- migrate the operator database to schema 33; or
+- migrate the operator database; or
 - use the operator home or socket for a test.
 
 Developers use a temporary `DARK_FACTORY_HOME` and explicit socket as described
-in the [development workflow](development/WORKFLOW.md). The prior release may
-remain installed but must stay stopped as directed by the operator.
+in the [development workflow](development/WORKFLOW.md). A prior release may
+remain installed but must stay stopped when directed by the operator.
 
-Installation documentation will be restored only after all three stages, the
-causal proof matrix, hosted gates, and an independent boot review pass. Passing
-that gate will not itself install, release, start, or modify the operator
-system; each is a separate explicit decision.
+Boot approval does not itself install, release, start, enable dispatch, or
+modify the operator system. Each is a separate explicit decision; supported
+installation instructions return only after those decisions establish a live
+release.

@@ -4,11 +4,9 @@ See [AGENTS.md](AGENTS.md) for the full workflow (one development worktree per c
 mandatory adversarial PR review, remove-or-refactor over patch) — this
 file is just the shortest path to a useful first change.
 
-Dark Factory is currently frozen for the
-[safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not run
-real provider work, install a development build, or use `~/.dark-factory`. Stage 1
-and Stage 2 fixtures must use only isolated temporary homes and deterministic
-shell providers; Stage 3 and the boot review remain incomplete.
+Live use remains frozen until an independent exact-main boot review passes.
+Development fixtures use isolated temporary homes, explicit sockets, and
+deterministic providers; never use the operator's installation.
 
 ## Before you send a change
 
@@ -60,12 +58,8 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
   maintainer has to choose, not code) — anything `size:S` is a reasonable
   first change. Found a new one? Open an issue with the bug template and
   label it `known-issue`; a fix closes it in the same PR (`Closes #N`).
-  Batches found during a dogfood run are triaged first in a local,
-  gitignored note under `docs/internal/` and turned into issues with
-  `scripts/import-issues.sh <note.md>` (one issue per `###` section; #24–#40
-  and #59–#76 came in that way).
 - **A new provider**: see [docs/providers.md](docs/providers.md) — the
-  whole contract is one `Provider` trait (`spawn_spec` + `capabilities`)
+  whole contract is one `Provider` trait (`spawn_spec`)
   in `crates/factoryd/src/providers/mod.rs`. `shell.rs` is the minimal
   reference implementation to copy from.
 - **A new theme**: `crates/factory-tui/src/theme.rs` is one `Theme` struct
@@ -76,7 +70,7 @@ A few workspace-wide rules the gate enforces, worth knowing up front:
   wire its name into `factory-tui`'s `--theme` flag parsing in `main.rs`.
   The `glyph_tables_are_complete` test in `theme.rs` catches a theme
   missing a glyph the board can actually draw.
-- **A safe-kernel causal test**: use the proof matrix in
+- **A kernel causal test**: use the proof matrix in
   `docs/development/SAFE_KERNEL_REFACTOR.md`. Process fixtures must register
   exact resources before use and include an independent post-test verifier;
   provider/test-process cleanup is not proof.

@@ -1,12 +1,12 @@
 # Development workflow
 
-## Freeze and scope
+## Live-use boundary
 
-Dark Factory is in a three-stage safe-kernel refactor. Do not start provider
-work, install or release a refactor revision, enable dispatch, modify
-`~/.dark-factory`, load or alter the installed launchd job, or delete preserved
-worktrees. Stage-specific isolated fixtures are allowed only with a temporary
-home, explicit socket, exact resource identities, and an independent reaper.
+Live use remains frozen until an independent exact-main boot review passes.
+Do not start provider work, install or release a development revision, enable
+dispatch, modify `~/.dark-factory`, load or alter the installed launchd job,
+or delete retained Changes. Isolated fixtures use a temporary home, explicit
+socket, exact resource identities, and an independent reaper.
 
 ## Day to day
 
@@ -80,22 +80,20 @@ must restart the daemon and let its durable finalizer converge. `Drop`, shell
 traps, sleeps, broad process scans, and cleanup owned only by the killed fixture
 are insufficient proof.
 
-## Stage review discipline
+## Review discipline
 
-Each safe-kernel stage is a coherent serial PR. Before implementation review,
-record:
+Each PR is one coherent change. Before review, record:
 
 - the old authority paths deleted;
 - production and test additions/deletions separately;
 - exact causal tests and injected crash boundaries;
-- unsupported later-stage operations that now fail closed;
+- unsupported operations that fail closed;
 - migration preconditions and rollback requirements; and
 - any compatibility code retained, with its sole caller.
 
-An independent phase review follows the stage PR review and challenges the
-combined architecture against
-[`SAFE_KERNEL_REFACTOR.md`](SAFE_KERNEL_REFACTOR.md). Passing one stage never
-authorizes booting the factory.
+Security-sensitive changes receive an independent adversarial review against
+[`SAFE_KERNEL_REFACTOR.md`](SAFE_KERNEL_REFACTOR.md). Merge, boot approval,
+release, installation, and live verification remain separate decisions.
 
 ## Migration rules
 
@@ -104,14 +102,13 @@ SQLite migrations are sequential numbered files under
 fixtures must apply the real ordered chain to version N rather than creating a
 new schema and manually deleting objects.
 
-The Stage 1 cutover migration refuses a schema-29 database containing live
-sessions, active/uncertain delivery, nonterminal runs, or other work whose
-external effect cannot be proven. Stage 2 moves every preserved source path
-into metadata-only `legacy_sources` quarantine, including separate records
-when agents or projects shared a path. Factoryd never inspects or owns those
-paths; forgetting a record does not touch the filesystem. Before any future
-schema-30/31 boot, take an explicit database backup and rollback decision; the
-refactor itself does not boot it.
+Kernel cutover migrations refuse databases containing live legacy authority or
+other external effects whose completion cannot be proven. Preserved source
+paths migrate into metadata-only `legacy_sources` quarantine, including
+separate records when agents or projects shared a path. Factoryd never inspects
+or owns those paths; forgetting a record does not touch the filesystem. Before
+an operator database crosses an irreversible migration boundary, take an
+explicit backup and rollback decision. Migration never implies boot approval.
 
 ## CI and GitHub
 
@@ -127,12 +124,13 @@ credentials, messages, source, and review deliberation stay private.
 
 ## Release and install
 
-Release and install are paused until the safe-kernel boot review. Do not tag,
-publish, update the Homebrew tap, run `factoryctl update --install`, or load a
-refactor binary into the operator job.
+Release and install are paused until the independent exact-main boot review.
+Do not tag, publish, update the Homebrew tap, run
+`factoryctl update --install`, or load a development binary into the operator
+job.
 
-After the freeze is lifted, the existing release transaction remains the
-required shape:
+After boot approval and a separate release decision, the release transaction
+retains this shape:
 
 - a semver tag matching the workspace version builds the supported archives;
 - published manifests and archives carry exact SHA-256 identities;
@@ -144,14 +142,12 @@ required shape:
 - migrations run at daemon start, with backup/rollback handled before an
   irreversible schema boundary.
 
-The old zero-downtime claim based on resident provider processes no longer
-applies. Any future updater must respect durable run resources and finalization
-rather than assuming daemon restart leaves an independent session alive.
+Any updater must respect durable run resources and finalization rather than
+assuming a daemon restart leaves provider work independently alive.
 
 ## Exact reporting
 
 Report each command actually run and whether it passed, failed, or was not run.
 Keep local proof, hosted CI, review approval, merge, release, install, and live
 verification distinct. A source build is not provider validation; deterministic
-shell proof is not Claude/Codex proof; a merged intermediate stage is not a
-boot candidate.
+shell proof is not Claude/Codex proof; a merged change is not a boot decision.
