@@ -3901,7 +3901,17 @@ mod tests {
         connection
             .pragma_update(None, "foreign_keys", true)
             .unwrap();
-        migrate_to(&mut connection, 29).unwrap();
+        for migration in [
+            include_str!("../migrations/0001_state_and_events.sql"),
+            include_str!("../migrations/0002_execution_ledger.sql"),
+            include_str!("../migrations/0003_runner_reconciliation.sql"),
+            include_str!("../migrations/0004_observer_health.sql"),
+            include_str!("../migrations/0005_provider_session_context.sql"),
+            include_str!("../migrations/0006_webhooks.sql"),
+        ] {
+            connection.execute_batch(migration).unwrap();
+        }
+        connection.pragma_update(None, "user_version", 6).unwrap();
         connection
             .execute_batch(
                 "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)

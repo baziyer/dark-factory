@@ -19,7 +19,7 @@ while IFS='|' read -r name color description; do
     try gh label create "$name" --color "$color" --description "$description" --force >/dev/null
 done <<'LABELS'
 known-issue|B60205|Imported from the known-issues triage; the smallest fix is in the body
-area:daemon|1D76DB|factoryd: sessions, dispatch, store, hooks, webhooks
+area:daemon|1D76DB|factoryd: attempts, dispatch, store, hooks, supervision
 area:cli|1D76DB|factoryctl
 area:tui|1D76DB|factory-tui
 area:providers|1D76DB|claude/codex/shell adapters and their generated config
@@ -34,7 +34,7 @@ size:S|C2E0C6|A focused change; hours
 size:M|FBCA04|A day or two; touches more than one crate or a load-bearing path
 size:L|E99695|Needs design or an upstream change first
 decision|D4C5F9|Needs the maintainer to decide, not (only) code
-security|D93F0B|Widens or narrows what a session, webhook caller, or PR can reach
+security|D93F0B|Widens or narrows what an attempt, external caller, or PR can reach
 LABELS
 
 step "merge settings (linear history: squash or rebase only; delete merged branches)"

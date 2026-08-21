@@ -13,7 +13,7 @@ security fixes.
 ## Current freeze
 
 The safe-kernel refactor is not a live release. Do not install or start this
-revision, enable auto mode, submit provider work, expose webhook intake, or use
+revision, enable dispatch, submit provider work, add external intake, or use
 the operator's `~/.dark-factory`. Stage 3 exact-head proof, independent review,
 merge, and the separate boot review remain required.
 
