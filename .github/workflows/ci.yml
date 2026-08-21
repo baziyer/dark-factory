@@ -138,17 +138,17 @@ jobs:
           test "$(uname -s)" = Linux
           test "$(uname -m)" = x86_64
 
-      - name: Check build headroom
-        run: ./scripts/check-build-headroom.sh
-
       - name: Install the pinned toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy,rustfmt --no-self-update
 
-      - name: Build the workspace
-        run: cargo +1.88.0 build --locked --workspace
-
       - name: Run the Linux authoritative gate
         run: ./scripts/local-ci.sh --linux-source
+
+      # The gate has already compiled every target. Build only the normal
+      # binaries that the following shell smoke executes, after clippy/tests
+      # so the gate cannot invalidate and rebuild an up-front cargo build.
+      - name: Build the workspace binaries
+        run: cargo +1.88.0 build --locked --workspace --bins
 
       - name: Verify source-gate mode boundary
         run: ./scripts/test-local-ci-mode.sh

@@ -35,6 +35,16 @@ grep -Fq 'temporary_root=' "$smoke" \
     || fail "smoke does not retain verifier staging until exact group release"
 grep -Fq 'exec sleep 120' "$smoke" \
     || fail "runner-kill descendant can expire inside the smoke timeout"
+grep -Fq 'verifier-release' "$smoke" \
+    || fail "verifier descendant has no causal release handshake"
+grep -Fq ': >"$scratch/verifier-release"' "$smoke" \
+    || fail "smoke never releases the verifier descendant after its assertions"
+grep -Fq 'Duration::from_secs(20)' "$smoke" \
+    && fail "verifier descendant still uses an arbitrary 20-second hold"
+grep -Fq '; sleep 5;' "$smoke" \
+    && fail "first provider uses an arbitrary five-second delay"
+grep -Fxq 'sleep 0.2' "$smoke" \
+    && fail "process discovery uses an arbitrary delay before bounded polling"
 
 if DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 \
     "$smoke"; then
