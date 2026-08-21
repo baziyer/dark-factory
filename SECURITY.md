@@ -60,6 +60,15 @@ God/orchestrator credentials grant scheduling policy only. They cannot create
 source paths, launch or finalize processes, change capacity or agents, publish
 repositories, or submit another run's outcome.
 
+Attempt messaging and scheduling follow the durable agent tree, not caller
+claims or task/run ancestry. Workers may message only themselves, their
+immediate parent, or their nearest orchestrator ancestor. Orchestrators may
+message themselves or strict descendants, create child tasks assigned to
+strict descendants, and assign queued tasks to strict descendants. They cannot
+edit tasks or unassign them. Factoryd rechecks the exact running run, project,
+role, current task, and `agents.parent_agent_id` inside the same immediate
+SQLite transaction that writes the message, task, revision, and event.
+
 ## Process and cleanup safety
 
 Before provider execution, `factoryd` durably records the admitted run and its

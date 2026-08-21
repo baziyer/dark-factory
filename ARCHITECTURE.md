@@ -60,10 +60,16 @@ pretends the resource disappeared or rewrites the outcome.
    the private operator credential. Attempt credentials are valid only while
    the exact run is `running`; admission, `finalizing`, and `terminal` do not
    grant effect authority.
-4. Request authorization is exhaustive and fail-closed. Workers can act only
-   on their admitted work. Orchestrators can propose bounded scheduling policy
-   within their project. Operator authority cannot be used as an attempt
-   identity for completion, blocking, or hooks.
+4. Request authorization is exhaustive and fail-closed. A worker may message
+   itself, its immediate parent,
+   or its nearest orchestrator ancestor. An orchestrator may message itself or
+   a strict descendant, create a child of its current task only when assigning
+   it to a strict descendant, and assign queued work only to a strict
+   descendant; attempt authority cannot edit or unassign tasks. These
+   relationship checks rederive the exact running run and `agents.parent_agent_id`
+   inside the same immediate Store transaction as the mutation. Task and run
+   ancestry never grant agent authority. Operator authority cannot be used as
+   an attempt identity for completion, blocking, or hooks.
 5. Admission is the only transition from queued work to an attempt. One Store
    transaction checks dispatch and capacity, selects the current canonical
    queue head, derives its agent role and provider, and binds the immutable
