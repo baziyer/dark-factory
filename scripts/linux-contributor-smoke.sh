@@ -50,6 +50,7 @@ export RUSTUP_HOME="$host_rustup_home"
 preserve_failure=$(printenv DARK_FACTORY_SMOKE_PRESERVE_FAILURE || printf 0)
 
 daemon_pid=
+verifier_descendant=
 tracked_processes="$scratch/runner-processes"
 crash_processes="$scratch/crash-processes"
 
@@ -193,6 +194,25 @@ provider_record() {
     '
 }
 
+verifier_record() {
+    snapshot_runner_processes
+    grep -F -- '--rust-verify-worker ' "$tracked_processes" | head -1
+}
+
+verifier_descendant_record() {
+    verifier_pid=$1
+    ps -axo pid=,pgid=,command= | awk -v group="$verifier_pid" '
+        $2 == group && $1 != group && index($0, "/bin/test-0000") {
+            pid = $1
+            $1 = ""
+            $2 = ""
+            sub(/^[[:space:]]+/, "", $0)
+            print pid "\t" $0
+            exit
+        }
+    '
+}
+
 wait_for_process_record() {
     kind=$1
     checked_run_id=$2
@@ -216,6 +236,69 @@ wait_for_process_record() {
         }
     done
     printf '%s\n' "$process_record"
+}
+
+wait_for_verifier_record() {
+    attempt=0
+    process_record=
+    while test -z "$process_record"; do
+        process_record=$(verifier_record || true)
+        attempt=$((attempt + 1))
+        test -n "$process_record" || {
+            test "$attempt" -lt 300 || {
+                cat "$tracked_processes" >&2 2>/dev/null || true
+                cat "$scratch/factoryd.log" >&2 2>/dev/null || true
+                echo "Rust verifier group leader did not appear" >&2
+                return 1
+            }
+            sleep 0.1
+        }
+    done
+    printf '%s\n' "$process_record"
+}
+
+wait_for_verifier_descendant() {
+    verifier_pid=$1
+    attempt=0
+    process_record=
+    while test -z "$process_record"; do
+        process_record=$(verifier_descendant_record "$verifier_pid" || true)
+        attempt=$((attempt + 1))
+        test -n "$process_record" || {
+            test "$attempt" -lt 300 || {
+                ps -axo pid=,ppid=,pgid=,command= \
+                    | awk -v group="$verifier_pid" '$3 == group' >&2
+                echo "Rust verifier test descendant did not appear" >&2
+                return 1
+            }
+            sleep 0.1
+        }
+    done
+    printf '%s\n' "$process_record"
+}
+
+record_is_alive() {
+    record=$1
+    process_pid=$(printf '%s\n' "$record" | cut -f1)
+    expected=$(printf '%s\n' "$record" | cut -f2-)
+    current=$(ps -p "$process_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
+    status=$(ps -p "$process_pid" -o stat= 2>/dev/null | sed 's/[[:space:]].*//' || true)
+    test -n "$current" && test "$current" = "$expected" \
+        && ! printf '%s\n' "$status" | grep -q '^Z'
+}
+
+wait_for_record_exit() {
+    record=$1
+    label=$2
+    attempt=0
+    while record_is_alive "$record"; do
+        attempt=$((attempt + 1))
+        test "$attempt" -lt 300 || {
+            echo "$label survived its causal fixture bound" >&2
+            return 1
+        }
+        sleep 0.1
+    done
 }
 
 kill_exact_record() {
@@ -326,6 +409,10 @@ cleanup() {
         echo "scratch socket survived daemon shutdown: $socket" >&2
         cleanup_status=1
     fi
+    if test -n "$verifier_descendant"; then
+        wait_for_record_exit "$verifier_descendant" "Rust verifier descendant" \
+            || cleanup_status=1
+    fi
     if test "$cleanup_status" -eq 0 \
         && { test "$status" -eq 0 \
             || test "$preserve_failure" != 1; }; then
@@ -393,7 +480,10 @@ mod tests {
             "launch"
         )
         .unwrap();
-        thread::sleep(Duration::from_secs(8));
+        // This descendant must outlive factoryd's five-second effect reap
+        // bound. The smoke kills only its group leader and proves no cache or
+        // temporary-root cleanup races this still-running writer.
+        thread::sleep(Duration::from_secs(20));
         assert_eq!(2 + 2, 4);
     }
 }
@@ -410,7 +500,7 @@ case "$launch" in
     1) test ! -e .git; ! git rev-parse --show-toplevel >/dev/null 2>&1; ! git worktree add ../x HEAD >/dev/null 2>&1; echo retained-mutation >>README.md; sleep 5; "$DARK_FACTORY_FACTORYCTL" task done --result outcome-before-exit; exit 42 ;;
     2) : >"$HOME/provider-kill-ready"; exec sleep 30 ;;
     3) sleep 0.5; "$DARK_FACTORY_FACTORYCTL" task done --result retry; exit 43 ;;
-    4) : >"$HOME/runner-kill-ready"; exec sleep 30 ;;
+    4) : >"$HOME/runner-kill-ready"; exec sleep 120 ;;
     5) : >"$HOME/cancel-ready"; exec sleep 30 ;;
     *) exit 99 ;;
 esac
@@ -480,8 +570,9 @@ if test "${DARK_FACTORY_SMOKE_FORCE_FAILURE:-0}" = 1; then
     exit 23
 fi
 
-# Success is durable before the provider's later exit 42. Crash the daemon
-# while its one verifier effect and one God attempt are both active.
+# Success is durable before the provider's later exit 42. Kill the verifier
+# group leader while its exact test descendant remains alive, then crash the
+# daemon while that one effect and one God attempt are both active.
 run_id=$(wait_for_task_run linux-smoke-task)
 wait_for_file "$scratch/verifier-launches" "Rust verifier"
 run_has "$run_id" '"phase":"finalizing".*"outcome":{"type":"succeeded"' || {
@@ -499,6 +590,9 @@ god_run=$(wait_for_task_run linux-smoke-god)
 wait_for_file "$HOME/god-ready" "orchestrator provider"
 sleep 0.2
 god_provider=$(wait_for_process_record provider "$god_run")
+verifier=$(wait_for_verifier_record)
+verifier_pid=$(printf '%s\n' "$verifier" | cut -f1)
+verifier_descendant=$(wait_for_verifier_descendant "$verifier_pid")
 snapshot_runner_processes "$crash_processes"
 change_root=$(find "$home/changes" -mindepth 1 -maxdepth 1 -type d -print -quit)
 test -n "$change_root" || {
@@ -506,13 +600,61 @@ test -n "$change_root" || {
     exit 1
 }
 printf 'B\n' >"$change_root/revision.txt"
+kill_exact_record "$verifier" "Rust verifier group leader"
+wait_for_pid_exit "$verifier_pid" "Rust verifier group leader"
+
+# The old failure path waited five seconds, then measured the live cache and
+# released the temporary root while this descendant was still writing. Hold
+# the assertion beyond that bound: without the original leader fingerprint,
+# the daemon must leave the completion check nonterminal and storage unknown.
+temporary_root="$home/artifacts/tmp/$(printf '%s\n' "$run_id" | tr -d '-')"
+attempt=0
+while test "$attempt" -lt 65; do
+    record_is_alive "$verifier_descendant" || {
+        echo "Rust verifier descendant did not outlive the cleanup assertion" >&2
+        exit 1
+    }
+    run_has "$run_id" '"phase":"finalizing"' || {
+        cat "$scratch/runs.json" >&2
+        echo "completion terminalized before its exact effect group was absent" >&2
+        exit 1
+    }
+    "$factoryctl" storage status --json >"$scratch/storage-pending.json"
+    grep -Fq '"complete":false' "$scratch/storage-pending.json" || {
+        cat "$scratch/storage-pending.json" >&2
+        echo "live verifier cache was measured before exact group release" >&2
+        exit 1
+    }
+    test -d "$temporary_root" || {
+        echo "verifier temporary root was released while its descendant lived" >&2
+        exit 1
+    }
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+
 kill -KILL "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=
 start_daemon
 
+record_is_alive "$verifier_descendant" || {
+    echo "verifier descendant did not cross the daemon restart boundary" >&2
+    exit 1
+}
+run_has "$run_id" '"phase":"finalizing"' || {
+    cat "$scratch/runs.json" >&2
+    echo "restart terminalized completion before exact group release" >&2
+    exit 1
+}
+test -d "$temporary_root" || {
+    echo "restart released verifier staging before exact group release" >&2
+    exit 1
+}
+
 kill_exact_record "$god_provider" "orchestrator provider"
 wait_for_run_terminal "$god_run" failed
+wait_for_record_exit "$verifier_descendant" "Rust verifier descendant"
 wait_for_run_terminal "$run_id" failed
 run_has "$run_id" '"reason":"unverifiable"' \
     && run_has "$run_id" '"exit_code":42|"exit_signal":[1-9][0-9]*' || {
@@ -610,4 +752,4 @@ test ! -d "$home/artifacts/tmp" \
     exit 1
 }
 
-echo "Linux source smoke passed: outcome-before-exit, fail-closed one-effect verifier recovery, exact provider/runner/God death, retained-Change retry, active cancellation, and resource teardown"
+echo "Linux source smoke passed: outcome-before-exit, fail-closed leader-loss verifier recovery, exact provider/runner/God death, retained-Change retry, active cancellation, and resource teardown"

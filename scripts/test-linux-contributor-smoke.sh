@@ -25,9 +25,16 @@ if grep -En '(^|[[:space:];])kill[[:space:]]+-[A-Z]+' "$smoke" \
 fi
 grep -Eq '(^|[[:space:]])(pkill|killall)([[:space:]]|$)' "$smoke" \
     && fail "smoke signals by process name"
-for proof in stop_owned_runs wait_for_tracked_processes kill_exact_record; do
+for proof in stop_owned_runs wait_for_tracked_processes kill_exact_record \
+    wait_for_verifier_record wait_for_verifier_descendant record_is_alive; do
     grep -Fq "$proof" "$smoke" || fail "smoke lacks $proof"
 done
+grep -Fq '"complete":false' "$smoke" \
+    || fail "smoke does not prove live verifier cache measurement stays incomplete"
+grep -Fq 'temporary_root=' "$smoke" \
+    || fail "smoke does not retain verifier staging until exact group release"
+grep -Fq 'exec sleep 120' "$smoke" \
+    || fail "runner-kill descendant can expire inside the smoke timeout"
 
 if DARK_FACTORY_SMOKE_ROOT="$root" DARK_FACTORY_SMOKE_FORCE_FAILURE=1 \
     "$smoke"; then

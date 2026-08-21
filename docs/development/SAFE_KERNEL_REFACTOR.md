@@ -414,8 +414,10 @@ approval.
   before use. Result publication is atomic and the one effect has a fixed
   30-minute deadline. On restart, recovery reaps that effect and consumes its
   already atomic exact result if present; otherwise the check terminally fails
-  unverifiable. It never rebuilds from later Change contents. Finalization
-  reconciles all registered resources.
+  unverifiable. It never rebuilds from later Change contents. If a group leader
+  is lost while descendants remain, its numeric PGID is not sufficient kill
+  authority: finalization stays nonterminal, with cache measurement and staging
+  cleanup withheld, until exact group absence is independently proven.
 - [x] Deny direct `cargo`, `rustc`, and `rustup` tool calls and recognized
   mutable `target/.../{debug,release}` launches in cooperative provider hook
   policy. Provider startup guidance says that `factoryctl task done` is the
@@ -480,11 +482,11 @@ the externally visible effect, not only an internal callback or row.
 | Outcome/exit race | Exercise request-before-exit and exit-before-request. The first durable `finalizing` request wins, late signals are harmless, and the finalizer selects the documented outcome. Only failed configured verification may turn requested success into `failed(unverifiable)`. |
 | Completion ordering | After a provider proposes success, another mutation and successor admission are refused. Reap every provider group, publish one stable source snapshot, run configured verification, and release resources before terminal. Verification failure records failure through the same finalizer. |
 | Failure, cancel, retry | Spawn failure, provider crash, and operator cancellation each finalize to the documented task result. Retry is refused before terminal, then creates a new RunId and work revision while retaining the same Change. Stale credentials remain invalid. |
-| External finalization | Own provider, runner, and verifier process groups plus their runtime and temporary roots. Kill each process owner and the daemon at separate phase cuts. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. The operator launchd service is outside attempt ownership; its adapter remains a separate release fixture in #280. |
+| External finalization | Own provider, runner, and verifier process groups plus their runtime and temporary roots. Kill each process owner and the daemon at separate phase cuts. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. If a verifier leader vanishes first, prove its descendant keeps finalization nonterminal past the reap bound and across restart, then converges only after exact group absence. The operator launchd service is outside attempt ownership; its adapter remains a separate release fixture in #280. |
 | Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs from the exact attempt-owned staging identity. Tampered or identity-replaced staging fails closed. Restart reaps the one verifier effect and consumes its atomically published exact result, or fails unverifiable without rebuilding from later Change contents. |
 | Immutable source | Request completion, prove the provider group is gone, and scan/copy/scan source A. A concurrent mutation either yields one canonical A snapshot or makes publication fail before compilation; no mixed snapshot is accepted. |
 | Cache reuse | Build two exact source revisions with the same project/toolchain configuration. They use one mutable cache namespace and produce different source-bound immutable manifests. |
-| Bounded storage | Count admission refuses a new cache before effects. A running writer makes byte status incomplete; after exact group reap, allocated bytes are remeasured and safe reclamation converges idempotently. Reuse of a measured over-limit cache is refused. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
+| Bounded storage | Count admission refuses a new cache before effects. A running writer makes byte status incomplete; leader loss cannot complete that measurement while any exact effect row remains unreleased. After exact group absence, allocated bytes are remeasured and safe reclamation converges idempotently. Reuse of a measured over-limit cache is refused. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
 | Source-view boundary | The provider source view has no discoverable Git administrative locator; repository discovery and ordinary worktree creation fail. The exact retained Change remains inspectable and removable only through daemon-owned operations. |
 | God policy only | God may propose priority and assignment. Worktree creation, process launch, repository publication, outcome submission, capacity/budget mutation, and operator control fail. Killing God does not change finalization. |
 
