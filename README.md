@@ -1,118 +1,97 @@
 # Dark Factory
 
-Dark Factory is a local, terminal-first control plane for turning a software
-backlog into bounded coding-agent runs. `factoryd` owns durable work,
-capabilities, processes, and cleanup; `factoryctl` and `factory-tui` are
-clients of the same private local API.
+Dark Factory turns a software backlog into supervised coding-agent work on
+your own machine. `factoryd` owns the durable queue and provider processes;
+`factoryctl` controls it, and `factory-tui` is a detachable terminal view over
+the same local API. It is not a coding model, hosted service, or general agent
+framework.
 
-> **Development freeze:** `main` is part-way through the
-> [safe-kernel refactor](docs/development/SAFE_KERNEL_REFACTOR.md). Do not
-> install or start this revision, enable auto mode, submit provider work, or
-> point it at `~/.dark-factory`. Stages 1 and 2 are merged. Stage 3 is being
-> implemented on its isolated branch; its exact-head gates, independent review,
-> merge, and the separate boot review are still incomplete.
+## Model
 
-## The smaller runtime model
+- A **project** points at a local source repository and holds shared policy.
+- An **agent** has a role, provider, settings, and ordered task queue.
+- A **task** is durable work; assigning it makes it eligible for admission.
+- An **attempt** (stored as a run) is one execution of one task.
+- A **Change** is the retained, `.git`-free source tree used by worker attempts
+  and retries.
 
-There are no resident provider sessions. One admitted run owns one fresh,
-non-interactive provider process:
+Each admitted attempt gets a fresh, non-interactive provider process. Its
+credential resolves only while that run is running, and the daemon derives the
+caller's stored attempt identity instead of accepting a caller-selected one.
+Attempt authority is revoked before cleanup and configured completion checks.
+Dark Factory supplies no commit, push, or pull-request surface. Closing the CLI
+or TUI does not stop active work.
 
-```text
-queued task -> admitted -> running -> finalizing -> terminal
-                              |             |
-                              |             +-- authority revoked; resources reaped
-                              +-- exact attempt bearer grants bounded operations
-```
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed lifecycle and
+[SECURITY.md](SECURITY.md) for threat boundaries.
 
-- A queued task grants no process or mutation authority.
-- Admission records the exact task incarnation, run, capability, and declared
-  resources before a provider can execute.
-- `factory-runner` prepares a blocked child. `factoryd` records its PID and
-  process group, moves the run to `running`, and only then releases it to
-  `exec`.
-- Success, block, cancellation, spawn failure, and unexpected exit all enter
-  `finalizing`. One restartable daemon finalizer releases exact registered
-  resources before writing `terminal`.
-- A provider request carries a private attempt bearer. The daemon derives its
-  project, agent, task, run, role, and source scope; callers do not select
-  those identities.
-- Provider processes receive only the path to that bearer in
-  `DARK_FACTORY_ATTEMPT_TOKEN_FILE`. `factoryctl` uses the ambient attempt
-  credential for every provider-invoked request, so an operator-shaped command
-  is checked as that attempt and refused rather than upgraded to operator
-  authority.
-- God/orchestrators may propose priority and assignment. They do not own
-  admission, source, processes, finalization, capacity, or administration.
+## Availability
 
-The safe kernel removes PTY attach, terminal input, provider resume, delivery replay,
-session outboxes, message-only provider turns, and per-agent worktree
-creation. Historical session events may still decode for old databases, but
-the live runtime does not create sessions.
+Dark Factory is pre-1.0. Current `main` is not approved for installation or
+live provider work. There is no supported install command for this revision:
+do not run `factoryctl init`, enable `factoryctl auto on`, update a live
+installation, or point a source build at `~/.dark-factory`.
 
-## Current stage boundary
+Supported installation steps will return only when a revision is approved for
+live operation.
 
-`factoryd` now reserves one Change for an exact task incarnation and
-materializes a plain writable source tree from one exact local commit before
-the worker can execute. The provider view contains no `.git` locator and is
-not a linked Git worktree. Provider mutations remain in that retained Change;
-status, commit, push, pull-request, and publication operations are deliberately
-absent.
+## Safe source preview
 
-Paths retained from the pre-kernel architecture are metadata-only
-`legacy_sources`. Factoryd never stats, adopts, measures, leases, renames, or
-deletes them. An operator may forget only the metadata record by its typed ID.
-
-Orchestrator policy runs may use their bounded guidance/project policy
-context, but this revision is still not a boot candidate. The Stage 3 branch
-adds an operator-selected `None`/`RustWorkspaceTest` completion policy, one
-shared project/toolchain cache, attempt-owned immutable test-executable
-staging, and convergent cache reclamation. Providers receive no generic build
-API: direct Rust toolchains are refused by their cooperative hook policy, and
-`factoryctl task done` owns configured final verification after the provider
-has been reaped. A separate exact-head review must accept those claims before
-merge or boot review.
-
-## Repository layout
-
-- `factory-core`: bounded domain and wire types.
-- `factory-runner`: provider-blind process host with prepare/activate gating.
-- `factoryd`: durable admission, authority, resource ownership, and
-  finalization.
-- `factoryctl`: operator and attempt-scoped local-API client.
-- `factory-tui`: operator projection over the same API.
-
-The five crates are process and dependency boundaries, not an invitation to
-add service or repository abstractions. The daemon keeps one SQLite `Store`.
-
-## Development
-
-Rust 1.88 or later is required.
+Rust 1.88 or later is required. This preview starts an empty daemon in a
+throwaway home, checks its local API, and stops that exact daemon. It does not
+submit provider work or use a Claude or Codex subscription.
 
 ```sh
-./scripts/new-worktree.sh <slug>
-cd .worktrees/<slug>
-cargo build --workspace
-./scripts/local-ci.sh
+cargo +1.88.0 build --locked --workspace
+
+DF_DEV_HOME="$(mktemp -d /tmp/dark-factory.XXXXXX)"
+chmod 700 "$DF_DEV_HOME"
+DARK_FACTORY_HOME="$DF_DEV_HOME" \
+  target/debug/factoryd --socket "$DF_DEV_HOME/factory.sock" &
+DF_DAEMON_PID=$!
+
+for _ in 1 2 3 4 5; do
+  DARK_FACTORY_HOME="$DF_DEV_HOME" \
+    target/debug/factoryctl --socket "$DF_DEV_HOME/factory.sock" health \
+    >/dev/null 2>&1 && break
+  sleep 1
+done
+DARK_FACTORY_HOME="$DF_DEV_HOME" \
+  target/debug/factoryctl --socket "$DF_DEV_HOME/factory.sock" health
+DARK_FACTORY_HOME="$DF_DEV_HOME" \
+  target/debug/factoryctl --socket "$DF_DEV_HOME/factory.sock" status
+
+kill "$DF_DAEMON_PID"
+wait "$DF_DAEMON_PID"
 ```
 
-On Ubuntu x86-64, use `./scripts/local-ci.sh --linux-source`. Tests and manual
-checks must use a temporary `DARK_FACTORY_HOME` and explicit temporary socket.
-Never exercise a real Claude or Codex subscription when the deterministic
-shell fixture proves the behavior.
+For development work, use an isolated branch/worktree and the fuller
+[development workflow](docs/development/WORKFLOW.md). It includes the
+authoritative local gate and deterministic shell-provider fixtures.
 
-Every pull request requires a cold adversarial review by someone other than
-the author. The reviewer tries to break correctness, security, and the claimed
-simplification before merge. See [AGENTS.md](AGENTS.md) and the
-[development workflow](docs/development/WORKFLOW.md).
+## Operator surface
 
-## Documentation
+These are the main day-to-day entry points once live operation is supported:
 
-- [Architecture and invariants](ARCHITECTURE.md)
-- [Safe-kernel epic and progress](docs/development/SAFE_KERNEL_REFACTOR.md)
+```sh
+factoryctl status
+factory-tui
+
+factoryctl run list --project PROJECT_ID
+factoryctl run stop --project PROJECT_ID --run RUN_ID
+```
+
+Run `factoryctl --help` or `factoryctl <command> --help` for the exact project,
+agent, and task operations. The CLI remains the canonical control path; the TUI
+does not have a separate mutation API.
+
+## Learn more
+
+- [TUI guide](crates/factory-tui/README.md)
 - [Provider contract](docs/providers.md)
-- [Security boundary](SECURITY.md)
+- [Architecture](ARCHITECTURE.md)
+- [Security](SECURITY.md)
 - [Contributing](CONTRIBUTING.md)
-- [Installation and service freeze](docs/install.md)
+- [Development workflow](docs/development/WORKFLOW.md)
 
-Dark Factory is MIT licensed. It is pre-1.0 and currently deliberately
-unavailable for live operation while the safe kernel is completed.
+Dark Factory is MIT licensed.

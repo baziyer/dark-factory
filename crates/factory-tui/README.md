@@ -1,8 +1,8 @@
 # factory-tui
 
 `factory-tui` is the detachable terminal board for a running Dark Factory. It
-uses the same local API as `factoryctl`; closing it never stops the daemon or an
-attempt.
+uses the same local API as `factoryctl`. Closing the TUI does not stop the
+daemon or active work.
 
 ```sh
 factory-tui
@@ -10,24 +10,13 @@ factory-tui --project my-project
 factory-tui --theme plain
 ```
 
-The board reconnects across daemon restarts and remembers the last focused
+The board reconnects after daemon restarts and remembers the last focused
 project unless `--project` selects one.
 
-## Views
-
-BUILDING shows every project, agent, queue, recent activity, and the shared
-NEEDS YOU decision list. Durable run phase and outcome determine each agent's
-state. Current activity is a separate bounded label and event-driven sparkline;
-the TUI never infers work authority from a client or provider process.
-
-AGENT shows the selected agent's current or latest attempt, queue, durable
-messages, and settings. `Admitted`, `Running`, `Finalizing`, and `Terminal` are
-shown directly. Finalizing is explicitly authority-revoked resource cleanup,
-not an interactive session.
-
-The TUI deliberately has no provider PTY, terminal input, attach, resize, or
-session lifecycle path. Provider execution belongs to the exact admitted run;
-operators inspect immutable run output through the CLI/API boundary.
+BUILDING is the fleet view: projects, agents, queues, recent activity, and the
+shared NEEDS YOU list. AGENT shows one agent's current or latest attempt,
+queue, messages, and settings. The TUI has no embedded provider terminal or
+session controls; provider execution belongs to its admitted attempt.
 
 ## Keys
 
@@ -51,10 +40,10 @@ operators inspect immutable run output through the CLI/API boundary.
 | `?` | Show all keys. |
 | `q` | Detach from the factory. |
 
-Mouse clicks select the same tabs, agents, tasks, and attention actions as the
-keyboard. All mutations use daemon requests; there is no TUI-only control path.
+Mouse input selects the same visible tabs, agents, tasks, and actions as the
+keyboard.
 
-## Development
-
-Never point a development build at the live install. Follow the
-[development workflow](../../docs/development/WORKFLOW.md#developing-the-daemon-without-disrupting-a-running-factory).
+Current `main` is frozen for live operation. Never point a development build at
+the operator's installation; follow the
+[development workflow](../../docs/development/WORKFLOW.md) with a temporary
+home and socket.
