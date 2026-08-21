@@ -1,14 +1,21 @@
 #!/bin/sh
 set -eu
 
-# A short, provider-free contributor check for Ubuntu. The workspace tests
-# exercise the deeper attempt/resource lifecycle; this script proves that a
-# fresh source checkout can bring up the real binaries, materialize one exact
-# `.git`-free Change, and complete one worker task through the public CLI and
-# one-shot shell provider.
+# A provider-free causal check for Ubuntu. It brings up the real binaries and
+# drives deterministic one-shot shell attempts through the public CLI while
+# observing exact processes, durable phases, verification, and storage.
 
 repo_root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 host_rustup_home=${RUSTUP_HOME:-${HOME:-}/.rustup}
+cargo_bin=$(command -v cargo)
+provider_free_path=$(dirname "$cargo_bin"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+for paid_provider in claude codex; do
+    if PATH="$provider_free_path" command -v "$paid_provider" >/dev/null 2>&1; then
+        echo "provider-free smoke PATH unexpectedly resolves $paid_provider" >&2
+        exit 1
+    fi
+done
+export PATH="$provider_free_path"
 target_root=${CARGO_TARGET_DIR:-"$repo_root/target"}
 bin_dir="$target_root/debug"
 factoryd="$bin_dir/factoryd"
@@ -82,7 +89,14 @@ record_process() {
 
 run_list() {
     "$factoryctl" --socket "$socket" run list \
-        --project linux-smoke-project --limit 100 >"$scratch/runs.json"
+        --project linux-smoke-project --limit 100 >"$scratch/runs.json" \
+        || return 1
+    grep -Fq '"response":{"type":"runs","data":{"runs":[' \
+        "$scratch/runs.json" || {
+        cat "$scratch/runs.json" >&2
+        echo "run list returned a malformed projection" >&2
+        return 1
+    }
 }
 
 discover_task_run() {
@@ -111,6 +125,16 @@ change_record() {
     sed 's/},{/\n/g' "$scratch/changes.json" \
         | grep -F "\"task_id\":\"$task_id\"" \
         | tail -1
+}
+
+add_worker_task() {
+    task_id=$1
+    "$factoryctl" task add \
+        --id "$task_id" \
+        --project linux-smoke-project \
+        --agent linux-smoke-agent \
+        --title "$task_id" \
+        --body 'Exercise the causal smoke boundary.' >/dev/null
 }
 
 wait_for_file() {
@@ -167,6 +191,112 @@ wait_for_run_terminal() {
         echo "run $checked_run_id did not retain $outcome as its outcome" >&2
         return 1
     }
+}
+
+assert_attempt_refused() {
+    token_file=$1
+    label=$2
+    if DARK_FACTORY_ATTEMPT_TOKEN_FILE="$token_file" \
+        "$factoryctl" agent message \
+            --id "denied-$label" \
+            --project linux-smoke-project \
+            --to linux-smoke-agent \
+            --body "late $label mutation" \
+            >"$scratch/$label-message.out" 2>&1; then
+        echo "$label bearer inserted a message after authority revocation" >&2
+        return 1
+    fi
+    if DARK_FACTORY_ATTEMPT_TOKEN_FILE="$token_file" \
+        "$factoryctl" task blocked --reason "late $label outcome" \
+            >"$scratch/$label-outcome.out" 2>&1; then
+        echo "$label bearer replaced its durable outcome" >&2
+        return 1
+    fi
+}
+
+assert_task_has_no_open_run() {
+    task_id=$1
+    label=$2
+    open_run=$(discover_task_run "$task_id")
+    test -z "$open_run" || {
+        echo "$label unexpectedly admitted run $open_run" >&2
+        return 1
+    }
+}
+
+wait_for_storage_complete() {
+    label=$1
+    attempt=0
+    while :; do
+        "$factoryctl" storage status --json >"$scratch/storage-complete.json"
+        if grep -Fq '"complete":true' "$scratch/storage-complete.json" \
+            && grep -Eq '"cache_bytes":[0-9]+' "$scratch/storage-complete.json"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        test "$attempt" -lt 300 || {
+            cat "$scratch/storage-complete.json" >&2
+            echo "$label did not converge to a measured complete storage inventory" >&2
+            return 1
+        }
+        sleep 0.1
+    done
+}
+
+retained_change_count() {
+    "$factoryctl" --socket "$socket" change list \
+        --project linux-smoke-project >"$scratch/changes.json"
+    count=$(sed -n \
+        's/.*"factory_storage":{"retained_count":\([0-9][0-9]*\).*/\1/p' \
+        "$scratch/changes.json")
+    test -n "$count" || return 1
+    printf '%s\n' "$count"
+}
+
+wait_for_change_storage_complete() {
+    label=$1
+    attempt=0
+    while :; do
+        retained_change_count >/dev/null
+        complete_count=$(grep -o '"complete":true' "$scratch/changes.json" \
+            | wc -l | tr -d '[:space:]')
+        if test "$complete_count" -eq 2; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        test "$attempt" -lt 300 || {
+            cat "$scratch/changes.json" >&2
+            echo "$label did not converge to complete Change storage" >&2
+            return 1
+        }
+        sleep 0.1
+    done
+}
+
+snapshot_changes() {
+    output=$1
+    page="$scratch/change-page.json"
+    after=
+    : >"$output"
+    while :; do
+        if test -n "$after"; then
+            "$factoryctl" --socket "$socket" change list \
+                --project linux-smoke-project --limit 16 --after "$after" >"$page"
+        else
+            "$factoryctl" --socket "$socket" change list \
+                --project linux-smoke-project --limit 16 >"$page"
+        fi
+        cat "$page" >>"$output"
+        printf '\n' >>"$output"
+        next_after=$(sed -n \
+            's/.*"next_after_id":"\([^"]*\)".*/\1/p' "$page")
+        test -n "$next_after" || return 0
+        test "$next_after" != "$after" || {
+            echo "Change pagination did not advance from $after" >&2
+            return 1
+        }
+        after=$next_after
+    done
 }
 
 # Capture only descendants of this exact scratch daemon. The smoke never
@@ -511,7 +641,7 @@ EOF
 cat >"$repo/src/lib.rs" <<EOF
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write as _, thread, time::Duration};
+    use std::{fs, io::Write as _, path::Path, thread, time::{Duration, Instant}};
 
     #[test]
     fn immutable_prepared_binary_runs() {
@@ -527,10 +657,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(revision, "A\n");
-        // This descendant must outlive factoryd's five-second effect reap
-        // bound. The smoke kills only its group leader and proves no cache or
-        // temporary-root cleanup races this still-running writer.
-        thread::sleep(Duration::from_secs(20));
+        if Path::new("controlled-verification").exists() {
+            fs::write(r#"$scratch/success-verifier-started"#, b"started").unwrap();
+            let release = Path::new(r#"$scratch/success-verifier-release"#);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !release.exists() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(release.exists(), "controlled verifier was never released");
+        } else {
+            // This descendant must outlive factoryd's five-second effect reap
+            // bound. The smoke kills only its group leader and proves no cache
+            // or temporary-root cleanup races this still-running writer.
+            thread::sleep(Duration::from_secs(20));
+        }
         assert_eq!(2 + 2, 4);
     }
 }
@@ -545,11 +685,13 @@ launch=$((launch + 1))
 echo "$launch" >>"$HOME/launches"
 case "$launch" in
     1) test ! -e .git; ! git rev-parse --show-toplevel >/dev/null 2>&1; ! git worktree add ../x HEAD >/dev/null 2>&1; echo retained-mutation >>README.md; sleep 5; "$DARK_FACTORY_FACTORYCTL" task done --result outcome-before-exit; exit 42 ;;
-    2) : >"$HOME/provider-kill-ready"; exec sleep 30 ;;
-    3) sleep 0.5; "$DARK_FACTORY_FACTORYCTL" task done --result retry; exit 43 ;;
-    4) : >"$HOME/runner-kill-ready"; exec sleep 120 ;;
-    5) : >"$HOME/cancel-ready"; exec sleep 30 ;;
-    *) exit 99 ;;
+    2) cp "$DARK_FACTORY_ATTEMPT_TOKEN_FILE" "$HOME/finalizing-token"; chmod 600 "$HOME/finalizing-token"; : >controlled-verification; "$DARK_FACTORY_FACTORYCTL" task done --result verified-success; exit 42 ;;
+    3) cp "$DARK_FACTORY_ATTEMPT_TOKEN_FILE" "$HOME/exit-token"; chmod 600 "$HOME/exit-token"; exit 41 ;;
+    4) : >"$HOME/provider-kill-ready"; exec sleep 30 ;;
+    5) sleep 0.5; "$DARK_FACTORY_FACTORYCTL" task done --result retry; exit 43 ;;
+    6) : >"$HOME/runner-kill-ready"; exec sleep 120 ;;
+    7) : >"$HOME/cancel-ready"; exec sleep 30 ;;
+    *) "$DARK_FACTORY_FACTORYCTL" task done --result "cap-fill-$launch"; exit 0 ;;
 esac
 EOF
 chmod 755 "$repo/smoke-agent.sh"
@@ -739,20 +881,70 @@ test "$(sed -n '1p' "$scratch/verifier-launches")" = A || {
     exit 1
 }
 wait_for_tracked_processes "$crash_processes"
+wait_for_storage_complete "interrupted verifier recovery"
 
-# Only the first task is a verification subject.
+# Run one configured verification to success. Its test-owned release barrier
+# keeps the run durably finalizing while the harness proves that the revoked
+# bearer, operator retry, and same-agent successor cannot cross that boundary.
+add_worker_task linux-smoke-verified-success
+verified_run=$(wait_for_task_run linux-smoke-verified-success)
+wait_for_file "$scratch/success-verifier-started" "controlled Rust verifier" 900
+run_has "$verified_run" '"phase":"finalizing".*"outcome":{"type":"succeeded"' || {
+    cat "$scratch/runs.json" >&2
+    echo "verified success was not durably proposed before verification" >&2
+    exit 1
+}
+assert_attempt_refused "$HOME/finalizing-token" finalizing
+if "$factoryctl" task retry \
+    --project linux-smoke-project --task linux-smoke-verified-success \
+    >"$scratch/finalizing-retry.out" 2>&1; then
+    echo "operator retry crossed a finalizing run" >&2
+    exit 1
+fi
+
+# This task is also the exit-before-outcome case. It must remain queued until
+# the verified predecessor is terminal, then receive a fresh run and bearer.
+add_worker_task linux-smoke-exit-before-outcome
+attempt=0
+while test "$attempt" -lt 65; do
+    assert_task_has_no_open_run \
+        linux-smoke-exit-before-outcome "finalizing successor"
+    run_has "$verified_run" '"phase":"finalizing"' || {
+        echo "verified run left finalizing before its release barrier" >&2
+        exit 1
+    }
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+: >"$scratch/success-verifier-release"
+wait_for_run_terminal "$verified_run" succeeded
+assert_attempt_refused "$HOME/finalizing-token" terminal
+wait_for_storage_complete "successful verifier"
+test "$(wc -l <"$scratch/verifier-launches" | tr -d '[:space:]')" = 2 || {
+    cat "$scratch/verifier-launches" >&2
+    echo "configured success did not launch exactly one additional verifier" >&2
+    exit 1
+}
+test "$(sed -n '2p' "$scratch/verifier-launches")" = A || {
+    cat "$scratch/verifier-launches" >&2
+    echo "successful verifier did not launch the selected source" >&2
+    exit 1
+}
+
+exit_first_run=$(wait_for_task_run linux-smoke-exit-before-outcome)
+test "$exit_first_run" != "$verified_run" || exit 1
+wait_for_run_terminal "$exit_first_run" failed
+run_has "$exit_first_run" '"reason":"process"' || exit 1
+assert_attempt_refused "$HOME/exit-token" exit-terminal
+run_has "$exit_first_run" '"reason":"process"' || {
+    echo "late bearer replaced the exit-first process outcome" >&2
+    exit 1
+}
+
+# The remaining attempts exercise lifecycle and retained-Change bounds without
+# adding more completion checks.
 "$factoryctl" project verification \
     --project linux-smoke-project --mode none >/dev/null
-
-add_worker_task() {
-    task_id=$1
-    "$factoryctl" task add \
-        --id "$task_id" \
-        --project linux-smoke-project \
-        --agent linux-smoke-agent \
-        --title "$task_id" \
-        --body 'Exercise the causal smoke boundary.' >/dev/null
-}
 
 change_identity() {
     record=$(change_record "$1")
@@ -807,7 +999,7 @@ while test "$attempt" -lt 65; do
         echo "factoryd signalled a provider after losing its runner authority" >&2
         exit 1
     }
-    run_has "$runner_kill_run" '"phase":"finalizing"' || {
+    run_has "$runner_kill_run" '"phase":"(running|finalizing)"' || {
         cat "$scratch/runs.json" >&2
         echo "runner loss terminalized before provider-group absence" >&2
         exit 1
@@ -836,6 +1028,63 @@ snapshot_runner_processes
 wait_for_run_terminal "$cancel_run" cancelled
 wait_for_tracked_processes
 
+# Fill the retained-Change inventory through ordinary admitted attempts, then
+# prove the hard factory-wide cap refuses admission without deleting or
+# replacing any of the 64 daemon-owned Changes.
+retained=$(retained_change_count)
+fill_index=1
+while test "$retained" -lt 64; do
+    fill_task=$(printf 'linux-smoke-cap-fill-%02d' "$fill_index")
+    add_worker_task "$fill_task"
+    fill_run=$(wait_for_task_run "$fill_task")
+    wait_for_run_terminal "$fill_run" succeeded
+    retained=$(retained_change_count)
+    fill_index=$((fill_index + 1))
+    test "$fill_index" -le 65 || {
+        echo "retained-Change fill did not converge to the hard cap" >&2
+        exit 1
+    }
+done
+test "$retained" -eq 64 || exit 1
+wait_for_change_storage_complete "retained-Change cap fill"
+grep -Fq '"hard_factory_count_cap":64' "$scratch/changes.json" || {
+    cat "$scratch/changes.json" >&2
+    echo "Change status did not publish the enforced hard cap" >&2
+    exit 1
+}
+snapshot_changes "$scratch/cap-before.jsonl"
+test "$(grep -o '"task_id":"' "$scratch/cap-before.jsonl" | wc -l \
+    | tr -d '[:space:]')" -eq 64 || {
+    echo "paginated Change snapshot did not contain the retained inventory" >&2
+    exit 1
+}
+add_worker_task linux-smoke-cap-refused
+attempt=0
+while test "$attempt" -lt 65; do
+    assert_task_has_no_open_run linux-smoke-cap-refused "retained-Change cap"
+    "$factoryctl" task get \
+        --project linux-smoke-project --task linux-smoke-cap-refused \
+        >"$scratch/cap-task.json"
+    grep -Fq '"status":"queued"' "$scratch/cap-task.json" || {
+        cat "$scratch/cap-task.json" >&2
+        echo "cap-refused task did not remain queued" >&2
+        exit 1
+    }
+    test "$(retained_change_count)" -eq 64 || exit 1
+    attempt=$((attempt + 1))
+    sleep 0.1
+done
+snapshot_changes "$scratch/cap-after.jsonl"
+cmp "$scratch/cap-before.jsonl" "$scratch/cap-after.jsonl" || {
+    echo "cap refusal changed the retained-Change inventory" >&2
+    exit 1
+}
+if grep -Fq '"task_id":"linux-smoke-cap-refused"' \
+    "$scratch/cap-after.jsonl"; then
+    echo "cap-refused task acquired a Change" >&2
+    exit 1
+fi
+
 snapshot_runner_processes
 test ! -s "$tracked_processes" || {
     cat "$tracked_processes" >&2
@@ -854,4 +1103,4 @@ test ! -d "$home/artifacts/tmp" \
     exit 1
 }
 
-echo "Linux source smoke passed: outcome-before-exit, fail-closed verifier and runner leader loss, exact provider/God death, retained-Change retry, active cancellation, and resource teardown"
+echo "Linux source smoke passed: both outcome/exit orders, revoked authority, successful and fail-closed verification, exact leader loss, retry/cancellation, retained-Change cap, and resource teardown"

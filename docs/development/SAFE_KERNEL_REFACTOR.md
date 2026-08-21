@@ -209,7 +209,7 @@ callback or row:
 | Crash and restart | Inject failure after admission, resource declaration, each blocked-exec release, provider exit, external cleanup, and before acknowledgement. Restart yields at most one provider execution, no input replay, exact identity, and idempotent convergence. |
 | Taskless refusal | With no admitted run, no provider exists. Old, forged, taskless, finalizing, and terminal credentials cannot mutate task, budget, source, or outcome state. |
 | Queue race | Reorder or insert higher-priority assigned work between observation and admission. The Store admits only the canonical queue head selected inside its transaction. |
-| Hierarchy scope | Reparent agents and attempt cross-agent messaging, creation, and assignment. The same mutation transaction uses the current durable hierarchy and refuses siblings, ancestors outside the worker allowance, and non-descendants. |
+| Hierarchy scope | Construct alternate durable agent hierarchies and attempt cross-agent messaging, creation, and assignment. The same mutation transaction uses the stored hierarchy and refuses siblings, ancestors outside the worker allowance, and non-descendants. |
 | Outcome and exit race | Exercise request-before-exit and exit-before-request. The first `finalizing` request wins; only failed configured verification may refine proposed success. |
 | Completion ordering | After a success proposal, further attempt mutation and successor admission are refused until provider reap, exact snapshot and configured verification, release of every resource, and terminalization. |
 | Failure, cancel, and retry | Spawn failure, provider crash, and cancellation converge through finalization. Retry is refused before terminal and creates a fresh run and bearer afterward. |
