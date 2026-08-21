@@ -410,11 +410,11 @@ approval.
   never launch a mutable `target/debug` or `target/release` top-level sibling.
   The snapshot is the test working directory; fixtures are not copied, doctests
   are excluded, and same-UID test code is not sandboxed.
-- [x] Register each worker, process group, and temporary root durably before
-  use. Result publication is atomic, every effect has a fixed 30-minute
-  deadline, and restart either consumes its exact result or starts one bounded
-  replacement from the same persisted invocation. At most two verifier effects
-  exist for a check: the initial launch and that replacement. Finalization
+- [x] Register the verifier effect, process group, and temporary root durably
+  before use. Result publication is atomic and the one effect has a fixed
+  30-minute deadline. On restart, recovery reaps that effect and consumes its
+  already atomic exact result if present; otherwise the check terminally fails
+  unverifiable. It never rebuilds from later Change contents. Finalization
   reconciles all registered resources.
 - [x] Deny direct `cargo`, `rustc`, and `rustup` tool calls and recognized
   mutable `target/.../{debug,release}` launches in cooperative provider hook
@@ -480,8 +480,8 @@ the externally visible effect, not only an internal callback or row.
 | Outcome/exit race | Exercise request-before-exit and exit-before-request. The first durable `finalizing` request wins, late signals are harmless, and the finalizer selects the documented outcome. Only failed configured verification may turn requested success into `failed(unverifiable)`. |
 | Completion ordering | After a provider proposes success, another mutation and successor admission are refused. Reap every provider group, publish one stable source snapshot, run configured verification, and release resources before terminal. Verification failure records failure through the same finalizer. |
 | Failure, cancel, retry | Spawn failure, provider crash, and operator cancellation each finalize to the documented task result. Retry is refused before terminal, then creates a new RunId and work revision while retaining the same Change. Stale credentials remain invalid. |
-| External finalization | Own a process group, runtime root, temporary root, and throwaway launchd job. Kill provider, runner, daemon, and fixture separately. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. |
-| Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs from the exact attempt-owned staging identity. Tampered or identity-replaced staging fails closed. Restart consumes the atomically published exact result or reruns the bounded worker from the persisted invocation. |
+| External finalization | Own provider, runner, and verifier process groups plus their runtime and temporary roots. Kill each process owner and the daemon at separate phase cuts. Restart reaps only exact fingerprint-matched resources and leaves reused identities untouched. The operator launchd service is outside attempt ownership; its adapter remains a separate release fixture in #280. |
+| Immutable launch | Prepare A, replace mutable Cargo output with B, then launch: A runs from the exact attempt-owned staging identity. Tampered or identity-replaced staging fails closed. Restart reaps the one verifier effect and consumes its atomically published exact result, or fails unverifiable without rebuilding from later Change contents. |
 | Immutable source | Request completion, prove the provider group is gone, and scan/copy/scan source A. A concurrent mutation either yields one canonical A snapshot or makes publication fail before compilation; no mixed snapshot is accepted. |
 | Cache reuse | Build two exact source revisions with the same project/toolchain configuration. They use one mutable cache namespace and produce different source-bound immutable manifests. |
 | Bounded storage | Count admission refuses a new cache before effects. A running writer makes byte status incomplete; after exact group reap, allocated bytes are remeasured and safe reclamation converges idempotently. Reuse of a measured over-limit cache is refused. Separately exceed the unique-Change admission cap and prove new work is refused without deleting retained data. |
