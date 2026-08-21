@@ -362,7 +362,7 @@ mod tests {
     };
 
     use factory_core::{
-        AgentId, EventEnvelope, FactoryEvent, ProjectId,
+        AgentId, EventEnvelope, ExecutionMode, FactoryEvent, ProjectId,
         local::{ErrorCode, LocalResponse},
     };
 
@@ -417,7 +417,7 @@ mod tests {
                 model: Some("gpt-5.6-sol".into()),
                 reasoning_effort: Some("xhigh".into()),
                 model_selection_reason: Some("release integration".into()),
-                permission_mode: None,
+                execution_mode: ExecutionMode::WorkspaceWrite,
                 instructions: String::new(),
                 memory: String::new(),
             })
@@ -461,7 +461,7 @@ mod tests {
                         protocol_version: 1,
                         sequence: 1,
                         occurred_at_ms: 10,
-                        event: FactoryEvent::AutoModeChanged { enabled: true },
+                        event: FactoryEvent::LegacyAutoModeChanged { enabled: true },
                     },
                 },
                 ServerFrame::Response {
@@ -474,7 +474,7 @@ mod tests {
                         protocol_version: PROTOCOL_VERSION,
                         sequence: 2,
                         occurred_at_ms: 11,
-                        event: FactoryEvent::AutoModeChanged { enabled: false },
+                        event: FactoryEvent::DispatchPolicyChanged { enabled: false },
                     },
                 },
             ];

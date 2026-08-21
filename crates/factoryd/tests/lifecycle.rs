@@ -13,6 +13,10 @@ use std::{
 
 use factoryd::lifecycle::DaemonInstance;
 
+// Optional reviewed-provider metadata is validated before factoryd binds its
+// socket, so startup readiness includes that bounded preflight.
+const STARTUP_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn private_directory(path: &Path) {
     fs::create_dir_all(path).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
@@ -245,7 +249,7 @@ fn sigterm_is_a_clean_shutdown_and_the_socket_can_be_rebound() {
 }
 
 fn wait_until_ready(child: &mut Child, socket: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + STARTUP_READINESS_TIMEOUT;
     while Instant::now() < deadline {
         if UnixStream::connect(socket).is_ok() {
             return;

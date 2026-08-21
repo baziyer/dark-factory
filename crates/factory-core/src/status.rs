@@ -23,7 +23,7 @@ pub struct FleetStatus {
     #[serde(default = "legacy_event_sequence")]
     pub event_sequence: i64,
     #[serde(default)]
-    pub auto_mode: bool,
+    pub dispatch_enabled: bool,
     pub active_run_cap: u32,
     pub active_runs: u32,
     pub projects: Vec<ProjectStatus>,

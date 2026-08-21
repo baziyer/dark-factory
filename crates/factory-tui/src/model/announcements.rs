@@ -134,7 +134,8 @@ pub fn format_event(event: &EventEnvelope) -> Option<Announcement> {
             ),
             Attention::NeedsInput,
         ),
-        FactoryEvent::AutoModeChanged { .. }
+        FactoryEvent::DispatchPolicyChanged { .. }
+        | FactoryEvent::LegacyAutoModeChanged { .. }
         | FactoryEvent::PolicyDecision { .. }
         | FactoryEvent::AgentBudgetChanged { .. }
         | FactoryEvent::LegacyRepositoryOperation { .. }

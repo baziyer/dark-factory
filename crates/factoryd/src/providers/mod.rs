@@ -17,19 +17,7 @@ pub mod shell;
 
 use std::path::PathBuf;
 
-use factory_core::RunId;
-
-/// Returns the capability declaration for a provider kind without requiring
-/// callers to know which concrete provider implements it. Profile updates use
-/// this same declaration as launch, so an unsupported permission mode fails
-/// before it can be persisted for a future attempt.
-pub fn capabilities_for(kind: factory_core::Provider) -> Capabilities {
-    match kind {
-        factory_core::Provider::ClaudeCode => claude::ClaudeProvider.capabilities(),
-        factory_core::Provider::Codex => codex::CodexProvider::new().capabilities(),
-        factory_core::Provider::Shell => shell::ShellProvider.capabilities(),
-    }
-}
+use factory_core::{ExecutionMode, RunId};
 
 /// Everything a provider needs to describe how to launch one process for one
 /// admitted run. Built by the daemon and consumed by exactly one
@@ -46,21 +34,20 @@ pub struct SpawnContext {
     pub model: Option<String>,
     /// An explicit provider reasoning tier, when supported.
     pub reasoning_effort: Option<String>,
-    /// A provider-scoped permission/approval mode string (Claude:
-    /// `acceptEdits`/`plan`/...; Codex: `on-request`/`never`), or `None` to
-    /// override the factory-wide auto-mode default.
-    pub permission_mode: Option<String>,
-    /// Factory-wide bypass default. An explicit `permission_mode` wins.
-    pub auto_mode: bool,
-    /// Absolute path to this run's private hook-token file. The file is
-    /// expected to already exist (written by
-    /// [`hooks::write_private_file`]) — a provider only needs its path to
-    /// embed in generated hook commands, never its contents.
+    /// Typed authority frozen by admission for this exact attempt.
+    pub execution_mode: ExecutionMode,
+    /// Reserved absolute path for this run's private hook-token file. The
+    /// daemon creates it after [`Provider::spawn_spec`] succeeds and before
+    /// launch; a provider may embed the path in generated hook commands but
+    /// never reads its contents.
     pub hook_token_path: PathBuf,
     /// Trusted absolute path to the `factoryctl` binary that generated hook
     /// commands should invoke. A provider's hook subprocess inherits the
     /// runner's sanitized `PATH`, so this must not be a bare name.
     pub factoryctl_path: PathBuf,
+    /// Exact daemon Unix socket the authenticated `factoryctl` control call
+    /// must reach from a bounded provider sandbox.
+    pub socket_path: PathBuf,
     /// Directory where generated provider configuration lives.
     pub agent_dir: PathBuf,
 }
@@ -85,35 +72,6 @@ pub struct ProviderLaunch {
     pub startup_input: Vec<u8>,
 }
 
-/// What a provider supports, so generic callers (the dispatcher, the TUI)
-/// can behave correctly without a provider-specific `match`.
-pub struct Capabilities {
-    /// The permission/approval mode strings this provider accepts in
-    /// [`SpawnContext::permission_mode`], for validating `agent profile set
-    /// --permission-mode` up front rather than failing at spawn time.
-    pub permission_modes: &'static [&'static str],
-    pub model_ids: &'static [&'static str],
-    pub model_prefix: Option<&'static str>,
-    pub reasoning_efforts: &'static [&'static str],
-    pub model_is_command: bool,
-}
-
-impl Capabilities {
-    pub fn for_provider(
-        provider: factory_core::Provider,
-        permission_modes: &'static [&'static str],
-    ) -> Self {
-        let policy = factory_core::model_policy::capabilities(provider);
-        Self {
-            permission_modes,
-            model_ids: policy.model_ids,
-            model_prefix: policy.model_prefix,
-            reasoning_efforts: policy.reasoning_efforts,
-            model_is_command: policy.model_is_command,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
     #[error("run id {run_id:?} is not a canonical UUID Claude requires for --session-id")]
@@ -128,6 +86,24 @@ pub enum ProviderError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("execution mode {mode:?} is not supported by provider {provider:?}")]
+    UnsupportedExecutionMode {
+        provider: factory_core::Provider,
+        mode: ExecutionMode,
+    },
+    #[error("provider {provider:?} is unavailable: {reason}")]
+    Unavailable {
+        provider: factory_core::Provider,
+        reason: &'static str,
+    },
+    #[error("execution mode {mode:?} is not supported by provider {provider:?} on {platform}")]
+    UnsupportedPlatform {
+        provider: factory_core::Provider,
+        mode: ExecutionMode,
+        platform: String,
+    },
+    #[error("Claude Code preflight failed for {program}: {reason}")]
+    ClaudePreflight { program: PathBuf, reason: String },
 }
 
 /// A provider describes how to launch one non-interactive process for one
@@ -143,6 +119,4 @@ pub trait Provider {
     /// (an unusable run identity) or generated configuration
     /// cannot be written.
     fn spawn_spec(&self, ctx: &SpawnContext) -> Result<ProviderLaunch, ProviderError>;
-
-    fn capabilities(&self) -> Capabilities;
 }

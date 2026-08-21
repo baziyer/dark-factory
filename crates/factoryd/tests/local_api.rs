@@ -36,6 +36,8 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
             runner_program: "/bin/false".into(),
             factoryctl_path: "/bin/false".into(),
             git_program: "/bin/false".into(),
+            claude_installation: None,
+            codex_provider: factoryd::providers::codex::CodexProvider::new(None),
             cargo_program: Some("/bin/false".into()),
             runtime_root,
             changes_root: directory.path().join("changes"),

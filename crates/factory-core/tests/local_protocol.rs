@@ -1,8 +1,8 @@
 use factory_core::{
     AgentId, AgentRole, AgentSnapshot, ChangeId, ChangePhase, ChangeSnapshot,
-    ChangeStorageSnapshot, EventEnvelope, FactoryEvent, LegacySourceId, LegacySourceSnapshot,
-    PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskDetail,
-    TaskId, TaskSnapshot, TaskStatus,
+    ChangeStorageSnapshot, EventEnvelope, ExecutionMode, FactoryEvent, LegacySourceId,
+    LegacySourceSnapshot, PROTOCOL_VERSION, ProjectId, ProjectSnapshot, Provider,
+    ProviderHookEvent, RunId, TaskDetail, TaskId, TaskSnapshot, TaskStatus,
     local::{
         AgentDetail, AgentMessage, AgentProfile, ErrorCode, LocalRequest, LocalResponse,
         MAX_CHANGE_PAGE_ITEMS, MAX_EVENT_PAGE_ITEMS, MAX_LEGACY_SOURCE_PAGE_ITEMS,
@@ -29,7 +29,7 @@ fn run_id(value: &str) -> RunId {
 
 #[test]
 fn request_envelope_has_a_stable_tagged_shape() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let request = RequestEnvelope {
         protocol_version: PROTOCOL_VERSION,
         credential: None,
@@ -277,7 +277,7 @@ fn agent_profile_is_available_only_through_private_local_detail() {
                 model: Some("gpt-5-codex".into()),
                 reasoning_effort: None,
                 model_selection_reason: None,
-                permission_mode: Some("on-request".into()),
+                execution_mode: ExecutionMode::WorkspaceWrite,
                 instructions: "Orchestrate the factory.".into(),
                 memory: "Prefer narrow slices.".into(),
                 updated_at_ms: 3,
@@ -301,8 +301,14 @@ fn agent_profile_is_available_only_through_private_local_detail() {
 }
 
 #[test]
+fn unknown_execution_modes_fail_closed_on_the_wire() {
+    assert!(serde_json::from_str::<ExecutionMode>(r#""interactive""#).is_err());
+    assert!(serde_json::from_str::<ExecutionMode>(r#""on_request""#).is_err());
+}
+
+#[test]
 fn server_frames_version_responses_and_events_at_the_outer_boundary() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let frame = ServerFrame::Response {
         protocol_version: PROTOCOL_VERSION,
         response: LocalResponse::Projects {
@@ -775,8 +781,8 @@ fn health_version_is_additive_so_a_new_client_reads_an_old_daemon() {
 #[test]
 fn status_requests_have_stable_shapes() {
     assert_eq!(
-        serde_json::to_value(LocalRequest::SetAutoMode { enabled: false }).unwrap(),
-        serde_json::json!({"type":"set_auto_mode","data":{"enabled":false}})
+        serde_json::to_value(LocalRequest::SetDispatchEnabled { enabled: false }).unwrap(),
+        serde_json::json!({"type":"set_dispatch_enabled","data":{"enabled":false}})
     );
     let fleet = serde_json::to_value(LocalRequest::FleetStatus).unwrap();
     assert_eq!(fleet["type"], "fleet_status");
@@ -790,7 +796,7 @@ fn status_requests_have_stable_shapes() {
     assert_eq!(agent["data"]["agent_id"], "agent-1");
 
     let status = factory_core::status::FleetStatus {
-        auto_mode: true,
+        dispatch_enabled: true,
         generated_at_ms: 7,
         event_sequence: 9,
         active_run_cap: 4,
@@ -804,7 +810,7 @@ fn status_requests_have_stable_shapes() {
     .unwrap();
     assert_eq!(value["type"], "fleet_status");
     assert_eq!(value["data"]["status"]["active_run_cap"], 4);
-    assert_eq!(value["data"]["status"]["auto_mode"], true);
+    assert_eq!(value["data"]["status"]["dispatch_enabled"], true);
     assert_eq!(value["data"]["status"]["active_runs"], 1);
     assert_eq!(value["data"]["status"]["event_sequence"], 9);
     assert_eq!(value["data"]["status"]["projects"], serde_json::json!([]));

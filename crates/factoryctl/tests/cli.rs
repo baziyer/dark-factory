@@ -143,7 +143,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
     let status = FleetStatus {
         generated_at_ms: 123,
         event_sequence: 0,
-        auto_mode: true,
+        dispatch_enabled: true,
         active_run_cap: 4,
         active_runs: 0,
         projects: Vec::new(),
@@ -202,7 +202,7 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
             env!("CARGO_PKG_VERSION"),
             " | active runtime v",
             env!("CARGO_PKG_VERSION"),
-            " | auto on | attempts 0/4 | projects 0 | attention 0\n"
+            " | dispatch on | attempts 0/4 | projects 0 | attention 0\n"
         )
     );
 
@@ -577,13 +577,16 @@ fn attempt_environment_cannot_accidentally_select_operator_authority() {
             .unwrap();
         assert_eq!(
             serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::authenticated(LocalRequest::SetAutoMode { enabled: true }, credential)
+            RequestEnvelope::authenticated(
+                LocalRequest::SetDispatchEnabled { enabled: true },
+                credential,
+            )
         );
-        write_response(&mut stream, LocalResponse::AutoModeSet { enabled: true });
+        write_response(&mut stream, LocalResponse::DispatchSet { enabled: true });
     });
 
     let output = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-        .args(["--socket", socket.to_str().unwrap(), "auto", "on"])
+        .args(["--socket", socket.to_str().unwrap(), "dispatch", "on"])
         .env("DARK_FACTORY_HOME", directory.path())
         .env("DARK_FACTORY_ATTEMPT_TOKEN_FILE", token_path)
         .output()

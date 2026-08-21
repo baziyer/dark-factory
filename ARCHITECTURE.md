@@ -72,8 +72,11 @@ pretends the resource disappeared or rewrites the outcome.
    an attempt identity for completion, blocking, or hooks.
 5. Admission is the only transition from queued work to an attempt. One Store
    transaction checks dispatch and capacity, selects the current canonical
-   queue head, derives its agent role and provider, and binds the immutable
-   task incarnation and work revision before external effects.
+   queue head, derives its agent role, provider, and typed execution mode, and
+   binds the immutable task incarnation and work revision before external
+   effects. The factory-wide dispatch switch controls only whether this
+   transaction may admit new work; changing an agent profile or disabling
+   dispatch cannot rewrite an admitted run's launch authority.
 6. No admitted attempt means no provider process, tool hook, outcome request,
    or writable source lease.
 7. A retry creates a new run and new bearer. It never revives an old process
@@ -115,13 +118,31 @@ terminalization.
 The `Provider` trait answers only:
 
 - which executable, arguments, environment additions, and generated private
-  configuration launch this run; and
-- which model, reasoning, and permission values the provider supports.
+  configuration launch this run.
 
 It receives a daemon-derived `SpawnContext` with an exact `RunId`, source path,
 single `startup_input`, hook-token path, trusted `factoryctl` path, and resolved
-profile. It cannot choose a source path, keep a process alive for later work,
-or extend authority. See [the provider guide](docs/providers.md).
+profile including one typed `PlanOnly`, `WorkspaceWrite`, or `Unrestricted`
+mode frozen by admission. Provider adapters exhaustively translate that value
+to non-interactive native flags; free-form permission strings are not part of
+the domain. An adapter cannot choose a source path, keep a process alive for
+later work, or extend authority. See [the provider guide](docs/providers.md).
+
+`WorkspaceWrite` means durable provider writes belong to the admitted Change.
+Codex denies its inherited system-temp write roots; Claude's native sandbox
+retains only its per-session ephemeral temp scratch in addition to the Change.
+That scratch is provider-owned runtime state, not product source or publication
+authority.
+
+Factoryd validates one exact Claude executable and the finite generated
+settings shapes before Store admission begins. Claude `WorkspaceWrite` is
+macOS-only because its exact AF_UNIX sandbox policy is ignored elsewhere.
+Claude `PlanOnly` has no sandbox stanza, but is conservatively restricted to
+the supported macOS product runtime rather than asserting a second platform
+claim. `Unrestricted` remains available elsewhere. A missing or rejected
+install disables only that provider, while a provider version or executable
+identity change fails its launch closed. Codex parses every actual launch
+under `--strict-config` and inherits no ambient provider configuration.
 
 The generic runner exports `DARK_FACTORY_ATTEMPT_TOKEN_FILE` as the path to the
 private bearer file. It does not export the bearer value. When that variable is

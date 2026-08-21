@@ -3,7 +3,7 @@
 ## Freeze and scope
 
 Dark Factory is in a three-stage safe-kernel refactor. Do not start provider
-work, install or release a refactor revision, enable auto mode, modify
+work, install or release a refactor revision, enable dispatch, modify
 `~/.dark-factory`, load or alter the installed launchd job, or delete preserved
 worktrees. Stage-specific isolated fixtures are allowed only with a temporary
 home, explicit socket, exact resource identities, and an independent reaper.

@@ -29,7 +29,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed lifecycle and
 
 Dark Factory is pre-1.0. Current `main` is not approved for installation or
 live provider work. There is no supported install command for this revision:
-do not run `factoryctl init`, enable `factoryctl auto on`, update a live
+do not run `factoryctl init`, enable `factoryctl dispatch on`, update a live
 installation, or point a source build at `~/.dark-factory`.
 
 Supported installation steps will return only when a revision is approved for

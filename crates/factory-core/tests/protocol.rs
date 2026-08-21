@@ -13,7 +13,7 @@ where
 
 #[test]
 fn run_phases_have_stable_wire_names_and_only_running_grants_authority() {
-    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(PROTOCOL_VERSION, 6);
     let cases = [
         (RunPhase::Admitted, "admitted"),
         (RunPhase::Running, "running"),
@@ -117,7 +117,7 @@ fn an_event_envelope_round_trips_the_attempt_phase_and_outcome() {
                 runner_instance_id: None,
                 runtime_model: Some("gpt-5.6-luna".into()),
                 runtime_reasoning_effort: Some("medium".into()),
-                runtime_permission_mode: None,
+                runtime_execution_mode: None,
                 runtime_control_mode: None,
                 activity: Some("releasing resources".into()),
                 wait_reason: None,
@@ -165,7 +165,7 @@ fn phase_outcome_contract_rejects_authority_with_an_outcome_or_finalizing_withou
         runner_instance_id: None,
         runtime_model: None,
         runtime_reasoning_effort: None,
-        runtime_permission_mode: None,
+        runtime_execution_mode: None,
         runtime_control_mode: None,
         activity: None,
         wait_reason: None,

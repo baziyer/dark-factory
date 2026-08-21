@@ -1,4 +1,4 @@
-use factory_core::{AgentId, AgentRole, ProjectId, Provider};
+use factory_core::{AgentId, AgentRole, ExecutionMode, ProjectId, Provider};
 use factoryd::store::{NewAgent, NewProject, Store, UpdateAgentProfile};
 
 fn fixture() -> Store {
@@ -40,7 +40,10 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
 
     let initial = store.get_agent_detail(&project, &agent).unwrap();
     assert_eq!(initial.profile.model, None);
-    assert_eq!(initial.profile.permission_mode, None);
+    assert_eq!(
+        initial.profile.execution_mode,
+        ExecutionMode::WorkspaceWrite
+    );
 
     store
         .update_agent_profile(
@@ -50,7 +53,7 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
                 model: Some("gpt-5.6-sol".into()),
                 reasoning_effort: Some("xhigh".into()),
                 model_selection_reason: Some("operator verification".into()),
-                permission_mode: Some("on-request".into()),
+                execution_mode: ExecutionMode::PlanOnly,
             },
             3,
         )
@@ -58,18 +61,27 @@ fn agent_profile_model_is_durable_and_separate_from_public_agent_snapshot() {
 
     let reloaded = store.get_agent_detail(&project, &agent).unwrap();
     assert_eq!(reloaded.profile.model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(
-        reloaded.profile.permission_mode.as_deref(),
-        Some("on-request")
-    );
+    assert_eq!(reloaded.profile.execution_mode, ExecutionMode::PlanOnly);
     assert_eq!(reloaded.snapshot.provider, Provider::Codex);
 }
 
 #[test]
-fn agent_profile_rejects_permission_modes_not_declared_by_the_provider() {
+fn agent_profile_rejects_execution_modes_not_supported_by_the_provider() {
     let mut store = fixture();
     let project = ProjectId::try_from("factory").unwrap();
-    let agent = AgentId::try_from("god").unwrap();
+    let agent = AgentId::try_from("shell-worker").unwrap();
+    store
+        .create_agent(
+            NewAgent {
+                id: agent.clone(),
+                project_id: project.clone(),
+                parent_agent_id: Some(AgentId::try_from("god").unwrap()),
+                role: AgentRole::Worker,
+                provider: Provider::Shell,
+            },
+            3,
+        )
+        .unwrap();
 
     let error = match store.update_agent_profile(
         &project,
@@ -78,24 +90,24 @@ fn agent_profile_rejects_permission_modes_not_declared_by_the_provider() {
             model: None,
             reasoning_effort: None,
             model_selection_reason: None,
-            permission_mode: Some("bypass".into()),
+            execution_mode: ExecutionMode::WorkspaceWrite,
         },
-        3,
+        4,
     ) {
-        Ok(_) => panic!("unsupported Codex permission mode was persisted"),
+        Ok(_) => panic!("unsupported shell execution mode was persisted"),
         Err(error) => error,
     };
     assert!(matches!(
         error,
-        factoryd::store::StoreError::UnsupportedAgentPermissionMode {
-            provider: Provider::Codex,
+        factoryd::store::StoreError::UnsupportedAgentExecutionMode {
+            provider: Provider::Shell,
             mode
-        } if mode == "bypass"
+        } if mode == ExecutionMode::WorkspaceWrite
     ));
     let profile = store.get_agent_detail(&project, &agent).unwrap().profile;
     assert_eq!(profile.model, None);
-    assert_eq!(profile.permission_mode, None);
-    assert_eq!(profile.updated_at_ms, 2);
+    assert_eq!(profile.execution_mode, ExecutionMode::Unrestricted);
+    assert_eq!(profile.updated_at_ms, 3);
 }
 
 #[test]
@@ -224,7 +236,7 @@ fn profile_escalation_requires_a_reason_and_normalizes_to_xhigh() {
             model: Some(factory_core::model_policy::ESCALATED_MODEL.into()),
             reasoning_effort: None,
             model_selection_reason: None,
-            permission_mode: None,
+            execution_mode: ExecutionMode::WorkspaceWrite,
         },
         4,
     ) {
@@ -246,7 +258,7 @@ fn profile_escalation_requires_a_reason_and_normalizes_to_xhigh() {
                 model: Some(factory_core::model_policy::ESCALATED_MODEL.into()),
                 reasoning_effort: None,
                 model_selection_reason: Some("release integration after failed attempt".into()),
-                permission_mode: None,
+                execution_mode: ExecutionMode::WorkspaceWrite,
             },
             5,
         )

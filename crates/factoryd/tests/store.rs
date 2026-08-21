@@ -1134,7 +1134,7 @@ fn delete_agent_deletes_its_profile_and_inbox_but_keeps_sent_messages_with_sende
                 model: Some("gpt-5.6-luna".into()),
                 reasoning_effort: None,
                 model_selection_reason: None,
-                permission_mode: None,
+                execution_mode: factory_core::ExecutionMode::WorkspaceWrite,
             },
             4,
         )
@@ -1228,7 +1228,7 @@ fn delete_project_cascades_agent_profiles_and_messages() {
                 model: Some("gpt-5.6-luna".into()),
                 reasoning_effort: None,
                 model_selection_reason: None,
-                permission_mode: None,
+                execution_mode: factory_core::ExecutionMode::WorkspaceWrite,
             },
             4,
         )

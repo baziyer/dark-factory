@@ -254,9 +254,9 @@ impl ApiFailure {
             Self::Store(StoreError::InvalidAgentModelPolicy(error)) => {
                 (ErrorCode::InvalidRequest, error.to_string())
             }
-            Self::Store(StoreError::UnsupportedAgentPermissionMode { provider, mode }) => (
+            Self::Store(StoreError::UnsupportedAgentExecutionMode { provider, mode }) => (
                 ErrorCode::InvalidRequest,
-                format!("permission mode {mode:?} is not supported by provider {provider:?}"),
+                format!("execution mode {mode:?} is not supported by provider {provider:?}"),
             ),
             Self::Store(StoreError::InvalidAgentMessage) => (
                 ErrorCode::InvalidRequest,
@@ -601,7 +601,7 @@ fn authorize_attempt(attempt: &AttemptPrincipal, request: &LocalRequest) -> Resu
         LocalRequest::CreateTask { project_id, .. }
         | LocalRequest::AssignTask { project_id, .. } => orchestrator && same_project(project_id),
         LocalRequest::ListAgents { project_id, .. } => orchestrator && same_project(project_id),
-        LocalRequest::SetAutoMode { .. }
+        LocalRequest::SetDispatchEnabled { .. }
         | LocalRequest::FleetStatus
         | LocalRequest::RustStorageStatus
         | LocalRequest::CreateProject { .. }
@@ -667,14 +667,14 @@ async fn handle_request(
             version: env!("CARGO_PKG_VERSION").to_owned(),
             process_id: std::process::id(),
         }),
-        LocalRequest::SetAutoMode { enabled } => {
+        LocalRequest::SetDispatchEnabled { enabled } => {
             state
                 .commit_and_publish(move |store| {
-                    let event = store.set_auto_mode(enabled, now_ms()?)?;
+                    let event = store.set_dispatch_enabled(enabled, now_ms()?)?;
                     Ok(((), vec![event]))
                 })
                 .await?;
-            Ok(LocalResponse::AutoModeSet { enabled })
+            Ok(LocalResponse::DispatchSet { enabled })
         }
         LocalRequest::SetAgentBudget {
             project_id,
@@ -714,13 +714,13 @@ async fn handle_request(
         }
         LocalRequest::FleetStatus => {
             let active_run_cap = u32::try_from(execution.max_active_runs()).unwrap_or(u32::MAX);
-            let (projects, active_runs, generated_at_ms, auto_mode, event_sequence) = state
+            let (projects, active_runs, generated_at_ms, dispatch_enabled, event_sequence) = state
                 .with_store(move |store| {
                     Ok((
                         store.fleet_status()?,
                         store.recoverable_kernel_runs()?.len(),
                         now_ms()?,
-                        store.auto_mode()?,
+                        store.dispatch_enabled()?,
                         store.latest_event_sequence()?,
                     ))
                 })
@@ -759,7 +759,7 @@ async fn handle_request(
                 status: status::FleetStatus {
                     generated_at_ms,
                     event_sequence,
-                    auto_mode,
+                    dispatch_enabled,
                     active_run_cap,
                     active_runs,
                     projects,
@@ -1048,7 +1048,7 @@ async fn handle_request(
             model,
             reasoning_effort,
             model_selection_reason,
-            permission_mode,
+            execution_mode,
             instructions,
             memory,
         } => {
@@ -1063,7 +1063,7 @@ async fn handle_request(
                             model,
                             reasoning_effort,
                             model_selection_reason,
-                            permission_mode,
+                            execution_mode,
                         },
                         now_ms()?,
                     )?;
@@ -1800,7 +1800,7 @@ fn local_agent_detail(
             model: agent.profile.model,
             reasoning_effort: agent.profile.reasoning_effort,
             model_selection_reason: agent.profile.model_selection_reason,
-            permission_mode: agent.profile.permission_mode,
+            execution_mode: agent.profile.execution_mode,
             instructions,
             memory,
             updated_at_ms: agent.profile.updated_at_ms,
@@ -2308,4 +2308,43 @@ fn api_failure_to_io(error: ApiFailure) -> io::Error {
         | ApiFailure::Internal(message) => message,
         ApiFailure::Store(error) => error.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use factory_core::ExecutionMode;
+
+    fn attempt() -> Principal {
+        Principal::Attempt(AttemptPrincipal {
+            run_id: RunId::try_from("run").unwrap(),
+            project_id: ProjectId::try_from("project").unwrap(),
+            agent_id: AgentId::try_from("agent").unwrap(),
+            role: AgentRole::Orchestrator,
+            source_root: "/tmp/source".into(),
+        })
+    }
+
+    #[test]
+    fn only_the_operator_may_change_dispatch_or_execution_authority() {
+        let dispatch = LocalRequest::SetDispatchEnabled { enabled: false };
+        let execution_mode = LocalRequest::UpdateAgentProfile {
+            project_id: ProjectId::try_from("project").unwrap(),
+            agent_id: AgentId::try_from("agent").unwrap(),
+            model: None,
+            reasoning_effort: None,
+            model_selection_reason: None,
+            execution_mode: ExecutionMode::Unrestricted,
+            instructions: String::new(),
+            memory: String::new(),
+        };
+
+        for request in [&dispatch, &execution_mode] {
+            assert!(authorize(&Principal::Operator, request).is_ok());
+            assert!(matches!(
+                authorize(&attempt(), request),
+                Err(ApiFailure::Unauthorized(_))
+            ));
+        }
+    }
 }

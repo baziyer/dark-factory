@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use factory_core::{
-    AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, FactoryEvent, MessageId, ProjectId,
-    Provider, RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot, RunnerInstanceId, TaskId,
+    AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, ExecutionMode, FactoryEvent,
+    MessageId, ProjectId, Provider, RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot,
+    RunnerInstanceId, TaskId,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,7 @@ use super::{
     MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, NewAgentMessage, NewTask, Result, Store,
     StoreError, TaskDetail, append_agent_changed_event, append_event, assign_task_in_transaction,
     insert_agent_message, insert_task, load_agent, load_agent_profile, load_task, parse_agent_role,
-    parse_id, parse_observer_health, parse_provider,
+    parse_execution_mode, parse_id, parse_observer_health, parse_provider,
 };
 
 const CAPABILITY_HEX_LEN: usize = 64;
@@ -60,8 +61,7 @@ pub struct AttemptTarget {
     pub base_oid: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
-    pub permission_mode: Option<String>,
-    pub auto_mode: bool,
+    pub execution_mode: ExecutionMode,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub runtime_claim: String,
@@ -197,7 +197,7 @@ impl Store {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let dispatch_enabled: bool = transaction.query_row(
-            "SELECT auto_mode FROM factory_settings WHERE singleton = 1",
+            "SELECT dispatch_enabled FROM factory_settings WHERE singleton = 1",
             [],
             |row| row.get(0),
         )?;
@@ -346,7 +346,12 @@ impl Store {
 
         let profile =
             load_agent_profile(&transaction, &input.agent_id)?.ok_or(StoreError::AgentNotFound)?;
-
+        if !profile.execution_mode.supported_by(agent.snapshot.provider) {
+            return Err(StoreError::UnsupportedAgentExecutionMode {
+                provider: agent.snapshot.provider,
+                mode: profile.execution_mode,
+            });
+        }
         transaction.execute(
             "UPDATE tasks
              SET status = 'running', updated_at_ms = ?1, work_revision = work_revision + 1,
@@ -359,7 +364,7 @@ impl Store {
                 id, project_id, agent_id, task_id, task_incarnation_id,
                 admitted_task_work_revision, change_id, parent_run_id, source_root,
                 phase, outcome, outcome_detail, outcome_result, capability_digest,
-                provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
+                provider, runtime_model, runtime_reasoning_effort, runtime_execution_mode,
                 runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
                 runner_instance_id, runner_runtime, runner_protocol_version,
                 last_runner_sequence, terminal_runner_sequence, runner_reconciled_at_ms,
@@ -385,7 +390,7 @@ impl Store {
                 provider_str(agent.snapshot.provider),
                 profile.model,
                 profile.reasoning_effort,
-                profile.permission_mode,
+                profile.execution_mode.as_str(),
                 input.runner_instance_id.as_str(),
                 input.runner_runtime,
                 i64::from(factory_core::runner::RUNNER_PROTOCOL_VERSION),
@@ -478,8 +483,7 @@ impl Store {
                 base_oid,
                 model: profile.model,
                 reasoning_effort: profile.reasoning_effort,
-                permission_mode: profile.permission_mode,
-                auto_mode: true,
+                execution_mode: profile.execution_mode,
                 runner_instance_id: input.runner_instance_id,
                 runner_runtime: input.runner_runtime,
                 runtime_claim: input.runtime_claim,
@@ -1923,7 +1927,7 @@ pub(super) fn load_kernel_run(
             "SELECT id, project_id, agent_id, task_id, provider, phase,
                     outcome, outcome_detail, outcome_result,
                     runner_instance_id,
-                    runtime_model, runtime_reasoning_effort, runtime_permission_mode,
+                    runtime_model, runtime_reasoning_effort, runtime_execution_mode,
                     runtime_control_mode, activity, wait_reason,
                     observer_health, observer_reason, admitted_at_ms, running_at_ms,
                     phase_since_ms, updated_at_ms, ended_at_ms, exit_code, exit_signal
@@ -1949,7 +1953,12 @@ pub(super) fn load_kernel_run(
                     },
                     runtime_model: row.get(10)?,
                     runtime_reasoning_effort: row.get(11)?,
-                    runtime_permission_mode: row.get(12)?,
+                    runtime_execution_mode: {
+                        let value: Option<String> = row.get(12)?;
+                        value
+                            .map(|value| parse_execution_mode(&value, 12))
+                            .transpose()?
+                    },
                     runtime_control_mode: row.get(13)?,
                     activity: row.get(14)?,
                     wait_reason: row.get(15)?,
@@ -2043,7 +2052,7 @@ mod tests {
     use super::*;
     use crate::store::{
         ChangeBaseIdentity, ChangeMaterialization, ChangeRemovalKind, ChangeSourceIdentity,
-        NewAgent, NewAgentMessage, NewProject, NewTask,
+        NewAgent, NewAgentMessage, NewProject, NewTask, UpdateAgentProfile,
     };
     use factory_core::TaskStatus;
 
@@ -2226,7 +2235,7 @@ mod tests {
                 created_at_ms: 4,
             })
             .unwrap();
-        store.set_auto_mode(false, 5).unwrap();
+        store.set_dispatch_enabled(false, 5).unwrap();
         let sequence = store.latest_event_sequence().unwrap();
 
         assert!(
@@ -2346,6 +2355,82 @@ mod tests {
 
     fn admit_worker(store: &mut Store) -> RunId {
         admit_worker_with_verification(store, factory_core::CompletionVerification::None)
+    }
+
+    fn codex_admission_fixture(
+        store: &mut Store,
+        execution_mode: ExecutionMode,
+    ) -> (ProjectId, AgentId, TaskId, NewRunAdmission) {
+        let (project_id, agent_id) = seed_worker(store);
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET provider = 'codex' WHERE id = ?1",
+                [agent_id.as_str()],
+            )
+            .unwrap();
+        store
+            .update_agent_profile(
+                &project_id,
+                &agent_id,
+                UpdateAgentProfile {
+                    model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
+                    execution_mode,
+                },
+                3,
+            )
+            .unwrap();
+        let task_id = queue_task(store, &project_id, &agent_id, "task-1", 0, 4);
+        let admission = next_admission(
+            "11111111-1111-4111-8111-111111111111",
+            project_id.clone(),
+            agent_id.clone(),
+        );
+        (project_id, agent_id, task_id, admission)
+    }
+
+    #[test]
+    fn admitted_attempt_keeps_the_execution_mode_frozen_on_its_run() {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project_id, agent_id, _task_id, admission) =
+            codex_admission_fixture(&mut store, ExecutionMode::PlanOnly);
+
+        let admitted = store.admit_next_run(admission, 5).unwrap().unwrap();
+        store
+            .update_agent_profile(
+                &project_id,
+                &agent_id,
+                UpdateAgentProfile {
+                    model: None,
+                    reasoning_effort: None,
+                    model_selection_reason: None,
+                    execution_mode: ExecutionMode::Unrestricted,
+                },
+                6,
+            )
+            .unwrap();
+
+        assert_eq!(admitted.target.execution_mode, ExecutionMode::PlanOnly);
+        assert_eq!(
+            admitted.run.runtime_execution_mode,
+            Some(ExecutionMode::PlanOnly)
+        );
+        let runs = store.list_runs(&project_id, None, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].runtime_execution_mode,
+            Some(ExecutionMode::PlanOnly)
+        );
+        assert_eq!(
+            store
+                .get_agent_detail(&project_id, &agent_id)
+                .unwrap()
+                .profile
+                .execution_mode,
+            ExecutionMode::Unrestricted
+        );
     }
 
     fn prepared_identity() -> PreparedProcessIdentity {
@@ -2987,7 +3072,7 @@ mod tests {
                     id, project_id, agent_id, task_id, task_incarnation_id,
                     admitted_task_work_revision, change_id, parent_run_id, source_root,
                     phase, outcome, outcome_detail, outcome_result, capability_digest,
-                    provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
+                    provider, runtime_model, runtime_reasoning_effort, runtime_execution_mode,
                     runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
                     runner_instance_id, runner_runtime, runner_protocol_version,
                     last_runner_sequence, terminal_runner_sequence, runner_reconciled_at_ms,
@@ -2997,7 +3082,7 @@ mod tests {
                  SELECT 'fabricated-parent-run', project_id, 'middle-worker', id, incarnation_id,
                         work_revision, NULL, NULL, '/tmp/fabricated-parent',
                         'terminal', 'succeeded', NULL, NULL, NULL,
-                        'shell', NULL, NULL, NULL, NULL, NULL, NULL, 'unknown', NULL,
+                        'shell', NULL, NULL, 'unrestricted', NULL, NULL, NULL, 'unknown', NULL,
                         NULL, NULL, NULL, 0, NULL, NULL, NULL,
                         7, NULL, 7, 7, 7, 7, NULL, NULL
                  FROM tasks WHERE id = ?1 AND project_id = ?2",

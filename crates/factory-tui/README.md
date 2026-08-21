@@ -33,7 +33,7 @@ session controls; provider execution belongs to its admitted attempt.
 | `Space` | Pause or resume the selected agent. |
 | `t` | Manage the selected task. |
 | `I` / `M` | Edit agent instructions or memory in `$EDITOR`. |
-| `v` / `a` | Edit the agent model or permission mode. |
+| `v` / `a` | Edit the agent model or execution mode. |
 | `C` | Edit the factory-wide active-run capacity. |
 | `u` | Install and relaunch when an update is available. |
 | `x` | Cancel the selected run after confirmation. |
