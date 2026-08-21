@@ -10,7 +10,7 @@ In particular, do not:
 - run `factoryctl init` or `factoryctl update --install` from this revision;
 - replace binaries under `~/.dark-factory/bin`;
 - load or restart the installed launchd job;
-- migrate the operator database to schema 32; or
+- migrate the operator database to schema 33; or
 - use the operator home or socket for a test.
 
 Developers use a temporary `DARK_FACTORY_HOME` and explicit socket as described

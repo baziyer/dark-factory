@@ -208,9 +208,9 @@ for their exact run through `DARK_FACTORY_ATTEMPT_TOKEN_FILE` (or an explicit
 hook `--token-file`). A provider-invoked `factoryctl` process cannot cross into
 operator authority by choosing an operator command.
 
-The optional loopback webhook remains an input transport, not trusted work.
-GitHub and external intake stay quarantined until the complete kernel boot
-gate. No input source can bypass admission.
+There is no HTTP webhook or generic connector intake. GitHub and other external
+intake remain outside the product; work enters only through the authenticated
+private local API and cannot bypass admission.
 
 ## State outside SQLite
 

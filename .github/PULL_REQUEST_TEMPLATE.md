@@ -33,8 +33,8 @@ Reviewer, tick as you go:
       provider/effect that hangs or dies)
 - [ ] **Simplification**: looked for a smaller change that does the same
       thing; nothing added that one implementation doesn't need
-- [ ] **Security**: nothing widens what an admitted attempt, a webhook caller,
-      or an untrusted PR can reach (socket/file modes, hook token, sandbox,
-      CI runner)
+- [ ] **Security**: nothing widens what an admitted attempt, a local caller, or
+      an untrusted PR can reach (socket/file modes, hook token, sandbox, CI
+      runner)
 - [ ] **Docs**: what the docs now say matches what the code now does
 - [ ] Findings posted as comments; author responses re-checked

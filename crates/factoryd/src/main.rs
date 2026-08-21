@@ -6,7 +6,6 @@ use std::{
     fs, io,
     os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
-    sync::Arc,
     thread,
     time::Duration,
 };
@@ -18,9 +17,8 @@ use factoryd::{
     local_api::{ApiState, serve},
     providers::hooks,
     store::Store,
-    webhook_http::{WebhookHttpMetrics, WebhookServer, bind_webhooks, load_webhook_config},
 };
-use tokio::{net::UnixListener, sync::watch, task::JoinHandle};
+use tokio::{net::UnixListener, task::JoinHandle};
 
 const DEFAULT_MAX_ACTIVE_RUNS: usize = 4;
 
@@ -40,7 +38,6 @@ struct Config {
     /// `factory_core::paths`).
     guidance_root: PathBuf,
     max_active_runs: usize,
-    webhook_config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -71,24 +68,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     listener.set_nonblocking(true)?;
     let listener = UnixListener::from_std(listener)?;
 
-    let webhook_metrics = config
-        .webhook_config
-        .as_ref()
-        .map(|_| Arc::new(WebhookHttpMetrics::default()));
-    let webhooks = match (config.webhook_config, webhook_metrics.as_ref()) {
-        (Some(path), Some(metrics)) => Some(
-            bind_webhooks(
-                state.clone(),
-                load_webhook_config(&path)?,
-                Arc::clone(metrics),
-            )
-            .await?,
-        ),
-        (None, None) => None,
-        _ => return Err("invalid webhook configuration state".into()),
-    };
-    let webhooks_enabled = webhooks.is_some();
-    let webhooks_bind = webhooks.as_ref().map(WebhookServer::local_addr);
     let guidance_root = config.guidance_root.clone();
     let (execution, mut execution_join) = execution::spawn(
         execution::Config {
@@ -109,31 +88,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
     tracing::info!(
         database = %instance.database_path().display(),
         socket = %instance.socket_path().display(),
-        webhooks_enabled,
-        webhooks_bind = webhooks_bind.map(|bind| bind.to_string()),
         "factory daemon ready"
     );
-    if let Some(bind) = webhooks_bind {
-        tracing::info!(target: "factoryd.webhook", %bind, "webhooks enabled");
-    } else {
-        tracing::info!(
-            target: "factoryd.webhook",
-            "webhooks disabled: no --webhook-config and no $DARK_FACTORY_HOME/webhooks.json"
-        );
-    }
 
-    let control_planes = serve_control_planes(
+    let control_plane = serve(
         listener,
         state,
         execution.clone(),
         guidance_root,
         operator_credential,
-        webhooks,
-        shutdown,
+        shutdown.recv(),
     );
-    tokio::pin!(control_planes);
+    tokio::pin!(control_plane);
     let result = tokio::select! {
-        result = &mut control_planes => {
+        result = &mut control_plane => {
             let stopped = stop_execution(execution, execution_join).await;
             result?;
             stopped
@@ -147,16 +115,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     if let Err(error) = socket_cleanup.remove() {
         tracing::warn!(%error, socket = %instance.socket_path().display(), "could not remove socket");
-    }
-    if let Some(metrics) = webhook_metrics {
-        let metrics = metrics.snapshot();
-        tracing::info!(
-            target: "factoryd.webhook",
-            event = "listener_stopped",
-            authenticated_requests = metrics.authenticated_requests,
-            rate_limited_requests = metrics.rate_limited_requests,
-            bounded_rejections = metrics.bounded_rejections
-        );
     }
     result?;
     Ok(())
@@ -264,88 +222,6 @@ fn materializer_invocation_path() -> Result<Option<PathBuf>, Box<dyn Error>> {
     Ok(Some(path))
 }
 
-async fn serve_control_planes(
-    listener: UnixListener,
-    state: ApiState,
-    execution: execution::Handle,
-    guidance_root: PathBuf,
-    operator_credential: RequestCredential,
-    webhooks: Option<WebhookServer>,
-    shutdown: ShutdownSignals,
-) -> io::Result<()> {
-    let (stop_tx, stop_rx) = watch::channel(false);
-    let local = serve(
-        listener,
-        state,
-        execution,
-        guidance_root,
-        operator_credential,
-        wait_for_stop(stop_rx.clone()),
-    );
-    let web = serve_optional_webhooks(webhooks, stop_rx);
-    tokio::pin!(local);
-    tokio::pin!(web);
-
-    enum Completed {
-        Shutdown,
-        Local(io::Result<()>),
-        Webhooks(io::Result<()>),
-    }
-
-    let completed = tokio::select! {
-        () = shutdown.recv() => Completed::Shutdown,
-        result = &mut local => Completed::Local(result),
-        result = &mut web => Completed::Webhooks(result),
-    };
-    let _ = stop_tx.send(true);
-    match completed {
-        Completed::Shutdown => {
-            let (local, web) = tokio::join!(local, web);
-            local?;
-            web?;
-            tracing::info!("shutdown requested");
-            Ok(())
-        }
-        Completed::Local(result) => {
-            let web = web.await;
-            result?;
-            web
-        }
-        Completed::Webhooks(result) => {
-            let local = local.await;
-            result?;
-            local
-        }
-    }
-}
-
-async fn serve_optional_webhooks(
-    webhooks: Option<WebhookServer>,
-    shutdown: watch::Receiver<bool>,
-) -> io::Result<()> {
-    match webhooks {
-        Some(server) => server
-            .serve(wait_for_stop(shutdown))
-            .await
-            .map_err(|_| io::Error::other("webhook HTTP listener failed")),
-        None => {
-            wait_for_stop(shutdown).await;
-            Ok(())
-        }
-    }
-}
-
-async fn wait_for_stop(mut shutdown: watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            return;
-        }
-    }
-}
-
 async fn stop_execution(
     execution: execution::Handle,
     join: JoinHandle<Result<(), execution::Error>>,
@@ -367,7 +243,6 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         .ok_or("factoryd executable has no parent directory")?;
     let runner = sibling_dir.join("factory-runner");
     let factoryctl = sibling_dir.join("factoryctl");
-    let default_webhook_config = home.join("webhooks.json");
     let config = Config {
         factoryd: current_executable,
         database: home.join("factory.db"),
@@ -383,18 +258,8 @@ fn parse_config() -> Result<Config, Box<dyn Error>> {
         artifacts_root: home.join("artifacts"),
         guidance_root: home,
         max_active_runs: DEFAULT_MAX_ACTIVE_RUNS,
-        webhook_config: None,
     };
-    let mut config = parse_arguments(config, env::args_os().skip(1))?;
-    // Webhooks are on by default: if `$DARK_FACTORY_HOME/webhooks.json`
-    // exists, load it without requiring `--webhook-config`. An explicit
-    // `--webhook-config PATH` overrides this default.
-    config.webhook_config = resolve_webhook_config(
-        config.webhook_config,
-        default_webhook_config.clone(),
-        default_webhook_config.is_file(),
-    );
-    Ok(config)
+    parse_arguments(config, env::args_os().skip(1)).map_err(Into::into)
 }
 
 fn resolve_executable_on_path(name: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -518,14 +383,6 @@ fn resolve_executable_in_path(name: &str, path: &OsStr) -> Result<PathBuf, Strin
     Err(format!("{name} was not found as an executable on PATH"))
 }
 
-fn resolve_webhook_config(
-    explicit: Option<PathBuf>,
-    default_path: PathBuf,
-    default_exists: bool,
-) -> Option<PathBuf> {
-    explicit.or_else(|| default_exists.then_some(default_path))
-}
-
 fn parse_arguments(
     mut config: Config,
     mut arguments: impl Iterator<Item = OsString>,
@@ -560,15 +417,9 @@ fn parse_arguments(
                     .filter(|value| *value > 0)
                     .ok_or("--max-active-runs requires a positive integer")?;
             }
-            Some("--webhook-config") => {
-                if config.webhook_config.is_some() {
-                    return Err("--webhook-config may only be provided once".into());
-                }
-                config.webhook_config = Some(next_path(&mut arguments, "--webhook-config")?);
-            }
             Some("-h" | "--help") => {
                 println!(
-                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--artifacts-root PATH] [--max-active-runs N] [--webhook-config PATH]"
+                    "factoryd [--database PATH] [--socket PATH] [--runner PATH] [--factoryctl PATH] [--runtime-root PATH] [--artifacts-root PATH] [--max-active-runs N]"
                 );
                 std::process::exit(0);
             }
@@ -635,7 +486,7 @@ mod tests {
 
     use super::{
         Config, parse_arguments, resolve_cargo_in_path, resolve_executable_in_path,
-        resolve_webhook_config, rust_worker_must_terminate,
+        rust_worker_must_terminate,
     };
 
     fn config() -> Config {
@@ -652,7 +503,6 @@ mod tests {
             artifacts_root: PathBuf::from("/state/artifacts"),
             guidance_root: PathBuf::from("/state"),
             max_active_runs: 4,
-            webhook_config: None,
         }
     }
 
@@ -745,60 +595,12 @@ mod tests {
         assert_eq!(parsed.runtime_root, PathBuf::from("/private/runs"));
         assert_eq!(parsed.artifacts_root, PathBuf::from("/private/artifacts"));
         assert_eq!(parsed.max_active_runs, 2);
-        assert!(parsed.webhook_config.is_none());
 
         assert_eq!(
             parse_arguments(config(), args(&["--max-active-runs", "0"]))
                 .err()
                 .unwrap(),
             "--max-active-runs requires a positive integer"
-        );
-    }
-
-    #[test]
-    fn webhook_config_is_one_explicit_path() {
-        let parsed = parse_arguments(
-            config(),
-            args(&["--webhook-config", "/state/webhooks.json"]),
-        )
-        .unwrap();
-        assert_eq!(
-            parsed.webhook_config,
-            Some(PathBuf::from("/state/webhooks.json"))
-        );
-
-        let duplicate = parse_arguments(
-            config(),
-            args(&[
-                "--webhook-config",
-                "/state/one.json",
-                "--webhook-config",
-                "/state/two.json",
-            ]),
-        )
-        .err()
-        .unwrap();
-        assert_eq!(duplicate, "--webhook-config may only be provided once");
-    }
-
-    #[test]
-    fn webhooks_default_on_when_the_home_config_file_exists_but_defer_to_an_explicit_path() {
-        let default_path = PathBuf::from("/state/webhooks.json");
-        assert_eq!(
-            resolve_webhook_config(None, default_path.clone(), true),
-            Some(default_path.clone())
-        );
-        assert_eq!(
-            resolve_webhook_config(None, default_path.clone(), false),
-            None
-        );
-        assert_eq!(
-            resolve_webhook_config(
-                Some(PathBuf::from("/explicit/webhooks.json")),
-                default_path,
-                true
-            ),
-            Some(PathBuf::from("/explicit/webhooks.json"))
         );
     }
 

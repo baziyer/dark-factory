@@ -215,7 +215,7 @@ micro-crates.
 Inside factoryd the intended dependency direction is:
 
 ```text
-domain -> store -> control -> API/webhooks
+domain -> store -> control -> local API
                    |
                    +-------> execution/resource effects
 ```
