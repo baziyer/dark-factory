@@ -84,6 +84,9 @@ must restart the daemon and let its durable finalizer converge. `Drop`, shell
 traps, sleeps, broad process scans, and cleanup owned only by the killed fixture
 are insufficient proof.
 
+The scratch-only macOS smoke covers these cuts through external causal proofs;
+it makes no claim about launchd or the operator's installed job.
+
 ## Review discipline
 
 Each PR is one coherent change. Before review, record:

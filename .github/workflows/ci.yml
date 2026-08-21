@@ -71,6 +71,12 @@ jobs:
       - name: Run the macOS source gate
         run: ./scripts/local-ci.sh
 
+      - name: Run the macOS causal source smoke
+        run: |
+          cargo +1.88.0 build --locked --workspace
+          ./scripts/macos-contributor-smoke.sh
+          ./scripts/test-macos-contributor-smoke.sh
+
       - name: Publish bounded workflow summary
         if: always()
         env:
