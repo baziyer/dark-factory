@@ -2492,29 +2492,29 @@ mod tests {
         };
         let change_id: Option<ChangeId> = (role == AgentRole::Worker).then(|| id("scope-change"));
         store
-            .admit_run(
+            .admit_next_run(
                 NewRunAdmission {
                     run_id: run_id.clone(),
                     project_id: project_id.clone(),
-                    task_id: authority_task_id.clone(),
                     agent_id: authority_agent_id,
-                    expected_provider: Provider::Shell,
                     capability_digest: capability_digest("scope-secret"),
                     runtime_claim: "runtime-claim:cccccccccccc4ccc8ccccccccccccccc".into(),
                     runner_instance_id,
                     runner_runtime: "/tmp/factory-runner".into(),
                     max_active_runs: 1,
-                    change_reservation: change_id.as_ref().map(|change_id| ChangeReservation {
-                        id: change_id.clone(),
+                    change_reservation: ChangeReservation {
+                        id: change_id
+                            .clone()
+                            .unwrap_or_else(|| id("unused-scope-change")),
                         source_root: "/tmp/scope-change".into(),
                         max_factory_changes: 1,
-                    }),
-                    policy_cwd: (role == AgentRole::Orchestrator)
-                        .then(|| "/tmp/factory-policy".into()),
+                    },
+                    policy_cwd: "/tmp/factory-policy".into(),
                 },
                 4,
             )
-            .unwrap();
+            .unwrap()
+            .expect("queued authority task should be admitted");
         if let Some(change_id) = change_id {
             let base = ChangeBaseIdentity {
                 repository_root: "/tmp/factory".into(),
