@@ -1719,7 +1719,7 @@ async fn terminate_effect_group(
     state: &DaemonState,
     run_id: &RunId,
     mut child: Option<&mut Child>,
-    finish_path: &Path,
+    _finish_path: &Path,
 ) -> Result<(), Error> {
     let _resources = state
         .with_store({
@@ -1735,7 +1735,7 @@ async fn terminate_effect_group(
         kill_registered_effect_group(group)?;
     }
     #[cfg(not(target_os = "linux"))]
-    write_finish_signal(finish_path)?;
+    write_finish_signal(_finish_path)?;
     if let Some(child) = child.as_mut() {
         let _ = timeout(RUNNER_EXIT_GRACE, child.wait()).await;
     }
