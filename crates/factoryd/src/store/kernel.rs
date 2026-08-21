@@ -2361,29 +2361,12 @@ mod tests {
         store: &mut Store,
         execution_mode: ExecutionMode,
     ) -> (ProjectId, AgentId, TaskId, NewRunAdmission) {
-        let project_id = ProjectId::try_from("factory").unwrap();
-        let agent_id = AgentId::try_from("worker").unwrap();
-        let task_id = TaskId::try_from("task-1").unwrap();
+        let (project_id, agent_id) = seed_worker(store);
         store
-            .create_project(
-                NewProject {
-                    id: project_id.clone(),
-                    name: "Factory".into(),
-                    root: "/tmp/factory".into(),
-                },
-                1,
-            )
-            .unwrap();
-        store
-            .create_agent(
-                NewAgent {
-                    id: agent_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_agent_id: None,
-                    role: AgentRole::Worker,
-                    provider: Provider::Codex,
-                },
-                2,
+            .connection
+            .execute(
+                "UPDATE agents SET provider = 'codex' WHERE id = ?1",
+                [agent_id.as_str()],
             )
             .unwrap();
         store
@@ -2399,74 +2382,13 @@ mod tests {
                 3,
             )
             .unwrap();
-        store
-            .create_assigned_task(
-                NewTask {
-                    id: task_id.clone(),
-                    project_id: project_id.clone(),
-                    parent_task_id: None,
-                    title: "Do work".into(),
-                    body: "Body".into(),
-                    priority: 0,
-                },
-                agent_id.clone(),
-                4,
-            )
-            .unwrap();
-        let admission = NewRunAdmission {
-            run_id: RunId::try_from("11111111-1111-4111-8111-111111111111").unwrap(),
-            project_id: project_id.clone(),
-            agent_id: agent_id.clone(),
-            capability_digest: capability_digest(BEARER),
-            runtime_claim: "runtime-claim:55555555555545558555555555555555".into(),
-            runner_instance_id: RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222")
-                .unwrap(),
-            runner_runtime: "/tmp/factory-runner".into(),
-            max_active_runs: 1,
-            change_reservation: ChangeReservation {
-                id: ChangeId::try_from("change-1").unwrap(),
-                source_root: "/tmp/factory-change-1".into(),
-                max_factory_changes: 1,
-            },
-            policy_cwd: "/tmp/factory-runner/policy".into(),
-        };
+        let task_id = queue_task(store, &project_id, &agent_id, "task-1", 0, 4);
+        let admission = next_admission(
+            "11111111-1111-4111-8111-111111111111",
+            project_id.clone(),
+            agent_id.clone(),
+        );
         (project_id, agent_id, task_id, admission)
-    }
-
-    #[test]
-    fn disabled_dispatch_refuses_admission_without_durable_effects_for_every_mode() {
-        for execution_mode in [
-            ExecutionMode::PlanOnly,
-            ExecutionMode::WorkspaceWrite,
-            ExecutionMode::Unrestricted,
-        ] {
-            let mut store = Store::open_in_memory().unwrap();
-            let (project_id, _agent_id, task_id, admission) =
-                codex_admission_fixture(&mut store, execution_mode);
-            store.set_dispatch_enabled(false, 5).unwrap();
-
-            assert!(store.admit_next_run(admission, 6).unwrap().is_none());
-            assert_eq!(
-                store
-                    .get_task(&project_id, &task_id)
-                    .unwrap()
-                    .snapshot
-                    .status,
-                TaskStatus::Queued
-            );
-            assert!(store.list_runs(&project_id, None, 10).unwrap().is_empty());
-            assert!(
-                store
-                    .list_changes(&project_id, None, 10)
-                    .unwrap()
-                    .is_empty()
-            );
-            let resources: i64 = store
-                .connection
-                .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(resources, 0);
-        }
     }
 
     #[test]

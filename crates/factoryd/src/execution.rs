@@ -70,6 +70,7 @@ pub struct Config {
     pub factoryctl_path: PathBuf,
     pub git_program: PathBuf,
     pub claude_installation: Option<providers::claude::ClaudeInstallation>,
+    pub codex_provider: providers::codex::CodexProvider,
     pub cargo_program: Option<PathBuf>,
     pub runtime_root: PathBuf,
     pub changes_root: PathBuf,
@@ -714,6 +715,7 @@ async fn launch_admitted(
     let provider = match select_provider(
         admitted.target.provider,
         config.claude_installation.as_ref(),
+        &config.codex_provider,
     ) {
         Ok(provider) => provider,
         Err(error) => return Err((error.into(), None, recovery)),
@@ -1055,6 +1057,7 @@ fn provider_environment(
 fn select_provider(
     kind: Provider,
     claude_installation: Option<&providers::claude::ClaudeInstallation>,
+    codex_provider: &providers::codex::CodexProvider,
 ) -> Result<Box<dyn providers::Provider + Send>, providers::ProviderError> {
     match kind {
         Provider::ClaudeCode => claude_installation
@@ -1066,7 +1069,7 @@ fn select_provider(
                 provider: Provider::ClaudeCode,
                 reason: "no validated executable was found on daemon startup PATH",
             }),
-        Provider::Codex => Ok(Box::new(providers::codex::CodexProvider::new())),
+        Provider::Codex => Ok(Box::new(codex_provider.clone())),
         Provider::Shell => Ok(Box::new(providers::shell::ShellProvider)),
     }
 }
@@ -4029,6 +4032,7 @@ mod tests {
             factoryctl_path: PathBuf::from("/bin/factoryctl"),
             git_program: PathBuf::from("/usr/bin/git"),
             claude_installation: None,
+            codex_provider: providers::codex::CodexProvider::new(None),
             cargo_program: Some(PathBuf::from("/usr/bin/cargo")),
             runtime_root: root.join("runs"),
             changes_root: root.join("changes"),
@@ -4049,8 +4053,9 @@ mod tests {
 
     #[test]
     fn unavailable_claude_is_rejected_without_a_bare_path_fallback() {
+        let codex = providers::codex::CodexProvider::new(None);
         assert!(matches!(
-            select_provider(Provider::ClaudeCode, None),
+            select_provider(Provider::ClaudeCode, None, &codex),
             Err(providers::ProviderError::Unavailable {
                 provider: Provider::ClaudeCode,
                 ..
