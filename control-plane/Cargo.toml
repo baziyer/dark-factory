@@ -1,0 +1,30 @@
+[package]
+name = "dark-factory-control-plane"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+
+[dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+hex = "0.4.3"
+hmac = "0.12.1"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+
+# This directory is an exportable standalone service, not a dark-factory
+# workspace member. It will move to the sibling control-plane repository.
+[workspace]

@@ -51,6 +51,18 @@ The product and maintainer registrations may share control-plane implementation
 but never keys, installation mappings, permission revisions, operation journal
 namespaces, or audit identities.
 
+The broker implementation belongs in the sibling
+`dark-factory-control-plane` service, not in the pure-Rust local-runtime
+workspace or `factoryd`. The temporary `control-plane/` staging export proves
+only a versioned, signed, inert maintainer delivery boundary. Its SQLite journal
+is development-only and its readiness response reports the webhook inactive.
+Moving the export does not activate it: the hosted service still requires a
+durable shared journal, secret-manager configuration with an explicit secret
+revision, independent review, and the activation gates below. Product webhook
+intake and operator/PWA projections keep separate routes, configuration,
+storage namespaces, and authentication even if they later share hardened HTTP
+or signature primitives.
+
 The local coordinator client has no direct GitHub mutation path. Every
 maintainer effect executes inside the broker authenticated as the exact
 operation-bound App installation. It never falls back to ambient `git` or
