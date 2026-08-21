@@ -1,3 +1,5 @@
+#![cfg(feature = "development-sqlite")]
+
 use std::path::Path;
 
 use axum::{
@@ -30,17 +32,26 @@ fn hmac_matches_githubs_documented_vector() {
 }
 
 #[tokio::test]
-async fn health_refuses_to_claim_development_storage_is_ready() {
+async fn liveness_is_separate_from_fixed_inactive_readiness() {
     let (router, _temporary, _database) = test_router();
     let response = router
+        .clone()
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
+
+    let response = router
+        .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
     assert_eq!(
         body.as_ref(),
-        br#"{"status":"development_only","maintainer_webhook":"inactive","product_webhook":"inactive","operator_api":"inactive"}"#
+        br#"{"status":"inactive","maintainer_webhook":"inactive","product_webhook":"inactive","operator_api":"inactive"}"#
     );
 }
 
@@ -94,7 +105,7 @@ async fn replay_binds_hook_target_and_secret_revision() {
         .unwrap();
     assert_eq!(changed_hook.status(), StatusCode::CONFLICT);
 
-    let changed_target = app(state(&database, "maintainer-v1"))
+    let changed_target = app(state_with_target(&database, "maintainer-v1", 9999))
         .oneshot(signed_request_with_bindings(
             "ping", delivery, "1234", "9999", body,
         ))
@@ -130,7 +141,7 @@ async fn bad_signature_never_reaches_the_journal() {
 }
 
 #[tokio::test]
-async fn bounded_installation_lifecycle_is_audited_but_inert() {
+async fn signed_installation_lifecycle_is_policy_rejected() {
     let (router, _temporary, database) = test_router();
     let response = router
         .oneshot(signed_request(
@@ -140,9 +151,9 @@ async fn bounded_installation_lifecycle_is_audited_but_inert() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(delivery_count(&database), 1);
-    assert_eq!(stored_disposition(&database), "lifecycle_audited");
+    assert_eq!(stored_disposition(&database), "policy_rejected");
 }
 
 #[tokio::test]
@@ -198,6 +209,51 @@ async fn malformed_or_oversized_requests_are_rejected_before_journaling() {
 }
 
 #[tokio::test]
+async fn arbitrary_target_type_and_wrong_configured_target_fail_closed() {
+    let (router, _temporary, database) = test_router();
+    let body = br#"{"zen":"scope first"}"#;
+    let mut wrong_type = signed_request("ping", "6c8a5c44-7f1f-11f0-952e-acde48001122", body);
+    wrong_type.headers_mut().insert(
+        "x-github-hook-installation-target-type",
+        "organization".parse().unwrap(),
+    );
+    let response = router.clone().oneshot(wrong_type).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let wrong_target = signed_request_with_bindings(
+        "ping",
+        "7c8a5c44-7f1f-11f0-952e-acde48001122",
+        "1234",
+        "9999",
+        body,
+    );
+    let response = router.oneshot(wrong_target).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(delivery_count(&database), 0);
+}
+
+#[tokio::test]
+async fn duplicate_security_headers_are_rejected_before_journaling() {
+    let (router, _temporary, database) = test_router();
+    let body = br#"{"zen":"one value per binding"}"#;
+    for name in [
+        "x-hub-signature-256",
+        "x-github-delivery",
+        "x-github-event",
+        "x-github-hook-id",
+        "x-github-hook-installation-target-id",
+        "x-github-hook-installation-target-type",
+    ] {
+        let mut request = signed_request("ping", "8c8a5c44-7f1f-11f0-952e-acde48001122", body);
+        let duplicate = request.headers().get(name).unwrap().clone();
+        request.headers_mut().append(name, duplicate);
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{name}");
+    }
+    assert_eq!(delivery_count(&database), 0);
+}
+
+#[tokio::test]
 async fn future_product_and_operator_routes_are_not_exposed() {
     let (router, _temporary, _database) = test_router();
     for path in ["/v1/github/product/webhook", "/v1/operator/needs-you"] {
@@ -218,10 +274,15 @@ fn test_router() -> (Router, TempDir, std::path::PathBuf) {
 }
 
 fn state(database: &Path, secret_revision: &str) -> BrokerState {
+    state_with_target(database, secret_revision, 5678)
+}
+
+fn state_with_target(database: &Path, secret_revision: &str, target_id: i64) -> BrokerState {
     BrokerState::open_development(
         database,
         WebhookSecret::new(SECRET.to_vec()).expect("32-byte secret"),
         SecretRevision::new(secret_revision.to_owned()).expect("valid secret revision"),
+        target_id,
     )
     .unwrap()
 }

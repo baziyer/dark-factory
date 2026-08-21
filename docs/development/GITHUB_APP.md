@@ -54,8 +54,10 @@ namespaces, or audit identities.
 The broker implementation belongs in the sibling
 `dark-factory-control-plane` service, not in the pure-Rust local-runtime
 workspace or `factoryd`. The temporary `control-plane/` staging export proves
-only a versioned, signed, inert maintainer delivery boundary. Its SQLite journal
-is development-only and its readiness response reports the webhook inactive.
+only a versioned, signed, inert maintainer `ping` boundary. Every non-ping event
+is policy-rejected. Its SQLite journal exists only behind a non-default
+development feature; the default build installs no webhook route, and readiness
+reports the webhook inactive.
 Moving the export does not activate it: the hosted service still requires a
 durable shared journal, secret-manager configuration with an explicit secret
 revision, independent review, and the activation gates below. Product webhook

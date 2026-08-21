@@ -69,8 +69,7 @@ impl DeliveryJournal {
                 disposition TEXT NOT NULL CHECK (
                     disposition IN (
                         'ping',
-                        'lifecycle_audited',
-                        'event_rejected',
+                        'policy_rejected',
                         'payload_rejected'
                     )
                 ),

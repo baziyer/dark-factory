@@ -6,22 +6,25 @@ member and never links to or runs inside `factoryd`.
 
 The current code proves only the inert maintainer webhook boundary:
 
-- `GET /healthz` reports `development_only`; every product, maintainer, and
-  operator surface remains inactive for deployment.
+- `GET /healthz` proves process liveness only. `GET /readyz` returns 503 and
+  reports every product, maintainer, and operator surface inactive.
 - `POST /v1/github/maintainer/webhook` verifies `X-Hub-Signature-256` over the
   exact body with HMAC-SHA-256, bounds the body to 64 KiB, and requires the
   GitHub delivery, event, hook, installation-target ID, and target-type
-  headers.
+  headers. Each required header must occur exactly once, the target type must
+  be `integration`, and the target ID must match the configured App ID.
 - A replay binds every required header, the parsed action, body digest,
   disposition, and webhook-secret revision. An exact replay returns its stored
   result; reuse of a delivery ID with any different binding is a conflict.
-- `ping` is acknowledged. Known `installation` and
-  `installation_repositories` lifecycle actions are journalled as inert audit
-  records. Other events and actions fail closed. No payload can create a task,
-  message, prompt, provider run, or GitHub mutation.
+- A valid `ping` is the only acknowledged event. Every installation,
+  lifecycle, and other event is journalled as `policy_rejected` and returns
+  422. No payload can create a task, message, prompt, provider run, or GitHub
+  mutation.
 
-The SQLite journal exists only for local causal tests and persistent-filesystem
-development. It is not a Vercel storage design. A deployment must add the
+The SQLite journal exists only behind the non-default `development-sqlite`
+feature for local causal tests. The default/release build does not link SQLite
+and installs no webhook route. SQLite is not a Vercel storage design. A
+deployment must add the
 reviewed Postgres journal adapter, configure an explicit secret revision, and
 make readiness depend on both the secret and journal before the webhook is
 reported active. Until then, do not configure this route as an active GitHub
@@ -38,5 +41,7 @@ Run the local proof with:
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --features development-sqlite
+cargo clippy --locked --all-targets --features development-sqlite -- -D warnings
 cargo fmt --all -- --check
 ```
