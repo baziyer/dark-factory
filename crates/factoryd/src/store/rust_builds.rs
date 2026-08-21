@@ -8,13 +8,8 @@ use super::{MAX_PATH_BYTES, Result, Store, StoreError};
 
 const DIGEST_HEX_LEN: usize = 64;
 const MAX_FAILURE_BYTES: usize = 4096;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProjectExecutionPolicy {
-    pub project_id: ProjectId,
-    pub incarnation_id: String,
-    pub completion_verification: CompletionVerification,
-}
+pub(crate) const MAX_RUST_CACHE_COUNT: u64 = 8;
+pub(crate) const MAX_RUST_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RustCompletionPhase {
@@ -72,7 +67,6 @@ pub enum RustCacheLifecycle {
     Declared,
     Available,
     Reclaiming,
-    Removed,
 }
 
 impl RustCacheLifecycle {
@@ -81,7 +75,6 @@ impl RustCacheLifecycle {
             "declared" => Self::Declared,
             "available" => Self::Available,
             "reclaiming" => Self::Reclaiming,
-            "removed" => Self::Removed,
             _ => return None,
         })
     }
@@ -103,13 +96,6 @@ pub struct RustBuildCache {
     pub last_used_at_ms: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RustStoragePolicy {
-    pub max_cache_count: u64,
-    pub max_cache_bytes: u64,
-    pub updated_at_ms: i64,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustStorageSummary {
     pub cache_count: u64,
@@ -120,28 +106,6 @@ pub struct RustStorageSummary {
 }
 
 impl Store {
-    pub fn project_execution_policy(
-        &self,
-        project_id: &ProjectId,
-    ) -> Result<ProjectExecutionPolicy> {
-        self.connection
-            .query_row(
-                "SELECT id, incarnation_id, completion_verification
-                 FROM projects WHERE id = ?1",
-                [project_id.as_str()],
-                |row| {
-                    let verification: String = row.get(2)?;
-                    Ok(ProjectExecutionPolicy {
-                        project_id: super::parse_id(row.get(0)?, 0)?,
-                        incarnation_id: row.get(1)?,
-                        completion_verification: parse_verification(&verification, 2)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or(StoreError::ProjectNotFound)
-    }
-
     pub fn set_project_completion_verification(
         &mut self,
         project_id: &ProjectId,
@@ -264,20 +228,14 @@ impl Store {
             return Err(StoreError::RustCacheWriterBusy);
         }
         let existing = load_cache(&transaction, &check.project_incarnation_id, cache_key)?;
-        let max_cache_bytes: i64 = transaction.query_row(
-            "SELECT max_cache_bytes FROM rust_storage_policy WHERE singleton = 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        )?;
-        let max_cache_bytes = from_i64(max_cache_bytes, 0)?;
         if existing
             .as_ref()
             .and_then(|cache| cache.bytes)
-            .is_some_and(|bytes| bytes > max_cache_bytes)
+            .is_some_and(|bytes| bytes > MAX_RUST_CACHE_BYTES)
         {
             return Err(StoreError::RustStorageCapacityReached {
                 kind: "cache-bytes",
-                limit: max_cache_bytes,
+                limit: MAX_RUST_CACHE_BYTES,
             });
         }
         match existing {
@@ -288,7 +246,7 @@ impl Store {
                 ) => {}
             existing => {
                 ensure_cache_claim_capacity(&transaction)?;
-                if existing.is_some_and(|cache| cache.lifecycle != RustCacheLifecycle::Removed) {
+                if existing.is_some() {
                     return Err(StoreError::InvalidRustBuildMetadata);
                 }
             }
@@ -543,59 +501,19 @@ impl Store {
             .ok_or(StoreError::InvalidRustBuildMetadata)
     }
 
-    pub fn rust_storage_policy(&self) -> Result<RustStoragePolicy> {
-        self.connection
-            .query_row(
-                "SELECT max_cache_count, max_cache_bytes, updated_at_ms
-             FROM rust_storage_policy WHERE singleton = 1",
-                [],
-                |row| {
-                    Ok(RustStoragePolicy {
-                        max_cache_count: from_i64(row.get(0)?, 0)?,
-                        max_cache_bytes: from_i64(row.get(1)?, 1)?,
-                        updated_at_ms: row.get(2)?,
-                    })
-                },
-            )
-            .map_err(Into::into)
-    }
-
-    #[cfg(test)]
-    fn set_rust_storage_policy(
-        &mut self,
-        policy: RustStoragePolicy,
-        now_ms: i64,
-    ) -> Result<RustStoragePolicy> {
-        if policy.max_cache_count == 0 || policy.max_cache_bytes == 0 {
-            return Err(StoreError::InvalidRustBuildMetadata);
-        }
-        self.connection.execute(
-            "UPDATE rust_storage_policy
-             SET max_cache_count = ?1, max_cache_bytes = ?2,
-                 updated_at_ms = ?3
-             WHERE singleton = 1",
-            params![
-                to_i64(policy.max_cache_count)?,
-                to_i64(policy.max_cache_bytes)?,
-                now_ms,
-            ],
-        )?;
-        self.rust_storage_policy()
-    }
-
     /// Exact persisted inventory. Byte totals are absent when any live row is
     /// not measured, rather than presenting a plausible partial total.
     pub fn rust_storage_summary(&self) -> Result<RustStorageSummary> {
         let (cache_count, cache_measured, cache_bytes): (i64, i64, i64) =
             self.connection.query_row(
                 "SELECT COUNT(*), COUNT(bytes), COALESCE(SUM(bytes), 0)
-             FROM rust_build_caches WHERE lifecycle <> 'removed'",
+             FROM rust_build_caches",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
         let protected_count: i64 = self.connection.query_row(
             "SELECT COUNT(*) FROM rust_build_caches c
-             WHERE c.lifecycle <> 'removed' AND EXISTS (
+             WHERE EXISTS (
                 SELECT 1 FROM rust_completion_checks r
                 WHERE r.project_incarnation_id = c.project_incarnation_id
                   AND r.cache_key = c.cache_key AND r.phase = 'running')",
@@ -612,8 +530,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let failed_count: i64 = self.connection.query_row(
-            "SELECT COUNT(*) FROM rust_build_caches
-             WHERE lifecycle <> 'removed' AND failure IS NOT NULL",
+            "SELECT COUNT(*) FROM rust_build_caches WHERE failure IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
@@ -744,9 +661,8 @@ impl Store {
         &mut self,
         incarnation_id: &str,
         cache_key: &str,
-        now_ms: i64,
     ) -> Result<()> {
-        finish_reclaim(&self.connection, incarnation_id, cache_key, now_ms)
+        finish_reclaim(&self.connection, incarnation_id, cache_key)
     }
 
     pub fn record_rust_cache_failure(
@@ -764,9 +680,8 @@ impl Store {
         &mut self,
         incarnation_id: &str,
         cache_key: &str,
-        now_ms: i64,
     ) -> Result<()> {
-        finish_absent_declaration(&self.connection, incarnation_id, cache_key, now_ms)
+        finish_absent_declaration(&self.connection, incarnation_id, cache_key)
     }
 
     /// Atomically turns a deletable project's exact regenerable caches into
@@ -857,18 +772,6 @@ fn declare_cache_row(
                     params![now_ms, incarnation_id, cache_key],
                 )?;
             }
-            RustCacheLifecycle::Removed => {
-                ensure_artifact_capacity(transaction)?;
-                transaction.execute(
-                    "UPDATE rust_build_caches
-                     SET dev = NULL, inode = NULL, bytes = NULL,
-                         lifecycle = 'declared', failure = NULL,
-                         created_at_ms = ?1, updated_at_ms = ?1, last_used_at_ms = ?1
-                     WHERE project_incarnation_id = ?2 AND cache_key = ?3
-                       AND lifecycle = 'removed'",
-                    params![now_ms, incarnation_id, cache_key],
-                )?;
-            }
             RustCacheLifecycle::Reclaiming => {
                 return Err(StoreError::InvalidRustBuildMetadata);
             }
@@ -888,38 +791,36 @@ fn declare_cache_row(
 }
 
 fn ensure_artifact_capacity(transaction: &Transaction<'_>) -> Result<()> {
-    let sql = "SELECT
-        (SELECT COUNT(*) FROM rust_build_caches WHERE lifecycle <> 'removed'),
-        (SELECT max_cache_count FROM rust_storage_policy WHERE singleton = 1)";
-    let (count, limit): (i64, i64) =
-        transaction.query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    if count >= limit {
+    let count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM rust_build_caches", [], |row| {
+            row.get(0)
+        })?;
+    if from_i64(count, 0)? >= MAX_RUST_CACHE_COUNT {
         return Err(StoreError::RustStorageCapacityReached {
             kind: "cache",
-            limit: from_i64(limit, 0)?,
+            limit: MAX_RUST_CACHE_COUNT,
         });
     }
     Ok(())
 }
 
 fn ensure_cache_claim_capacity(transaction: &Transaction<'_>) -> Result<()> {
-    let (claimed, limit): (i64, i64) = transaction.query_row(
+    let claimed: i64 = transaction.query_row(
         "SELECT
-            (SELECT COUNT(*) FROM rust_build_caches WHERE lifecycle <> 'removed')
+            (SELECT COUNT(*) FROM rust_build_caches)
             + (SELECT COUNT(*) FROM rust_completion_checks r
                WHERE r.phase = 'running' AND NOT EXISTS (
                    SELECT 1 FROM rust_build_caches c
                    WHERE c.project_incarnation_id = r.project_incarnation_id
-                     AND c.cache_key = r.cache_key AND c.lifecycle <> 'removed'
-               )),
-            (SELECT max_cache_count FROM rust_storage_policy WHERE singleton = 1)",
+                     AND c.cache_key = r.cache_key
+               ))",
         [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| row.get(0),
     )?;
-    if claimed >= limit {
+    if from_i64(claimed, 0)? >= MAX_RUST_CACHE_COUNT {
         return Err(StoreError::RustStorageCapacityReached {
             kind: "cache",
-            limit: from_i64(limit, 0)?,
+            limit: MAX_RUST_CACHE_COUNT,
         });
     }
     Ok(())
@@ -1040,18 +941,16 @@ fn finish_reclaim(
     connection: &rusqlite::Connection,
     incarnation_id: &str,
     cache_key: &str,
-    now_ms: i64,
 ) -> Result<()> {
     let changed = connection.execute(
-        "UPDATE rust_build_caches
-         SET lifecycle = 'removed', failure = NULL, updated_at_ms = ?1
-         WHERE project_incarnation_id = ?2 AND cache_key = ?3
+        "DELETE FROM rust_build_caches
+         WHERE project_incarnation_id = ?1 AND cache_key = ?2
            AND lifecycle = 'reclaiming' AND NOT EXISTS (
                 SELECT 1 FROM rust_completion_checks r
                 WHERE r.project_incarnation_id = rust_build_caches.project_incarnation_id
                   AND r.cache_key = rust_build_caches.cache_key AND r.phase = 'running'
            )",
-        params![now_ms, incarnation_id, cache_key],
+        params![incarnation_id, cache_key],
     )?;
     if changed == 1 {
         Ok(())
@@ -1064,18 +963,16 @@ fn finish_absent_declaration(
     connection: &rusqlite::Connection,
     incarnation_id: &str,
     cache_key: &str,
-    now_ms: i64,
 ) -> Result<()> {
     let changed = connection.execute(
-        "UPDATE rust_build_caches
-         SET lifecycle = 'removed', failure = NULL, updated_at_ms = ?1
-         WHERE project_incarnation_id = ?2 AND cache_key = ?3
+        "DELETE FROM rust_build_caches
+         WHERE project_incarnation_id = ?1 AND cache_key = ?2
            AND lifecycle = 'declared' AND NOT EXISTS (
                 SELECT 1 FROM rust_completion_checks r
                 WHERE r.project_incarnation_id = rust_build_caches.project_incarnation_id
                   AND r.cache_key = rust_build_caches.cache_key AND r.phase = 'running'
            )",
-        params![now_ms, incarnation_id, cache_key],
+        params![incarnation_id, cache_key],
     )?;
     if changed == 1 {
         Ok(())
@@ -1218,10 +1115,23 @@ mod tests {
             )
             .unwrap();
         let incarnation = store
-            .project_execution_policy(&project_id)
-            .unwrap()
-            .incarnation_id;
+            .connection
+            .query_row(
+                "SELECT incarnation_id FROM projects WHERE id = ?1",
+                [project_id.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
         (project_id, incarnation)
+    }
+
+    fn cache_key(index: u64) -> String {
+        format!("{index:064x}")
+    }
+
+    fn run_id(index: u64) -> RunId {
+        RunId::try_from(format!("00000000-0000-4000-8000-{index:012x}"))
+            .expect("generated test RunId should be valid")
     }
 
     fn declare_cache(
@@ -1281,16 +1191,6 @@ mod tests {
     fn capacity_refuses_claim_without_consuming_pending_and_allows_exact_reuse() {
         let mut store = Store::open_in_memory().unwrap();
         let (project_id, incarnation) = project(&mut store);
-        store
-            .set_rust_storage_policy(
-                RustStoragePolicy {
-                    max_cache_count: 1,
-                    max_cache_bytes: 1,
-                    updated_at_ms: 0,
-                },
-                2,
-            )
-            .unwrap();
         declare_cache(
             &mut store,
             &project_id,
@@ -1300,6 +1200,17 @@ mod tests {
             3,
         )
         .unwrap();
+        for index in 1..MAX_RUST_CACHE_COUNT {
+            declare_cache(
+                &mut store,
+                &project_id,
+                &incarnation,
+                &cache_key(index),
+                &format!("/tmp/cache-{index}"),
+                3,
+            )
+            .unwrap();
+        }
         // Exact identities are reusable even when the inventory is at cap.
         declare_cache(
             &mut store,
@@ -1323,7 +1234,7 @@ mod tests {
             store.claim_rust_completion_check(&run_id, CACHE_B, 6),
             Err(StoreError::RustStorageCapacityReached {
                 kind: "cache",
-                limit: 1
+                limit: MAX_RUST_CACHE_COUNT
             })
         ));
         assert_eq!(
@@ -1343,25 +1254,16 @@ mod tests {
     fn running_claim_reserves_capacity_before_the_cache_path_exists() {
         let mut store = Store::open_in_memory().unwrap();
         let (project_id, incarnation) = project(&mut store);
-        store
-            .set_rust_storage_policy(
-                RustStoragePolicy {
-                    max_cache_count: 1,
-                    max_cache_bytes: 1,
-                    updated_at_ms: 0,
-                },
-                2,
-            )
-            .unwrap();
-        let first_run = RunId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
-        insert_test_check(
-            &store,
-            &first_run,
-            &project_id,
-            &incarnation,
-            RustCompletionPhase::Running,
-            Some(CACHE_A),
-        );
+        for index in 0..MAX_RUST_CACHE_COUNT {
+            insert_test_check(
+                &store,
+                &run_id(index),
+                &project_id,
+                &incarnation,
+                RustCompletionPhase::Running,
+                Some(&cache_key(index)),
+            );
+        }
         let second_run = RunId::try_from("44444444-4444-4444-8444-444444444444").unwrap();
         insert_test_check(
             &store,
@@ -1376,7 +1278,7 @@ mod tests {
             store.claim_rust_completion_check(&second_run, CACHE_B, 3),
             Err(StoreError::RustStorageCapacityReached {
                 kind: "cache",
-                limit: 1
+                limit: MAX_RUST_CACHE_COUNT
             })
         ));
         assert_eq!(
@@ -1393,16 +1295,6 @@ mod tests {
     fn claim_refuses_oversized_cache_and_clears_reused_measurement() {
         let mut store = Store::open_in_memory().unwrap();
         let (project_id, incarnation) = project(&mut store);
-        store
-            .set_rust_storage_policy(
-                RustStoragePolicy {
-                    max_cache_count: 1,
-                    max_cache_bytes: 1,
-                    updated_at_ms: 0,
-                },
-                2,
-            )
-            .unwrap();
         declare_cache(
             &mut store,
             &project_id,
@@ -1416,9 +1308,9 @@ mod tests {
             .connection
             .execute(
                 "UPDATE rust_build_caches
-                 SET lifecycle = 'available', dev = 1, inode = 2, bytes = 2
-                 WHERE cache_key = ?1",
-                [CACHE_A],
+                 SET lifecycle = 'available', dev = 1, inode = 2, bytes = ?1
+                 WHERE cache_key = ?2",
+                params![to_i64(MAX_RUST_CACHE_BYTES + 1).unwrap(), CACHE_A],
             )
             .unwrap();
         let run_id = RunId::try_from("55555555-5555-4555-8555-555555555555").unwrap();
@@ -1434,7 +1326,7 @@ mod tests {
             store.claim_rust_completion_check(&run_id, CACHE_A, 4),
             Err(StoreError::RustStorageCapacityReached {
                 kind: "cache-bytes",
-                limit: 1
+                limit: MAX_RUST_CACHE_BYTES
             })
         ));
         assert_eq!(
@@ -1442,13 +1334,10 @@ mod tests {
             RustCompletionPhase::Pending
         );
         store
-            .set_rust_storage_policy(
-                RustStoragePolicy {
-                    max_cache_count: 1,
-                    max_cache_bytes: 3,
-                    updated_at_ms: 0,
-                },
-                5,
+            .connection
+            .execute(
+                "UPDATE rust_build_caches SET bytes = 1 WHERE cache_key = ?1",
+                [CACHE_A],
             )
             .unwrap();
         store
@@ -1607,8 +1496,13 @@ mod tests {
             .record_rust_cache_failure(&incarnation, CACHE_B, "missing", 3)
             .unwrap();
         store
-            .finish_absent_declared_rust_cache(&incarnation, CACHE_C, 3)
+            .finish_absent_declared_rust_cache(&incarnation, CACHE_C)
             .unwrap();
+        assert!(
+            load_cache(&store.connection, &incarnation, CACHE_C)
+                .unwrap()
+                .is_none()
+        );
 
         store
             .connection

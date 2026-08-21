@@ -39,7 +39,6 @@ const MAX_SOURCE_BYTES: u64 = 1_099_511_627_776;
 const MAX_BUILD_STDOUT: usize = 32 * 1024 * 1024;
 const MAX_BUILD_STDERR: usize = 4 * 1024 * 1024;
 const MAX_TEST_OUTPUT: usize = 4 * 1024 * 1024;
-const MAX_CHECKPOINT_BYTES: usize = 64 * 1024;
 const MAX_BUNDLE_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKER_INVOCATION_BYTES: usize = 64 * 1024;
 const MAX_WORKER_RESULT_BYTES: usize = 512 * 1024;
@@ -74,7 +73,6 @@ struct RustWorkspaceTest {
     temporary_identity: FileIdentity,
     snapshots_root: PathBuf,
     bundle_staging_root: PathBuf,
-    checkpoints_root: PathBuf,
 }
 
 /// A content-addressed source snapshot and executable bundle ready to launch.
@@ -112,23 +110,10 @@ impl PreparedRustWorkspaceTest {
     }
 }
 
-/// Bounded output from one prepared test executable.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct RustTestExecution {
-    pub executable_digest: String,
-    pub success: bool,
-    pub exit_code: Option<i32>,
-    pub diagnostic: String,
-}
-
 /// Bounded result from executing every test artifact serially.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RustWorkspaceTestResult {
-    pub snapshot_digest: String,
-    pub bundle_digest: String,
-    pub cache_target: PathBuf,
-    pub success: bool,
-    pub executions: Vec<RustTestExecution>,
+    success: bool,
+    diagnostic: String,
 }
 
 /// Bounded hidden-worker input. All paths are daemon-derived; no arguments or
@@ -212,11 +197,7 @@ enum EntryKind {
 struct BundleManifest {
     version: u32,
     snapshot_digest: String,
-    cargo_lock_digest: String,
     cache_key: String,
-    cache_target: PathBuf,
-    build_arguments: Vec<String>,
-    build_environment: Vec<(String, String)>,
     executables: Vec<BundleExecutable>,
 }
 
@@ -228,16 +209,6 @@ struct BundleExecutable {
     mode: u32,
     device: u64,
     inode: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct BundleCheckpoint {
-    version: u32,
-    snapshot_digest: String,
-    staging_name: String,
-    staging_device: Option<u64>,
-    staging_inode: Option<u64>,
-    bundle_digest: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -291,7 +262,7 @@ pub enum RustVerifyError {
     ArtifactOutsideCache(PathBuf),
     #[error("Cargo artifact is missing, replaced, non-regular, or non-executable: {0:?}")]
     InvalidArtifact(PathBuf),
-    #[error("bundle checkpoint is invalid or conflicts with this source snapshot")]
+    #[error("bounded verifier state is invalid or conflicts with this invocation")]
     InvalidCheckpoint,
     #[error("bundle manifest is missing, oversized, malformed, or inconsistent")]
     InvalidBundle,
@@ -349,7 +320,6 @@ impl RustWorkspaceTest {
         let build_home = prepare_private_root(&cache_root.join("home"))?;
         let snapshots_root = prepare_private_root(&temporary_root.join("snapshots"))?;
         let bundle_staging_root = prepare_private_root(&temporary_root.join("bundle-staging"))?;
-        let checkpoints_root = prepare_private_root(&temporary_root.join("checkpoints"))?;
         Ok(Self {
             cargo,
             rustc,
@@ -365,7 +335,6 @@ impl RustWorkspaceTest {
             temporary_identity,
             snapshots_root,
             bundle_staging_root,
-            checkpoints_root,
         })
     }
 
@@ -383,15 +352,13 @@ impl RustWorkspaceTest {
         self.cargo.verify()?;
         self.rustc.verify()?;
         let (snapshot_digest, snapshot_root) = self.prepare_snapshot()?;
-        if let Some(prepared) = self.recover_checkpoint(&snapshot_digest, &snapshot_root)? {
-            return Ok(prepared);
-        }
-
+        hash_path(&snapshot_root.join("Cargo.lock"))
+            .map_err(|_| RustVerifyError::CargoLockMissing)?;
         let artifacts = self.build(&snapshot_root)?;
         if capture_tree(&snapshot_root)?.digest() != snapshot_digest {
             return Err(RustVerifyError::SourceChanged);
         }
-        self.publish_bundle(&snapshot_digest, &snapshot_root, &artifacts)
+        self.publish_bundle(&snapshot_digest, &artifacts)
     }
 
     /// Reopens and verifies every published executable immediately before its
@@ -407,7 +374,8 @@ impl RustWorkspaceTest {
             &prepared.bundle_digest,
             &self.cache_key,
         )?;
-        let mut executions = Vec::with_capacity(manifest.executables.len());
+        let mut success = true;
+        let mut diagnostics = Vec::new();
         for executable in &manifest.executables {
             self.verify_snapshot(prepared)?;
             let path = prepared.bundle_root.join("bin").join(&executable.name);
@@ -435,19 +403,14 @@ impl RustWorkspaceTest {
             } else {
                 &output.stderr
             };
-            executions.push(RustTestExecution {
-                executable_digest: executable.digest.clone(),
-                success: output.status.success(),
-                exit_code: output.status.code(),
-                diagnostic: bounded_diagnostic(diagnostic_bytes),
-            });
+            success &= output.status.success();
+            if !output.status.success() && !diagnostic_bytes.is_empty() {
+                diagnostics.push(bounded_diagnostic(diagnostic_bytes));
+            }
         }
         Ok(RustWorkspaceTestResult {
-            snapshot_digest: prepared.snapshot_digest.clone(),
-            bundle_digest: prepared.bundle_digest.clone(),
-            cache_target: self.cache_target.clone(),
-            success: executions.iter().all(|execution| execution.success),
-            executions,
+            success,
+            diagnostic: bounded_diagnostic(diagnostics.join("\n").as_bytes()),
         })
     }
 
@@ -471,7 +434,6 @@ impl RustWorkspaceTest {
             &self.build_home,
             &self.snapshots_root,
             &self.bundle_staging_root,
-            &self.checkpoints_root,
         ] {
             verify_private_directory(root)?;
         }
@@ -560,147 +522,25 @@ impl RustWorkspaceTest {
             .env("NO_COLOR", "1");
     }
 
-    fn build_environment_manifest(&self) -> Vec<(String, String)> {
-        vec![
-            ("CARGO_HOME".into(), self.cargo_home.display().to_string()),
-            ("CARGO_INCREMENTAL".into(), "0".into()),
-            ("CARGO_NET_GIT_FETCH_WITH_CLI".into(), "false".into()),
-            (
-                "CARGO_TARGET_DIR".into(),
-                self.cache_target.display().to_string(),
-            ),
-            ("CARGO_TERM_COLOR".into(), "never".into()),
-            ("HOME".into(), self.build_home.display().to_string()),
-            ("LANG".into(), "C".into()),
-            ("LC_ALL".into(), "C".into()),
-            ("NO_COLOR".into(), "1".into()),
-            (
-                "PATH".into(),
-                fixed_path(&self.cargo.path).to_string_lossy().into_owned(),
-            ),
-            ("RUST_BACKTRACE".into(), "0".into()),
-            ("TERM".into(), "dumb".into()),
-        ]
-    }
-
-    fn checkpoint_path(&self, snapshot_digest: &str) -> PathBuf {
-        self.checkpoints_root
-            .join(format!("{snapshot_digest}.json"))
-    }
-
-    fn recover_checkpoint(
-        &self,
-        snapshot_digest: &str,
-        snapshot_root: &Path,
-    ) -> Result<Option<PreparedRustWorkspaceTest>> {
-        let path = self.checkpoint_path(snapshot_digest);
-        if !path_exists(&path)? {
-            return Ok(None);
-        }
-        let checkpoint: BundleCheckpoint = read_bounded_json(&path, MAX_CHECKPOINT_BYTES)?;
-        if checkpoint.version != MANIFEST_VERSION
-            || checkpoint.snapshot_digest != snapshot_digest
-            || !safe_name(&checkpoint.staging_name)
-        {
-            return Err(RustVerifyError::InvalidCheckpoint);
-        }
-        let staging = self.bundle_staging_root.join(&checkpoint.staging_name);
-        let Some(bundle_digest) = checkpoint.bundle_digest.as_ref() else {
-            self.remove_checkpointed_staging(&staging, &checkpoint)?;
-            remove_exact_file(&path)?;
-            return Ok(None);
-        };
-        if !valid_digest(bundle_digest) {
-            return Err(RustVerifyError::InvalidCheckpoint);
-        }
-        verify_checkpointed_directory(&staging, &checkpoint)?;
-        let manifest = read_bundle_manifest(&staging)?;
-        verify_bundle(
-            &staging,
-            &manifest,
-            snapshot_digest,
-            bundle_digest,
-            &self.cache_key,
-        )?;
-        Ok(Some(PreparedRustWorkspaceTest {
-            snapshot_digest: snapshot_digest.to_owned(),
-            snapshot_root: snapshot_root.to_owned(),
-            bundle_digest: bundle_digest.clone(),
-            bundle_root: staging,
-        }))
-    }
-
-    fn remove_checkpointed_staging(
-        &self,
-        staging: &Path,
-        checkpoint: &BundleCheckpoint,
-    ) -> Result<()> {
-        if !path_exists(staging)? {
-            return Ok(());
-        }
-        if checkpoint.staging_device.is_some() || checkpoint.staging_inode.is_some() {
-            verify_checkpointed_directory(staging, checkpoint)?;
-        } else {
-            verify_private_directory(staging)?;
-        }
-        fs::remove_dir_all(staging).map_err(|source| RustVerifyError::Io {
-            path: staging.to_owned(),
-            source,
-        })?;
-        sync_directory(&self.bundle_staging_root)
-    }
-
     fn publish_bundle(
         &self,
         snapshot_digest: &str,
-        snapshot_root: &Path,
         artifacts: &[PathBuf],
     ) -> Result<PreparedRustWorkspaceTest> {
-        let staging_name = format!(".staging-{}", Uuid::new_v4().simple());
+        let snapshot_root = self.snapshots_root.join(snapshot_digest);
+        let nonce = Uuid::new_v4().simple().to_string();
+        let staging_name = format!(".staging-{nonce}");
         let staging = self.bundle_staging_root.join(&staging_name);
-        let checkpoint_path = self.checkpoint_path(snapshot_digest);
-        let mut checkpoint = BundleCheckpoint {
-            version: MANIFEST_VERSION,
-            snapshot_digest: snapshot_digest.to_owned(),
-            staging_name,
-            staging_device: None,
-            staging_inode: None,
-            bundle_digest: None,
-        };
-        write_atomic_json(
-            &checkpoint_path,
-            &checkpoint,
-            MAX_CHECKPOINT_BYTES,
-            &self.checkpoints_root,
-        )?;
         create_private_directory(&staging)?;
         let staging_identity = directory_identity(&staging)?;
-        checkpoint.staging_device = Some(staging_identity.device);
-        checkpoint.staging_inode = Some(staging_identity.inode);
-        write_atomic_json(
-            &checkpoint_path,
-            &checkpoint,
-            MAX_CHECKPOINT_BYTES,
-            &self.checkpoints_root,
-        )?;
-
-        (|| {
+        let prepared = (|| {
             let bin = staging.join("bin");
             create_private_directory(&bin)?;
             let executables = copy_artifacts(artifacts, &bin)?;
-            let cargo_lock_digest = hash_path(&snapshot_root.join("Cargo.lock"))
-                .map_err(|_| RustVerifyError::CargoLockMissing)?;
             let manifest = BundleManifest {
                 version: MANIFEST_VERSION,
                 snapshot_digest: snapshot_digest.to_owned(),
-                cargo_lock_digest,
                 cache_key: self.cache_key.clone(),
-                cache_target: self.cache_target.clone(),
-                build_arguments: BUILD_ARGUMENTS
-                    .iter()
-                    .map(|argument| (*argument).to_owned())
-                    .collect(),
-                build_environment: self.build_environment_manifest(),
                 executables,
             };
             let bundle_digest = bundle_digest(&manifest)?;
@@ -710,20 +550,22 @@ impl RustWorkspaceTest {
                 MAX_BUNDLE_MANIFEST_BYTES,
             )?;
             sync_tree(&staging)?;
-            checkpoint.bundle_digest = Some(bundle_digest.clone());
-            write_atomic_json(
-                &checkpoint_path,
-                &checkpoint,
-                MAX_CHECKPOINT_BYTES,
-                &self.checkpoints_root,
-            )?;
             Ok(PreparedRustWorkspaceTest {
                 snapshot_digest: snapshot_digest.to_owned(),
                 snapshot_root: snapshot_root.to_owned(),
                 bundle_digest,
-                bundle_root: staging,
+                bundle_root: staging.clone(),
             })
-        })()
+        })();
+        if prepared.is_err() {
+            remove_exact_tree(
+                &staging,
+                staging_identity.device,
+                staging_identity.inode,
+                &format!(".reaping-{nonce}"),
+            )?;
+        }
+        prepared
     }
 
     fn verify_prepared_paths(&self, prepared: &PreparedRustWorkspaceTest) -> Result<()> {
@@ -786,18 +628,11 @@ fn run_worker(invocation: &WorkerInvocation) -> Result<WorkerResult> {
     )?;
     let prepared = operation.prepare()?;
     let result = operation.execute(&prepared)?;
-    let diagnostic = result
-        .executions
-        .iter()
-        .filter(|execution| !execution.success && !execution.diagnostic.is_empty())
-        .map(|execution| execution.diagnostic.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     Ok(WorkerResult {
-        snapshot_digest: Some(result.snapshot_digest),
-        bundle_digest: Some(result.bundle_digest),
+        snapshot_digest: Some(prepared.snapshot_digest),
+        bundle_digest: Some(prepared.bundle_digest),
         success: result.success,
-        diagnostic: bounded_diagnostic(diagnostic.as_bytes()),
+        diagnostic: result.diagnostic,
         bundle_staging: Some(measure_exact_tree(&prepared.bundle_root)?),
     })
 }
@@ -1000,6 +835,64 @@ pub(crate) fn remove_exact_tree(
         source,
     })?;
     sync_directory(parent)
+}
+
+/// Removes an unbound cache directory only while it is still an empty,
+/// owner-only direct child of its private cache parent. The deterministic
+/// sibling quarantine makes a crash after rename safe to resume without ever
+/// recursively deleting an identity that was not durably bound.
+pub(crate) fn remove_empty_claimed_directory(path: &Path, quarantine_name: &str) -> Result<()> {
+    let path = checked_absolute(path)?;
+    let cache_key = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|value| valid_digest(value))
+        .ok_or_else(|| RustVerifyError::UnsafePath(path.clone()))?;
+    if quarantine_name != format!(".reclaim-cache-{cache_key}") {
+        return Err(RustVerifyError::UnsafePath(PathBuf::from(quarantine_name)));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| RustVerifyError::UnsafePath(path.clone()))?;
+    verify_private_directory(parent)?;
+    let quarantine = parent.join(quarantine_name);
+    match (path_exists(&path)?, path_exists(&quarantine)?) {
+        (false, false) => return sync_directory(parent),
+        (true, true) => return Err(RustVerifyError::UnsafePath(quarantine)),
+        (true, false) => {
+            verify_empty_private_directory(&path)?;
+            let expected = directory_identity(&path)?;
+            fs::rename(&path, &quarantine).map_err(|source| RustVerifyError::Io {
+                path: quarantine.clone(),
+                source,
+            })?;
+            sync_directory(parent)?;
+            verify_empty_private_directory(&quarantine)?;
+            verify_directory_identity(&quarantine, expected)?;
+        }
+        (false, true) => verify_empty_private_directory(&quarantine)?,
+    }
+    fs::remove_dir(&quarantine).map_err(|source| RustVerifyError::Io {
+        path: quarantine,
+        source,
+    })?;
+    sync_directory(parent)
+}
+
+fn verify_empty_private_directory(path: &Path) -> Result<()> {
+    verify_private_directory(path)?;
+    let mut entries = fs::read_dir(path).map_err(|source| RustVerifyError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    match entries.next() {
+        None => Ok(()),
+        Some(Ok(_)) => Err(RustVerifyError::UnsafePrivateDirectory(path.to_owned())),
+        Some(Err(source)) => Err(RustVerifyError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn bounded_diagnostic(bytes: &[u8]) -> String {
@@ -1525,12 +1418,6 @@ fn verify_bundle(
     if manifest.version != MANIFEST_VERSION
         || manifest.snapshot_digest != snapshot_digest
         || manifest.cache_key != expected_cache_key
-        || manifest.build_arguments.len() != BUILD_ARGUMENTS.len()
-        || !manifest
-            .build_arguments
-            .iter()
-            .zip(BUILD_ARGUMENTS)
-            .all(|(actual, expected)| actual == expected)
         || manifest.executables.is_empty()
         || manifest.executables.len() > MAX_TEST_ARTIFACTS
         || bundle_digest(manifest)? != expected_bundle_digest
@@ -1602,20 +1489,6 @@ fn verify_opened_executable(
         return Err(RustVerifyError::ExecutableTampered(path.to_owned()));
     }
     Ok(())
-}
-
-fn verify_checkpointed_directory(path: &Path, checkpoint: &BundleCheckpoint) -> Result<()> {
-    let expected = match (checkpoint.staging_device, checkpoint.staging_inode) {
-        (Some(device), Some(inode)) => (device, inode),
-        _ => return Err(RustVerifyError::InvalidCheckpoint),
-    };
-    verify_private_directory(path)?;
-    let identity = directory_identity(path)?;
-    if (identity.device, identity.inode) == expected {
-        Ok(())
-    } else {
-        Err(RustVerifyError::InvalidCheckpoint)
-    }
 }
 
 fn write_create_only_json<T: Serialize>(path: &Path, value: &T, maximum: usize) -> Result<()> {
@@ -1690,18 +1563,6 @@ fn read_bounded_json<T: for<'de> Deserialize<'de>>(path: &Path, maximum: usize) 
         return Err(RustVerifyError::InvalidCheckpoint);
     }
     Ok(serde_json::from_slice(&bytes)?)
-}
-
-fn remove_exact_file(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| RustVerifyError::UnsafePath(path.to_owned()))?;
-    let _ = read_bounded_json::<BundleCheckpoint>(path, MAX_CHECKPOINT_BYTES)?;
-    fs::remove_file(path).map_err(|source| RustVerifyError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    sync_directory(parent)
 }
 
 fn run_bounded(
@@ -2181,21 +2042,94 @@ mod tests {
     }
 
     #[test]
-    fn ready_checkpoint_recovers_staging_after_restart_without_rebuilding() {
+    fn replacement_attempt_builds_fresh_attempt_owned_staging() {
         let fixture = Fixture::new(false, false);
         let operation = fixture.operation();
         let prepared = operation.prepare().unwrap();
         let restarted = fixture.operation().prepare().unwrap();
         assert_eq!(restarted.bundle_digest(), prepared.bundle_digest());
-        assert_eq!(restarted.bundle_root(), prepared.bundle_root());
+        assert_ne!(restarted.bundle_root(), prepared.bundle_root());
+        assert!(prepared.bundle_root().is_dir());
         assert!(restarted.bundle_root().is_dir());
         assert_eq!(
             fs::read_to_string(&fixture.invocation_log)
                 .unwrap()
                 .lines()
                 .count(),
-            1
+            2
         );
+    }
+
+    #[test]
+    fn failed_bundle_publication_removes_its_exact_staging_tree() {
+        let fixture = Fixture::new(false, false);
+        let operation = fixture.operation();
+        let (snapshot_digest, snapshot_root) = operation.prepare_snapshot().unwrap();
+        let artifacts = operation.build(&snapshot_root).unwrap();
+        fs::set_permissions(&artifacts[0], fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(
+            operation
+                .publish_bundle(&snapshot_digest, &artifacts)
+                .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(&operation.bundle_staging_root)
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn unbound_empty_cache_cleanup_recovers_after_creation_and_rename() {
+        let temporary = tempfile::Builder::new()
+            .prefix("df-unbound-cache-cleanup-")
+            .tempdir()
+            .unwrap();
+        let parent = temporary.path().join("caches");
+        private_directory(&parent);
+        let key = "a".repeat(64);
+        let path = parent.join(&key);
+        let quarantine_name = format!(".reclaim-cache-{key}");
+        let quarantine = parent.join(&quarantine_name);
+
+        private_directory(&path);
+        remove_empty_claimed_directory(&path, &quarantine_name).unwrap();
+        assert!(!path.exists());
+        assert!(!quarantine.exists());
+        remove_empty_claimed_directory(&path, &quarantine_name).unwrap();
+
+        private_directory(&path);
+        fs::rename(&path, &quarantine).unwrap();
+        sync_directory(&parent).unwrap();
+        remove_empty_claimed_directory(&path, &quarantine_name).unwrap();
+        assert!(!quarantine.exists());
+    }
+
+    #[test]
+    fn unbound_cache_cleanup_refuses_ambiguous_or_nonempty_replacements() {
+        let temporary = tempfile::Builder::new()
+            .prefix("df-unbound-cache-refusal-")
+            .tempdir()
+            .unwrap();
+        let parent = temporary.path().join("caches");
+        private_directory(&parent);
+        let key = "b".repeat(64);
+        let path = parent.join(&key);
+        let quarantine_name = format!(".reclaim-cache-{key}");
+        let quarantine = parent.join(&quarantine_name);
+
+        private_directory(&path);
+        fs::write(path.join("replacement"), b"do not delete").unwrap();
+        assert!(remove_empty_claimed_directory(&path, &quarantine_name).is_err());
+        assert!(path.join("replacement").is_file());
+
+        fs::remove_file(path.join("replacement")).unwrap();
+        private_directory(&quarantine);
+        assert!(remove_empty_claimed_directory(&path, &quarantine_name).is_err());
+        assert!(path.is_dir());
+        assert!(quarantine.is_dir());
     }
 
     #[test]
