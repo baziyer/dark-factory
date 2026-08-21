@@ -87,6 +87,11 @@ are insufficient proof.
 The scratch-only macOS smoke covers these cuts through external causal proofs;
 it makes no claim about launchd or the operator's installed job.
 
+The separate opt-in `./scripts/macos-launchd-release-proof.sh` uses a randomized
+scratch-only launchd label to prove release replacement and rollback. Its
+external verifier removes that job and refuses success if the installed label
+or plist changed. The fixture job is not an attempt `KernelResource`.
+
 ## Review discipline
 
 Each PR is one coherent change. Before review, record:

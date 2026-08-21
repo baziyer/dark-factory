@@ -52,6 +52,7 @@ esac
 # The authoritative source gate is shared by macOS and Linux. Keep this
 # seam explicit so a platform mode cannot silently omit a core check.
 ./scripts/test-github-step-summary.sh
+./scripts/test-macos-launchd-release-proof.sh
 cargo +1.88.0 fmt --all -- --check
 cargo +1.88.0 clippy --locked --workspace --all-targets --all-features -- -D warnings
 cargo +1.88.0 test --locked --workspace --all-targets -- --test-threads=1
