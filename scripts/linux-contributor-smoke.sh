@@ -282,9 +282,9 @@ record_is_alive() {
     process_pid=$(printf '%s\n' "$record" | cut -f1)
     expected=$(printf '%s\n' "$record" | cut -f2-)
     current=$(ps -p "$process_pid" -o command= 2>/dev/null | sed 's/^[[:space:]]*//' || true)
-    status=$(ps -p "$process_pid" -o stat= 2>/dev/null | sed 's/[[:space:]].*//' || true)
+    process_state=$(ps -p "$process_pid" -o stat= 2>/dev/null | sed 's/[[:space:]].*//' || true)
     test -n "$current" && test "$current" = "$expected" \
-        && ! printf '%s\n' "$status" | grep -q '^Z'
+        && ! printf '%s\n' "$process_state" | grep -q '^Z'
 }
 
 wait_for_record_exit() {
