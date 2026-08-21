@@ -4,9 +4,9 @@ A provider is a small adapter that describes how to launch one supported
 coding-agent CLI for one admitted run. Claude Code, Codex, and the deterministic
 shell adapter implement the same boundary.
 
-> The safe-kernel refactor is frozen for live use until Stage 3 and the boot
-> review. Provider tests use temporary directories and fake/shell processes;
-> do not send a real paid prompt while developing it.
+> Live use remains frozen until an independent exact-main boot review passes.
+> Provider tests use temporary directories and fake/shell processes; do not
+> send a real paid prompt while developing an adapter.
 
 ## Contract
 
@@ -30,8 +30,8 @@ pub trait Provider {
 - the trusted absolute `factoryctl` path and exact daemon socket.
 
 `ProviderLaunch` returns one executable, argv, provider-specific environment
-additions, the same startup input, generated configuration paths, and runtime
-metadata actually established by that launch.
+additions, and the same startup input. Any required configuration is written
+under the daemon-provided runtime directory before that description returns.
 
 The runner writes `startup_input` once to the process stdin and closes stdin.
 The provider process exits when that one run ends. There is no interactive PTY
@@ -83,7 +83,7 @@ socket-only policy. Adapter tests validate the complete generated profile with
 an installed Codex metadata command and never send a prompt.
 
 Claude `WorkspaceWrite` uses a native Bash sandbox that writes to the Change
-and one provider-created per-session temp directory; the latter is ephemeral
+and one provider-created per-launch temp directory; the latter is ephemeral
 runtime scratch, not durable product source. Its exact AF_UNIX allowlist is
 enforced by Claude only on macOS, so `WorkspaceWrite` fails before launch on
 other platforms. `PlanOnly` has no sandbox stanza and technically does not
@@ -158,22 +158,19 @@ launch.
 - Claude receives a per-run settings file containing daemon-authored hooks and
   the exact permissions/sandbox settings for the frozen execution mode.
   Dark Factory does not edit the operator's `~/.claude.json`.
-- Codex uses an isolated generated home. The seed retains only the operator's
-  `auth.json` link, not ambient configuration. Model and reasoning selection
-  comes from the admitted agent profile; custom model-provider tables and
-  their command-backed authentication cannot enter the attempt.
-  It excludes every table, including custom model-provider tables whose
-  authentication may execute a helper command, plus every ambient rule,
-  profile, MCP, project-trust, hook, permission, network-feature, and legacy
-  sandbox setting. Dark Factory then writes its own hook and source-trust
-  settings and supplies the exact frozen permission profile at launch. Ambient
-  authority is removed, not merged or overridden by precedence.
+- Codex uses one fresh isolated home per attempt. Factoryd resolves the source
+  home once at daemon startup, links only its `auth.json` when present, and
+  writes a complete daemon-owned config containing the authenticated hook and
+  exact source trust. Ambient rules, profiles, MCP servers, provider commands,
+  hooks, permissions, network features, project trust, and sandbox settings
+  never enter the attempt. Model, reasoning, and the frozen typed execution
+  mode come only from the admitted profile and explicit launch arguments.
 - Provider environment additions must not duplicate the runner's generic
   sanitized environment or expose repository credentials.
 
-Generated configuration is a registered run resource. Rust `Drop` or a test
-temporary-directory destructor is not its cleanup authority; the daemon
-finalizer must release and acknowledge it durably.
+Generated configuration lives under the registered run runtime root. Rust
+`Drop` or a test temporary-directory destructor is not its cleanup authority;
+the daemon finalizer must release and acknowledge that root durably.
 
 ## Adding an adapter
 
@@ -215,4 +212,4 @@ destructor is not evidence.
 
 Run focused tests through the repository CI lease, then `./scripts/local-ci.sh`.
 Real Claude and Codex runs are reserved for an explicit provider-validation
-task after the complete safe-kernel boot gate.
+task after the independent exact-main boot review.

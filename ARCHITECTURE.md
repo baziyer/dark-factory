@@ -2,15 +2,12 @@
 
 Dark Factory separates model policy from durable work authority. This file
 describes the attempt kernel, daemon-owned Change model, and fail-closed
-completion-verification boundary implemented across the safe-kernel refactor.
+completion-verification boundary implemented by the current kernel.
 It is a contract, not a component catalogue.
 
 ## Current status
 
-Stages 1 and 2 are merged. Stage 3 is implemented on an isolated branch but has
-not passed its exact-head gates, independent review, or merge; the separate
-boot review also remains. Do not start the daemon against the operator
-installation or submit real provider work.
+Live use remains frozen until an independent exact-main boot review passes.
 
 The complete design and causal proof matrix live in
 [`docs/development/SAFE_KERNEL_REFACTOR.md`](docs/development/SAFE_KERNEL_REFACTOR.md).
@@ -61,8 +58,8 @@ pretends the resource disappeared or rewrites the outcome.
    the exact run is `running`; admission, `finalizing`, and `terminal` do not
    grant effect authority.
 4. Request authorization is exhaustive and fail-closed. A worker may message
-   itself, its immediate parent,
-   or its nearest orchestrator ancestor. An orchestrator may message itself or
+   itself, its immediate parent, or its nearest orchestrator ancestor. An
+   orchestrator may message itself or
    a strict descendant, create a child of its current task only when assigning
    it to a strict descendant, and assign queued work only to a strict
    descendant; attempt authority cannot edit or unassign tasks. These
@@ -130,7 +127,7 @@ later work, or extend authority. See [the provider guide](docs/providers.md).
 
 `WorkspaceWrite` means durable provider writes belong to the admitted Change.
 Codex denies its inherited system-temp write roots; Claude's native sandbox
-retains only its per-session ephemeral temp scratch in addition to the Change.
+retains only its per-launch ephemeral temp scratch in addition to the Change.
 That scratch is provider-owned runtime state, not product source or publication
 authority.
 
@@ -180,15 +177,14 @@ can only forget the metadata row by typed ID.
 
 ## Build and storage boundary
 
-Stages 1 and 2 did not solve build storage. The Stage 3 branch gives each project an
-operator-selected verification policy: `None` or one fixed
+Each project has one operator-selected verification policy: `None` or one fixed
 `RustWorkspaceTest`. There is no provider-visible generic build operation or
 Cargo shim. For a Rust-policy worker, `factoryctl task done` is the single
 completion boundary: the daemon moves the run to `finalizing`, revokes its
 authority, reaps every provider process group, and only then snapshots source
 and starts verification. Orchestrator runs are not verified this way.
 
-The source snapshot is a canonical scan/copy/scan of the plain Stage 2 Change;
+The source snapshot is a canonical scan/copy/scan of the plain Change;
 it is published only when the manifests agree. This deliberately replaces the
 earlier private-Git-index and in-flight-writer design: Changes contain no Git
 administration, and a hook has no trustworthy `PostToolUse` writer ledger.
@@ -207,6 +203,11 @@ Mutable `target/debug` or
 or cooperative replacement; they are not a sandbox against hostile same-UID
 code.
 
+Verifier recovery retains the same ownership rule as provider recovery. If a
+process-group leader disappears while descendants remain, the run stays
+`finalizing`; a numeric process-group ID without the exact live leader identity
+is neither signal authority nor proof that the effect is gone.
+
 Regenerable cache storage has a hard entry count and a measured byte policy.
 Starting a writer makes byte status incomplete; after its exact process group
 is reaped, factoryd remeasures allocated bytes and reclaims unprotected caches
@@ -216,8 +217,6 @@ count, and recoverable failure count, not an invented protected-byte subtotal.
 An ordinary directory
 cannot promise a portable instantaneous byte ceiling while Cargo is writing,
 so the architecture does not claim one.
-
-Until that stage and its storage proofs land, Dark Factory remains frozen.
 
 ## Policy versus correctness
 
@@ -261,5 +260,5 @@ launchd job are never test fixtures.
   separate OS user, container, or sandbox.
 - No session compatibility layer beyond decoding historical events needed for
   migration and replay.
-- No live installation, release, or GitHub intake until all three stages and
-  the independent boot review pass.
+- No live installation, release, or external intake before the independent
+  exact-main boot review and a separate operator decision.
