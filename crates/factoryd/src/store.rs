@@ -42,7 +42,7 @@ pub struct ProjectStatusRows {
     pub blocked: Vec<factory_core::status::BlockedTaskStatus>,
 }
 
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 const MAX_EVENT_PAGE: usize = 10_000;
 /// Every `List*` handler in `local_api.rs` fetches `limit + 1` rows (one
 /// extra, to detect whether a next page exists) where `limit` is bounded by
@@ -1585,10 +1585,9 @@ impl Store {
             "DELETE FROM agents WHERE project_id = ?1",
             params![project_id.as_str()],
         )?;
-        // Immutable by design (see task_documents_immutable_delete); no code
-        // path inserts rows here today, so this is normally a no-op. If rows
-        // exist, the trigger aborts the delete and the whole transaction
-        // rolls back, surfacing as a Conflict.
+        // Webhook intake is gone, but an upgraded database may retain immutable
+        // document snapshots. They remain untouched until the operator deletes
+        // their project, when this transaction removes the exact project rows.
         transaction.execute(
             "DELETE FROM task_documents WHERE project_id = ?1",
             params![project_id.as_str()],
@@ -2760,13 +2759,23 @@ fn migrate_to(connection: &mut Connection, target: i64) -> Result<()> {
         verify_no_foreign_key_violations(connection)?;
         current = 31;
     }
-    if current == 31 && target == SCHEMA_VERSION {
+    if current == 31 && target >= 32 {
         connection.pragma_update(None, "foreign_keys", false)?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute_batch(include_str!("../migrations/0032_bounded_rust_builds.sql"))?;
         transaction.pragma_update(None, "user_version", 32)?;
         transaction.commit()?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        verify_no_foreign_key_violations(connection)?;
+        current = 32;
+    }
+    if current == 32 && target == SCHEMA_VERSION {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(include_str!(
+            "../migrations/0033_retire_webhook_document_delete_guard.sql"
+        ))?;
+        transaction.pragma_update(None, "user_version", 33)?;
+        transaction.commit()?;
         verify_no_foreign_key_violations(connection)?;
     }
     Ok(())
@@ -3884,6 +3893,75 @@ mod tests {
             )
             .unwrap();
         assert_eq!(agent_worktree_columns, 0);
+    }
+
+    #[test]
+    fn schema_6_document_survives_upgrade_until_explicit_project_deletion() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        migrate_to(&mut connection, 29).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, root, created_at_ms, updated_at_ms)
+                 VALUES ('document-project', 'Documents', '/tmp/document-project', 1, 1);
+                 INSERT INTO task_documents (
+                     project_id, id, name, reference, revision, content
+                 ) VALUES (
+                     'document-project', 'document-1', 'Historical document',
+                     'https://example.invalid/document-1', 'revision-1', 'preserve me'
+                 );",
+            )
+            .unwrap();
+
+        migrate(&mut connection).unwrap();
+
+        let retained: String = connection
+            .query_row(
+                "SELECT content FROM task_documents
+                 WHERE project_id = 'document-project' AND id = 'document-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained, "preserve me");
+        let delete_guard_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'trigger' AND name = 'task_documents_immutable_delete'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!delete_guard_exists);
+        let update_guard_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_schema
+                     WHERE type = 'trigger' AND name = 'task_documents_immutable_update'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(update_guard_exists);
+
+        let mut store = Store { connection };
+        store
+            .delete_project(&ProjectId::try_from("document-project").unwrap(), 2)
+            .unwrap();
+        let remaining: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_documents WHERE project_id = 'document-project'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
