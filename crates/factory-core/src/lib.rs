@@ -161,6 +161,8 @@ pub struct WorkCandidateSnapshot {
     pub source_id: String,
     pub source_revision: String,
     pub content_digest: String,
+    /// Derived from the source's exact durable current-candidate pointer.
+    pub is_current: bool,
     pub status: WorkCandidateStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,

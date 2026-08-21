@@ -1,4 +1,9 @@
-use std::{env, io::Write, path::PathBuf, process};
+use std::{
+    env,
+    io::{Read as _, Write},
+    path::PathBuf,
+    process,
+};
 
 use factory_core::local::{
     GuidanceHealthState, LocalRequest, LocalResponse, MAX_AGENT_PAGE_ITEMS, MAX_CHANGE_PAGE_ITEMS,
@@ -1340,7 +1345,14 @@ fn read_guidance_file(path: &str) -> Result<String, String> {
 }
 
 fn read_bounded_text_file(path: &str, label: &str, max_bytes: usize) -> Result<String, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let file = std::fs::File::open(path).map_err(|error| format!("cannot read {path}: {error}"))?;
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1).min(8192));
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {path}: {error}"))?;
     if bytes.len() > max_bytes {
         return Err(format!("{label} must be at most {max_bytes} bytes"));
     }
@@ -2902,6 +2914,20 @@ mod tests {
         ));
         assert!(parse_args(args(&["candidate", "accept"])).is_err());
         assert!(parse_args(args(&["input", "materialize"])).is_err());
+
+        let mut oversized = tempfile::NamedTempFile::new().unwrap();
+        oversized
+            .write_all(&vec![b'x'; MAX_INPUT_CONTENT_BYTES + 1])
+            .unwrap();
+        assert_eq!(
+            read_bounded_text_file(
+                oversized.path().to_str().unwrap(),
+                "input content",
+                MAX_INPUT_CONTENT_BYTES,
+            )
+            .unwrap_err(),
+            format!("input content must be at most {MAX_INPUT_CONTENT_BYTES} bytes")
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use factory_core::{
     EventEnvelope, FactoryEvent, InputEnvelopeId, InputEnvelopeSnapshot, InputReceipt,
     PROTOCOL_VERSION, ProjectId, WorkCandidateId, WorkCandidateSnapshot, WorkCandidateStatus,
+    local::MAX_INPUT_CONTENT_BYTES,
 };
 use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
@@ -14,7 +15,6 @@ const MAX_SOURCE_KIND_BYTES: usize = 64;
 const MAX_SOURCE_ID_BYTES: usize = 512;
 const MAX_DELIVERY_ID_BYTES: usize = 256;
 const MAX_SOURCE_REVISION_BYTES: usize = 256;
-const MAX_INPUT_CONTENT_BYTES: usize = 64 * 1024;
 const MAX_STATUS_REASON_BYTES: usize = 1024;
 const STALE_REASON: &str = "superseded by a different source revision";
 
@@ -219,7 +219,7 @@ impl Store {
             }
             transaction.execute(
                 "UPDATE input_sources
-                 SET current_candidate_id = ?1, revision = revision + 1
+                 SET current_candidate_id = ?1
                  WHERE project_id = ?2 AND source_kind = ?3 AND source_id = ?4",
                 params![
                     candidate_id.as_str(),
@@ -231,8 +231,8 @@ impl Store {
         } else {
             transaction.execute(
                 "INSERT INTO input_sources (
-                    project_id, source_kind, source_id, current_candidate_id, revision
-                 ) VALUES (?1, ?2, ?3, ?4, 1)",
+                    project_id, source_kind, source_id, current_candidate_id
+                 ) VALUES (?1, ?2, ?3, ?4)",
                 params![
                     input.project_id.as_str(),
                     input.source_kind,
@@ -318,12 +318,19 @@ impl Store {
         validate_page_limit(limit)?;
         let after_id = after_id.map_or("", WorkCandidateId::as_str);
         let mut statement = self.connection.prepare(
-            "SELECT id, project_id, origin_envelope_id, source_kind, source_id,
-                    source_revision, content_digest, status, status_reason, revision,
-                    created_at_ms, updated_at_ms
-             FROM work_candidates
-             WHERE project_id = ?1 AND id > ?2
-             ORDER BY id
+            "SELECT w.id, w.project_id, w.origin_envelope_id, w.source_kind,
+                    w.source_id, w.source_revision, w.content_digest, w.status,
+                    w.status_reason, w.revision, w.created_at_ms, w.updated_at_ms,
+                    EXISTS(
+                        SELECT 1 FROM input_sources s
+                        WHERE s.project_id = w.project_id
+                          AND s.source_kind = w.source_kind
+                          AND s.source_id = w.source_id
+                          AND s.current_candidate_id = w.id
+                    )
+             FROM work_candidates w
+             WHERE w.project_id = ?1 AND w.id > ?2
+             ORDER BY w.id
              LIMIT ?3",
         )?;
         let rows = statement.query_map(
@@ -588,11 +595,18 @@ fn load_candidate(
 ) -> Result<Option<WorkCandidateSnapshot>> {
     connection
         .query_row(
-            "SELECT id, project_id, origin_envelope_id, source_kind, source_id,
-                    source_revision, content_digest, status, status_reason, revision,
-                    created_at_ms, updated_at_ms
-             FROM work_candidates
-             WHERE project_id = ?1 AND id = ?2",
+            "SELECT w.id, w.project_id, w.origin_envelope_id, w.source_kind,
+                    w.source_id, w.source_revision, w.content_digest, w.status,
+                    w.status_reason, w.revision, w.created_at_ms, w.updated_at_ms,
+                    EXISTS(
+                        SELECT 1 FROM input_sources s
+                        WHERE s.project_id = w.project_id
+                          AND s.source_kind = w.source_kind
+                          AND s.source_id = w.source_id
+                          AND s.current_candidate_id = w.id
+                    )
+             FROM work_candidates w
+             WHERE w.project_id = ?1 AND w.id = ?2",
             params![project_id.as_str(), candidate_id.as_str()],
             candidate_from_row,
         )
@@ -610,6 +624,7 @@ fn candidate_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkCandidate
         source_id: row.get(4)?,
         source_revision: row.get(5)?,
         content_digest: row.get(6)?,
+        is_current: row.get(12)?,
         status: parse_status(&status, 7)?,
         status_reason: row.get(8)?,
         revision: row.get(9)?,
@@ -764,11 +779,20 @@ mod tests {
         let (second, events) = store.receive_input(second, 3).unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(second.candidate.status, WorkCandidateStatus::Quarantined);
+        assert!(second.candidate.is_current);
         let first = store
             .get_work_candidate(&project_id, &first.candidate.id)
             .unwrap();
         assert_eq!(first.status, WorkCandidateStatus::Stale);
         assert_eq!(first.status_reason.as_deref(), Some(STALE_REASON));
+        assert!(!first.is_current);
+        let (first_replay, replay_events) = store
+            .receive_input(input(&project_id, "delivery-1", "z-revision"), 4)
+            .unwrap();
+        assert!(first_replay.replayed);
+        assert_eq!(first_replay.candidate.status, WorkCandidateStatus::Stale);
+        assert!(!first_replay.candidate.is_current);
+        assert!(replay_events.is_empty());
         assert_eq!(first.revision, 2);
     }
 
@@ -840,12 +864,20 @@ mod tests {
             superseding.candidate.status,
             WorkCandidateStatus::Quarantined
         );
+        assert!(superseding.candidate.is_current);
+        let old_rejection = store
+            .get_work_candidate(&project_id, &receipt.candidate.id)
+            .unwrap();
+        assert_eq!(old_rejection.status, WorkCandidateStatus::Rejected);
+        assert!(!old_rejection.is_current);
         assert_eq!(
             store
-                .get_work_candidate(&project_id, &receipt.candidate.id)
+                .list_work_candidates(&project_id, None, 10)
                 .unwrap()
-                .status,
-            WorkCandidateStatus::Rejected
+                .iter()
+                .filter(|candidate| candidate.is_current)
+                .count(),
+            1
         );
         let (late_retry, late_retry_events) = store
             .reject_work_candidate(
@@ -856,7 +888,11 @@ mod tests {
                 6,
             )
             .unwrap();
-        assert_eq!(late_retry, rejected);
+        assert_eq!(late_retry.id, rejected.id);
+        assert_eq!(late_retry.status, rejected.status);
+        assert_eq!(late_retry.status_reason, rejected.status_reason);
+        assert_eq!(late_retry.revision, rejected.revision);
+        assert!(!late_retry.is_current);
         assert!(late_retry_events.is_empty());
 
         for table in ["tasks", "agent_messages", "runs", "changes"] {
@@ -891,13 +927,11 @@ mod tests {
                 .candidate_id,
             candidate_id
         );
-        assert_eq!(
-            store
-                .get_work_candidate(&project_id, &candidate_id)
-                .unwrap()
-                .status,
-            WorkCandidateStatus::Quarantined
-        );
+        let candidate = store
+            .get_work_candidate(&project_id, &candidate_id)
+            .unwrap();
+        assert_eq!(candidate.status, WorkCandidateStatus::Quarantined);
+        assert!(candidate.is_current);
     }
 
     #[test]

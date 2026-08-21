@@ -86,6 +86,8 @@ pretends the resource disappeared or rewrites the outcome.
    quarantined candidate atomically. A rejected predecessor keeps its durable
    decision while losing current-source authority. Exact observation or
    rejection replay has no second effect, even after that pointer advances.
+   Candidate snapshots derive `is_current` from that pointer so reconciliation
+   can recover exact causal authority after restart.
 
 ## Process and resource ownership
 

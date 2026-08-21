@@ -28,7 +28,9 @@ The current provider-neutral quarantine is inert. Operator-only
 `factoryctl input` and `factoryctl candidate` actions store, list, inspect, and
 reject untrusted observations; there is deliberately no accept or materialize
 command. Receipt cannot create a task, message, run, Change, prompt, or
-scheduling event. There is still no HTTP listener or GitHub adapter.
+scheduling event. Candidate inspection identifies the exact current source
+revision needed for a later causal observation. There is still no HTTP listener
+or GitHub adapter.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed lifecycle and
 [SECURITY.md](SECURITY.md) for threat boundaries.

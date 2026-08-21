@@ -134,7 +134,9 @@ pub const MAX_RUN_PAGE_ITEMS: u32 = 1000;
 pub const MAX_CHANGE_PAGE_ITEMS: u32 = 16;
 /// Two maximally escaped 64 KiB untrusted input bodies fit in one frame.
 pub const MAX_INPUT_ENVELOPE_PAGE_ITEMS: u32 = 2;
-pub const MAX_WORK_CANDIDATE_PAGE_ITEMS: u32 = 100;
+/// Candidate metadata may include an escaped 1 KiB status reason. Sixty-four
+/// worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
+pub const MAX_WORK_CANDIDATE_PAGE_ITEMS: u32 = 64;
 /// A legacy row may contain two 4 KiB strings whose JSON escaping expands
 /// substantially. Sixteen worst-case rows stay below [`MAX_LOCAL_FRAME_BYTES`].
 pub const MAX_LEGACY_SOURCE_PAGE_ITEMS: u32 = 16;

@@ -87,7 +87,6 @@ CREATE TABLE input_sources (
     source_kind TEXT NOT NULL,
     source_id TEXT NOT NULL,
     current_candidate_id TEXT NOT NULL,
-    revision INTEGER NOT NULL CHECK (revision >= 1),
     PRIMARY KEY (project_id, source_kind, source_id),
     FOREIGN KEY (
         current_candidate_id, project_id, source_kind, source_id
