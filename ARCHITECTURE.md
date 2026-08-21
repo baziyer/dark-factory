@@ -64,8 +64,10 @@ pretends the resource disappeared or rewrites the outcome.
    on their admitted work. Orchestrators can propose bounded scheduling policy
    within their project. Operator authority cannot be used as an attempt
    identity for completion, blocking, or hooks.
-5. Admission is the only transition from queued work to an attempt. It binds
-   the immutable task incarnation and work revision before external effects.
+5. Admission is the only transition from queued work to an attempt. One Store
+   transaction checks dispatch and capacity, selects the current canonical
+   queue head, derives its agent role and provider, and binds the immutable
+   task incarnation and work revision before external effects.
 6. No admitted attempt means no provider process, tool hook, outcome request,
    or writable source lease.
 7. A retry creates a new run and new bearer. It never revives an old process

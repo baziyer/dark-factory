@@ -3,7 +3,6 @@ use std::path::Path;
 use factory_core::{
     AgentId, AgentRole, ChangeId, ChangePhase, EventEnvelope, FactoryEvent, MessageId, ProjectId,
     Provider, RunFailureReason, RunId, RunOutcome, RunPhase, RunSnapshot, RunnerInstanceId, TaskId,
-    TaskStatus,
 };
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -28,16 +27,14 @@ const MAX_RESOURCE_FAILURE_BYTES: usize = 4096;
 pub struct NewRunAdmission {
     pub run_id: RunId,
     pub project_id: ProjectId,
-    pub task_id: TaskId,
     pub agent_id: AgentId,
-    pub expected_provider: Provider,
     pub capability_digest: String,
     pub runtime_claim: String,
     pub runner_instance_id: RunnerInstanceId,
     pub runner_runtime: String,
     pub max_active_runs: usize,
-    pub change_reservation: Option<ChangeReservation>,
-    pub policy_cwd: Option<String>,
+    pub change_reservation: ChangeReservation,
+    pub policy_cwd: String,
 }
 
 pub struct AdmittedRun {
@@ -179,9 +176,14 @@ pub struct RecoverableKernelRun {
 }
 
 impl Store {
-    pub fn admit_run(&mut self, input: NewRunAdmission, now_ms: i64) -> Result<AdmittedRun> {
+    pub fn admit_next_run(
+        &mut self,
+        input: NewRunAdmission,
+        now_ms: i64,
+    ) -> Result<Option<AdmittedRun>> {
         validate_capability_digest(&input.capability_digest)?;
         validate_absolute_path(&input.runner_runtime)?;
+        validate_absolute_path(&input.policy_cwd)?;
         validate_runtime_claim(&input.runtime_claim)?;
         if input.max_active_runs == 0 {
             return Err(StoreError::InvalidConcurrencyLimit);
@@ -190,6 +192,38 @@ impl Store {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let dispatch_enabled: bool = transaction.query_row(
+            "SELECT auto_mode FROM factory_settings WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !dispatch_enabled {
+            return Ok(None);
+        }
+        let agent = load_agent(&transaction, &input.agent_id)?
+            .filter(|agent| agent.snapshot.project_id == input.project_id)
+            .ok_or(StoreError::AgentNotFound)?;
+        if agent.snapshot.paused {
+            return Ok(None);
+        }
+        if agent.snapshot.current_run_id.is_some() {
+            return Ok(None);
+        }
+        let task_id = transaction
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE project_id = ?1 AND assigned_agent_id = ?2 AND status = 'queued'
+                 ORDER BY priority DESC, created_at_ms, id
+                 LIMIT 1",
+                params![input.project_id.as_str(), input.agent_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|id| parse_id(id, 0))
+            .transpose()?;
+        let Some(task_id) = task_id else {
+            return Ok(None);
+        };
         let active: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM runs WHERE phase <> 'terminal'",
             [],
@@ -200,43 +234,16 @@ impl Store {
                 limit: input.max_active_runs,
             });
         }
-
-        let task = load_task(&transaction, &input.task_id)?
-            .filter(|task| task.snapshot.project_id == input.project_id)
-            .filter(|task| task.snapshot.status == TaskStatus::Queued)
-            .ok_or(StoreError::TaskNotQueued)?;
-        if task.snapshot.assigned_agent_id.as_ref() != Some(&input.agent_id) {
-            return Err(StoreError::TaskAssignmentMismatch);
-        }
+        let task = load_task(&transaction, &task_id)?.ok_or(StoreError::TaskNotFound)?;
         let task_title = task.snapshot.title.clone();
         let task_body = task.body.clone();
         let (task_incarnation_id, admitted_task_work_revision): (String, i64) = transaction
             .query_row(
                 "SELECT incarnation_id, work_revision FROM tasks
                  WHERE id = ?1 AND project_id = ?2",
-                params![input.task_id.as_str(), input.project_id.as_str()],
+                params![task_id.as_str(), input.project_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
-        let agent = load_agent(&transaction, &input.agent_id)?
-            .filter(|agent| agent.snapshot.project_id == input.project_id)
-            .ok_or(StoreError::AgentNotFound)?;
-        if agent.snapshot.provider != input.expected_provider {
-            return Err(StoreError::AgentProviderMismatch);
-        }
-        if agent.snapshot.paused {
-            return Err(StoreError::AgentUnavailable);
-        }
-        let already_open: bool = transaction.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM runs
-                 WHERE phase <> 'terminal' AND (agent_id = ?1 OR task_id = ?2)
-             )",
-            params![input.agent_id.as_str(), input.task_id.as_str()],
-            |row| row.get(0),
-        )?;
-        if already_open {
-            return Err(StoreError::AgentUnavailable);
-        }
 
         let (source_root, change_id, change_phase, change_revision, base_oid, change_event) =
             match agent.snapshot.role {
@@ -249,7 +256,7 @@ impl Store {
                            AND c.task_incarnation_id = ?3",
                             params![
                                 input.project_id.as_str(),
-                                input.task_id.as_str(),
+                                task_id.as_str(),
                                 task_incarnation_id,
                             ],
                             |row| {
@@ -269,16 +276,12 @@ impl Store {
                                 (change_id, source_root, phase, revision, base_oid, None)
                             }
                             None => {
-                                let reservation = input
-                                    .change_reservation
-                                    .as_ref()
-                                    .ok_or(StoreError::InvalidExecutionMetadata)?;
                                 let mutation = reserve_change(
                                     &transaction,
                                     &input.project_id,
-                                    &input.task_id,
+                                    &task_id,
                                     &task_incarnation_id,
-                                    reservation,
+                                    &input.change_reservation,
                                     now_ms,
                                 )?;
                                 let change_event = mutation.event;
@@ -333,39 +336,19 @@ impl Store {
                         change_event,
                     )
                 }
-                AgentRole::Orchestrator => (
-                    {
-                        if input.change_reservation.is_some() {
-                            return Err(StoreError::InvalidChangeMetadata);
-                        }
-                        input
-                            .policy_cwd
-                            .clone()
-                            .ok_or(StoreError::InvalidExecutionMetadata)?
-                    },
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
+                AgentRole::Orchestrator => (input.policy_cwd.clone(), None, None, None, None, None),
             };
         validate_absolute_path(&source_root)?;
 
         let profile =
             load_agent_profile(&transaction, &input.agent_id)?.ok_or(StoreError::AgentNotFound)?;
-        let auto_mode: bool = transaction.query_row(
-            "SELECT auto_mode FROM factory_settings WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
 
         transaction.execute(
             "UPDATE tasks
              SET status = 'running', updated_at_ms = ?1, work_revision = work_revision + 1,
                  blocked_reason = NULL, completed_at_ms = NULL
              WHERE id = ?2 AND project_id = ?3 AND status = 'queued'",
-            params![now_ms, input.task_id.as_str(), input.project_id.as_str()],
+            params![now_ms, task_id.as_str(), input.project_id.as_str()],
         )?;
         transaction.execute(
             "INSERT INTO runs (
@@ -389,13 +372,13 @@ impl Store {
                 input.run_id.as_str(),
                 input.project_id.as_str(),
                 input.agent_id.as_str(),
-                input.task_id.as_str(),
+                task_id.as_str(),
                 task_incarnation_id,
                 admitted_task_work_revision,
                 change_id.as_ref().map(ChangeId::as_str),
                 source_root,
                 input.capability_digest,
-                provider_str(input.expected_provider),
+                provider_str(agent.snapshot.provider),
                 profile.model,
                 profile.reasoning_effort,
                 profile.permission_mode,
@@ -444,7 +427,7 @@ impl Store {
             )?;
         }
 
-        let task = load_task(&transaction, &input.task_id)?
+        let task = load_task(&transaction, &task_id)?
             .ok_or(StoreError::TaskNotFound)?
             .snapshot;
         let run = load_kernel_run(&transaction, &input.run_id)?.ok_or(StoreError::RunNotFound)?;
@@ -473,14 +456,14 @@ impl Store {
             event: run_event_value,
         });
 
-        Ok(AdmittedRun {
+        Ok(Some(AdmittedRun {
             run,
             target: AttemptTarget {
                 project_id: input.project_id,
-                task_id: input.task_id,
+                task_id,
                 agent_id: input.agent_id,
                 role: agent.snapshot.role,
-                provider: input.expected_provider,
+                provider: agent.snapshot.provider,
                 task_title,
                 task_body,
                 messages,
@@ -492,13 +475,13 @@ impl Store {
                 model: profile.model,
                 reasoning_effort: profile.reasoning_effort,
                 permission_mode: profile.permission_mode,
-                auto_mode,
+                auto_mode: true,
                 runner_instance_id: input.runner_instance_id,
                 runner_runtime: input.runner_runtime,
                 runtime_claim: input.runtime_claim,
             },
             events,
-        })
+        }))
     }
 
     pub fn activate_prepared_run(
@@ -1840,6 +1823,7 @@ mod tests {
         ChangeBaseIdentity, ChangeMaterialization, ChangeRemovalKind, ChangeSourceIdentity,
         NewAgent, NewAgentMessage, NewProject, NewTask,
     };
+    use factory_core::TaskStatus;
 
     const BEARER: &str = "attempt-secret";
 
@@ -1854,14 +1838,29 @@ mod tests {
             .unwrap()
     }
 
-    fn admit_worker_provisioning_with_verification(
-        store: &mut Store,
-        verification: factory_core::CompletionVerification,
-    ) -> (RunId, ProjectId, ChangeId) {
+    fn next_admission(run: &str, project_id: ProjectId, agent_id: AgentId) -> NewRunAdmission {
+        NewRunAdmission {
+            run_id: RunId::try_from(run).unwrap(),
+            project_id,
+            agent_id,
+            capability_digest: capability_digest(BEARER),
+            runtime_claim: "runtime-claim:55555555555545558555555555555555".into(),
+            runner_instance_id: RunnerInstanceId::try_from("22222222-2222-4222-8222-222222222222")
+                .unwrap(),
+            runner_runtime: "/tmp/factory-runner".into(),
+            max_active_runs: 1,
+            change_reservation: ChangeReservation {
+                id: ChangeId::try_from("change-1").unwrap(),
+                source_root: "/tmp/factory-change-1".into(),
+                max_factory_changes: 1,
+            },
+            policy_cwd: "/tmp/factory-runner/policy".into(),
+        }
+    }
+
+    fn seed_worker(store: &mut Store) -> (ProjectId, AgentId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("worker").unwrap();
-        let task_id = TaskId::try_from("task-1").unwrap();
-        let run_id = RunId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
         store
             .create_project(
                 NewProject {
@@ -1871,9 +1870,6 @@ mod tests {
                 },
                 1,
             )
-            .unwrap();
-        store
-            .set_project_completion_verification(&project_id, verification, 1)
             .unwrap();
         store
             .create_agent(
@@ -1887,46 +1883,188 @@ mod tests {
                 2,
             )
             .unwrap();
+        (project_id, agent_id)
+    }
+
+    fn queued_worker() -> (Store, ProjectId, AgentId) {
+        let mut store = Store::open_in_memory().unwrap();
+        let (project_id, agent_id) = seed_worker(&mut store);
+        (store, project_id, agent_id)
+    }
+
+    fn queue_task(
+        store: &mut Store,
+        project_id: &ProjectId,
+        agent_id: &AgentId,
+        id: &str,
+        priority: i32,
+        now_ms: i64,
+    ) -> TaskId {
+        let id = TaskId::try_from(id).unwrap();
         store
             .create_assigned_task(
                 NewTask {
-                    id: task_id.clone(),
+                    id: id.clone(),
                     project_id: project_id.clone(),
                     parent_task_id: None,
-                    title: "Do work".into(),
-                    body: "Body".into(),
-                    priority: 0,
+                    title: id.to_string(),
+                    body: String::new(),
+                    priority,
                 },
                 agent_id.clone(),
-                3,
+                now_ms,
             )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn admission_uses_the_current_head_role_and_provider_after_a_stale_read() {
+        let (mut store, project_id, agent_id) = queued_worker();
+        let low = queue_task(&mut store, &project_id, &agent_id, "low", 0, 3);
+        let stale = store.agent_status(&project_id, &agent_id).unwrap();
+        assert_eq!(stale.queue[0].id, low);
+        assert_eq!(
+            (stale.agent.role, stale.agent.provider),
+            (AgentRole::Worker, Provider::Shell)
+        );
+        let high = queue_task(&mut store, &project_id, &agent_id, "high", 1, 4);
+        store
+            .connection
+            .execute(
+                "UPDATE agents SET role = 'orchestrator', provider = 'claude_code' WHERE id = ?1",
+                [agent_id.as_str()],
+            )
+            .unwrap();
+
+        let admitted = store
+            .admit_next_run(
+                next_admission(
+                    "11111111-1111-4111-8111-111111111111",
+                    project_id.clone(),
+                    agent_id,
+                ),
+                5,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted.target.task_id, high);
+        assert_eq!(
+            (admitted.target.role, admitted.target.provider),
+            (AgentRole::Orchestrator, Provider::ClaudeCode)
+        );
+        assert_eq!(admitted.target.source_root, "/tmp/factory-runner/policy");
+        assert!(admitted.target.change_id.is_none());
+        assert_eq!(
+            store.get_task(&project_id, &low).unwrap().snapshot.status,
+            TaskStatus::Queued
+        );
+    }
+
+    #[test]
+    fn admission_uses_the_canonical_created_at_then_id_queue_tiebreakers() {
+        let (mut store, project_id, agent_id) = queued_worker();
+        let later_id = queue_task(&mut store, &project_id, &agent_id, "task-b", 1, 3);
+        let earlier_id = queue_task(&mut store, &project_id, &agent_id, "task-a", 1, 3);
+
+        let admitted = store
+            .admit_next_run(
+                next_admission(
+                    "11111111-1111-4111-8111-111111111111",
+                    project_id.clone(),
+                    agent_id,
+                ),
+                4,
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(admitted.target.task_id, earlier_id);
+        assert_eq!(
+            store
+                .get_task(&project_id, &later_id)
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Queued
+        );
+    }
+
+    #[test]
+    fn disabled_dispatch_admits_nothing_and_consumes_nothing() {
+        let (mut store, project_id, agent_id) = queued_worker();
+        let task_id = queue_task(&mut store, &project_id, &agent_id, "task", 0, 3);
+        store
+            .send_agent_message(NewAgentMessage {
+                id: MessageId::try_from("message").unwrap(),
+                project_id: project_id.clone(),
+                sender_agent_id: None,
+                recipient_agent_id: agent_id.clone(),
+                body: "wait".into(),
+                created_at_ms: 4,
+            })
+            .unwrap();
+        store.set_auto_mode(false, 5).unwrap();
+        let sequence = store.latest_event_sequence().unwrap();
+
+        assert!(
+            store
+                .admit_next_run(
+                    next_admission(
+                        "11111111-1111-4111-8111-111111111111",
+                        project_id.clone(),
+                        agent_id.clone(),
+                    ),
+                    6,
+                )
+                .unwrap()
+                .is_none()
+        );
+        let counts: (i64, i64, i64) = store
+            .connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM runs), (SELECT COUNT(*) FROM changes),
+                        (SELECT COUNT(*) FROM resources)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (0, 0, 0));
+        assert_eq!(store.latest_event_sequence().unwrap(), sequence);
+        assert_eq!(
+            store
+                .get_task(&project_id, &task_id)
+                .unwrap()
+                .snapshot
+                .status,
+            TaskStatus::Queued
+        );
+        assert!(
+            store
+                .list_agent_messages(&project_id, &agent_id, None, 1)
+                .unwrap()[0]
+                .delivered_at_ms
+                .is_none()
+        );
+    }
+
+    fn admit_worker_provisioning_with_verification(
+        store: &mut Store,
+        verification: factory_core::CompletionVerification,
+    ) -> (RunId, ProjectId, ChangeId) {
+        let (project_id, agent_id) = seed_worker(store);
+        queue_task(store, &project_id, &agent_id, "task-1", 0, 3);
+        let run_id = RunId::try_from("11111111-1111-4111-8111-111111111111").unwrap();
+        store
+            .set_project_completion_verification(&project_id, verification, 1)
             .unwrap();
         let change_id = ChangeId::try_from("change-1").unwrap();
         let admitted = store
-            .admit_run(
-                NewRunAdmission {
-                    run_id: run_id.clone(),
-                    project_id: project_id.clone(),
-                    task_id,
-                    agent_id,
-                    expected_provider: Provider::Shell,
-                    capability_digest: capability_digest(BEARER),
-                    runtime_claim: "runtime-claim:55555555555545558555555555555555".into(),
-                    runner_instance_id: RunnerInstanceId::try_from(
-                        "22222222-2222-4222-8222-222222222222",
-                    )
-                    .unwrap(),
-                    runner_runtime: "/tmp/factory-runner".into(),
-                    max_active_runs: 1,
-                    change_reservation: Some(ChangeReservation {
-                        id: change_id.clone(),
-                        source_root: "/tmp/factory-change-1".into(),
-                        max_factory_changes: 1,
-                    }),
-                    policy_cwd: None,
-                },
+            .admit_next_run(
+                next_admission(run_id.as_str(), project_id.clone(), agent_id),
                 5,
             )
+            .unwrap()
             .unwrap();
         assert_eq!(admitted.run.phase, RunPhase::Admitted);
         assert!(matches!(
@@ -2365,13 +2503,11 @@ mod tests {
             )
             .unwrap();
         store
-            .admit_run(
+            .admit_next_run(
                 NewRunAdmission {
                     run_id: run_id.clone(),
                     project_id: project_id.clone(),
-                    task_id,
                     agent_id,
-                    expected_provider: Provider::Shell,
                     capability_digest: capability_digest("second-secret"),
                     runtime_claim: "runtime-claim:66666666666646668666666666666666".into(),
                     runner_instance_id: RunnerInstanceId::try_from(
@@ -2380,15 +2516,16 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner-2".into(),
                     max_active_runs: 2,
-                    change_reservation: Some(ChangeReservation {
+                    change_reservation: ChangeReservation {
                         id: change_id.clone(),
                         source_root: "/tmp/factory-change-2".into(),
                         max_factory_changes: 2,
-                    }),
-                    policy_cwd: None,
+                    },
+                    policy_cwd: "/tmp/factory-runner-2/policy".into(),
                 },
                 11,
             )
+            .unwrap()
             .unwrap();
         let base = ChangeBaseIdentity {
             repository_root: "/tmp/factory".into(),
@@ -2789,13 +2926,11 @@ mod tests {
         store.retry_task(&project_id, &task_id, 10).unwrap();
 
         let retry = store
-            .admit_run(
+            .admit_next_run(
                 NewRunAdmission {
                     run_id: RunId::try_from("33333333-3333-4333-8333-333333333333").unwrap(),
                     project_id,
-                    task_id,
                     agent_id,
-                    expected_provider: Provider::Shell,
                     capability_digest: capability_digest("retry-secret"),
                     runtime_claim: "runtime-claim:66666666666646668666666666666666".into(),
                     runner_instance_id: RunnerInstanceId::try_from(
@@ -2804,15 +2939,16 @@ mod tests {
                     .unwrap(),
                     runner_runtime: "/tmp/factory-runner-retry".into(),
                     max_active_runs: 1,
-                    change_reservation: Some(ChangeReservation {
+                    change_reservation: ChangeReservation {
                         id: ChangeId::try_from("unused-retry-change").unwrap(),
                         source_root: "/tmp/unused-retry-change".into(),
                         max_factory_changes: 1,
-                    }),
-                    policy_cwd: None,
+                    },
+                    policy_cwd: "/tmp/factory-runner-retry/policy".into(),
                 },
                 11,
             )
+            .unwrap()
             .unwrap();
         assert_eq!(retry.target.messages.len(), 1);
         assert_eq!(retry.target.messages[0].id, message_id);
