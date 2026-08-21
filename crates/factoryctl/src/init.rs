@@ -335,6 +335,7 @@ mod tests {
             id: ProjectId::try_from("factory").unwrap(),
             name: "Factory".into(),
             root: "/tmp/factory".into(),
+            completion_verification: factory_core::CompletionVerification::None,
             created_at_ms: 1,
             updated_at_ms: 1,
         }

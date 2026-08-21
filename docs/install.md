@@ -1,16 +1,16 @@
 # Installation frozen
 
 Do not install or update Dark Factory from the safe-kernel refactor. Stages 1
-and 2 implement the attempt kernel and daemon-owned Changes, but Stage 3 must
-still supply bounded build storage and immutable executable bundles before the
-independent boot review.
+and 2 are merged, and Stage 3 is being implemented on an isolated branch, but
+its exact-head gates, independent review, merge, and the separate boot review
+remain incomplete.
 
 In particular, do not:
 
 - run `factoryctl init` or `factoryctl update --install` from this revision;
 - replace binaries under `~/.dark-factory/bin`;
 - load or restart the installed launchd job;
-- migrate the operator database to schema 31; or
+- migrate the operator database to schema 32; or
 - use the operator home or socket for a test.
 
 Developers use a temporary `DARK_FACTORY_HOME` and explicit socket as described

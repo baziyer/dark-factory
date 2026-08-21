@@ -84,13 +84,28 @@ forged, taskless, finalizing, or terminal credential fails closed.
 Provider hook names come from the upstream CLIs and may contain the word
 “Session”; they are observations within one run, not Dark Factory session
 lifecycle states. `PreToolUse` enforces the daemon policy and budget before a
-tool call. Completion and blocking use the same bearer and derive the current
-task from it. No hook can directly terminalize a run; it can only cause the
-first transition to `finalizing`.
+tool call. It also refuses direct `cargo`, `rustc`, and `rustup` invocation and
+direct execution from a recognized mutable Cargo
+`target/.../{debug,release}` path: providers do not own Rust build paths or
+mutable Cargo outputs. Completion and blocking use the same bearer and derive
+the current task from it. On a project configured for `RustWorkspaceTest`,
+`factoryctl task done` first causes the transition to `finalizing`; factoryd
+reaps the provider and owns the fixed verification before it can terminalize.
+There is no generic provider build API, Cargo shim, or provider-selected build
+configuration. The fixed verifier excludes doctests and launches only copied
+top-level Cargo test executables; it is not an OS sandbox for test code. No
+hook can directly terminalize a run.
 
 Hook policy is a tripwire, not an OS sandbox. A provider runs as the operator's
 user and can bypass string-level policy through other execution paths. See
 [`SECURITY.md`](../SECURITY.md).
+
+Provider startup guidance directs workers to edit their Change and finish with
+`factoryctl task done --result <summary>`. It must not tell them to run a Rust
+toolchain first: the configured completion policy is the authoritative
+verification and runs only after their process has been reaped. Non-Rust
+projects configured with `None` keep the ordinary completion path;
+orchestrators are not workspace-test subjects.
 
 ## Generated configuration
 

@@ -175,7 +175,7 @@ fn task_responses_include_the_body_without_duplicating_snapshot_fields() {
 }
 
 #[test]
-fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
+fn agent_creation_has_a_small_truthful_wire_shape() {
     let create = LocalRequest::CreateAgent {
         id: agent_id("agent-1"),
         project_id: project_id("project-1"),
@@ -185,11 +185,6 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
         model: None,
         reasoning_effort: None,
         model_selection_reason: None,
-    };
-    let start = LocalRequest::StartTask {
-        project_id: project_id("project-1"),
-        task_id: task_id("task-1"),
-        agent_id: agent_id("agent-1"),
     };
     let created = LocalResponse::AgentCreated {
         agent: AgentSnapshot {
@@ -204,30 +199,15 @@ fn agent_creation_and_task_start_have_small_truthful_wire_shapes() {
             updated_at_ms: 10,
         },
     };
-    let accepted = LocalResponse::RunAccepted {
-        run_id: run_id("run-1"),
-    };
 
     let create = serde_json::to_value(create).unwrap();
     assert_eq!(create["type"], "create_agent");
     assert_eq!(create["data"]["role"], "worker");
     assert_eq!(create["data"]["provider"], "codex");
 
-    let start = serde_json::to_value(start).unwrap();
-    assert_eq!(start["type"], "start_task");
-    assert_eq!(start["data"]["task_id"], "task-1");
-    assert!(start["data"].get("worktree").is_none());
-    assert!(start["data"].get("parent_run_id").is_none());
-    assert!(start["data"].get("body").is_none());
-    assert!(start["data"].get("provider_session_id").is_none());
-
     assert_eq!(
         serde_json::to_value(created).unwrap()["type"],
         "agent_created"
-    );
-    assert_eq!(
-        serde_json::to_value(accepted).unwrap(),
-        serde_json::json!({"type":"run_accepted","data":{"run_id":"run-1"}})
     );
 }
 
@@ -328,6 +308,7 @@ fn server_frames_version_responses_and_events_at_the_outer_boundary() {
                 id: project_id("project-1"),
                 name: "Dark Factory".into(),
                 root: "/work/dark-factory".into(),
+                completion_verification: factory_core::CompletionVerification::None,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             }],
@@ -340,6 +321,33 @@ fn server_frames_version_responses_and_events_at_the_outer_boundary() {
     assert_eq!(value["data"]["protocol_version"], PROTOCOL_VERSION);
     assert_eq!(value["data"]["response"]["type"], "projects");
     assert_eq!(frame.protocol_version(), PROTOCOL_VERSION);
+}
+
+#[test]
+fn rust_storage_status_keeps_incomplete_measurements_explicit() {
+    let frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::RustStorageStatus {
+            storage: factory_core::local::RustStorageSnapshot {
+                max_cache_count: 8,
+                max_cache_bytes: 64 * 1024 * 1024 * 1024,
+                cache_count: 2,
+                cache_bytes: None,
+                protected_count: 1,
+                reclaimable_count: 2,
+                cache_count_over_limit: false,
+                cache_bytes_over_limit: false,
+                complete: false,
+            },
+        },
+    };
+
+    let value = serde_json::to_value(frame).unwrap();
+    let storage = &value["data"]["response"]["data"]["storage"];
+    assert!(storage.get("cache_bytes").is_none());
+    assert!(storage.get("bundle_bytes").is_none());
+    assert_eq!(storage["complete"], false);
+    assert_eq!(storage["max_cache_count"], 8);
 }
 
 #[test]

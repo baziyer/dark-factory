@@ -54,9 +54,9 @@ wrapper for a load-bearing Cargo or process fixture. Set
 The gate clears inherited live-factory home, socket, and attempt identity
 variables. Tests set their own isolated values. The build-headroom preflight
 reports and refuses low space but does not reclaim anything; inspect only
-inactive regenerable Cargo targets manually. Stage 3 will add bounded product
-cache reclamation, not change this daemon-independent development lease without
-separate evidence.
+inactive regenerable Cargo targets manually. Product Rust verification uses
+its own bounded daemon cache. It does not replace this daemon-independent
+development lease.
 
 ## Isolated daemon checks
 

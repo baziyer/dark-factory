@@ -20,7 +20,6 @@ check_pin() {
 check_pin scripts/local-ci.sh "cargo +$toolchain_version fmt"
 check_pin scripts/local-ci.sh "cargo +$toolchain_version clippy"
 check_pin scripts/local-ci.sh "cargo +$toolchain_version test"
-check_pin scripts/launch-ui.sh "cargo +$toolchain_version build"
 check_pin .github/workflows/ci.yml "rustup toolchain install $toolchain_version"
 check_pin .github/workflows/release.yml "rustup toolchain install $toolchain_version"
 check_pin .github/workflows/release.yml "rustup target add --toolchain $toolchain_version"

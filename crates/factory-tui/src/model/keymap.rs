@@ -249,9 +249,6 @@ pub struct TaskMenuState {
 fn task_menu_items(task: &factory_core::TaskDetail) -> Vec<&'static str> {
     let status = task.snapshot.status;
     let mut items = Vec::new();
-    if status == TaskStatus::Queued && task.snapshot.assigned_agent_id.is_some() {
-        items.push("start");
-    }
     if status == TaskStatus::Queued {
         items.push("assign");
     }
@@ -1217,20 +1214,6 @@ impl Board {
             return Intent::Redraw;
         };
         match state.items[state.cursor] {
-            "start" => {
-                let Some(task) = self.tasks.get(&task_id) else {
-                    return Intent::Redraw;
-                };
-                let Some(agent_id) = task.snapshot.assigned_agent_id.clone() else {
-                    self.set_status("assign a task to an agent first", StatusLevel::Error);
-                    return Intent::Redraw;
-                };
-                Intent::Send(LocalRequest::StartTask {
-                    project_id,
-                    task_id,
-                    agent_id,
-                })
-            }
             "assign" => {
                 if self.agent_ids_in(&project_id).is_empty() {
                     self.set_status("no agents to assign", StatusLevel::Error);

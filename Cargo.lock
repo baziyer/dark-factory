@@ -441,8 +441,6 @@ version = "0.2.6"
 dependencies = [
  "axum",
  "factory-core",
- "factory-runner",
- "factoryctl",
  "getrandom 0.3.4",
  "rusqlite",
  "rustix",

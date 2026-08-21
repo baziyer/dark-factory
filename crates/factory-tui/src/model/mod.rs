@@ -887,7 +887,6 @@ impl Board {
                     "loaded messages".to_owned()
                 }
             }
-            LocalResponse::RunAccepted { run_id } => format!("started run {run_id}"),
             LocalResponse::RunCancelled { run_id } => format!("run {run_id} cancelled"),
             LocalResponse::AttemptFinalizing { run_id } => format!("run {run_id} finalizing"),
             _ => "ok".to_owned(),

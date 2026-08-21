@@ -12,6 +12,7 @@ use uuid::Uuid;
 use super::changes::{
     change_mutation, invalidate_change_measurement, load_change, parse_change_phase, reserve_change,
 };
+use super::rust_builds::insert_completion_check_if_required;
 use super::{
     AgentMessage, ChangeReservation, MAX_BLOCKED_REASON_BYTES, MAX_PATH_BYTES,
     MAX_TASK_RESULT_BYTES, MAX_WAIT_REASON_BYTES, Result, Store, StoreError,
@@ -88,6 +89,9 @@ pub enum KernelResourceKind {
     ProviderProcess,
     ProcessGroup,
     RuntimeRoot,
+    EffectProcess,
+    EffectGroup,
+    TemporaryRoot,
 }
 
 impl KernelResourceKind {
@@ -97,6 +101,9 @@ impl KernelResourceKind {
             Self::ProviderProcess => "provider_process",
             Self::ProcessGroup => "process_group",
             Self::RuntimeRoot => "runtime_root",
+            Self::EffectProcess => "effect_process",
+            Self::EffectGroup => "effect_group",
+            Self::TemporaryRoot => "temporary_root",
         }
     }
 
@@ -106,6 +113,9 @@ impl KernelResourceKind {
             "provider_process" => Self::ProviderProcess,
             "process_group" => Self::ProcessGroup,
             "runtime_root" => Self::RuntimeRoot,
+            "effect_process" => Self::EffectProcess,
+            "effect_group" => Self::EffectGroup,
+            "temporary_root" => Self::TemporaryRoot,
             _ => return None,
         })
     }
@@ -361,7 +371,8 @@ impl Store {
             "INSERT INTO runs (
                 id, project_id, agent_id, task_id, task_incarnation_id,
                 admitted_task_work_revision, change_id, parent_run_id, source_root,
-                phase, outcome, outcome_detail, outcome_result, capability_digest,
+                phase, requested_outcome, requested_outcome_detail,
+                requested_outcome_result, capability_digest,
                 provider, runtime_model, runtime_reasoning_effort, runtime_permission_mode,
                 runtime_control_mode, activity, wait_reason, observer_health, observer_reason,
                 runner_instance_id, runner_runtime, runner_protocol_version,
@@ -675,7 +686,7 @@ impl Store {
             RunPhase::Running => {}
             RunPhase::Finalizing | RunPhase::Terminal => {
                 let stored_result: Option<String> = transaction.query_row(
-                    "SELECT outcome_result FROM runs WHERE id = ?1",
+                    "SELECT requested_outcome_result FROM runs WHERE id = ?1",
                     params![run_id.as_str()],
                     |row| row.get(0),
                 )?;
@@ -689,12 +700,14 @@ impl Store {
         let (kind, detail) = outcome_parts(outcome);
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', outcome = ?1, outcome_detail = ?2,
-                 outcome_result = ?3, stop_requested_at_ms = ?4,
+             SET phase = 'finalizing', requested_outcome = ?1,
+                 requested_outcome_detail = ?2, requested_outcome_result = ?3,
+                 capability_digest = NULL, stop_requested_at_ms = ?4,
                  finalizing_at_ms = ?4, phase_since_ms = ?4, updated_at_ms = ?4
              WHERE id = ?5 AND phase = 'running'",
             params![kind, detail, result, now_ms, run_id.as_str()],
         )?;
+        insert_completion_check_if_required(&transaction, &run, outcome, now_ms)?;
         transaction.execute(
             "UPDATE resources SET state = 'releasing', updated_at_ms = ?1
              WHERE run_id = ?2 AND state IN ('declared', 'active')",
@@ -766,7 +779,8 @@ impl Store {
         };
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', outcome = 'failed', outcome_detail = ?1,
+             SET phase = 'finalizing', requested_outcome = 'failed',
+                 requested_outcome_detail = ?1, capability_digest = NULL,
                  stop_requested_at_ms = ?2, finalizing_at_ms = ?2,
                  phase_since_ms = ?2, updated_at_ms = ?2
              WHERE id = ?3 AND phase = ?4",
@@ -816,7 +830,8 @@ impl Store {
         }
         transaction.execute(
             "UPDATE runs
-             SET phase = 'finalizing', outcome = 'cancelled', outcome_detail = ?1,
+             SET phase = 'finalizing', requested_outcome = 'cancelled',
+                 requested_outcome_detail = ?1, capability_digest = NULL,
                  stop_requested_at_ms = ?2, finalizing_at_ms = ?2,
                  phase_since_ms = ?2, updated_at_ms = ?2
              WHERE id = ?3 AND phase IN ('admitted', 'running')",
@@ -866,7 +881,8 @@ impl Store {
             });
             transaction.execute(
                 "UPDATE runs
-                 SET phase = 'finalizing', outcome = 'failed', outcome_detail = ?1,
+                 SET phase = 'finalizing', requested_outcome = 'failed',
+                     requested_outcome_detail = ?1, capability_digest = NULL,
                      finalizing_at_ms = ?2, phase_since_ms = ?2,
                      stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?2),
                      updated_at_ms = ?2
@@ -876,7 +892,8 @@ impl Store {
         } else if run.phase == RunPhase::Admitted {
             transaction.execute(
                 "UPDATE runs
-                 SET phase = 'finalizing', outcome = 'failed', outcome_detail = 'spawn',
+                 SET phase = 'finalizing', requested_outcome = 'failed',
+                     requested_outcome_detail = 'spawn', capability_digest = NULL,
                      finalizing_at_ms = ?1, phase_since_ms = ?1,
                      stop_requested_at_ms = COALESCE(stop_requested_at_ms, ?1),
                      updated_at_ms = ?1
@@ -954,6 +971,144 @@ impl Store {
         }
     }
 
+    /// Declares one external build effect before it can exist. Only a
+    /// finalizing run with a nonterminal Rust completion check may add these
+    /// resources; ordinary provider lifecycle resources use admission APIs.
+    pub fn declare_finalizing_resource(
+        &mut self,
+        run_id: &RunId,
+        resource_id: &str,
+        kind: KernelResourceKind,
+        locator: &str,
+        birth_fingerprint: Option<&str>,
+        now_ms: i64,
+    ) -> Result<()> {
+        if !matches!(
+            kind,
+            KernelResourceKind::EffectProcess
+                | KernelResourceKind::EffectGroup
+                | KernelResourceKind::TemporaryRoot
+        ) {
+            return Err(StoreError::InvalidExecutionMetadata);
+        }
+        if kind == KernelResourceKind::TemporaryRoot {
+            validate_temporary_claim(
+                birth_fingerprint.ok_or(StoreError::InvalidExecutionMetadata)?,
+            )?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_finalizing_check(&transaction, run_id)?;
+        let existing: Option<(String, String, Option<String>, String)> = transaction
+            .query_row(
+                "SELECT kind, locator, birth_fingerprint, state
+                 FROM resources WHERE id = ?1 AND run_id = ?2",
+                params![resource_id, run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        match existing {
+            Some((stored_kind, stored_locator, stored_fingerprint, state))
+                if stored_kind == kind.as_str()
+                    && stored_locator == locator
+                    && stored_fingerprint.as_deref() == birth_fingerprint
+                    && state == "declared" => {}
+            Some(_) => return Err(StoreError::ResourceIdentityMismatch),
+            None => insert_resource(
+                &transaction,
+                resource_id,
+                run_id,
+                kind,
+                locator,
+                birth_fingerprint,
+                now_ms,
+            )?,
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Binds a previously declared build effect to its exact external
+    /// identity. The deterministic resource ID avoids kind-wide ambiguity
+    /// when a check owns more than one process group or temporary root.
+    pub fn bind_finalizing_resource(
+        &mut self,
+        run_id: &RunId,
+        resource_id: &str,
+        expected_locator: &str,
+        birth_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        validate_resource_identity(expected_locator, birth_fingerprint)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_finalizing_check(&transaction, run_id)?;
+        let changed = transaction.execute(
+            "UPDATE resources
+             SET state = 'active', birth_fingerprint = ?1, updated_at_ms = ?2
+             WHERE id = ?3 AND run_id = ?4 AND locator = ?5
+               AND kind IN ('effect_process', 'effect_group', 'temporary_root')
+               AND state = 'declared'
+               AND (birth_fingerprint IS NULL OR birth_fingerprint = ?1)",
+            params![
+                birth_fingerprint,
+                now_ms,
+                resource_id,
+                run_id.as_str(),
+                expected_locator,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ResourceIdentityMismatch);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replaces a pre-mkdir temporary-root claim with its exact directory
+    /// identity. This is deliberately separate from process/group binding so
+    /// a caller must present the durable claim it is replacing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_claimed_finalizing_root(
+        &mut self,
+        run_id: &RunId,
+        resource_id: &str,
+        locator: &str,
+        expected_claim: &str,
+        exact_fingerprint: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        validate_resource_identity(locator, expected_claim)?;
+        validate_resource_identity(locator, exact_fingerprint)?;
+        validate_temporary_claim(expected_claim)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_finalizing_check(&transaction, run_id)?;
+        let changed = transaction.execute(
+            "UPDATE resources
+             SET state = 'active', birth_fingerprint = ?1, updated_at_ms = ?2
+             WHERE id = ?3 AND run_id = ?4 AND locator = ?5
+               AND kind = 'temporary_root' AND state = 'declared'
+               AND birth_fingerprint = ?6",
+            params![
+                exact_fingerprint,
+                now_ms,
+                resource_id,
+                run_id.as_str(),
+                locator,
+                expected_claim,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StoreError::ResourceIdentityMismatch);
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn mark_resource_unresolved(
         &mut self,
         resource_id: &str,
@@ -1000,16 +1155,19 @@ impl Store {
         if unreleased != 0 {
             return Err(StoreError::RunResourcesUnreleased { count: unreleased });
         }
-        let outcome = run.outcome.as_ref().ok_or(StoreError::InvalidRunState)?;
-        let outcome_result: Option<String> = transaction.query_row(
-            "SELECT outcome_result FROM runs WHERE id = ?1",
+        let requested_outcome = run.outcome.as_ref().ok_or(StoreError::InvalidRunState)?;
+        let requested_result: Option<String> = transaction.query_row(
+            "SELECT requested_outcome_result FROM runs WHERE id = ?1",
             params![run_id.as_str()],
             |row| row.get(0),
         )?;
-        let (task_status, blocked_reason, result) =
-            task_projection(outcome, outcome_result.as_deref());
+        let outcome = actual_outcome(&transaction, run_id, requested_outcome)?;
+        let outcome_result = matches!(outcome, RunOutcome::Succeeded)
+            .then_some(requested_result.as_deref())
+            .flatten();
+        let (task_status, blocked_reason, result) = task_projection(&outcome, outcome_result);
         if matches!(
-            outcome,
+            &outcome,
             RunOutcome::Failed { .. } | RunOutcome::Cancelled { .. }
         ) {
             transaction.execute(
@@ -1052,12 +1210,20 @@ impl Store {
         if projected != 1 {
             return Err(StoreError::InvalidRunState);
         }
+        let (outcome_kind, outcome_detail) = outcome_parts(&outcome);
         transaction.execute(
             "UPDATE runs
-             SET phase = 'terminal', phase_since_ms = ?1, updated_at_ms = ?1,
-                 ended_at_ms = ?1, capability_digest = NULL
-             WHERE id = ?2 AND phase = 'finalizing'",
-            params![now_ms, run_id.as_str()],
+             SET phase = 'terminal', outcome = ?1, outcome_detail = ?2,
+                 outcome_result = ?3, phase_since_ms = ?4, updated_at_ms = ?4,
+                 ended_at_ms = ?4, capability_digest = NULL
+             WHERE id = ?5 AND phase = 'finalizing'",
+            params![
+                outcome_kind,
+                outcome_detail,
+                outcome_result,
+                now_ms,
+                run_id.as_str()
+            ],
         )?;
         let change_event = transaction
             .query_row(
@@ -1250,6 +1416,30 @@ fn outcome_parts(outcome: &RunOutcome) -> (&'static str, Option<String>) {
     }
 }
 
+fn actual_outcome(
+    transaction: &Transaction<'_>,
+    run_id: &RunId,
+    requested: &RunOutcome,
+) -> Result<RunOutcome> {
+    if !matches!(requested, RunOutcome::Succeeded) {
+        return Ok(requested.clone());
+    }
+    let phase: Option<String> = transaction
+        .query_row(
+            "SELECT phase FROM rust_completion_checks WHERE run_id = ?1",
+            [run_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match phase.as_deref() {
+        None | Some("passed") => Ok(RunOutcome::Succeeded),
+        Some("failed") => Ok(RunOutcome::Failed {
+            reason: RunFailureReason::Unverifiable,
+        }),
+        Some(_) => Err(StoreError::CompletionVerificationPending),
+    }
+}
+
 fn task_projection<'a>(
     outcome: &'a RunOutcome,
     result: Option<&'a str>,
@@ -1344,9 +1534,39 @@ fn validate_resource_identity(locator: &str, fingerprint: &str) -> Result<()> {
     }
 }
 
+fn require_active_finalizing_check(transaction: &Transaction<'_>, run_id: &RunId) -> Result<()> {
+    let valid: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM runs r
+             JOIN rust_completion_checks c ON c.run_id = r.id
+             WHERE r.id = ?1 AND r.phase = 'finalizing'
+               AND c.phase NOT IN ('passed', 'failed')
+         )",
+        [run_id.as_str()],
+        |row| row.get(0),
+    )?;
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidRunState)
+    }
+}
+
 fn validate_runtime_claim(claim: &str) -> Result<()> {
     let nonce = claim
         .strip_prefix("runtime-claim:")
+        .ok_or(StoreError::InvalidExecutionMetadata)?;
+    let parsed = Uuid::parse_str(nonce).map_err(|_| StoreError::InvalidExecutionMetadata)?;
+    if parsed.simple().to_string() == nonce {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidExecutionMetadata)
+    }
+}
+
+fn validate_temporary_claim(claim: &str) -> Result<()> {
+    let nonce = claim
+        .strip_prefix("temp-claim:")
         .ok_or(StoreError::InvalidExecutionMetadata)?;
     let parsed = Uuid::parse_str(nonce).map_err(|_| StoreError::InvalidExecutionMetadata)?;
     if parsed.simple().to_string() == nonce {
@@ -1495,7 +1715,12 @@ pub(super) fn load_kernel_run(
     connection
         .query_row(
             "SELECT id, project_id, agent_id, task_id, provider, phase,
-                    outcome, outcome_detail, outcome_result, runner_instance_id,
+                    CASE WHEN phase = 'terminal' THEN outcome ELSE requested_outcome END,
+                    CASE WHEN phase = 'terminal' THEN outcome_detail
+                         ELSE requested_outcome_detail END,
+                    CASE WHEN phase = 'terminal' THEN outcome_result
+                         ELSE requested_outcome_result END,
+                    runner_instance_id,
                     runtime_model, runtime_reasoning_effort, runtime_permission_mode,
                     runtime_control_mode, activity, wait_reason,
                     observer_health, observer_reason, admitted_at_ms, running_at_ms,
@@ -1621,7 +1846,10 @@ mod tests {
 
     const BEARER: &str = "attempt-secret";
 
-    fn admit_worker_provisioning(store: &mut Store) -> (RunId, ProjectId, ChangeId) {
+    fn admit_worker_provisioning_with_verification(
+        store: &mut Store,
+        verification: factory_core::CompletionVerification,
+    ) -> (RunId, ProjectId, ChangeId) {
         let project_id = ProjectId::try_from("factory").unwrap();
         let agent_id = AgentId::try_from("worker").unwrap();
         let task_id = TaskId::try_from("task-1").unwrap();
@@ -1635,6 +1863,9 @@ mod tests {
                 },
                 1,
             )
+            .unwrap();
+        store
+            .set_project_completion_verification(&project_id, verification, 1)
             .unwrap();
         store
             .create_agent(
@@ -1702,8 +1933,19 @@ mod tests {
         (run_id, project_id, change_id)
     }
 
-    fn admit_worker(store: &mut Store) -> RunId {
-        let (run_id, project_id, change_id) = admit_worker_provisioning(store);
+    fn admit_worker_provisioning(store: &mut Store) -> (RunId, ProjectId, ChangeId) {
+        admit_worker_provisioning_with_verification(
+            store,
+            factory_core::CompletionVerification::None,
+        )
+    }
+
+    fn admit_worker_with_verification(
+        store: &mut Store,
+        verification: factory_core::CompletionVerification,
+    ) -> RunId {
+        let (run_id, project_id, change_id) =
+            admit_worker_provisioning_with_verification(store, verification);
         let base = ChangeBaseIdentity {
             repository_root: "/tmp/factory".into(),
             device: 1,
@@ -1732,6 +1974,10 @@ mod tests {
             )
             .unwrap();
         run_id
+    }
+
+    fn admit_worker(store: &mut Store) -> RunId {
+        admit_worker_with_verification(store, factory_core::CompletionVerification::None)
     }
 
     fn prepared_identity() -> PreparedProcessIdentity {
@@ -1764,6 +2010,33 @@ mod tests {
         }
     }
 
+    fn request_rust_success(store: &mut Store, run_id: &RunId) {
+        store
+            .activate_prepared_run(run_id, prepared_identity(), 7)
+            .unwrap();
+        store
+            .request_attempt_outcome(run_id, &RunOutcome::Succeeded, Some("verified"), 8)
+            .unwrap();
+    }
+
+    fn pass_rust_check(store: &mut Store, run_id: &RunId) {
+        let cache_key = "a".repeat(64);
+        let source_digest = "b".repeat(64);
+        let bundle_digest = "c".repeat(64);
+        let check = store
+            .claim_rust_completion_check(run_id, &cache_key, 9)
+            .unwrap();
+        store
+            .declare_rust_cache(run_id, "/tmp/factory-rust-cache", 9)
+            .unwrap();
+        store
+            .bind_rust_cache(run_id, "/tmp/factory-rust-cache", 1, 2, 100, 9)
+            .unwrap();
+        store
+            .pass_rust_completion_check(run_id, check.revision, &source_digest, &bundle_digest, 13)
+            .unwrap();
+    }
+
     #[test]
     fn credential_resolves_only_its_exact_attempt_and_durable_change() {
         let mut store = Store::open_in_memory().unwrap();
@@ -1785,6 +2058,342 @@ mod tests {
                 6,
             ),
             Err(StoreError::ChangeLeased)
+        ));
+    }
+
+    #[test]
+    fn rust_completion_revokes_authority_and_defers_actual_success() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker_with_verification(
+            &mut store,
+            factory_core::CompletionVerification::RustWorkspaceTest,
+        );
+        let project_id = ProjectId::try_from("factory").unwrap();
+        let original_incarnation = store
+            .project_execution_policy(&project_id)
+            .unwrap()
+            .incarnation_id;
+        request_rust_success(&mut store, &run_id);
+
+        assert!(store.authenticate_attempt(BEARER).unwrap().is_none());
+        assert_eq!(
+            store.rust_completion_check(&run_id).unwrap().unwrap().phase,
+            super::super::RustCompletionPhase::Pending
+        );
+        assert_eq!(
+            store
+                .project_execution_policy(&project_id)
+                .unwrap()
+                .incarnation_id,
+            original_incarnation
+        );
+        release_all(&mut store, &run_id, 9);
+        assert!(matches!(
+            store.finalize_run(&run_id, 10),
+            Err(StoreError::CompletionVerificationPending)
+        ));
+
+        pass_rust_check(&mut store, &run_id);
+        let (terminal, _) = store.finalize_run(&run_id, 14).unwrap();
+        assert_eq!(terminal.outcome, Some(RunOutcome::Succeeded));
+        let (requested, actual): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT requested_outcome, outcome FROM runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (requested.as_str(), actual.as_str()),
+            ("succeeded", "succeeded")
+        );
+    }
+
+    #[test]
+    fn failed_rust_completion_projects_unverifiable_not_requested_success() {
+        let mut store = Store::open_in_memory().unwrap();
+        let run_id = admit_worker_with_verification(
+            &mut store,
+            factory_core::CompletionVerification::RustWorkspaceTest,
+        );
+        request_rust_success(&mut store, &run_id);
+        release_all(&mut store, &run_id, 9);
+        let check = store
+            .claim_rust_completion_check(&run_id, &"d".repeat(64), 9)
+            .unwrap();
+        store
+            .fail_rust_completion_check(&run_id, check.revision, "cargo failed", 10)
+            .unwrap();
+
+        let (terminal, _) = store.finalize_run(&run_id, 11).unwrap();
+        assert_eq!(
+            terminal.outcome,
+            Some(RunOutcome::Failed {
+                reason: RunFailureReason::Unverifiable
+            })
+        );
+        assert_eq!(
+            store
+                .get_task(
+                    &ProjectId::try_from("factory").unwrap(),
+                    &TaskId::try_from("task-1").unwrap(),
+                )
+                .unwrap()
+                .snapshot
+                .status,
+            factory_core::TaskStatus::Failed
+        );
+        let (requested, actual, detail): (String, String, String) = store
+            .connection
+            .query_row(
+                "SELECT requested_outcome, outcome, outcome_detail
+                 FROM runs WHERE id = ?1",
+                [run_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(requested, "succeeded");
+        assert_eq!(
+            (actual.as_str(), detail.as_str()),
+            ("failed", "unverifiable")
+        );
+    }
+
+    #[test]
+    fn reclaim_intent_survives_restart_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("factory.sqlite3");
+        let cache;
+        {
+            let mut store = Store::open(&database).unwrap();
+            let run_id = admit_worker_with_verification(
+                &mut store,
+                factory_core::CompletionVerification::RustWorkspaceTest,
+            );
+            request_rust_success(&mut store, &run_id);
+            release_all(&mut store, &run_id, 9);
+            pass_rust_check(&mut store, &run_id);
+            store.finalize_run(&run_id, 14).unwrap();
+            cache = store.rust_reclaim_candidates(1).unwrap().remove(0);
+            store.begin_rust_cache_reclaim(&cache, 15).unwrap();
+        }
+        let mut store = Store::open(&database).unwrap();
+        assert_eq!(store.recoverable_rust_reclaims().unwrap().len(), 1);
+        store.begin_rust_cache_reclaim(&cache, 16).unwrap();
+        store
+            .finish_rust_cache_reclaim(&cache.project_incarnation_id, &cache.cache_key, 17)
+            .unwrap();
+        assert!(store.recoverable_rust_reclaims().unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_delete_refuses_live_rust_caches_and_clears_removed_tombstones() {
+        let mut store = Store::open_in_memory().unwrap();
+        let project_id = ProjectId::try_from("factory").unwrap();
+        store
+            .create_project(
+                NewProject {
+                    id: project_id.clone(),
+                    name: "Factory".into(),
+                    root: "/tmp/factory".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let incarnation = store
+            .project_execution_policy(&project_id)
+            .unwrap()
+            .incarnation_id;
+        store
+            .connection
+            .execute(
+                "INSERT INTO rust_build_caches (
+                    project_incarnation_id, cache_key, project_id, path,
+                    dev, inode, bytes, lifecycle, failure,
+                    created_at_ms, updated_at_ms, last_used_at_ms
+                 ) VALUES (?1, ?2, ?3, '/tmp/cache', 1, 2, 3,
+                           'available', NULL, 2, 2, 2)",
+                params![incarnation, "e".repeat(64), project_id.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.check_project_deletable(&project_id),
+            Err(StoreError::ProjectHasRustCaches)
+        ));
+        store
+            .connection
+            .execute("UPDATE rust_build_caches SET lifecycle = 'removed'", [])
+            .unwrap();
+        store.delete_project(&project_id, 3).unwrap();
+        assert!(matches!(
+            store.get_project(&project_id),
+            Err(StoreError::ProjectNotFound)
+        ));
+    }
+
+    #[test]
+    fn project_verification_and_cache_reclamation_refuse_a_live_run() {
+        let mut store = Store::open_in_memory().unwrap();
+        let _run_id = admit_worker(&mut store);
+        let project_id = ProjectId::try_from("factory").unwrap();
+        store
+            .set_project_completion_verification(
+                &project_id,
+                factory_core::CompletionVerification::None,
+                6,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.set_project_completion_verification(
+                &project_id,
+                factory_core::CompletionVerification::RustWorkspaceTest,
+                7,
+            ),
+            Err(StoreError::ProjectHasActiveRun)
+        ));
+        let incarnation = store
+            .project_execution_policy(&project_id)
+            .unwrap()
+            .incarnation_id;
+        store
+            .connection
+            .execute(
+                "INSERT INTO rust_build_caches (
+                    project_incarnation_id, cache_key, project_id, path,
+                    dev, inode, bytes, lifecycle, failure,
+                    created_at_ms, updated_at_ms, last_used_at_ms
+                 ) VALUES (?1, ?2, ?3, '/tmp/live-cache', 1, 2, 3,
+                           'available', NULL, 8, 8, 8)",
+                params![incarnation, "9".repeat(64), project_id.as_str()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.begin_project_rust_cache_reclamation(&project_id, 9),
+            Err(StoreError::ProjectHasActiveRun)
+        ));
+    }
+
+    #[test]
+    fn one_project_cache_key_has_one_active_writer() {
+        let mut store = Store::open_in_memory().unwrap();
+        let first_run = admit_worker_with_verification(
+            &mut store,
+            factory_core::CompletionVerification::RustWorkspaceTest,
+        );
+        let project_id = ProjectId::try_from("factory").unwrap();
+        request_rust_success(&mut store, &first_run);
+        let cache_key = "f".repeat(64);
+        store
+            .claim_rust_completion_check(&first_run, &cache_key, 9)
+            .unwrap();
+
+        let agent_id = AgentId::try_from("worker-2").unwrap();
+        let task_id = TaskId::try_from("task-2").unwrap();
+        let run_id = RunId::try_from("33333333-3333-4333-8333-333333333333").unwrap();
+        let change_id = ChangeId::try_from("change-2").unwrap();
+        store
+            .create_agent(
+                NewAgent {
+                    id: agent_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_agent_id: None,
+                    role: AgentRole::Worker,
+                    provider: Provider::Shell,
+                },
+                10,
+            )
+            .unwrap();
+        store
+            .create_assigned_task(
+                NewTask {
+                    id: task_id.clone(),
+                    project_id: project_id.clone(),
+                    parent_task_id: None,
+                    title: "Other work".into(),
+                    body: "Body".into(),
+                    priority: 0,
+                },
+                agent_id.clone(),
+                10,
+            )
+            .unwrap();
+        store
+            .admit_run(
+                NewRunAdmission {
+                    run_id: run_id.clone(),
+                    project_id: project_id.clone(),
+                    task_id,
+                    agent_id,
+                    expected_provider: Provider::Shell,
+                    capability_digest: capability_digest("second-secret"),
+                    runtime_claim: "runtime-claim:66666666666646668666666666666666".into(),
+                    runner_instance_id: RunnerInstanceId::try_from(
+                        "44444444-4444-4444-8444-444444444444",
+                    )
+                    .unwrap(),
+                    runner_runtime: "/tmp/factory-runner-2".into(),
+                    max_active_runs: 2,
+                    change_reservation: Some(ChangeReservation {
+                        id: change_id.clone(),
+                        source_root: "/tmp/factory-change-2".into(),
+                        max_factory_changes: 2,
+                    }),
+                    policy_cwd: None,
+                },
+                11,
+            )
+            .unwrap();
+        let base = ChangeBaseIdentity {
+            repository_root: "/tmp/factory".into(),
+            device: 1,
+            inode: 2,
+        };
+        store
+            .record_change_base(
+                &project_id,
+                &change_id,
+                0,
+                "0123456789abcdef0123456789abcdef01234567",
+                &base,
+                12,
+            )
+            .unwrap();
+        store
+            .mark_change_available(
+                &project_id,
+                &change_id,
+                1,
+                &ChangeMaterialization {
+                    base_oid: "0123456789abcdef0123456789abcdef01234567".into(),
+                    base,
+                    source: ChangeSourceIdentity {
+                        source_root: "/tmp/factory-change-2".into(),
+                        device: 3,
+                        inode: 5,
+                        size_bytes: 6,
+                    },
+                },
+                12,
+            )
+            .unwrap();
+        let mut identity = prepared_identity();
+        identity.runtime_locator =
+            serde_json::json!({ "path": "/tmp/factory-runner-2" }).to_string();
+        identity.runner_locator = serde_json::json!({
+            "pid": 19,
+            "runner_instance_id": "44444444-4444-4444-8444-444444444444"
+        })
+        .to_string();
+        identity.provider_locator = serde_json::json!({ "pid": 20 }).to_string();
+        identity.process_group_locator = serde_json::json!({ "pgid": 20 }).to_string();
+        store.activate_prepared_run(&run_id, identity, 13).unwrap();
+        store
+            .request_attempt_outcome(&run_id, &RunOutcome::Succeeded, None, 14)
+            .unwrap();
+        assert!(matches!(
+            store.claim_rust_completion_check(&run_id, &cache_key, 15),
+            Err(StoreError::RustCacheWriterBusy)
         ));
     }
 

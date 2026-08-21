@@ -36,8 +36,10 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
             runner_program: "/bin/false".into(),
             factoryctl_path: "/bin/false".into(),
             git_program: "/bin/false".into(),
+            cargo_program: Some("/bin/false".into()),
             runtime_root,
             changes_root: directory.path().join("changes"),
+            artifacts_root: directory.path().join("artifacts"),
             guidance_root: directory.path().join("guidance"),
             socket_path: socket.clone(),
             max_active_runs: 1,
@@ -82,6 +84,33 @@ async fn request_authority_is_explicit_and_taskless_bearers_are_refused() {
             },
             ..
         }
+    ));
+    assert!(matches!(
+        request(
+            &socket,
+            RequestEnvelope::new(LocalRequest::RustStorageStatus),
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::Error {
+                code: ErrorCode::Unauthorized,
+                ..
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        request(
+            &socket,
+            RequestEnvelope::authenticated(LocalRequest::RustStorageStatus, operator.clone()),
+        )
+        .await,
+        ServerFrame::Response {
+            response: LocalResponse::RustStorageStatus { storage },
+            ..
+        } if storage.cache_count == 0
+            && storage.cache_bytes == Some(0)
+            && storage.complete
     ));
 
     let taskless = RequestCredential::new("not-an-admitted-attempt".into()).unwrap();

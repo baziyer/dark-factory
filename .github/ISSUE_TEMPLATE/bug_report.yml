@@ -1,5 +1,5 @@
 name: Bug report
-description: Something the daemon, CLI, TUI, or a provider session does wrong
+description: Something the daemon, CLI, TUI, or a provider attempt does wrong
 labels: ["bug"]
 body:
   - type: textarea
@@ -21,7 +21,7 @@ body:
     id: evidence
     attributes:
       label: Evidence
-      description: "`factoryctl health` output, the relevant `session list`/`task get`/`events` frames, daemon log lines. Do not paste provider transcripts, `terminal.log`, hook tokens, or anything from `~/.claude.json` / `CODEX_HOME`."
+      description: "`factoryctl health` output, the relevant `run list`/`task get`/`events` frames, and daemon log lines. Do not paste provider output, attempt credentials, source, or anything from `~/.claude.json` / `CODEX_HOME`."
   - type: input
     id: version
     attributes:

@@ -6,9 +6,12 @@ use std::{
 };
 
 use factory_core::{
-    AgentId, AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
-    ProjectSnapshot, Provider, ProviderHookEvent, RunId, TaskId,
-    local::{LocalRequest, LocalResponse, RequestCredential, RequestEnvelope, ServerFrame},
+    AgentRole, AgentSnapshot, EventEnvelope, FactoryEvent, PROTOCOL_VERSION, ProjectId,
+    ProjectSnapshot, Provider, ProviderHookEvent, RunId,
+    local::{
+        LocalRequest, LocalResponse, RequestCredential, RequestEnvelope, RustStorageSnapshot,
+        ServerFrame,
+    },
     status::FleetStatus,
 };
 
@@ -215,6 +218,73 @@ fn status_is_human_by_default_and_json_preserves_the_protocol_frame() {
 }
 
 #[test]
+fn storage_status_is_concise_by_default_and_json_preserves_the_frame() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("factory.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    write_operator_credential(directory.path());
+    let storage = RustStorageSnapshot {
+        max_cache_count: 8,
+        max_cache_bytes: 1024,
+        cache_count: 2,
+        cache_bytes: None,
+        protected_count: 1,
+        reclaimable_count: 4,
+        cache_count_over_limit: false,
+        cache_bytes_over_limit: false,
+        complete: false,
+    };
+    let expected_frame = ServerFrame::Response {
+        protocol_version: PROTOCOL_VERSION,
+        response: LocalResponse::RustStorageStatus { storage },
+    };
+    let mut expected_json = serde_json::to_vec(&expected_frame).unwrap();
+    expected_json.push(b'\n');
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_str::<RequestEnvelope>(&line)
+                    .unwrap()
+                    .request,
+                LocalRequest::RustStorageStatus
+            ));
+            write_response(&mut stream, LocalResponse::RustStorageStatus { storage });
+        }
+    });
+
+    let human = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args(["--socket", socket.to_str().unwrap(), "storage", "status"])
+        .env("DARK_FACTORY_HOME", directory.path())
+        .output()
+        .unwrap();
+    assert!(human.status.success(), "{human:?}");
+    assert_eq!(
+        String::from_utf8(human.stdout).unwrap(),
+        "Rust storage: caches 2/8 (unknown / 1024 bytes), protected 1, reclaimable 4, measurement incomplete\n"
+    );
+
+    let json = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
+        .args([
+            "--socket",
+            socket.to_str().unwrap(),
+            "storage",
+            "status",
+            "--json",
+        ])
+        .env("DARK_FACTORY_HOME", directory.path())
+        .output()
+        .unwrap();
+    assert!(json.status.success(), "{json:?}");
+    assert_eq!(json.stdout, expected_json);
+    server.join().unwrap();
+}
+
+#[test]
 fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
@@ -252,6 +322,7 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
                             id: ProjectId::try_from("project-1").unwrap(),
                             name: "Project One".into(),
                             root: "/work/project-one".into(),
+                            completion_verification: factory_core::CompletionVerification::None,
                             created_at_ms: 1_000,
                             updated_at_ms: 1_000,
                         },
@@ -291,7 +362,7 @@ fn events_follow_reports_the_replay_cursor_when_the_daemon_disconnects() {
 }
 
 #[test]
-fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
+fn agent_add_emits_one_machine_readable_response() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("factory.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -342,29 +413,6 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
                 },
             },
         );
-
-        let (mut start_stream, _) = listener.accept().unwrap();
-        line.clear();
-        BufReader::new(start_stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert_eq!(
-            serde_json::from_str::<RequestEnvelope>(&line).unwrap(),
-            RequestEnvelope::authenticated(
-                LocalRequest::StartTask {
-                    project_id: ProjectId::try_from("project-1").unwrap(),
-                    task_id: TaskId::try_from("task-1").unwrap(),
-                    agent_id: AgentId::try_from("agent-1").unwrap(),
-                },
-                expected_credential,
-            )
-        );
-        write_response(
-            &mut start_stream,
-            LocalResponse::RunAccepted {
-                run_id: RunId::try_from("run-1").unwrap(),
-            },
-        );
     });
 
     let agent = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
@@ -397,35 +445,6 @@ fn agent_add_and_task_start_each_emit_one_machine_readable_response() {
         }
     ));
 
-    let start = Command::new(env!("CARGO_BIN_EXE_factoryctl"))
-        .args([
-            "--socket",
-            socket.to_str().unwrap(),
-            "task",
-            "start",
-            "--project",
-            "project-1",
-            "--task",
-            "task-1",
-            "--agent",
-            "agent-1",
-        ])
-        .env("DARK_FACTORY_HOME", directory.path())
-        .output()
-        .unwrap();
-    assert!(start.status.success());
-    assert!(start.stderr.is_empty());
-    assert_eq!(
-        start.stdout.iter().filter(|byte| **byte == b'\n').count(),
-        1
-    );
-    assert!(matches!(
-        serde_json::from_slice::<ServerFrame>(&start.stdout).unwrap(),
-        ServerFrame::Response {
-            response: LocalResponse::RunAccepted { .. },
-            ..
-        }
-    ));
     server.join().unwrap();
 }
 

@@ -14,8 +14,8 @@ security fixes.
 
 The safe-kernel refactor is not a live release. Do not install or start this
 revision, enable auto mode, submit provider work, expose webhook intake, or use
-the operator's `~/.dark-factory`. Stage 3 and an independent boot review remain
-required.
+the operator's `~/.dark-factory`. Stage 3 exact-head proof, independent review,
+merge, and the separate boot review remain required.
 
 ## Threat model
 
@@ -86,9 +86,12 @@ delivery replay, provider resume, or session outboxes.
 Provider hooks are authenticated observations and bounded requests.
 `PreToolUse` applies the durable tool-call budget and a conservative command
 tripwire. The tripwire denies recognized destructive or credential-sensitive
-commands, every recognized `git push` publication attempt, and unsupported
-shell syntax. Local source-editing commands such as `git apply`, `git mv`, and
-`git rm` remain permitted. It is not a sandbox: interpreters, generated
+commands, every recognized `git push` publication attempt, direct `cargo`,
+`rustc`, and `rustup` invocation, direct launch from a recognized mutable
+Cargo `target/.../{debug,release}` path, and unsupported shell syntax. Local
+source-editing commands such as `git apply`, `git mv`, and `git rm` remain
+permitted. Rust-policy verification belongs to `factoryctl task done`, not a
+provider build surface. This is not a sandbox: interpreters, generated
 programs, MCP tools, provider defects, and direct syscalls can evade string
 inspection.
 
@@ -119,12 +122,31 @@ isolation from a hostile same-user process.
 
 ## Build and storage boundary
 
-The complete boot contract requires Stage 3 to build through a bounded
-project/configuration cache and execute immutable prepared bundles verified by
-digest. Mutable Cargo sibling discovery and one target per checkout are not
-secure or bounded execution paths. Resource reclamation may remove only exact,
-registered, unleased regenerable data; unique retained Changes are never
-automatic cleanup targets.
+The complete boot contract requires a Rust-policy completion to revoke attempt
+authority and reap the provider before source selection. The daemon accepts a
+private source snapshot only when canonical before/copy/after manifests agree,
+then builds through one project-incarnation/toolchain cache. It copies Cargo's
+top-level test executables into content-addressed staging under the run's
+registered temporary root, records exact identity and digest, and verifies
+both before launch. The immutable snapshot supplies the working tree; fixtures
+are not copied into staging and doctests are not run. Mutable Cargo sibling
+discovery and one target per checkout are not accepted top-level launch paths.
+Cargo dependency resolution may use the network through the registered
+verifier process. Its registry, Git, and target data live inside the bounded
+project cache, but Rust verification is not a network sandbox.
+
+Identity and digest checks prevent accidental and cooperative substitution;
+they do not create isolation from a hostile same-user process racing filesystem
+operations. Stronger execution isolation requires a separate user, sandbox, or
+container.
+
+Resource reclamation may remove only exact, registered, unleased regenerable
+cache data; unique retained Changes are never automatic cleanup targets. A
+writer makes byte status incomplete. Its exact process group is reaped before
+remeasurement, after which the byte policy converges; an already measured
+over-limit cache is refused for a new verification. The daemon reports total
+measured bytes plus protected entry count and does not claim an instantaneous
+filesystem byte ceiling while Cargo is writing.
 
 ## Bounded inputs and durable data
 

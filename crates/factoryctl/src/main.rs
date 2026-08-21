@@ -5,7 +5,7 @@ use factory_core::local::{
     MAX_LEGACY_SOURCE_PAGE_ITEMS, MAX_PROJECT_PAGE_ITEMS, MAX_RUN_PAGE_ITEMS, MAX_TASK_PAGE_ITEMS,
     RequestCredential, ServerFrame,
 };
-use factory_core::{AgentRole, Provider, ProviderHookEvent};
+use factory_core::{AgentRole, CompletionVerification, Provider, ProviderHookEvent};
 use factoryctl::{Client, capacity};
 use uuid::Uuid;
 
@@ -18,7 +18,7 @@ mod usage;
 
 const ATTEMPT_TOKEN_FILE_ENV: &str = "DARK_FACTORY_ATTEMPT_TOKEN_FILE";
 
-const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
+const USAGE: &str = "usage: factoryctl [--socket PATH] <health|status|storage|auto|capacity|init|doctor|update|version|usage|project|task|agent|run|change|hook|events> ...";
 const HELP: &str = "Dark Factory local control plane
 
 Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a persistent terminal.
@@ -26,6 +26,7 @@ Run the daemon separately (launchd keeps it alive), then run `factory-tui` in a 
 Commands:
   health                                      Check the daemon
   status [--json]                             The whole fleet at one instant: attempts, queues, attention, active-attempt cap
+  storage status [--json]                     Show bounded daemon-owned Rust caches
   auto on|off|status                         Set or show the factory-wide provider bypass default
   capacity status|set N                     Show or change the operator-owned active-attempt capacity (1..=64)
   init [--yes] [--no-launchd]                 Guided install: create the home, install these binaries, load the launchd job
@@ -33,9 +34,10 @@ Commands:
   update [--install]                          Check for a newer release; --install downloads, verifies, and activates it
   version                                     Print this factoryctl's version
   usage                                       Probe Codex subscription usage on demand
-  project add|list|delete|get|guidance        Manage projects and their guidance file
-  task add|list|get|start|retry|assign|cancel|update|delete|done|blocked
-                                               Manage and run tasks
+  project add|list|delete|get|guidance|verification
+                                               Manage projects and completion verification
+  task add|list|get|retry|assign|cancel|update|delete|done|blocked
+                                               Manage tasks; assignment and auto mode admit work
   agent add|list|delete|get|profile|message|inbox|pause|resume
                                                Manage agents, their guidance files, and their durable messages
   run list|stop                               List and stop process attempts
@@ -62,6 +64,15 @@ A concise human summary of the whole daemon at one instant: projects,
 agents, attempts, project backlogs, assigned worker queues, Changes, and
 anything needing attention.
 factory-tui reads the same request. For history, use the list commands.
+
+Options:
+  --json                       Print the complete protocol response frame
+  -h, --help                   Show this help";
+const STORAGE_HELP: &str = "usage: factoryctl storage status [--json]
+
+Show the exact persisted inventory and configured bounds for daemon-owned Rust
+build caches. Missing byte totals are reported as unknown instead of presenting
+a partial measurement as complete.
 
 Options:
   --json                       Print the complete protocol response frame
@@ -149,7 +160,8 @@ const USAGE_HELP: &str = "usage: factoryctl usage
 Run a local Codex JSON-RPC probe against `codex` on PATH and print the
 result. No daemon or socket is involved and nothing is persisted; Claude's
 usage is read by running `/usage` inside Claude's own interactive terminal.";
-const PROJECT_HELP: &str = "usage: factoryctl project <add|list|delete|get|guidance> [options]
+const PROJECT_HELP: &str =
+    "usage: factoryctl project <add|list|delete|get|guidance|verification> [options]
 
 Manage projects.
 
@@ -159,6 +171,7 @@ Actions:
   delete    Delete a project that has no non-terminal run
   get       Fetch one project, including its guidance file path
   guidance  Manage a project's standing guidance file
+  verification  Select none or the fixed daemon-owned Rust workspace test
 
 Run `factoryctl project <action> --help` for action-specific options.";
 const PROJECT_ADD_HELP: &str = "usage: factoryctl project add --name TEXT --root PATH [options]
@@ -183,8 +196,9 @@ Options:
 const PROJECT_DELETE_HELP: &str = "usage: factoryctl project delete --project ID
 
 Delete a project that has no non-terminal run and no retained managed Change
-or legacy-source metadata. Cascades to delete every remaining task, agent, and
-run in the project.
+or legacy-source metadata. Regenerable Rust caches are first scheduled for
+exact cleanup; retry after cleanup completes. Then every remaining task,
+agent, and run in the project is deleted.
 
 Required:
   --project ID           Project to delete
@@ -222,7 +236,6 @@ Actions:
   add       Create a new task
   list      List tasks in a project
   get       Fetch one task
-  start     Start a queued task on an agent
   retry     Requeue a blocked, failed, or cancelled task
   reorder   Change a queued task's priority/order
   assign    Assign or return a queued task; assignment wakes delivery
@@ -274,17 +287,19 @@ Required:
 
 Options:
   -h, --help              Show this help";
-const TASK_START_HELP: &str = "usage: factoryctl task start --project ID --task ID --agent ID
+const PROJECT_VERIFICATION_HELP: &str =
+    "usage: factoryctl project verification --project ID --mode <none|rust-workspace-test>
 
-Start a queued task on an idle agent.
+Select the operator-owned completion policy for future worker attempts. Rust
+workspace test runs one fixed daemon-owned build/test path; attempts cannot
+supply Cargo arguments, paths, or environment.
 
 Required:
-  --project ID           Project the task belongs to
-  --task ID              Task to start
-  --agent ID             Agent to run it
+  --project ID           Project to update
+  --mode MODE            none or rust-workspace-test
 
 Options:
-  -h, --help                 Show this help";
+  -h, --help             Show this help";
 const TASK_RETRY_HELP: &str = "usage: factoryctl task retry --project ID --task ID
 
 Requeue a blocked, failed, or cancelled task.
@@ -669,6 +684,9 @@ enum CliCommand {
     Status {
         json: bool,
     },
+    StorageStatus {
+        json: bool,
+    },
     SetAutoMode {
         enabled: bool,
     },
@@ -708,6 +726,10 @@ enum CliCommand {
         project_id: String,
         file: String,
     },
+    ProjectVerificationSet {
+        project_id: String,
+        verification: CompletionVerification,
+    },
     TaskAdd {
         id: Option<String>,
         project_id: String,
@@ -724,11 +746,6 @@ enum CliCommand {
         agent_id: Option<String>,
         history: bool,
         limit: u32,
-    },
-    TaskStart {
-        project_id: String,
-        task_id: String,
-        agent_id: String,
     },
     TaskRetry {
         project_id: String,
@@ -999,6 +1016,7 @@ fn run() -> Result<i32, String> {
     }
 
     let human_status = matches!(&command, CliCommand::Status { json: false });
+    let human_storage = matches!(&command, CliCommand::StorageStatus { json: false });
     let request = request_for(command)?;
     let frame = client.request(request).map_err(|error| error.to_string())?;
     if human_status {
@@ -1028,6 +1046,14 @@ fn run() -> Result<i32, String> {
             }
             _ => write_frame(&mut output, &frame)?,
         }
+    } else if human_storage {
+        match &frame {
+            ServerFrame::Response {
+                response: LocalResponse::RustStorageStatus { storage },
+                ..
+            } => write_storage_status(&mut output, storage)?,
+            _ => write_frame(&mut output, &frame)?,
+        }
     } else {
         write_frame(&mut output, &frame)?;
     }
@@ -1053,6 +1079,34 @@ fn capacity_result(change: &capacity::CapacityChange) -> serde_json::Value {
         "launchd": "reloaded",
         "active_attempts_preserved": true,
     })
+}
+
+fn write_storage_status(
+    output: &mut impl Write,
+    storage: &factory_core::local::RustStorageSnapshot,
+) -> Result<(), String> {
+    let state = if !storage.complete {
+        "measurement incomplete"
+    } else if storage.cache_count_over_limit || storage.cache_bytes_over_limit {
+        "over limit"
+    } else {
+        "within limits"
+    };
+    writeln!(
+        output,
+        "Rust storage: caches {}/{} ({} / {} bytes), protected {}, reclaimable {}, {state}",
+        storage.cache_count,
+        storage.max_cache_count,
+        optional_bytes(storage.cache_bytes),
+        storage.max_cache_bytes,
+        storage.protected_count,
+        storage.reclaimable_count,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn optional_bytes(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unknown".to_owned(), |bytes| bytes.to_string())
 }
 
 fn command_requires_attempt_credential(command: &CliCommand) -> bool {
@@ -1270,6 +1324,18 @@ fn parse_args(mut args: Vec<String>) -> Result<(Option<String>, CliCommand), Str
             require_empty(&args)?;
             Ok((socket, CliCommand::Status { json }))
         }
+        "storage" => {
+            if wants_help(&args) {
+                return Ok((socket, CliCommand::Help(STORAGE_HELP)));
+            }
+            let action = take_action(&mut args, "storage")?;
+            if action != "status" {
+                return Err(format!("unknown storage action {action:?}"));
+            }
+            let json = take_flag(&mut args, "--json")?;
+            require_empty(&args)?;
+            Ok((socket, CliCommand::StorageStatus { json }))
+        }
         "auto" => {
             if wants_help(&args) {
                 return Ok((
@@ -1382,6 +1448,7 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
             "delete" => PROJECT_DELETE_HELP,
             "get" => PROJECT_GET_HELP,
             "guidance" => PROJECT_GUIDANCE_HELP,
+            "verification" => PROJECT_VERIFICATION_HELP,
             _ => PROJECT_HELP,
         }));
     }
@@ -1421,6 +1488,19 @@ fn parse_project(mut args: Vec<String>) -> Result<CliCommand, String> {
                 _ => Err(format!("unknown project guidance action {sub_action:?}")),
             }
         }
+        "verification" => {
+            let project_id = required_project(&mut args)?;
+            let verification = match required_option(&mut args, "--mode")?.as_str() {
+                "none" => CompletionVerification::None,
+                "rust-workspace-test" => CompletionVerification::RustWorkspaceTest,
+                _ => return Err("--mode must be none or rust-workspace-test".into()),
+            };
+            require_empty(&args)?;
+            Ok(CliCommand::ProjectVerificationSet {
+                project_id,
+                verification,
+            })
+        }
         _ => Err(format!("unknown project action {action:?}")),
     }
 }
@@ -1435,7 +1515,6 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
             "add" => TASK_ADD_HELP,
             "list" => TASK_LIST_HELP,
             "get" => TASK_GET_HELP,
-            "start" => TASK_START_HELP,
             "retry" => TASK_RETRY_HELP,
             "assign" => TASK_ASSIGN_HELP,
             "cancel" => TASK_CANCEL_HELP,
@@ -1489,17 +1568,6 @@ fn parse_task(mut args: Vec<String>) -> Result<CliCommand, String> {
                 agent_id,
                 history,
                 limit,
-            })
-        }
-        "start" => {
-            let project_id = required_project(&mut args)?;
-            let task_id = required_option(&mut args, "--task")?;
-            let agent_id = required_option(&mut args, "--agent")?;
-            require_empty(&args)?;
-            Ok(CliCommand::TaskStart {
-                project_id,
-                task_id,
-                agent_id,
             })
         }
         "retry" => {
@@ -1936,6 +2004,7 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
         CliCommand::Help(_) => Err("help is not a daemon request".into()),
         CliCommand::Health => Ok(LocalRequest::Health),
         CliCommand::Status { .. } => Ok(LocalRequest::FleetStatus),
+        CliCommand::StorageStatus { .. } => Ok(LocalRequest::RustStorageStatus),
         CliCommand::SetAutoMode { enabled } => Ok(LocalRequest::SetAutoMode { enabled }),
         CliCommand::CapacityStatus | CliCommand::CapacitySet { .. } => {
             Err("capacity is handled outside the daemon protocol".into())
@@ -1971,6 +2040,13 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 text: read_guidance_file(&file)?,
             })
         }
+        CliCommand::ProjectVerificationSet {
+            project_id,
+            verification,
+        } => Ok(LocalRequest::SetProjectCompletionVerification {
+            project_id: parse_id(project_id, "project")?,
+            verification,
+        }),
         CliCommand::TaskAdd {
             id,
             project_id,
@@ -2016,15 +2092,6 @@ fn request_for(command: CliCommand) -> Result<LocalRequest, String> {
                 limit,
             })
         }
-        CliCommand::TaskStart {
-            project_id,
-            task_id,
-            agent_id,
-        } => Ok(LocalRequest::StartTask {
-            project_id: parse_id(project_id, "project")?,
-            task_id: parse_id(task_id, "task")?,
-            agent_id: parse_id(agent_id, "agent")?,
-        }),
         CliCommand::TaskRetry {
             project_id,
             task_id,
@@ -2505,6 +2572,26 @@ mod tests {
     }
 
     #[test]
+    fn storage_status_is_a_read_only_daemon_request_with_optional_json() {
+        assert_eq!(
+            parse_args(args(&["storage", "status"])).unwrap().1,
+            CliCommand::StorageStatus { json: false }
+        );
+        assert_eq!(
+            parse_args(args(&["storage", "status", "--json"]))
+                .unwrap()
+                .1,
+            CliCommand::StorageStatus { json: true }
+        );
+        assert_eq!(
+            request_for(CliCommand::StorageStatus { json: false }).unwrap(),
+            LocalRequest::RustStorageStatus
+        );
+        assert!(parse_args(args(&["storage", "prune"])).is_err());
+        assert!(parse_args(args(&["storage", "status", "--unexpected"])).is_err());
+    }
+
+    #[test]
     fn capacity_result_promises_active_attempt_preservation_in_the_cli_contract() {
         let value = capacity_result(&capacity::CapacityChange {
             previous: 4,
@@ -2606,6 +2693,12 @@ mod tests {
             CliCommand::Help(STATUS_HELP)
         );
         assert_eq!(
+            parse_args(args(&["storage", "status", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(STORAGE_HELP)
+        );
+        assert_eq!(
             parse_args(args(&["update", "--help"])).unwrap().1,
             CliCommand::Help(UPDATE_HELP)
         );
@@ -2660,6 +2753,12 @@ mod tests {
             CliCommand::Help(PROJECT_GUIDANCE_HELP)
         );
         assert_eq!(
+            parse_args(args(&["project", "verification", "--help"]))
+                .unwrap()
+                .1,
+            CliCommand::Help(PROJECT_VERIFICATION_HELP)
+        );
+        assert_eq!(
             parse_args(args(&["task"])).unwrap().1,
             CliCommand::Help(TASK_HELP)
         );
@@ -2667,7 +2766,6 @@ mod tests {
             ("add", TASK_ADD_HELP),
             ("list", TASK_LIST_HELP),
             ("get", TASK_GET_HELP),
-            ("start", TASK_START_HELP),
             ("retry", TASK_RETRY_HELP),
             ("assign", TASK_ASSIGN_HELP),
             ("cancel", TASK_CANCEL_HELP),
@@ -2786,6 +2884,22 @@ mod tests {
         );
         assert_eq!(
             parse_args(args(&[
+                "project",
+                "verification",
+                "--project",
+                "factory",
+                "--mode",
+                "rust-workspace-test",
+            ]))
+            .unwrap()
+            .1,
+            CliCommand::ProjectVerificationSet {
+                project_id: "factory".into(),
+                verification: CompletionVerification::RustWorkspaceTest,
+            }
+        );
+        assert_eq!(
+            parse_args(args(&[
                 "task",
                 "add",
                 "--project",
@@ -2837,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_explicit_agent_creation_and_task_start_commands() {
+    fn parses_explicit_agent_creation_commands() {
         assert_eq!(
             parse_args(args(&[
                 "agent",
@@ -2868,28 +2982,6 @@ mod tests {
                 }
             )
         );
-        assert_eq!(
-            parse_args(args(&[
-                "task",
-                "start",
-                "--project",
-                "project-1",
-                "--task",
-                "task-1",
-                "--agent",
-                "agent-1",
-            ]))
-            .unwrap(),
-            (
-                None,
-                CliCommand::TaskStart {
-                    project_id: "project-1".into(),
-                    task_id: "task-1".into(),
-                    agent_id: "agent-1".into(),
-                }
-            )
-        );
-
         assert_eq!(
             parse_args(args(&[
                 "agent",
@@ -3192,14 +3284,6 @@ mod tests {
         };
         assert!(Uuid::parse_str(id.as_str()).is_ok());
         assert_eq!(role, AgentRole::Orchestrator);
-
-        let request = request_for(CliCommand::TaskStart {
-            project_id: "project-1".into(),
-            task_id: "task-1".into(),
-            agent_id: "agent-1".into(),
-        })
-        .unwrap();
-        assert!(matches!(request, LocalRequest::StartTask { .. }));
     }
 
     #[test]

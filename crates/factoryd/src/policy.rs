@@ -30,6 +30,10 @@ pub fn decide(payload: &Value, source_root: &Path) -> Decision {
 
     let denied_by = if commands.is_err() {
         Some("unsupported_shell_syntax")
+    } else if direct_rust_toolchain(commands.as_deref().unwrap_or_default()) {
+        Some("daemon_owned_rust_verification")
+    } else if direct_mutable_cargo_output(commands.as_deref().unwrap_or_default()) {
+        Some("mutable_cargo_output")
     } else if disallowed_git(commands.as_deref().unwrap_or_default()) {
         Some("destructive_or_publication_git")
     } else if recursive_force_delete_outside(commands.as_deref().unwrap_or_default(), source_root) {
@@ -47,6 +51,39 @@ pub fn decide(payload: &Value, source_root: &Path) -> Decision {
     }
 }
 
+fn direct_rust_toolchain(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        resolve_command(words).is_some_and(|(program, _)| {
+            matches!(program_name(&program), Some("cargo" | "rustc" | "rustup"))
+        })
+    })
+}
+
+fn direct_mutable_cargo_output(commands: &[Vec<ShellWord>]) -> bool {
+    commands.iter().any(|words| {
+        resolve_command(words).is_some_and(|(program, _)| {
+            let components = Path::new(&program)
+                .components()
+                .filter_map(|component| match component {
+                    std::path::Component::Normal(component) => component.to_str(),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            components.iter().enumerate().any(|(index, component)| {
+                *component == "target"
+                    && components[index + 1..]
+                        .iter()
+                        .position(|part| matches!(*part, "debug" | "release"))
+                        .is_some_and(|profile| index + profile + 2 < components.len())
+            })
+        })
+    })
+}
+
+fn program_name(program: &str) -> Option<&str> {
+    Path::new(program).file_name()?.to_str()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ShellWord {
     Arg(String),
@@ -58,7 +95,7 @@ fn disallowed_git(commands: &[Vec<ShellWord>]) -> bool {
         let Some((program, args)) = resolve_command(words) else {
             return false;
         };
-        if program != "git" {
+        if program_name(&program) != Some("git") {
             return false;
         }
         let Some((subcommand, args)) = git_subcommand(&args) else {
@@ -105,7 +142,8 @@ fn git_subcommand(args: &[String]) -> Option<(&str, &[String])> {
 fn recursive_force_delete_outside(commands: &[Vec<ShellWord>], source_root: &Path) -> bool {
     commands.iter().enumerate().any(|(index, words)| {
         resolve_command(words).is_some_and(|(program, args)| {
-            program == "rm" && unsafe_recursive_delete(index, &args, commands.len(), source_root)
+            program_name(&program) == Some("rm")
+                && unsafe_recursive_delete(index, &args, commands.len(), source_root)
         })
     })
 }
@@ -173,7 +211,7 @@ fn shell_accesses_secret(commands: &[Vec<ShellWord>]) -> bool {
         let Some((program, args)) = resolve_command(words) else {
             return false;
         };
-        (FILE_COMMANDS.contains(&program.as_str())
+        (program_name(&program).is_some_and(|program| FILE_COMMANDS.contains(&program))
             && args
                 .iter()
                 .filter(|word| !word.starts_with('-'))
@@ -215,7 +253,8 @@ fn resolve_command(words: &[ShellWord]) -> Option<(String, Vec<String>)> {
         while clean.get(cursor).is_some_and(|word| is_assignment(word)) {
             cursor += 1;
         }
-        let basename = Path::new(clean.get(cursor)?).file_name()?.to_str()?;
+        let program = clean.get(cursor)?;
+        let basename = program_name(program)?;
         if matches!(basename, "command" | "builtin" | "exec") {
             cursor += 1;
             while clean.get(cursor).is_some_and(|word| word.starts_with('-')) {
@@ -237,7 +276,7 @@ fn resolve_command(words: &[ShellWord]) -> Option<(String, Vec<String>)> {
                 return None;
             }
         } else {
-            return Some((basename.to_owned(), clean[cursor + 1..].to_vec()));
+            return Some((program.to_owned(), clean[cursor + 1..].to_vec()));
         }
     }
 }
@@ -544,6 +583,52 @@ mod tests {
             decide(&bash("echo replacement > ~/.aws/credentials"), root).denied_by,
             Some("secret_path")
         );
+    }
+
+    #[test]
+    fn denies_direct_rust_toolchains_for_daemon_owned_verification() {
+        let root = Path::new("/tmp/change");
+        for command in [
+            "cargo test --workspace",
+            "cargo metadata --format-version 1",
+            "/usr/bin/cargo +stable check",
+            "env CARGO_TERM_COLOR=never cargo test",
+            "command rustc --version",
+            "exec rustup run stable cargo test",
+            "echo ready | cargo test",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("daemon_owned_rust_verification"),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn denies_direct_mutable_cargo_output_launches() {
+        let root = Path::new("/tmp/change");
+        for command in [
+            "./target/debug/app",
+            "/tmp/change/target/release/app --check",
+            "env target/aarch64-unknown-linux-gnu/debug/deps/workspace_test --exact case",
+            "command ./target/release/deps/workspace_test",
+            "echo ready | ./target/debug/app",
+        ] {
+            assert_eq!(
+                decide(&bash(command), root).denied_by,
+                Some("mutable_cargo_output"),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "ls target/debug",
+            "rm target/debug/obsolete",
+            "printf '%s' target/debug/app",
+        ] {
+            assert_eq!(decide(&bash(command), root).denied_by, None, "{command}");
+        }
     }
 
     #[test]
